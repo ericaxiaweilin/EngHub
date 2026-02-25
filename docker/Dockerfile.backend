@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY core/ ./core/
+COPY api/ ./api/
+COPY integrations/ ./integrations/
+COPY database/ ./database/
+
+# Create models and services directories
+RUN mkdir -p models services
+
+# Create main.py entry point
+RUN printf 'from fastapi import FastAPI\nfrom api.routes import mes_router, pp_router, qms_router, wms_router\n\napp = FastAPI(title="EngHub MES")\napp.include_router(mes_router, prefix="/api/mes")\napp.include_router(pp_router, prefix="/api/pp")\napp.include_router(qms_router, prefix="/api/qms")\napp.include_router(wms_router, prefix="/api/wms")\n\n@app.get("/")\ndef root():\n    return {"message": "EngHub MES API"}\n' > main.py
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
