@@ -1,4 +1,40 @@
-node_modules/
+```
+# Dependencies
+.venv/
+venv/
+__pycache__/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Build artifacts
+*.pyc
+*.pyo
+*.pyd
+build/
 dist/
-.DS_Store
-*.tar.gz
+*.egg-info/
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+
+# Compressed deployment file
+mes-project-deploy.tar.gz
+```
