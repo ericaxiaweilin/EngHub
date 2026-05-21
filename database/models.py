@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Text,
+    JSON,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship
@@ -375,6 +376,39 @@ class TrainingRecord(Base):
     skill = relationship("Skill")
 
 
+class SimERPAuditLog(Base):
+    """Sim-ERP 审计日志表"""
+
+    __tablename__ = "sim_erp_audit_logs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    simulation_id = Column(String(36), unique=True, nullable=False, index=True)
+    worker_ref = Column(String(50), nullable=False, index=True)
+    shift_id = Column(String(50), nullable=False, index=True)
+    task_type = Column(String(100), nullable=False, index=True)
+    zone_id = Column(String(50), nullable=False, index=True)
+    final_status = Column(String(20), nullable=False, index=True)
+    legal_blocked = Column(Boolean, default=False, nullable=False, index=True)
+    total_cost_delta = Column(Numeric(12, 2), default=0)
+    max_required_break_minutes = Column(Integer, default=0)
+    total_penalty_score = Column(Integer, default=0)
+    simulation_input_hash = Column(String(64), nullable=False, index=True)
+    physics_core_version = Column(String(20), nullable=False)
+    plugin_manifest_hash = Column(String(256), nullable=False)
+    legislation_pack_hash = Column(String(256), nullable=False)
+    arbiter_version = Column(String(20), nullable=False)
+    optimizer_version = Column(String(50), default="manual")
+    snapshot_payload = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False)
+    plugin_records_payload = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False)
+    arbiter_result_payload = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("idx_sim_erp_status_created", "final_status", "created_at"),
+        Index("idx_sim_erp_worker_shift", "worker_ref", "shift_id"),
+    )
+
+
 # 导出所有模型
 __all__ = [
     "Base",
@@ -393,4 +427,5 @@ __all__ = [
     "Skill",
     "EmployeeSkill",
     "TrainingRecord",
+    "SimERPAuditLog",
 ]

@@ -10,6 +10,7 @@ import ProductionReport from './pages/reporting/ProductionReport'
 import InspectionList from './pages/qms/InspectionList'
 import DefectList from './pages/qms/DefectList'
 import InventoryList from './pages/wms/InventoryList'
+import AuditCenter from './pages/sim-erp/AuditCenter'
 
 // 纯色主题配置
 const theme = {
@@ -40,6 +41,7 @@ const App: React.FC = () => {
             <Route path="inspections" element={<InspectionList />} />
             <Route path="defects" element={<DefectList />} />
             <Route path="inventory" element={<InventoryList />} />
+            <Route path="sim-erp/audits" element={<AuditCenter />} />
           </Route>
         </Routes>
       </BrowserRouter>

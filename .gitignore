@@ -1,30 +1,40 @@
-```
 # Dependencies
 .venv/
+.venv_stable/
 venv/
 __pycache__/
+
+# OS files
+.DS_Store
+**/.DS_Store
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
+logs/*.jsonl
 
 # Environment
 .env
 .env.local
 *.env.*
+test.db
 
 # Editors
 .vscode/
 .idea/
 
-# Build artifacts
+# Python build artifacts
 *.pyc
 *.pyo
 *.pyd
 build/
 dist/
 *.egg-info/
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
 
 # Coverage
 .coverage
@@ -37,4 +47,3 @@ htmlcov/
 
 # Compressed deployment file
 mes-project-deploy.tar.gz
-```

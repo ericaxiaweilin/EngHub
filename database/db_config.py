@@ -2,15 +2,18 @@
 Database Configuration and Session Management
 数据库配置和会话管理模块
 """
+from pathlib import Path
 import os
 from typing import AsyncGenerator
+from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import (
     create_async_engine,
     AsyncSession,
     async_sessionmaker,
     AsyncEngine,
 )
-from sqlalchemy.pool import NullPool
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 class DatabaseConfig:
@@ -32,14 +35,19 @@ class DatabaseConfig:
     def engine(self) -> AsyncEngine:
         """获取数据库引擎 (单例模式)"""
         if self._engine is None:
-            self._engine = create_async_engine(
-                self.database_url,
-                pool_pre_ping=True,
-                echo=self.echo,
-                pool_size=self.pool_size,
-                max_overflow=self.max_overflow,
-                pool_recycle=3600,  # 1 小时后回收连接
-            )
+            engine_kwargs = {
+                "echo": self.echo,
+            }
+            if not self.database_url.startswith("sqlite"):
+                engine_kwargs.update(
+                    {
+                        "pool_pre_ping": True,
+                        "pool_size": self.pool_size,
+                        "max_overflow": self.max_overflow,
+                        "pool_recycle": 3600,
+                    }
+                )
+            self._engine = create_async_engine(self.database_url, **engine_kwargs)
         return self._engine
     
     @property

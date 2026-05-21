@@ -2,6 +2,7 @@ import React from 'react'
 import { Outlet, Link, useLocation } from 'react-router-dom'
 import { Layout as AntLayout, Menu, Badge } from 'antd'
 import {
+  AuditOutlined,
   DashboardOutlined,
   FileTextOutlined,
   EditOutlined,
@@ -22,6 +23,7 @@ const Layout: React.FC = () => {
     { key: '/inspections', icon: <SafetyOutlined />, label: <Link to="/inspections">检验管理</Link> },
     { key: '/defects', icon: <WarningOutlined />, label: <Link to="/defects"><Badge count={5} size="small">不良品</Badge></Link> },
     { key: '/inventory', icon: <InboxOutlined />, label: <Link to="/inventory">库存管理</Link> },
+    { key: '/sim-erp/audits', icon: <AuditOutlined />, label: <Link to="/sim-erp/audits">合规审计</Link> },
   ]
 
   return (

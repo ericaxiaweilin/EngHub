@@ -1,0 +1,12 @@
+{
+  "jurisdiction": "VN",
+  "version": "2024.01",
+  "continuous_work_limit": {
+    "max_minutes": 240,
+    "required_break_minutes": 30
+  },
+  "heat_allowance": {
+    "temperature_c_gt": 35,
+    "allowance_vnd": 30000
+  }
+}

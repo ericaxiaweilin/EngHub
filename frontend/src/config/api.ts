@@ -23,6 +23,12 @@ export const API_ENDPOINTS = {
   WAREHOUSES: `${API_BASE_URL}/api/v1/warehouses`,
   INVENTORY: `${API_BASE_URL}/api/v1/inventory`,
   INVENTORY_TRANSACTIONS: `${API_BASE_URL}/api/v1/inventory/transactions`,
+
+  // Sim-ERP
+  SIM_ERP_PLUGINS: `${API_BASE_URL}/api/v1/sim-erp/plugins`,
+  SIM_ERP_AUDITS: `${API_BASE_URL}/api/v1/sim-erp/audits`,
+  SIM_ERP_AUDIT_LATEST: `${API_BASE_URL}/api/v1/sim-erp/audits/latest`,
+  SIM_ERP_AUDIT: (simulationId: string) => `${API_BASE_URL}/api/v1/sim-erp/audits/${simulationId}`,
 };
 
 export default API_BASE_URL;

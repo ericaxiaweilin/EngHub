@@ -1,0 +1,7 @@
+{
+  "organization": "Johnson",
+  "version": "2024.01",
+  "fatigue_warning": {
+    "step_count_gt": 10000
+  }
+}

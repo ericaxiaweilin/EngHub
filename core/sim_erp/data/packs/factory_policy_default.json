@@ -1,0 +1,8 @@
+{
+  "factory_code": "DEFAULT",
+  "version": "2024.01",
+  "break_policy": {
+    "continuous_work_minutes_gte": 300,
+    "break_minutes": 15
+  }
+}
