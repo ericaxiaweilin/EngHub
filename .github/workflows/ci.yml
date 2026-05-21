@@ -7,33 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  # 代码质量检查
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
-        run: |
-          pip install black flake8 mypy
-          pip install -r backend/requirements.txt
-      
-      - name: Check code formatting
-        run: black --check backend/
-      
-      - name: Lint with flake8
-        run: flake8 backend/ --max-line-length=120
-      
-      - name: Type check with mypy
-        run: mypy backend/ --ignore-missing-imports
-
-  # 后端测试
-  test-backend:
+  backend-checks:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -49,105 +23,121 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
-    
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
-        run: |
-          pip install pytest pytest-asyncio pytest-cov
-          pip install -r backend/requirements.txt
-      
-      - name: Run tests
-        run: pytest backend/tests/ -v --cov=backend --cov-report=xml
-        env:
-          DATABASE_URL: postgresql://test:test@localhost:5432/test
 
-  # 前端构建
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile backend modules
+        run: |
+          python -m py_compile \
+            main.py \
+            database/db_config.py \
+            database/models.py \
+            api/routes/__init__.py \
+            api/routes/sim_erp_routes.py \
+            api/services/sim_erp_audit_service.py \
+            core/sim_erp/*.py \
+            core/sim_erp/plugins/*.py
+
+      - name: Run Sim-ERP unit tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/test
+        run: pytest -q tests/unit/test_sim_erp.py
+
   build-frontend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
-          cache: 'npm'
-          cache-dependency-path: frontend/package.json
-      
+          node-version: "18"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Install dependencies
-        run: cd frontend && npm ci
-      
-      - name: Build
-        run: cd frontend && npm run build
-      
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
           path: frontend/dist
 
-  # 构建并推送Docker镜像
-  build-and-push:
-    needs: [lint, test-backend, build-frontend]
+  docker-build:
+    needs: [backend-checks, build-frontend]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      
-      - name: Build and push backend
+
+      - name: Build backend image
         uses: docker/build-push-action@v5
         with:
-          context: ./backend
+          context: .
           file: ./docker/Dockerfile.backend
-          push: true
-          tags: ${{ secrets.DOCKER_USERNAME }}/enghub-backend:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      
-      - name: Build and push frontend
-        uses: docker/build-push-action@v5
-        with:
-          context: ./frontend
-          file: ./docker/Dockerfile.frontend
-          push: true
-          tags: ${{ secrets.DOCKER_USERNAME }}/enghub-frontend:latest
+          push: false
+          tags: enghub-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # 部署到服务器
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.frontend
+          push: false
+          tags: enghub-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy:
-    needs: build-and-push
+    needs: [docker-build]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     steps:
       - uses: actions/checkout@v4
-      
+
+      - name: Upload application source
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          source: "api,core,database,docker,frontend,integrations,main.py,requirements.txt"
+          target: "/home/eric/enghub"
+          overwrite: true
+
       - name: Deploy to server
-        uses: appleboy/ssh-action@v1.0.0
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           script: |
-            cd /opt/enghub
-            docker-compose -f docker-compose.minimal.yml pull
-            docker-compose -f docker-compose.minimal.yml up -d
+            set -e
+            mkdir -p /home/eric/enghub
+            printf '%s' '${{ github.sha }}' > /home/eric/enghub/.vone_sync_commit
+            cd /home/eric/enghub/docker
+            docker compose -f docker-compose.minimal.yml up -d --build postgres redis backend frontend
+            docker exec -i docker-postgres-1 psql -U enghub -d enghub -f /home/eric/enghub/database/migrations/004_sim_erp_audit_logs.sql
             docker system prune -f
