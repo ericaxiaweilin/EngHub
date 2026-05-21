@@ -9,6 +9,9 @@ on:
 jobs:
   backend-checks:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
+      PYTEST_ADDOPTS: -o asyncio_default_fixture_loop_scope=function
     services:
       postgres:
         image: postgres:15-alpine
