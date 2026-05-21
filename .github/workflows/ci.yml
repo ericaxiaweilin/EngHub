@@ -112,10 +112,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Enable this job only after GitHub Actions has valid server credentials
+  # and network reachability to the target host.
   deploy:
     needs: [docker-build]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_GITHUB_DEPLOY == 'true'
 
     steps:
       - uses: actions/checkout@v4
