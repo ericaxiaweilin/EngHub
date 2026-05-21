@@ -16,13 +16,27 @@ from sqlalchemy.ext.asyncio import (
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
+def _normalize_database_url(raw_url: str) -> str:
+    if raw_url.startswith("postgresql+asyncpg://") or raw_url.startswith("sqlite+aiosqlite://"):
+        return raw_url
+    if raw_url.startswith("postgresql://"):
+        return raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if raw_url.startswith("postgres://"):
+        return raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    if raw_url.startswith("sqlite:///"):
+        return raw_url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
+    return raw_url
+
+
 class DatabaseConfig:
     """数据库配置类"""
     
     def __init__(self):
-        self.database_url = os.getenv(
-            "DATABASE_URL",
-            "postgresql+asyncpg://enghub:enghub123@localhost:5432/enghub"
+        self.database_url = _normalize_database_url(
+            os.getenv(
+                "DATABASE_URL",
+                "postgresql+asyncpg://enghub:enghub123@localhost:5432/enghub"
+            )
         )
         self.pool_size = int(os.getenv("DB_POOL_SIZE", "10"))
         self.max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "20"))
