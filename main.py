@@ -24,7 +24,8 @@ app.include_router(mes_router)
 app.include_router(pp_router)
 app.include_router(qms_router)
 app.include_router(wms_router)
-app.include_router(employee_skill_router)
+if employee_skill_router is not None:
+    app.include_router(employee_skill_router)
 app.include_router(sim_erp_router)
 
 
