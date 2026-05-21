@@ -1,5 +1,3 @@
-version: '3.8'
-
 # 生产部署配置 - 适合6GB内存服务器
 services:
   postgres:
@@ -10,8 +8,6 @@ services:
       POSTGRES_DB: enghub
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     restart: unless-stopped
     # 内存限制 1GB
     deploy:
@@ -25,8 +21,6 @@ services:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
-    ports:
-      - "6379:6379"
     restart: unless-stopped
     # 内存限制 512MB
     deploy:
