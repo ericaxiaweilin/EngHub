@@ -4,7 +4,7 @@ Database persistence helpers for Sim-ERP audit records.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import func, select
@@ -22,6 +22,9 @@ class SimERPAuditService:
         snapshot = record.snapshot.model_dump(mode="json")
         plugin_records = [item.model_dump(mode="json") for item in record.plugin_records]
         arbiter_result = record.arbiter_result.model_dump(mode="json")
+        created_at = record.created_at
+        if created_at.tzinfo is not None:
+            created_at = created_at.astimezone(timezone.utc).replace(tzinfo=None)
 
         entity = SimERPAuditLog(
             simulation_id=record.simulation_id,
@@ -43,7 +46,7 @@ class SimERPAuditService:
             snapshot_payload=snapshot,
             plugin_records_payload=plugin_records,
             arbiter_result_payload=arbiter_result,
-            created_at=record.created_at,
+            created_at=created_at,
         )
         self.db.add(entity)
         await self.db.flush()
