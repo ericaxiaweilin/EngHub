@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { Row, Col, Card, Statistic, Table, Tag, Spin, message } from 'antd'
+import { Row, Col, Card, Statistic, Table, Tag, Spin } from 'antd'
 import { getWorkOrders, WorkOrder } from '../services/mes'
 
 const Dashboard: React.FC = () => {
