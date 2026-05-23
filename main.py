@@ -11,14 +11,15 @@ from api.routes import (
     sim_erp_router,
     wms_router,
 )
+from api.v1 import api_router as v1_router
 
 app = FastAPI(
     title="EngHub MES",
-    description="Manufacturing Execution System API",
-    version="1.0.0"
+    description="Manufacturing Execution System API with Production Expert System",
+    version="1.1.0"
 )
 
-# Include routers
+# Include legacy routers
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(mes_router)
 app.include_router(pp_router)
@@ -27,6 +28,9 @@ app.include_router(wms_router)
 if employee_skill_router is not None:
     app.include_router(employee_skill_router)
 app.include_router(sim_erp_router)
+
+# Include v1 API router (with expert system)
+app.include_router(v1_router)
 
 
 @app.get("/")
