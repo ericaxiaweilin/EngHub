@@ -3,6 +3,7 @@ EngHub MES Application Entry Point
 """
 from fastapi import FastAPI
 from api.routes import (
+    ai_router,
     auth_router,
     employee_skill_router,
     mes_router,
@@ -11,6 +12,7 @@ from api.routes import (
     sim_erp_router,
     wms_router,
 )
+from api.v1 import api_router as v1_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -26,7 +28,9 @@ app.include_router(qms_router)
 app.include_router(wms_router)
 if employee_skill_router is not None:
     app.include_router(employee_skill_router)
+app.include_router(ai_router)
 app.include_router(sim_erp_router)
+app.include_router(v1_router)
 
 
 @app.get("/")

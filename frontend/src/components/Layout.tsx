@@ -9,6 +9,7 @@ import {
   SafetyOutlined,
   WarningOutlined,
   InboxOutlined,
+  RobotOutlined,
 } from '@ant-design/icons'
 
 const { Header, Sider, Content } = AntLayout
@@ -24,6 +25,7 @@ const Layout: React.FC = () => {
     { key: '/defects', icon: <WarningOutlined />, label: <Link to="/defects"><Badge count={5} size="small">不良品</Badge></Link> },
     { key: '/inventory', icon: <InboxOutlined />, label: <Link to="/inventory">库存管理</Link> },
     { key: '/sim-erp/audits', icon: <AuditOutlined />, label: <Link to="/sim-erp/audits">合规审计</Link> },
+    { key: '/expert', icon: <RobotOutlined />, label: <Link to="/expert">生产专家</Link> },
   ]
 
   return (
