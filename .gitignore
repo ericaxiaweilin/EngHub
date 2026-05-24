@@ -1,49 +1,175 @@
-# Dependencies
-.venv/
-.venv_stable/
-venv/
+```gitignore
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# OS files
-.DS_Store
-**/.DS_Store
-
-# Logs and temp files
+# Logs
 *.log
-*.tmp
-*.swp
-logs/*.jsonl
 
-# Environment
+# Environment variables
 .env
 .env.local
-*.env.*
-test.db
+.env.*
 
-# Editors
+# IDE specific
 .vscode/
 .idea/
+*.swp
+*.swo
+*.tmp
 
-# Python build artifacts
-*.pyc
-*.pyo
-*.pyd
-build/
-dist/
-*.egg-info/
+# Compressed files
+*.tar.gz
 
-# Frontend build artifacts
-frontend/node_modules/
-frontend/dist/
-
-# Coverage
+# Coverage reports
 .coverage
-coverage/
 htmlcov/
+.coverage.*
 
 # Testing
 .pytest_cache/
 .mypy_cache/
 
-# Compressed deployment file
-mes-project-deploy.tar.gz
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# Sage
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Cython
+*.so
+
+# PyInstaller
+*.pyz
+*.pyz_extracted/
+
+# Coverage
+.coverage.*
+
+# Frontend build artifacts would typically go here if needed
+# node_modules/ (uncomment if using npm/yarn)
+```
