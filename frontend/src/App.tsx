@@ -1,51 +1,42 @@
-import React from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { ConfigProvider } from 'antd'
-import zhCN from 'antd/locale/zh_CN'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import Layout from './components/Layout'
+import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
-import WorkOrderList from './pages/workorder/WorkOrderList'
-import WorkOrderDetail from './pages/workorder/WorkOrderDetail'
-import ProductionReport from './pages/reporting/ProductionReport'
+import WorkOrderList from './pages/mes/WorkOrderList'
+import ProductionReport from './pages/mes/ProductionReport'
+import PlanBoard from './pages/pp/PlanBoard'
 import InspectionList from './pages/qms/InspectionList'
-import DefectList from './pages/qms/DefectList'
-import InventoryList from './pages/wms/InventoryList'
-import AuditCenter from './pages/sim-erp/AuditCenter'
+import WarehouseList from './pages/wms/WarehouseList'
 
-// 纯色主题配置
-const theme = {
-  token: {
-    colorPrimary: '#1890ff',
-    colorSuccess: '#52c41a',
-    colorWarning: '#faad14',
-    colorError: '#f5222d',
-    colorText: '#262626',
-    colorTextSecondary: '#595959',
-    colorBorder: '#d9d9d9',
-    colorBgLayout: '#f5f5f5',
-    borderRadius: 4,
-  },
-}
+const queryClient = new QueryClient()
 
-const App: React.FC = () => {
+function App() {
   return (
-    <ConfigProvider locale={zhCN} theme={theme}>
+    <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <Routes>
+          <Route path="/login" element={<Login />} />
           <Route path="/" element={<Layout />}>
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="dashboard" element={<Dashboard />} />
-            <Route path="work-orders" element={<WorkOrderList />} />
-            <Route path="work-orders/:id" element={<WorkOrderDetail />} />
-            <Route path="production-report" element={<ProductionReport />} />
-            <Route path="inspections" element={<InspectionList />} />
-            <Route path="defects" element={<DefectList />} />
-            <Route path="inventory" element={<InventoryList />} />
-            <Route path="sim-erp/audits" element={<AuditCenter />} />
+            
+            {/* MES 模块 */}
+            <Route path="mes/work-orders" element={<WorkOrderList />} />
+            <Route path="mes/production-report" element={<ProductionReport />} />
+            
+            {/* PP 模块 */}
+            <Route path="pp/plan-board" element={<PlanBoard />} />
+            
+            {/* QMS 模块 */}
+            <Route path="qms/inspections" element={<InspectionList />} />
+            
+            {/* WMS 模块 */}
+            <Route path="wms/warehouses" element={<WarehouseList />} />
           </Route>
         </Routes>
       </BrowserRouter>
-    </ConfigProvider>
+    </QueryClientProvider>
   )
 }
 

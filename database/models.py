@@ -409,6 +409,238 @@ class SimERPAuditLog(Base):
     )
 
 
+# ==================== PP Models ====================
+
+class ProductionPlan(Base):
+    """生产计划表 (MPS)"""
+
+    __tablename__ = "production_plans"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    plan_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    sales_order_id = Column(String(50), index=True)
+    quantity = Column(Integer, nullable=False, default=0)
+    required_date = Column(DateTime, nullable=False)
+    plan_type = Column(String(20), default="mps", index=True)  # mps, forecast
+    customer_level = Column(String(20), default="b")  # vip, a, b, c
+    priority = Column(Integer, default=50)
+    priority_score = Column(Numeric(10, 2), default=0)
+    status = Column(String(20), default="draft", index=True)  # draft, confirmed, released, in_progress, completed, cancelled
+    due_date = Column(DateTime)
+    confirmed_by = Column(String(50))
+    confirmed_at = Column(DateTime)
+    released_by = Column(String(50))
+    released_at = Column(DateTime)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_plan_status_factory", "status", "factory_id"),
+        Index("idx_plan_required_date", "required_date"),
+    )
+
+
+class MRPResult(Base):
+    """物料需求计划结果表"""
+
+    __tablename__ = "mrp_results"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    mrp_code = Column(String(50), unique=True, nullable=False, index=True)
+    plan_id = Column(UUID(as_uuid=True), ForeignKey("production_plans.id"), nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    target_date = Column(DateTime, nullable=False)
+    status = Column(String(20), default="pending", index=True)  # pending, calculated, ordered, partial, received
+    total_shortage = Column(Integer, default=0)
+    total_value = Column(Numeric(12, 2), default=0)
+    calculated_at = Column(DateTime)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # 关系
+    items = relationship("MRPItem", back_populates="mrp_result")
+
+
+class MRPItem(Base):
+    """MRP 明细项"""
+
+    __tablename__ = "mrp_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    mrp_id = Column(UUID(as_uuid=True), ForeignKey("mrp_results.id"), nullable=False, index=True)
+    material_id = Column(String(50), nullable=False, index=True)
+    material_code = Column(String(50), nullable=False)
+    material_name = Column(String(200))
+    required_qty = Column(Integer, nullable=False, default=0)
+    available_qty = Column(Integer, default=0)
+    shortage_qty = Column(Integer, default=0)
+    suggested_qty = Column(Integer, default=0)
+    suggested_date = Column(DateTime)
+    priority = Column(String(20), default="normal")  # urgent, high, normal, low
+    unit = Column(String(20), default="pcs")
+    lead_time_days = Column(Integer, default=0)
+    supplier_id = Column(String(50))
+    estimated_cost = Column(Numeric(12, 2), default=0)
+    level = Column(Integer, default=1)  # BOM层级
+    parent_material_id = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # 关系
+    mrp_result = relationship("MRPResult", back_populates="items")
+
+
+# ==================== QMS Models ====================
+
+class Inspection(Base):
+    """检验单表"""
+
+    __tablename__ = "inspections"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    inspection_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    inspection_type = Column(String(20), nullable=False, index=True)  # iqc, ipqc, fqc, oqc
+    product_id = Column(String(50), index=True)
+    material_id = Column(String(50), index=True)
+    batch_id = Column(String(50), index=True)
+    batch_size = Column(Integer, default=0)
+    work_order_id = Column(String(50), index=True)
+    aql_level = Column(Numeric(5, 2), default=1.0)
+    inspection_level = Column(String(20), default="general_ii")
+    sample_size = Column(Integer, default=0)
+    status = Column(String(20), default="pending", index=True)  # pending, in_progress, passed, failed, rejected
+    inspected_qty = Column(Integer, default=0)
+    defective_qty = Column(Integer, default=0)
+    defect_details = Column(JSON().with_variant(JSONB, "postgresql"))
+    inspector_id = Column(String(50))
+    inspected_at = Column(DateTime)
+    aql_result = Column(JSON().with_variant(JSONB, "postgresql"))
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_inspection_type_status", "inspection_type", "status"),
+        Index("idx_inspection_work_order", "work_order_id"),
+    )
+
+
+class Defect(Base):
+    """不良品单表"""
+
+    __tablename__ = "defects"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    defect_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    defect_type = Column(String(20), nullable=False, index=True)  # appearance, dimension, function, etc.
+    quantity = Column(Integer, nullable=False, default=0)
+    severity = Column(String(20), default="minor", index=True)  # critical, major, minor, observation
+    inspection_id = Column(UUID(as_uuid=True), ForeignKey("inspections.id"), index=True)
+    work_order_id = Column(String(50), index=True)
+    material_id = Column(String(50), index=True)
+    batch_id = Column(String(50), index=True)
+    station_id = Column(String(50), index=True)
+    description = Column(Text)
+    status = Column(String(20), default="open", index=True)  # open, in_progress, resolved, closed, cancelled
+    disposition = Column(String(20))  # rework, repair, scrap, concession, return
+    disposition_qty = Column(Integer)
+    disposition_by = Column(String(50))
+    disposition_at = Column(DateTime)
+    disposition_remark = Column(Text)
+    ocap_status = Column(String(20), default="pending", index=True)  # pending, triggered, in_progress, completed
+    ocap_trigger_reason = Column(Text)
+    ocap_triggered_at = Column(DateTime)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_defect_batch", "batch_id"),
+        Index("idx_defect_status_type", "status", "defect_type"),
+    )
+
+
+class OCAP(Base):
+    """OCAP (纠正预防措施) 表"""
+
+    __tablename__ = "ocaps"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    ocap_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    defect_id = Column(UUID(as_uuid=True), ForeignKey("defects.id"), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    description = Column(Text)
+    root_cause = Column(Text)
+    corrective_action = Column(Text)
+    preventive_action = Column(Text)
+    status = Column(String(20), default="in_progress", index=True)  # in_progress, completed, closed
+    assigned_to = Column(String(50))
+    due_date = Column(DateTime)
+    completed_at = Column(DateTime)
+    closed_by = Column(String(50))
+    closed_at = Column(DateTime)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+# ==================== Cost Models ====================
+
+class WorkOrderCost(Base):
+    """工单成本表"""
+
+    __tablename__ = "work_order_costs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    work_order_id = Column(String(50), unique=True, nullable=False, index=True)
+    work_order_code = Column(String(50), nullable=False)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    produced_qty = Column(Integer, default=0)
+    material_cost = Column(Numeric(12, 2), default=0)
+    labor_cost = Column(Numeric(12, 2), default=0)
+    overhead_cost = Column(Numeric(12, 2), default=0)
+    total_cost = Column(Numeric(12, 2), default=0)
+    unit_cost = Column(Numeric(12, 2), default=0)
+    status = Column(String(20), default="pending", index=True)  # pending, calculated, confirmed, adjusted
+    calculated_at = Column(DateTime)
+    confirmed_by = Column(String(50))
+    confirmed_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class ProductStandardCost(Base):
+    """产品标准成本表"""
+
+    __tablename__ = "product_standard_costs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    product_id = Column(String(50), nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    bom_version = Column(String(50))
+    material_cost = Column(Numeric(12, 2), default=0)
+    labor_cost = Column(Numeric(12, 2), default=0)
+    overhead_cost = Column(Numeric(12, 2), default=0)
+    total_standard_cost = Column(Numeric(12, 2), default=0)
+    is_active = Column(Boolean, default=True)
+    validated_by = Column(String(50))
+    validated_at = Column(DateTime)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_product_cost_unique", "product_id", "bom_version", unique=True),
+    )
+
+
 # 导出所有模型
 __all__ = [
     "Base",
@@ -428,4 +660,15 @@ __all__ = [
     "EmployeeSkill",
     "TrainingRecord",
     "SimERPAuditLog",
+    # PP Models
+    "ProductionPlan",
+    "MRPResult",
+    "MRPItem",
+    # QMS Models
+    "Inspection",
+    "Defect",
+    "OCAP",
+    # Cost Models
+    "WorkOrderCost",
+    "ProductStandardCost",
 ]

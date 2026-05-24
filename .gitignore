@@ -1,49 +1,42 @@
-# Dependencies
-.venv/
-.venv_stable/
-venv/
+```
+# Python
 __pycache__/
-
-# OS files
-.DS_Store
-**/.DS_Store
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-logs/*.jsonl
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.ENV
+.python-version
+.python-history
 
 # Environment
 .env
 .env.local
-*.env.*
-test.db
+.env.*
+!.env.example
 
-# Editors
-.vscode/
-.idea/
+# Dependencies
+node_modules/
 
-# Python build artifacts
-*.pyc
-*.pyo
-*.pyd
-build/
+# Build artifacts
 dist/
+build/
+target/
 *.egg-info/
 
-# Frontend build artifacts
-frontend/node_modules/
-frontend/dist/
+# Logs
+*.log
 
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# Testing
-.pytest_cache/
-.mypy_cache/
-
-# Compressed deployment file
-mes-project-deploy.tar.gz
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Icon?
+```
