@@ -6,6 +6,7 @@ from api.routes import (
     ai_router,
     auth_router,
     employee_skill_router,
+    intelligence_router,
     mes_router,
     pp_router,
     qms_router,
@@ -29,13 +30,18 @@ app.include_router(wms_router)
 if employee_skill_router is not None:
     app.include_router(employee_skill_router)
 app.include_router(ai_router)
+app.include_router(intelligence_router)
 app.include_router(sim_erp_router)
 app.include_router(v1_router)
 
 
 @app.get("/")
 def root():
-    return {"message": "EngHub MES API", "status": "running"}
+    return {
+        "message": "EngHub Manufacturing Intelligence API",
+        "status": "running",
+        "system_type": "simulation_ai_scenario_decision",
+    }
 
 
 @app.get("/health")

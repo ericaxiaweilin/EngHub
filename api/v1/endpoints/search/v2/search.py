@@ -7,21 +7,18 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional, List
 from datetime import datetime
 
-from core.search_engine.v2 import (
-    get_search_engine,
-    get_data_loader,
-    SearchQuery,
-    SearchEntityType,
-    SearchDocument,
-)
+from core.intelligence import ManufacturingIntelligenceHub, get_intelligence_hub
+from core.search_engine.v2 import SearchDocument, SearchEntityType, SearchQuery
 
 router = APIRouter(prefix="/search", tags=["Search Engine v2"])
 
 
 @router.get("/health")
-async def health_check():
+async def health_check(
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """健康检查"""
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     stats = engine.get_stats()
     return {
         "status": "healthy",
@@ -31,9 +28,11 @@ async def health_check():
 
 
 @router.get("/stats")
-async def get_stats():
+async def get_stats(
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """获取索引统计信息"""
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     return engine.get_stats()
 
 
@@ -46,13 +45,14 @@ async def search(
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     sort_by: str = Query("relevance", description="排序字段"),
     sort_order: str = Query("desc", description="排序方向"),
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
 ):
     """
     统一搜索接口
     
     支持搜索工单、设备、物料、SOP、质量报告等所有业务数据
     """
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     
     # 解析实体类型
     entity_types = None
@@ -86,25 +86,31 @@ async def search(
 
 
 @router.post("/search", response_model=dict)
-async def advanced_search(search_query: SearchQuery):
+async def advanced_search(
+    search_query: SearchQuery,
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """
     高级搜索接口
     
     支持复杂的过滤条件和上下文感知搜索
     """
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     response = engine.search(search_query)
     return response.model_dump()
 
 
 @router.post("/index")
-async def index_document(document: SearchDocument):
+async def index_document(
+    document: SearchDocument,
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """
     索引单个文档
     
     用于实时同步业务数据变更
     """
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     engine.index_document(document)
     
     return {
@@ -116,7 +122,11 @@ async def index_document(document: SearchDocument):
 
 
 @router.delete("/index/{entity_type}/{entity_id}")
-async def delete_document(entity_type: str, entity_id: str):
+async def delete_document(
+    entity_type: str,
+    entity_id: str,
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """
     删除索引文档
     """
@@ -125,7 +135,7 @@ async def delete_document(entity_type: str, entity_id: str):
     except ValueError:
         raise HTTPException(status_code=400, detail=f"无效的实体类型：{entity_type}")
     
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     engine.delete_document(et, entity_id)
     
     return {
@@ -138,13 +148,14 @@ async def delete_document(entity_type: str, entity_id: str):
 async def get_suggestions(
     q: str = Query(..., description="查询前缀", min_length=1),
     limit: int = Query(5, ge=1, le=20, description="建议数量"),
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
 ):
     """
     获取搜索建议
     
     基于索引词汇的前缀匹配
     """
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     tokenizer = engine.tokenizer
     
     # 分词
@@ -163,13 +174,16 @@ async def get_suggestions(
 
 
 @router.post("/index/batch")
-async def index_batch_documents(documents: list[SearchDocument]):
+async def index_batch_documents(
+    documents: list[SearchDocument],
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """
     批量索引文档
     
     用于初始化或全量同步
     """
-    engine = get_search_engine()
+    engine = hub.get_search_engine()
     
     success_count = 0
     failed_ids = []
@@ -192,7 +206,9 @@ async def index_batch_documents(documents: list[SearchDocument]):
 
 # 示例数据初始化端点
 @router.post("/seed/sample-data")
-async def seed_sample_data():
+async def seed_sample_data(
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """
     加载示例数据用于测试
     
@@ -200,8 +216,8 @@ async def seed_sample_data():
     """
     from datetime import timedelta
     
-    loader = get_data_loader()
-    engine = get_search_engine()
+    loader = hub.get_search_loader()
+    engine = hub.get_search_engine()
     
     now = datetime.now()
     

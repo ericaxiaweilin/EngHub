@@ -8,6 +8,7 @@ from .qms_routes import router as qms_router
 from .wms_routes import router as wms_router
 from .auth_routes import router as auth_router
 from .ai_routes import router as ai_router
+from .intelligence_routes import router as intelligence_router
 from .sim_erp_routes import router as sim_erp_router
 
 try:
@@ -22,6 +23,7 @@ __all__ = [
     "wms_router",
     "auth_router",
     "ai_router",
+    "intelligence_router",
     "employee_skill_router",
     "sim_erp_router",
 ]

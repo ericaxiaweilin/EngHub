@@ -3,24 +3,25 @@
 
 提供 RESTful 接口供前端调用专家系统功能
 """
+from __future__ import annotations
+
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 
-from core.expert_system import ExpertEngine
+from core.intelligence import ManufacturingIntelligenceHub, get_intelligence_hub
+
+if TYPE_CHECKING:
+    from core.expert_system import ExpertEngine
 
 router = APIRouter(prefix="/expert", tags=["生产专家系统"])
 
-# 全局专家引擎实例 (延迟初始化)
-_expert_engine: Optional[ExpertEngine] = None
 
-
-def get_expert_engine() -> ExpertEngine:
+def get_expert_engine(
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+) -> Any:
     """获取专家引擎实例"""
-    global _expert_engine
-    if _expert_engine is None:
-        _expert_engine = ExpertEngine()
-    return _expert_engine
+    return hub.get_expert_engine()
 
 
 # ========== 请求/响应模型 ==========
@@ -61,7 +62,7 @@ class HealthResponse(BaseModel):
 # ========== API 端点 ==========
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check(engine: ExpertEngine = Depends(get_expert_engine)):
+async def health_check(engine: Any = Depends(get_expert_engine)):
     """
     健康检查
     
@@ -77,7 +78,7 @@ async def health_check(engine: ExpertEngine = Depends(get_expert_engine)):
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
-    engine: ExpertEngine = Depends(get_expert_engine)
+    engine: Any = Depends(get_expert_engine)
 ):
     """
     与生产专家对话
@@ -107,7 +108,7 @@ async def chat(
 
 
 @router.get("/tools", response_model=ToolsResponse)
-async def list_tools(engine: ExpertEngine = Depends(get_expert_engine)):
+async def list_tools(engine: Any = Depends(get_expert_engine)):
     """
     列出专家系统可用的工具
     
@@ -123,7 +124,7 @@ async def list_tools(engine: ExpertEngine = Depends(get_expert_engine)):
 
 
 @router.post("/initialize")
-async def initialize_engine(engine: ExpertEngine = Depends(get_expert_engine)):
+async def initialize_engine(engine: Any = Depends(get_expert_engine)):
     """
     手动初始化专家引擎
     
@@ -144,7 +145,7 @@ async def initialize_engine(engine: ExpertEngine = Depends(get_expert_engine)):
 
 
 @router.get("/knowledge/stats")
-async def knowledge_stats(engine: ExpertEngine = Depends(get_expert_engine)):
+async def knowledge_stats(engine: Any = Depends(get_expert_engine)):
     """
     获取知识库统计信息
     """

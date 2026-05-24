@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
 
 from database.db_config import get_db
-from core.ai_service import ai_service
+from core.intelligence import DecisionStudio, ManufacturingIntelligenceHub, get_decision_studio, get_intelligence_hub
 
 router = APIRouter(prefix="/api/v1/ai", tags=["AI Services"])
 
@@ -32,8 +32,11 @@ class ChatRequest(BaseModel):
 
 
 @router.get("/health")
-async def ai_health_check():
+async def ai_health_check(
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     """检查 AI 服务网关是否可用"""
+    ai_service = hub.get_ai_service()
     is_healthy = await ai_service.health_check()
     if not is_healthy:
         raise HTTPException(
@@ -50,13 +53,14 @@ async def ai_health_check():
 @router.post("/optimize/schedule")
 async def optimize_production_schedule(
     request: ScheduleOptimizationRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    studio: DecisionStudio = Depends(get_decision_studio),
 ):
     """
     生产排程优化
     调用模型网关进行智能排程
     """
-    result = await ai_service.optimize_schedule(
+    result = await studio.optimize_schedule(
         work_orders=request.work_orders,
         constraints=request.constraints
     )
@@ -73,13 +77,14 @@ async def optimize_production_schedule(
 @router.post("/predict/defects")
 async def predict_defect_rate(
     request: DefectPredictionRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    studio: DecisionStudio = Depends(get_decision_studio),
 ):
     """
     不良品率预测
     基于工艺参数预测质量风险
     """
-    result = await ai_service.predict_defects(
+    result = await studio.predict_defects(
         process_params=request.process_params
     )
     
@@ -95,13 +100,14 @@ async def predict_defect_rate(
 @router.post("/analyze/quality")
 async def analyze_quality_trends(
     request: QualityAnalysisRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    studio: DecisionStudio = Depends(get_decision_studio),
 ):
     """
     质量趋势分析
     分析检验数据，识别质量趋势
     """
-    result = await ai_service.analyze_quality_trend(
+    result = await studio.analyze_quality(
         inspection_data=request.inspection_data
     )
     
@@ -118,13 +124,16 @@ async def analyze_quality_trends(
 async def chat_with_assistant(
     request: ChatRequest,
     current_user_id: str = "anonymous",  # 实际应从 JWT token 获取
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    studio: DecisionStudio = Depends(get_decision_studio),
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
 ):
     """
     与智能助手对话
     支持自然语言查询和操作指导
     """
-    result = await ai_service.get_chat_response(
+    ai_service = hub.get_ai_service()
+    result = await studio.chat(
         user_id=current_user_id,
         message=request.message,
         context=request.context

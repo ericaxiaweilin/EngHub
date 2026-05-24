@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.services.sim_erp_audit_service import SimERPAuditService
-from core.sim_erp.engine import SimERPEngine
+from core.intelligence import DecisionStudio, ManufacturingIntelligenceHub, get_decision_studio, get_intelligence_hub
 from core.sim_erp.models import (
     ActionType,
     AuditRecord,
@@ -21,7 +21,6 @@ from core.sim_erp.models import (
     TerrainType,
     WorkContext,
 )
-from core.sim_erp.plugins.registry import build_default_registry
 from core.sim_erp.serializers import (
     entity_to_detail_payload,
     entity_to_summary_payload,
@@ -31,8 +30,6 @@ from database.db_config import get_db
 from database.models import SimERPAuditLog
 
 router = APIRouter(prefix="/api/v1/sim-erp", tags=["sim-erp"])
-engine = SimERPEngine()
-plugin_registry = build_default_registry()
 
 
 class SimERPScenarioRequest(BaseModel):
@@ -172,12 +169,15 @@ async def sim_erp_status():
         "status": "running",
         "engine": "Sim-ERP v2.0",
         "physics_model": "step_based_fatigue",
+        "intelligence_module": "core.intelligence",
     }
 
 
 @router.get("/plugins", response_model=List[SimERPPluginManifestResponse])
-async def list_plugins():
-    return plugin_registry.list_manifests()
+async def list_plugins(
+    studio: DecisionStudio = Depends(get_decision_studio),
+):
+    return studio.list_simulation_plugins()
 
 
 @router.get("/audits", response_model=SimERPAuditListResponse)
@@ -214,13 +214,16 @@ async def list_audits(
 
 
 @router.get("/audits/latest", response_model=SimERPAuditSummaryResponse)
-async def latest_audit(db: AsyncSession = Depends(get_db)):
+async def latest_audit(
+    db: AsyncSession = Depends(get_db),
+    hub: ManufacturingIntelligenceHub = Depends(get_intelligence_hub),
+):
     service = SimERPAuditService(db)
     entity = await service.get_latest_audit_log()
     if entity is not None:
         return _entity_to_summary(entity)
 
-    record = engine.audit_trail.latest()
+    record = hub.get_sim_erp_engine().audit_trail.latest()
     if record is None:
         raise HTTPException(status_code=404, detail="No audit records found.")
     return _record_to_summary(record)
@@ -235,12 +238,11 @@ async def get_audit(simulation_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/simulate", response_model=SimERPScenarioResponse)
-async def simulate(request: SimERPSimulationRequest, db: AsyncSession = Depends(get_db)):
-    try:
-        plugins = plugin_registry.create_many(request.plugin_names)
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=f"Unknown plugin: {exc.args[0]}") from exc
-
+async def simulate(
+    request: SimERPSimulationRequest,
+    db: AsyncSession = Depends(get_db),
+    studio: DecisionStudio = Depends(get_decision_studio),
+):
     physical_input = PhysicalInput(
         time_step_minutes=request.time_step_minutes,
         step_count=request.step_count,
@@ -254,7 +256,13 @@ async def simulate(request: SimERPSimulationRequest, db: AsyncSession = Depends(
         environment=EnvironmentSnapshot(**request.environment.model_dump()),
         work_context=WorkContext(**request.work_context.model_dump()),
     )
-    record = engine.evaluate(physical_input, plugins)
+    try:
+        record = studio.simulate_compliance(
+            physical_input=physical_input,
+            plugin_names=request.plugin_names,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f"Unknown plugin: {exc.args[0]}") from exc
     await _persist_audit_record(db, record)
     return _build_response(record)
 
@@ -263,6 +271,7 @@ async def simulate(request: SimERPSimulationRequest, db: AsyncSession = Depends(
 async def simulate_high_heat_overtime(
     request: SimERPScenarioRequest,
     db: AsyncSession = Depends(get_db),
+    studio: DecisionStudio = Depends(get_decision_studio),
 ):
     physical_input = PhysicalInput(
         time_step_minutes=30,
@@ -286,11 +295,9 @@ async def simulate_high_heat_overtime(
             action_type=ActionType.WALK,
         ),
     )
-    record = engine.evaluate(
-        physical_input,
-        plugin_registry.create_many(
-            ["VN_Legal_2024", "Johnson_Global_Standard", "Factory_Policy_Default"]
-        ),
+    record = studio.simulate_compliance(
+        physical_input=physical_input,
+        plugin_names=["VN_Legal_2024", "Johnson_Global_Standard", "Factory_Policy_Default"],
     )
     await _persist_audit_record(db, record)
     return _build_response(record)
