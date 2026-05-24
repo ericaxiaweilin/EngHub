@@ -1,5 +1,5 @@
 {
-  "name": "enghub-frontend",
+  "name": "enghub-mes-frontend",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -7,25 +7,31 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "lint": "eslint . --ext ts,tsx"
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
   },
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
     "axios": "^1.6.2",
-    "antd": "^5.12.0",
-    "dayjs": "^1.11.10",
-    "zustand": "^4.4.7"
+    "@tanstack/react-query": "^5.12.2",
+    "zustand": "^4.4.7",
+    "antd": "^5.12.2",
+    "@ant-design/icons": "^5.2.6",
+    "echarts": "^5.4.3",
+    "echarts-for-react": "^3.0.2"
   },
   "devDependencies": {
     "@types/react": "^18.2.43",
     "@types/react-dom": "^18.2.17",
-    "@vitejs/plugin-react": "^4.2.1",
-    "typescript": "^5.2.2",
-    "vite": "^5.0.8",
-    "eslint": "^8.55.0",
+    "@types/node": "^20.10.4",
     "@typescript-eslint/eslint-plugin": "^6.14.0",
-    "@typescript-eslint/parser": "^6.14.0"
+    "@typescript-eslint/parser": "^6.14.0",
+    "@vitejs/plugin-react": "^4.2.1",
+    "eslint": "^8.55.0",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.8"
   }
 }

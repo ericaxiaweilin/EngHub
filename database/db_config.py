@@ -13,7 +13,12 @@ from sqlalchemy.ext.asyncio import (
     AsyncEngine,
 )
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+# Load environment variables from .env and .env.production
+env_path = Path(__file__).resolve().parents[1] / ".env"
+env_prod_path = Path(__file__).resolve().parents[1] / ".env.production"
+if env_prod_path.exists():
+    load_dotenv(env_prod_path)
+load_dotenv(env_path)
 
 
 def _normalize_database_url(raw_url: str) -> str:

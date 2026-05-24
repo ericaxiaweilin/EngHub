@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: enghub-db
+    environment:
+      POSTGRES_USER: mesuser
+      POSTGRES_PASSWORD: mespassword
+      POSTGRES_DB: mesdb
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mesuser -d mesdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - enghub-net
+
+  # FastAPI 后端服务
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: enghub-api
+    environment:
+      DATABASE_URL: postgresql://mesuser:mespassword@postgres:5432/mesdb
+      JWT_SECRET_KEY: your-secret-key-change-in-production
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+      # AI 服务配置 - 使用 host.docker.internal 访问宿主机网络
+      MODEL_GATEWAY_URL: http://host.docker.internal:14041
+      CHATBOT_URL: http://host.docker.internal:3000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - enghub-net
+
+  # React 前端服务 (生产环境使用 Nginx)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: enghub-web
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - enghub-net
+
+volumes:
+  pg_data:
+    driver: local
+
+networks:
+  enghub-net:
+    driver: bridge

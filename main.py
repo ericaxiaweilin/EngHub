@@ -10,11 +10,12 @@ from api.routes import (
     qms_router,
     sim_erp_router,
     wms_router,
+    ai_router,
 )
 
 app = FastAPI(
     title="EngHub MES",
-    description="Manufacturing Execution System API",
+    description="Manufacturing Execution System API with AI Integration",
     version="1.0.0"
 )
 
@@ -27,11 +28,16 @@ app.include_router(wms_router)
 if employee_skill_router is not None:
     app.include_router(employee_skill_router)
 app.include_router(sim_erp_router)
+app.include_router(ai_router)  # AI Services
 
 
 @app.get("/")
 def root():
-    return {"message": "EngHub MES API", "status": "running"}
+    return {
+        "message": "EngHub MES API",
+        "status": "running",
+        "ai_enabled": True
+    }
 
 
 @app.get("/health")
