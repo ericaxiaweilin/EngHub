@@ -11,6 +11,7 @@ import InspectionList from './pages/qms/InspectionList'
 import DefectList from './pages/qms/DefectList'
 import InventoryList from './pages/wms/InventoryList'
 import AuditCenter from './pages/sim-erp/AuditCenter'
+import ExpertChat from './pages/expert/ExpertChat'
 
 // 纯色主题配置
 const theme = {
@@ -42,6 +43,7 @@ const App: React.FC = () => {
             <Route path="defects" element={<DefectList />} />
             <Route path="inventory" element={<InventoryList />} />
             <Route path="sim-erp/audits" element={<AuditCenter />} />
+            <Route path="expert" element={<ExpertChat />} />
           </Route>
         </Routes>
       </BrowserRouter>
