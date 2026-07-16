@@ -22,6 +22,20 @@ The Sim-ERP compliance engine lives under:
 
 This is the active path for simulation, arbitration, plugin execution, and audit logging.
 
+## AI Agent + MCP layout
+
+The manufacturing AI agent and MCP server live under:
+
+- `core/agent/` — tool registry, LLM client, agent loop
+- `core/mcp/` — MCP JSON-RPC server + stdio/HTTP transports
+- `api/routes/agent_routes.py` — `/api/v1/agent/*`
+- `api/routes/mcp_routes.py` — `/mcp` Streamable HTTP
+- `scripts/enghub_mcp.py` — Codex-compatible stdio entrypoint
+- `docs/AI_AGENT_MCP.md` — setup guide
+- `tests/unit/test_agent_mcp.py`
+
+New agent tools should be registered in `core/agent/tools.py` so both the HTTP agent and MCP clients share them.
+
 ## Legacy layout
 
 The `app/` directory is legacy code and is not part of the active backend boot path.
