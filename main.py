@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 from api.routes import (
     agent_router,
+    ai_router,
     auth_router,
     employee_skill_router,
     mcp_router,
@@ -51,6 +52,7 @@ if employee_skill_router is not None:
     app.include_router(employee_skill_router)
 app.include_router(sim_erp_router)
 app.include_router(agent_router)
+app.include_router(ai_router)
 app.include_router(mcp_router)
 
 

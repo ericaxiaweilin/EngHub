@@ -28,10 +28,12 @@ def get_agent() -> ManufacturingAgent:
 @router.get("/health")
 async def agent_health(agent: ManufacturingAgent = Depends(get_agent)) -> Dict[str, Any]:
     llm_ok = await agent.llm.health_check()
+    backend = await agent.llm.backend_status()
     tools = get_tool_registry()
     return {
         "status": "healthy",
         "llm_reachable": llm_ok,
+        "model_base": backend,
         "llm_gateway": settings.LLM_GATEWAY_URL,
         "llm_model": settings.LLM_MODEL_NAME,
         "tool_count": len(tools.list_definitions()),

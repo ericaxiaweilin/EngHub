@@ -274,6 +274,56 @@ class ToolRegistry:
             "Return EngHub agent/MCP capability status and configured defaults.",
             {"type": "object", "properties": {}},
         )
+        # Luaguage ERP master-data tools (context for agent reasoning, not LLM)
+        self.register(
+            "get_luaguage_bom",
+            self.get_luaguage_bom,
+            "Fetch product BOM from luaguage ERP (falls back to demo when offline).",
+            {
+                "type": "object",
+                "properties": {
+                    "product_id": {
+                        "type": "string",
+                        "description": "Product id in luaguage / EngHub.",
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": "Optional BOM version.",
+                    },
+                },
+                "required": ["product_id"],
+            },
+        )
+        self.register(
+            "get_luaguage_ppap",
+            self.get_luaguage_ppap,
+            "Fetch material PPAP approval status from luaguage ERP.",
+            {
+                "type": "object",
+                "properties": {
+                    "material_id": {"type": "string"},
+                },
+                "required": ["material_id"],
+            },
+        )
+        self.register(
+            "get_luaguage_material",
+            self.get_luaguage_material,
+            "Fetch material master data from luaguage ERP.",
+            {
+                "type": "object",
+                "properties": {
+                    "material_id": {"type": "string"},
+                },
+                "required": ["material_id"],
+            },
+        )
+        self.register(
+            "get_model_base_status",
+            self.get_model_base_status,
+            "Check connectivity of model-engineering-base and model-stack backends.",
+            {"type": "object", "properties": {}},
+        )
 
     # ---- tool implementations -------------------------------------------------
 
@@ -688,11 +738,40 @@ class ToolRegistry:
             "default_factory_id": self.factory_id,
             "tool_count": len(self._definitions),
             "tools": [name for name in self._definitions],
+            "model_base_provider": settings.MODEL_BASE_PROVIDER,
+            "model_engineering_base_url": settings.MODEL_ENGINEERING_BASE_URL,
+            "model_stack_url": settings.MODEL_STACK_URL,
             "llm_gateway": settings.LLM_GATEWAY_URL,
             "llm_model": settings.LLM_MODEL_NAME,
+            "luaguage_base_url": settings.LUAGUAGE_BASE_URL,
+            "luaguage_enabled": settings.LUAGUAGE_ENABLED,
             "live_db_enabled": self._session_factory is not None,
             "queried_at": _iso_now(),
         }
+
+    async def get_luaguage_bom(
+        self,
+        product_id: str,
+        version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from integrations.luaguage import get_luaguage
+
+        return await get_luaguage().get_bom(product_id=product_id, version=version)
+
+    async def get_luaguage_ppap(self, material_id: str) -> Dict[str, Any]:
+        from integrations.luaguage import get_luaguage
+
+        return await get_luaguage().get_ppap_status(material_id)
+
+    async def get_luaguage_material(self, material_id: str) -> Dict[str, Any]:
+        from integrations.luaguage import get_luaguage
+
+        return await get_luaguage().get_material_master(material_id)
+
+    async def get_model_base_status(self) -> Dict[str, Any]:
+        from core.model_base import get_model_base_client
+
+        return await get_model_base_client().health()
 
 
 _REGISTRY: Optional[ToolRegistry] = None

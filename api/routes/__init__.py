@@ -10,6 +10,7 @@ from .auth_routes import router as auth_router
 from .sim_erp_routes import router as sim_erp_router
 from .agent_routes import router as agent_router
 from .mcp_routes import router as mcp_router
+from .ai_routes import router as ai_router
 
 try:
     from .employee_skill_router import router as employee_skill_router
@@ -26,4 +27,5 @@ __all__ = [
     "sim_erp_router",
     "agent_router",
     "mcp_router",
+    "ai_router",
 ]

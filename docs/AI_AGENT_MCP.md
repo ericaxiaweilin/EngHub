@@ -109,12 +109,18 @@ url = "http://127.0.0.1:8000/mcp"
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `LLM_GATEWAY_URL` / `MODEL_GATEWAY_URL` | `http://100.96.188.77:14041` | OpenAI-compatible chat gateway |
+| `MODEL_BASE_PROVIDER` | `auto` | `auto` / `model-engineering-base` / `model-stack` |
+| `MODEL_ENGINEERING_BASE_URL` | `http://100.96.188.77:14041` | OpenAI-compatible LLM base |
+| `MODEL_STACK_URL` | `http://100.96.188.77:14041` | MES domain model gateway |
+| `LLM_GATEWAY_URL` / `MODEL_GATEWAY_URL` | same host | Backward-compatible aliases |
 | `LLM_API_KEY` | empty | Optional bearer token |
 | `LLM_MODEL_NAME` | `qwen-max` | Model id |
+| `LUAGUAGE_BASE_URL` | `http://localhost:8080` | ERP master data (not LLM) |
 | `DEFAULT_FACTORY_ID` | `factory-001` | Default factory scope for tools |
 | `MCP_SERVER_NAME` | `enghub-mes` | MCP serverInfo.name |
 | `DATABASE_URL` | local postgres URL | Enables live MES reads |
+
+See also `docs/MODEL_BASES.md` for model-stack / model-engineering-base / luaguage wiring.
 
 ## Architecture
 
