@@ -1,61 +1,7 @@
-```python
-# Compiled and build artifacts
-*.pyc
-__pycache__/
-*.o
-*.obj
-*.class
-*.so
-*.dll
-*.exe
-*.out
-*.a
+Nothing should be ignored in this case, as the added files (`test_andon_system.py` and `test_data_driven_scheduling.py`) are both Python source code files and do not fall under any of the categories that should be ignored according to the specified rules. 
 
-# Dependencies
-.venv/
-venv/
-node_modules/
-pip-wheel-metadata/
-*.egg-info/
-.installed.cfg
-*.egg
+Therefore, the output is:
 
-# Build directories
-build/
-dist/
-*.egg-info/
-.coverage
-coverage/
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.tox/
-.hypothesis/
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
-
-# Environment files
-.env
-.env.local
-.env.*
-!.env.example
-
-# Editors
-.vscode/
-.idea/
-*.sublime-project
-*.sublime-workspace
-```
-
-Wait, let me reconsider. The added files are only Python source files (.py), which are source code and should not trigger adding general ignore patterns. Since there are no build artifacts, dependency directories, or other ignorable files in the change list, the output should be empty.
-
-```python
+```text
 
 ```
