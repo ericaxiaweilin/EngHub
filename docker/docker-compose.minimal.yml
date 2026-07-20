@@ -38,11 +38,19 @@ services:
       - DATABASE_URL=postgresql://enghub:enghub123@postgres:5432/enghub
       - REDIS_URL=redis://redis:6379
       - SECRET_KEY=your-secret-key-here
+      # AI 助手 -> litellm 网关 (通过 model-stack 内网直连)
+      # 密钥通过 docker/.env 提供 (见 .env.example)，不提交到仓库
+      - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-gateway:4000}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-openai/qwen-plus}
     ports:
-      - "8000:8000"
+      - "18000:8000"
     depends_on:
       - postgres
       - redis
+    networks:
+      - default
+      - model-stack
     restart: unless-stopped
     # 内存限制 2GB (Python应用需要更多内存)
     deploy:
@@ -57,10 +65,16 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.frontend
     ports:
-      - "80:80"
+      - "18888:80"
     depends_on:
       - backend
     restart: unless-stopped
+
+networks:
+  default:
+  model-stack:
+    external: true
+    name: model-stack_default
 
 volumes:
   postgres_data:

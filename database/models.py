@@ -409,6 +409,154 @@ class SimERPAuditLog(Base):
     )
 
 
+# ============== TMS (Task Management System) Models ==============
+
+class TMSTask(Base):
+    """TMS 任务表 - 任务分发核心"""
+
+    __tablename__ = "tms_tasks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    task_code = Column(String(50), unique=True, nullable=False, index=True)  # TASK-2026-00001
+    title = Column(String(200), nullable=False)
+    description = Column(Text)
+    task_type = Column(String(50), nullable=False, index=True)  # ecn_release, ecr_approval, inspection, custom
+    source = Column(String(50), default="manual")  # manual, system, agent, api
+    priority = Column(String(20), default="medium", index=True)  # low, medium, high, urgent
+    points = Column(Integer, default=0)  # 积分激励
+
+    # 分发相关（核心字段）
+    status = Column(String(30), default="pending_distribution", index=True)
+    # pending_distribution -> distributed -> claimed -> in_progress -> pending_approval -> completed / rejected
+    distribution_strategy = Column(String(50))  # skill_match, load_balance, round_robin, manual, agent_decide
+    assigned_to = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    assigned_by = Column(String(100))  # user_id 或 "agent:xxx"
+    candidate_pool = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 候选人列表
+    required_skills = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 所需技能标签
+    required_roles = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 所需角色
+    deadline = Column(DateTime)
+
+    # 审批关联
+    approval_flow_id = Column(UUID(as_uuid=True), nullable=True)
+
+    # Agent 元数据
+    agent_context = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # Agent 可读写上下文
+    metadata_ = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)  # 扩展字段
+
+    # 关联
+    related_work_order_id = Column(UUID(as_uuid=True), ForeignKey("work_orders.id"), nullable=True)
+
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # 关系
+    distribution_logs = relationship("TMSDistributionLog", back_populates="task")
+    approval_flow = relationship("TMSApprovalFlow", back_populates="task", uselist=False)
+
+    __table_args__ = (
+        Index("idx_tms_task_status_priority", "status", "priority"),
+        Index("idx_tms_task_type_status", "task_type", "status"),
+        Index("idx_tms_task_assigned", "assigned_to", "status"),
+    )
+
+
+class TMSApprovalFlow(Base):
+    """TMS 审批流表"""
+
+    __tablename__ = "tms_approval_flows"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    flow_code = Column(String(50), unique=True, nullable=False, index=True)
+    task_id = Column(UUID(as_uuid=True), ForeignKey("tms_tasks.id"), nullable=False, index=True)
+    flow_type = Column(String(50), nullable=False, default="sequential")  # sequential, parallel, conditional
+    steps = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)  # 审批步骤定义
+    current_step = Column(Integer, default=0)
+    status = Column(String(30), default="active", index=True)  # active, approved, rejected, cancelled
+    initiated_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # 关系
+    task = relationship("TMSTask", back_populates="approval_flow")
+    records = relationship("TMSApprovalRecord", back_populates="flow", order_by="TMSApprovalRecord.created_at")
+
+
+class TMSApprovalRecord(Base):
+    """TMS 审批记录表"""
+
+    __tablename__ = "tms_approval_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    flow_id = Column(UUID(as_uuid=True), ForeignKey("tms_approval_flows.id"), nullable=False, index=True)
+    step_index = Column(Integer, nullable=False)
+    approver_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    action = Column(String(20), nullable=False)  # approve, reject, delegate, escalate
+    comment = Column(Text)
+    acted_by = Column(String(100), nullable=False)  # "user:xxx" 或 "agent:chatbot-01"
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # 关系
+    flow = relationship("TMSApprovalFlow", back_populates="records")
+
+    __table_args__ = (
+        Index("idx_tms_approval_flow_step", "flow_id", "step_index"),
+    )
+
+
+class TMSDistributionLog(Base):
+    """TMS 分发日志表 - 可审计"""
+
+    __tablename__ = "tms_distribution_logs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    task_id = Column(UUID(as_uuid=True), ForeignKey("tms_tasks.id"), nullable=False, index=True)
+    strategy = Column(String(50), nullable=False)
+    candidate_scores = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 各候选人评分
+    selected_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    reason = Column(Text)  # 分发决策理由
+    triggered_by = Column(String(100), nullable=False)  # "system" / "agent:xxx" / "user:xxx"
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # 关系
+    task = relationship("TMSTask", back_populates="distribution_logs")
+
+
+class TMSAgentAction(Base):
+    """TMS Agent 操作日志 - 全量审计"""
+
+    __tablename__ = "tms_agent_actions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    agent_id = Column(String(100), nullable=False, index=True)  # chatbot/agent 标识
+    action_type = Column(String(50), nullable=False, index=True)  # assign, approve, escalate, reassign, query, create_task
+    target_task_id = Column(UUID(as_uuid=True), ForeignKey("tms_tasks.id"), nullable=True)
+    payload = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 命令参数
+    result = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 执行结果
+    status = Column(String(20), default="success", index=True)  # success, failed, pending_confirmation
+    requires_confirmation = Column(Boolean, default=False)  # 高危操作需人工确认
+    idempotency_key = Column(String(100), unique=True, nullable=True, index=True)  # 幂等键
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_tms_agent_action_type", "agent_id", "action_type"),
+    )
+
+
+class TMSWebhookSubscription(Base):
+    """TMS Webhook 订阅表 - Agent 事件推送"""
+
+    __tablename__ = "tms_webhook_subscriptions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    agent_id = Column(String(100), nullable=False, index=True)
+    event_types = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)  # 订阅事件类型
+    webhook_url = Column(String(500), nullable=False)
+    secret = Column(String(100))  # 签名密钥
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 # 导出所有模型
 __all__ = [
     "Base",
@@ -428,4 +576,11 @@ __all__ = [
     "EmployeeSkill",
     "TrainingRecord",
     "SimERPAuditLog",
+    # TMS Models
+    "TMSTask",
+    "TMSApprovalFlow",
+    "TMSApprovalRecord",
+    "TMSDistributionLog",
+    "TMSAgentAction",
+    "TMSWebhookSubscription",
 ]

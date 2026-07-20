@@ -19,6 +19,8 @@ logs/*.jsonl
 .env.local
 *.env.*
 test.db
+# keep example templates tracked
+!*.env.example
 
 # Editors
 .vscode/

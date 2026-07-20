@@ -11,6 +11,16 @@ import InspectionList from './pages/qms/InspectionList'
 import DefectList from './pages/qms/DefectList'
 import InventoryList from './pages/wms/InventoryList'
 import AuditCenter from './pages/sim-erp/AuditCenter'
+import SimulationRunner from './pages/sim-erp/SimulationRunner'
+import PlanList from './pages/pp/PlanList'
+import BaseData from './pages/basedata/BaseData'
+import SkillMatrix from './pages/hr/SkillMatrix'
+import WarehouseList from './pages/wms/WarehouseList'
+import Assistant from './pages/ai/Assistant'
+// TMS 模块
+import ApprovalCenter from './pages/tms/ApprovalCenter'
+import TaskDistribution from './pages/tms/TaskDistribution'
+import AgentConsole from './pages/tms/AgentConsole'
 
 // 纯色主题配置
 const theme = {
@@ -41,7 +51,17 @@ const App: React.FC = () => {
             <Route path="inspections" element={<InspectionList />} />
             <Route path="defects" element={<DefectList />} />
             <Route path="inventory" element={<InventoryList />} />
+            <Route path="warehouses" element={<WarehouseList />} />
+            <Route path="plans" element={<PlanList />} />
+            <Route path="base-data" element={<BaseData />} />
+            <Route path="skill-matrix" element={<SkillMatrix />} />
+            <Route path="sim-erp/run" element={<SimulationRunner />} />
             <Route path="sim-erp/audits" element={<AuditCenter />} />
+            <Route path="ai" element={<Assistant />} />
+            {/* TMS 任务管理系统 */}
+            <Route path="tms/approval" element={<ApprovalCenter />} />
+            <Route path="tms/distribution" element={<TaskDistribution />} />
+            <Route path="tms/agent" element={<AgentConsole />} />
           </Route>
         </Routes>
       </BrowserRouter>

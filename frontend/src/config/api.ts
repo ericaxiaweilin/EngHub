@@ -13,7 +13,14 @@ export const API_ENDPOINTS = {
   
   // PP
   PLANS: `${API_BASE_URL}/api/v1/plans`,
+  PLAN: (id: string) => `${API_BASE_URL}/api/v1/plans/${id}`,
+  PLAN_CONFIRM: (id: string) => `${API_BASE_URL}/api/v1/plans/${id}/confirm`,
+  PLAN_RELEASE: (id: string) => `${API_BASE_URL}/api/v1/plans/${id}/release`,
+  PLAN_CAPACITY_CONFLICT: (id: string) => `${API_BASE_URL}/api/v1/plans/${id}/capacity-conflict`,
   MRP: `${API_BASE_URL}/api/v1/mrp`,
+  MRP_CALCULATE: `${API_BASE_URL}/api/v1/mrp/calculate`,
+  CAPACITY_ANALYSIS: `${API_BASE_URL}/api/v1/capacity/analysis`,
+  INVENTORY_ALERTS: `${API_BASE_URL}/api/v1/inventory/alerts`,
   
   // QMS
   INSPECTIONS: `${API_BASE_URL}/api/v1/inspections`,
@@ -25,10 +32,25 @@ export const API_ENDPOINTS = {
   INVENTORY_TRANSACTIONS: `${API_BASE_URL}/api/v1/inventory/transactions`,
 
   // Sim-ERP
+  SIM_ERP_STATUS: `${API_BASE_URL}/api/v1/sim-erp/status`,
   SIM_ERP_PLUGINS: `${API_BASE_URL}/api/v1/sim-erp/plugins`,
+  SIM_ERP_SIMULATE: `${API_BASE_URL}/api/v1/sim-erp/simulate`,
+  SIM_ERP_SCENARIO_HHO: `${API_BASE_URL}/api/v1/sim-erp/scenarios/high-heat-overtime`,
   SIM_ERP_AUDITS: `${API_BASE_URL}/api/v1/sim-erp/audits`,
   SIM_ERP_AUDIT_LATEST: `${API_BASE_URL}/api/v1/sim-erp/audits/latest`,
   SIM_ERP_AUDIT: (simulationId: string) => `${API_BASE_URL}/api/v1/sim-erp/audits/${simulationId}`,
+
+  // Employee Skills (HR)
+  SKILLS: `${API_BASE_URL}/api/v1/skills`,
+  SKILL_MATRIX: `${API_BASE_URL}/api/v1/skill-matrix`,
+  QUALIFIED_EMPLOYEES: `${API_BASE_URL}/api/v1/qualified-employees`,
+  EXPIRING_CERTS: `${API_BASE_URL}/api/v1/expiring-certifications`,
+  TRAINING_RECORDS: `${API_BASE_URL}/api/v1/training-records`,
+  EMPLOYEE_SKILLS: (userId: string) => `${API_BASE_URL}/api/v1/employees/${userId}/skills`,
+
+  // AI Assistant
+  CHAT: `${API_BASE_URL}/api/v1/chat`,
+  CHAT_HEALTH: `${API_BASE_URL}/api/v1/chat/health`,
 };
 
 export default API_BASE_URL;

@@ -18,7 +18,7 @@ from api.schemas.employee_skill import (
     SkillMatrixResponse
 )
 from database.models import User
-from api.services.auth_service import get_current_user
+from core.auth.security import get_current_user
 
 
 router = APIRouter(prefix="/employee-skills", tags=["员工能力标签"])
@@ -131,23 +131,14 @@ async def find_qualified_employees(
     current_user: User = Depends(get_current_user)
 ):
     """查找具备特定技能等级的员工"""
-    from models.employee_skill import SkillLevel
-    
-    level_map = {
-        "L1": SkillLevel.L1_TRAINEE,
-        "L2": SkillLevel.L2_BASIC,
-        "L3": SkillLevel.L3_INDEPENDENT,
-        "L4": SkillLevel.L4_ADVANCED,
-        "L5": SkillLevel.L5_EXPERT
-    }
-    
-    if min_level not in level_map:
+    valid_levels = {"L1", "L2", "L3", "L4", "L5"}
+    if min_level not in valid_levels:
         raise HTTPException(status_code=400, detail="Invalid level. Use L1-L5")
     
     service = EmployeeSkillService(db)
     employees = await service.find_qualified_employees(
         skill_id=skill_id,
-        min_level=level_map[min_level]
+        min_level=min_level
     )
     
     return [
