@@ -20,6 +20,7 @@ httpx==0.28.1
 # Authentication
 python-jose[cryptography]==3.4.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1  # 锁定：passlib 1.7.4 与 bcrypt>=4.1/5.x 不兼容，否则报 72 bytes 错误
 itsdangerous==2.2.0
 python-multipart==0.0.12
 

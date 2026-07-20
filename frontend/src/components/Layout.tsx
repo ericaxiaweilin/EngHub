@@ -1,6 +1,6 @@
 import React from 'react'
-import { Outlet, Link, useLocation } from 'react-router-dom'
-import { Layout as AntLayout, Menu, Badge, Avatar, Space, Tag } from 'antd'
+import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
+import { Layout as AntLayout, Menu, Badge, Avatar, Space, Tag, Dropdown } from 'antd'
 import {
   AuditOutlined,
   DashboardOutlined,
@@ -17,7 +17,10 @@ import {
   HddOutlined,
   ClusterOutlined,
   CheckSquareOutlined,
+  LogoutOutlined,
+  UserOutlined,
 } from '@ant-design/icons'
+import { getStoredUser, logout } from '../services/auth'
 
 const { Header, Sider, Content } = AntLayout
 
@@ -72,6 +75,32 @@ const menuItems = [
 
 const Layout: React.FC = () => {
   const location = useLocation()
+  const navigate = useNavigate()
+  const user = getStoredUser()
+  const displayName = user?.full_name || user?.username || '用户'
+  const avatarChar = displayName.charAt(0).toUpperCase()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login', { replace: true })
+  }
+
+  const userMenu = {
+    items: [
+      {
+        key: 'info',
+        label: (
+          <div style={{ padding: '4px 0' }}>
+            <div style={{ fontWeight: 600 }}>{displayName}</div>
+            <div style={{ fontSize: 12, color: '#999' }}>{user?.role || '-'}</div>
+          </div>
+        ),
+        disabled: true,
+      },
+      { type: 'divider' as const },
+      { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
+    ],
+  }
 
   return (
     <AntLayout style={{ minHeight: '100vh' }}>
@@ -81,9 +110,15 @@ const Layout: React.FC = () => {
           <span style={{ fontSize: 18, fontWeight: 700, color: '#fff', letterSpacing: 1 }}>EngHub MES</span>
           <Tag color="blue" style={{ marginLeft: 4 }}>v1.1</Tag>
         </Space>
-        <Space>
+        <Space size={16}>
+          {user?.factory_id && <Tag color="geekblue">厂区 {user.factory_id}</Tag>}
           <Link to="/ai" style={{ color: 'rgba(255,255,255,0.85)' }}><RobotOutlined /> AI 助手</Link>
-          <Avatar style={{ background: '#52c41a' }}>管</Avatar>
+          <Dropdown menu={userMenu} placement="bottomRight">
+            <Space style={{ cursor: 'pointer', color: 'rgba(255,255,255,0.9)' }}>
+              <Avatar style={{ background: '#52c41a' }} icon={!avatarChar ? <UserOutlined /> : undefined}>{avatarChar}</Avatar>
+              <span>{displayName}</span>
+            </Space>
+          </Dropdown>
         </Space>
       </Header>
       <AntLayout>

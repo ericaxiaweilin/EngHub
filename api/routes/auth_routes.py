@@ -6,7 +6,7 @@ from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional
 
 from database.db_config import get_db
@@ -60,6 +60,12 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id(cls, v):
+        # user.id 为 UUID 类型，pydantic v2 不会自动转 str
+        return str(v)
+
 
 # --- Helper Functions ---
 
@@ -103,10 +109,10 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     
     # 生成 Token
     access_token = create_access_token(
-        data={"sub": user.username, "user_id": user.id, "role": user.role}
+        data={"sub": user.username, "user_id": str(user.id), "role": user.role}
     )
     refresh_token = create_refresh_token(
-        data={"sub": user.username, "user_id": user.id}
+        data={"sub": user.username, "user_id": str(user.id)}
     )
     
     return TokenResponse(
@@ -149,10 +155,10 @@ async def refresh_token(request: RefreshTokenRequest, db: AsyncSession = Depends
     
     # 生成新的 Token
     access_token = create_access_token(
-        data={"sub": user.username, "user_id": user.id, "role": user.role}
+        data={"sub": user.username, "user_id": str(user.id), "role": user.role}
     )
     new_refresh_token = create_refresh_token(
-        data={"sub": user.username, "user_id": user.id}
+        data={"sub": user.username, "user_id": str(user.id)}
     )
     
     return TokenResponse(

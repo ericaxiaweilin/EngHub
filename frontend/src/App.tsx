@@ -17,6 +17,8 @@ import BaseData from './pages/basedata/BaseData'
 import SkillMatrix from './pages/hr/SkillMatrix'
 import WarehouseList from './pages/wms/WarehouseList'
 import Assistant from './pages/ai/Assistant'
+import Login from './pages/auth/Login'
+import { isAuthenticated } from './services/auth'
 // TMS 模块
 import ApprovalCenter from './pages/tms/ApprovalCenter'
 import TaskDistribution from './pages/tms/TaskDistribution'
@@ -37,12 +39,28 @@ const theme = {
   },
 }
 
+// 路由守卫：未登录跳转登录页
+const RequireAuth: React.FC<{ children: React.ReactElement }> = ({ children }) => {
+  if (!isAuthenticated()) {
+    return <Navigate to="/login" replace state={{ from: window.location.pathname }} />
+  }
+  return children
+}
+
 const App: React.FC = () => {
   return (
     <ConfigProvider locale={zhCN} theme={theme}>
       <BrowserRouter>
         <Routes>
-          <Route path="/" element={<Layout />}>
+          <Route path="/login" element={<Login />} />
+          <Route
+            path="/"
+            element={
+              <RequireAuth>
+                <Layout />
+              </RequireAuth>
+            }
+          >
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="work-orders" element={<WorkOrderList />} />

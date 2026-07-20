@@ -27,6 +27,17 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
+    const status = error.response?.status;
+    // 未认证/登录过期：清除 token 并跳转登录页
+    if (status === 401) {
+      localStorage.removeItem('token');
+      localStorage.removeItem('refresh_token');
+      localStorage.removeItem('user');
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
+      return Promise.reject(error);
+    }
     const msg = error.response?.data?.detail || error.message || 'Request failed';
     message.error(msg);
     return Promise.reject(error);

@@ -3,6 +3,11 @@
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 export const API_ENDPOINTS = {
+  // Auth
+  AUTH_LOGIN: `${API_BASE_URL}/api/v1/auth/login`,
+  AUTH_ME: `${API_BASE_URL}/api/v1/auth/me`,
+  AUTH_REFRESH: `${API_BASE_URL}/api/v1/auth/refresh`,
+
   // MES
   WORK_ORDERS: `${API_BASE_URL}/api/v1/work-orders`,
   WORK_ORDER: (id: string) => `${API_BASE_URL}/api/v1/work-orders/${id}`,
