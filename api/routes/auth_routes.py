@@ -67,6 +67,44 @@ class UserResponse(BaseModel):
         return str(v)
 
 
+class RegisterRequest(BaseModel):
+    """自助注册请求 (邀请制多租户)"""
+    username: str
+    email: EmailStr
+    password: str
+    full_name: Optional[str] = None
+    factory_id: Optional[str] = None
+    invitation_token: Optional[str] = None
+
+
+class InvitationCreate(BaseModel):
+    """创建邀请请求"""
+    email: EmailStr
+    role: str = "operator"
+    factory_id: Optional[str] = None  # 默认当前管理员自身厂区；仅超管可指定其他
+
+
+class InvitationResponse(BaseModel):
+    """邀请响应"""
+    id: str
+    email: str
+    factory_id: str
+    role: str
+    token: str
+    accepted: bool
+    expires_at: str
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id(cls, v):
+        return str(v)
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def _coerce_dt(cls, v):
+        return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+
 # --- Helper Functions ---
 
 async def get_current_active_superuser(current_user: User = Depends(get_current_user)) -> User:
@@ -107,12 +145,12 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     # 更新最后登录时间
     await user_service.update_last_login(user.id)
     
-    # 生成 Token
+    # 生成 Token (租户 factory_id 写入 JWT，服务端从 token 取租户)
     access_token = create_access_token(
-        data={"sub": user.username, "user_id": str(user.id), "role": user.role}
+        data={"sub": user.username, "user_id": str(user.id), "role": user.role, "factory_id": user.factory_id}
     )
     refresh_token = create_refresh_token(
-        data={"sub": user.username, "user_id": str(user.id)}
+        data={"sub": user.username, "user_id": str(user.id), "factory_id": user.factory_id}
     )
     
     return TokenResponse(
@@ -155,10 +193,10 @@ async def refresh_token(request: RefreshTokenRequest, db: AsyncSession = Depends
     
     # 生成新的 Token
     access_token = create_access_token(
-        data={"sub": user.username, "user_id": str(user.id), "role": user.role}
+        data={"sub": user.username, "user_id": str(user.id), "role": user.role, "factory_id": user.factory_id}
     )
     new_refresh_token = create_refresh_token(
-        data={"sub": user.username, "user_id": str(user.id)}
+        data={"sub": user.username, "user_id": str(user.id), "factory_id": user.factory_id}
     )
     
     return TokenResponse(
@@ -170,44 +208,65 @@ async def refresh_token(request: RefreshTokenRequest, db: AsyncSession = Depends
 
 
 @router.post("/register", response_model=UserResponse)
-async def register(
-    user_data: UserCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_superuser)
-):
+async def register(user_data: RegisterRequest, db: AsyncSession = Depends(get_db)):
     """
-    注册新用户
-    需要管理员权限
+    自助注册 (邀请制多租户，公开端点)
+    - 携邀请码：加入已有厂区，角色由邀请决定
+    - 无邀请码且厂区不存在：创建新租户，首用户为该厂区 admin
+    - 无邀请码但厂区已存在：拒绝
     """
     user_service = UserService(db)
-    
-    # 检查用户名是否已存在
-    existing_user = await user_service.get_user_by_username(user_data.username)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username already registered"
+    try:
+        user = await user_service.register_user(
+            username=user_data.username,
+            email=user_data.email,
+            password=user_data.password,
+            full_name=user_data.full_name,
+            factory_id=user_data.factory_id,
+            invitation_token=user_data.invitation_token,
         )
-    
-    # 检查邮箱是否已存在
-    existing_email = await user_service.get_user_by_email(user_data.email)
-    if existing_email:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # 创建用户
-    user = await user_service.create_user(
-        username=user_data.username,
-        email=user_data.email,
-        password=user_data.password,
-        full_name=user_data.full_name,
-        factory_id=user_data.factory_id,
-        role=user_data.role,
-    )
-    
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return user
+
+
+@router.post("/invitations", response_model=InvitationResponse)
+async def create_invitation(
+    data: InvitationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建邀请 (需 admin/manager 或超管)；普通管理员仅能邀请到自身厂区"""
+    if not (current_user.is_superuser or current_user.role in ("admin", "manager")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权邀请用户")
+
+    target_factory = data.factory_id or current_user.factory_id
+    if not target_factory:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="未指定厂区(租户)")
+    # 非超管不能跨厂区邀请
+    if not current_user.is_superuser and target_factory != current_user.factory_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权邀请至其他厂区")
+
+    user_service = UserService(db)
+    invitation = await user_service.create_invitation(
+        email=data.email,
+        factory_id=target_factory,
+        role=data.role,
+        invited_by=current_user.username,
+    )
+    return invitation
+
+
+@router.get("/invitations", response_model=list[InvitationResponse])
+async def list_invitations(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出当前管理员厂区下的邀请 (超管可传 factory_id 查其他，此处默认自身)"""
+    if not (current_user.is_superuser or current_user.role in ("admin", "manager")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权查看邀请")
+    user_service = UserService(db)
+    return await user_service.list_invitations(current_user.factory_id)
 
 
 @router.get("/me", response_model=UserResponse)

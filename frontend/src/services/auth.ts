@@ -18,6 +18,25 @@ export interface LoginResult {
   expires_in: number
 }
 
+export interface RegisterPayload {
+  username: string
+  email: string
+  password: string
+  full_name?: string
+  factory_id?: string
+  invitation_token?: string
+}
+
+export interface Invitation {
+  id: string
+  email: string
+  factory_id: string
+  role: string
+  token: string
+  accepted: boolean
+  expires_at: string
+}
+
 const TOKEN_KEY = 'token'
 const REFRESH_KEY = 'refresh_token'
 const USER_KEY = 'user'
@@ -62,4 +81,31 @@ export function getStoredUser(): CurrentUser | null {
 
 export function isAuthenticated(): boolean {
   return !!localStorage.getItem(TOKEN_KEY)
+}
+
+function authHeader() {
+  const token = localStorage.getItem(TOKEN_KEY)
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+/** 自助注册 (邀请制多租户)。成功后返回创建的用户 */
+export async function register(payload: RegisterPayload): Promise<CurrentUser> {
+  const { data } = await axios.post<CurrentUser>(API_ENDPOINTS.AUTH_REGISTER, payload)
+  return data
+}
+
+/** 管理员创建邀请，返回含安全 token 的邀请 */
+export async function createInvitation(email: string, role: string, factory_id?: string): Promise<Invitation> {
+  const { data } = await axios.post<Invitation>(
+    API_ENDPOINTS.AUTH_INVITATIONS,
+    { email, role, factory_id },
+    { headers: authHeader() },
+  )
+  return data
+}
+
+/** 列出当前管理员厂区的邀请 */
+export async function listInvitations(): Promise<Invitation[]> {
+  const { data } = await axios.get<Invitation[]>(API_ENDPOINTS.AUTH_INVITATIONS, { headers: authHeader() })
+  return data
 }

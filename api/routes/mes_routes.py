@@ -18,9 +18,9 @@ from api.services.mes_services import (
     RoutingService,
     EquipmentService,
 )
-from core.auth.security import get_current_user
+from core.auth.security import get_current_user, enforce_tenant
 
-router = APIRouter(prefix="/api/v1", tags=["mes"])
+router = APIRouter(prefix="/api/v1", tags=["mes"], dependencies=[Depends(enforce_tenant)])
 
 # --- Request/Response Models ---
 

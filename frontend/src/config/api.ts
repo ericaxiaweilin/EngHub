@@ -5,8 +5,10 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 export const API_ENDPOINTS = {
   // Auth
   AUTH_LOGIN: `${API_BASE_URL}/api/v1/auth/login`,
+  AUTH_REGISTER: `${API_BASE_URL}/api/v1/auth/register`,
   AUTH_ME: `${API_BASE_URL}/api/v1/auth/me`,
   AUTH_REFRESH: `${API_BASE_URL}/api/v1/auth/refresh`,
+  AUTH_INVITATIONS: `${API_BASE_URL}/api/v1/auth/invitations`,
 
   // MES
   WORK_ORDERS: `${API_BASE_URL}/api/v1/work-orders`,

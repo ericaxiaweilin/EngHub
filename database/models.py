@@ -50,6 +50,37 @@ class User(Base):
     )
 
 
+class Factory(Base):
+    """租户注册表 (对齐 engflow companies；factory_id 即租户键)"""
+
+    __tablename__ = "factories"
+
+    id = Column(String(50), primary_key=True)  # = factory_id / 租户键
+    name = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class UserInvitation(Base):
+    """用户邀请表 (邀请制多租户；安全 token 邀请，改进自 engflow)"""
+
+    __tablename__ = "user_invitations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    email = Column(String(100), nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    role = Column(String(20), default="operator", nullable=False)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    accepted = Column(Boolean, default=False, nullable=False)
+    invited_by = Column(String(50))
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_invitation_email_factory", "email", "factory_id"),
+    )
+
+
 class WorkOrder(Base):
     """生产工单表"""
     

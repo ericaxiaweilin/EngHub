@@ -18,6 +18,7 @@ import SkillMatrix from './pages/hr/SkillMatrix'
 import WarehouseList from './pages/wms/WarehouseList'
 import Assistant from './pages/ai/Assistant'
 import Login from './pages/auth/Login'
+import Register from './pages/auth/Register'
 import { isAuthenticated } from './services/auth'
 // TMS 模块
 import ApprovalCenter from './pages/tms/ApprovalCenter'
@@ -53,6 +54,7 @@ const App: React.FC = () => {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
           <Route
             path="/"
             element={

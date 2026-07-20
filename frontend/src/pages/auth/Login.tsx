@@ -71,6 +71,9 @@ const Login: React.FC = () => {
         <Text type="secondary" style={{ fontSize: 12, display: 'block', textAlign: 'center' }}>
           默认账号 admin，如无法登录请联系管理员初始化
         </Text>
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', textAlign: 'center', marginTop: 6 }}>
+          还没有账号？<a onClick={() => navigate('/register')} style={{ cursor: 'pointer' }}>注册 / 创建厂区</a>
+        </Text>
       </Card>
     </div>
   )

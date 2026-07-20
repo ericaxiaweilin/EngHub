@@ -1,6 +1,6 @@
-import React from 'react'
+import React, { useState } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Layout as AntLayout, Menu, Badge, Avatar, Space, Tag, Dropdown } from 'antd'
+import { Layout as AntLayout, Menu, Badge, Avatar, Space, Tag, Dropdown, Modal, Form, Input, Select, Button, Typography, message } from 'antd'
 import {
   AuditOutlined,
   DashboardOutlined,
@@ -20,7 +20,7 @@ import {
   LogoutOutlined,
   UserOutlined,
 } from '@ant-design/icons'
-import { getStoredUser, logout } from '../services/auth'
+import { getStoredUser, logout, createInvitation } from '../services/auth'
 
 const { Header, Sider, Content } = AntLayout
 
@@ -79,10 +79,39 @@ const Layout: React.FC = () => {
   const user = getStoredUser()
   const displayName = user?.full_name || user?.username || '用户'
   const avatarChar = displayName.charAt(0).toUpperCase()
+  const canInvite = user?.role === 'admin' || user?.role === 'manager'
+
+  const [inviteOpen, setInviteOpen] = useState(false)
+  const [inviteLink, setInviteLink] = useState('')
+  const [inviteLoading, setInviteLoading] = useState(false)
+  const [inviteForm] = Form.useForm<{ email: string; role: string }>()
 
   const handleLogout = () => {
     logout()
     navigate('/login', { replace: true })
+  }
+
+  const openInvite = () => {
+    setInviteLink('')
+    inviteForm.resetFields()
+    setInviteOpen(true)
+  }
+
+  const submitInvite = async () => {
+    try {
+      const values = await inviteForm.validateFields()
+      setInviteLoading(true)
+      const inv = await createInvitation(values.email.trim(), values.role)
+      const link = `${window.location.origin}/register?token=${inv.token}`
+      setInviteLink(link)
+      message.success('邀请已生成')
+    } catch (err: any) {
+      if (err?.response) {
+        message.error(err.response.data?.detail || '生成邀请失败')
+      }
+    } finally {
+      setInviteLoading(false)
+    }
   }
 
   const userMenu = {
@@ -98,6 +127,9 @@ const Layout: React.FC = () => {
         disabled: true,
       },
       { type: 'divider' as const },
+      ...(canInvite
+        ? [{ key: 'invite', icon: <TeamOutlined />, label: '邀请成员', onClick: openInvite }]
+        : []),
       { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
     ],
   }
@@ -137,6 +169,39 @@ const Layout: React.FC = () => {
           </div>
         </Content>
       </AntLayout>
+
+      <Modal
+        title="邀请成员加入厂区"
+        open={inviteOpen}
+        onCancel={() => setInviteOpen(false)}
+        footer={[
+          <Button key="close" onClick={() => setInviteOpen(false)}>关闭</Button>,
+          <Button key="submit" type="primary" loading={inviteLoading} onClick={submitInvite}>生成邀请链接</Button>,
+        ]}
+        destroyOnClose
+      >
+        <Form form={inviteForm} layout="vertical" initialValues={{ role: 'operator' }}>
+          <Form.Item name="email" label="受邀人邮箱" rules={[{ required: true, type: 'email', message: '请输入有效邮箱' }]}>
+            <Input placeholder="member@example.com" allowClear />
+          </Form.Item>
+          <Form.Item name="role" label="角色" rules={[{ required: true }]}>
+            <Select
+              options={[
+                { value: 'operator', label: '操作员 operator' },
+                { value: 'manager', label: '主管 manager' },
+                { value: 'admin', label: '管理员 admin' },
+              ]}
+            />
+          </Form.Item>
+        </Form>
+        {inviteLink && (
+          <div style={{ marginTop: 8 }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>将下方链接发送给受邀人，其打开后即可完成注册并加入本厂区：</Typography.Text>
+            <Input.TextArea value={inviteLink} readOnly autoSize style={{ marginTop: 6 }} onFocus={(e) => e.target.select()} />
+            <Button size="small" style={{ marginTop: 6 }} onClick={() => { navigator.clipboard?.writeText(inviteLink); message.success('已复制') }}>复制链接</Button>
+          </div>
+        )}
+      </Modal>
     </AntLayout>
   )
 }

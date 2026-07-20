@@ -3,10 +3,10 @@ Security utilities for authentication
 密码加密和 JWT Token 工具
 """
 import os
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,21 +19,24 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 
-# 密码加密上下文
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """验证密码"""
-    return pwd_context.verify(plain_password, hashed_password)
+    """验证密码 (直连 bcrypt，避开 passlib 1.7.4 与 bcrypt>=4.1 的 72-byte 自检 bug)"""
+    if not hashed_password:
+        return False
+    try:
+        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+    except Exception:
+        return False
 
 
 def get_password_hash(password: str) -> str:
-    """生成密码哈希"""
-    return pwd_context.hash(password)
+    """生成密码哈希 (直连 bcrypt，输出标准 $2b$ 哈希，与旧 passlib 哈希兼容)"""
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    return hashed.decode("utf-8")
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -114,3 +117,29 @@ async def get_current_active_superuser(
             detail="Not enough privileges"
         )
     return current_user
+
+
+async def enforce_tenant(
+    factory_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+) -> str:
+    """多租户隔离依赖 (改进自 engflow TenantContext)。
+
+    作为路由级依赖挂到业务 router：
+    - 普通用户：强制锁定自身 factory_id，客户端传入不一致的厂区直接 403；
+    - 超管(is_superuser)：可跨厂区，传什么用什么，不传则用自身。
+    返回生效的 factory_id (供需要的端点复用)。
+    """
+    if current_user.is_superuser:
+        return factory_id or current_user.factory_id
+    if not current_user.factory_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="当前用户未分配厂区(租户)",
+        )
+    if factory_id and factory_id != current_user.factory_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无权访问其他厂区(租户)的数据",
+        )
+    return current_user.factory_id
