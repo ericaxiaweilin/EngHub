@@ -19,6 +19,7 @@ import WarehouseList from './pages/wms/WarehouseList'
 import Assistant from './pages/ai/Assistant'
 import Login from './pages/auth/Login'
 import Register from './pages/auth/Register'
+import ExpertChat from './pages/expert/ExpertChat'
 import { isAuthenticated } from './services/auth'
 // TMS 模块
 import ApprovalCenter from './pages/tms/ApprovalCenter'
@@ -78,6 +79,7 @@ const App: React.FC = () => {
             <Route path="sim-erp/run" element={<SimulationRunner />} />
             <Route path="sim-erp/audits" element={<AuditCenter />} />
             <Route path="ai" element={<Assistant />} />
+            <Route path="expert" element={<ExpertChat />} />
             {/* TMS 任务管理系统 */}
             <Route path="tms/approval" element={<ApprovalCenter />} />
             <Route path="tms/distribution" element={<TaskDistribution />} />

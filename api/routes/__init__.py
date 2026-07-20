@@ -7,6 +7,8 @@ from .pp_routes import router as pp_router
 from .qms_routes import router as qms_router
 from .wms_routes import router as wms_router
 from .auth_routes import router as auth_router
+from .ai_routes import router as ai_router
+from .intelligence_routes import router as intelligence_router
 from .sim_erp_routes import router as sim_erp_router
 from .chat_routes import router as chat_router
 from .tms_routes import router as tms_router
@@ -22,6 +24,8 @@ __all__ = [
     "qms_router",
     "wms_router",
     "auth_router",
+    "ai_router",
+    "intelligence_router",
     "employee_skill_router",
     "sim_erp_router",
     "chat_router",

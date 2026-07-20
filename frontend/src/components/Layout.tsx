@@ -71,6 +71,7 @@ const menuItems = [
     ],
   },
   { key: '/ai', icon: <RobotOutlined />, label: <Link to="/ai">AI 助手</Link> },
+  { key: '/expert', icon: <RobotOutlined />, label: <Link to="/expert">生产专家</Link> },
 ]
 
 const Layout: React.FC = () => {
