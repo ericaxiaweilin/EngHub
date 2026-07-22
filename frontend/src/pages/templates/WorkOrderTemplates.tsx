@@ -1,7 +1,7 @@
 
 
-import React, { useState, useEffect } from 'react'
-import { Card, Table, Button, Form, Input, Select, message, Tag, Descriptions, Space, Modal } from 'antd'
+import { useState, useEffect } from 'react'
+import { Card, Button, Form, Input, message, Tag, Descriptions, Space, Modal } from 'antd'
 import { PlusOutlined, FileTextOutlined } from '@ant-design/icons'
 import axios from 'axios'
 import { workOrderTemplatesApi } from '../../services/workOrderTemplates'
@@ -93,7 +93,7 @@ export default function WorkOrderTemplatesPage() {
                 <Tag color={field.required ? 'red' : 'default'}>
                   {field.type}{field.required ? ' *' : ''}
                 </Tag>
-                {field.options && field.options.map(opt => (
+                {field.options && field.options.map((opt: string) => (
                   <Tag key={opt} style={{ marginLeft: 4 }}>{opt}</Tag>
                 ))}
               </Descriptions.Item>

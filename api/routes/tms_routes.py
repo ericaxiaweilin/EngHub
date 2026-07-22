@@ -35,9 +35,9 @@ router = APIRouter(prefix="/api/v1/tms", tags=["TMS - 任务管理系统"])
 # ========== 依赖注入 ==========
 
 async def get_tms_service() -> TMSService:
-    """获取 TMS 服务（简化版，生产环境应使用真正的 DB session）"""
-    from database.db_config import get_async_session
-    async for session in get_async_session():
+    """获取 TMS 服务（使用真正的 DB session）"""
+    from database.db_config import get_db
+    async for session in get_db():
         yield TMSService(session)
 
 

@@ -530,7 +530,7 @@ class TMSTask(Base):
 
     __tablename__ = "tms_tasks"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     task_code = Column(String(50), unique=True, nullable=False, index=True)  # TASK-2026-00001
     title = Column(String(200), nullable=False)
     description = Column(Text)
@@ -543,7 +543,7 @@ class TMSTask(Base):
     status = Column(String(30), default="pending_distribution", index=True)
     # pending_distribution -> distributed -> claimed -> in_progress -> pending_approval -> completed / rejected
     distribution_strategy = Column(String(50))  # skill_match, load_balance, round_robin, manual, agent_decide
-    assigned_to = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    assigned_to = Column(String(36), ForeignKey("users.id"), nullable=True, index=True)
     assigned_by = Column(String(100))  # user_id 或 "agent:xxx"
     candidate_pool = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 候选人列表
     required_skills = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 所需技能标签
@@ -551,14 +551,14 @@ class TMSTask(Base):
     deadline = Column(DateTime)
 
     # 审批关联
-    approval_flow_id = Column(UUID(as_uuid=True), nullable=True)
+    approval_flow_id = Column(String(36), nullable=True)
 
     # Agent 元数据
     agent_context = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # Agent 可读写上下文
     metadata_ = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)  # 扩展字段
 
     # 关联
-    related_work_order_id = Column(UUID(as_uuid=True), ForeignKey("work_orders.id"), nullable=True)
+    related_work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
 
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -580,9 +580,9 @@ class TMSApprovalFlow(Base):
 
     __tablename__ = "tms_approval_flows"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     flow_code = Column(String(50), unique=True, nullable=False, index=True)
-    task_id = Column(UUID(as_uuid=True), ForeignKey("tms_tasks.id"), nullable=False, index=True)
+    task_id = Column(String(36), ForeignKey("tms_tasks.id"), nullable=False, index=True)
     flow_type = Column(String(50), nullable=False, default="sequential")  # sequential, parallel, conditional
     steps = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)  # 审批步骤定义
     current_step = Column(Integer, default=0)
@@ -601,10 +601,10 @@ class TMSApprovalRecord(Base):
 
     __tablename__ = "tms_approval_records"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
-    flow_id = Column(UUID(as_uuid=True), ForeignKey("tms_approval_flows.id"), nullable=False, index=True)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    flow_id = Column(String(36), ForeignKey("tms_approval_flows.id"), nullable=False, index=True)
     step_index = Column(Integer, nullable=False)
-    approver_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    approver_id = Column(String(36), ForeignKey("users.id"), nullable=True)
     action = Column(String(20), nullable=False)  # approve, reject, delegate, escalate
     comment = Column(Text)
     acted_by = Column(String(100), nullable=False)  # "user:xxx" 或 "agent:chatbot-01"
@@ -623,11 +623,11 @@ class TMSDistributionLog(Base):
 
     __tablename__ = "tms_distribution_logs"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
-    task_id = Column(UUID(as_uuid=True), ForeignKey("tms_tasks.id"), nullable=False, index=True)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    task_id = Column(String(36), ForeignKey("tms_tasks.id"), nullable=False, index=True)
     strategy = Column(String(50), nullable=False)
     candidate_scores = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 各候选人评分
-    selected_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    selected_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
     reason = Column(Text)  # 分发决策理由
     triggered_by = Column(String(100), nullable=False)  # "system" / "agent:xxx" / "user:xxx"
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -641,10 +641,10 @@ class TMSAgentAction(Base):
 
     __tablename__ = "tms_agent_actions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     agent_id = Column(String(100), nullable=False, index=True)  # chatbot/agent 标识
     action_type = Column(String(50), nullable=False, index=True)  # assign, approve, escalate, reassign, query, create_task
-    target_task_id = Column(UUID(as_uuid=True), ForeignKey("tms_tasks.id"), nullable=True)
+    target_task_id = Column(String(36), ForeignKey("tms_tasks.id"), nullable=True)
     payload = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 命令参数
     result = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 执行结果
     status = Column(String(20), default="success", index=True)  # success, failed, pending_confirmation
@@ -661,7 +661,7 @@ class TMSWebhookSubscription(Base):
 
     __tablename__ = "tms_webhook_subscriptions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     agent_id = Column(String(100), nullable=False, index=True)
     event_types = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)  # 订阅事件类型
     webhook_url = Column(String(500), nullable=False)

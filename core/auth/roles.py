@@ -754,6 +754,13 @@ def get_menu_items_for_user(user) -> list:
             "module": "reconciliation",
         })
 
+    # v2.5 - 快速工单（所有角色可见）
+    items.append({
+        "key": "/quick-request",
+        "label": "快速工单",
+        "module": "quick_request",
+    })
+
     return items
 
 

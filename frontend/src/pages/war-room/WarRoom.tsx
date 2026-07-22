@@ -1,7 +1,7 @@
 
 
-import React, { useState, useEffect } from 'react'
-import { Card, Select, Button, Row, Col, Statistic, Table, Tag, Progress, Tabs, Space, Timeline, Alert } from 'antd'
+import { useState, useEffect } from 'react'
+import { Card, Select, Button, Row, Col, Statistic, Table, Tag, Progress, Tabs, Timeline, Alert } from 'antd'
 import { ThunderboltOutlined, WarningOutlined, CheckCircleOutlined, ClockCircleOutlined } from '@ant-design/icons'
 import axios from 'axios'
 
@@ -56,7 +56,7 @@ export default function WarRoom() {
     return (
       <Card title="🏭 EngHub v2.5 — 仿真引擎战情室" style={{ minHeight: 400 }}>
         <Row justify="center" align="middle" style={{ height: 300 }}>
-          <Col span={12} textAlign="center">
+          <Col span={12} style={{ textAlign: 'center' }}>
             <ThunderboltOutlined style={{ fontSize: 64, color: '#1890ff' }} />
             <h2 style={{ marginTop: 16 }}>选择工厂场景并运行仿真</h2>
             <Select

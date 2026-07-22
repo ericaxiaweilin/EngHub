@@ -24,6 +24,7 @@ import {
 import { getStoredUser, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
 import RoleSwitcher from './RoleSwitcher'
+import AIAssistantWidget from './AIAssistantWidget'
 
 const { Header, Sider, Content } = AntLayout
 
@@ -43,6 +44,9 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/tms/approval': <CheckSquareOutlined />,
   '/tms/distribution': <ThunderboltOutlined />,
   '/tms/agent': <RobotOutlined />,
+  '/tms': <ThunderboltOutlined />,
+  '/quick-request': <EditOutlined />,
+  '/work-order-templates': <FileTextOutlined />,
   '/ai': <RobotOutlined />,
   '/users': <UserOutlined />,
   '/roles': <SettingOutlined />,
@@ -165,6 +169,9 @@ const Layout: React.FC = () => {
         onClose={() => setSwitcherOpen(false)}
         currentRole={user?.role || ''}
       />
+
+      {/* 全局 AI 助手浮窗 */}
+      <AIAssistantWidget />
     </AntLayout>
   )
 }

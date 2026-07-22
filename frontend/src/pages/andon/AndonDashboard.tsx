@@ -1,8 +1,8 @@
 
 
-import React, { useState, useEffect } from 'react'
-import { Card, Table, Tag, Button, Modal, Form, Input, Select, message, Descriptions, Space } from 'antd'
-import { PlusOutlined, RiseOutlined, CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
+import { useState, useEffect } from 'react'
+import { Card, Table, Tag, Button, Modal, Form, Input, message, Descriptions, Space } from 'antd'
+import { PlusOutlined, RiseOutlined } from '@ant-design/icons'
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1'
@@ -31,7 +31,7 @@ export default function Andon2Dashboard() {
   const [loading, setLoading] = useState(false)
   const [modalVisible, setModalVisible] = useState(false)
   const [form] = Form.useForm()
-  const [selectedCategory, setSelectedCategory] = useState('equipment_repair')
+  const [selectedCategory] = useState('equipment_repair')
 
   const fetchTickets = async () => {
     setLoading(true)
@@ -75,7 +75,7 @@ export default function Andon2Dashboard() {
       title: '工单号',
       dataIndex: 'ticket_code',
       key: 'ticket_code',
-      fixed: 'left',
+      fixed: 'left' as const,
       width: 180,
     },
     {
