@@ -19,6 +19,7 @@ from api.routes import (
 from api.routes.andon_routes import router as andon_router
 from api.routes.test_switch import test_router
 from api.routes.data_consistency_routes import router as data_consistency_router
+from api.routes.expert_system_routes import router as expert_system_router
 from api.routes.work_order_template_routes import router as work_order_template_router
 
 app = FastAPI(
@@ -41,6 +42,7 @@ app.include_router(chat_router)
 app.include_router(tms_router)
 app.include_router(andon_router)  # Andon 2.0 智能工单系统
 app.include_router(data_consistency_router)
+app.include_router(expert_system_router)
 app.include_router(work_order_template_router)
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
