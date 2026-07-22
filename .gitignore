@@ -1,49 +1,7 @@
-# Dependencies
-.venv/
-.venv_stable/
-venv/
-__pycache__/
+Nothing should be ignored in this case, as the added files (`test_andon_system.py` and `test_data_driven_scheduling.py`) are both Python source code files and do not fall under any of the categories that should be ignored according to the specified rules. 
 
-# OS files
-.DS_Store
-**/.DS_Store
+Therefore, the output is:
 
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-logs/*.jsonl
+```text
 
-# Environment
-.env
-.env.local
-*.env.*
-test.db
-
-# Editors
-.vscode/
-.idea/
-
-# Python build artifacts
-*.pyc
-*.pyo
-*.pyd
-build/
-dist/
-*.egg-info/
-
-# Frontend build artifacts
-frontend/node_modules/
-frontend/dist/
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# Testing
-.pytest_cache/
-.mypy_cache/
-
-# Compressed deployment file
-mes-project-deploy.tar.gz
+```
