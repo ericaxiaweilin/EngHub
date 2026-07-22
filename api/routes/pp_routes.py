@@ -3,13 +3,12 @@ PP API Routes
 生产计划 (MPS), 物料需求计划 (MRP)
 """
 
-from fastapi import APIRouter, Header, Depends
+from fastapi import APIRouter, Header
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
-from core.auth.security import enforce_tenant
 
-router = APIRouter(prefix="/api/v1", tags=["pp"], dependencies=[Depends(enforce_tenant)])
+router = APIRouter(prefix="/api/v1", tags=["pp"])
 
 # --- MPS Endpoints ---
 

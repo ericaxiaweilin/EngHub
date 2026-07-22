@@ -34,6 +34,73 @@ export interface SimulationRequest {
   plugin_names: string[]
 }
 
+export interface RuleEvidence {
+  field: string
+  observed_value: any
+  expected?: string | null
+  source?: string | null
+}
+
+export interface RequiredAction {
+  action_code: string
+  description: string
+  break_minutes: number
+  metadata: Record<string, any>
+}
+
+export interface RuleDecision {
+  plugin_name: string
+  plugin_version: string
+  rule_code: string
+  rule_version: string
+  decision_type: string
+  priority: string
+  message: string
+  blocking: boolean
+  required_break_minutes: number
+  cost_delta: number
+  penalty_score: number
+  evidence: RuleEvidence[]
+  required_actions: RequiredAction[]
+}
+
+export interface PluginRecord {
+  plugin_name: string
+  plugin_version: string
+  rule_version: string
+  priority: string
+  legislation_pack?: string | null
+  timeout_ms: number
+  duration_ms: number
+  status: string
+  error?: string | null
+  decisions: RuleDecision[]
+}
+
+export interface SimSnapshot {
+  timestamp: string
+  worker_ref: string
+  shift_id: string
+  task_type: string
+  zone_id: string
+  action_type: string
+  distance_meters: number
+  step_count: number
+  load_weight_kg: number
+  posture_angle_deg: number
+  continuous_work_minutes: number
+  fatigue_score: number
+  energy_kcal: number
+  temperature_c: number
+  humidity_percent: number
+  noise_db?: number | null
+  terrain: string
+  floor_incline_percent: number
+  skill_level?: string | null
+  ppe_status?: string | null
+  machine_risk_level?: string | null
+}
+
 export interface SimulationResult {
   simulation_id: string
   final_status: string
@@ -44,6 +111,15 @@ export interface SimulationResult {
   max_required_break_minutes: number
   blocking_rules: string[]
   warnings: string[]
+  // --- 扩展工程字段 ---
+  total_penalty_score: number
+  winning_priority?: string | null
+  physics_core_version: string
+  arbiter_version: string
+  snapshot?: SimSnapshot | null
+  plugin_records: PluginRecord[]
+  applied_actions: RequiredAction[]
+  all_decisions: RuleDecision[]
 }
 
 export interface PluginManifest {

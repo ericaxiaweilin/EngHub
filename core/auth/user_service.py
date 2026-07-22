@@ -3,11 +3,10 @@ User Service - 用户管理服务
 处理用户相关的业务逻辑
 """
 from typing import Optional, List
-import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.models import User, Factory, UserInvitation
+from database.models import User
 from .security import get_password_hash, verify_password
 
 
@@ -158,122 +157,3 @@ class UserService:
         
         await self.db.commit()
         return True
-
-    # ------------------------------------------------------------------
-    # 多租户 / 邀请制 (移植自 engflow AuthService + rbac.invitation_service)
-    # ------------------------------------------------------------------
-
-    async def get_factory(self, factory_id: str) -> Optional[Factory]:
-        """根据租户键获取厂区"""
-        result = await self.db.execute(
-            select(Factory).where(Factory.id == factory_id)
-        )
-        return result.scalar_one_or_none()
-
-    async def create_factory(self, factory_id: str, name: str) -> Factory:
-        """创建新租户(厂区)"""
-        factory = Factory(id=factory_id, name=name, is_active=True)
-        self.db.add(factory)
-        await self.db.commit()
-        await self.db.refresh(factory)
-        return factory
-
-    async def create_invitation(
-        self,
-        email: str,
-        factory_id: str,
-        role: str = "operator",
-        invited_by: Optional[str] = None,
-        ttl_days: int = 7,
-    ) -> UserInvitation:
-        """创建邀请 (安全随机 token + 7 天有效期，改进自 engflow 邮箱匹配方式)"""
-        invitation = UserInvitation(
-            email=email,
-            factory_id=factory_id,
-            role=role,
-            token=secrets.token_urlsafe(32),
-            accepted=False,
-            invited_by=invited_by,
-            expires_at=datetime.utcnow() + timedelta(days=ttl_days),
-        )
-        self.db.add(invitation)
-        await self.db.commit()
-        await self.db.refresh(invitation)
-        return invitation
-
-    async def get_invitation_by_token(self, token: str) -> Optional[UserInvitation]:
-        """根据 token 获取未接受且未过期的邀请"""
-        result = await self.db.execute(
-            select(UserInvitation).where(UserInvitation.token == token)
-        )
-        inv = result.scalar_one_or_none()
-        if not inv or inv.accepted or inv.expires_at < datetime.utcnow():
-            return None
-        return inv
-
-    async def list_invitations(self, factory_id: str) -> List[UserInvitation]:
-        """列出某租户下的邀请"""
-        result = await self.db.execute(
-            select(UserInvitation)
-            .where(UserInvitation.factory_id == factory_id)
-            .order_by(UserInvitation.created_at.desc())
-        )
-        return result.scalars().all()
-
-    async def register_user(
-        self,
-        username: str,
-        email: str,
-        password: str,
-        full_name: Optional[str] = None,
-        factory_id: Optional[str] = None,
-        invitation_token: Optional[str] = None,
-    ) -> User:
-        """自助注册 (邀请制多租户，移植自 engflow register_user 并改进):
-
-        - 有邀请 token：校验 token（邮箱/厂区一致、未过期），角色取自邀请，标记已接受；
-        - 无邀请且厂区不存在：开放注册，创建新租户，首个用户成为该租户 admin；
-        - 无邀请但厂区已存在：拒绝（已有租户仅邀请可加入）。
-        """
-        if await self.get_user_by_username(username):
-            raise ValueError("用户名已存在")
-        if await self.get_user_by_email(email):
-            raise ValueError("邮箱已注册")
-
-        role = "operator"
-        is_superuser = False
-        invitation: Optional[UserInvitation] = None
-
-        if invitation_token:
-            invitation = await self.get_invitation_by_token(invitation_token)
-            if not invitation:
-                raise ValueError("邀请码无效或已过期")
-            if invitation.email.lower() != email.lower():
-                raise ValueError("邀请码与邮箱不匹配")
-            factory_id = invitation.factory_id
-            role = invitation.role
-        else:
-            if not factory_id:
-                raise ValueError("必须提供厂区(租户)")
-            existing_factory = await self.get_factory(factory_id)
-            if existing_factory:
-                raise ValueError(f"厂区 '{factory_id}' 已存在，需邀请码才能加入")
-            # 开放注册：创建新租户，首用户为租户管理员
-            await self.create_factory(factory_id, name=(full_name or username) + " 厂区")
-            role = "admin"
-
-        user = await self.create_user(
-            username=username,
-            email=email,
-            password=password,
-            full_name=full_name,
-            factory_id=factory_id,
-            role=role,
-            is_superuser=is_superuser,
-        )
-
-        if invitation:
-            invitation.accepted = True
-            await self.db.commit()
-
-        return user

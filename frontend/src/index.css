@@ -65,3 +65,350 @@ body {
 .table th {
   background-color: var(--bg-color);
 }
+
+/* ==================== 仿真引擎控制台 ==================== */
+
+/* 控制台头部：深色渐变 + 蓝图网格纹理 */
+.sim-console {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(600px 200px at 85% -20%, rgba(54, 207, 201, 0.18), transparent 70%),
+    linear-gradient(120deg, #0c2438 0%, #10395c 55%, #0b4a63 100%);
+  border-radius: 6px;
+}
+
+.sim-console::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.035) 0 1px, transparent 1px 28px),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.035) 0 1px, transparent 1px 28px);
+  pointer-events: none;
+}
+
+/* 能力面 Tab 卡片 */
+.sim-tab-card {
+  cursor: pointer;
+  transition: transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.sim-tab-card:hover {
+  transform: translateY(-2px);
+}
+
+.sim-tab-card.active {
+  box-shadow: 0 6px 16px rgba(4, 20, 35, 0.25);
+}
+
+/* 引擎运行状态点：脉冲呼吸 */
+@keyframes sim-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(82, 196, 26, 0.55); }
+  60% { box-shadow: 0 0 0 6px rgba(82, 196, 26, 0); }
+}
+
+.sim-status-dot {
+  animation: sim-pulse 1.8s ease-out infinite;
+}
+
+/* 面板切入淡入 */
+@keyframes sim-fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+.sim-panel {
+  animation: sim-fade-in 0.28s ease;
+}
+
+/* ==================== 产线流转拓扑（组态图） ==================== */
+
+.flow-node {
+  position: relative;
+  width: 142px;
+  flex: 0 0 auto;
+  background: linear-gradient(165deg, rgba(20, 45, 70, 0.95), rgba(9, 24, 40, 0.98));
+  border: 1px solid rgba(94, 140, 180, 0.35);
+  border-radius: 6px;
+  padding: 10px 11px 9px;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.flow-node:hover {
+  transform: translateY(-3px);
+  border-color: rgba(54, 207, 201, 0.65);
+  box-shadow: 0 10px 22px rgba(2, 12, 24, 0.55);
+}
+
+.flow-node-bn {
+  border-color: rgba(245, 34, 45, 0.8) !important;
+  animation: flow-bn 1.6s ease-out infinite;
+}
+
+@keyframes flow-bn {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 34, 45, 0.45); }
+  60% { box-shadow: 0 0 0 8px rgba(245, 34, 45, 0); }
+}
+
+.flow-bn-badge {
+  position: absolute;
+  top: -9px;
+  right: 8px;
+  background: #f5222d;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 0 7px;
+  border-radius: 9px;
+  line-height: 17px;
+}
+
+.flow-bn-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f5222d;
+  margin-right: 4px;
+  animation: flow-bn 1.6s ease-out infinite;
+}
+
+.flow-node-head { display: flex; align-items: baseline; gap: 6px; }
+.flow-node-name { color: #fff; font-weight: 800; font-size: 14px; letter-spacing: 1px; }
+.flow-node-id { color: rgba(255, 255, 255, 0.32); font-size: 9px; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+.flow-node-sub { display: flex; align-items: center; justify-content: space-between; margin-top: 5px; }
+.flow-ws { color: rgba(255, 255, 255, 0.5); font-size: 10px; }
+
+.flow-tag {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  line-height: 15px;
+  padding: 0 5px;
+  border-radius: 2px;
+}
+
+.flow-tag-mts { color: #36cfc9; background: rgba(54, 207, 201, 0.12); border: 1px solid rgba(54, 207, 201, 0.45); }
+.flow-tag-mto { color: #69b1ff; background: rgba(24, 144, 255, 0.14); border: 1px solid rgba(24, 144, 255, 0.45); }
+
+.flow-node-res { margin-top: 6px; color: rgba(255, 255, 255, 0.55); font-size: 10px; white-space: nowrap; }
+.flow-node-res .anticon { margin-right: 3px; color: rgba(255, 255, 255, 0.4); }
+
+.flow-bar {
+  height: 5px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 8px 0 5px;
+}
+
+.flow-bar i { display: block; height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+
+.flow-node-stats { display: flex; justify-content: space-between; font-size: 10px; color: rgba(255, 255, 255, 0.55); }
+
+.flow-node-idle {
+  margin-top: 9px;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.3);
+  letter-spacing: 1px;
+  text-align: center;
+  border-top: 1px dashed rgba(255, 255, 255, 0.14);
+  padding-top: 6px;
+}
+
+.flow-node-end { width: 128px; }
+.flow-node-pool { border-color: rgba(24, 144, 255, 0.55); }
+.flow-node-out { border-color: rgba(82, 196, 26, 0.5); }
+.flow-node-en { color: rgba(255, 255, 255, 0.3); font-size: 9px; letter-spacing: 2px; margin-top: 2px; }
+
+.flow-end-lines { margin-top: 8px; }
+
+.flow-end-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.5);
+  padding: 2px 0;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
+}
+
+.flow-end-line:last-child { border-bottom: none; }
+.flow-end-line b { color: #fff; font-size: 12px; font-weight: 700; }
+
+.flow-link {
+  width: 50px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  padding: 0 2px 18px;
+}
+
+.flow-dash {
+  position: relative;
+  width: 100%;
+  border-radius: 1px;
+  animation: flow-dash-move 2.4s linear infinite;
+}
+
+@keyframes flow-dash-move { to { background-position: 28px 0; } }
+
+.flow-arrow {
+  position: absolute;
+  right: -2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 8px solid rgba(54, 207, 201, 0.8);
+}
+
+.flow-link-label { text-align: center; font-size: 9px; margin-top: 5px; white-space: nowrap; }
+
+/* 合规仿真流程管线 */
+.pipe-stage {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 150px;
+  background: linear-gradient(165deg, rgba(20, 45, 70, 0.95), rgba(9, 24, 40, 0.98));
+  border: 1px solid rgba(94, 140, 180, 0.35);
+  border-radius: 6px;
+  padding: 10px 12px;
+  transition: transform 0.18s ease, border-color 0.18s ease;
+}
+
+.pipe-stage:hover { transform: translateY(-2px); border-color: rgba(54, 207, 201, 0.6); }
+
+.pipe-stage-no {
+  position: absolute;
+  top: -8px;
+  left: 10px;
+  background: #0b4a63;
+  border: 1px solid rgba(54, 207, 201, 0.5);
+  color: #36cfc9;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  padding: 0 6px;
+  border-radius: 8px;
+  line-height: 15px;
+}
+
+.pipe-arrow {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 34px;
+  height: 2px;
+  position: relative;
+  margin: 0 2px 14px;
+  background: repeating-linear-gradient(90deg, rgba(54, 207, 201, 0.55) 0 6px, transparent 6px 12px);
+  animation: flow-dash-move 2s linear infinite;
+}
+
+.pipe-arrow::after {
+  content: '';
+  position: absolute;
+  right: -2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 7px solid rgba(54, 207, 201, 0.75);
+}
+
+/* ==================== 组态编辑器（可拖拽画布） ==================== */
+
+/* 点阵网格画布 */
+.topo-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.09) 1px, transparent 1.5px);
+  background-size: 22px 22px;
+}
+
+/* 车间容器 */
+.topo-ws {
+  position: absolute;
+  width: 252px;
+  background: rgba(13, 35, 58, 0.78);
+  border: 1px solid rgba(94, 140, 180, 0.42);
+  border-radius: 8px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.topo-ws.drag-over {
+  border-color: rgba(54, 207, 201, 0.95);
+  box-shadow: 0 0 0 2px rgba(54, 207, 201, 0.28), 0 10px 26px rgba(2, 12, 24, 0.55);
+}
+
+.topo-ws-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 38px;
+  padding: 0 6px 0 10px;
+  cursor: grab;
+  user-select: none;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.13);
+}
+
+.topo-ws-head:active { cursor: grabbing; }
+
+/* 工段卡片 */
+.topo-sec {
+  position: relative;
+  height: 100px;
+  background: linear-gradient(165deg, rgba(20, 45, 70, 0.95), rgba(9, 24, 40, 0.98));
+  border: 1px solid rgba(94, 140, 180, 0.35);
+  border-radius: 6px;
+  padding: 8px 10px 7px;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+}
+
+.topo-sec:hover { border-color: rgba(54, 207, 201, 0.6); }
+
+.topo-sec.selected {
+  border-color: #36cfc9;
+  box-shadow: 0 0 0 2px rgba(54, 207, 201, 0.32);
+}
+
+.topo-sec.dragging { opacity: 0.35; }
+
+/* 拖入时的插入指示线 */
+.topo-sec.drop-before::before {
+  content: '';
+  position: absolute;
+  top: -6px;
+  left: 10px;
+  right: 10px;
+  height: 2px;
+  background: #36cfc9;
+  border-radius: 1px;
+  box-shadow: 0 0 6px rgba(54, 207, 201, 0.8);
+}
+
+/* 端点节点（订单池 / 成品交付） */
+.topo-end {
+  position: absolute;
+  width: 132px;
+  height: 100px;
+  cursor: grab;
+}
+
+.topo-end:active { cursor: grabbing; }
+
+/* SVG 连线流动动画 */
+@keyframes topo-dash { to { stroke-dashoffset: -28; } }
+.topo-edge { animation: topo-dash 1.4s linear infinite; }

@@ -5,10 +5,8 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 export const API_ENDPOINTS = {
   // Auth
   AUTH_LOGIN: `${API_BASE_URL}/api/v1/auth/login`,
-  AUTH_REGISTER: `${API_BASE_URL}/api/v1/auth/register`,
   AUTH_ME: `${API_BASE_URL}/api/v1/auth/me`,
   AUTH_REFRESH: `${API_BASE_URL}/api/v1/auth/refresh`,
-  AUTH_INVITATIONS: `${API_BASE_URL}/api/v1/auth/invitations`,
 
   // MES
   WORK_ORDERS: `${API_BASE_URL}/api/v1/work-orders`,
@@ -17,6 +15,7 @@ export const API_ENDPOINTS = {
   ROUTINGS: `${API_BASE_URL}/api/v1/routings`,
   STATIONS: `${API_BASE_URL}/api/v1/stations`,
   EQUIPMENT: `${API_BASE_URL}/api/v1/equipment`,
+  PRODUCTS: `${API_BASE_URL}/api/v1/products`,
   
   // PP
   PLANS: `${API_BASE_URL}/api/v1/plans`,
@@ -46,6 +45,13 @@ export const API_ENDPOINTS = {
   SIM_ERP_AUDITS: `${API_BASE_URL}/api/v1/sim-erp/audits`,
   SIM_ERP_AUDIT_LATEST: `${API_BASE_URL}/api/v1/sim-erp/audits/latest`,
   SIM_ERP_AUDIT: (simulationId: string) => `${API_BASE_URL}/api/v1/sim-erp/audits/${simulationId}`,
+
+  // Sim-Factory（车间级 / 工段级负荷仿真）
+  SIM_FACTORY_STATUS: `${API_BASE_URL}/api/v1/sim-factory/status`,
+  SIM_FACTORY_SCENARIOS: `${API_BASE_URL}/api/v1/sim-factory/scenarios`,
+  SIM_FACTORY_SCENARIO: (scenarioId?: string) =>
+    `${API_BASE_URL}/api/v1/sim-factory/scenario${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
+  SIM_FACTORY_RUN: `${API_BASE_URL}/api/v1/sim-factory/run`,
 
   // Employee Skills (HR)
   SKILLS: `${API_BASE_URL}/api/v1/skills`,

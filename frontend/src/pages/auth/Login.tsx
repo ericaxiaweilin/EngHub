@@ -1,21 +1,40 @@
-import React, { useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
-import { Form, Input, Button, Card, Typography, message, Avatar } from 'antd'
-import { UserOutlined, LockOutlined, AppstoreOutlined } from '@ant-design/icons'
-import { login, fetchMe } from '../../services/auth'
+import { Form, Input, Button, Card, Typography, message, Avatar, Checkbox, Alert, Tag } from 'antd'
+import { UserOutlined, LockOutlined, AppstoreOutlined, ClockCircleOutlined } from '@ant-design/icons'
+import { login, fetchMe, loadCredentials, clearCredentials, SESSION_HOURS } from '../../services/auth'
 
 const { Title, Text } = Typography
 
 const Login: React.FC = () => {
   const [loading, setLoading] = useState(false)
+  const [form] = Form.useForm()
   const navigate = useNavigate()
   const location = useLocation() as any
   const from = location.state?.from || '/dashboard'
 
-  const onFinish = async (values: { username: string; password: string }) => {
+  // 会话过期标记（由路由守卫/401 拦截器设置）
+  const [expired] = useState(() => sessionStorage.getItem('session_expired') === '1')
+
+  // 标记当前密码是否来自「记住密码」自动填充。
+  // 自动填充的密码在服务端重置后会过期，且掩码框用户看不见，需在失败时特殊处理
+  const autofilledPwd = useRef(false)
+
+  useEffect(() => {
+    // 自动填充已保存的凭据
+    const saved = loadCredentials()
+    if (saved) {
+      form.setFieldsValue({ username: saved.username, password: saved.password, remember: true })
+      autofilledPwd.current = true
+    }
+    // 清除过期标记（只展示一次）
+    sessionStorage.removeItem('session_expired')
+  }, [form])
+
+  const onFinish = async (values: { username: string; password: string; remember?: boolean }) => {
     setLoading(true)
     try {
-      await login(values.username.trim(), values.password)
+      await login(values.username.trim(), values.password.trim(), values.remember)
       try {
         await fetchMe()
       } catch {
@@ -24,8 +43,18 @@ const Login: React.FC = () => {
       message.success('登录成功')
       navigate(from, { replace: true })
     } catch (err: any) {
-      const detail = err?.response?.data?.detail || err?.message || '登录失败'
-      message.error(detail)
+      if (autofilledPwd.current) {
+        // 提交的密码来自「记住密码」自动填充：服务端重置密码后旧密码已失效，
+        // 而掩码框让用户无法察觉，只会看到莫名其妙的「用户名或密码错误」。
+        // 这里清除失效凭据和密码框，并明确提示重新输入，避免反复踩坑
+        clearCredentials()
+        form.setFieldsValue({ password: '' })
+        autofilledPwd.current = false
+        message.error('自动填充的密码可能已失效，请重新输入密码')
+      } else {
+        const detail = err?.response?.data?.detail || err?.message || '登录失败'
+        message.error(detail)
+      }
     } finally {
       setLoading(false)
     }
@@ -54,12 +83,39 @@ const Login: React.FC = () => {
           <Text type="secondary">制造执行系统 · 登录</Text>
         </div>
 
-        <Form name="login" onFinish={onFinish} size="large" autoComplete="off">
+        {expired && (
+          <Alert
+            type="warning"
+            showIcon
+            icon={<ClockCircleOutlined />}
+            message={`登录状态已超过 ${SESSION_HOURS} 小时，请重新登录`}
+            style={{ marginBottom: 16 }}
+          />
+        )}
+
+        <Form
+          form={form}
+          name="login"
+          onFinish={onFinish}
+          size="large"
+          autoComplete="off"
+          initialValues={{ remember: true }}
+        >
           <Form.Item name="username" rules={[{ required: true, message: '请输入用户名' }]}>
             <Input prefix={<UserOutlined />} placeholder="用户名" allowClear />
           </Form.Item>
           <Form.Item name="password" rules={[{ required: true, message: '请输入密码' }]}>
-            <Input.Password prefix={<LockOutlined />} placeholder="密码" />
+            <Input.Password
+              prefix={<LockOutlined />}
+              placeholder="密码"
+              onChange={() => {
+                // 用户手动修改过密码后，不再视为自动填充
+                autofilledPwd.current = false
+              }}
+            />
+          </Form.Item>
+          <Form.Item name="remember" valuePropName="checked" style={{ marginBottom: 12 }}>
+            <Checkbox>记住密码（本机自动填充）</Checkbox>
           </Form.Item>
           <Form.Item style={{ marginBottom: 8 }}>
             <Button type="primary" htmlType="submit" block loading={loading}>
@@ -68,12 +124,22 @@ const Login: React.FC = () => {
           </Form.Item>
         </Form>
 
-        <Text type="secondary" style={{ fontSize: 12, display: 'block', textAlign: 'center' }}>
-          默认账号 admin，如无法登录请联系管理员初始化
-        </Text>
-        <Text type="secondary" style={{ fontSize: 12, display: 'block', textAlign: 'center', marginTop: 6 }}>
-          还没有账号？<a onClick={() => navigate('/register')} style={{ cursor: 'pointer' }}>注册 / 创建厂区</a>
-        </Text>
+        <div style={{ textAlign: 'center' }}>
+          <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+            登录状态保持 {SESSION_HOURS} 小时，届时需重新登录
+          </Text>
+          <div style={{ marginTop: 8 }}>
+            <Tag color="blue" style={{ marginRight: 4 }}>厂长</Tag>
+            <Tag color="green" style={{ marginRight: 4 }}>经理</Tag>
+            <Tag color="orange" style={{ marginRight: 4 }}>课长</Tag>
+            <Tag color="purple" style={{ marginRight: 4 }}>线长</Tag>
+            <Tag color="cyan" style={{ marginRight: 4 }}>工程师</Tag>
+            <Tag color="default">操作员</Tag>
+          </div>
+          <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
+            默认账号 admin，如无法登录请联系管理员初始化
+          </Text>
+        </div>
       </Card>
     </div>
   )

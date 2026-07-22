@@ -1,8 +1,7 @@
-import React, { useState } from 'react'
+import React, { useState, useMemo } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Layout as AntLayout, Menu, Badge, Avatar, Space, Tag, Dropdown, Modal, Form, Input, Select, Button, Typography, message } from 'antd'
+import { Layout as AntLayout, Menu, Avatar, Space, Tag, Dropdown, Button } from 'antd'
 import {
-  AuditOutlined,
   DashboardOutlined,
   FileTextOutlined,
   EditOutlined,
@@ -19,60 +18,56 @@ import {
   CheckSquareOutlined,
   LogoutOutlined,
   UserOutlined,
+  SettingOutlined,
+  SwapOutlined,
 } from '@ant-design/icons'
-import { getStoredUser, logout, createInvitation } from '../services/auth'
+import { getStoredUser, logout } from '../services/auth'
+import { isTestMode } from '../services/testSwitch'
+import RoleSwitcher from './RoleSwitcher'
 
 const { Header, Sider, Content } = AntLayout
 
-const menuItems = [
-  { key: '/dashboard', icon: <DashboardOutlined />, label: <Link to="/dashboard">生产看板</Link> },
-  {
-    key: 'g-mfg', icon: <ClusterOutlined />, label: '生产制造',
-    children: [
-      { key: '/work-orders', icon: <FileTextOutlined />, label: <Link to="/work-orders">工单管理</Link> },
-      { key: '/production-report', icon: <EditOutlined />, label: <Link to="/production-report">生产报工</Link> },
-      { key: '/base-data', icon: <ApartmentOutlined />, label: <Link to="/base-data">工位/工艺/设备</Link> },
-    ],
-  },
-  {
-    key: 'g-plan', icon: <ScheduleOutlined />, label: '计划物料',
-    children: [
-      { key: '/plans', icon: <ScheduleOutlined />, label: <Link to="/plans">生产计划</Link> },
-      { key: '/inventory', icon: <InboxOutlined />, label: <Link to="/inventory">库存管理</Link> },
-      { key: '/warehouses', icon: <HddOutlined />, label: <Link to="/warehouses">仓库管理</Link> },
-    ],
-  },
-  {
-    key: 'g-qms', icon: <SafetyOutlined />, label: '质量管理',
-    children: [
-      { key: '/inspections', icon: <SafetyOutlined />, label: <Link to="/inspections">检验管理</Link> },
-      { key: '/defects', icon: <WarningOutlined />, label: <Link to="/defects"><Badge count={5} size="small" offset={[8, 0]}>不良品</Badge></Link> },
-    ],
-  },
-  {
-    key: 'g-hr', icon: <TeamOutlined />, label: '人员',
-    children: [
-      { key: '/skill-matrix', icon: <TeamOutlined />, label: <Link to="/skill-matrix">员工技能矩阵</Link> },
-    ],
-  },
-  {
-    key: 'g-sim', icon: <ThunderboltOutlined />, label: '合规仿真',
-    children: [
-      { key: '/sim-erp/run', icon: <ThunderboltOutlined />, label: <Link to="/sim-erp/run">仿真引擎</Link> },
-      { key: '/sim-erp/audits', icon: <AuditOutlined />, label: <Link to="/sim-erp/audits">合规审计</Link> },
-    ],
-  },
-  {
-    key: 'g-tms', icon: <CheckSquareOutlined />, label: 'TMS 任务管理',
-    children: [
-      { key: '/tms/approval', icon: <CheckSquareOutlined />, label: <Link to="/tms/approval"><Badge count={24} size="small" offset={[8, 0]}>审批中心</Badge></Link> },
-      { key: '/tms/distribution', icon: <ThunderboltOutlined />, label: <Link to="/tms/distribution">分发看板</Link> },
-      { key: '/tms/agent', icon: <RobotOutlined />, label: <Link to="/tms/agent">Agent 控制台</Link> },
-    ],
-  },
-  { key: '/ai', icon: <RobotOutlined />, label: <Link to="/ai">AI 助手</Link> },
-  { key: '/expert', icon: <RobotOutlined />, label: <Link to="/expert">生产专家</Link> },
-]
+// 菜单图标映射
+const menuIcons: Record<string, React.ReactElement> = {
+  '/dashboard': <DashboardOutlined />,
+  '/work-orders': <FileTextOutlined />,
+  '/production-report': <EditOutlined />,
+  '/base-data': <ApartmentOutlined />,
+  '/plans': <ScheduleOutlined />,
+  '/inventory': <InboxOutlined />,
+  '/warehouses': <HddOutlined />,
+  '/inspections': <SafetyOutlined />,
+  '/defects': <WarningOutlined />,
+  '/skill-matrix': <TeamOutlined />,
+  '/simulation': <ThunderboltOutlined />,
+  '/tms/approval': <CheckSquareOutlined />,
+  '/tms/distribution': <ThunderboltOutlined />,
+  '/tms/agent': <RobotOutlined />,
+  '/ai': <RobotOutlined />,
+  '/users': <UserOutlined />,
+  '/roles': <SettingOutlined />,
+}
+
+// 将后端 menu_items 转换为 Ant Design Menu 格式
+function convertMenuItems(items: any[]): any[] {
+  if (!items || !items.length) return []
+
+  return items.map((item: any) => {
+    if (item.children && item.children.length > 0) {
+      return {
+        key: item.key,
+        icon: menuIcons[item.key] || <ClusterOutlined />,
+        label: item.label,
+        children: convertMenuItems(item.children),
+      }
+    }
+    return {
+      key: item.key,
+      icon: menuIcons[item.key] || <DashboardOutlined />,
+      label: <Link to={item.key}>{item.label}</Link>,
+    }
+  })
+}
 
 const Layout: React.FC = () => {
   const location = useLocation()
@@ -80,39 +75,18 @@ const Layout: React.FC = () => {
   const user = getStoredUser()
   const displayName = user?.full_name || user?.username || '用户'
   const avatarChar = displayName.charAt(0).toUpperCase()
-  const canInvite = user?.role === 'admin' || user?.role === 'manager'
+  const [switcherOpen, setSwitcherOpen] = useState(false)
+  const testMode = isTestMode()
 
-  const [inviteOpen, setInviteOpen] = useState(false)
-  const [inviteLink, setInviteLink] = useState('')
-  const [inviteLoading, setInviteLoading] = useState(false)
-  const [inviteForm] = Form.useForm<{ email: string; role: string }>()
+  // 根据用户权限动态生成菜单
+  const menuItems = useMemo(() => {
+    if (!user) return []
+    return convertMenuItems(user.menu_items || [])
+  }, [user])
 
   const handleLogout = () => {
     logout()
     navigate('/login', { replace: true })
-  }
-
-  const openInvite = () => {
-    setInviteLink('')
-    inviteForm.resetFields()
-    setInviteOpen(true)
-  }
-
-  const submitInvite = async () => {
-    try {
-      const values = await inviteForm.validateFields()
-      setInviteLoading(true)
-      const inv = await createInvitation(values.email.trim(), values.role)
-      const link = `${window.location.origin}/register?token=${inv.token}`
-      setInviteLink(link)
-      message.success('邀请已生成')
-    } catch (err: any) {
-      if (err?.response) {
-        message.error(err.response.data?.detail || '生成邀请失败')
-      }
-    } finally {
-      setInviteLoading(false)
-    }
   }
 
   const userMenu = {
@@ -122,15 +96,14 @@ const Layout: React.FC = () => {
         label: (
           <div style={{ padding: '4px 0' }}>
             <div style={{ fontWeight: 600 }}>{displayName}</div>
-            <div style={{ fontSize: 12, color: '#999' }}>{user?.role || '-'}</div>
+            <div style={{ fontSize: 12, color: '#999' }}>
+              {user?.role ? `${user.role}` : '-'}
+            </div>
           </div>
         ),
         disabled: true,
       },
       { type: 'divider' as const },
-      ...(canInvite
-        ? [{ key: 'invite', icon: <TeamOutlined />, label: '邀请成员', onClick: openInvite }]
-        : []),
       { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
     ],
   }
@@ -141,11 +114,26 @@ const Layout: React.FC = () => {
         <Space size={12}>
           <Avatar shape="square" style={{ background: '#1890ff' }} icon={<ClusterOutlined />} />
           <span style={{ fontSize: 18, fontWeight: 700, color: '#fff', letterSpacing: 1 }}>EngHub MES</span>
-          <Tag color="blue" style={{ marginLeft: 4 }}>v1.1</Tag>
+          <Tag color="blue" style={{ marginLeft: 4 }}>v1.2</Tag>
+          {testMode && <Tag color="red">测试模式</Tag>}
         </Space>
         <Space size={16}>
           {user?.factory_id && <Tag color="geekblue">厂区 {user.factory_id}</Tag>}
           <Link to="/ai" style={{ color: 'rgba(255,255,255,0.85)' }}><RobotOutlined /> AI 助手</Link>
+          
+          {/* 测试模式：角色切换按钮 */}
+          {testMode && (
+            <Button
+              type="primary"
+              ghost
+              icon={<SwapOutlined />}
+              onClick={() => setSwitcherOpen(true)}
+              style={{ color: '#fff', borderColor: 'rgba(255,255,255,0.5)' }}
+            >
+              切换角色
+            </Button>
+          )}
+
           <Dropdown menu={userMenu} placement="bottomRight">
             <Space style={{ cursor: 'pointer', color: 'rgba(255,255,255,0.9)' }}>
               <Avatar style={{ background: '#52c41a' }} icon={!avatarChar ? <UserOutlined /> : undefined}>{avatarChar}</Avatar>
@@ -159,7 +147,7 @@ const Layout: React.FC = () => {
           <Menu
             mode="inline"
             selectedKeys={[location.pathname]}
-            defaultOpenKeys={['g-mfg', 'g-plan', 'g-qms', 'g-hr', 'g-sim', 'g-tms']}
+            defaultOpenKeys={menuItems.filter((i: any) => i.children).map((i: any) => i.key)}
             style={{ height: '100%', borderRight: 0, paddingTop: 8 }}
             items={menuItems}
           />
@@ -171,38 +159,12 @@ const Layout: React.FC = () => {
         </Content>
       </AntLayout>
 
-      <Modal
-        title="邀请成员加入厂区"
-        open={inviteOpen}
-        onCancel={() => setInviteOpen(false)}
-        footer={[
-          <Button key="close" onClick={() => setInviteOpen(false)}>关闭</Button>,
-          <Button key="submit" type="primary" loading={inviteLoading} onClick={submitInvite}>生成邀请链接</Button>,
-        ]}
-        destroyOnClose
-      >
-        <Form form={inviteForm} layout="vertical" initialValues={{ role: 'operator' }}>
-          <Form.Item name="email" label="受邀人邮箱" rules={[{ required: true, type: 'email', message: '请输入有效邮箱' }]}>
-            <Input placeholder="member@example.com" allowClear />
-          </Form.Item>
-          <Form.Item name="role" label="角色" rules={[{ required: true }]}>
-            <Select
-              options={[
-                { value: 'operator', label: '操作员 operator' },
-                { value: 'manager', label: '主管 manager' },
-                { value: 'admin', label: '管理员 admin' },
-              ]}
-            />
-          </Form.Item>
-        </Form>
-        {inviteLink && (
-          <div style={{ marginTop: 8 }}>
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>将下方链接发送给受邀人，其打开后即可完成注册并加入本厂区：</Typography.Text>
-            <Input.TextArea value={inviteLink} readOnly autoSize style={{ marginTop: 6 }} onFocus={(e) => e.target.select()} />
-            <Button size="small" style={{ marginTop: 6 }} onClick={() => { navigator.clipboard?.writeText(inviteLink); message.success('已复制') }}>复制链接</Button>
-          </div>
-        )}
-      </Modal>
+      {/* 角色切换抽屉 */}
+      <RoleSwitcher
+        open={switcherOpen}
+        onClose={() => setSwitcherOpen(false)}
+        currentRole={user?.role || ''}
+      />
     </AntLayout>
   )
 }

@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Boolean,
     Numeric,
+    Float,
     ForeignKey,
     Index,
     Text,
@@ -27,6 +28,92 @@ def generate_uuid():
     return str(uuid.uuid4())
 
 
+# ============================================================
+# 权限与角色模型（新增）
+# ============================================================
+
+class Role(Base):
+    """角色表 - 存储 MES 系统预定义角色"""
+
+    __tablename__ = "roles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    role_code = Column(String(50), unique=True, nullable=False, index=True)  # factory_manager, operator...
+    role_name = Column(String(100), nullable=False)  # 厂长、操作员...
+    position = Column(String(30), nullable=False, index=True)  # 职位层级
+    department = Column(String(50), default="all")  # 所属部门
+    description = Column(Text)
+    is_system = Column(Boolean, default=False, index=True)  # 系统内置角色不可删除
+    level = Column(Integer, default=999)  # 层级数字，越小越高
+    permissions = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    # 数据范围: {"type": "own"|"department"|"factory"|"all"}
+    data_scope = Column(JSON().with_variant(JSONB, "postgresql"), default={"type": "own"})
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # 关系
+    users = relationship("User", back_populates="role_obj", foreign_keys="User.role_id")
+
+    __table_args__ = (
+        Index("idx_role_position_dept", "position", "department"),
+    )
+
+
+class Permission(Base):
+    """权限表 - 细粒度权限定义"""
+
+    __tablename__ = "permissions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    module = Column(String(50), nullable=False, index=True)  # work_order, production_report...
+    action = Column(String(30), nullable=False, index=True)  # view, create, edit, delete, approve...
+    module_name = Column(String(50))  # 中文模块名
+    action_name = Column(String(50))  # 中文动作名
+    description = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_perm_module_action", "module", "action", unique=True),
+    )
+
+
+class UserRole(Base):
+    """用户-角色关联表 - 支持多角色"""
+
+    __tablename__ = "user_roles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False, index=True)
+    is_primary = Column(Boolean, default=True)  # 是否主角色
+    assigned_by = Column(String(50))
+    assigned_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
+
+    # 关系
+    user_obj = relationship("User", back_populates="user_roles", foreign_keys=[user_id])
+    role_obj = relationship("Role", foreign_keys=[role_id])
+
+    __table_args__ = (
+        Index("idx_user_role_user_role", "user_id", "role_id", unique=True),
+    )
+
+
+class RolePermission(Base):
+    """角色-权限关联表"""
+
+    __tablename__ = "role_permissions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False, index=True)
+    permission_id = Column(UUID(as_uuid=True), ForeignKey("permissions.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_role_perm_role_perm", "role_id", "permission_id", unique=True),
+    )
+
+
 class User(Base):
     """用户表"""
     
@@ -38,46 +125,20 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(100))
     factory_id = Column(String(50), index=True)
-    role = Column(String(20), default="operator", index=True)  # admin, manager, operator, viewer
+    role = Column(String(50), default="operator", index=True)  # 兼容字段：快捷角色编码
+    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=True, index=True)  # 关联角色表
     is_active = Column(Boolean, default=True)
     is_superuser = Column(Boolean, default=False)
     last_login = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
+    # 关系
+    role_obj = relationship("Role", back_populates="users", foreign_keys=[role_id])
+    user_roles = relationship("UserRole", back_populates="user_obj", foreign_keys="UserRole.user_id")
+    
     __table_args__ = (
         Index("idx_user_factory_role", "factory_id", "role"),
-    )
-
-
-class Factory(Base):
-    """租户注册表 (对齐 engflow companies；factory_id 即租户键)"""
-
-    __tablename__ = "factories"
-
-    id = Column(String(50), primary_key=True)  # = factory_id / 租户键
-    name = Column(String(100), nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
-class UserInvitation(Base):
-    """用户邀请表 (邀请制多租户；安全 token 邀请，改进自 engflow)"""
-
-    __tablename__ = "user_invitations"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
-    email = Column(String(100), nullable=False, index=True)
-    factory_id = Column(String(50), nullable=False, index=True)
-    role = Column(String(20), default="operator", nullable=False)
-    token = Column(String(64), unique=True, nullable=False, index=True)
-    accepted = Column(Boolean, default=False, nullable=False)
-    invited_by = Column(String(50))
-    expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    __table_args__ = (
-        Index("idx_invitation_email_factory", "email", "factory_id"),
     )
 
 
@@ -86,7 +147,7 @@ class WorkOrder(Base):
     
     __tablename__ = "work_orders"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     work_order_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
     sales_order_id = Column(String(50), index=True)
@@ -128,10 +189,10 @@ class ProductionReport(Base):
     
     __tablename__ = "production_reports"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     report_code = Column(String(50), unique=True, nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
-    work_order_id = Column(UUID(as_uuid=True), ForeignKey("work_orders.id"), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
     station_id = Column(String(50), nullable=False, index=True)
     good_qty = Column(Integer, nullable=False, default=0)
     defect_qty = Column(Integer, default=0)
@@ -162,8 +223,8 @@ class ProductionReportComment(Base):
     
     __tablename__ = "production_report_comments"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
-    report_id = Column(UUID(as_uuid=True), ForeignKey("production_reports.id"), nullable=False, index=True)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    report_id = Column(String(36), ForeignKey("production_reports.id"), nullable=False, index=True)
     comment = Column(Text, nullable=False)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -172,12 +233,33 @@ class ProductionReportComment(Base):
     report = relationship("ProductionReport", back_populates="comments")
 
 
+class Product(Base):
+    """产品主数据表"""
+
+    __tablename__ = "products"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_code = Column(String(50), unique=True, nullable=False, index=True)
+    product_name = Column(String(100), nullable=False)
+    category = Column(String(50), nullable=False, default="default")
+    unit = Column(String(20), nullable=False, default="pcs")
+    description = Column(String(500))
+    status = Column(String(20), nullable=False, default="active")
+    standard_cost = Column(Float)
+    selling_price = Column(Float)
+    current_bom_version = Column(String(20))
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class Station(Base):
     """工位/产线表"""
     
     __tablename__ = "stations"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     station_code = Column(String(50), nullable=False, index=True)
     station_name = Column(String(100), nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
@@ -200,7 +282,7 @@ class Routing(Base):
     
     __tablename__ = "routings"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     routing_code = Column(String(50), unique=True, nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
     product_id = Column(String(50), nullable=False, index=True)
@@ -221,7 +303,7 @@ class Equipment(Base):
     
     __tablename__ = "equipment"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     equipment_code = Column(String(50), unique=True, nullable=False)
     equipment_name = Column(String(100), nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
@@ -242,7 +324,7 @@ class Warehouse(Base):
     
     __tablename__ = "warehouses"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     warehouse_code = Column(String(50), unique=True, nullable=False, index=True)
     warehouse_name = Column(String(100), nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
@@ -263,10 +345,10 @@ class Location(Base):
     
     __tablename__ = "locations"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     location_code = Column(String(50), nullable=False, index=True)
     location_name = Column(String(100))
-    warehouse_id = Column(UUID(as_uuid=True), ForeignKey("warehouses.id"), nullable=False, index=True)
+    warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False, index=True)
     location_type = Column(String(20), default="rack")
     zone = Column(String(50))
     capacity = Column(Integer)
@@ -284,12 +366,12 @@ class Inventory(Base):
     
     __tablename__ = "inventory"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     material_id = Column(String(50), nullable=False, index=True)
     material_code = Column(String(50), nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
-    warehouse_id = Column(UUID(as_uuid=True), ForeignKey("warehouses.id"), nullable=False, index=True)
-    location_id = Column(UUID(as_uuid=True), ForeignKey("locations.id"))
+    warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False, index=True)
+    location_id = Column(String(36), ForeignKey("locations.id"))
     batch_code = Column(String(50), index=True)
     total_qty = Column(Integer, default=0, nullable=False)
     available_qty = Column(Integer, default=0, nullable=False)
@@ -309,10 +391,10 @@ class InboundOrder(Base):
     
     __tablename__ = "inbound_orders"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     inbound_code = Column(String(50), unique=True, nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
-    warehouse_id = Column(UUID(as_uuid=True), ForeignKey("warehouses.id"), nullable=False)
+    warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False)
     material_id = Column(String(50), nullable=False)
     material_code = Column(String(50), nullable=False)
     quantity = Column(Integer, nullable=False)
@@ -320,7 +402,7 @@ class InboundOrder(Base):
     supplier_id = Column(String(50))
     purchase_order_id = Column(String(50))
     unit_cost = Column(Numeric(10, 2))
-    location_id = Column(UUID(as_uuid=True), ForeignKey("locations.id"))
+    location_id = Column(String(36), ForeignKey("locations.id"))
     inbound_type = Column(String(20), default="purchase")
     status = Column(String(20), default="pending")
     created_by = Column(String(50))
@@ -333,10 +415,10 @@ class OutboundOrder(Base):
     
     __tablename__ = "outbound_orders"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default="gen_random_uuidid()")
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     outbound_code = Column(String(50), unique=True, nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
-    warehouse_id = Column(UUID(as_uuid=True), ForeignKey("warehouses.id"), nullable=False)
+    warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False)
     material_id = Column(String(50), nullable=False)
     quantity = Column(Integer, nullable=False)
     work_order_id = Column(String(50), index=True)
@@ -595,6 +677,7 @@ __all__ = [
     "WorkOrder",
     "ProductionReport",
     "ProductionReportComment",
+    "Product",
     "Station",
     "Routing",
     "Equipment",

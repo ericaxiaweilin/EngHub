@@ -3,13 +3,12 @@ QMS API Routes
 检验管理、不良品管理
 """
 
-from fastapi import APIRouter, Header, Depends
+from fastapi import APIRouter, Header
 from typing import Optional, List
 from pydantic import BaseModel
 from datetime import datetime
-from core.auth.security import enforce_tenant
 
-router = APIRouter(prefix="/api/v1", tags=["qms"], dependencies=[Depends(enforce_tenant)])
+router = APIRouter(prefix="/api/v1", tags=["qms"])
 
 # --- Inspection Endpoints ---
 

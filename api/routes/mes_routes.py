@@ -3,24 +3,26 @@ MES API Routes
 工单管理、生产报工、工艺路线、工位管理、设备管理
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import Optional, List
 from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from database.db_config import get_db
-from database.models import User
-from api.services.work_order_service import WorkOrderService
+from database.models import User, Product
+from api.services.work_order_service import WorkOrderService, WOStatus
 from api.services.mes_services import (
     ProductionReportService,
     StationService,
     RoutingService,
     EquipmentService,
 )
-from core.auth.security import get_current_user, enforce_tenant
+from core.auth.security import get_current_user
 
-router = APIRouter(prefix="/api/v1", tags=["mes"], dependencies=[Depends(enforce_tenant)])
+router = APIRouter(prefix="/api/v1", tags=["mes"])
+
 
 # --- Request/Response Models ---
 
@@ -46,6 +48,10 @@ class WorkOrderUpdate(BaseModel):
 class WorkOrderSplit(BaseModel):
     split_qty: int
     remark: Optional[str] = None
+
+
+class WorkOrderAction(BaseModel):
+    reason: Optional[str] = None
 
 
 class ProductionReportCreate(BaseModel):
@@ -80,17 +86,18 @@ class RoutingCreate(BaseModel):
     steps: List[dict]
 
 
-# --- Work Order Endpoints ---
+# ============================================================
+# Work Order Endpoints
+# ============================================================
 
-@router.post("/work-orders")
+@router.post("/work-orders", status_code=201)
 async def create_work_order(
     wo: WorkOrderCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """创建工单"""
+    """创建工单（草稿状态）"""
     service = WorkOrderService(db)
-    
     try:
         work_order = await service.create_work_order(
             factory_id=wo.factory_id,
@@ -103,13 +110,7 @@ async def create_work_order(
             remark=wo.remark,
             created_by=current_user.username,
         )
-        
-        return {
-            "id": work_order.id,
-            "work_order_code": work_order.work_order_code,
-            "status": work_order.status,
-            "created_at": work_order.created_at.isoformat()
-        }
+        return service.to_dict(work_order)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -119,70 +120,83 @@ async def list_work_orders(
     factory_id: str,
     status: Optional[str] = None,
     product_id: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    priority: Optional[str] = None,
+    station_id: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """获取工单列表"""
+    """获取工单列表（含进度信息）"""
     service = WorkOrderService(db)
-    
     skip = (page - 1) * page_size
     work_orders = await service.list_work_orders(
         factory_id=factory_id,
         status=status,
         product_id=product_id,
+        priority=priority,
+        station_id=station_id,
         skip=skip,
-        limit=page_size
+        limit=page_size,
     )
-    
     total = len(work_orders)
-    
-    return {
-        "items": [
-            {
-                "id": wo.id,
-                "work_order_code": wo.work_order_code,
-                "status": wo.status,
-                "product_id": wo.product_id,
-                "planned_qty": wo.planned_qty,
-                "completed_qty": wo.completed_qty,
-                "created_at": wo.created_at.isoformat()
-            }
-            for wo in work_orders
-        ],
-        "total": total,
-        "page": page,
-        "page_size": page_size
-    }
+
+    items = []
+    for wo in work_orders:
+        d = service.to_dict(wo)
+        progress = await service.get_progress(wo)
+        d.update(progress)
+        items.append(d)
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/work-orders/stats")
+async def get_work_order_stats(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取工单统计卡片数据"""
+    service = WorkOrderService(db)
+    return await service.get_stats(factory_id)
 
 
 @router.get("/work-orders/{work_order_id}")
 async def get_work_order(
     work_order_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """获取工单详情"""
     service = WorkOrderService(db)
     work_order = await service.get_work_order_by_id(work_order_id)
-    
     if not work_order:
         raise HTTPException(status_code=404, detail="Work order not found")
-    
-    return {
-        "id": work_order.id,
-        "work_order_code": work_order.work_order_code,
-        "status": work_order.status,
-        "product_id": work_order.product_id,
-        "planned_qty": work_order.planned_qty,
-        "completed_qty": work_order.completed_qty,
-        "good_qty": work_order.good_qty,
-        "defect_qty": work_order.defect_qty,
-        "priority": work_order.priority,
-        "planned_due": work_order.planned_due.isoformat() if work_order.planned_due else None,
-        "created_at": work_order.created_at.isoformat()
-    }
+
+    reports = []
+    if hasattr(work_order, 'production_reports') and work_order.production_reports:
+        reports = [
+            {
+                "id": str(r.id), "report_code": r.report_code,
+                "work_order_id": str(r.work_order_id) if r.work_order_id else None,
+                "station_id": r.station_id, "good_qty": r.good_qty,
+                "defect_qty": r.defect_qty, "scrap_qty": r.scrap_qty,
+                "report_type": r.report_type, "shift": r.shift,
+                "operator_id": r.operator_id, "remark": r.remark,
+                "is_modified": r.is_modified,
+                "modified_at": r.modified_at.isoformat() if r.modified_at else None,
+                "modified_by": r.modified_by,
+                "created_by": r.created_by,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in work_order.production_reports
+        ]
+
+    result = service.to_dict(work_order)
+    result["production_reports"] = reports
+    result["progress"] = await service.get_progress(work_order)
+    return result
 
 
 @router.patch("/work-orders/{work_order_id}")
@@ -190,11 +204,10 @@ async def update_work_order(
     work_order_id: str,
     wo: WorkOrderUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """更新工单"""
     service = WorkOrderService(db)
-    
     try:
         work_order = await service.update_work_order(
             work_order_id=work_order_id,
@@ -204,15 +217,9 @@ async def update_work_order(
             assigned_station_id=wo.station_id,
             remark=wo.remark,
         )
-        
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
-        
-        return {
-            "id": work_order.id,
-            "status": work_order.status,
-            "warning": None
-        }
+        return service.to_dict(work_order)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -221,16 +228,15 @@ async def update_work_order(
 async def release_work_order(
     work_order_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """下达工单"""
+    """待下发 → 已下达"""
     service = WorkOrderService(db)
-    
     try:
         work_order = await service.release_work_order(work_order_id)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
-        return {"status": work_order.status}
+        return service.to_dict(work_order)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -239,16 +245,68 @@ async def release_work_order(
 async def start_work_order(
     work_order_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """开始工单"""
+    """已下达 → 生产中"""
     service = WorkOrderService(db)
-    
     try:
         work_order = await service.start_work_order(work_order_id)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
-        return {"status": work_order.status}
+        return service.to_dict(work_order)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/work-orders/{work_order_id}/pause")
+async def pause_work_order(
+    work_order_id: str,
+    data: WorkOrderAction = WorkOrderAction(),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """生产中 → 暂停"""
+    service = WorkOrderService(db)
+    try:
+        work_order = await service.pause_work_order(work_order_id, data.reason or "")
+        if not work_order:
+            raise HTTPException(status_code=404, detail="Work order not found")
+        return service.to_dict(work_order)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/work-orders/{work_order_id}/resume")
+async def resume_work_order(
+    work_order_id: str,
+    data: WorkOrderAction = WorkOrderAction(),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """暂停 → 生产中"""
+    service = WorkOrderService(db)
+    try:
+        work_order = await service.resume_work_order(work_order_id, data.reason or "")
+        if not work_order:
+            raise HTTPException(status_code=404, detail="Work order not found")
+        return service.to_dict(work_order)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/work-orders/{work_order_id}/pending-inbound")
+async def mark_pending_inbound(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """生产中 → 待入库"""
+    service = WorkOrderService(db)
+    try:
+        work_order = await service.mark_pending_inbound(work_order_id)
+        if not work_order:
+            raise HTTPException(status_code=404, detail="Work order not found")
+        return service.to_dict(work_order)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -256,17 +314,38 @@ async def start_work_order(
 @router.post("/work-orders/{work_order_id}/complete")
 async def complete_work_order(
     work_order_id: str,
+    completed_qty: Optional[int] = None,
+    good_qty: Optional[int] = None,
+    defect_qty: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """完成工单"""
+    """待入库/生产中 → 已完成"""
     service = WorkOrderService(db)
-    
     try:
-        work_order = await service.complete_work_order(work_order_id)
+        work_order = await service.complete_work_order(
+            work_order_id, completed_qty, good_qty, defect_qty
+        )
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
-        return {"status": work_order.status}
+        return service.to_dict(work_order)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/work-orders/{work_order_id}/close")
+async def close_work_order(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """已完成 → 已关闭"""
+    service = WorkOrderService(db)
+    try:
+        work_order = await service.close_work_order(work_order_id)
+        if not work_order:
+            raise HTTPException(status_code=404, detail="Work order not found")
+        return service.to_dict(work_order)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -274,18 +353,17 @@ async def complete_work_order(
 @router.post("/work-orders/{work_order_id}/cancel")
 async def cancel_work_order(
     work_order_id: str,
-    reason: str,
+    reason: str = "",
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """取消工单"""
     service = WorkOrderService(db)
-    
     try:
         work_order = await service.cancel_work_order(work_order_id, reason)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
-        return {"status": work_order.status}
+        return service.to_dict(work_order)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -295,17 +373,10 @@ async def split_work_order(
     work_order_id: str,
     data: WorkOrderSplit,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    拆分工单
-    
-    规则:
-    - 只能拆分 draft/pending 状态的工单
-    - 拆分数量 >= 计划数的 50%
-    """
+    """拆分工单"""
     service = WorkOrderService(db)
-    
     try:
         original_wo, new_wo = await service.split_work_order(
             work_order_id=work_order_id,
@@ -313,27 +384,74 @@ async def split_work_order(
             remark=data.remark,
             created_by=current_user.username,
         )
-        
         return {
-            "original_work_order_id": original_wo.id,
-            "new_work_order_id": new_wo.id,
-            "split_qty": data.split_qty
+            "original_work_order": service.to_dict(original_wo),
+            "new_work_order": service.to_dict(new_wo),
+            "split_qty": data.split_qty,
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# --- Production Report Endpoints ---
+# ============================================================
+# Production Report Endpoints
+# ============================================================
+
+@router.get("/production-reports")
+async def list_production_reports(
+    factory_id: str,
+    work_order_id: Optional[str] = None,
+    station_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取生产报工列表（看板/报工页使用）"""
+    service = ProductionReportService(db)
+    skip = max(page - 1, 0) * page_size
+    reports = await service.list_reports(
+        factory_id=factory_id,
+        work_order_id=work_order_id,
+        station_id=station_id,
+        skip=skip,
+        limit=page_size,
+    )
+    return {
+        "items": [
+            {
+                "id": str(r.id),
+                "report_code": r.report_code,
+                "factory_id": r.factory_id,
+                "work_order_id": str(r.work_order_id) if r.work_order_id else None,
+                "station_id": r.station_id,
+                "good_qty": r.good_qty,
+                "defect_qty": r.defect_qty,
+                "scrap_qty": r.scrap_qty,
+                "report_type": r.report_type,
+                "shift": r.shift,
+                "operator_id": r.operator_id,
+                "remark": r.remark,
+                "is_modified": r.is_modified,
+                "modified_at": r.modified_at.isoformat() if r.modified_at else None,
+                "modified_by": r.modified_by,
+                "created_by": r.created_by,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in reports
+        ],
+        "total": len(reports),
+    }
+
 
 @router.post("/production-reports")
 async def create_production_report(
     report: ProductionReportCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """创建生产报工"""
     service = ProductionReportService(db)
-    
     try:
         production_report = await service.create_report(
             factory_id=report.factory_id,
@@ -348,147 +466,14 @@ async def create_production_report(
             remark=report.remark,
             created_by=current_user.username,
         )
-        
         return {
             "id": production_report.id,
             "report_code": production_report.report_code,
             "status": "submitted",
-            "created_at": production_report.created_at.isoformat()
+            "created_at": production_report.created_at.isoformat(),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/production-reports")
-async def list_production_reports(
-    factory_id: str,
-    work_order_id: Optional[str] = None,
-    station_id: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取报工列表"""
-    service = ProductionReportService(db)
-    
-    skip = (page - 1) * page_size
-    reports = await service.list_reports(
-        factory_id=factory_id,
-        work_order_id=work_order_id,
-        station_id=station_id,
-        skip=skip,
-        limit=page_size
-    )
-    
-    total = len(reports)
-    
-    return {
-        "items": [
-            {
-                "id": r.id,
-                "report_code": r.report_code,
-                "work_order_id": str(r.work_order_id),
-                "station_id": r.station_id,
-                "good_qty": r.good_qty,
-                "defect_qty": r.defect_qty,
-                "scrap_qty": r.scrap_qty,
-                "shift": r.shift,
-                "created_at": r.created_at.isoformat()
-            }
-            for r in reports
-        ],
-        "total": total,
-        "page": page,
-        "page_size": page_size
-    }
-
-
-@router.get("/production-reports/{report_id}")
-async def get_production_report(
-    report_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取报工详情"""
-    service = ProductionReportService(db)
-    report = await service.get_report_by_id(report_id)
-    
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-    
-    return {
-        "id": report.id,
-        "report_code": report.report_code,
-        "work_order_id": str(report.work_order_id),
-        "station_id": report.station_id,
-        "good_qty": report.good_qty,
-        "defect_qty": report.defect_qty,
-        "scrap_qty": report.scrap_qty,
-        "report_type": report.report_type,
-        "shift": report.shift,
-        "operator_id": report.operator_id,
-        "remark": report.remark,
-        "is_modified": report.is_modified,
-        "comments": [
-            {"comment": c.comment, "created_by": c.created_by, "created_at": c.created_at.isoformat()}
-            for c in report.comments
-        ],
-        "created_at": report.created_at.isoformat()
-    }
-
-
-@router.post("/production-reports/{report_id}/comment")
-async def add_production_report_comment(
-    report_id: str,
-    data: ProductionReportComment,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """添加报工评论"""
-    service = ProductionReportService(db)
-    
-    comment = await service.add_comment(
-        report_id=report_id,
-        comment=data.comment,
-        created_by=current_user.username,
-    )
-    
-    return {
-        "id": comment.id,
-        "comment": comment.comment,
-        "created_at": comment.created_at.isoformat()
-    }
-
-
-@router.patch("/production-reports/{report_id}")
-async def modify_production_report(
-    report_id: str,
-    good_qty: Optional[int] = None,
-    defect_qty: Optional[int] = None,
-    remark: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """修改报工"""
-    service = ProductionReportService(db)
-    
-    report = await service.modify_report(
-        report_id=report_id,
-        good_qty=good_qty,
-        defect_qty=defect_qty,
-        remark=remark,
-        modified_by=current_user.username,
-    )
-    
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-    
-    return {
-        "id": report.id,
-        "is_modified": report.is_modified,
-        "modified_at": report.modified_at.isoformat() if report.modified_at else None
-    }
 
 
 # --- Station Endpoints ---
@@ -497,13 +482,12 @@ async def modify_production_report(
 async def create_station(
     station: StationCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """创建工位"""
     service = StationService(db)
-    
     try:
-        new_station = await service.create_station(
+        result = await service.create_station(
             factory_id=station.factory_id,
             station_code=station.station_code,
             station_name=station.station_name,
@@ -512,12 +496,7 @@ async def create_station(
             workshop_id=station.workshop_id,
             created_by=current_user.username,
         )
-        
-        return {
-            "id": new_station.id,
-            "station_code": new_station.station_code,
-            "status": "active"
-        }
+        return {"id": str(result.id), "station_code": result.station_code, "status": "success"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -526,107 +505,39 @@ async def create_station(
 async def list_stations(
     factory_id: str,
     station_type: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """获取工位列表"""
     service = StationService(db)
-    
-    skip = (page - 1) * page_size
-    stations = await service.list_stations(
-        factory_id=factory_id,
-        station_type=station_type,
-        status=status,
-        skip=skip,
-        limit=page_size
-    )
-    
-    total = len(stations)
-    
+    stations = await service.list_stations(factory_id=factory_id, station_type=station_type)
     return {
         "items": [
             {
-                "id": s.id,
-                "station_code": s.station_code,
-                "station_name": s.station_name,
-                "station_type": s.station_type,
-                "capacity_per_hour": s.capacity_per_hour,
-                "status": s.status,
+                "id": str(s.id), "station_code": s.station_code,
+                "station_name": s.station_name, "factory_id": s.factory_id,
+                "station_type": s.station_type, "capacity_per_hour": s.capacity_per_hour,
+                "status": s.status, "created_at": s.created_at.isoformat() if s.created_at else None,
             }
             for s in stations
         ],
-        "total": total,
-        "page": page,
-        "page_size": page_size
+        "total": len(stations),
     }
 
 
 @router.get("/stations/{station_id}")
-async def get_station(
-    station_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
+async def get_station(station_id: str, db: AsyncSession = Depends(get_db)):
     """获取工位详情"""
     service = StationService(db)
     station = await service.get_station_by_id(station_id)
-    
     if not station:
         raise HTTPException(status_code=404, detail="Station not found")
-    
     return {
-        "id": station.id,
-        "station_code": station.station_code,
-        "station_name": station.station_name,
-        "station_type": station.station_type,
-        "workshop_id": station.workshop_id,
-        "capacity_per_hour": station.capacity_per_hour,
-        "equipment_ids": station.equipment_ids,
+        "id": str(station.id), "station_code": station.station_code,
+        "station_name": station.station_name, "factory_id": station.factory_id,
+        "station_type": station.station_type, "capacity_per_hour": station.capacity_per_hour,
         "status": station.status,
     }
-
-
-@router.put("/stations/{station_id}")
-async def update_station(
-    station_id: str,
-    station: StationCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """更新工位"""
-    service = StationService(db)
-    
-    updated = await service.update_station(
-        station_id=station_id,
-        station_name=station.station_name,
-        station_type=station.station_type,
-        capacity_per_hour=station.capacity_per_hour,
-        workshop_id=station.workshop_id,
-    )
-    
-    if not updated:
-        raise HTTPException(status_code=404, detail="Station not found")
-    
-    return {"id": updated.id, "status": updated.status}
-
-
-@router.delete("/stations/{station_id}")
-async def delete_station(
-    station_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """删除工位"""
-    service = StationService(db)
-    success = await service.delete_station(station_id)
-    
-    if not success:
-        raise HTTPException(status_code=404, detail="Station not found")
-    
-    return {"message": "Station deleted"}
 
 
 # --- Routing Endpoints ---
@@ -635,26 +546,19 @@ async def delete_station(
 async def create_routing(
     routing: RoutingCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """创建工艺路线"""
     service = RoutingService(db)
-    
     try:
-        new_routing = await service.create_routing(
+        result = await service.create_routing(
             factory_id=routing.factory_id,
             product_id=routing.product_id,
             version=routing.version,
             steps=routing.steps,
             created_by=current_user.username,
         )
-        
-        return {
-            "id": new_routing.id,
-            "routing_code": new_routing.routing_code,
-            "product_id": new_routing.product_id,
-            "version": new_routing.version,
-        }
+        return {"id": str(result.id), "routing_code": result.routing_code, "status": "success"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -663,39 +567,24 @@ async def create_routing(
 async def list_routings(
     factory_id: str,
     product_id: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """获取工艺路线列表"""
     service = RoutingService(db)
-    
-    skip = (page - 1) * page_size
-    routings = await service.list_routings(
-        factory_id=factory_id,
-        product_id=product_id,
-        skip=skip,
-        limit=page_size
-    )
-    
-    total = len(routings)
-    
+    routings = await service.list_routings(factory_id=factory_id, product_id=product_id)
     return {
         "items": [
             {
-                "id": r.id,
-                "routing_code": r.routing_code,
-                "product_id": r.product_id,
-                "version": r.version,
-                "steps_count": len(r.steps),
-                "is_active": r.is_active,
+                "id": str(r.id), "routing_code": r.routing_code,
+                "factory_id": r.factory_id, "product_id": r.product_id,
+                "version": r.version, "is_active": r.is_active,
+                "steps": r.steps,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in routings
         ],
-        "total": total,
-        "page": page,
-        "page_size": page_size
+        "total": len(routings),
     }
 
 
@@ -703,217 +592,78 @@ async def list_routings(
 async def get_routing(
     routing_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """获取工艺路线详情"""
+    """获取工艺路线详情（含工序步骤，供工单详情追溯当前工序）"""
     service = RoutingService(db)
     routing = await service.get_routing_by_id(routing_id)
-    
     if not routing:
-        raise HTTPException(status_code=404, detail="Routing not found")
-    
+        raise HTTPException(status_code=404, detail="工艺路线不存在")
     return {
-        "id": routing.id,
-        "routing_code": routing.routing_code,
-        "product_id": routing.product_id,
-        "version": routing.version,
+        "id": str(routing.id), "routing_code": routing.routing_code,
+        "factory_id": routing.factory_id, "product_id": routing.product_id,
+        "version": routing.version, "is_active": routing.is_active,
         "steps": routing.steps,
-        "is_active": routing.is_active,
+        "created_by": routing.created_by,
+        "created_at": routing.created_at.isoformat() if routing.created_at else None,
+        "updated_at": routing.updated_at.isoformat() if routing.updated_at else None,
     }
-
-
-@router.put("/routings/{routing_id}")
-async def update_routing(
-    routing_id: str,
-    version: Optional[str] = None,
-    steps: Optional[List[dict]] = None,
-    is_active: Optional[bool] = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """更新工艺路线"""
-    service = RoutingService(db)
-    
-    updated = await service.update_routing(
-        routing_id=routing_id,
-        version=version,
-        steps=steps,
-        is_active=is_active,
-    )
-    
-    if not updated:
-        raise HTTPException(status_code=404, detail="Routing not found")
-    
-    return {"id": updated.id, "version": updated.version, "is_active": updated.is_active}
-
-
-@router.post("/routings/{routing_id}/deactivate")
-async def deactivate_routing(
-    routing_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """停用工艺路线"""
-    service = RoutingService(db)
-    success = await service.deactivate_routing(routing_id)
-    
-    if not success:
-        raise HTTPException(status_code=404, detail="Routing not found")
-    
-    return {"message": "Routing deactivated"}
 
 
 # --- Equipment Endpoints ---
 
-class EquipmentCreate(BaseModel):
-    factory_id: str
-    equipment_code: str
-    equipment_name: str
-    equipment_type: Optional[str] = None
-    station_id: Optional[str] = None
-    spec: Optional[dict] = None
-
-
-@router.post("/equipment")
-async def create_equipment(
-    equipment: EquipmentCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """创建设备"""
-    service = EquipmentService(db)
-    
-    try:
-        new_equipment = await service.create_equipment(
-            factory_id=equipment.factory_id,
-            equipment_code=equipment.equipment_code,
-            equipment_name=equipment.equipment_name,
-            equipment_type=equipment.equipment_type,
-            station_id=equipment.station_id,
-            spec=equipment.spec,
-        )
-        
-        return {
-            "id": new_equipment.id,
-            "equipment_code": new_equipment.equipment_code,
-            "status": "available"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @router.get("/equipment")
 async def list_equipment(
     factory_id: str,
-    equipment_type: Optional[str] = None,
-    status: Optional[str] = None,
-    station_id: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """获取设备列表"""
     service = EquipmentService(db)
-    
-    skip = (page - 1) * page_size
-    equipment_list = await service.list_equipment(
-        factory_id=factory_id,
-        equipment_type=equipment_type,
-        status=status,
-        station_id=station_id,
-        skip=skip,
-        limit=page_size
-    )
-    
-    total = len(equipment_list)
-    
+    equipment_list = await service.list_equipment(factory_id=factory_id)
     return {
         "items": [
             {
-                "id": e.id,
-                "equipment_code": e.equipment_code,
-                "equipment_name": e.equipment_name,
-                "equipment_type": e.equipment_type,
-                "station_id": e.station_id,
-                "status": e.status,
+                "id": str(e.id), "equipment_code": e.equipment_code,
+                "equipment_name": e.equipment_name, "factory_id": e.factory_id,
+                "equipment_type": e.equipment_type, "status": e.status,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
             }
             for e in equipment_list
         ],
-        "total": total,
-        "page": page,
-        "page_size": page_size
+        "total": len(equipment_list),
     }
 
 
-@router.get("/equipment/{equipment_id}")
-async def get_equipment(
-    equipment_id: str,
+# --- Product Endpoints ---
+
+@router.get("/products")
+async def list_products(
+    factory_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """获取设备详情"""
-    service = EquipmentService(db)
-    equipment = await service.get_equipment_by_id(equipment_id)
-    
-    if not equipment:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-    
+    """获取产品列表（供各页面把 product_id 解析为可读的产品编码/名称）。
+    factory_id 可选：不传则返回全部产品，避免跨厂区引用的产品解析不到。"""
+    query = select(Product)
+    if factory_id:
+        query = query.where(Product.factory_id == factory_id)
+    query = query.order_by(Product.created_at.desc())
+    result = await db.execute(query)
+    products = list(result.scalars().all())
     return {
-        "id": equipment.id,
-        "equipment_code": equipment.equipment_code,
-        "equipment_name": equipment.equipment_name,
-        "equipment_type": equipment.equipment_type,
-        "station_id": equipment.station_id,
-        "status": equipment.status,
-        "spec": equipment.spec,
+        "items": [
+            {
+                "id": str(p.id), "product_code": p.product_code,
+                "product_name": p.product_name, "factory_id": p.factory_id,
+                "category": p.category, "unit": p.unit, "status": p.status,
+                "current_bom_version": p.current_bom_version,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            }
+            for p in products
+        ],
+        "total": len(products),
     }
-
-
-@router.put("/equipment/{equipment_id}")
-async def update_equipment(
-    equipment_id: str,
-    equipment_name: Optional[str] = None,
-    equipment_type: Optional[str] = None,
-    station_id: Optional[str] = None,
-    status: Optional[str] = None,
-    spec: Optional[dict] = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """更新设备"""
-    service = EquipmentService(db)
-    
-    updated = await service.update_equipment(
-        equipment_id=equipment_id,
-        equipment_name=equipment_name,
-        equipment_type=equipment_type,
-        station_id=station_id,
-        status=status,
-        spec=spec,
-    )
-    
-    if not updated:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-    
-    return {"id": updated.id, "status": updated.status}
-
-
-@router.post("/equipment/{equipment_id}/status")
-async def update_equipment_status(
-    equipment_id: str,
-    status: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """更新设备状态"""
-    service = EquipmentService(db)
-    success = await service.update_status(equipment_id, status)
-    
-    if not success:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-    
-    return {"equipment_id": equipment_id, "status": status}
 
 
 __all__ = ["router"]

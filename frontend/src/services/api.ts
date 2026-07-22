@@ -28,17 +28,22 @@ api.interceptors.response.use(
   (response) => response.data,
   (error) => {
     const status = error.response?.status;
-    // 未认证/登录过期：清除 token 并跳转登录页
+    // 未认证/登录过期：清除 token 并跳转登录页（保留记住密码供自动填充）
     if (status === 401) {
       localStorage.removeItem('token');
       localStorage.removeItem('refresh_token');
       localStorage.removeItem('user');
+      localStorage.removeItem('login_at');
       if (window.location.pathname !== '/login') {
         window.location.href = '/login';
       }
       return Promise.reject(error);
     }
-    const msg = error.response?.data?.detail || error.message || 'Request failed';
+    const detail = error.response?.data?.detail;
+    // FastAPI 422 返回的 detail 是对象数组，提取 msg 字段避免渲染报错
+    const msg = Array.isArray(detail)
+      ? detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ')
+      : (detail || error.message || 'Request failed');
     message.error(msg);
     return Promise.reject(error);
   }

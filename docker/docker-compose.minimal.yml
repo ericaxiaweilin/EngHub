@@ -38,6 +38,8 @@ services:
       - DATABASE_URL=postgresql://enghub:enghub123@postgres:5432/enghub
       - REDIS_URL=redis://redis:6379
       - SECRET_KEY=your-secret-key-here
+      # 测试模式：启用角色快捷切换（生产环境务必改为 false）
+      - TEST_MODE=true
       # AI 助手 -> litellm 网关 (通过 model-stack 内网直连)
       # 密钥通过 docker/.env 提供 (见 .env.example)，不提交到仓库
       - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-gateway:4000}

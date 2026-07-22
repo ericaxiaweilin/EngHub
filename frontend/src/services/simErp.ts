@@ -18,9 +18,9 @@ export interface SimERPAuditDetail extends SimERPAuditSummary {
   task_type: string
   zone_id: string
   total_penalty_score: number
-  snapshot_payload: Record<string, unknown>
-  plugin_records_payload: Array<Record<string, unknown>>
-  arbiter_result_payload: Record<string, unknown>
+  snapshot_payload: Record<string, any>
+  plugin_records_payload: Array<Record<string, any>>
+  arbiter_result_payload: Record<string, any>
 }
 
 export interface SimERPAuditQuery {
