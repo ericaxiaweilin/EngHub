@@ -129,15 +129,16 @@ class InventoryService:
     async def get_inventory(
         self,
         factory_id: str,
-        material_id: str,
+        material_id: Optional[str] = None,
         warehouse_id: Optional[str] = None,
     ) -> List[Inventory]:
         """获取库存信息"""
         query = select(Inventory).where(
             Inventory.factory_id == factory_id,
-            Inventory.material_id == material_id
         )
-        
+
+        if material_id:
+            query = query.where(Inventory.material_id == material_id)
         if warehouse_id:
             query = query.where(Inventory.warehouse_id == warehouse_id)
         

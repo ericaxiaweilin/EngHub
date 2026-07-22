@@ -710,7 +710,7 @@ class DefectRecord(Base):
     work_order = relationship("WorkOrder")
     production_report = relationship("ProductionReport")
     product = relationship("Product")
-    station_obj = relationship("Station")
+    station_obj = relationship("Station", primaryjoin="foreign(DefectRecord.station_id) == Station.station_code", viewonly=True)
     equipment_obj = relationship("Equipment")
 
 
@@ -826,6 +826,62 @@ class PullReplenishmentTask(Base):
     )
 
 
+# ============================================================
+# QMS 检验模型
+# ============================================================
+
+
+class QualityInspection(Base):
+    """质量检验记录表"""
+    __tablename__ = "quality_inspections"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
+    routing_step_id = Column(String(36), nullable=False, index=True)
+    inspect_type = Column(String(20), nullable=False)  # IQC/IPQC/FQC/OQC
+    inspector_id = Column(String(50), nullable=False)
+    sample_qty = Column(Integer, nullable=False, default=0)
+    defect_qty = Column(Integer, nullable=False, default=0)
+    result = Column(String(20), nullable=False)  # PASS/FAIL/PENDING
+    defect_details = Column(JSON, nullable=True)
+    remark = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    work_order = relationship("WorkOrder")
+
+
+# ============================================================
+# PP 生产计划模型
+# ============================================================
+
+
+class Plan(Base):
+    """生产计划表"""
+    __tablename__ = "plans"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    plan_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    sales_order_id = Column(String(50), nullable=True)
+    quantity = Column(Integer, nullable=False)
+    required_date = Column(DateTime, nullable=False)
+    plan_type = Column(String(20), nullable=False, default="mps")
+    customer_level = Column(String(10), nullable=False, default="b")
+    priority = Column(Integer, nullable=False, default=50)
+    status = Column(String(20), nullable=False, default="draft")
+    due_date = Column(DateTime, nullable=True)
+    priority_score = Column(Float, nullable=False, default=0.0)
+    confirmed_by = Column(String(50), nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    released_by = Column(String(50), nullable=True)
+    released_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_by = Column(String(50), nullable=True)
+
+
 # 导出所有模型
 __all__ = [
     "Base",
@@ -859,4 +915,7 @@ __all__ = [
     "ReconciliationLog",
     "ReplenishmentThreshold",
     "PullReplenishmentTask",
+    # QMS / PP Models
+    "QualityInspection",
+    "Plan",
 ]

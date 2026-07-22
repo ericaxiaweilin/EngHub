@@ -226,10 +226,7 @@ async def get_inventory(
 ):
     """获取库存信息"""
     service = InventoryService(db)
-    
-    if not material_id:
-        return {"items": [], "total": 0}
-    
+
     inventories = await service.get_inventory(
         factory_id=factory_id,
         material_id=material_id,
