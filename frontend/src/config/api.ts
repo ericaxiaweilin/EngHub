@@ -52,6 +52,8 @@ export const API_ENDPOINTS = {
   SIM_FACTORY_SCENARIO: (scenarioId?: string) =>
     `${API_BASE_URL}/api/v1/sim-factory/scenario${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
   SIM_FACTORY_RUN: `${API_BASE_URL}/api/v1/sim-factory/run`,
+  SIM_FACTORY_DASHBOARD_SUMMARY: (scenarioId?: string) =>
+    `${API_BASE_URL}/api/v1/sim-factory/dashboard-summary${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
 
   // Employee Skills (HR)
   SKILLS: `${API_BASE_URL}/api/v1/skills`,

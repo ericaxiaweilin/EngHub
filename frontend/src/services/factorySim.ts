@@ -365,6 +365,22 @@ export interface FactoryScenarioMeta {
   hints: string[]
 }
 
+// 仿真结果看板摘要（与真实生产数据分离，is_simulation 恒为 true）
+export interface FactorySimDashboardSummary {
+  is_simulation: boolean
+  scenario_id: string
+  scenario_name: string
+  engine_version: string
+  horizon_days: number
+  order_count: number
+  section_count: number
+  created_at: string
+  kpis: FactoryKPIs
+  blocking_points: BlockingPoint[]
+  alert_count: number
+  critical_alert_count: number
+}
+
 // ==================== API ====================
 
 export const getFactoryScenarios = () =>
@@ -375,3 +391,6 @@ export const getFactoryScenario = (scenarioId?: string) =>
 
 export const runFactorySimulation = (config: FactorySimConfig) =>
   api.post<any, FactorySimResult>(API_ENDPOINTS.SIM_FACTORY_RUN, config)
+
+export const getFactorySimDashboardSummary = (scenarioId?: string) =>
+  api.get<any, FactorySimDashboardSummary>(API_ENDPOINTS.SIM_FACTORY_DASHBOARD_SUMMARY(scenarioId))

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -30,6 +31,11 @@ from core.sim_factory.scenarios import (
 
 router = APIRouter(prefix="/api/v1/sim-factory", tags=["sim-factory"])
 engine = FactoryLoadEngine()
+
+# 仿真结果看板缓存：仿真为按需计算（不落库），看板每次加载不应重跑全量仿真，
+# 故按 scenario_id 内存缓存，TTL 内复用。仿真数据与真实生产数据完全分离。
+_SIM_SUMMARY_CACHE: Dict[str, Dict[str, Any]] = {}
+_SIM_SUMMARY_TTL = 300  # 秒
 
 
 class FactorySimScenarioResponse(BaseModel):
@@ -107,3 +113,45 @@ async def run_simulation(request: FactorySimRunRequest) -> FactorySimResult:
         return engine.run(config)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/dashboard-summary")
+async def factory_sim_dashboard_summary(
+    scenario_id: Optional[str] = Query(default=None, description="工厂场景 ID，缺省为默认精密机械厂"),
+) -> Dict[str, Any]:
+    """供生产看板使用的仿真结果轻量摘要。
+
+    重要：仿真数据与真实生产数据严格分离，本接口返回结果带 is_simulation=True 标记，
+    前端需独立分区展示，不得与实时报工/工单/设备数据混计。
+    """
+    sid = scenario_id or "enghub-precision-plant"
+    now = datetime.now(timezone.utc)
+    cached = _SIM_SUMMARY_CACHE.get(sid)
+    if cached and (now - cached["ts"]).total_seconds() < _SIM_SUMMARY_TTL:
+        return cached["data"]
+
+    meta = get_scenario_meta(sid)
+    config = build_scenario(sid)
+    try:
+        result = engine.run(config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    k = result.kpis
+    data: Dict[str, Any] = {
+        "is_simulation": True,  # 明确标记：仿真数据，非真实生产
+        "scenario_id": sid,
+        "scenario_name": meta.get("scenario_name", sid),
+        "engine_version": result.engine_version,
+        "horizon_days": result.horizon_days,
+        "order_count": result.order_count,
+        "section_count": result.section_count,
+        "created_at": result.created_at.isoformat(),
+        "kpis": k.model_dump(),
+        # 卡点排行 Top5（供看板快速展示瓶颈）
+        "blocking_points": [bp.model_dump() for bp in result.blocking_points[:5]],
+        "alert_count": len(result.alerts),
+        "critical_alert_count": sum(1 for a in result.alerts if a.level == "critical"),
+    }
+    _SIM_SUMMARY_CACHE[sid] = {"ts": now, "data": data}
+    return data
