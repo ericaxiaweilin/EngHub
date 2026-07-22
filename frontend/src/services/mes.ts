@@ -150,6 +150,10 @@ export interface Defect {
   id: string;
   defect_code?: string;
   work_order_id?: string;
+  production_report_id?: string;
+  product_id?: string;
+  material_id?: string;
+  batch_code?: string;
   defect_type: string;
   description?: string;
   severity?: string;
@@ -157,11 +161,30 @@ export interface Defect {
   defect_qty: number;
   defect_location?: string;
   station_id?: string;
+  equipment_id?: string;
+  // 品质追溯
+  defect_source?: string;        // incoming/process/design/operation/environment/customer
+  root_cause_category?: string;  // 5M1E
   root_cause?: string;
+  responsible_dept?: string;
+  discovery_stage?: string;      // IQC/IPQC/FQC/OQC/customer
   discovery_time?: string;
   inspection_id?: string;
-  status?: string;
+  process_step?: string;
+  // 处置
   disposition?: string;
+  disposition_by?: string;
+  disposition_at?: string;
+  disposition_remark?: string;
+  corrective_action?: string;
+  preventive_action?: string;
+  // 评审/状态
+  ocap_status?: string;
+  review_status?: string;
+  reviewed_by?: string;
+  reviewed_at?: string;
+  status?: string;
+  created_by?: string;
   created_at?: string;
 }
 

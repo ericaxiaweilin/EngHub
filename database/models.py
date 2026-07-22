@@ -701,6 +701,22 @@ class DefectRecord(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     is_finalized = Column(Boolean, default=False, index=True)
 
+    # 品质追溯字段
+    defect_source = Column(String(30), nullable=True)          # incoming/process/design/operation/environment/customer
+    root_cause_category = Column(String(30), nullable=True)    # 5M1E: material/method/machine/man/environment/measurement
+    root_cause = Column(Text, nullable=True)                   # 根因描述
+    responsible_dept = Column(String(30), nullable=True)       # QA/production/purchasing/engineering/vendor
+    discovery_stage = Column(String(20), nullable=True)        # IQC/IPQC/FQC/OQC/customer
+    discovery_time = Column(DateTime, nullable=True)           # 发现时间
+    defect_location = Column(String(200), nullable=True)       # 缺陷位置
+    inspection_id = Column(String(36), nullable=True)          # 关联检验单
+    corrective_action = Column(Text, nullable=True)            # 纠正措施
+    preventive_action = Column(Text, nullable=True)            # 预防措施
+    process_step = Column(String(50), nullable=True)           # 工序名称
+    review_status = Column(String(20), default="pending")      # pending/under_review/reviewed/closed
+    reviewed_by = Column(String(50), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+
     __table_args__ = (
         Index("idx_dr_factory_batch", "factory_id", "batch_code"),
         Index("idx_dr_disposition_severity", "disposition", "severity"),

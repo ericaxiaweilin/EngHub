@@ -235,7 +235,7 @@ async def process_defect(
 
 
 def _serialize_defect(r: DefectRecord) -> dict:
-    """序列化缺陷记录，字段对齐前端 Defect 接口"""
+    """序列化缺陷记录，字段对齐前端 Defect 接口 + 完整品质追溯"""
     return {
         "id": r.id,
         "defect_code": r.record_code,
@@ -244,17 +244,36 @@ def _serialize_defect(r: DefectRecord) -> dict:
         "work_order_id": r.work_order_id,
         "production_report_id": r.production_report_id,
         "product_id": r.product_id,
+        "material_id": r.material_id,
+        "batch_code": r.batch_code,
         "station_id": r.station_id,
         "equipment_id": r.equipment_id,
         "defect_type": r.defect_type,
         "severity": r.severity,
         "quantity": r.quantity,
         "defect_qty": r.quantity,
+        # 品质追溯
+        "defect_source": r.defect_source,
+        "root_cause_category": r.root_cause_category,
+        "root_cause": r.root_cause,
+        "responsible_dept": r.responsible_dept,
+        "discovery_stage": r.discovery_stage,
+        "discovery_time": r.discovery_time.isoformat() if r.discovery_time else None,
+        "defect_location": r.defect_location,
+        "inspection_id": r.inspection_id,
+        "process_step": r.process_step,
+        # 处置
         "disposition": r.disposition,
         "disposition_by": r.disposition_by,
         "disposition_at": r.disposition_at.isoformat() if r.disposition_at else None,
         "disposition_remark": r.disposition_remark,
+        "corrective_action": r.corrective_action,
+        "preventive_action": r.preventive_action,
+        # 评审/状态
         "ocap_status": r.ocap_status,
+        "review_status": r.review_status,
+        "reviewed_by": r.reviewed_by,
+        "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
         "description": r.description,
         "status": "resolved" if r.disposition else "open",
         "created_by": r.created_by,

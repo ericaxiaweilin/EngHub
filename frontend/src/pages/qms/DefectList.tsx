@@ -16,6 +16,7 @@ const SEVERITY_MAP: Record<string, { color: string; text: string }> = {
   critical: { color: 'red', text: '致命' },
   major: { color: 'orange', text: '重大' },
   minor: { color: 'default', text: '轻微' },
+  observation: { color: 'blue', text: '观察' },
 }
 
 const STATUS_MAP: Record<string, { color: string; text: string }> = {
@@ -27,10 +28,46 @@ const STATUS_MAP: Record<string, { color: string; text: string }> = {
 
 const DISPOSITION_MAP: Record<string, string> = {
   rework: '返工',
+  repair: '维修',
   scrap: '报废',
   concession: '让步接收',
+  return: '退供应商',
   return_supplier: '退供应商',
   downgrade: '降级使用',
+}
+
+const SOURCE_MAP: Record<string, string> = {
+  incoming: '来料',
+  process: '制程',
+  design: '设计',
+  operation: '操作',
+  environment: '环境',
+  customer: '客诉',
+}
+
+const CAUSE_MAP: Record<string, string> = {
+  material: '材料',
+  method: '方法',
+  machine: '设备',
+  man: '人员',
+  environment: '环境',
+  measurement: '测量',
+}
+
+const DEPT_MAP: Record<string, string> = {
+  QA: '品保',
+  production: '生产',
+  purchasing: '采购',
+  engineering: '工程',
+  vendor: '供应商',
+}
+
+const STAGE_MAP: Record<string, string> = {
+  IQC: 'IQC来料',
+  IPQC: 'IPQC巡检',
+  FQC: 'FQC终检',
+  OQC: 'OQC出货',
+  customer: '客诉',
 }
 
 interface DrillConfig {
@@ -104,7 +141,7 @@ const DefectList: React.FC = () => {
     return inspections.find(i => i.id === id)?.inspection_code || id
   }
 
-  // ===== 追溯：不良品详情字段（全字段：根因/处置/批次等）=====
+  // ===== 追溯：不良品详情字段（完整品质流程：发现→判定→根因→责任→处置→纠正/预防）=====
   const detailFields: DetailField[] = [
     { label: '不良单号', key: 'defect_code', render: (v: string, r: Defect) => v || r.id },
     { label: '缺陷类型', key: 'defect_type', render: (v: string) => v || '-' },
@@ -113,7 +150,12 @@ const DefectList: React.FC = () => {
       render: (v: string) => { const i = SEVERITY_MAP[v] || { color: 'default', text: v || '-' }; return <Tag color={i.color}>{i.text}</Tag> },
     },
     { label: '数量', key: 'quantity', render: (v: number) => v ?? '-' },
+    { label: '缺陷来源', key: 'defect_source', render: (v: string) => v ? <Tag>{SOURCE_MAP[v] || v}</Tag> : '-' },
+    { label: '发现阶段', key: 'discovery_stage', render: (v: string) => v ? <Tag color="blue">{STAGE_MAP[v] || v}</Tag> : '-' },
+    { label: '发现时间', key: 'discovery_time', render: (v: string) => (v ? dayjs(v).format('YYYY-MM-DD HH:mm') : '-') },
     { label: '责任工位', key: 'station_id', render: (v: string) => stationLabel(v) },
+    { label: '工序', key: 'process_step', render: (v: string) => v || '-' },
+    { label: '缺陷位置', key: 'defect_location', render: (v: string) => v || '-' },
     {
       label: '关联工单', key: 'work_order_id',
       render: (v: string) => v
@@ -121,15 +163,26 @@ const DefectList: React.FC = () => {
         : '-',
     },
     { label: '关联检验单', key: 'inspection_id', render: (v: string) => inspectionCode(v) },
-    { label: '缺陷位置', key: 'defect_location', render: (v: string) => v || '-' },
     { label: '描述', key: 'description', span: 2, render: (v: string) => v || '-' },
-    { label: '根因', key: 'root_cause', span: 2, render: (v: string) => v || '-' },
-    { label: '处置方式', key: 'disposition', render: (v: string) => DISPOSITION_MAP[v] || v || '-' },
+    // 根因判定
+    { label: '原因分类', key: 'root_cause_category', render: (v: string) => v ? <Tag color="volcano">{CAUSE_MAP[v] || v}</Tag> : '-' },
+    { label: '责任部门', key: 'responsible_dept', render: (v: string) => v ? <Tag color="purple">{DEPT_MAP[v] || v}</Tag> : '-' },
+    { label: '根因分析', key: 'root_cause', span: 2, render: (v: string) => v || '待判定' },
+    // 处置
+    { label: '处置方式', key: 'disposition', render: (v: string) => DISPOSITION_MAP[v] || v || '待处置' },
+    { label: '处置人', key: 'disposition_by', render: (v: string) => v || '-' },
+    { label: '处置时间', key: 'disposition_at', render: (v: string) => (v ? dayjs(v).format('YYYY-MM-DD HH:mm') : '-') },
+    { label: '处置说明', key: 'disposition_remark', span: 2, render: (v: string) => v || '-' },
+    // 纠正/预防
+    { label: '纠正措施', key: 'corrective_action', span: 2, render: (v: string) => v || '-' },
+    { label: '预防措施', key: 'preventive_action', span: 2, render: (v: string) => v || '-' },
+    // 状态
     {
       label: '状态', key: 'status',
       render: (s: string) => { const i = STATUS_MAP[s] || { color: 'default', text: s }; return <Tag color={i.color}>{i.text}</Tag> },
     },
-    { label: '发现时间', key: 'discovery_time', render: (v: string) => (v ? dayjs(v).format('YYYY-MM-DD HH:mm') : '-') },
+    { label: '评审人', key: 'reviewed_by', render: (v: string) => v || '-' },
+    { label: '创建人', key: 'created_by', render: (v: string) => v || '-' },
     { label: '创建时间', key: 'created_at', render: (v: string) => (v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '-') },
   ]
 
@@ -175,7 +228,9 @@ const DefectList: React.FC = () => {
 
   const columns = [
     { title: '不良单号', dataIndex: 'defect_code', key: 'code', width: 140, render: (v: string, r: Defect) => v || r.id },
-    { title: '缺陷类型', dataIndex: 'defect_type', key: 'type', width: 110, render: (v: string) => v || '-' },
+    { title: '缺陷类型', dataIndex: 'defect_type', key: 'type', width: 100, render: (v: string) => v || '-' },
+    { title: '来源', dataIndex: 'defect_source', key: 'source', width: 80, render: (v: string) => v ? <Tag>{SOURCE_MAP[v] || v}</Tag> : '-' },
+    { title: '发现阶段', dataIndex: 'discovery_stage', key: 'stage', width: 95, render: (v: string) => v ? <Tag color="blue">{STAGE_MAP[v] || v}</Tag> : '-' },
     { title: '描述', dataIndex: 'description', key: 'desc', ellipsis: true, render: (v: string) => v || '-' },
     {
       title: '严重等级', dataIndex: 'severity', key: 'severity', width: 90,
