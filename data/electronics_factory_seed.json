@@ -1,0 +1,206 @@
+{
+  "industry": "电子厂",
+  "description": "消费电子组装 — SMT/DIP/测试/包装",
+  "generated_at": "2026-07-22T19:12:00.673600",
+  "products": [
+    {
+      "id": "prod-3ab688a2",
+      "code": "PCBA-X100",
+      "name": "智能手表主板",
+      "category": "pcba",
+      "standard_cost": 45.0
+    },
+    {
+      "id": "prod-3b2def16",
+      "code": "PCBA-Y200",
+      "name": "蓝牙耳机主板",
+      "category": "pcba",
+      "standard_cost": 32.0
+    },
+    {
+      "id": "prod-1a833efc",
+      "code": "ASM-Z300",
+      "name": "智能手环成品",
+      "category": "asm",
+      "standard_cost": 89.0
+    }
+  ],
+  "workstations": [
+    {
+      "code": "SMT-001",
+      "name": "SMT贴片机",
+      "type": "smt",
+      "capacity_per_hour": 5000
+    },
+    {
+      "code": "SMT-002",
+      "name": "回流焊",
+      "type": "reflow",
+      "capacity_per_hour": 4000
+    },
+    {
+      "code": "DIP-001",
+      "name": "DIP插件线",
+      "type": "dip",
+      "capacity_per_hour": 2000
+    },
+    {
+      "code": "TEST-001",
+      "name": "功能测试站",
+      "type": "test",
+      "capacity_per_hour": 3000
+    },
+    {
+      "code": "PACK-001",
+      "name": "包装线",
+      "type": "packaging",
+      "capacity_per_hour": 4000
+    }
+  ],
+  "workers": [
+    {
+      "code": "W-ELEC-001",
+      "name": "陈操作员",
+      "skills": [
+        {
+          "code": "smt_load",
+          "level": 4,
+          "score": 88
+        }
+      ],
+      "certificates": [
+        "SMT操作员证"
+      ],
+      "efficiency": 0.87
+    },
+    {
+      "code": "W-ELEC-002",
+      "name": "刘技术员",
+      "skills": [
+        {
+          "code": "smt_setup",
+          "level": 5,
+          "score": 93
+        }
+      ],
+      "certificates": [
+        "SMT高级工程师证"
+      ],
+      "efficiency": 0.92
+    },
+    {
+      "code": "W-ELEC-003",
+      "name": "黄质检员",
+      "skills": [
+        {
+          "code": "aoi_inspect",
+          "level": 3,
+          "score": 76
+        }
+      ],
+      "certificates": [
+        "AOI检验员证"
+      ],
+      "efficiency": 0.8
+    },
+    {
+      "code": "W-ELEC-004",
+      "name": "吴工程师",
+      "skills": [
+        {
+          "code": "process_engineer",
+          "level": 4,
+          "score": 86
+        }
+      ],
+      "certificates": [
+        "PE工程师证"
+      ],
+      "efficiency": 0.85
+    }
+  ],
+  "routings": [
+    {
+      "id": "rt-850b7c34",
+      "product_id": "PCBA-X100",
+      "steps": [
+        {
+          "step_no": 1,
+          "name": "锡膏印刷",
+          "station_type": "smt"
+        },
+        {
+          "step_no": 2,
+          "name": "贴片",
+          "station_type": "smt"
+        },
+        {
+          "step_no": 3,
+          "name": "回流焊",
+          "station_type": "reflow"
+        },
+        {
+          "step_no": 4,
+          "name": "AOI检测",
+          "station_type": "test"
+        },
+        {
+          "step_no": 5,
+          "name": "DIP插件",
+          "station_type": "dip"
+        },
+        {
+          "step_no": 6,
+          "name": "波峰焊",
+          "station_type": "reflow"
+        },
+        {
+          "step_no": 7,
+          "name": "功能测试",
+          "station_type": "test"
+        },
+        {
+          "step_no": 8,
+          "name": "组装包装",
+          "station_type": "packaging"
+        }
+      ]
+    }
+  ],
+  "rush_order": {
+    "title": "智能手表主板-芯片短缺加急单",
+    "quantity": 5000,
+    "due_date_offset_days": 3,
+    "penalty_per_day": 1500.0,
+    "priority": "urgent",
+    "order_id": "RUSH-ELECTRONICS_FACTORY-20260722-5787D5",
+    "planned_start": "2026-07-22T19:12:00.673600",
+    "due_date": "2026-07-25T19:12:00.673600"
+  },
+  "simulated_work_orders": [
+    {
+      "wo_code": "WO-ELE-20260722-0001",
+      "product_code": "PCBA-X100",
+      "planned_qty": 372,
+      "status": "in_progress",
+      "priority": "low",
+      "created_by": "W-001"
+    },
+    {
+      "wo_code": "WO-ELE-20260722-0002",
+      "product_code": "PCBA-Y200",
+      "planned_qty": 765,
+      "status": "released",
+      "priority": "low",
+      "created_by": "W-004"
+    },
+    {
+      "wo_code": "WO-ELE-20260722-0003",
+      "product_code": "ASM-Z300",
+      "planned_qty": 381,
+      "status": "released",
+      "priority": "high",
+      "created_by": "W-003"
+    }
+  ]
+}

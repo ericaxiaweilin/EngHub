@@ -17,6 +17,9 @@ import SkillMatrix from './pages/hr/SkillMatrix'
 import WarehouseList from './pages/wms/WarehouseList'
 import Assistant from './pages/ai/Assistant'
 import Login from './pages/auth/Login'
+// v2.5 Modules
+import AndonDashboard from './pages/andon/AndonDashboard'
+import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
 import { isAuthenticated, getStoredUser } from './services/auth'
 // TMS 模块
 import ApprovalCenter from './pages/tms/ApprovalCenter'
@@ -109,6 +112,9 @@ const App: React.FC = () => {
             <Route path="tms/approval" element={<PermissionGate path="/tms/approval"><ApprovalCenter /></PermissionGate>} />
             <Route path="tms/distribution" element={<PermissionGate path="/tms/distribution"><TaskDistribution /></PermissionGate>} />
             <Route path="tms/agent" element={<PermissionGate path="/tms/agent"><AgentConsole /></PermissionGate>} />
+            {/* v2.5 Smart Collaboration */}
+            <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
+            <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
           </Route>
         </Routes>
       </BrowserRouter>

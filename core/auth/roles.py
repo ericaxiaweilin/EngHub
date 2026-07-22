@@ -730,15 +730,28 @@ def get_menu_items_for_user(user) -> list:
                 "children": children,
             })
 
-    # 系统管理 - 仅管理员
-    if getattr(user, "is_superuser", False) or user.role == "admin":
+    # v2.5 - Andon 智能工单
+    if "andon" in modules_with_access or getattr(user, "is_superuser", False):
         items.append({
-            "key": "/users",
-            "label": "用户管理",
+            "key": "/andon",
+            "label": "安灯小工单",
+            "module": "andon",
         })
+
+    # v2.5 - 程序工单模板
+    if "work_order_template" in modules_with_access or getattr(user, "is_superuser", False):
         items.append({
-            "key": "/roles",
-            "label": "角色管理",
+            "key": "/work-order-templates",
+            "label": "程序工单模板",
+            "module": "work_order_template",
+        })
+
+    # v2.5 - 数据一致性
+    if "reconciliation" in modules_with_access or "traceability" in modules_with_access or "replenishment" in modules_with_access or getattr(user, "is_superuser", False):
+        items.append({
+            "key": "/data-consistency",
+            "label": "数据一致性",
+            "module": "reconciliation",
         })
 
     return items

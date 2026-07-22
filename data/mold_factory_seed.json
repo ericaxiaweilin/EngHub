@@ -1,0 +1,201 @@
+{
+  "industry": "模具厂",
+  "description": "精密模具加工 — 铣削/车削/线切割/EDM/装配",
+  "generated_at": "2026-07-22T19:12:00.673167",
+  "products": [
+    {
+      "id": "prod-61dc25f1",
+      "code": "MOLD-A100",
+      "name": "汽车仪表盘模具",
+      "category": "mold",
+      "standard_cost": 8500.0
+    },
+    {
+      "id": "prod-fbc41c4f",
+      "code": "MOLD-B200",
+      "name": "电子连接器模具",
+      "category": "mold",
+      "standard_cost": 5200.0
+    },
+    {
+      "id": "prod-364e61a8",
+      "code": "MOLD-C300",
+      "name": "家电外壳模具",
+      "category": "mold",
+      "standard_cost": 12000.0
+    }
+  ],
+  "workstations": [
+    {
+      "code": "CNC-001",
+      "name": "五轴铣床",
+      "type": "cnc",
+      "capacity_per_hour": 4
+    },
+    {
+      "code": "CNC-002",
+      "name": "数控车床",
+      "type": "lathe",
+      "capacity_per_hour": 6
+    },
+    {
+      "code": "EDM-001",
+      "name": "电火花加工机",
+      "type": "edm",
+      "capacity_per_hour": 3
+    },
+    {
+      "code": "WJC-001",
+      "name": "线切割机",
+      "type": "wire_cut",
+      "capacity_per_hour": 5
+    },
+    {
+      "code": "ASSY-001",
+      "name": "模具装配工位",
+      "type": "assembly",
+      "capacity_per_hour": 2
+    }
+  ],
+  "workers": [
+    {
+      "code": "W-MOLD-001",
+      "name": "张师傅",
+      "skills": [
+        {
+          "code": "cnc_operate",
+          "level": 5,
+          "score": 92
+        }
+      ],
+      "certificates": [
+        "CNC高级操作证"
+      ],
+      "efficiency": 0.95
+    },
+    {
+      "code": "W-MOLD-002",
+      "name": "李工",
+      "skills": [
+        {
+          "code": "edm_operate",
+          "level": 4,
+          "score": 85
+        }
+      ],
+      "certificates": [
+        "EDM操作证"
+      ],
+      "efficiency": 0.88
+    },
+    {
+      "code": "W-MOLD-003",
+      "name": "王技师",
+      "skills": [
+        {
+          "code": "assembly",
+          "level": 5,
+          "score": 90
+        }
+      ],
+      "certificates": [
+        "模具装配技师证"
+      ],
+      "efficiency": 0.91
+    },
+    {
+      "code": "W-MOLD-004",
+      "name": "赵技术员",
+      "skills": [
+        {
+          "code": "quality_inspect",
+          "level": 3,
+          "score": 78
+        }
+      ],
+      "certificates": [
+        "质检员证"
+      ],
+      "efficiency": 0.82
+    }
+  ],
+  "routings": [
+    {
+      "id": "rt-fea62d9f",
+      "product_id": "MOLD-A100",
+      "steps": [
+        {
+          "step_no": 1,
+          "name": "下料",
+          "station_type": "raw_material"
+        },
+        {
+          "step_no": 2,
+          "name": "粗铣",
+          "station_type": "cnc"
+        },
+        {
+          "step_no": 3,
+          "name": "精铣",
+          "station_type": "cnc"
+        },
+        {
+          "step_no": 4,
+          "name": "线切割",
+          "station_type": "wire_cut"
+        },
+        {
+          "step_no": 5,
+          "name": "电火花",
+          "station_type": "edm"
+        },
+        {
+          "step_no": 6,
+          "name": "钳工装配",
+          "station_type": "assembly"
+        },
+        {
+          "step_no": 7,
+          "name": "终检",
+          "station_type": "inspection"
+        }
+      ]
+    }
+  ],
+  "rush_order": {
+    "title": "汽车仪表盘模具-加急订单",
+    "quantity": 15,
+    "due_date_offset_days": 5,
+    "penalty_per_day": 2000.0,
+    "priority": "urgent",
+    "order_id": "RUSH-MOLD_FACTORY-20260722-9AE1DA",
+    "planned_start": "2026-07-22T19:12:00.673167",
+    "due_date": "2026-07-27T19:12:00.673167"
+  },
+  "simulated_work_orders": [
+    {
+      "wo_code": "WO-MOL-20260722-0001",
+      "product_code": "MOLD-A100",
+      "planned_qty": 319,
+      "status": "pending",
+      "priority": "low",
+      "created_by": "W-002"
+    },
+    {
+      "wo_code": "WO-MOL-20260722-0002",
+      "product_code": "MOLD-B200",
+      "planned_qty": 807,
+      "status": "released",
+      "priority": "low",
+      "created_by": "W-003"
+    },
+    {
+      "wo_code": "WO-MOL-20260722-0003",
+      "product_code": "MOLD-C300",
+      "planned_qty": 226,
+      "status": "in_progress",
+      "priority": "low",
+      "created_by": "W-003"
+    }
+  ]
+}

@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     Text,
     JSON,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship
@@ -655,7 +656,6 @@ class TMSAgentAction(Base):
         Index("idx_tms_agent_action_type", "agent_id", "action_type"),
     )
 
-
 class TMSWebhookSubscription(Base):
     """TMS Webhook 订阅表 - Agent 事件推送"""
 
@@ -668,6 +668,162 @@ class TMSWebhookSubscription(Base):
     secret = Column(String(100))  # 签名密钥
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ==================== v2.5 Data Consistency Models ====================
+
+class DefectRecord(Base):
+    """缺陷记录表 — 与报工原子关联，支持不良品闭环"""
+
+    __tablename__ = "defect_records"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    record_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    production_report_id = Column(String(36), ForeignKey("production_reports.id"), nullable=True, index=True)
+    product_id = Column(String(36), ForeignKey("products.id"), nullable=True, index=True)
+    material_id = Column(String(50), nullable=True, index=True)
+    batch_code = Column(String(50), nullable=True, index=True)
+    station_id = Column(String(50), nullable=True, index=True)
+    equipment_id = Column(String(36), ForeignKey("equipment.id"), nullable=True, index=True)
+    defect_type = Column(String(50), nullable=False)      # appearance/dimension/function/performance/material/process/other
+    severity = Column(String(20), nullable=False, default="minor")  # critical/major/minor/observation
+    quantity = Column(Integer, nullable=False, default=0)
+    disposition = Column(String(20), nullable=True)        # rework/repair/scrap/concession/return
+    disposition_by = Column(String(50), nullable=True)
+    disposition_at = Column(DateTime, nullable=True)
+    disposition_remark = Column(Text, nullable=True)
+    ocap_status = Column(String(20), default="pending", index=True)  # pending/triggered/in_progress/completed
+    description = Column(Text, nullable=True)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    is_finalized = Column(Boolean, default=False, index=True)
+
+    __table_args__ = (
+        Index("idx_dr_factory_batch", "factory_id", "batch_code"),
+        Index("idx_dr_disposition_severity", "disposition", "severity"),
+    )
+
+    # 关系
+    work_order = relationship("WorkOrder")
+    production_report = relationship("ProductionReport")
+    product = relationship("Product")
+    station_obj = relationship("Station")
+    equipment_obj = relationship("Equipment")
+
+
+class ItemTraceability(Base):
+    """一物一码追溯链 — 正反向全链路追溯"""
+
+    __tablename__ = "item_traceability"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    item_code = Column(String(50), unique=True, nullable=False, index=True)
+    item_type = Column(String(20), default="finished", index=True)  # raw_material/semi_finished/finished
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    product_id = Column(String(36), ForeignKey("products.id"), nullable=True, index=True)
+    material_batch_id = Column(String(50), nullable=True, index=True)
+    material_supplier_id = Column(String(50), nullable=True)
+    station_id = Column(String(50), nullable=True, index=True)
+    equipment_id = Column(String(36), ForeignKey("equipment.id"), nullable=True)
+    operator_id = Column(String(50), nullable=True, index=True)
+    quality_check_result = Column(String(20), nullable=True)  # pass/fail/rework_pass
+    serial_number = Column(String(50), nullable=True, index=True)
+    next_item_code = Column(String(36), ForeignKey("item_traceability.item_code"), nullable=True)
+    inspection_record_id = Column(String(36), nullable=True)
+    metadata_ = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_it_work_order", "work_order_id"),
+        Index("idx_it_factory_product", "factory_id", "product_id"),
+    )
+
+
+class ReconciliationLog(Base):
+    """自动对账日志 — 生产报工 vs 工单进度 vs 库存增量"""
+
+    __tablename__ = "reconciliation_logs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    reconcile_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    planned_qty = Column(Integer, nullable=False, default=0)
+    good_qty = Column(Integer, nullable=False, default=0)
+    defect_qty = Column(Integer, nullable=False, default=0)
+    scrap_qty = Column(Integer, nullable=False, default=0)
+    net_change = Column(Integer, nullable=False, default=0)
+    expected_delta = Column(Integer, nullable=False, default=0)
+    delta = Column(Integer, nullable=False, default=0)
+    status = Column(String(20), nullable=False, default="ok", index=True)  # ok/mismatch/investigating
+    discrepancy_detail = Column(Text, nullable=True)
+    checked_by = Column(String(50), default="auto_reconciler")
+    checked_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_rl_factory_date", "factory_id", "checked_at"),
+        Index("idx_rl_work_order", "work_order_id", "status"),
+    )
+
+
+class ReplenishmentThreshold(Base):
+    """Min-Max 线边仓水位模型"""
+
+    __tablename__ = "replenishment_thresholds"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=True)
+    location_id = Column(String(36), ForeignKey("locations.id"), nullable=True)
+    material_id = Column(String(50), nullable=False, index=True)
+    min_level = Column(Integer, nullable=False, default=0)
+    max_level = Column(Integer, nullable=False, default=0)
+    safety_stock = Column(Integer, nullable=False, default=0)
+    reorder_lot_size = Column(Integer, nullable=False, default=1)
+    reorder_lead_time_hours = Column(Float, default=24.0)
+    line_side_location = Column(String(50), nullable=True)
+    active = Column(Boolean, default=True)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("factory_id", "material_id", "line_side_location", name="uq_rt_factory_mat_loc"),
+    )
+
+
+class PullReplenishmentTask(Base):
+    """拉动式补货任务"""
+
+    __tablename__ = "pull_replenishment_tasks"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    task_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    source_warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=True)
+    target_location_id = Column(String(36), ForeignKey("locations.id"), nullable=True)
+    material_id = Column(String(50), nullable=False, index=True)
+    requested_qty = Column(Integer, nullable=False, default=0)
+    fulfilled_qty = Column(Integer, nullable=False, default=0)
+    status = Column(String(20), default="pending", index=True)  # pending/approved/picking/delivering/completed/cancelled
+    trigger_type = Column(String(20), default="min_reached")
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
+    threshold_id = Column(String(36), ForeignKey("replenishment_thresholds.id"), nullable=True)
+    assigned_to = Column(String(50), nullable=True)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_prt_factory_status", "factory_id", "status"),
+    )
 
 
 # 导出所有模型
@@ -697,4 +853,10 @@ __all__ = [
     "TMSDistributionLog",
     "TMSAgentAction",
     "TMSWebhookSubscription",
+    # v2.5 Data Consistency Models
+    "DefectRecord",
+    "ItemTraceability",
+    "ReconciliationLog",
+    "ReplenishmentThreshold",
+    "PullReplenishmentTask",
 ]
