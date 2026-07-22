@@ -18,6 +18,7 @@ import WarehouseList from './pages/wms/WarehouseList'
 import Assistant from './pages/ai/Assistant'
 import Login from './pages/auth/Login'
 // v2.5 Modules
+import WarRoom from './pages/war-room/WarRoom'
 import AndonDashboard from './pages/andon/AndonDashboard'
 import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
 import { isAuthenticated, getStoredUser } from './services/auth'
@@ -115,6 +116,7 @@ const App: React.FC = () => {
             {/* v2.5 Smart Collaboration */}
             <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
+            <Route path="war-room" element={<PermissionGate path="/simulation"><WarRoom /></PermissionGate>} />
           </Route>
         </Routes>
       </BrowserRouter>
