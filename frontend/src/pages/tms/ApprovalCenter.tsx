@@ -18,31 +18,26 @@ import {
   Tabs,
   List,
   Space,
-  Input,
   Badge,
   Typography,
-  Alert,
   Timeline,
-  Progress,
   Tooltip,
   message,
   Modal,
-  Drawer,
+  Alert,
 } from 'antd';
 import {
   CheckCircleOutlined,
   ClockCircleOutlined,
   SyncOutlined,
   TrophyOutlined,
-  RobotOutlined,
-  SendOutlined,
   PlusOutlined,
   ExclamationCircleOutlined,
-  BulbOutlined,
-  TeamOutlined,
   SafetyOutlined,
+  BulbOutlined,
 } from '@ant-design/icons';
 import tmsApi, { TMSTask, DashboardStats, PendingApproval } from '../../services/tms';
+import api from '../../services/api';
 
 const { Title, Text, Paragraph } = Typography;
 const { TabPane } = Tabs;
@@ -69,14 +64,15 @@ const ApprovalCenter: React.FC = () => {
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('recommended');
-  const [chatInput, setChatInput] = useState('');
-  const [chatHistory, setChatHistory] = useState<Array<{ role: 'user' | 'ai'; content: string }>>([]);
-  const [aiDrawerVisible, setAiDrawerVisible] = useState(false);
 
-  // 模拟用户 ID（生产环境从 auth context 获取）
-  const currentUserId = 'current-user-id';
+  // 从 auth 获取真实用户 ID
+  const [currentUserId, setCurrentUserId] = useState<string>('');
 
   useEffect(() => {
+    // 获取当前用户信息
+    api.get('/api/v1/auth/me').then((res: any) => {
+      if (res?.id) setCurrentUserId(res.id);
+    }).catch(() => {});
     loadData();
   }, []);
 
@@ -128,36 +124,6 @@ const ApprovalCenter: React.FC = () => {
     });
   };
 
-  // 处理 Chat 命令
-  const handleChatSend = async () => {
-    if (!chatInput.trim()) return;
-
-    const userMessage = chatInput.trim();
-    setChatHistory(prev => [...prev, { role: 'user', content: userMessage }]);
-    setChatInput('');
-
-    // 解析命令
-    let response = '';
-    try {
-      if (userMessage.startsWith('/')) {
-        const [cmd, ...args] = userMessage.slice(1).split(' ');
-        const result = await tmsApi.agentCommand({
-          agent_id: 'web-chat',
-          command: cmd,
-          params: { query: args.join(' ') },
-        });
-        response = result.data?.message || '命令已执行';
-      } else {
-        // 普通对话 - 调用 AI 建议
-        response = `收到: "${userMessage}"。我可以帮你：\n- /query_tasks 查询任务\n- /get_recommendation 获取分发建议\n- /assign_task 分配任务`;
-      }
-    } catch (error) {
-      response = '命令执行失败，请检查格式';
-    }
-
-    setChatHistory(prev => [...prev, { role: 'ai', content: response }]);
-  };
-
   // 任务卡片组件
   const TaskCard: React.FC<{ task: TMSTask }> = ({ task }) => {
     const typeInfo = taskTypeLabels[task.task_type] || taskTypeLabels.custom;
@@ -167,13 +133,6 @@ const ApprovalCenter: React.FC = () => {
         size="small"
         style={{ marginBottom: 12 }}
         actions={[
-          <Tooltip title="AI 推荐分发" key="ai">
-            <Button
-              type="text"
-              icon={<RobotOutlined />}
-              onClick={() => handleAiRecommend(task)}
-            />
-          </Tooltip>,
           <Tooltip title="去审批" key="approve">
             <Button
               type="primary"
@@ -216,39 +175,6 @@ const ApprovalCenter: React.FC = () => {
     );
   };
 
-  const handleAiRecommend = async (task: TMSTask) => {
-    try {
-      const result = await tmsApi.agentCommand({
-        agent_id: 'web-ui',
-        command: 'get_recommendation',
-        params: { task_id: task.id },
-      });
-      const recommendations = result.data?.data?.recommendations || [];
-      Modal.info({
-        title: `AI 分发建议 - ${task.task_code}`,
-        width: 500,
-        content: (
-          <List
-            size="small"
-            dataSource={recommendations}
-            renderItem={(item: any) => (
-              <List.Item>
-                <Space>
-                  <TeamOutlined />
-                  <Text>{item.full_name}</Text>
-                  <Progress percent={item.score * 100} size="small" style={{ width: 100 }} />
-                  <Text type="secondary">{item.reasons?.join(', ')}</Text>
-                </Space>
-              </List.Item>
-            )}
-          />
-        ),
-      });
-    } catch (error) {
-      message.error('获取 AI 建议失败');
-    }
-  };
-
   return (
     <div style={{ padding: 24 }}>
       {/* 页面标题 */}
@@ -260,14 +186,9 @@ const ApprovalCenter: React.FC = () => {
           <Text type="secondary">实时任务流与工业级智能协同</Text>
         </Col>
         <Col>
-          <Space>
-            <Button icon={<RobotOutlined />} onClick={() => setAiDrawerVisible(true)}>
-              AI 助手
-            </Button>
-            <Button type="primary" icon={<PlusOutlined />}>
-              发布任务
-            </Button>
-          </Space>
+          <Button type="primary" icon={<PlusOutlined />}>
+            发布任务
+          </Button>
         </Col>
       </Row>
 
@@ -402,40 +323,8 @@ const ApprovalCenter: React.FC = () => {
           </Card>
         </Col>
 
-        {/* 右侧：AI 面板 */}
+        {/* 右侧：最近动态 */}
         <Col span={8}>
-          {/* AI 智能分析 */}
-          <Card
-            title={
-              <Space>
-                <RobotOutlined style={{ color: '#722ed1' }} />
-                <span>AI 智能分析</span>
-                <Tag color="purple">NEURAL CO-PILOT v4</Tag>
-              </Space>
-            }
-            style={{ marginBottom: 16 }}
-          >
-            <Space direction="vertical" style={{ width: '100%' }} size={12}>
-              <Alert
-                message="风险预警"
-                description="检测到零件 PN-1189 存在版本兼容风险，建议由 EE 介入分析。"
-                type="warning"
-                showIcon
-              />
-              <Alert
-                message="任务撮合"
-                description="根据您的技能匹配，'信号完整性评估'任务获准概率为 98%。"
-                type="info"
-                showIcon
-                icon={<BulbOutlined />}
-              />
-              <Button type="primary" block icon={<RobotOutlined />}>
-                询问 AI 任务建议
-              </Button>
-            </Space>
-          </Card>
-
-          {/* 最近动态 */}
           <Card title="最近动态" size="small">
             <Timeline
               items={[
@@ -474,78 +363,6 @@ const ApprovalCenter: React.FC = () => {
           </Card>
         </Col>
       </Row>
-
-      {/* 底部 Chat 输入框 */}
-      <Card
-        size="small"
-        style={{
-          position: 'fixed',
-          bottom: 0,
-          left: 200,
-          right: 0,
-          borderRadius: 0,
-          boxShadow: '0 -2px 8px rgba(0,0,0,0.1)',
-        }}
-      >
-        <Space.Compact style={{ width: '100%' }}>
-          <Input
-            placeholder="Ask anything... (支持 /query_tasks, /assign_task 等命令)"
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            onPressEnter={handleChatSend}
-            prefix={<RobotOutlined style={{ color: '#722ed1' }} />}
-          />
-          <Button type="primary" icon={<SendOutlined />} onClick={handleChatSend}>
-            Chat
-          </Button>
-        </Space.Compact>
-        {chatHistory.length > 0 && (
-          <div style={{ maxHeight: 150, overflow: 'auto', marginTop: 8 }}>
-            {chatHistory.map((msg, idx) => (
-              <div
-                key={idx}
-                style={{
-                  textAlign: msg.role === 'user' ? 'right' : 'left',
-                  marginBottom: 8,
-                }}
-              >
-                <Tag color={msg.role === 'user' ? 'blue' : 'purple'}>
-                  {msg.role === 'user' ? 'You' : 'AI'}
-                </Tag>
-                <Text style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</Text>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
-      {/* AI 助手抽屉 */}
-      <Drawer
-        title="AI 任务助手"
-        placement="right"
-        width={400}
-        open={aiDrawerVisible}
-        onClose={() => setAiDrawerVisible(false)}
-      >
-        <Space direction="vertical" style={{ width: '100%' }}>
-          <Alert
-            message="可用命令"
-            description={
-              <ul style={{ paddingLeft: 16, margin: 0 }}>
-                <li>/query_tasks - 查询任务列表</li>
-                <li>/get_recommendation - 获取 AI 分发建议</li>
-                <li>/assign_task - 分配任务</li>
-                <li>/approve_task - 代审批（需确认）</li>
-                <li>/escalate_task - 升级审批</li>
-              </ul>
-            }
-            type="info"
-          />
-          <Text type="secondary">
-            提示：高危操作（审批、批量分发）需要人工确认后才会执行。
-          </Text>
-        </Space>
-      </Drawer>
     </div>
   );
 };

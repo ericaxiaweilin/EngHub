@@ -16,10 +16,8 @@ import PlanList from './pages/pp/PlanList'
 import BaseData from './pages/basedata/BaseData'
 import SkillMatrix from './pages/hr/SkillMatrix'
 import WarehouseList from './pages/wms/WarehouseList'
-import Assistant from './pages/ai/Assistant'
 import Login from './pages/auth/Login'
 // v2.5 Modules
-import ExpertSystemChat from './pages/expert/ExpertChat'
 import WarRoom from './pages/war-room/WarRoom'
 import AndonDashboard from './pages/andon/AndonDashboard'
 import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
@@ -30,6 +28,7 @@ import TaskDistribution from './pages/tms/TaskDistribution'
 import AgentConsole from './pages/tms/AgentConsole'
 import QuickRequest from './pages/tms/QuickRequest'
 import PersonalSettings from './pages/settings/PersonalSettings'
+import CodeTableSettings from './pages/settings/CodeTableSettings'
 
 // 纯色主题配置
 const theme = {
@@ -113,17 +112,16 @@ const App: React.FC = () => {
             <Route path="sim-erp/factory" element={<Navigate to="/simulation?tab=factory" replace />} />
             <Route path="sim-erp/run" element={<Navigate to="/simulation?tab=compliance" replace />} />
             <Route path="sim-erp/audits" element={<Navigate to="/simulation?tab=audit" replace />} />
-            <Route path="ai" element={<PermissionGate path="/ai"><Assistant /></PermissionGate>} />
             {/* TMS 任务管理系统 */}
             <Route path="tms/approval" element={<PermissionGate path="/tms/approval"><ApprovalCenter /></PermissionGate>} />
             <Route path="tms/distribution" element={<PermissionGate path="/tms/distribution"><TaskDistribution /></PermissionGate>} />
             <Route path="tms/agent" element={<PermissionGate path="/tms/agent"><AgentConsole /></PermissionGate>} />
             <Route path="quick-request" element={<QuickRequest />} />
             <Route path="settings" element={<PersonalSettings />} />
+            <Route path="settings/code-tables" element={<CodeTableSettings />} />
             {/* v2.5 Smart Collaboration */}
             <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
-            <Route path="expert" element={<PermissionGate path="/ai"><ExpertSystemChat /></PermissionGate>} />
             <Route path="war-room" element={<PermissionGate path="/simulation"><WarRoom /></PermissionGate>} />
           </Route>
         </Routes>

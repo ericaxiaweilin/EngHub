@@ -11,6 +11,7 @@ from .sim_erp_routes import router as sim_erp_router
 from .sim_factory_routes import router as sim_factory_router
 from .chat_routes import router as chat_router
 from .tms_routes import router as tms_router
+from .code_table_routes import router as code_table_router
 
 try:
     from .employee_skill_router import router as employee_skill_router
@@ -28,4 +29,5 @@ __all__ = [
     "sim_factory_router",
     "chat_router",
     "tms_router",
+    "code_table_router",
 ]

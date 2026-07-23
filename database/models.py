@@ -18,7 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import declarative_base, relationship, backref
 import uuid
 
 Base = declarative_base()
@@ -169,8 +169,16 @@ class WorkOrder(Base):
     assigned_station_id = Column(String(50), index=True)
     current_routing_step = Column(Integer, default=0)
     bom_version = Column(String(50))
+    # ---- 工单体系化编码：层级字段（主工单 <-> 工序工单）----
+    parent_work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    wo_type = Column(String(20), nullable=False, default="master", index=True)  # master=主工单 / operation=工序工单
+    process_code = Column(String(20), nullable=True, index=True)  # 行业通用工序代码（SMT/INJ/MACH...），主工单为空
+    operation_seq = Column(Integer, nullable=True)  # 同一工序内道次序号（01/02...）
     created_by = Column(String(50))
     updated_by = Column(String(50))
+    # ---- 状态审核机制（014）：下达人/完工确认人 ----
+    released_by = Column(String(50), nullable=True)   # 下达人（管理角色且非创建人）
+    completed_by = Column(String(50), nullable=True)  # 完工确认人（品质角色）
     remark = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -179,10 +187,32 @@ class WorkOrder(Base):
     __table_args__ = (
         Index("idx_wo_status_factory", "status", "factory_id"),
         Index("idx_wo_created_at", "created_at"),
+        Index("idx_wo_parent", "parent_work_order_id"),
     )
     
     # 关系
     production_reports = relationship("ProductionReport", back_populates="work_order")
+    # 层级关系：主工单.operations -> 工序工单；工序工单.parent -> 主工单
+    operations = relationship(
+        "WorkOrder",
+        backref=backref("parent", remote_side=[id]),
+        cascade="all, delete-orphan",
+    )
+
+
+class WoStatusLog(Base):
+    """工单状态操作日志（审核追溯：谁/什么角色/何时/做了什么）"""
+    __tablename__ = "wo_status_logs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
+    action = Column(String(30), nullable=False)          # create/release/start/pause/resume/pending_inbound/complete/close/cancel/split
+    from_status = Column(String(20), nullable=True)
+    to_status = Column(String(20), nullable=False)
+    operator = Column(String(50), nullable=False)        # 操作人 username
+    operator_role = Column(String(50), nullable=True)    # 操作人角色
+    comment = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
 class ProductionReport(Base):
@@ -898,6 +928,73 @@ class Plan(Base):
     created_by = Column(String(50), nullable=True)
 
 
+class BomItem(Base):
+    """BOM 物料清单表（MRP 计算前置：产品→物料用量）"""
+    __tablename__ = "bom_items"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)   # 对应 products.id
+    bom_version = Column(String(50), nullable=False)              # 对应 products.current_bom_version
+    material_code = Column(String(50), nullable=False, index=True)  # 对应 inventory.material_code
+    material_name = Column(String(100), nullable=True)
+    qty_per_unit = Column(Float, nullable=False, default=1.0)     # 单位产品用量
+    unit = Column(String(20), nullable=True, default="pcs")
+    level = Column(Integer, nullable=False, default=1)            # BOM 层级
+    remark = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+# ============================================================
+# 统一码表（基础数据管理）—— 系统设置中集中维护，告别硬编码散落
+# ============================================================
+
+class CodeTable(Base):
+    """统一码表 / 基础数据管理
+
+    将散落在代码各处的枚举字典（工单类型、工序代码、优先级等）
+    集中到数据库，支持在系统设置页面自定义扩展。
+    category 为码表分类，code 为编码值，name 为中文显示名。
+    """
+    __tablename__ = "code_tables"
+    __table_args__ = (
+        UniqueConstraint("category", "code", name="uq_code_table_category_code"),
+        Index("idx_code_table_category", "category"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    category = Column(String(50), nullable=False)       # 码表分类: wo_type / process_code / priority ...
+    code = Column(String(30), nullable=False)           # 编码值（如 S / INJ / high）
+    name = Column(String(100), nullable=False)          # 中文名称（如 标准量产 / 注塑）
+    name_en = Column(String(100), nullable=True)        # 英文名称（如 Standard Production）
+    description = Column(String(255), nullable=True)    # 补充说明
+    keywords = Column(JSON, nullable=True)              # 关键词列表（用于工序解析匹配）
+    extra = Column(JSON, nullable=True)                 # 扩展属性（颜色、图标等）
+    sort_order = Column(Integer, default=0)             # 排序
+    is_active = Column(Boolean, default=True)           # 是否启用
+    is_system = Column(Boolean, default=False)          # 系统内置（不可删除，可改名/停用）
+    factory_id = Column(String(50), nullable=True)      # NULL=全局；非空=工厂专属
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "category": self.category,
+            "code": self.code,
+            "name": self.name,
+            "name_en": self.name_en,
+            "description": self.description,
+            "keywords": self.keywords,
+            "extra": self.extra,
+            "sort_order": self.sort_order,
+            "is_active": self.is_active,
+            "is_system": self.is_system,
+            "factory_id": self.factory_id,
+        }
+
+
 # 导出所有模型
 __all__ = [
     "Base",
@@ -934,4 +1031,8 @@ __all__ = [
     # QMS / PP Models
     "QualityInspection",
     "Plan",
+    "BomItem",
+    "WoStatusLog",
+    # 统一码表
+    "CodeTable",
 ]

@@ -117,9 +117,9 @@ class SkillMatrixItem(BaseModel):
 
 class SkillMatrixResponse(BaseModel):
     """技能矩阵响应"""
-    user_id: int
+    user_id: str
     name: str
-    department: Optional[str]
+    department: Optional[str] = None
     skills: List[SkillMatrixItem]
 
 

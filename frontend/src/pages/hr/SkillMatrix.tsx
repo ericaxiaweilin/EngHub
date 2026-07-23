@@ -31,7 +31,25 @@ const SkillMatrix: React.FC = () => {
   const fetchData = () => {
     setLoading(true)
     Promise.allSettled([getSkillMatrix(), listSkills(), getExpiringCerts()]).then((res) => {
-      if (res[0].status === 'fulfilled') setMatrix((res[0].value as any[]) || [])
+      if (res[0].status === 'fulfilled') {
+        // API 返回按员工分组的嵌套结构，扁平化为表格行
+        const raw: any[] = (res[0].value as any[]) || []
+        const flat = raw.flatMap((emp: any) =>
+          (emp.skills || []).map((s: any) => ({
+            user_id: emp.user_id,
+            user_name: emp.name,
+            department: emp.department,
+            skill_name: s.skill_name,
+            category: s.category,
+            level: s.level,
+            score: s.score,
+            certified: s.is_valid,
+            certified_date: s.certified_date,
+            expiry_date: s.expiry_date,
+          }))
+        )
+        setMatrix(flat)
+      }
       if (res[1].status === 'fulfilled') setSkills((res[1].value as any[]) || [])
       if (res[2].status === 'fulfilled') {
         const v: any = res[2].value

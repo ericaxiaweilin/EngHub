@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import {
   Table, Button, Input, Select, Tag, Space, Card, Modal, Form, InputNumber,
-  DatePicker, Progress, message, Row, Col, Tooltip, Badge,
+  DatePicker, Progress, message, Row, Col, Tooltip, Badge, Alert,
 } from 'antd'
 import {
   PlusOutlined, SearchOutlined, ReloadOutlined,
@@ -52,6 +52,14 @@ const STATUS_FILTERS = [
   { key: 'completed', label: '完成' },
 ]
 
+// 行业通用工序代码 -> 中文名称（与后端 work_order_coding.PROCESS_CODES 一致）
+const PROCESS_NAME: Record<string, string> = {
+  CUT: '下料', MACH: '机加', INJ: '注塑', EDM: '电火花', WCUT: '线切割',
+  WELD: '焊接', PAINT: '涂装', ASSY: '组立', PKG: '包装', QC: '检验',
+  SMT: '贴片', DIP: '插件', STMP: '冲压', CAST: '铸造', HT: '热处理',
+  FIN: '表面处理', GRD: '研磨', SEW: '针车', FORM: '成型', GEN: '通用',
+}
+
 // ============================================================
 // 操作按钮生成器（根据状态 + 权限动态渲染）
 // ============================================================
@@ -61,8 +69,8 @@ const renderActionButtons = (record: WorkOrder, actions: any) => {
 
   return (
     <Space size={2} wrap>
-      {/* 待下发 → 已下达 */}
-      {record.status === 'pending' && release && (
+      {/* 草稿/待下发 → 已下达（后端审核门槛：管理角色 + 非创建人）*/}
+      {['draft', 'pending'].includes(record.status) && release && (
         <Tooltip title="下发工单">
           <Button type="primary" size="small" icon={<PlayCircleOutlined />} style={btnStyle} onClick={() => release(record)}>
             下发
@@ -133,8 +141,8 @@ const renderActionButtons = (record: WorkOrder, actions: any) => {
         </Tooltip>
       )}
 
-      {/* 拆分（草稿/待下发/已下达） */}
-      {['pending', 'released'].includes(record.status) && split && (
+      {/* 拆分（草稿/待下发/已下达；拆分后新工单作为子工单挂在当前工单下）*/}
+      {['draft', 'pending', 'released'].includes(record.status) && split && (
         <Tooltip title="拆分工单">
           <Button size="small" icon={<ScissorOutlined />} style={{ ...btnStyle, borderColor: '#d9d9d9' }} onClick={() => split(record)}>
             拆分
@@ -175,6 +183,10 @@ const WorkOrderList: React.FC = () => {
   const [activeFilter, setActiveFilter] = useState('all')
   const [filters, setFilters] = useState<Record<string, any>>({})
   const [stats, setStats] = useState<WorkOrderStats | null>(null)
+
+  // 工序工单下钻缓存（主工单id -> 其工序工单列表）
+  const [opsCache, setOpsCache] = useState<Record<string, WorkOrder[]>>({})
+  const [opsLoading, setOpsLoading] = useState<Record<string, boolean>>({})
 
   // Modals
   const [createModalOpen, setCreateModalOpen] = useState(false)
@@ -234,6 +246,24 @@ const WorkOrderList: React.FC = () => {
       setStats(res)
     } catch {
       // stats 失败不影响主列表
+    }
+  }, [factoryId])
+
+  // 展开主工单时加载其派生的工序工单
+  const loadOperations = useCallback(async (record: WorkOrder) => {
+    setOpsLoading(l => ({ ...l, [record.id]: true }))
+    try {
+      const res = await getWorkOrders({
+        factory_id: factoryId,
+        wo_type: 'operation',
+        parent_work_order_id: record.id,
+        page_size: 100,
+      })
+      setOpsCache(c => ({ ...c, [record.id]: res.items || [] }))
+    } catch {
+      setOpsCache(c => ({ ...c, [record.id]: [] }))
+    } finally {
+      setOpsLoading(l => ({ ...l, [record.id]: false }))
     }
   }, [factoryId])
 
@@ -332,11 +362,14 @@ const WorkOrderList: React.FC = () => {
   // ---- 列定义 ----
   const columns = [
     {
-      title: '工单号', dataIndex: 'work_order_code', key: 'code', width: 170, fixed: 'left' as const,
+      title: '工单号', dataIndex: 'work_order_code', key: 'code', width: 200, fixed: 'left' as const,
       render: (text: string, record: WorkOrder) => (
-        <Link to={`/work-orders/${record.id}`} style={{ fontWeight: 600, fontFamily: 'monospace', color: '#1890ff' }}>
-          {text}
-        </Link>
+        <Space size={4}>
+          <Link to={`/work-orders/${record.id}`} style={{ fontWeight: 600, fontFamily: 'monospace', color: '#1890ff' }}>
+            {text}
+          </Link>
+          {record.wo_type === 'operation' && <Tag color="purple" style={{ marginRight: 0 }}>工序</Tag>}
+        </Space>
       ),
     },
     {
@@ -441,6 +474,34 @@ const WorkOrderList: React.FC = () => {
         split: canSplit ? () => { setSplitTarget(record); setSplitModalOpen(true) } : undefined,
         detail: canViewDetail ? () => navigate(`/work-orders/${record.id}`) : undefined,
       }),
+    },
+  ]
+
+  // ---- 工序工单子表列（主工单下钻）----
+  const opColumns = [
+    {
+      title: '工序工单号', dataIndex: 'work_order_code', key: 'code',
+      render: (t: string, r: WorkOrder) => (
+        <Link to={`/work-orders/${r.id}`} style={{ fontFamily: 'monospace', color: '#1890ff' }}>{t}</Link>
+      ),
+    },
+    {
+      title: '工序', key: 'process',
+      render: (_: any, r: WorkOrder) => (
+        <Tag color="geekblue">{r.process_code} · {PROCESS_NAME[r.process_code || ''] || r.process_code}</Tag>
+      ),
+    },
+    { title: '道次', dataIndex: 'operation_seq', key: 'seq', width: 60, render: (v: number) => (v ? `#${v}` : '-') },
+    {
+      title: '计划/完成', key: 'qty', width: 110,
+      render: (_: any, r: WorkOrder) => `${r.completed_qty} / ${r.planned_qty}`,
+    },
+    {
+      title: '状态', dataIndex: 'status', key: 'status', width: 90,
+      render: (s: string) => {
+        const info = STATUS_MAP[s] || { color: 'default', text: s }
+        return <Tag color={info.color}>{info.text}</Tag>
+      },
     },
   ]
 
@@ -584,6 +645,28 @@ const WorkOrderList: React.FC = () => {
           loading={loading}
           scroll={{ x: 1600 }}
           size="middle"
+          expandable={{
+            expandedRowRender: (record: WorkOrder) => {
+              const ops = opsCache[record.id] || []
+              if (opsLoading[record.id]) {
+                return <div style={{ padding: 12, color: '#8c8c8c' }}>加载工序工单…</div>
+              }
+              if (!ops.length) {
+                return <div style={{ padding: 12, color: '#8c8c8c' }}>该主工单暂无派生工序工单（产品可能未配置工艺路线）</div>
+              }
+              return (
+                <Table
+                  columns={opColumns}
+                  dataSource={ops}
+                  rowKey="id"
+                  size="small"
+                  pagination={false}
+                />
+              )
+            },
+            rowExpandable: (record: WorkOrder) => record.wo_type !== 'operation',
+            onExpand: (expanded, record) => { if (expanded) loadOperations(record) },
+          }}
           pagination={{
             current: page, pageSize, total, showSizeChanger: true, showTotal: (t) => `共 ${t} 条`,
             showQuickJumper: true,
@@ -666,6 +749,12 @@ const WorkOrderList: React.FC = () => {
 
       {/* ========== 拆分工单弹窗 ========== */}
       <Modal title={`拆分工单: ${splitTarget?.work_order_code || ''}`} open={splitModalOpen} onCancel={() => setSplitModalOpen(false)} footer={null} width={480}>
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="拆分后新工单将作为子工单挂在当前工单下，主工单进度由子工单自动汇总，子工单全部完工后主工单才能完工"
+        />
         <Form form={splitForm} layout="vertical" onFinish={handleSplit}>
           <Form.Item label={`拆分数量 (当前计划: ${splitTarget?.planned_qty || 0})`} name="split_qty" rules={[{ required: true }]}>
             <InputNumber min={1} max={(splitTarget?.planned_qty || 1) - 1} style={{ width: '100%' }} />

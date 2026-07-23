@@ -21,7 +21,7 @@ from database.models import User
 from core.auth.security import get_current_user
 
 
-router = APIRouter(prefix="/employee-skills", tags=["员工能力标签"])
+router = APIRouter(prefix="/api/v1", tags=["员工能力标签"])
 
 
 # ==================== 技能库管理 ====================

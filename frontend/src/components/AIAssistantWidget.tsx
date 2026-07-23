@@ -91,10 +91,20 @@ export default function AIAssistantWidget() {
   const [open, setOpen] = useState(false)
   const [maximized, setMaximized] = useState(false)
   const [tab, setTab] = useState('ai')
-  // 拖拽
+  // 拖拽 & 拉伸（参考 luaguage ChatbotWidget - Pointer Events 方案）
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null)
   const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null)
   const panelRef = useRef<HTMLDivElement>(null)
+  // 拉伸状态（Pointer Capture 方案，不用 React state 避免重渲染）
+  const resizeStateRef = useRef<{
+    edge: 'left' | 'right' | 'top' | 'bottom'
+    startX: number
+    startY: number
+    startWidth: number
+    startHeight: number
+    rafId?: number
+  } | null>(null)
+  const [isResizing, setIsResizing] = useState(false)
   // 聊天
   const [messages, setMessages] = useState<ChatMsg[]>([
     { role: 'assistant', content: '你好！我是 EngHub MES 智能助手，可以回答生产工单、报工、检验、不良品、库存、计划等问题。', time: now() },
@@ -144,6 +154,66 @@ export default function AIAssistantWidget() {
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }, [maximized])
+
+  // ---------- 拉伸逻辑（luaguage Pointer Events 方案） ----------
+  const handleResizeStart = useCallback((
+    event: React.PointerEvent<HTMLDivElement>,
+    edge: 'left' | 'right' | 'top' | 'bottom',
+  ) => {
+    if (maximized) return
+    const node = panelRef.current
+    if (!node) return
+    event.preventDefault()
+    // 关键：setPointerCapture 保证鼠标移出窗口也能收到事件
+    ;(event.currentTarget as HTMLDivElement).setPointerCapture(event.pointerId)
+    resizeStateRef.current = {
+      edge,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: node.offsetWidth,
+      startHeight: node.offsetHeight,
+    }
+    setIsResizing(true)
+  }, [maximized])
+
+  const handleResizeMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const state = resizeStateRef.current
+    const node = panelRef.current
+    if (!state || !node) return
+    if (state.rafId != null) cancelAnimationFrame(state.rafId)
+    const cx = event.clientX
+    const cy = event.clientY
+    state.rafId = requestAnimationFrame(() => {
+      const margin = 8
+      const minWidth = 320
+      const minHeight = 400
+      const maxWidth = Math.max(minWidth, window.innerWidth - margin * 2)
+      const maxHeight = Math.max(minHeight, window.innerHeight - margin * 2)
+      const widthDelta = state.edge === 'left'
+        ? state.startX - cx
+        : state.edge === 'right'
+          ? cx - state.startX
+          : 0
+      const heightDelta = state.edge === 'top'
+        ? state.startY - cy
+        : state.edge === 'bottom'
+          ? cy - state.startY
+          : 0
+      const nextWidth = Math.min(maxWidth, Math.max(minWidth, state.startWidth + widthDelta))
+      const nextHeight = Math.min(maxHeight, Math.max(minHeight, state.startHeight + heightDelta))
+      // 直接操作 DOM，不用 React state，避免重渲染卡顿
+      node.style.width = `${nextWidth}px`
+      node.style.height = `${nextHeight}px`
+    })
+  }, [])
+
+  const handleResizeEnd = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const state = resizeStateRef.current
+    if (state?.rafId != null) cancelAnimationFrame(state.rafId)
+    resizeStateRef.current = null
+    setIsResizing(false)
+    ;(event.currentTarget as HTMLDivElement).releasePointerCapture(event.pointerId)
+  }, [])
 
   // ---------- 发送消息 ----------
   const sendMessage = async (preset?: string) => {
@@ -261,7 +331,7 @@ export default function AIAssistantWidget() {
     }
   }
 
-  // ---------- 面板样式（支持自由拉伸） ----------
+  // ---------- 面板样式（初始尺寸，拉伸通过直接操作 DOM） ----------
   const panelStyle: React.CSSProperties = maximized
     ? { position: 'fixed', inset: 0, width: '100vw', height: '100vh', borderRadius: 0, zIndex: 1000 }
     : {
@@ -272,9 +342,10 @@ export default function AIAssistantWidget() {
         minHeight: 400,
         maxWidth: '92vw',
         maxHeight: '92vh',
-        resize: 'both',
         borderRadius: 12,
         zIndex: 1000,
+        // 拉伸时禁止文本选中
+        userSelect: isResizing ? 'none' : undefined,
         ...(pos
           ? { left: pos.x, top: pos.y }
           : { right: 24, bottom: 24 }),
@@ -616,6 +687,74 @@ export default function AIAssistantWidget() {
                   </div>
             )}
           </div>
+
+          {/* 拉伸手柄（四方向，参考 luaguage Pointer Events 方案） */}
+          {!maximized && (
+            <>
+              {/* 顶部手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'top')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="顶部拖拽调整高度"
+                style={{
+                  position: 'absolute', top: 0, left: '50%', transform: 'translateX(-50%)',
+                  width: '28%', maxWidth: 120, height: 10, cursor: 'ns-resize',
+                  touchAction: 'none', userSelect: 'none', zIndex: 70,
+                }}
+              >
+                <div style={{ width: 40, height: 3, margin: '4px auto 0', borderRadius: 999, background: 'rgba(0,0,0,0.15)' }} />
+              </div>
+              {/* 底部手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'bottom')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="底部拖拽调整高度"
+                style={{
+                  position: 'absolute', bottom: 0, left: '50%', transform: 'translateX(-50%)',
+                  width: '28%', maxWidth: 120, height: 10, cursor: 'ns-resize',
+                  touchAction: 'none', userSelect: 'none', zIndex: 70,
+                }}
+              >
+                <div style={{ width: 40, height: 3, margin: '4px auto 0', borderRadius: 999, background: 'rgba(0,0,0,0.15)' }} />
+              </div>
+              {/* 左下角手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'left')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="左下角拖拽缩放"
+                style={{
+                  position: 'absolute', left: 6, bottom: 6, width: 16, height: 16,
+                  cursor: 'nesw-resize', touchAction: 'none', userSelect: 'none', zIndex: 70,
+                  display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-start',
+                  borderBottomLeftRadius: 10,
+                }}
+              >
+                <div style={{ width: 10, height: 10, borderLeft: '2px solid rgba(0,0,0,0.25)', borderBottom: '2px solid rgba(0,0,0,0.25)', borderBottomLeftRadius: 8 }} />
+              </div>
+              {/* 右下角手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'right')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="右下角拖拽缩放"
+                style={{
+                  position: 'absolute', right: 6, bottom: 6, width: 16, height: 16,
+                  cursor: 'nwse-resize', touchAction: 'none', userSelect: 'none', zIndex: 70,
+                  display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end',
+                  borderBottomRightRadius: 10,
+                }}
+              >
+                <div style={{ width: 10, height: 10, borderRight: '2px solid rgba(0,0,0,0.25)', borderBottom: '2px solid rgba(0,0,0,0.25)', borderBottomRightRadius: 8 }} />
+              </div>
+            </>
+          )}
         </div>
       )}
 

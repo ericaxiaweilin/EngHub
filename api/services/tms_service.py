@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import TMSTask, TMSApprovalFlow, TMSDistributionLog, User
@@ -368,7 +368,7 @@ class TMSService:
         from database.models import EmployeeSkill, Skill
         skill_result = await self.db.execute(
             select(Skill.code).join(EmployeeSkill, EmployeeSkill.skill_id == Skill.id)
-            .where(EmployeeSkill.user_id == user_id)
+            .where(cast(EmployeeSkill.user_id, String(36)) == str(user_id))
         )
         user_skills = {row[0] for row in skill_result.all()}
 

@@ -51,7 +51,6 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/tms': <ThunderboltOutlined />,
   '/quick-request': <EditOutlined />,
   '/work-order-templates': <FileTextOutlined />,
-  '/ai': <RobotOutlined />,
   '/users': <UserOutlined />,
   '/roles': <SettingOutlined />,
 }
@@ -122,6 +121,9 @@ const Layout: React.FC = () => {
       },
       { type: 'divider' as const },
       { key: 'settings', icon: <SettingOutlined />, label: '个人设置', onClick: () => navigate('/settings') },
+      ...(user?.role === 'admin' || user?.role === 'super_admin'
+        ? [{ key: 'code-tables', icon: <SettingOutlined />, label: '码表管理', onClick: () => navigate('/settings/code-tables') }]
+        : []),
       { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
     ],
   }
@@ -139,7 +141,6 @@ const Layout: React.FC = () => {
           {/* 全站搜索 */}
           <GlobalSearch />
           {user?.factory_id && <Tag color="geekblue">厂区 {user.factory_id}</Tag>}
-          <Link to="/ai" style={{ color: 'rgba(255,255,255,0.85)' }}><RobotOutlined /> AI 助手</Link>
           
           {/* 测试模式：角色切换按钮 */}
           {testMode && (

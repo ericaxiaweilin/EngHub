@@ -20,8 +20,13 @@ from sqlalchemy import select, func
 
 from database.models import (
     WorkOrder, ProductionReport, Station, Equipment, Product,
-    Inventory, DefectRecord,
+    Inventory, DefectRecord, User,
 )
+from core.mes.work_order_coding import (
+    generate_master_work_order_code,
+    derive_operation_work_orders,
+)
+from api.services.work_order_service import WorkOrderService, WoPermissionError
 
 
 # ==================== 工具定义（OpenAI function-calling 格式） ====================
@@ -388,7 +393,7 @@ async def _tool_create_work_order(db: AsyncSession, args: Dict[str, Any], operat
     except (ValueError, TypeError):
         return {"error": f"日期格式错误：{planned_due_str}，应为 YYYY-MM-DD"}
 
-    wo_code = f"WO-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    wo_code = await generate_master_work_order_code(db, product.factory_id, wo_type="S")
     wo = WorkOrder(
         id=str(uuid.uuid4()),
         work_order_code=wo_code,
@@ -399,19 +404,24 @@ async def _tool_create_work_order(db: AsyncSession, args: Dict[str, Any], operat
         priority=priority,
         status="pending",
         created_by=operator,
+        wo_type="master",
     )
     db.add(wo)
+    await db.flush()  # 拿到主工单 id，供派生工序工单引用
+    operations = await derive_operation_work_orders(db, wo, created_by=operator)
     await db.commit()
     await db.refresh(wo)
     return {
         "success": True,
-        "message": f"工单创建成功",
+        "message": "工单创建成功" + (f"，已按工艺路线派生 {len(operations)} 道工序工单" if operations else ""),
         "work_order_code": wo.work_order_code,
         "id": wo.id,
         "product_name": product.product_name,
         "planned_qty": planned_qty,
         "planned_due": planned_due_str,
         "status": "pending（待下达）",
+        "operation_count": len(operations),
+        "operation_codes": [op.work_order_code for op in operations],
     }
 
 
@@ -422,13 +432,13 @@ async def _tool_release_work_order(db: AsyncSession, args: Dict[str, Any], opera
         wo = (await db.execute(select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code}%")).limit(1))).scalar_one_or_none()
     if not wo:
         return {"error": f"未找到工单 {code}"}
-    if wo.status != "pending":
-        return {"error": f"工单 {wo.work_order_code} 当前状态为 {wo.status}，只有待下达(pending)工单可以下达"}
 
-    wo.status = "released"
-    wo.updated_by = operator
-    wo.updated_at = datetime.utcnow()
-    await db.commit()
+    # 统一走服务层审核门槛（角色校验 + 职责分离），不允许 AI 助手绕过
+    user = (await db.execute(select(User).where(User.username == operator))).scalar_one_or_none()
+    try:
+        wo = await WorkOrderService(db).release_work_order(wo.id, user)
+    except (WoPermissionError, ValueError) as e:
+        return {"error": str(e)}
     return {
         "success": True,
         "message": f"工单 {wo.work_order_code} 已下达",

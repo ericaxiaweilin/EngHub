@@ -2,28 +2,49 @@ import React, { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Card, Descriptions, Tag, Button, Space, Table, Steps, Statistic, Row, Col,
-  Progress, message, Spin, Modal, Input, Divider,
+  Progress, message, Spin, Modal, Input, Divider, Timeline, Tooltip, Alert,
 } from 'antd'
 import {
   ArrowLeftOutlined, PlayCircleOutlined, CheckCircleOutlined, StopOutlined,
+  AuditOutlined, ApartmentOutlined, HistoryOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import {
   getWorkOrder, releaseWorkOrder, startWorkOrder, completeWorkOrder,
-  cancelWorkOrder, getStations, getRouting, getProducts,
-  WorkOrder, ProductionReport, Station, Routing, Product,
+  closeWorkOrder, cancelWorkOrder, getStations, getRouting, getProducts,
+  getWorkOrderStatusLogs, getWorkOrderChildren,
+  WorkOrder, ProductionReport, Station, Routing, Product, WoStatusLog,
 } from '../../services/mes'
+import { getStoredUser } from '../../services/auth'
 import RecordDetailDrawer, { DetailField } from '../../components/trace/RecordDetailDrawer'
 import { makeStationResolver, makeProductResolver } from '../../components/trace/resolvers'
 
 const STATUS_MAP: Record<string, { color: string; text: string }> = {
-  pending: { color: 'default', text: '待下达' },
+  draft: { color: 'default', text: '草稿' },
+  pending: { color: 'processing', text: '待下发' },
   released: { color: 'processing', text: '已下达' },
   in_progress: { color: 'blue', text: '生产中' },
   pending_inbound: { color: 'cyan', text: '待入库' },
   completed: { color: 'success', text: '已完成' },
+  closed: { color: 'default', text: '已关闭' },
   cancelled: { color: 'error', text: '已取消' },
   on_hold: { color: 'warning', text: '暂停' },
+}
+
+// 状态操作日志：动作/角色显示名（与后端 ACTION_ROLE_GATES 配套）
+const ACTION_LABELS: Record<string, string> = {
+  create: '创建', release: '下达', start: '开工', pause: '暂停', resume: '恢复',
+  pending_inbound: '标记待入库', complete: '完工确认', close: '关闭', cancel: '取消', split: '拆分',
+}
+const ROLE_NAMES: Record<string, string> = {
+  admin: '管理员', factory_manager: '厂长', production_manager: '生产经理',
+  quality_manager: '品质经理', operator: '操作员',
+}
+// 动作角色门槛（与后端 ACTION_ROLE_GATES 一致）
+const ACTION_ROLES: Record<string, string[]> = {
+  release: ['factory_manager', 'production_manager', 'admin'],
+  complete: ['factory_manager', 'quality_manager', 'admin'],
+  close: ['factory_manager', 'admin'],
 }
 
 const PRIORITY_MAP: Record<string, { color: string; text: string }> = {
@@ -41,6 +62,7 @@ const STEP_LABELS: Record<string, string> = {
 const WorkOrderDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const currentUser = getStoredUser()
   const [loading, setLoading] = useState(true)
   const [wo, setWo] = useState<WorkOrder | null>(null)
   const [cancelModalOpen, setCancelModalOpen] = useState(false)
@@ -49,6 +71,15 @@ const WorkOrderDetail: React.FC = () => {
   const [products, setProducts] = useState<Product[]>([])
   const [routing, setRouting] = useState<Routing | null>(null)
   const [reportDetail, setReportDetail] = useState<ProductionReport | null>(null)
+  const [children, setChildren] = useState<WorkOrder[]>([])
+  const [statusLogs, setStatusLogs] = useState<WoStatusLog[]>([])
+
+  // 角色门槛（与后端一致）：superuser 或角色在允许列表
+  const hasRole = (action: string): boolean => {
+    if (!currentUser) return false
+    if (currentUser.is_superuser) return true
+    return (ACTION_ROLES[action] || []).includes(currentUser.role)
+  }
 
   const fetchDetail = async () => {
     if (!id) return
@@ -60,6 +91,9 @@ const WorkOrderDetail: React.FC = () => {
       if (res.routing_id) {
         getRouting(res.routing_id).then(setRouting).catch(() => setRouting(null))
       }
+      // 子工单 + 状态操作日志（审核追溯）
+      getWorkOrderChildren(id).then((r) => setChildren(r.items || [])).catch(() => setChildren([]))
+      getWorkOrderStatusLogs(id).then((r) => setStatusLogs(r.items || [])).catch(() => setStatusLogs([]))
     } catch (err: any) {
       message.error(err?.response?.data?.detail || '获取工单详情失败')
     } finally {
@@ -93,6 +127,7 @@ const WorkOrderDetail: React.FC = () => {
         case 'release': await releaseWorkOrder(wo.id); break
         case 'start': await startWorkOrder(wo.id); break
         case 'complete': await completeWorkOrder(wo.id); break
+        case 'close': await closeWorkOrder(wo.id); break
       }
       message.success('操作成功')
       fetchDetail()
@@ -124,6 +159,14 @@ const WorkOrderDetail: React.FC = () => {
 
   const currentStepIndex = STATUS_STEPS.indexOf(wo.status)
   const stepCurrent = wo.status === 'cancelled' || wo.status === 'on_hold' ? currentStepIndex : Math.max(currentStepIndex, 0)
+
+  // 审核机制派生状态：创建人 / 子工单完成情况 / 角色门槛
+  const isCreator = !!currentUser && !!wo.created_by && wo.created_by === currentUser.username
+  const hasChildren = children.length > 0
+  const childrenAllDone = hasChildren && children.every((c) => ['completed', 'closed'].includes(c.status))
+  const canRelease = hasRole('release')
+  const canComplete = hasRole('complete')
+  const canClose = hasRole('close')
 
   // 追溯：工位名/产品名解析
   const stationLabel = makeStationResolver(stations)
@@ -180,12 +223,25 @@ const WorkOrderDetail: React.FC = () => {
           items={STATUS_STEPS.map((s) => ({ title: STEP_LABELS[s] }))}
         />
         <Divider style={{ margin: '12px 0' }} />
-        <Space>
-          {wo.status === 'pending' && <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => handleAction('release')}>下达</Button>}
-          {wo.status === 'released' && <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => handleAction('start')}>开工</Button>}
-          {wo.status === 'in_progress' && <Button type="primary" icon={<CheckCircleOutlined />} onClick={() => handleAction('complete')}>完工</Button>}
-          {['pending', 'released'].includes(wo.status) && <Button danger icon={<StopOutlined />} onClick={() => setCancelModalOpen(true)}>取消工单</Button>}
+        <Space wrap>
+          {['draft', 'pending'].includes(wo.status) && canRelease && (
+            <Tooltip title={isCreator ? '职责分离：创建人不能下达自己创建的工单' : ''}>
+              <Button type="primary" icon={<AuditOutlined />} disabled={isCreator} onClick={() => handleAction('release')}>下达</Button>
+            </Tooltip>
+          )}
+          {wo.status === 'released' && !hasChildren && <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => handleAction('start')}>开工</Button>}
+          {(wo.status === 'in_progress' || wo.status === 'pending_inbound' || (hasChildren && childrenAllDone && wo.status === 'released')) && canComplete && (
+            <Button type="primary" icon={<CheckCircleOutlined />} onClick={() => handleAction('complete')}>完工</Button>
+          )}
+          {wo.status === 'completed' && canClose && <Button icon={<CheckCircleOutlined />} onClick={() => handleAction('close')}>关闭</Button>}
+          {['draft', 'pending', 'released'].includes(wo.status) && <Button danger icon={<StopOutlined />} onClick={() => setCancelModalOpen(true)}>取消工单</Button>}
         </Space>
+        {!canRelease && ['draft', 'pending'].includes(wo.status) && (
+          <div style={{ marginTop: 8, color: '#999', fontSize: 12 }}>下达需由生产经理/厂长操作，且创建人不能下达自己创建的工单</div>
+        )}
+        {hasChildren && !canComplete && ['released', 'in_progress', 'pending_inbound'].includes(wo.status) && (
+          <div style={{ marginTop: 8, color: '#999', fontSize: 12 }}>完工需品质确认（厂长/品质经理）</div>
+        )}
       </Card>
 
       {/* 进度统计 */}
@@ -228,9 +284,59 @@ const WorkOrderDetail: React.FC = () => {
           <Descriptions.Item label="实际完工">{wo.actual_complete ? dayjs(wo.actual_complete).format('YYYY-MM-DD HH:mm') : '-'}</Descriptions.Item>
           <Descriptions.Item label="创建人">{wo.created_by || '-'}</Descriptions.Item>
           <Descriptions.Item label="创建时间">{wo.created_at ? dayjs(wo.created_at).format('YYYY-MM-DD HH:mm') : '-'}</Descriptions.Item>
+          <Descriptions.Item label="下达人">{wo.released_by || '-'}</Descriptions.Item>
+          <Descriptions.Item label="完工确认人">{wo.completed_by || '-'}</Descriptions.Item>
           <Descriptions.Item label="备注" span={3}>{wo.remark || '-'}</Descriptions.Item>
         </Descriptions>
       </Card>
+
+      {/* 子工单面板（主工单拆分后显示：子工单未完工时主工单不可完工）*/}
+      {hasChildren && (
+        <Card
+          title={<span><ApartmentOutlined /> 子工单（{children.length}）</span>}
+          size="small"
+          style={{ marginBottom: 16 }}
+        >
+          {!childrenAllDone && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="子工单未全部完工，主工单不可完工；主工单进度由子工单自动汇总"
+            />
+          )}
+          <Table
+            size="small"
+            pagination={false}
+            dataSource={children.map((c) => ({ ...c, key: c.id }))}
+            columns={[
+              {
+                title: '子工单号', dataIndex: 'work_order_code', key: 'code', width: 200,
+                render: (v: string, r: WorkOrder) => <a onClick={() => navigate(`/work-orders/${r.id}`)}>{v}</a>,
+              },
+              {
+                title: '状态', dataIndex: 'status', key: 'status', width: 100,
+                render: (v: string) => {
+                  const info = STATUS_MAP[v] || { color: 'default', text: v }
+                  return <Tag color={info.color}>{info.text}</Tag>
+                },
+              },
+              { title: '计划量', dataIndex: 'planned_qty', key: 'planned', width: 90 },
+              { title: '完成量', dataIndex: 'completed_qty', key: 'completed', width: 90 },
+              {
+                title: '进度', key: 'progress',
+                render: (_: any, r: WorkOrder) => (
+                  <Progress
+                    percent={r.planned_qty > 0 ? Math.round(r.completed_qty / r.planned_qty * 100) : 0}
+                    size="small"
+                    status={['completed', 'closed'].includes(r.status) ? 'success' : 'active'}
+                  />
+                ),
+              },
+            ]}
+          />
+        </Card>
+      )}
 
       {/* 工艺路线（追溯：当前工序第 N 步 → 具体工序）*/}
       {routing && routing.steps && routing.steps.length > 0 && (
@@ -256,6 +362,38 @@ const WorkOrderDetail: React.FC = () => {
           scroll={{ x: 900 }}
           onRow={(r) => ({ onClick: () => setReportDetail(r), style: { cursor: 'pointer' } })}
         />
+      </Card>
+
+      {/* 状态操作记录（审核追溯：谁/什么角色/何时/做了什么）*/}
+      <Card title={<span><HistoryOutlined /> 状态记录 ({statusLogs.length})</span>} size="small" style={{ marginTop: 16 }}>
+        {statusLogs.length === 0 ? (
+          <div style={{ color: '#999' }}>暂无状态操作记录</div>
+        ) : (
+          <Timeline
+            style={{ marginTop: 16 }}
+            items={[...statusLogs].reverse().map((log) => ({
+              color: log.action === 'complete' ? 'green' : log.action === 'release' ? 'blue' : log.action === 'cancel' ? 'red' : 'gray',
+              children: (
+                <div>
+                  <div>
+                    <b>{ACTION_LABELS[log.action] || log.action}</b>
+                    {log.from_status && (
+                      <span style={{ color: '#999' }}>
+                        {' '}({(STATUS_MAP[log.from_status] || { text: log.from_status }).text} → {(STATUS_MAP[log.to_status] || { text: log.to_status }).text})
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ color: '#666', fontSize: 12 }}>
+                    {log.operator}
+                    {log.operator_role ? `（${ROLE_NAMES[log.operator_role] || log.operator_role}）` : ''}
+                    {log.created_at ? ` · ${dayjs(log.created_at).format('YYYY-MM-DD HH:mm:ss')}` : ''}
+                  </div>
+                  {log.comment && <div style={{ color: '#999', fontSize: 12 }}>{log.comment}</div>}
+                </div>
+              ),
+            }))}
+          />
+        )}
       </Card>
 
       {/* 取消 Modal */}

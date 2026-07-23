@@ -3,6 +3,8 @@
 参考 luaguage site_search_engine 设计：跨模块聚合搜索 + 分类 facets + 排序去重
 搜索范围：工单、产品、设备、库存、工位、仓库、员工
 """
+import logging
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -10,17 +12,55 @@ from sqlalchemy import text
 from database.db_config import get_db
 from core.auth.security import get_current_user
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1/search", tags=["Global Search"])
 
-# 各模块搜索配置：(source标识, 中文标签, SQL表名, 搜索字段列表, 前端跳转路由)
+# 各模块搜索配置（字段名必须与 DB 实际列名一致，JOIN 用 CAST AS TEXT 兼容 uuid/varchar 混用）
+# select: 返回列（避免 SELECT * 导致 JOIN 重复列）; fields: 参与 ILIKE 搜索的列; route: 前端跳转路由
 SEARCH_MODULES = [
-    ("work_order", "工单", "work_orders", ["work_order_number", "product_name", "status"], "/work-orders"),
-    ("product", "产品", "products", ["product_code", "product_name", "specification"], "/base-data"),
-    ("equipment", "设备", "equipment", ["equipment_code", "equipment_name", "model"], "/base-data"),
-    ("inventory", "库存", "inventory", ["item_code", "item_name", "warehouse_id"], "/inventory"),
-    ("station", "工位", "stations", ["station_code", "station_name", "station_type"], "/base-data"),
-    ("warehouse", "仓库", "warehouses", ["warehouse_code", "warehouse_name", "warehouse_type"], "/warehouses"),
-    ("employee", "员工", "users", ["username", "full_name", "email"], "/skill-matrix"),
+    {
+        "source": "work_order", "label": "工单", "route": "/work-orders",
+        "select": "wo.id, wo.work_order_code, wo.status, wo.priority, wo.planned_qty, wo.completed_qty, p.product_name",
+        "from": "work_orders wo LEFT JOIN products p ON CAST(wo.product_id AS TEXT) = CAST(p.id AS TEXT)",
+        "fields": ["wo.work_order_code", "p.product_name", "wo.status"],
+    },
+    {
+        "source": "product", "label": "产品", "route": "/base-data",
+        "select": "id, product_code, product_name, category, unit, status",
+        "from": "products",
+        "fields": ["product_code", "product_name", "category"],
+    },
+    {
+        "source": "equipment", "label": "设备", "route": "/base-data",
+        "select": "id, equipment_code, equipment_name, equipment_type, spec, status",
+        "from": "equipment",
+        "fields": ["equipment_code", "equipment_name", "spec"],
+    },
+    {
+        "source": "inventory", "label": "库存", "route": "/inventory",
+        "select": "i.id, i.material_code, i.batch_code, i.total_qty, i.available_qty, i.status, p.product_name",
+        "from": "inventory i LEFT JOIN products p ON CAST(i.material_id AS TEXT) = CAST(p.id AS TEXT)",
+        "fields": ["i.material_code", "p.product_name", "i.batch_code"],
+    },
+    {
+        "source": "station", "label": "工位", "route": "/base-data",
+        "select": "id, station_code, station_name, station_type, capacity, status",
+        "from": "stations",
+        "fields": ["station_code", "station_name", "station_type"],
+    },
+    {
+        "source": "warehouse", "label": "仓库", "route": "/warehouses",
+        "select": "id, warehouse_code, warehouse_name, warehouse_type, status",
+        "from": "warehouses",
+        "fields": ["warehouse_code", "warehouse_name", "warehouse_type"],
+    },
+    {
+        "source": "employee", "label": "员工", "route": "/skill-matrix",
+        "select": "id, username, full_name, email, role",
+        "from": "users",
+        "fields": ["username", "full_name", "email"],
+    },
 ]
 
 
@@ -43,13 +83,13 @@ async def global_search(
     all_results = []
     facets = {}
 
-    for source, label, table, fields, route in SEARCH_MODULES:
+    for mod in SEARCH_MODULES:
         # 构建 OR 条件
         conditions = " OR ".join(
-            f"CAST({f} AS TEXT) ILIKE :kw" for f in fields
+            f"CAST({f} AS TEXT) ILIKE :kw" for f in mod["fields"]
         )
         sql = f"""
-            SELECT * FROM {table}
+            SELECT {mod['select']} FROM {mod['from']}
             WHERE {conditions}
             LIMIT :lim
         """
@@ -58,29 +98,31 @@ async def global_search(
             rows = result.mappings().all()
             count = len(rows)
             if count > 0:
-                facets[source] = count
+                facets[mod["source"]] = count
                 for row in rows:
                     row_dict = dict(row)
-                    # 提取显示标题（优先用第一个搜索字段）
+                    # 提取显示标题（优先用第一个搜索字段，去掉表别名前缀）
                     title = ""
                     subtitle = ""
-                    for f in fields:
-                        val = str(row_dict.get(f) or "")
+                    for f in mod["fields"]:
+                        key = f.split(".")[-1]
+                        val = str(row_dict.get(key) or "")
                         if val and not title:
                             title = val
                         elif val and not subtitle:
                             subtitle = val
                     all_results.append({
-                        "source": source,
-                        "source_label": label,
+                        "source": mod["source"],
+                        "source_label": mod["label"],
                         "title": title or str(row_dict.get("id", "")),
                         "subtitle": subtitle,
-                        "route": route,
+                        "route": mod["route"],
                         "id": str(row_dict.get("id", "")),
                         "data": {k: str(v) for k, v in row_dict.items() if v is not None},
                     })
-        except Exception:
-            # 表不存在等情况静默跳过
+        except Exception as exc:
+            # 表不存在/列名不匹配等情况跳过，但记录日志避免静默失败
+            logger.warning("全站搜索模块 %s 查询失败: %s", mod["source"], exc)
             continue
 
     return {

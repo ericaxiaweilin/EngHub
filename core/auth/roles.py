@@ -648,13 +648,6 @@ def get_menu_items_for_user(user) -> list:
         ],
     })
 
-    # AI助手 - 所有人可见
-    items.append({
-        "key": "/ai",
-        "label": "AI助手",
-        "module": "ai",
-    })
-
     # 生产制造组
     if any(m in modules_with_access for m in ["work_order", "production_report", "station", "routing", "equipment"]):
         children = []

@@ -29,6 +29,8 @@ export interface WorkOrder {
   bom_version?: string;
   created_by?: string;
   updated_by?: string;
+  released_by?: string;   // 下达人（审核门槛：管理角色且非创建人）
+  completed_by?: string;  // 完工确认人（品质角色）
   remark?: string;
   created_at: string;
   updated_at?: string;
@@ -39,6 +41,11 @@ export interface WorkOrder {
   remaining_qty?: number;
   remaining_time?: string;
   is_overdue?: boolean;
+  // 工单体系化编码：层级字段
+  wo_type?: string;              // master=主工单 / operation=工序工单
+  process_code?: string;         // 行业通用工序代码（SMT/INJ/MACH...）
+  operation_seq?: number;        // 同一工序内道次序号
+  parent_work_order_id?: string; // 工序工单指向主工单
 }
 
 export interface WorkOrderStats {
@@ -286,6 +293,25 @@ export const cancelWorkOrder = (id: string, reason: string) =>
 
 export const splitWorkOrder = (id: string, splitQty: number, remark?: string) =>
   api.post<any, { new_work_order?: WorkOrder; [k: string]: any }>(`${API_ENDPOINTS.WORK_ORDER(id)}/split`, { split_qty: splitQty, remark });
+
+// 状态操作日志（审核追溯）
+export interface WoStatusLog {
+  id: string;
+  action: string;
+  from_status?: string;
+  to_status: string;
+  operator: string;
+  operator_role?: string;
+  comment?: string;
+  created_at?: string;
+}
+
+export const getWorkOrderStatusLogs = (id: string) =>
+  api.get<any, { items: WoStatusLog[]; total: number }>(`${API_ENDPOINTS.WORK_ORDER(id)}/status-logs`);
+
+// 子工单列表（含进度）
+export const getWorkOrderChildren = (id: string) =>
+  api.get<any, { items: (WorkOrder & { progress?: { progress_rate?: number } })[]; total: number }>(`${API_ENDPOINTS.WORK_ORDER(id)}/children`);
 
 // ============== Production Reports ==============
 

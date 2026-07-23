@@ -2,10 +2,10 @@
 员工能力标签服务
 提供技能矩阵、资质认证、人员匹配等功能
 """
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional, Dict
 from database.models import (
     EmployeeSkill, Skill, TrainingRecord, User
@@ -104,7 +104,7 @@ class EmployeeSkillService:
         """
         query = (
             select(User, EmployeeSkill, Skill)
-            .join(EmployeeSkill, User.id == EmployeeSkill.user_id)
+            .join(EmployeeSkill, cast(User.id, String(36)) == EmployeeSkill.user_id)
             .join(Skill, EmployeeSkill.skill_id == Skill.id)
             .where((EmployeeSkill.expiry_date.is_(None)) | (EmployeeSkill.expiry_date >= datetime.utcnow()))
         )
@@ -171,7 +171,7 @@ class EmployeeSkillService:
         
         # Get user details
         users_result = await self.db.execute(
-            select(User).where(User.id.in_(qualified_user_ids))
+            select(User).where(cast(User.id, String(36)).in_(qualified_user_ids))
         )
         return list(users_result.scalars().all())
     
@@ -186,11 +186,11 @@ class EmployeeSkillService:
         
         result = await self.db.execute(
             select(EmployeeSkill, User, Skill)
-            .join(User, EmployeeSkill.user_id == User.id)
+            .join(User, EmployeeSkill.user_id == cast(User.id, String(36)))
             .join(Skill, EmployeeSkill.skill_id == Skill.id)
             .where(
                 EmployeeSkill.expiry_date.isnot(None),
-                EmployeeSkill.expiry_date <= func.date(target_date, f'+{days} days'),
+                EmployeeSkill.expiry_date <= target_date + timedelta(days=days),
                 EmployeeSkill.expiry_date >= target_date
             )
         )
@@ -201,9 +201,9 @@ class EmployeeSkillService:
                 "user_id": user.id,
                 "username": user.username,
                 "skill_name": skill.name,
-                "current_level": emp_skill.level.value,
+                "current_level": emp_skill.level if isinstance(emp_skill.level, str) else emp_skill.level.value,
                 "expiry_date": emp_skill.expiry_date,
-                "days_until_expiry": (emp_skill.expiry_date - target_date).days
+                "days_until_expiry": (emp_skill.expiry_date.replace(tzinfo=None) - datetime.combine(target_date, datetime.min.time())).days
             })
         
         return expiring

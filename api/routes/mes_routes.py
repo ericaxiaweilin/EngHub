@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from database.db_config import get_db
 from database.models import User, Product
-from api.services.work_order_service import WorkOrderService, WOStatus
+from api.services.work_order_service import WorkOrderService, WOStatus, WoPermissionError
 from api.services.mes_services import (
     ProductionReportService,
     StationService,
@@ -122,12 +122,14 @@ async def list_work_orders(
     product_id: Optional[str] = None,
     priority: Optional[str] = None,
     station_id: Optional[str] = None,
+    wo_type: Optional[str] = Query("master", description="工单层级：master=主工单 / operation=工序工单 / all=全部"),
+    parent_work_order_id: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取工单列表（含进度信息）"""
+    """获取工单列表（含进度信息）。默认只返回主工单，传 wo_type=all 含工序工单。"""
     service = WorkOrderService(db)
     skip = (page - 1) * page_size
     work_orders = await service.list_work_orders(
@@ -136,6 +138,8 @@ async def list_work_orders(
         product_id=product_id,
         priority=priority,
         station_id=station_id,
+        wo_type=wo_type,
+        parent_work_order_id=parent_work_order_id,
         skip=skip,
         limit=page_size,
     )
@@ -230,13 +234,15 @@ async def release_work_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """待下发 → 已下达"""
+    """待下发 → 已下达（审核门槛：管理角色 + 创建人不能下达自己的工单）"""
     service = WorkOrderService(db)
     try:
-        work_order = await service.release_work_order(work_order_id)
+        work_order = await service.release_work_order(work_order_id, current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
+    except WoPermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -247,10 +253,10 @@ async def start_work_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """已下达 → 生产中"""
+    """已下达 → 生产中（父子约束：已拆分的主工单由子工单分别开工）"""
     service = WorkOrderService(db)
     try:
-        work_order = await service.start_work_order(work_order_id)
+        work_order = await service.start_work_order(work_order_id, current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
@@ -268,7 +274,7 @@ async def pause_work_order(
     """生产中 → 暂停"""
     service = WorkOrderService(db)
     try:
-        work_order = await service.pause_work_order(work_order_id, data.reason or "")
+        work_order = await service.pause_work_order(work_order_id, data.reason or "", user=current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
@@ -286,7 +292,7 @@ async def resume_work_order(
     """暂停 → 生产中"""
     service = WorkOrderService(db)
     try:
-        work_order = await service.resume_work_order(work_order_id, data.reason or "")
+        work_order = await service.resume_work_order(work_order_id, data.reason or "", user=current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
@@ -303,7 +309,7 @@ async def mark_pending_inbound(
     """生产中 → 待入库"""
     service = WorkOrderService(db)
     try:
-        work_order = await service.mark_pending_inbound(work_order_id)
+        work_order = await service.mark_pending_inbound(work_order_id, user=current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
@@ -320,15 +326,17 @@ async def complete_work_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """待入库/生产中 → 已完成"""
+    """生产中/待入库 → 已完成（审核门槛：品质角色 + 实际产出 + 子工单全部完工）"""
     service = WorkOrderService(db)
     try:
         work_order = await service.complete_work_order(
-            work_order_id, completed_qty, good_qty, defect_qty
+            work_order_id, completed_qty, good_qty, defect_qty, user=current_user
         )
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
+    except WoPermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -339,13 +347,15 @@ async def close_work_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """已完成 → 已关闭"""
+    """已完成 → 已关闭（审核门槛：厂长 / 管理员）"""
     service = WorkOrderService(db)
     try:
-        work_order = await service.close_work_order(work_order_id)
+        work_order = await service.close_work_order(work_order_id, current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
+    except WoPermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -360,7 +370,7 @@ async def cancel_work_order(
     """取消工单"""
     service = WorkOrderService(db)
     try:
-        work_order = await service.cancel_work_order(work_order_id, reason)
+        work_order = await service.cancel_work_order(work_order_id, reason, user=current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
         return service.to_dict(work_order)
@@ -383,6 +393,7 @@ async def split_work_order(
             split_qty=data.split_qty,
             remark=data.remark,
             created_by=current_user.username,
+            user=current_user,
         )
         return {
             "original_work_order": service.to_dict(original_wo),
@@ -391,6 +402,30 @@ async def split_work_order(
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/work-orders/{work_order_id}/status-logs")
+async def get_work_order_status_logs(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """状态操作日志（审核追溯：谁/什么角色/何时/做了什么）"""
+    service = WorkOrderService(db)
+    logs = await service.get_status_logs(work_order_id)
+    return {"items": logs, "total": len(logs)}
+
+
+@router.get("/work-orders/{work_order_id}/children")
+async def get_work_order_children(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """子工单列表（含进度，主工单详情页使用）"""
+    service = WorkOrderService(db)
+    children = await service.get_children_detail(work_order_id)
+    return {"items": children, "total": len(children)}
 
 
 # ============================================================

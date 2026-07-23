@@ -7,12 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
+import math
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
 from core.auth.security import get_current_user
-from database.models import User, Plan
+from database.models import User, Plan, Product, BomItem, Inventory
 
 router = APIRouter(prefix="/api/v1", tags=["pp"])
 
@@ -140,7 +141,97 @@ async def release_plan(
     return _serialize_plan(p)
 
 
-# --- MRP / Capacity stubs (暂无独立表) ---
+# --- MRP 物料需求计算 ---
+
+
+@router.post("/mrp/calculate")
+async def calculate_mrp(
+    plan_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    MRP 物料需求计算（真实 DB 数据）
+
+    计算链路：计划 → 产品 BOM 展开 → 库存可用量核对 → 净需求 + 采购建议
+    前置条件：计划存在 且 产品已配置 BOM（bom_items 表）
+    """
+    p = await db.get(Plan, plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="计划不存在")
+
+    # 产品名称（product_id 可能是自由文本，不一定对应真实产品）
+    product_name = None
+    prod_res = await db.execute(select(Product).where(Product.id == p.product_id))
+    product = prod_res.scalars().first()
+    if product:
+        product_name = product.product_name
+
+    # BOM 展开：按产品取物料清单
+    bom_res = await db.execute(select(BomItem).where(BomItem.product_id == p.product_id))
+    bom_items = list(bom_res.scalars().all())
+    if not bom_items:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"MRP 计算失败：产品[{product_name or p.product_id}]未配置 BOM（物料清单）。"
+                f"MRP 需要：计划 → 产品 → BOM → 库存数据，请先为基础数据中的产品维护 BOM。"
+            ),
+        )
+
+    # 库存可用量：按 material_code 汇总（跨仓库），按厂区过滤
+    mat_codes = [b.material_code for b in bom_items]
+    inv_res = await db.execute(
+        select(Inventory.material_code, func.sum(Inventory.available_qty))
+        .where(Inventory.material_code.in_(mat_codes))
+        .where(Inventory.factory_id == p.factory_id)
+        .group_by(Inventory.material_code)
+    )
+    on_hand_map = {row[0]: int(row[1] or 0) for row in inv_res.all()}
+
+    items = []
+    shortage_count = 0
+    total_shortage = 0
+    for b in bom_items:
+        required = math.ceil(p.quantity * float(b.qty_per_unit))
+        on_hand = on_hand_map.get(b.material_code, 0)
+        net = max(0, required - on_hand)
+        # 采购建议：净缺口向上取整到 MOQ=100 的整数倍
+        suggested = ((net + 99) // 100) * 100 if net > 0 else 0
+        if net > 0:
+            shortage_count += 1
+            total_shortage += net
+        items.append({
+            "material_id": b.material_code,
+            "material_code": b.material_code,
+            "material_name": b.material_name,
+            "unit": b.unit,
+            "qty_per_unit": b.qty_per_unit,
+            "required_qty": required,
+            "on_hand_qty": on_hand,
+            "net_qty": net,
+            "suggested_order_qty": suggested,
+        })
+
+    return {
+        "id": f"MRP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{plan_id[:8]}",
+        "plan_id": plan_id,
+        "plan_code": p.plan_code,
+        "product_id": p.product_id,
+        "product_name": product_name,
+        "status": "calculated",
+        "calculated_at": datetime.utcnow().isoformat(),
+        "target_date": p.required_date.isoformat() if p.required_date else None,
+        "items": items,
+        "summary": {
+            "total_materials": len(items),
+            "shortage_count": shortage_count,
+            "total_shortage_qty": total_shortage,
+        },
+    }
+
+
+# --- Capacity stubs (暂无独立表) ---
 
 
 @router.get("/capacity/analysis")
