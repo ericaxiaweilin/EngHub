@@ -119,10 +119,10 @@ async def run_simulation(request: FactorySimRunRequest) -> FactorySimResult:
 async def factory_sim_dashboard_summary(
     scenario_id: Optional[str] = Query(default=None, description="工厂场景 ID，缺省为默认精密机械厂"),
 ) -> Dict[str, Any]:
-    """供生产看板使用的仿真结果轻量摘要。
+    """供仿真结果看板使用的完整仿真结果（含全部 KPI / 工段 / 订单 / 流转 / 出库 / 卡点）。
 
     重要：仿真数据与真实生产数据严格分离，本接口返回结果带 is_simulation=True 标记，
-    前端需独立分区展示，不得与实时报工/工单/设备数据混计。
+    前端需独立页面展示，不得与实时报工/工单/设备数据混计。
     """
     sid = scenario_id or "enghub-precision-plant"
     now = datetime.now(timezone.utc)
@@ -137,21 +137,10 @@ async def factory_sim_dashboard_summary(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    k = result.kpis
-    data: Dict[str, Any] = {
-        "is_simulation": True,  # 明确标记：仿真数据，非真实生产
-        "scenario_id": sid,
-        "scenario_name": meta.get("scenario_name", sid),
-        "engine_version": result.engine_version,
-        "horizon_days": result.horizon_days,
-        "order_count": result.order_count,
-        "section_count": result.section_count,
-        "created_at": result.created_at.isoformat(),
-        "kpis": k.model_dump(),
-        # 卡点排行 Top5（供看板快速展示瓶颈）
-        "blocking_points": [bp.model_dump() for bp in result.blocking_points[:5]],
-        "alert_count": len(result.alerts),
-        "critical_alert_count": sum(1 for a in result.alerts if a.level == "critical"),
-    }
+    # 返回完整仿真结果（与 POST /run 结构一致）+ 仿真标记 + 场景信息
+    data: Dict[str, Any] = result.model_dump(mode="json")
+    data["is_simulation"] = True  # 明确标记：仿真数据，非真实生产
+    data["scenario_id"] = sid
+    data["scenario_name"] = meta.get("scenario_name", sid)
     _SIM_SUMMARY_CACHE[sid] = {"ts": now, "data": data}
     return data

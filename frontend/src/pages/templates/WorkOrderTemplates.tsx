@@ -1,19 +1,30 @@
 
 
-import { useState, useEffect } from 'react'
-import { Card, Button, Form, Input, message, Tag, Descriptions, Space, Modal } from 'antd'
-import { PlusOutlined, FileTextOutlined } from '@ant-design/icons'
+import { useState, useEffect, useRef, lazy, Suspense } from 'react'
+import { Card, Button, Form, Input, message, Tag, Descriptions, Space, Modal, Spin } from 'antd'
+import { PlusOutlined, FileTextOutlined, TableOutlined } from '@ant-design/icons'
 import axios from 'axios'
+import { useForm } from 'form-render'
 import { workOrderTemplatesApi } from '../../services/workOrderTemplates'
+import SchemaFormRenderer, { TemplateField } from '../../components/SchemaFormRenderer'
+import type { SpreadsheetEditorHandle } from '../../components/SpreadsheetEditor'
+
+// Univer 体积较大，懒加载：仅在打开电子表格弹窗时才下载对应分包
+const SpreadsheetEditor = lazy(() => import('../../components/SpreadsheetEditor'))
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1'
 
 export default function WorkOrderTemplatesPage() {
   const [templates, setTemplates] = useState<any[]>([])
-  const [fields, setFields] = useState<any[]>([])
+  const [fields, setFields] = useState<TemplateField[]>([])
   const [selectedCode, setSelectedCode] = useState('')
   const [formVisible, setFormVisible] = useState(false)
-  const [form] = Form.useForm()
+  const [titleForm] = Form.useForm()
+  const schemaForm = useForm()
+
+  // 电子表格录入弹窗（json_array 字段用类 Excel 方式填写）
+  const [sheetField, setSheetField] = useState<TemplateField | null>(null)
+  const sheetRef = useRef<SpreadsheetEditorHandle>(null)
 
   const fetchTemplates = async () => {
     try {
@@ -44,18 +55,25 @@ export default function WorkOrderTemplatesPage() {
 
   const handleCreate = async () => {
     try {
-      const values = await form.validateFields()
+      const titleValues = await titleForm.validateFields()
+      // 触发 form-render 校验，通过后由 onFinish 提交
+      const data = await schemaForm.validateFields()
       const result = await workOrderTemplatesApi.createFromTemplate({
         factory_id: 'factory-001',
         template_code: selectedCode,
-        title: values.title,
-        data: values.data || {},
+        title: titleValues.title,
+        data: data || {},
       })
       message.success(`程序工单创建成功！工单号：${result.data?.work_order_code || '-'}`)
-      form.resetFields()
+      titleForm.resetFields()
+      schemaForm.resetFields()
       setFormVisible(false)
     } catch (err: any) {
-      message.error(err.response?.data?.detail || '创建失败')
+      if (err?.response?.data?.detail) {
+        message.error(err.response.data.detail)
+      } else if (err?.errorFields) {
+        message.warning('请检查表单必填项')
+      }
     }
   }
 
@@ -65,6 +83,20 @@ export default function WorkOrderTemplatesPage() {
     ECR: { name: '工艺变更申请', desc: '风险评估、受影响工单自动关联', color: 'blue' },
     FAI: { name: '首件检验单', desc: '关键尺寸实测值与公差自动对比', color: 'green' },
     SCRAP: { name: '报废申请单', desc: '成本估算、财务审批流', color: 'default' },
+  }
+
+  /** 电子表格确认：二维数组 → [{name, value, remark}] 写入表单字段 */
+  const handleSheetConfirm = () => {
+    if (!sheetField || !sheetRef.current) return
+    const rows = sheetRef.current.getData().filter((row) => row.some((c) => c !== '' && c !== null && c !== undefined))
+    const arr = rows.map((row) => ({
+      name: row[0] != null ? String(row[0]) : '',
+      value: row[1] != null ? String(row[1]) : '',
+      remark: row[2] != null ? String(row[2]) : '',
+    }))
+    schemaForm.setValueByPath(sheetField.key, arr)
+    message.success(`已录入 ${arr.length} 行数据到「${sheetField.label}」`)
+    setSheetField(null)
   }
 
   return (
@@ -96,6 +128,17 @@ export default function WorkOrderTemplatesPage() {
                 {field.options && field.options.map((opt: string) => (
                   <Tag key={opt} style={{ marginLeft: 4 }}>{opt}</Tag>
                 ))}
+                {(field.type === 'json_array' || field.type === 'array') && (
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<TableOutlined />}
+                    style={{ padding: '0 4px' }}
+                    onClick={() => setSheetField(field)}
+                  >
+                    电子表格录入
+                  </Button>
+                )}
               </Descriptions.Item>
             ))}
           </Descriptions>
@@ -111,7 +154,7 @@ export default function WorkOrderTemplatesPage() {
         基于模板创建程序工单
       </Button>
 
-      {/* 创建工单弹窗 */}
+      {/* 创建工单弹窗：动态表单（form-render 根据模板 schema 自动渲染控件） */}
       <Modal
         title={selectedCode ? `基于 ${templateMeta[selectedCode]?.name} 创建工单` : '请选择模板'}
         open={formVisible}
@@ -119,16 +162,43 @@ export default function WorkOrderTemplatesPage() {
         onCancel={() => setFormVisible(false)}
         okText="创建"
         cancelText="取消"
-        width={700}
+        width={760}
+        destroyOnClose
       >
-        <Form form={form} layout="vertical">
-          <Form.Item name="title" label="工单标题" rules={[{ required: true }]}>
+        <Form form={titleForm} layout="vertical" style={{ marginBottom: 8 }}>
+          <Form.Item name="title" label="工单标题" rules={[{ required: true, message: '请输入工单标题' }]}>
             <Input placeholder={`例：${templateMeta[selectedCode]?.name} - 20260722-001`} />
           </Form.Item>
-          <Form.Item name="data" label="模板数据（JSON）" extra="此处为简化版，实际应使用前端JSON Schema渲染器生成UI">
-            <Input.TextArea rows={8} placeholder='{"defect_code":"DC-001","severity":"major"}' />
-          </Form.Item>
         </Form>
+        {fields.length > 0 && (
+          <SchemaFormRenderer fields={fields} form={schemaForm} />
+        )}
+      </Modal>
+
+      {/* 电子表格录入弹窗（类 Excel，支持公式/粘贴） */}
+      <Modal
+        title={sheetField ? `${sheetField.label} - 电子表格录入` : '电子表格录入'}
+        open={!!sheetField}
+        onOk={handleSheetConfirm}
+        onCancel={() => setSheetField(null)}
+        okText="确认录入"
+        cancelText="取消"
+        width={900}
+        destroyOnClose
+      >
+        <div style={{ marginBottom: 8, color: '#8c8c8c', fontSize: 12 }}>
+          支持从 Excel 直接复制粘贴 · 列结构：名称/项目 | 数值/数量 | 备注
+        </div>
+        {sheetField && (
+          <Suspense fallback={<div style={{ height: 380, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Spin tip="加载电子表格组件..." /></div>}>
+            <SpreadsheetEditor
+              ref={sheetRef}
+              headers={['名称/项目', '数值/数量', '备注']}
+              height={380}
+              sheetName={sheetField.label}
+            />
+          </Suspense>
+        )}
       </Modal>
     </Card>
   )

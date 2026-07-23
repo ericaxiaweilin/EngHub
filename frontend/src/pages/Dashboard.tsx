@@ -1,9 +1,8 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { Row, Col, Card, Statistic, Table, Tag, Spin, Progress, message, List, Tooltip } from 'antd'
+import { Row, Col, Card, Statistic, Table, Tag, Spin, Progress, message, List } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import {
   RiseOutlined, CheckCircleOutlined, ToolOutlined, AlertOutlined,
-  ExperimentOutlined, ThunderboltOutlined,
 } from '@ant-design/icons'
 import { Link, useNavigate } from 'react-router-dom'
 import dayjs from 'dayjs'
@@ -11,7 +10,6 @@ import {
   getWorkOrders, getProductionReports, getEquipment, getStations, getProducts,
   WorkOrder, ProductionReport, Equipment, Station, Product,
 } from '../services/mes'
-import { getFactorySimDashboardSummary, FactorySimDashboardSummary, BLOCKING_TYPE_LABEL, BLOCKING_TYPE_COLOR, BlockingType } from '../services/factorySim'
 import { getStoredUser } from '../services/auth'
 import DrillDownDrawer from '../components/trace/DrillDownDrawer'
 import RecordDetailDrawer, { DetailField } from '../components/trace/RecordDetailDrawer'
@@ -44,84 +42,6 @@ interface DrillConfig {
   onRowClick?: (r: any) => void
 }
 
-/* ==================== 仿真结果摘要视图（与真实生产数据完全分离） ==================== */
-const SimSummaryView: React.FC<{ summary: FactorySimDashboardSummary; pct: (v: number, d?: number) => string }> = ({ summary, pct }) => {
-  const k = summary.kpis
-  const items: { title: string; value: string; suffix?: string; color: string; tip?: string }[] = [
-    { title: '平均负荷率', value: pct(k.avg_load_rate), color: k.avg_load_rate > 0.9 ? '#fa8c16' : '#1890ff' },
-    { title: '峰值负荷率', value: pct(k.peak_load_rate, 0), color: k.peak_load_rate > 1 ? '#f5222d' : '#52c41a' },
-    { title: '订单准时率', value: pct(k.on_time_rate, 0), color: k.on_time_rate >= 0.8 ? '#52c41a' : '#f5222d' },
-    { title: '延期订单', value: `${k.delayed_orders}`, suffix: `/ ${summary.order_count}`, color: k.delayed_orders > 0 ? '#f5222d' : '#52c41a' },
-    { title: '瓶颈工段', value: `${k.bottleneck_sections}`, color: k.bottleneck_sections > 0 ? '#f5222d' : '#52c41a' },
-    { title: '负荷不均衡指数', value: k.imbalance_index.toFixed(2), color: k.imbalance_index > 0.4 ? '#fa8c16' : '#52c41a', tip: '各工段平均负荷率的极差' },
-    { title: '加班工时', value: k.overtime_hours.toFixed(0), suffix: 'h', color: '#722ed1' },
-    { title: 'WIP 峰值', value: `${k.wip_peak}`, suffix: '件', color: '#13c2c2' },
-    { title: '成品产出', value: `${k.total_output.toLocaleString()}`, suffix: '件', color: '#52c41a' },
-    { title: '综合良品率', value: pct(k.avg_yield_rate), color: k.avg_yield_rate >= 0.97 ? '#52c41a' : '#fa8c16' },
-    { title: '在岗人数', value: `${k.headcount}`, suffix: '人', color: '#2f54eb' },
-    { title: 'PO 完工/延期', value: `${k.po_completed}/${k.po_delayed}`, color: k.po_delayed > 0 ? '#f5222d' : '#52c41a' },
-    { title: '卡点工段', value: `${k.blocking_point_count}`, color: k.blocking_point_count > 0 ? '#f5222d' : '#52c41a' },
-    { title: '峰值积压', value: `${k.max_section_wip.toLocaleString()}`, suffix: '件', color: '#fa8c16' },
-    { title: '出库总量', value: `${k.total_outbound.toLocaleString()}`, suffix: '件', color: '#52c41a' },
-  ]
-
-  return (
-    <div>
-      {/* 场景信息行 */}
-      <div style={{ marginBottom: 12, color: '#8c8c8c', fontSize: 12 }}>
-        <ThunderboltOutlined style={{ marginRight: 4 }} />
-        场景 {summary.scenario_name} · 计划期 {summary.horizon_days} 天 · {summary.order_count} 订单 · {summary.section_count} 工段
-        {summary.critical_alert_count > 0 && <Tag color="red" style={{ marginLeft: 8 }}>{summary.critical_alert_count} 条严重预警</Tag>}
-        <span style={{ marginLeft: 8 }}>生成于 {dayjs(summary.created_at).format('MM-DD HH:mm')}</span>
-      </div>
-
-      {/* 仿真 KPI 卡片 */}
-      <Row gutter={[12, 12]}>
-        {items.map((it) => (
-          <Col span={6} xl={3} key={it.title}>
-            <Card size="small" styles={{ body: { padding: '10px 14px' } }}>
-              <Tooltip title={it.tip}>
-                <div style={{ fontSize: 11, color: '#8c8c8c' }}>{it.title}</div>
-                <div style={{ fontSize: 20, fontWeight: 700, color: it.color, lineHeight: 1.3 }}>
-                  {it.value}
-                  {it.suffix && <span style={{ fontSize: 12, fontWeight: 400, marginLeft: 2 }}>{it.suffix}</span>}
-                </div>
-              </Tooltip>
-            </Card>
-          </Col>
-        ))}
-      </Row>
-
-      {/* 卡点排行 Top5 */}
-      {summary.blocking_points.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <div style={{ fontWeight: 600, marginBottom: 8 }}>
-            <AlertOutlined style={{ color: '#f5222d', marginRight: 4 }} />
-            卡点排行（Top {summary.blocking_points.length}）
-          </div>
-          <Row gutter={[12, 12]}>
-            {summary.blocking_points.map((bp) => (
-              <Col span={8} key={`${bp.section_id}-${bp.rank}`}>
-                <Card size="small" styles={{ body: { padding: '8px 12px' } }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontWeight: 600 }}>#{bp.rank} {bp.section_name}</span>
-                    <Tag color={BLOCKING_TYPE_COLOR[bp.blocking_type as BlockingType]} style={{ margin: 0 }}>
-                      {BLOCKING_TYPE_LABEL[bp.blocking_type as BlockingType] || bp.blocking_type}
-                    </Tag>
-                  </div>
-                  <div style={{ fontSize: 12, color: '#8c8c8c', marginTop: 4 }}>
-                    严重度 {bp.severity.toFixed(0)} · 峰值 {Math.round(bp.peak_load_rate * 100)}% · WIP {bp.wip_peak.toLocaleString()} 件 · 延期 {bp.delayed_orders} 单
-                  </div>
-                </Card>
-              </Col>
-            ))}
-          </Row>
-        </div>
-      )}
-    </div>
-  )
-}
-
 const Dashboard: React.FC = () => {
   const navigate = useNavigate()
   const [loading, setLoading] = useState(false)
@@ -136,15 +56,8 @@ const Dashboard: React.FC = () => {
   const [reportDetail, setReportDetail] = useState<ProductionReport | null>(null)
   const [equipDetail, setEquipDetail] = useState<Equipment | null>(null)
 
-  // 仿真结果（与真实生产数据分离，独立加载，互不影响）
-  const [simSummary, setSimSummary] = useState<FactorySimDashboardSummary | null>(null)
-  const [simLoading, setSimLoading] = useState(false)
-
   const user = getStoredUser()
   const factoryId = user?.factory_id || 'F01'
-
-  // 仿真 KPI 百分比格式化
-  const pct = (v: number, digits = 1) => `${(v * 100).toFixed(digits)}%`
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -171,22 +84,6 @@ const Dashboard: React.FC = () => {
   }, [factoryId])
 
   useEffect(() => { fetchData() }, [fetchData])
-
-  // 仿真结果独立加载：仿真接口失败不影响真实生产看板
-  const fetchSim = useCallback(async () => {
-    setSimLoading(true)
-    try {
-      const res = await getFactorySimDashboardSummary()
-      setSimSummary(res)
-    } catch {
-      // 静默失败：仿真为辅助决策数据，不阻断看板
-      setSimSummary(null)
-    } finally {
-      setSimLoading(false)
-    }
-  }, [])
-
-  useEffect(() => { fetchSim() }, [fetchSim])
 
   // 统计计算
   const activeOrders = workOrders.filter(wo => wo.status === 'in_progress')
@@ -490,31 +387,6 @@ const Dashboard: React.FC = () => {
           </Col>
         </Row>
       </Spin>
-
-      {/* ==================== 仿真结果看板（独立分区，与真实生产数据严格分离） ==================== */}
-      <Card
-        size="small"
-        style={{ marginTop: 16, border: '1px dashed #722ed1', background: 'linear-gradient(180deg, #faf5ff 0%, #ffffff 60%)' }}
-        title={
-          <span>
-            <ExperimentOutlined style={{ color: '#722ed1', marginRight: 6 }} />
-            仿真结果看板
-            <Tag color="purple" style={{ marginLeft: 8 }}>仿真数据</Tag>
-            <Tag color="default">与实时生产分离</Tag>
-          </span>
-        }
-        extra={
-          <Link to="/simulation">查看完整仿真 →</Link>
-        }
-      >
-        <Spin spinning={simLoading}>
-          {simSummary ? (
-            <SimSummaryView summary={simSummary} pct={pct} />
-          ) : (
-            !simLoading && <div style={{ color: '#8c8c8c', textAlign: 'center', padding: 24 }}>暂无仿真数据，请前往「仿真引擎」运行场景</div>
-          )}
-        </Spin>
-      </Card>
 
       {/* 追溯：KPI 数字下钻抽屉 */}
       {drill && (

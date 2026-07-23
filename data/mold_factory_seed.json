@@ -1,24 +1,24 @@
 {
   "industry": "模具厂",
   "description": "精密模具加工 — 铣削/车削/线切割/EDM/装配",
-  "generated_at": "2026-07-22T19:12:00.673167",
+  "generated_at": "2026-07-23T04:42:11.294091",
   "products": [
     {
-      "id": "prod-61dc25f1",
+      "id": "prod-1cd4f1a8",
       "code": "MOLD-A100",
       "name": "汽车仪表盘模具",
       "category": "mold",
       "standard_cost": 8500.0
     },
     {
-      "id": "prod-fbc41c4f",
+      "id": "prod-6f58e26c",
       "code": "MOLD-B200",
       "name": "电子连接器模具",
       "category": "mold",
       "standard_cost": 5200.0
     },
     {
-      "id": "prod-364e61a8",
+      "id": "prod-76055e0c",
       "code": "MOLD-C300",
       "name": "家电外壳模具",
       "category": "mold",
@@ -121,7 +121,7 @@
   ],
   "routings": [
     {
-      "id": "rt-fea62d9f",
+      "id": "rt-178a6610",
       "product_id": "MOLD-A100",
       "steps": [
         {
@@ -168,32 +168,32 @@
     "due_date_offset_days": 5,
     "penalty_per_day": 2000.0,
     "priority": "urgent",
-    "order_id": "RUSH-MOLD_FACTORY-20260722-9AE1DA",
-    "planned_start": "2026-07-22T19:12:00.673167",
-    "due_date": "2026-07-27T19:12:00.673167"
+    "order_id": "RUSH-MOLD_FACTORY-20260723-02AEF4",
+    "planned_start": "2026-07-23T04:42:11.294091",
+    "due_date": "2026-07-28T04:42:11.294091"
   },
   "simulated_work_orders": [
     {
-      "wo_code": "WO-MOL-20260722-0001",
+      "wo_code": "WO-MOL-20260723-0001",
       "product_code": "MOLD-A100",
-      "planned_qty": 319,
-      "status": "pending",
-      "priority": "low",
-      "created_by": "W-002"
-    },
-    {
-      "wo_code": "WO-MOL-20260722-0002",
-      "product_code": "MOLD-B200",
-      "planned_qty": 807,
-      "status": "released",
-      "priority": "low",
-      "created_by": "W-003"
-    },
-    {
-      "wo_code": "WO-MOL-20260722-0003",
-      "product_code": "MOLD-C300",
-      "planned_qty": 226,
+      "planned_qty": 434,
       "status": "in_progress",
+      "priority": "low",
+      "created_by": "W-004"
+    },
+    {
+      "wo_code": "WO-MOL-20260723-0002",
+      "product_code": "MOLD-B200",
+      "planned_qty": 608,
+      "status": "in_progress",
+      "priority": "high",
+      "created_by": "W-004"
+    },
+    {
+      "wo_code": "WO-MOL-20260723-0003",
+      "product_code": "MOLD-C300",
+      "planned_qty": 189,
+      "status": "pending",
       "priority": "low",
       "created_by": "W-003"
     }

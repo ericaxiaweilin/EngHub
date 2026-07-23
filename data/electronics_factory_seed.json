@@ -1,24 +1,24 @@
 {
   "industry": "电子厂",
   "description": "消费电子组装 — SMT/DIP/测试/包装",
-  "generated_at": "2026-07-22T19:12:00.673600",
+  "generated_at": "2026-07-23T04:42:11.296017",
   "products": [
     {
-      "id": "prod-3ab688a2",
+      "id": "prod-6d781d3d",
       "code": "PCBA-X100",
       "name": "智能手表主板",
       "category": "pcba",
       "standard_cost": 45.0
     },
     {
-      "id": "prod-3b2def16",
+      "id": "prod-76b10851",
       "code": "PCBA-Y200",
       "name": "蓝牙耳机主板",
       "category": "pcba",
       "standard_cost": 32.0
     },
     {
-      "id": "prod-1a833efc",
+      "id": "prod-dfcd670e",
       "code": "ASM-Z300",
       "name": "智能手环成品",
       "category": "asm",
@@ -121,7 +121,7 @@
   ],
   "routings": [
     {
-      "id": "rt-850b7c34",
+      "id": "rt-71542c5b",
       "product_id": "PCBA-X100",
       "steps": [
         {
@@ -173,34 +173,34 @@
     "due_date_offset_days": 3,
     "penalty_per_day": 1500.0,
     "priority": "urgent",
-    "order_id": "RUSH-ELECTRONICS_FACTORY-20260722-5787D5",
-    "planned_start": "2026-07-22T19:12:00.673600",
-    "due_date": "2026-07-25T19:12:00.673600"
+    "order_id": "RUSH-ELECTRONICS_FACTORY-20260723-931740",
+    "planned_start": "2026-07-23T04:42:11.296017",
+    "due_date": "2026-07-26T04:42:11.296017"
   },
   "simulated_work_orders": [
     {
-      "wo_code": "WO-ELE-20260722-0001",
+      "wo_code": "WO-ELE-20260723-0001",
       "product_code": "PCBA-X100",
-      "planned_qty": 372,
+      "planned_qty": 928,
       "status": "in_progress",
-      "priority": "low",
-      "created_by": "W-001"
-    },
-    {
-      "wo_code": "WO-ELE-20260722-0002",
-      "product_code": "PCBA-Y200",
-      "planned_qty": 765,
-      "status": "released",
       "priority": "low",
       "created_by": "W-004"
     },
     {
-      "wo_code": "WO-ELE-20260722-0003",
+      "wo_code": "WO-ELE-20260723-0002",
+      "product_code": "PCBA-Y200",
+      "planned_qty": 368,
+      "status": "pending",
+      "priority": "medium",
+      "created_by": "W-002"
+    },
+    {
+      "wo_code": "WO-ELE-20260723-0003",
       "product_code": "ASM-Z300",
-      "planned_qty": 381,
-      "status": "released",
-      "priority": "high",
-      "created_by": "W-003"
+      "planned_qty": 985,
+      "status": "in_progress",
+      "priority": "medium",
+      "created_by": "W-004"
     }
   ]
 }

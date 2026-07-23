@@ -11,6 +11,7 @@ import InspectionList from './pages/qms/InspectionList'
 import DefectList from './pages/qms/DefectList'
 import InventoryList from './pages/wms/InventoryList'
 import SimulationEngine from './pages/simulation/SimulationEngine'
+import ProductionData from './pages/ProductionData'
 import PlanList from './pages/pp/PlanList'
 import BaseData from './pages/basedata/BaseData'
 import SkillMatrix from './pages/hr/SkillMatrix'
@@ -95,6 +96,7 @@ const App: React.FC = () => {
           >
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="dashboard" element={<Dashboard />} />
+            <Route path="production-data" element={<ProductionData />} />
             <Route path="work-orders" element={<PermissionGate path="/work-orders"><WorkOrderList /></PermissionGate>} />
             <Route path="work-orders/:id" element={<PermissionGate path="/work-orders"><WorkOrderDetail /></PermissionGate>} />
             <Route path="production-report" element={<PermissionGate path="/production-report"><ProductionReport /></PermissionGate>} />

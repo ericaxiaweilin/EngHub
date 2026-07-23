@@ -149,7 +149,7 @@ async def init_all():
                 full_name="系统管理员",
                 factory_id=None,
                 role="admin",
-                role_id=admin_role_obj.id if admin_role_obj else None,
+                role_id=admin_role_obj if admin_role_obj else None,
                 is_active=True,
                 is_superuser=True,
             )
@@ -237,7 +237,7 @@ async def init_all():
                 full_name=user_data["full_name"],
                 factory_id=user_data["factory_id"],
                 role=user_data["role"],
-                role_id=role_obj.id if role_obj else None,
+                role_id=role_obj if role_obj else None,
                 is_active=True,
                 is_superuser=False,
             )

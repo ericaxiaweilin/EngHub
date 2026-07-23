@@ -54,7 +54,7 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
 
 /* ==================== KPI 指标条 ==================== */
 
-const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const k = result.kpis
   const items: { title: string; value: string; suffix?: string; color: string; tip?: string }[] = [
     { title: '平均负荷率', value: pct(k.avg_load_rate), color: k.avg_load_rate > 0.9 ? '#fa8c16' : '#1890ff' },
@@ -98,7 +98,7 @@ const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== 工段 × 日 负荷热力图 ==================== */
 
-const LoadHeatmap: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const LoadHeatmap: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const horizon = result.horizon_days
   const showNum = horizon <= 16
   const groups = useMemo(() => {
@@ -178,7 +178,7 @@ const LoadHeatmap: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== 订单排程甘特图 ==================== */
 
-const OrderGantt: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const OrderGantt: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const horizon = result.horizon_days
   const axisStep = horizon > 31 ? 5 : 1
   const colorOf = useMemo(() => {
@@ -266,7 +266,7 @@ const OrderGantt: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== 订单 × 工段 负荷贡献矩阵 ==================== */
 
-const LoadMatrix: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const LoadMatrix: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const idx = useMemo(() => {
     const m = new Map<string, OrderSectionLoad>()
     result.order_section_loads.forEach((l) => m.set(`${l.order_id}|${l.section_id}`, l))
@@ -318,7 +318,7 @@ const LoadMatrix: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== WIP 曲线 ==================== */
 
-const WipCurve: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const WipCurve: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const { wip_curve, horizon_days, kpis } = result
   const max = Math.max(1, ...wip_curve.map((p) => p.wip_qty))
   const n = Math.max(1, horizon_days - 1)
@@ -340,7 +340,7 @@ const WipCurve: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== 告警中心 ==================== */
 
-const AlertPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const AlertPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const alerts = [...result.alerts].sort((a, b) => (LEVEL_ORDER[a.level] ?? 9) - (LEVEL_ORDER[b.level] ?? 9))
   if (!alerts.length) return <AntAlert type="success" showIcon message="本次仿真未触发任何告警" />
   return (
@@ -429,7 +429,7 @@ const SectionEditor: React.FC<{ section: SectionConfig; onPatch: (p: Partial<Sec
 
 /* ==================== 产出分析 ==================== */
 
-const OutputAnalysis: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const OutputAnalysis: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const { daily_output, section_outputs, horizon_days, kpis } = result
   const maxDaily = Math.max(1, ...daily_output.map((p) => p.output_qty))
   const maxCum = Math.max(1, ...daily_output.map((p) => p.cumulative))
@@ -472,7 +472,7 @@ const OutputAnalysis: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== 工人花名册 ==================== */
 
-const WorkforcePanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const WorkforcePanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const [secFilter, setSecFilter] = useState<string>('all')
   const allWorkers = useMemo(() => result.workforce.flatMap((w) => w.workers), [result])
   const workers = secFilter === 'all' ? allWorkers : allWorkers.filter((w) => w.section_id === secFilter)
@@ -527,7 +527,7 @@ const PO_STATUS: Record<string, { color: string; label: string }> = {
   delayed: { color: 'error', label: '延期' },
 }
 
-const PoPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const PoPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const pos = result.production_orders
   const releases = useMemo(() => {
     const m = new Map<number, ProductionOrderResult[]>()
@@ -576,7 +576,7 @@ const PoPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== 流转记录 ==================== */
 
-const TransferPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const TransferPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const lanes = useMemo(() => {
     const m = new Map<string, { from: string; to: string; qty: number; count: number }>()
     result.transfers.forEach((t) => {
@@ -620,7 +620,7 @@ const TransferPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
 
 /* ==================== 全流程追踪（下达 → 工段流转 → 出库） ==================== */
 
-const ProcessTracePanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const ProcessTracePanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const horizon = result.horizon_days
   const colorOf = useMemo(() => {
     const m = new Map<string, string>()
@@ -739,7 +739,7 @@ const ProcessTracePanel: React.FC<{ result: FactorySimResult }> = ({ result }) =
 
 /* ==================== 卡点分析 ==================== */
 
-const BlockingAnalysisPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
+export const BlockingAnalysisPanel: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const horizon = result.horizon_days
   const bps = result.blocking_points
   const maxWip = Math.max(1, ...result.sections.flatMap((s) => s.series.map((c) => c.wip_qty)))

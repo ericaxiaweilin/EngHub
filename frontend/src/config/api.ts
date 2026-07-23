@@ -55,6 +55,10 @@ export const API_ENDPOINTS = {
   SIM_FACTORY_DASHBOARD_SUMMARY: (scenarioId?: string) =>
     `${API_BASE_URL}/api/v1/sim-factory/dashboard-summary${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
 
+  // 生产看板（真实生产数据聚合，与仿真结果同构但 is_simulation=false）
+  PRODUCTION_DASHBOARD_SUMMARY: (factoryId?: string) =>
+    `${API_BASE_URL}/api/v1/production-dashboard/summary${factoryId ? `?factory_id=${factoryId}` : ''}`,
+
   // Employee Skills (HR)
   SKILLS: `${API_BASE_URL}/api/v1/skills`,
   SKILL_MATRIX: `${API_BASE_URL}/api/v1/skill-matrix`,

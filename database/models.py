@@ -543,7 +543,7 @@ class TMSTask(Base):
     status = Column(String(30), default="pending_distribution", index=True)
     # pending_distribution -> distributed -> claimed -> in_progress -> pending_approval -> completed / rejected
     distribution_strategy = Column(String(50))  # skill_match, load_balance, round_robin, manual, agent_decide
-    assigned_to = Column(String(36), ForeignKey("users.id"), nullable=True, index=True)
+    assigned_to = Column(String(36), nullable=True, index=True)
     assigned_by = Column(String(100))  # user_id 或 "agent:xxx"
     candidate_pool = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 候选人列表
     required_skills = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 所需技能标签
@@ -604,7 +604,7 @@ class TMSApprovalRecord(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     flow_id = Column(String(36), ForeignKey("tms_approval_flows.id"), nullable=False, index=True)
     step_index = Column(Integer, nullable=False)
-    approver_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    approver_id = Column(String(36), nullable=True)
     action = Column(String(20), nullable=False)  # approve, reject, delegate, escalate
     comment = Column(Text)
     acted_by = Column(String(100), nullable=False)  # "user:xxx" 或 "agent:chatbot-01"
@@ -627,7 +627,7 @@ class TMSDistributionLog(Base):
     task_id = Column(String(36), ForeignKey("tms_tasks.id"), nullable=False, index=True)
     strategy = Column(String(50), nullable=False)
     candidate_scores = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 各候选人评分
-    selected_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    selected_user_id = Column(String(36), nullable=True)
     reason = Column(Text)  # 分发决策理由
     triggered_by = Column(String(100), nullable=False)  # "system" / "agent:xxx" / "user:xxx"
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -736,7 +736,7 @@ class ItemTraceability(Base):
     __tablename__ = "item_traceability"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    item_code = Column(String(50), unique=True, nullable=False, index=True)
+    item_code = Column(String(50), unique=True, nullable=False)
     item_type = Column(String(20), default="finished", index=True)  # raw_material/semi_finished/finished
     factory_id = Column(String(50), nullable=False, index=True)
     work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)

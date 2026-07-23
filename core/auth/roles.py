@@ -637,11 +637,15 @@ def get_menu_items_for_user(user) -> list:
 
     items = []
 
-    # 生产看板 - 所有人可见
+    # 看板组（二级菜单）- 所有人可见，仅展示真实生产数据（仿真结果不属于看板数据源，在「仿真引擎」中查看）
+    # 生产看板 = KPI 概览（人机料法环）；生产数据 = 生产全过程分析（工单/报工/设备/人员）
     items.append({
-        "key": "/dashboard",
-        "label": "生产看板",
-        "module": "dashboard",
+        "key": "g-dashboard",
+        "label": "看板",
+        "children": [
+            {"key": "/dashboard", "label": "生产看板"},
+            {"key": "/production-data", "label": "生产数据"},
+        ],
     })
 
     # AI助手 - 所有人可见

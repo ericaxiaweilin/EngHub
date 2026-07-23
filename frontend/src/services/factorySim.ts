@@ -365,20 +365,25 @@ export interface FactoryScenarioMeta {
   hints: string[]
 }
 
-// 仿真结果看板摘要（与真实生产数据分离，is_simulation 恒为 true）
-export interface FactorySimDashboardSummary {
+// 仿真结果看板全量数据（与真实生产数据分离，is_simulation 恒为 true）
+export interface SimDashboardFullResult extends FactorySimResult {
   is_simulation: boolean
   scenario_id: string
   scenario_name: string
-  engine_version: string
-  horizon_days: number
-  order_count: number
-  section_count: number
-  created_at: string
-  kpis: FactoryKPIs
-  blocking_points: BlockingPoint[]
-  alert_count: number
-  critical_alert_count: number
+}
+
+// 生产看板全量数据（真实生产数据，is_simulation 恒为 false，与仿真结果同构以复用UI组件）
+export interface ProductionDashboardResult extends FactorySimResult {
+  is_simulation: false
+  factory_id: string
+  realtime: {
+    active_work_orders: number
+    running_equipment: number
+    total_equipment: number
+    equipment_utilization: number
+    today_reports: number
+    today_good_output: number
+  }
 }
 
 // ==================== API ====================
@@ -392,5 +397,9 @@ export const getFactoryScenario = (scenarioId?: string) =>
 export const runFactorySimulation = (config: FactorySimConfig) =>
   api.post<any, FactorySimResult>(API_ENDPOINTS.SIM_FACTORY_RUN, config)
 
-export const getFactorySimDashboardSummary = (scenarioId?: string) =>
-  api.get<any, FactorySimDashboardSummary>(API_ENDPOINTS.SIM_FACTORY_DASHBOARD_SUMMARY(scenarioId))
+export const getFactorySimDashboardResult = (scenarioId?: string) =>
+  api.get<any, SimDashboardFullResult>(API_ENDPOINTS.SIM_FACTORY_DASHBOARD_SUMMARY(scenarioId))
+
+// 生产看板聚合数据（真实生产数据，复用仿真结果组件渲染）
+export const getProductionDashboardResult = (factoryId?: string) =>
+  api.get<any, ProductionDashboardResult>(API_ENDPOINTS.PRODUCTION_DASHBOARD_SUMMARY(factoryId))

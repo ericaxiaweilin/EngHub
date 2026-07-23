@@ -1,24 +1,24 @@
 {
   "industry": "运动器材厂",
   "description": "运动鞋/球拍/健身器材生产 — 裁断/针车/成型/涂装",
-  "generated_at": "2026-07-22T19:12:00.673899",
+  "generated_at": "2026-07-23T04:42:11.296379",
   "products": [
     {
-      "id": "prod-e18b6c66",
+      "id": "prod-72947717",
       "code": "SHOE-R001",
       "name": "跑步鞋Pro",
       "category": "shoe",
       "standard_cost": 120.0
     },
     {
-      "id": "prod-08d1d7ef",
+      "id": "prod-6991c97f",
       "code": "RACKET-T001",
       "name": "碳纤维羽毛球拍",
       "category": "racket",
       "standard_cost": 280.0
     },
     {
-      "id": "prod-e4fabd90",
+      "id": "prod-2c1b1a6f",
       "code": "DUMBBELL-K001",
       "name": "可调哑铃套装",
       "category": "dumbbell",
@@ -121,7 +121,7 @@
   ],
   "routings": [
     {
-      "id": "rt-c549012d",
+      "id": "rt-3b3eca7a",
       "product_id": "SHOE-R001",
       "steps": [
         {
@@ -168,34 +168,34 @@
     "due_date_offset_days": 7,
     "penalty_per_day": 800.0,
     "priority": "high",
-    "order_id": "RUSH-SPORTING_GOODS_FACTORY-20260722-011A58",
-    "planned_start": "2026-07-22T19:12:00.673899",
-    "due_date": "2026-07-29T19:12:00.673899"
+    "order_id": "RUSH-SPORTING_GOODS_FACTORY-20260723-554699",
+    "planned_start": "2026-07-23T04:42:11.296379",
+    "due_date": "2026-07-30T04:42:11.296379"
   },
   "simulated_work_orders": [
     {
-      "wo_code": "WO-SPO-20260722-0001",
+      "wo_code": "WO-SPO-20260723-0001",
       "product_code": "SHOE-R001",
-      "planned_qty": 636,
+      "planned_qty": 791,
+      "status": "pending",
+      "priority": "medium",
+      "created_by": "W-002"
+    },
+    {
+      "wo_code": "WO-SPO-20260723-0002",
+      "product_code": "RACKET-T001",
+      "planned_qty": 561,
       "status": "in_progress",
       "priority": "low",
-      "created_by": "W-001"
+      "created_by": "W-002"
     },
     {
-      "wo_code": "WO-SPO-20260722-0002",
-      "product_code": "RACKET-T001",
-      "planned_qty": 386,
-      "status": "released",
-      "priority": "high",
-      "created_by": "W-004"
-    },
-    {
-      "wo_code": "WO-SPO-20260722-0003",
+      "wo_code": "WO-SPO-20260723-0003",
       "product_code": "DUMBBELL-K001",
-      "planned_qty": 610,
+      "planned_qty": 419,
       "status": "pending",
-      "priority": "high",
-      "created_by": "W-003"
+      "priority": "low",
+      "created_by": "W-004"
     }
   ]
 }

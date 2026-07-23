@@ -3,13 +3,16 @@
  * 可拖拽移动、最小化/最大化，参考 luaguage ChatbotWidget 交互模式
  */
 import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip } from 'antd'
+import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message } from 'antd'
 import {
   RobotOutlined, TeamOutlined, SendOutlined, MinusOutlined,
   ExpandOutlined, CompressOutlined, CloseOutlined,
   ToolOutlined, SafetyCertificateOutlined, DesktopOutlined, ApiOutlined,
+  ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined,
+  AlertOutlined, ExperimentOutlined, PhoneOutlined,
 } from '@ant-design/icons'
 import api from '../services/api'
+import { tmsApi } from '../services/tms'
 import { getStoredUser } from '../services/auth'
 
 const { Text } = Typography
@@ -36,13 +39,51 @@ const FACTORY_CONTACTS: Contact[] = [
   { id: 'c6', name: '刘计划', role: 'PMC计划员', dept: '计划部', color: '#13c2c2', icon: <DesktopOutlined />, online: false, tasks: 6 },
 ]
 
+// ---------- 工具执行记录（AI 已执行的操作） ----------
+interface ToolAction {
+  tool: string
+  label: string
+  arguments: Record<string, any>
+  result: Record<string, any>
+  is_write: boolean
+  success: boolean
+}
+
 // ---------- 聊天消息 ----------
 interface ChatMsg {
   role: 'user' | 'assistant'
   content: string
   time: string
   degraded?: boolean
+  actions?: ToolAction[]
 }
+
+// ---------- 快捷指令 ----------
+const QUICK_COMMANDS = [
+  '今天生产情况怎么样？',
+  '查询在制工单',
+  '查询库存水平',
+  '最近有哪些不良品？',
+  '设备运行状态如何？',
+]
+
+// ---------- IM 聊天消息 ----------
+interface IMMsg {
+  id: string
+  from: 'me' | 'them' | 'system'
+  content: string
+  time: string
+  isCall?: boolean  // 工单呼叫卡片
+  callMeta?: { call_type: string; station: string; priority: string; task_code?: string }
+}
+
+// 工单呼叫类型（与 QuickRequest 页一致，落到 TMS call_request）
+const IM_CALL_TYPES = [
+  { value: 'equipment_fault', label: '设备故障', icon: <ToolOutlined />, color: '#f5222d' },
+  { value: 'material_call', label: '物料呼叫', icon: <AlertOutlined />, color: '#fa8c16' },
+  { value: 'quality_call', label: '品质呼叫', icon: <ExperimentOutlined />, color: '#722ed1' },
+  { value: 'support_call', label: '支援呼叫', icon: <PhoneOutlined />, color: '#1890ff' },
+]
 
 const now = () => new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 
@@ -64,6 +105,16 @@ export default function AIAssistantWidget() {
   // IM 未读
   const [unread, setUnread] = useState<Record<string, number>>({ c2: 1, c3: 2 })
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null)
+  // IM 聊天
+  const [imMessages, setImMessages] = useState<Record<string, IMMsg[]>>({})
+  const [imInput, setImInput] = useState('')
+  const [imSending, setImSending] = useState(false)
+  const imListRef = useRef<HTMLDivElement>(null)
+  // 工单呼叫弹窗
+  const [callModalOpen, setCallModalOpen] = useState(false)
+  const [callType, setCallType] = useState('equipment_fault')
+  const [callForm] = Form.useForm()
+  const [callSubmitting, setCallSubmitting] = useState(false)
 
   const user = getStoredUser()
 
@@ -95,8 +146,8 @@ export default function AIAssistantWidget() {
   }, [maximized])
 
   // ---------- 发送消息 ----------
-  const sendMessage = async () => {
-    const text = input.trim()
+  const sendMessage = async (preset?: string) => {
+    const text = (preset ?? input).trim()
     if (!text || loading) return
     setInput('')
     const history = [...messages, { role: 'user' as const, content: text, time: now() }]
@@ -112,6 +163,7 @@ export default function AIAssistantWidget() {
         content: res.reply || '抱歉，暂时无法回答。',
         time: now(),
         degraded: res.degraded,
+        actions: res.actions || [],
       }])
     } catch {
       setMessages(prev => [...prev, {
@@ -122,6 +174,90 @@ export default function AIAssistantWidget() {
       }])
     } finally {
       setLoading(false)
+    }
+  }
+
+  // ---------- IM 自动滚动 ----------
+  useEffect(() => {
+    if (imListRef.current) imListRef.current.scrollTop = imListRef.current.scrollHeight
+  }, [imMessages, selectedContact])
+
+  // ---------- IM 发送消息 ----------
+  const sendImMessage = () => {
+    const text = imInput.trim()
+    if (!text || !selectedContact || imSending) return
+    setImInput('')
+    const cid = selectedContact.id
+    const myMsg: IMMsg = { id: `m${Date.now()}`, from: 'me', content: text, time: now() }
+    setImMessages(prev => ({ ...prev, [cid]: [...(prev[cid] || []), myMsg] }))
+    setImSending(true)
+    // 内网环境：模拟对方回复（实际可对接 WebSocket）
+    const contact = selectedContact
+    setTimeout(() => {
+      setImMessages(prev => ({
+        ...prev,
+        [cid]: [...(prev[cid] || []), {
+          id: `r${Date.now()}`,
+          from: 'them',
+          content: contact.online
+            ? `收到，我是${contact.name}，看到后会尽快处理。如需紧急处理可点下方“工单呼叫”。`
+            : '（对方离线，消息已送达，上线后可见）',
+          time: now(),
+        }],
+      }))
+      setImSending(false)
+    }, 900)
+  }
+
+  // ---------- 打开工单呼叫弹窗 ----------
+  const openCallModal = (type: string) => {
+    setCallType(type)
+    callForm.resetFields()
+    callForm.setFieldsValue({ priority: 'high' })
+    setCallModalOpen(true)
+  }
+
+  // ---------- 提交工单呼叫 → 直接创建 TMS 任务（不跳转页面） ----------
+  const submitCall = async () => {
+    if (!selectedContact) return
+    try {
+      const values = await callForm.validateFields()
+      setCallSubmitting(true)
+      const ct = IM_CALL_TYPES.find(c => c.value === callType)
+      const res: any = await tmsApi.createTask({
+        title: `${ct?.label}呼叫 - ${values.station}`,
+        task_type: 'call_request',
+        description: values.description,
+        priority: values.priority,
+        required_skills: [],
+        metadata: {
+          call_type: callType,
+          station: values.station,
+          requested_by: user?.username,
+          target_contact: selectedContact.name,
+          via: 'im_chat',
+        } as any,
+      })
+      const taskCode = res?.task_code || res?.data?.task_code || ''
+      const cid = selectedContact.id
+      setImMessages(prev => ({
+        ...prev,
+        [cid]: [...(prev[cid] || []), {
+          id: `c${Date.now()}`,
+          from: 'system',
+          isCall: true,
+          content: `${ct?.label}呼叫已发送给 ${selectedContact.name}`,
+          time: now(),
+          callMeta: { call_type: callType, station: values.station, priority: values.priority, task_code: taskCode },
+        }],
+      }))
+      message.success('工单呼叫已发送，等待响应')
+      setCallModalOpen(false)
+    } catch (e: any) {
+      if (e?.errorFields) return
+      message.error('呼叫发送失败: ' + (e?.response?.data?.detail || e?.message || ''))
+    } finally {
+      setCallSubmitting(false)
     }
   }
 
@@ -205,21 +341,32 @@ export default function AIAssistantWidget() {
             </Space>
           </div>
 
-          {/* Tabs */}
+          {/* Tab 导航栏（仅切换，不承载内容） */}
           <Tabs
             activeKey={tab}
             onChange={setTab}
             size="small"
             centered
-            style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+            style={{ flexShrink: 0, margin: 0, padding: '0 12px' }}
             items={[
+              { key: 'ai', label: <span><RobotOutlined /> AI 助手</span> },
               {
-                key: 'ai',
-                label: <span><RobotOutlined /> AI 助手</span>,
-                children: (
-                  <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-                    {/* 消息列表 */}
-                    <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: '12px 14px' }}>
+                key: 'im',
+                label: (
+                  <Badge count={totalUnread} size="small" offset={[8, -2]}>
+                    <span><TeamOutlined /> 内网通讯</span>
+                  </Badge>
+                ),
+              },
+            ]}
+          />
+
+          {/* 内容区（直接 flex 布局，不经过 Tabs content-holder） */}
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            {tab === 'ai' && (
+              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+                {/* 消息列表 */}
+                <div ref={listRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 14px' }}>
                       {messages.map((m, i) => (
                         <div key={i} style={{
                           display: 'flex',
@@ -241,6 +388,37 @@ export default function AIAssistantWidget() {
                             wordBreak: 'break-word',
                           }}>
                             {m.content}
+                            {/* AI 已执行的操作 */}
+                            {m.role === 'assistant' && m.actions && m.actions.length > 0 && (
+                              <div style={{ marginTop: 8, borderTop: '1px dashed #d9d9d9', paddingTop: 6 }}>
+                                <Text type="secondary" style={{ fontSize: 11 }}>
+                                  <ThunderboltOutlined /> 已执行 {m.actions.length} 个操作
+                                </Text>
+                                {m.actions.map((a, idx) => (
+                                  <div key={idx} style={{
+                                    marginTop: 4,
+                                    background: a.is_write ? '#f6ffed' : '#f0f5ff',
+                                    border: `1px solid ${a.is_write ? '#b7eb8f' : '#adc6ff'}`,
+                                    borderRadius: 6,
+                                    padding: '4px 8px',
+                                    fontSize: 11,
+                                  }}>
+                                    <Space size={4}>
+                                      {a.success
+                                        ? <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                                        : <CloseCircleOutlined style={{ color: '#f5222d' }} />}
+                                      <Text strong style={{ fontSize: 11 }}>{a.label}</Text>
+                                      <Tag color={a.is_write ? 'green' : 'blue'} style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>
+                                        {a.is_write ? '写操作' : '查询'}
+                                      </Tag>
+                                    </Space>
+                                    {a.result && a.result.error && (
+                                      <div style={{ color: '#f5222d', marginTop: 2 }}>{a.result.error}</div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                             {m.degraded && m.role === 'assistant' && (
                               <div style={{ marginTop: 4 }}>
                                 <Tag color="orange" style={{ fontSize: 10 }}>离线降级模式</Tag>
@@ -268,6 +446,19 @@ export default function AIAssistantWidget() {
                         </div>
                       )}
                     </div>
+                    {/* 快捷指令 */}
+                    <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {QUICK_COMMANDS.map(cmd => (
+                        <Tag
+                          key={cmd}
+                          color="processing"
+                          style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px' }}
+                          onClick={() => !loading && sendMessage(cmd)}
+                        >
+                          {cmd}
+                        </Tag>
+                      ))}
+                    </div>
                     {/* 输入区 */}
                     <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
                       <Space.Compact style={{ width: '100%' }}>
@@ -282,56 +473,103 @@ export default function AIAssistantWidget() {
                         <Button
                           type="primary"
                           icon={<SendOutlined />}
-                          onClick={sendMessage}
+                          onClick={() => sendMessage()}
                           loading={loading}
                           style={{ borderRadius: '0 8px 8px 0', height: 'auto' }}
                         />
                       </Space.Compact>
                     </div>
-                  </div>
-                ),
-              },
-              {
-                key: 'im',
-                label: (
-                  <Badge count={totalUnread} size="small" offset={[8, -2]}>
-                    <span><TeamOutlined /> 内网通讯</span>
-                  </Badge>
-                ),
-                children: (
-                  <div style={{ height: '100%', overflowY: 'auto', padding: '8px 0' }}>
+              </div>
+            )}
+            {tab === 'im' && (
+                  <div style={{ flex: 1, minHeight: 0, overflowY: selectedContact ? 'hidden' : 'auto', padding: selectedContact ? 0 : '8px 0' }}>
                     {selectedContact ? (
-                      /* 联系人详情 */
-                      <div style={{ padding: '0 14px' }}>
-                        <Button type="link" size="small" onClick={() => setSelectedContact(null)} style={{ padding: 0, marginBottom: 10 }}>
-                          ← 返回联系人列表
-                        </Button>
-                        <div style={{ textAlign: 'center', padding: '12px 0' }}>
-                          <Avatar size={56} style={{ background: selectedContact.color }} icon={selectedContact.icon} />
-                          <div style={{ marginTop: 8 }}>
-                            <Text strong style={{ fontSize: 16 }}>{selectedContact.name}</Text>
-                          </div>
-                          <Text type="secondary">{selectedContact.role} · {selectedContact.dept}</Text>
-                          <div style={{ marginTop: 8 }}>
-                            <Tag color={selectedContact.online ? 'green' : 'default'}>
-                              {selectedContact.online ? '在线' : '离线'}
-                            </Tag>
-                            <Tag color="blue">{selectedContact.tasks} 个进行中任务</Tag>
+                      /* 联系人聊天 */
+                      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                        {/* 头部 */}
+                        <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                          <Button type="text" size="small" onClick={() => setSelectedContact(null)}>←</Button>
+                          <Avatar size={32} style={{ background: selectedContact.color }} icon={selectedContact.icon} />
+                          <div style={{ flex: 1, lineHeight: 1.3 }}>
+                            <div>
+                              <Text strong>{selectedContact.name}</Text>
+                              <Text type="secondary" style={{ fontSize: 11, marginLeft: 6 }}>{selectedContact.role}</Text>
+                            </div>
+                            <Badge status={selectedContact.online ? 'success' : 'default'}
+                              text={<Text type="secondary" style={{ fontSize: 11 }}>{selectedContact.online ? '在线' : '离线'} · {selectedContact.tasks} 个任务</Text>} />
                           </div>
                         </div>
-                        <div style={{ borderTop: '1px solid #f0f0f0', paddingTop: 12 }}>
-                          <Text type="secondary" style={{ fontSize: 12 }}>快捷操作</Text>
-                          <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                            <Button size="small" onClick={() => { window.location.hash = ''; window.location.pathname = '/tms/distribution' }}>
-                              查看任务分发
-                            </Button>
-                            <Button size="small" onClick={() => { window.location.pathname = '/tms/approval' }}>
-                              审批中心
-                            </Button>
-                            <Button size="small" onClick={() => { window.location.pathname = '/quick-request' }}>
-                              发起工单
-                            </Button>
+                        {/* 消息区 */}
+                        <div ref={imListRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '10px 12px', background: '#fafafa' }}>
+                          {(imMessages[selectedContact.id] || []).length === 0 && (
+                            <div style={{ textAlign: 'center', color: '#999', fontSize: 12, marginTop: 24 }}>
+                              暂无消息，可直接发送或发起工单呼叫
+                            </div>
+                          )}
+                          {(imMessages[selectedContact.id] || []).map(m => (
+                            <div key={m.id} style={{ marginBottom: 10 }}>
+                              {m.isCall ? (
+                                /* 工单呼叫卡片 */
+                                <div style={{ maxWidth: '88%', margin: '0 auto', background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 8, padding: '8px 10px', fontSize: 12 }}>
+                                  <Space size={4}>
+                                    <PhoneOutlined style={{ color: '#fa8c16' }} />
+                                    <Text strong style={{ fontSize: 12 }}>{m.content}</Text>
+                                  </Space>
+                                  <div style={{ marginTop: 4, color: '#666', fontSize: 11 }}>
+                                    工位：{m.callMeta?.station} · 优先级：{m.callMeta?.priority}
+                                    {m.callMeta?.task_code && <span> · 任务号：{m.callMeta.task_code}</span>}
+                                  </div>
+                                  <div style={{ fontSize: 10, color: '#999', marginTop: 2, textAlign: 'right' }}>{m.time}</div>
+                                </div>
+                              ) : (
+                                <div style={{ display: 'flex', justifyContent: m.from === 'me' ? 'flex-end' : 'flex-start' }}>
+                                  {m.from === 'them' && (
+                                    <Avatar size={26} style={{ background: selectedContact.color, marginRight: 6, flexShrink: 0 }} icon={selectedContact.icon} />
+                                  )}
+                                  <div style={{
+                                    maxWidth: '72%', padding: '7px 10px', borderRadius: 10,
+                                    background: m.from === 'me' ? '#1677ff' : '#fff',
+                                    color: m.from === 'me' ? '#fff' : '#333',
+                                    fontSize: 12, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                    border: m.from === 'them' ? '1px solid #eee' : 'none',
+                                  }}>
+                                    {m.content}
+                                    <div style={{ fontSize: 10, color: m.from === 'me' ? 'rgba(255,255,255,0.7)' : '#999', marginTop: 3, textAlign: 'right' }}>{m.time}</div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                          {imSending && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <Avatar size={26} style={{ background: selectedContact.color }} icon={selectedContact.icon} />
+                              <Spin size="small" />
+                            </div>
+                          )}
+                        </div>
+                        {/* 工单呼叫快捷按钮 */}
+                        <div style={{ padding: '6px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                          <Text type="secondary" style={{ fontSize: 11 }}>工单呼叫（直达 {selectedContact.name}，无需跳转）</Text>
+                          <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                            {IM_CALL_TYPES.map(ct => (
+                              <Button key={ct.value} size="small" onClick={() => openCallModal(ct.value)}
+                                style={{ flex: 1, color: ct.color, borderColor: ct.color, fontSize: 11, padding: '0 2px' }}>
+                                {ct.icon} {ct.label}
+                              </Button>
+                            ))}
                           </div>
+                        </div>
+                        {/* 输入区 */}
+                        <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                          <Space.Compact style={{ width: '100%' }}>
+                            <Input
+                              value={imInput}
+                              onChange={e => setImInput(e.target.value)}
+                              onPressEnter={sendImMessage}
+                              placeholder={`发消息给 ${selectedContact.name}...`}
+                            />
+                            <Button type="primary" icon={<SendOutlined />} onClick={sendImMessage} />
+                          </Space.Compact>
                         </div>
                       </div>
                     ) : (
@@ -371,12 +609,51 @@ export default function AIAssistantWidget() {
                       />
                     )}
                   </div>
-                ),
-              },
-            ]}
-          />
+            )}
+          </div>
         </div>
       )}
+
+      {/* 工单呼叫弹窗（模板直达，无需跳转页面） */}
+      <Modal
+        title={
+          <Space>
+            <PhoneOutlined style={{ color: IM_CALL_TYPES.find(c => c.value === callType)?.color }} />
+            <span>{IM_CALL_TYPES.find(c => c.value === callType)?.label}呼叫</span>
+          </Space>
+        }
+        open={callModalOpen}
+        onCancel={() => setCallModalOpen(false)}
+        onOk={submitCall}
+        confirmLoading={callSubmitting}
+        okText="发送呼叫"
+        cancelText="取消"
+        width={400}
+        destroyOnClose
+      >
+        {selectedContact && (
+          <div style={{ marginBottom: 12, padding: '8px 10px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, fontSize: 12 }}>
+            <CheckCircleOutlined style={{ color: '#52c41a', marginRight: 6 }} />
+            呼叫将直达 <Text strong>{selectedContact.name}</Text>（{selectedContact.role}），并同步创建 TMS 任务
+          </div>
+        )}
+        <Form form={callForm} layout="vertical">
+          <Form.Item name="station" label="工位 / 位置" rules={[{ required: true, message: '请输入工位' }]}>
+            <Input placeholder="如: ST-ASM-01 / A栋2层" />
+          </Form.Item>
+          <Form.Item name="priority" label="紧急程度" rules={[{ required: true }]}>
+            <Radio.Group>
+              <Radio.Button value="low">低</Radio.Button>
+              <Radio.Button value="medium">中</Radio.Button>
+              <Radio.Button value="high">高</Radio.Button>
+              <Radio.Button value="urgent">紧急</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+          <Form.Item name="description" label="问题描述" rules={[{ required: true, message: '请描述问题' }]}>
+            <Input.TextArea rows={3} placeholder="简要描述现场情况..." />
+          </Form.Item>
+        </Form>
+      </Modal>
     </>
   )
 }

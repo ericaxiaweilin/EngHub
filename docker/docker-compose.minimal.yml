@@ -46,7 +46,7 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-openai/qwen-plus}
     ports:
-      - "18000:8000"
+      - "18888:8000"
     depends_on:
       - postgres
       - redis
@@ -62,15 +62,16 @@ services:
         reservations:
           memory: 1G
 
-  frontend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.frontend
-    ports:
-      - "18888:80"
-    depends_on:
-      - backend
-    restart: unless-stopped
+  # frontend 容器已废弃：前端由 FastAPI 同源托管（见 main.py 末尾 StaticFiles + SPA fallback）
+  # frontend:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile.frontend
+  #   ports:
+  #     - "18888:80"
+  #   depends_on:
+  #     - backend
+  #   restart: unless-stopped
 
 networks:
   default:
