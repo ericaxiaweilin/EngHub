@@ -261,18 +261,23 @@ export default function AIAssistantWidget() {
     }
   }
 
-  // ---------- 面板样式 ----------
+  // ---------- 面板样式（支持自由拉伸） ----------
   const panelStyle: React.CSSProperties = maximized
     ? { position: 'fixed', inset: 0, width: '100vw', height: '100vh', borderRadius: 0, zIndex: 1000 }
     : {
         position: 'fixed',
-        width: 380,
-        height: 520,
+        width: 400,
+        height: 560,
+        minWidth: 320,
+        minHeight: 400,
+        maxWidth: '92vw',
+        maxHeight: '92vh',
+        resize: 'both',
         borderRadius: 12,
         zIndex: 1000,
         ...(pos
           ? { left: pos.x, top: pos.y }
-          : { right: 24, bottom: 90 }),
+          : { right: 24, bottom: 24 }),
       }
 
   const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0)

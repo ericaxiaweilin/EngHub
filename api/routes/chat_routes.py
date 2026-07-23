@@ -136,6 +136,7 @@ async def _run_deterministic(
     operator: str,
     db: AsyncSession,
     actions: List[ToolAction],
+    factory_id: Optional[str] = None,
 ) -> ChatResponse:
     """确定性业务底座（参考 luaguage capability 执行思路）。
 
@@ -143,7 +144,7 @@ async def _run_deterministic(
     工具一定被调用、数据一定真实，从根本上杜绝“建议查看看板”这类推诿性模糊回答。"""
     tool_name = intent["tool"]
     tool_args = intent.get("args") or {}
-    result = await execute_tool(db, tool_name, tool_args, operator=operator)
+    result = await execute_tool(db, tool_name, tool_args, operator=operator, factory_id=factory_id)
     is_error = "error" in result
     actions.append(ToolAction(
         tool=tool_name,
@@ -196,6 +197,7 @@ async def chat(
     """转发对话到 litellm 网关，支持 tool calling 循环执行 MES 操作。"""
     model = request.model or MODEL
     operator = current_user.username or current_user.id
+    factory_id = current_user.factory_id  # 当前工厂：供工具查询做数据隔离，保证与页面口径一致
 
     last_user = next(
         (m.content for m in reversed(request.messages) if m.role == "user"), ""
@@ -205,7 +207,7 @@ async def chat(
     # ---- 确定性业务底座：命中查询意图 → 后端直接执行工具取真实数据，LLM 仅负责组织语言 ----
     intent = resolve_intent(last_user) if request.enable_tools else None
     if intent:
-        return await _run_deterministic(intent, last_user, model, operator, db, actions)
+        return await _run_deterministic(intent, last_user, model, operator, db, actions, factory_id)
 
     # ---- 非确定性意图：走 auto tool-calling 循环（写操作 / 多步 / 通用问答）----
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -265,7 +267,7 @@ async def chat(
                 except (json.JSONDecodeError, TypeError):
                     arguments = {}
 
-                result = await execute_tool(db, tool_name, arguments, operator=operator)
+                result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
                 is_error = "error" in result
                 actions.append(ToolAction(
                     tool=tool_name,

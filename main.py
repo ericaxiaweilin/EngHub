@@ -27,6 +27,7 @@ from api.routes.data_consistency_routes import router as data_consistency_router
 from api.routes.expert_system_routes import router as expert_system_router
 from api.routes.work_order_template_routes import router as work_order_template_router
 from api.routes.production_dashboard_routes import router as production_dashboard_router
+from api.routes.search_routes import router as search_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -51,6 +52,7 @@ app.include_router(data_consistency_router)
 app.include_router(expert_system_router)
 app.include_router(work_order_template_router)
 app.include_router(production_dashboard_router)  # 生产看板聚合（真实数据，复用仿真结果UI组件）
+app.include_router(search_router)  # 全站系统搜索
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 

@@ -193,9 +193,11 @@ def _wo_to_dict(wo: WorkOrder, product_name: str = "") -> Dict[str, Any]:
     }
 
 
-async def _tool_query_work_orders(db: AsyncSession, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _tool_query_work_orders(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     limit = min(int(args.get("limit", 10)), 50)
     stmt = select(WorkOrder).order_by(WorkOrder.created_at.desc()).limit(limit)
+    if factory_id:
+        stmt = stmt.where(WorkOrder.factory_id == factory_id)
     if args.get("status"):
         stmt = stmt.where(WorkOrder.status == args["status"])
     rows = (await db.execute(stmt)).scalars().all()
@@ -210,13 +212,17 @@ async def _tool_query_work_orders(db: AsyncSession, args: Dict[str, Any]) -> Dic
     return {"count": len(items), "work_orders": items}
 
 
-async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     code = args.get("work_order_code", "")
     stmt = select(WorkOrder).where(WorkOrder.work_order_code == code)
+    if factory_id:
+        stmt = stmt.where(WorkOrder.factory_id == factory_id)
     wo = (await db.execute(stmt)).scalar_one_or_none()
     if not wo:
         # 模糊匹配
         stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code}%")).limit(1)
+        if factory_id:
+            stmt = stmt.where(WorkOrder.factory_id == factory_id)
         wo = (await db.execute(stmt)).scalar_one_or_none()
     if not wo:
         return {"error": f"未找到工单 {code}"}
@@ -238,11 +244,13 @@ async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any]) ->
     return detail
 
 
-async def _tool_get_production_summary(db: AsyncSession, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _tool_get_production_summary(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     today_start = datetime.combine(date.today(), datetime.min.time())
 
     # 今日报工
     rpt_stmt = select(ProductionReport).where(ProductionReport.created_at >= today_start)
+    if factory_id:
+        rpt_stmt = rpt_stmt.where(ProductionReport.factory_id == factory_id)
     reports = (await db.execute(rpt_stmt)).scalars().all()
     today_good = sum(r.good_qty for r in reports)
     today_defect = sum(r.defect_qty for r in reports)
@@ -250,12 +258,18 @@ async def _tool_get_production_summary(db: AsyncSession, args: Dict[str, Any]) -
     yield_rate = round(today_good / total_out * 100, 1) if total_out else 100.0
 
     # 工单统计
-    wo_all = (await db.execute(select(WorkOrder))).scalars().all()
+    wo_stmt = select(WorkOrder)
+    if factory_id:
+        wo_stmt = wo_stmt.where(WorkOrder.factory_id == factory_id)
+    wo_all = (await db.execute(wo_stmt)).scalars().all()
     active = len([wo for wo in wo_all if wo.status == "in_progress"])
     pending = len([wo for wo in wo_all if wo.status == "pending"])
 
     # 设备
-    eq_all = (await db.execute(select(Equipment))).scalars().all()
+    eq_stmt = select(Equipment)
+    if factory_id:
+        eq_stmt = eq_stmt.where(Equipment.factory_id == factory_id)
+    eq_all = (await db.execute(eq_stmt)).scalars().all()
     running = len([e for e in eq_all if e.status == "running"])
     fault = len([e for e in eq_all if e.status == "fault"])
     utilization = round(running / len(eq_all) * 100, 1) if eq_all else 0
@@ -276,9 +290,11 @@ async def _tool_get_production_summary(db: AsyncSession, args: Dict[str, Any]) -
     }
 
 
-async def _tool_query_inventory(db: AsyncSession, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _tool_query_inventory(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     limit = min(int(args.get("limit", 10)), 50)
     stmt = select(Inventory).order_by(Inventory.updated_at.desc()).limit(limit)
+    if factory_id:
+        stmt = stmt.where(Inventory.factory_id == factory_id)
     kw = args.get("material_keyword")
     if kw:
         stmt = stmt.where(
@@ -301,9 +317,11 @@ async def _tool_query_inventory(db: AsyncSession, args: Dict[str, Any]) -> Dict[
     return {"count": len(items), "inventory": items}
 
 
-async def _tool_query_defects(db: AsyncSession, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _tool_query_defects(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     limit = min(int(args.get("limit", 10)), 50)
     stmt = select(DefectRecord).order_by(DefectRecord.created_at.desc()).limit(limit)
+    if factory_id:
+        stmt = stmt.where(DefectRecord.factory_id == factory_id)
     if args.get("severity"):
         stmt = stmt.where(DefectRecord.severity == args["severity"])
     rows = (await db.execute(stmt)).scalars().all()
@@ -324,8 +342,10 @@ async def _tool_query_defects(db: AsyncSession, args: Dict[str, Any]) -> Dict[st
     return {"count": len(items), "defects": items}
 
 
-async def _tool_query_equipment(db: AsyncSession, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _tool_query_equipment(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     stmt = select(Equipment)
+    if factory_id:
+        stmt = stmt.where(Equipment.factory_id == factory_id)
     if args.get("status"):
         stmt = stmt.where(Equipment.status == args["status"])
     rows = (await db.execute(stmt)).scalars().all()
@@ -584,15 +604,19 @@ async def execute_tool(
     tool_name: str,
     arguments: Dict[str, Any],
     operator: str = "ai_assistant",
+    factory_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """执行指定工具，返回结构化结果。未知工具或异常时返回 error 字段。"""
+    """执行指定工具，返回结构化结果。未知工具或异常时返回 error 字段。
+
+    factory_id：当前用户所属工厂。查询类工具据此过滤，保证与页面口径一致（多工厂数据隔离）；
+    写操作工具自行从产品/工单推导工厂，不受此参数影响。"""
     executor = _TOOL_EXECUTORS.get(tool_name)
     if not executor:
         return {"error": f"未知工具：{tool_name}"}
     try:
         if tool_name in WRITE_TOOLS:
             return await executor(db, arguments, operator)
-        return await executor(db, arguments)
+        return await executor(db, arguments, factory_id)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"工具执行失败：{type(exc).__name__}: {exc}"}
 

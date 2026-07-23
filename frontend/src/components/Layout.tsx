@@ -26,6 +26,7 @@ import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
 import RoleSwitcher from './RoleSwitcher'
 import AIAssistantWidget from './AIAssistantWidget'
+import GlobalSearch from './GlobalSearch'
 
 const { Header, Sider, Content } = AntLayout
 
@@ -120,6 +121,7 @@ const Layout: React.FC = () => {
         disabled: true,
       },
       { type: 'divider' as const },
+      { key: 'settings', icon: <SettingOutlined />, label: '个人设置', onClick: () => navigate('/settings') },
       { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
     ],
   }
@@ -134,6 +136,8 @@ const Layout: React.FC = () => {
           {testMode && <Tag color="red">测试模式</Tag>}
         </Space>
         <Space size={16}>
+          {/* 全站搜索 */}
+          <GlobalSearch />
           {user?.factory_id && <Tag color="geekblue">厂区 {user.factory_id}</Tag>}
           <Link to="/ai" style={{ color: 'rgba(255,255,255,0.85)' }}><RobotOutlined /> AI 助手</Link>
           

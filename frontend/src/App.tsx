@@ -29,6 +29,7 @@ import ApprovalCenter from './pages/tms/ApprovalCenter'
 import TaskDistribution from './pages/tms/TaskDistribution'
 import AgentConsole from './pages/tms/AgentConsole'
 import QuickRequest from './pages/tms/QuickRequest'
+import PersonalSettings from './pages/settings/PersonalSettings'
 
 // 纯色主题配置
 const theme = {
@@ -118,6 +119,7 @@ const App: React.FC = () => {
             <Route path="tms/distribution" element={<PermissionGate path="/tms/distribution"><TaskDistribution /></PermissionGate>} />
             <Route path="tms/agent" element={<PermissionGate path="/tms/agent"><AgentConsole /></PermissionGate>} />
             <Route path="quick-request" element={<QuickRequest />} />
+            <Route path="settings" element={<PersonalSettings />} />
             {/* v2.5 Smart Collaboration */}
             <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
