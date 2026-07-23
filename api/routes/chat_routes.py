@@ -23,7 +23,7 @@ from database.db_config import get_db
 from database.models import User
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, execute_tool, detect_intent_tool,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, execute_tool, resolve_intent,
 )
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
@@ -129,6 +129,64 @@ async def _call_llm(payload: Dict[str, Any]) -> httpx.Response:
         )
 
 
+async def _run_deterministic(
+    intent: Dict[str, Any],
+    user_question: str,
+    model: str,
+    operator: str,
+    db: AsyncSession,
+    actions: List[ToolAction],
+) -> ChatResponse:
+    """确定性业务底座（参考 luaguage capability 执行思路）。
+
+    后端根据意图直接执行工具取真实数据（不依赖模型决策），再让 LLM 仅负责把数据组织成自然语言。
+    工具一定被调用、数据一定真实，从根本上杜绝“建议查看看板”这类推诿性模糊回答。"""
+    tool_name = intent["tool"]
+    tool_args = intent.get("args") or {}
+    result = await execute_tool(db, tool_name, tool_args, operator=operator)
+    is_error = "error" in result
+    actions.append(ToolAction(
+        tool=tool_name,
+        label=TOOL_LABELS.get(tool_name, tool_name),
+        arguments=tool_args,
+        result=result,
+        is_write=tool_name in WRITE_TOOLS,
+        success=not is_error,
+    ))
+    data_str = json.dumps(result, ensure_ascii=False, default=str)
+    if is_error:
+        return ChatResponse(
+            reply=f"⚠️ 查询失败：{result.get('error')}",
+            model=model, degraded=False, actions=actions,
+        )
+    format_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"用户问题：{user_question}\n\n"
+            f"系统已通过工具 `{tool_name}` 从真实数据库取到如下数据（JSON）：\n{data_str}\n\n"
+            "请严格基于以上真实数据，用简洁专业的中文、以 Markdown 表格或清单形式直接回答用户，并给出简要分析。"
+            "数据已齐全，禁止说‘建议查看看板/日报中心’之类的推诿话术，直接呈现数据。"
+        )},
+    ]
+    try:
+        fmt_resp = await _call_llm({
+            "model": model,
+            "messages": format_messages,
+            "temperature": 0.3,
+        })
+        if fmt_resp.status_code < 400:
+            reply = (fmt_resp.json().get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            if reply:
+                return ChatResponse(reply=reply, model=model, degraded=False, actions=actions)
+    except Exception:  # noqa: BLE001
+        pass
+    # 格式化失败兜底：直接返回结构化真实数据
+    return ChatResponse(
+        reply=f"已从数据库取到真实数据：\n```json\n{data_str}\n```",
+        model=model, degraded=False, actions=actions,
+    )
+
+
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -139,6 +197,17 @@ async def chat(
     model = request.model or MODEL
     operator = current_user.username or current_user.id
 
+    last_user = next(
+        (m.content for m in reversed(request.messages) if m.role == "user"), ""
+    )
+    actions: List[ToolAction] = []
+
+    # ---- 确定性业务底座：命中查询意图 → 后端直接执行工具取真实数据，LLM 仅负责组织语言 ----
+    intent = resolve_intent(last_user) if request.enable_tools else None
+    if intent:
+        return await _run_deterministic(intent, last_user, model, operator, db, actions)
+
+    # ---- 非确定性意图：走 auto tool-calling 循环（写操作 / 多步 / 通用问答）----
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += [m.model_dump() for m in request.messages]
 
@@ -147,20 +216,9 @@ async def chat(
         "messages": messages,
         "temperature": request.temperature,
     }
-    # 确定性意图路由（业务底座）：命中业务关键词则强制调用对应工具，避免模型自由决策给出模糊回答
-    forced_tool: Optional[str] = None
     if request.enable_tools:
-        last_user = next(
-            (m.content for m in reversed(request.messages) if m.role == "user"), ""
-        )
-        forced_tool = detect_intent_tool(last_user)
         payload["tools"] = TOOL_DEFINITIONS
-        payload["tool_choice"] = (
-            {"type": "function", "function": {"name": forced_tool}}
-            if forced_tool else "auto"
-        )
-
-    actions: List[ToolAction] = []
+        payload["tool_choice"] = "auto"
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):

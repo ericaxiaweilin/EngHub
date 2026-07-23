@@ -558,6 +558,27 @@ def detect_intent_tool(message: str) -> Optional[str]:
     return None
 
 
+def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
+    """确定性意图解析：命中业务关键词返回 {"tool", "args"}，否则 None。
+
+    后端可据此直接执行工具取真实数据（不依赖模型决策），args 通过轻量关键词规则提取。
+    写操作/多步操作不走此路径，仍由模型 auto 编排。"""
+    tool = detect_intent_tool(message)
+    if not tool:
+        return None
+    args: Dict[str, Any] = {}
+    if tool == "query_work_orders":
+        if any(k in message for k in ["在制", "生产中", "进行中", "在做", "在产"]):
+            args["status"] = "in_progress"
+        elif any(k in message for k in ["待下达", "未下达"]):
+            args["status"] = "pending"
+        elif "已下达" in message:
+            args["status"] = "released"
+        elif any(k in message for k in ["已完成", "完工"]):
+            args["status"] = "completed"
+    return {"tool": tool, "args": args}
+
+
 async def execute_tool(
     db: AsyncSession,
     tool_name: str,
@@ -576,4 +597,4 @@ async def execute_tool(
         return {"error": f"工具执行失败：{type(exc).__name__}: {exc}"}
 
 
-__all__ = ["TOOL_DEFINITIONS", "TOOL_LABELS", "WRITE_TOOLS", "execute_tool", "detect_intent_tool", "INTENT_RULES"]
+__all__ = ["TOOL_DEFINITIONS", "TOOL_LABELS", "WRITE_TOOLS", "execute_tool", "detect_intent_tool", "resolve_intent", "INTENT_RULES"]
