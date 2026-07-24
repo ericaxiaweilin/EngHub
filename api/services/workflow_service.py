@@ -82,6 +82,17 @@ WORKFLOW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"tool": "query_simulation_audits", "args": {"limit": 5}},
         ],
     },
+    "alert_intelligence_brief": {
+        "label": "预警情报简报",
+        "description": "主动汇报当前预警态势：待处理预警汇总 → 最紧急预警详情 → AI 审查建议。",
+        "trigger_keywords": [
+            "预警简报", "预警情报", "异常简报", "告警简报",
+        ],
+        "steps": [
+            {"tool": "get_pending_alerts", "args": {}},
+            {"tool": "query_alert_reviews", "args": {"status": "pending", "limit": 5}},
+        ],
+    },
 }
 
 

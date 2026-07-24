@@ -130,6 +130,7 @@ class User(Base):
     role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=True, index=True)  # 关联角色表
     is_active = Column(Boolean, default=True)
     is_superuser = Column(Boolean, default=False)
+    work_center = Column(String(20), nullable=True, index=True)  # 工序组编码（WCUT/EDM/CUT...），null=管理岗不绑定
     last_login = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -179,6 +180,10 @@ class WorkOrder(Base):
     # ---- 状态审核机制（014）：下达人/完工确认人 ----
     released_by = Column(String(50), nullable=True)   # 下达人（管理角色且非创建人）
     completed_by = Column(String(50), nullable=True)  # 完工确认人（品质角色）
+    # ---- 工序流转与多角色视角（016）----
+    assigned_to = Column(String(36), nullable=True, index=True)  # 指派操作人 user_id
+    work_center = Column(String(20), nullable=True, index=True)  # 工序组（operation 工单=process_code）
+    routing_template_id = Column(String(36), nullable=True)  # 绑定的工艺路线模板
     remark = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -363,6 +368,72 @@ class Routing(Base):
     __table_args__ = (
         Index("idx_routing_product_version", "product_id", "version"),
     )
+
+
+class RoutingTemplate(Base):
+    """工艺路线模板表（016）"""
+
+    __tablename__ = "routing_templates"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    template_code = Column(String(50), unique=True, nullable=False)
+    template_name = Column(String(100), nullable=False)
+    factory_id = Column(String(50), nullable=False, index=True)
+    description = Column(Text)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # 关系
+    steps = relationship("RoutingTemplateStep", back_populates="template", order_by="RoutingTemplateStep.seq", cascade="all, delete-orphan")
+
+
+class RoutingTemplateStep(Base):
+    """工艺路线模板工序步骤（016）"""
+
+    __tablename__ = "routing_template_steps"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    template_id = Column(String(36), ForeignKey("routing_templates.id"), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    process_code = Column(String(20), nullable=False)
+    operation_name = Column(String(100), nullable=False)
+    work_center = Column(String(20), nullable=True)
+    standard_hours = Column(Numeric(8, 2), default=0)
+    is_parallel = Column(Boolean, default=False)
+    is_qc_gate = Column(Boolean, default=False)
+    remark = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # 关系
+    template = relationship("RoutingTemplate", back_populates="steps")
+
+    __table_args__ = (
+        Index("idx_rts_template_seq", "template_id", "seq"),
+    )
+
+
+class AlertIntelligenceReview(Base):
+    """AI 预警审查记录（017）—— 每条被动预警触发一条 AI 审查"""
+
+    __tablename__ = "alert_intelligence_reviews"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    alert_source = Column(String(30), nullable=False)      # andon/defect/equipment/wo_timeout/inventory
+    alert_ref_id = Column(String(36), nullable=False)      # 关联源记录 ID
+    alert_ref_code = Column(String(100), nullable=True)    # 源记录编码
+    alert_summary = Column(Text, nullable=False)           # 预警摘要
+    severity_assessment = Column(String(20), nullable=True)  # critical/high/medium/low
+    root_cause_hypothesis = Column(Text, nullable=True)
+    recommended_actions = Column(Text, nullable=True)      # JSON array
+    dispatch_recommendation = Column(String(100), nullable=True)
+    raw_ai_response = Column(Text, nullable=True)
+    status = Column(String(20), default="pending")         # pending/acknowledged/dismissed/acted
+    acknowledged_by = Column(String(50), nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
 class Equipment(Base):
@@ -1073,4 +1144,7 @@ __all__ = [
     "FileRecord",
     # 统一码表
     "CodeTable",
+    # 工序流转（016）
+    "RoutingTemplate",
+    "RoutingTemplateStep",
 ]

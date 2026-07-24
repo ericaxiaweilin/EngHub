@@ -12,8 +12,8 @@ import dayjs from 'dayjs'
 import {
   getWorkOrder, releaseWorkOrder, startWorkOrder, completeWorkOrder,
   closeWorkOrder, cancelWorkOrder, getStations, getRouting, getProducts,
-  getWorkOrderStatusLogs, getWorkOrderChildren,
-  WorkOrder, ProductionReport, Station, Routing, Product, WoStatusLog,
+  getWorkOrderStatusLogs, getWorkOrderChildren, getFlowDetail,
+  WorkOrder, ProductionReport, Station, Routing, Product, WoStatusLog, FlowStep,
 } from '../../services/mes'
 import { getStoredUser } from '../../services/auth'
 import RecordDetailDrawer, { DetailField } from '../../components/trace/RecordDetailDrawer'
@@ -73,6 +73,9 @@ const WorkOrderDetail: React.FC = () => {
   const [reportDetail, setReportDetail] = useState<ProductionReport | null>(null)
   const [children, setChildren] = useState<WorkOrder[]>([])
   const [statusLogs, setStatusLogs] = useState<WoStatusLog[]>([])
+  const [flowSteps, setFlowSteps] = useState<FlowStep[]>([])
+  const [flowDone, setFlowDone] = useState(0)
+  const [flowCurrent, setFlowCurrent] = useState(0)
 
   // 角色门槛（与后端一致）：superuser 或角色在允许列表
   const hasRole = (action: string): boolean => {
@@ -94,6 +97,12 @@ const WorkOrderDetail: React.FC = () => {
       // 子工单 + 状态操作日志（审核追溯）
       getWorkOrderChildren(id).then((r) => setChildren(r.items || [])).catch(() => setChildren([]))
       getWorkOrderStatusLogs(id).then((r) => setStatusLogs(r.items || [])).catch(() => setStatusLogs([]))
+      // 工序流转视图（016）
+      getFlowDetail(id).then((r) => {
+        setFlowSteps(r.flow_steps || [])
+        setFlowDone(r.done_steps || 0)
+        setFlowCurrent(r.current_step != null ? r.current_step - 1 : (r.flow_steps?.length || 0))
+      }).catch(() => setFlowSteps([]))
     } catch (err: any) {
       message.error(err?.response?.data?.detail || '获取工单详情失败')
     } finally {
@@ -349,6 +358,25 @@ const WorkOrderDetail: React.FC = () => {
               description: s.station_id ? stationLabel(s.station_id) : (s.duration_min ? `${s.duration_min}min` : undefined),
             }))}
           />
+        </Card>
+      )}
+
+      {/* 工序流转视图（016） */}
+      {flowSteps.length > 0 && (
+        <Card title={<span><ApartmentOutlined /> 工序流转 ({flowDone}/{flowSteps.length})</span>} size="small" style={{ marginTop: 16 }}>
+          <Steps
+            size="small"
+            current={flowCurrent}
+            items={flowSteps.map((s) => ({
+              title: s.remark || s.process_code,
+              description: s.status === 'completed' ? `✓ ${s.completed_by || ''}` : s.status === 'in_progress' ? '加工中' : s.status === 'released' ? '已释放' : '待释放',
+              status: s.status === 'completed' || s.status === 'closed' ? 'finish'
+                : s.status === 'in_progress' ? 'process'
+                : s.status === 'released' ? 'process' : 'wait',
+              icon: s.is_qc_gate ? <AuditOutlined style={{ color: s.status === 'completed' ? '#52c41a' : '#ff4d4f' }} /> : undefined,
+            }))}
+          />
+          <Progress percent={flowSteps.length ? Math.round(flowDone / flowSteps.length * 100) : 0} size="small" style={{ marginTop: 12 }} />
         </Card>
       )}
 

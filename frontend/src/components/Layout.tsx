@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
 import { Layout as AntLayout, Menu, Avatar, Space, Tag, Dropdown, Button } from 'antd'
+import { useTranslation } from 'react-i18next'
 import {
   DashboardOutlined,
   FileTextOutlined,
@@ -55,28 +56,30 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/roles': <SettingOutlined />,
 }
 
-// 将后端 menu_items 转换为 Ant Design Menu 格式
-function convertMenuItems(items: any[]): any[] {
+// 将后端 menu_items 转换为 Ant Design Menu 格式（label 优先取 i18n 翻译，缺失时回退后端原文）
+function convertMenuItems(items: any[], t: (key: string, opts?: any) => string): any[] {
   if (!items || !items.length) return []
 
   return items.map((item: any) => {
+    const label = t(`menu.${item.key}`, { defaultValue: item.label })
     if (item.children && item.children.length > 0) {
       return {
         key: item.key,
         icon: menuIcons[item.key] || <ClusterOutlined />,
-        label: item.label,
-        children: convertMenuItems(item.children),
+        label,
+        children: convertMenuItems(item.children, t),
       }
     }
     return {
       key: item.key,
       icon: menuIcons[item.key] || <DashboardOutlined />,
-      label: <Link to={item.key}>{item.label}</Link>,
+      label: <Link to={item.key}>{label}</Link>,
     }
   })
 }
 
 const Layout: React.FC = () => {
+  const { t } = useTranslation()
   const location = useLocation()
   const navigate = useNavigate()
   const [user, setUser] = useState(getStoredUser())
@@ -94,11 +97,11 @@ const Layout: React.FC = () => {
     return () => { cancelled = true }
   }, [])
 
-  // 根据用户权限动态生成菜单
+  // 根据用户权限动态生成菜单（label 走 i18n，语言切换时随 t 重新渲染）
   const menuItems = useMemo(() => {
     if (!user) return []
-    return convertMenuItems(user.menu_items || [])
-  }, [user])
+    return convertMenuItems(user.menu_items || [], t)
+  }, [user, t])
 
   const handleLogout = () => {
     logout()
@@ -120,8 +123,8 @@ const Layout: React.FC = () => {
         disabled: true,
       },
       { type: 'divider' as const },
-      { key: 'settings', icon: <SettingOutlined />, label: '系统设置', onClick: () => navigate('/settings') },
-      { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
+      { key: 'settings', icon: <SettingOutlined />, label: t('layout.settings'), onClick: () => navigate('/settings') },
+      { key: 'logout', icon: <LogoutOutlined />, label: t('layout.logout'), onClick: handleLogout },
     ],
   }
 
@@ -132,12 +135,12 @@ const Layout: React.FC = () => {
           <Avatar shape="square" style={{ background: '#1890ff' }} icon={<ClusterOutlined />} />
           <span style={{ fontSize: 18, fontWeight: 700, color: '#fff', letterSpacing: 1 }}>EngHub MES</span>
           <Tag color="blue" style={{ marginLeft: 4 }}>v1.2</Tag>
-          {testMode && <Tag color="red">测试模式</Tag>}
+          {testMode && <Tag color="red">{t('layout.testMode')}</Tag>}
         </Space>
         <Space size={16}>
           {/* 全站搜索 */}
           <GlobalSearch />
-          {user?.factory_id && <Tag color="geekblue">厂区 {user.factory_id}</Tag>}
+          {user?.factory_id && <Tag color="geekblue">{t('layout.factory')} {user.factory_id}</Tag>}
           
           {/* 测试模式：角色切换按钮 */}
           {testMode && (
@@ -148,7 +151,7 @@ const Layout: React.FC = () => {
               onClick={() => setSwitcherOpen(true)}
               style={{ color: '#fff', borderColor: 'rgba(255,255,255,0.5)' }}
             >
-              切换角色
+              {t('layout.switchRole')}
             </Button>
           )}
 

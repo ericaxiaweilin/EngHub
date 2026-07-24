@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database.db_config import get_db
-from database.models import User, Product
+from database.models import User, Product, RoutingTemplate, RoutingTemplateStep, WorkOrder as WorkOrderModel
 from api.services.work_order_service import WorkOrderService, WOStatus, WoPermissionError
 from api.services.mes_services import (
     ProductionReportService,
@@ -19,6 +19,7 @@ from api.services.mes_services import (
     RoutingService,
     EquipmentService,
 )
+from api.services.dispatch_service import dispatch_operations, advance_flow
 from core.auth.security import get_current_user
 
 router = APIRouter(prefix="/api/v1", tags=["mes"])
@@ -35,6 +36,7 @@ class WorkOrderCreate(BaseModel):
     station_id: Optional[str] = None
     bom_version: Optional[str] = None
     remark: Optional[str] = None
+    routing_template_id: Optional[str] = None  # 工艺路线模板（可选，下达时自动派工）
 
 
 class WorkOrderUpdate(BaseModel):
@@ -109,6 +111,8 @@ async def create_work_order(
             bom_version=wo.bom_version,
             remark=wo.remark,
             created_by=current_user.username,
+            routing_template_id=wo.routing_template_id,
+            derive_operations=not wo.routing_template_id,  # 有模板时跳过旧派生，下达时按模板派工
         )
         return service.to_dict(work_order)
     except Exception as e:
@@ -164,6 +168,248 @@ async def get_work_order_stats(
     """获取工单统计卡片数据"""
     service = WorkOrderService(db)
     return await service.get_stats(factory_id)
+
+
+# ============================================================
+# 多视角查询端点（016）—— 必须放在 /{work_order_id} 之前
+# ============================================================
+
+@router.get("/work-orders/global-flow")
+async def global_flow_view(
+    factory_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """全局宏观视角：所有主工单 + 工序进度摘要（data_scope: factory+）"""
+    # 权限检查：仅 factory/all 级别可访问
+    scope = getattr(current_user, "data_scope", None)
+    if isinstance(scope, dict):
+        scope_type = scope.get("type", "own")
+    else:
+        scope_type = "factory"  # 默认
+    if scope_type not in ("all", "factory"):
+        raise HTTPException(403, "全局视角需要 factory 级及以上权限")
+
+    from sqlalchemy import func as sa_func
+    from sqlalchemy.orm import selectinload
+
+    # 查询主工单
+    query = select(WorkOrderModel).where(
+        WorkOrderModel.factory_id == factory_id,
+        WorkOrderModel.wo_type == "master",
+    ).order_by(WorkOrderModel.created_at.desc())
+
+    total_result = await db.execute(
+        select(sa_func.count()).select_from(WorkOrderModel).where(
+            WorkOrderModel.factory_id == factory_id,
+            WorkOrderModel.wo_type == "master",
+        )
+    )
+    total = total_result.scalar() or 0
+
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(query)
+    masters = result.scalars().all()
+
+    items = []
+    for m in masters:
+        # 查询子工序工单摘要
+        ops_result = await db.execute(
+            select(WorkOrderModel).where(
+                WorkOrderModel.parent_work_order_id == m.id,
+                WorkOrderModel.wo_type == "operation",
+            ).order_by(WorkOrderModel.operation_seq)
+        )
+        ops = ops_result.scalars().all()
+        ops_summary = [
+            {
+                "id": op.id,
+                "code": op.work_order_code,
+                "seq": op.operation_seq,
+                "process_code": op.process_code,
+                "work_center": op.work_center,
+                "status": op.status,
+                "assigned_to": op.assigned_to,
+            }
+            for op in ops
+        ]
+        done_count = sum(1 for op in ops if op.status in ("completed", "closed"))
+        items.append({
+            "id": m.id,
+            "work_order_code": m.work_order_code,
+            "product_id": m.product_id,
+            "status": m.status,
+            "priority": m.priority,
+            "planned_qty": m.planned_qty,
+            "planned_due": m.planned_due.isoformat() if m.planned_due else None,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "operations": ops_summary,
+            "op_total": len(ops),
+            "op_done": done_count,
+            "progress_pct": round(done_count / len(ops) * 100) if ops else 0,
+        })
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/work-orders/queue")
+async def process_queue_view(
+    factory_id: str,
+    work_center: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """部门/工序组队列：指定工序组的工序工单（按优先级+交期排序）"""
+    from sqlalchemy import func as sa_func
+
+    # 确定工序组：显式传入 > 用户绑定的 work_center > 全部
+    wc_filter = work_center or getattr(current_user, "work_center", None)
+
+    query = select(WorkOrderModel).where(
+        WorkOrderModel.factory_id == factory_id,
+        WorkOrderModel.wo_type == "operation",
+    )
+    count_query = select(sa_func.count()).select_from(WorkOrderModel).where(
+        WorkOrderModel.factory_id == factory_id,
+        WorkOrderModel.wo_type == "operation",
+    )
+
+    if wc_filter:
+        query = query.where(WorkOrderModel.work_center == wc_filter)
+        count_query = count_query.where(WorkOrderModel.work_center == wc_filter)
+    if status:
+        query = query.where(WorkOrderModel.status == status)
+        count_query = count_query.where(WorkOrderModel.status == status)
+
+    total = (await db.execute(count_query)).scalar() or 0
+
+    # 排序：优先级(urgent>high>medium>low) + 交期
+    query = query.order_by(WorkOrderModel.priority.desc(), WorkOrderModel.planned_due.asc().nullslast())
+    query = query.offset((page - 1) * page_size).limit(page_size)
+
+    result = await db.execute(query)
+    ops = result.scalars().all()
+
+    service = WorkOrderService(db)
+    items = [service.to_dict(op) for op in ops]
+
+    # 统计卡片
+    stats_result = await db.execute(
+        select(WorkOrderModel.status, sa_func.count()).where(
+            WorkOrderModel.factory_id == factory_id,
+            WorkOrderModel.wo_type == "operation",
+            *([WorkOrderModel.work_center == wc_filter] if wc_filter else []),
+        ).group_by(WorkOrderModel.status)
+    )
+    status_counts = {row[0]: row[1] for row in stats_result.all()}
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "work_center": wc_filter,
+        "stats": {
+            "pending": status_counts.get("pending", 0),
+            "released": status_counts.get("released", 0),
+            "in_progress": status_counts.get("in_progress", 0),
+            "completed": status_counts.get("completed", 0),
+        },
+    }
+
+
+@router.get("/work-orders/my-tasks")
+async def my_tasks_view(
+    factory_id: str,
+    status: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """我的任务：assigned_to=当前用户的工序工单"""
+    from sqlalchemy import func as sa_func
+
+    user_id = str(current_user.id)
+    query = select(WorkOrderModel).where(
+        WorkOrderModel.factory_id == factory_id,
+        WorkOrderModel.assigned_to == user_id,
+    )
+    count_query = select(sa_func.count()).select_from(WorkOrderModel).where(
+        WorkOrderModel.factory_id == factory_id,
+        WorkOrderModel.assigned_to == user_id,
+    )
+
+    if status:
+        query = query.where(WorkOrderModel.status == status)
+        count_query = count_query.where(WorkOrderModel.status == status)
+
+    total = (await db.execute(count_query)).scalar() or 0
+    query = query.order_by(WorkOrderModel.priority.desc(), WorkOrderModel.planned_due.asc().nullslast())
+    query = query.offset((page - 1) * page_size).limit(page_size)
+
+    result = await db.execute(query)
+    tasks = result.scalars().all()
+
+    service = WorkOrderService(db)
+    return {"items": [service.to_dict(t) for t in tasks], "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/work-orders/{work_order_id}/flow-detail")
+async def flow_detail_view(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """单张主工单的工序流转详情（含每道状态/操作人/时间）"""
+    service = WorkOrderService(db)
+    master = await service.get_work_order_by_id(work_order_id)
+    if not master:
+        raise HTTPException(404, "Work order not found")
+
+    # 查询所有工序工单
+    ops_result = await db.execute(
+        select(WorkOrderModel).where(
+            WorkOrderModel.parent_work_order_id == work_order_id,
+            WorkOrderModel.wo_type == "operation",
+        ).order_by(WorkOrderModel.operation_seq)
+    )
+    ops = ops_result.scalars().all()
+
+    flow_steps = [
+        {
+            "id": op.id,
+            "seq": op.operation_seq,
+            "process_code": op.process_code,
+            "work_center": op.work_center,
+            "remark": op.remark,
+            "status": op.status,
+            "assigned_to": op.assigned_to,
+            "released_by": op.released_by,
+            "completed_by": op.completed_by,
+            "actual_start": op.actual_start.isoformat() if op.actual_start else None,
+            "actual_complete": op.actual_complete.isoformat() if op.actual_complete else None,
+            "is_qc_gate": "QC_GATE" in (op.remark or ""),
+        }
+        for op in ops
+    ]
+
+    done_count = sum(1 for op in ops if op.status in ("completed", "closed"))
+    current_step = next((op.operation_seq for op in ops if op.status in ("released", "in_progress")), None)
+
+    return {
+        "master": service.to_dict(master),
+        "flow_steps": flow_steps,
+        "total_steps": len(ops),
+        "done_steps": done_count,
+        "current_step": current_step,
+        "progress_pct": round(done_count / len(ops) * 100) if ops else 0,
+    }
 
 
 @router.get("/work-orders/{work_order_id}")
@@ -234,13 +480,36 @@ async def release_work_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """待下发 → 已下达（审核门槛：管理角色 + 创建人不能下达自己的工单）"""
+    """待下发 → 已下达（审核门槛：管理角色 + 创建人不能下达自己的工单）+ 自动派工"""
     service = WorkOrderService(db)
     try:
         work_order = await service.release_work_order(work_order_id, current_user)
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
-        return service.to_dict(work_order)
+
+        # 工序派工：如果主工单绑定了工艺路线模板，自动生成工序工单
+        dispatch_result = None
+        if work_order.routing_template_id and work_order.wo_type == "master":
+            from sqlalchemy.orm import selectinload
+            from sqlalchemy import select as sa_select
+            tpl_result = await db.execute(
+                sa_select(RoutingTemplate)
+                .where(RoutingTemplate.id == work_order.routing_template_id)
+                .options(selectinload(RoutingTemplate.steps))
+            )
+            template = tpl_result.scalar_one_or_none()
+            if template and template.steps:
+                ops = await dispatch_operations(db, work_order, template.steps, current_user.username)
+                await db.commit()
+                dispatch_result = {
+                    "dispatched_count": len(ops),
+                    "operation_codes": [op.work_order_code for op in ops],
+                }
+
+        resp = service.to_dict(work_order)
+        if dispatch_result:
+            resp["dispatch"] = dispatch_result
+        return resp
     except WoPermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
@@ -326,7 +595,7 @@ async def complete_work_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """生产中/待入库 → 已完成（审核门槛：品质角色 + 实际产出 + 子工单全部完工）"""
+    """生产中/待入库 → 已完成（审核门槛：品质角色 + 实际产出 + 子工单全部完工）+ 工序流转"""
     service = WorkOrderService(db)
     try:
         work_order = await service.complete_work_order(
@@ -334,7 +603,17 @@ async def complete_work_order(
         )
         if not work_order:
             raise HTTPException(status_code=404, detail="Work order not found")
-        return service.to_dict(work_order)
+
+        # 工序流转：如果是工序工单完工，自动释放下一道工序
+        flow_result = None
+        if work_order.wo_type == "operation" and work_order.parent_work_order_id:
+            flow_result = await advance_flow(db, work_order, current_user.username)
+            await db.commit()
+
+        resp = service.to_dict(work_order)
+        if flow_result:
+            resp["flow"] = flow_result
+        return resp
     except WoPermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:

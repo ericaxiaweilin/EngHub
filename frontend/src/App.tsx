@@ -6,6 +6,10 @@ import Layout from './components/Layout'
 import Dashboard from './pages/Dashboard'
 import WorkOrderList from './pages/workorder/WorkOrderList'
 import WorkOrderDetail from './pages/workorder/WorkOrderDetail'
+import ProcessQueue from './pages/workorder/ProcessQueue'
+import MyTasks from './pages/workorder/MyTasks'
+import RoutingTemplates from './pages/workorder/RoutingTemplates'
+import AlertIntelligence from './pages/alerts/AlertIntelligence'
 import ProductionReport from './pages/reporting/ProductionReport'
 import InspectionList from './pages/qms/InspectionList'
 import DefectList from './pages/qms/DefectList'
@@ -106,6 +110,10 @@ const App: React.FC = () => {
             <Route path="production-data" element={<ProductionData />} />
             <Route path="work-orders" element={<PermissionGate path="/work-orders"><WorkOrderList /></PermissionGate>} />
             <Route path="work-orders/:id" element={<PermissionGate path="/work-orders"><WorkOrderDetail /></PermissionGate>} />
+                        <Route path="process-queue" element={<PermissionGate path="/process-queue"><ProcessQueue /></PermissionGate>} />
+                        <Route path="my-tasks" element={<MyTasks />} />
+                        <Route path="routing-templates" element={<PermissionGate path="/routing-templates"><RoutingTemplates /></PermissionGate>} />
+                        <Route path="alert-intelligence" element={<PermissionGate path="/alert-intelligence"><AlertIntelligence /></PermissionGate>} />
             <Route path="production-report" element={<PermissionGate path="/production-report"><ProductionReport /></PermissionGate>} />
             <Route path="inspections" element={<PermissionGate path="/inspections"><InspectionList /></PermissionGate>} />
             <Route path="defects" element={<PermissionGate path="/defects"><DefectList /></PermissionGate>} />

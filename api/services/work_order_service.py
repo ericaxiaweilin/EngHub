@@ -232,6 +232,7 @@ class WorkOrderService:
         created_by: Optional[str] = None,
         wo_type: str = "S",
         derive_operations: bool = True,
+        routing_template_id: Optional[str] = None,
     ) -> WorkOrder:
         # 体系化编码：主工单码 = {PLANT}-{TYPE}{DATE}-{SEQ}（如 ELEC-S20260720-001）
         work_order_code = await generate_master_work_order_code(self.db, factory_id, wo_type=wo_type)
@@ -251,6 +252,7 @@ class WorkOrderService:
             remark=remark,
             created_by=created_by,
             wo_type="master",
+            routing_template_id=routing_template_id,
         )
 
         self.db.add(work_order)

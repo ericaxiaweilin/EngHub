@@ -5,7 +5,7 @@ Andon 2.0 API Routes
 """
 
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query, Body
+from fastapi import APIRouter, HTTPException, Depends, Query, Body, BackgroundTasks
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/v1/andon", tags=["andon - 智能工单"])
@@ -57,34 +57,71 @@ class AndonTicketUpdate(BaseModel):
 # ==================== Route Definitions ====================
 
 @router.post("/tickets", status_code=201, summary="创建安灯工单")
-async def create_ticket(payload: AndonTicketCreate):
-    """创建安灯小工单，自动校验类别，支持扫码派单和抢单"""
+async def create_ticket(payload: AndonTicketCreate, background_tasks: BackgroundTasks):
+    """创建安灯小工单，自动校验类别，支持扫码派单和抢单。创建后异步触发 AI 审查。"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from api.services.alert_intelligence_service import validate_andon_data, review_alert
+    from database.db_config import db_config
 
-    db = next(get_db())
-    service = AndonService(db)
+    # 边界校验（防低级失误）
+    validation_err = validate_andon_data(
+        timeout_no_response=payload.timeout_minutes_no_response,
+        timeout_resolve=payload.timeout_minutes_resolve,
+        priority=payload.priority,
+    )
+    if validation_err:
+        raise HTTPException(status_code=422, detail=validation_err)
+
+    async with db_config.session_factory() as db:
+        service = AndonService(db)
+        try:
+            ticket = await service.create_ticket(
+                factory_id=payload.factory_id,
+                category_code=payload.category_code,
+                title=payload.title,
+                description=payload.description,
+                location_id=payload.location_id,
+                equipment_id=payload.equipment_id,
+                work_order_id=payload.work_order_id,
+                priority=payload.priority,
+                metadata_=payload.metadata_,
+            )
+
+            # 异步触发 AI 审查（不阻塞主流程）
+            context = (
+                f"安灯工单创建：\n"
+                f"- 工单号：{ticket.ticket_code}\n"
+                f"- 类别：{payload.category_code}\n"
+                f"- 标题：{payload.title}\n"
+                f"- 优先级：{ticket.priority}\n"
+                f"- 描述：{(payload.description or '无')[:300]}"
+            )
+            background_tasks.add_task(
+                _async_review_alert, payload.factory_id, "andon", ticket.id, ticket.ticket_code, context
+            )
+
+            await db.commit()
+            return {"success": True, "data": {
+                "id": ticket.id,
+                "ticket_code": ticket.ticket_code,
+                "status": ticket.status,
+                "priority": ticket.priority,
+                "category_code": ticket.category_code,
+            }}
+        except Exception as exc:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def _async_review_alert(factory_id: str, source: str, ref_id: str, ref_code: str, context: str):
+    """Background task 包装器：独立 session 执行 AI 审查"""
+    from database.db_config import db_config
+    from api.services.alert_intelligence_service import review_alert
     try:
-        ticket = await service.create_ticket(
-            factory_id=payload.factory_id,
-            category_code=payload.category_code,
-            title=payload.title,
-            description=payload.description,
-            location_id=payload.location_id,
-            equipment_id=payload.equipment_id,
-            work_order_id=payload.work_order_id,
-            priority=payload.priority,
-            metadata_=payload.metadata_,
-        )
-        return {"success": True, "data": {
-            "id": ticket.id,
-            "ticket_code": ticket.ticket_code,
-            "status": ticket.status,
-            "priority": ticket.priority,
-            "category_code": ticket.category_code,
-        }}
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with db_config.session_factory() as db:
+            await review_alert(db, factory_id, source, ref_id, ref_code, context)
+    except Exception:
+        pass  # 审查失败不影响主流程
 
 
 @router.get("/tickets", summary="安灯工单列表")
@@ -97,9 +134,9 @@ async def list_tickets(
 ):
     """查询安灯工单列表"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     tickets = await service.list_tickets(factory_id=factory_id, status=status, category_code=category_code, page=page, page_size=page_size)
     return {"items": [
@@ -116,9 +153,9 @@ async def list_tickets(
 @router.get("/tickets/{ticket_id}", summary="安灯工单详情")
 async def get_ticket(ticket_id: str):
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         ticket = await service.get_ticket(ticket_id)
@@ -142,9 +179,9 @@ async def get_ticket(ticket_id: str):
 @router.put("/tickets/{ticket_id}", summary="更新安灯工单")
 async def update_ticket(ticket_id: str, payload: AndonTicketUpdate):
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         ticket = await service.get_ticket(ticket_id)
@@ -167,9 +204,9 @@ async def update_ticket(ticket_id: str, payload: AndonTicketUpdate):
 async def assign_ticket(ticket_id: str, payload: AndonTicketAssign):
     """一键指派给特定人员（支持扫码自动识别）"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         ticket = await service.assign_ticket(ticket_id, payload.target_user_id, payload.reason)
@@ -182,9 +219,9 @@ async def assign_ticket(ticket_id: str, payload: AndonTicketAssign):
 async def claim_ticket(ticket_id: str, payload: AndonTicketClaim):
     """公共池抢单模式"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         ticket = await service.claim_ticket(ticket_id, payload.user_id)
@@ -197,9 +234,9 @@ async def claim_ticket(ticket_id: str, payload: AndonTicketClaim):
 async def resolve_ticket(ticket_id: str, payload: AndonTicketResolve):
     """标记工单为已解决"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         ticket = await service.resolve_ticket(ticket_id, payload.resolution, payload.resolved_by)
@@ -212,9 +249,9 @@ async def resolve_ticket(ticket_id: str, payload: AndonTicketResolve):
 async def escalate_ticket(ticket_id: str, payload: AndonTicketEscalate):
     """手动升级至班组长/厂长"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         ticket = await service.escalate_ticket(ticket_id, payload.level, payload.note)
@@ -227,9 +264,9 @@ async def escalate_ticket(ticket_id: str, payload: AndonTicketEscalate):
 async def cancel_ticket(ticket_id: str):
     """取消安灯工单"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         ticket = await service.get_ticket(ticket_id)
@@ -245,9 +282,9 @@ async def cancel_ticket(ticket_id: str):
 async def process_timeouts():
     """定时任务接口：处理超时未响应/未解决的升级通知"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         actions = await service.process_timeout_escalations()
@@ -260,9 +297,9 @@ async def process_timeouts():
 async def process_reminders():
     """定时任务接口：发送定时提醒推送"""
     from api.services.andon_service import AndonService
-    from database.db_config import get_db
+    from database.db_config import db_config
 
-    db = next(get_db())
+    db = db_config.session_factory()
     service = AndonService(db)
     try:
         reminders = await service.process_timed_reminders()

@@ -397,6 +397,65 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    # ---- 预警情报审查工具（017） ----
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pending_alerts",
+            "description": "获取当前待处理预警汇总：各来源数量、严重度分布、最紧急的预警详情。用于回答'有什么预警''当前异常'类问题。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_alert_reviews",
+            "description": "查询 AI 预警审查记录。可按来源（andon/defect/equipment/wo_timeout）和状态（pending/acknowledged/dismissed）过滤。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["andon", "defect", "equipment", "wo_timeout", "inventory"],
+                        "description": "预警来源过滤，可选",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "acknowledged", "dismissed", "acted"],
+                        "description": "审查状态过滤，可选",
+                    },
+                    "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "acknowledge_alert",
+            "description": "确认或驳回某条 AI 预警审查建议。确认后表示已知晓并将处理，驳回表示误报/不需处理。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "review_id": {"type": "string", "description": "审查记录 ID"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["acknowledged", "dismissed"],
+                        "description": "操作：acknowledged=确认知晓 / dismissed=驳回误报",
+                    },
+                },
+                "required": ["review_id", "action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_alert_patrol",
+            "description": "主动执行一次预警巡检：扫描工单超时、安灯未响应等异常，自动触发 AI 审查。用于'巡检''扫描异常'类请求。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -1149,6 +1208,49 @@ async def _tool_export_report_file(db: AsyncSession, args: Dict[str, Any], opera
     }
 
 
+# ==================== 预警情报审查工具执行器（017） ====================
+
+async def _tool_get_pending_alerts(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    from api.services.alert_intelligence_service import get_pending_alerts_summary
+    if not factory_id:
+        return {"error": "缺少工厂ID"}
+    return await get_pending_alerts_summary(db, factory_id)
+
+
+async def _tool_query_alert_reviews(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    from api.services.alert_intelligence_service import list_reviews
+    if not factory_id:
+        return {"error": "缺少工厂ID"}
+    limit = min(int(args.get("limit", 10)), 50)
+    items = await list_reviews(db, factory_id, source=args.get("source"), status=args.get("status"), limit=limit)
+    return {"count": len(items), "reviews": items}
+
+
+async def _tool_acknowledge_alert(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    from api.services.alert_intelligence_service import acknowledge_review
+    review_id = args.get("review_id", "")
+    action = args.get("action", "acknowledged")
+    if action not in ("acknowledged", "dismissed"):
+        return {"error": f"action 须为 acknowledged 或 dismissed，当前值: {action}"}
+    result = await acknowledge_review(db, review_id, action, operator)
+    if not result:
+        return {"error": f"未找到审查记录 {review_id}"}
+    if "error" in result:
+        return result
+    return {"success": True, "message": f"审查记录已{('确认' if action == 'acknowledged' else '驳回')}", "review": result}
+
+
+async def _tool_run_alert_patrol(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    from api.services.alert_intelligence_service import patrol
+    user = await _get_user_by_name(db, operator)
+    factory_id = user.factory_id if user else None
+    if not factory_id:
+        return {"error": "无法确定工厂ID"}
+    result = await patrol(db, factory_id)
+    result["message"] = f"巡检完成：发现 {result.get('alerts_found', 0)} 条预警，创建 {result.get('reviews_created', 0)} 条AI审查"
+    return result
+
+
 # 执行器注册表
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
@@ -1172,6 +1274,10 @@ _TOOL_EXECUTORS = {
     "get_work_order_form": _tool_get_work_order_form,
     "get_inspection_form": _tool_get_inspection_form,
     "export_report_file": _tool_export_report_file,
+    "get_pending_alerts": _tool_get_pending_alerts,
+    "query_alert_reviews": _tool_query_alert_reviews,
+    "acknowledge_alert": _tool_acknowledge_alert,
+    "run_alert_patrol": _tool_run_alert_patrol,
 }
 
 # 写操作工具（需要记录操作人）
@@ -1181,6 +1287,7 @@ WRITE_TOOLS = {
     "run_compliance_simulation",
     "run_workflow",
     "export_report_file",
+    "acknowledge_alert", "run_alert_patrol",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
@@ -1209,6 +1316,10 @@ TOOL_LABELS = {
     "get_work_order_form": "工单表单",
     "get_inspection_form": "检验单表单",
     "export_report_file": "导出报告",
+    "get_pending_alerts": "预警汇总",
+    "query_alert_reviews": "预警审查记录",
+    "acknowledge_alert": "确认预警",
+    "run_alert_patrol": "预警巡检",
 }
 
 
@@ -1279,6 +1390,19 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "tool": "get_work_order_form",
         "keywords": [
             "工单表单", "工单完整表单", "完整工单表单", "工单全量信息",
+        ],
+    },
+    {
+        "tool": "get_pending_alerts",
+        "keywords": [
+            "预警", "告警", "警报", "异常汇报", "待处理预警", "当前异常",
+            "有什么预警", "预警情况", "告警情况", "预警汇总",
+        ],
+    },
+    {
+        "tool": "run_alert_patrol",
+        "keywords": [
+            "巡检", "扫描异常", "主动巡检", "预警巡检", "扫描预警",
         ],
     },
 ]

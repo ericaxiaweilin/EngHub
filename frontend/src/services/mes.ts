@@ -46,6 +46,10 @@ export interface WorkOrder {
   process_code?: string;         // 行业通用工序代码（SMT/INJ/MACH...）
   operation_seq?: number;        // 同一工序内道次序号
   parent_work_order_id?: string; // 工序工单指向主工单
+  // 工序流转（016）
+  assigned_to?: string;          // 指派操作人
+  work_center?: string;          // 工序组
+  routing_template_id?: string;  // 工艺路线模板
 }
 
 export interface WorkOrderStats {
@@ -472,3 +476,100 @@ export const getChatHealth = () =>
   api.get<any, { configured: boolean; reachable: boolean; model: string; gateway: string; detail: string }>(
     API_ENDPOINTS.CHAT_HEALTH,
   );
+
+// ============== 工序流转与多视角（016） ==============
+
+export interface RoutingTemplateStep {
+  id?: string;
+  seq: number;
+  process_code: string;
+  operation_name: string;
+  work_center?: string;
+  standard_hours?: number;
+  is_parallel?: boolean;
+  is_qc_gate?: boolean;
+  remark?: string;
+}
+
+export interface RoutingTemplate {
+  id: string;
+  template_code: string;
+  template_name: string;
+  factory_id: string;
+  description?: string;
+  is_active: boolean;
+  steps: RoutingTemplateStep[];
+  created_by?: string;
+  created_at?: string;
+}
+
+export interface FlowStep {
+  id: string;
+  seq: number;
+  process_code: string;
+  work_center?: string;
+  remark?: string;
+  status: string;
+  assigned_to?: string;
+  released_by?: string;
+  completed_by?: string;
+  actual_start?: string;
+  actual_complete?: string;
+  is_qc_gate?: boolean;
+}
+
+export const getRoutingTemplates = (factoryId: string) =>
+  api.get<any, { items: RoutingTemplate[]; total: number }>('/api/v1/routing-templates', { params: { factory_id: factoryId } });
+
+export const createRoutingTemplate = (data: any) =>
+  api.post<any, RoutingTemplate>('/api/v1/routing-templates', data);
+
+export const updateRoutingTemplate = (id: string, data: any) =>
+  api.put<any, RoutingTemplate>(`/api/v1/routing-templates/${id}`, data);
+
+export const deleteRoutingTemplate = (id: string) =>
+  api.delete<any, any>(`/api/v1/routing-templates/${id}`);
+
+export const getGlobalFlow = (factoryId: string, page = 1, pageSize = 20) =>
+  api.get<any, any>('/api/v1/work-orders/global-flow', { params: { factory_id: factoryId, page, page_size: pageSize } });
+
+export const getProcessQueue = (factoryId: string, workCenter?: string, status?: string, page = 1, pageSize = 50) =>
+  api.get<any, any>('/api/v1/work-orders/queue', { params: { factory_id: factoryId, work_center: workCenter, status, page, page_size: pageSize } });
+
+export const getMyTasks = (factoryId: string, status?: string, page = 1, pageSize = 50) =>
+  api.get<any, any>('/api/v1/work-orders/my-tasks', { params: { factory_id: factoryId, status, page, page_size: pageSize } });
+
+export const getFlowDetail = (workOrderId: string) =>
+  api.get<any, { master: WorkOrder; flow_steps: FlowStep[]; total_steps: number; done_steps: number; current_step: number | null; progress_pct: number }>(`/api/v1/work-orders/${workOrderId}/flow-detail`);
+
+// ---- 预警情报审查 API（017） ----
+
+export interface AlertReview {
+  id: string;
+  factory_id: string;
+  alert_source: string;
+  source_label: string;
+  alert_ref_id: string;
+  alert_ref_code: string;
+  alert_summary: string;
+  severity_assessment: string | null;
+  root_cause_hypothesis: string[];
+  recommended_actions: string[];
+  dispatch_recommendation: string | null;
+  status: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  created_at: string | null;
+}
+
+export const getAlertReviews = (factoryId: string, params?: { source?: string; status?: string; limit?: number }) =>
+  api.get<any, { items: AlertReview[]; count: number }>('/api/v1/alert-intelligence/reviews', { params: { factory_id: factoryId, ...params } });
+
+export const getAlertSummary = (factoryId: string) =>
+  api.get<any, { total_pending: number; by_source: Record<string, number>; by_severity: Record<string, number>; top_alerts: AlertReview[] }>('/api/v1/alert-intelligence/summary', { params: { factory_id: factoryId } });
+
+export const acknowledgeAlertReview = (reviewId: string, action: 'acknowledged' | 'dismissed') =>
+  api.post<any, AlertReview>(`/api/v1/alert-intelligence/reviews/${reviewId}/acknowledge`, { action });
+
+export const runAlertPatrol = (factoryId: string) =>
+  api.post<any, { patrol_time: string; alerts_found: number; reviews_created: number; overdue_work_orders: number; stale_andon_tickets: number }>('/api/v1/alert-intelligence/patrol', null, { params: { factory_id: factoryId } });

@@ -8,6 +8,7 @@ import React, { useMemo } from 'react'
 import { Card, Tabs } from 'antd'
 import { SettingOutlined } from '@ant-design/icons'
 import { useSearchParams } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import PersonalSettings from './PersonalSettings'
 import CodeTableSettings from './CodeTableSettings'
 import { getStoredUser } from '../../services/auth'
@@ -18,6 +19,7 @@ interface SystemSettingsProps {
 }
 
 const SystemSettings: React.FC<SystemSettingsProps> = ({ defaultTab }) => {
+  const { t } = useTranslation()
   const user = getStoredUser()
   const isAdmin = user?.role === 'admin' || user?.role === 'super_admin'
   const [searchParams, setSearchParams] = useSearchParams()
@@ -27,17 +29,17 @@ const SystemSettings: React.FC<SystemSettingsProps> = ({ defaultTab }) => {
 
   const items = useMemo(() => {
     const list = [
-      { key: 'personal', label: '个人设置', children: <PersonalSettings /> },
+      { key: 'personal', label: t('settings.personalTab'), children: <PersonalSettings /> },
     ]
     if (isAdmin) {
-      list.push({ key: 'codetables', label: '码表管理', children: <CodeTableSettings /> })
+      list.push({ key: 'codetables', label: t('settings.codeTablesTab'), children: <CodeTableSettings /> })
     }
     return list
-  }, [isAdmin])
+  }, [isAdmin, t])
 
   return (
     <Card
-      title={<><SettingOutlined /> 系统设置</>}
+      title={<><SettingOutlined /> {t('settings.title')}</>}
       size="small"
       styles={{ body: { paddingTop: 8 } }}
     >

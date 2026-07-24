@@ -653,10 +653,13 @@ def get_menu_items_for_user(user) -> list:
         children = []
         if "work_order" in modules_with_access:
             children.append({"key": "/work-orders", "label": "工单管理"})
+            children.append({"key": "/process-queue", "label": "工序队列"})
         if "production_report" in modules_with_access:
             children.append({"key": "/production-report", "label": "生产报工"})
         if any(m in modules_with_access for m in ["station", "routing", "equipment"]):
             children.append({"key": "/base-data", "label": "工位/工艺/设备"})
+        if "routing" in modules_with_access:
+            children.append({"key": "/routing-templates", "label": "工艺路线模板"})
         if children:
             items.append({
                 "key": "g-mfg",
@@ -757,6 +760,19 @@ def get_menu_items_for_user(user) -> list:
         "label": "快速工单",
         "module": "quick_request",
     })
+
+    # 我的任务（所有角色可见，操作工主视图）
+    items.append({
+        "key": "/my-tasks",
+        "label": "我的任务",
+    })
+
+    # 预警情报（017，管理角色可见）
+    if user_perms and any(p.get("module") in ("work_order", "quality", "equipment") for p in user_perms):
+        items.append({
+            "key": "/alert-intelligence",
+            "label": "预警情报",
+        })
 
     return items
 

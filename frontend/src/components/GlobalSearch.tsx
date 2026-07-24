@@ -6,6 +6,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { Input, Tag, Spin, Empty, Typography } from 'antd'
 import { SearchOutlined, FileTextOutlined, AppstoreOutlined, ToolOutlined, InboxOutlined, TeamOutlined, HomeOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import api from '../services/api'
 
 const { Text } = Typography
@@ -40,6 +41,7 @@ const sourceColors: Record<string, string> = {
 }
 
 export default function GlobalSearch() {
+  const { t } = useTranslation()
   const [keyword, setKeyword] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
   const [facets, setFacets] = useState<Record<string, number>>({})
@@ -120,7 +122,7 @@ export default function GlobalSearch() {
     <div ref={boxRef} style={{ position: 'relative', width: 260 }}>
       <Input
         prefix={<SearchOutlined style={{ color: 'rgba(255,255,255,0.5)' }} />}
-        placeholder="全站搜索 (工单/产品/设备/员工...)"
+        placeholder={t('layout.searchPlaceholder')}
         value={keyword}
         onChange={onChange}
         onKeyDown={onKeyDown}

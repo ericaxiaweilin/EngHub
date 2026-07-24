@@ -13,7 +13,7 @@ from sqlalchemy.orm import relationship
 import uuid
 from datetime import datetime
 
-from database.db_config import Base
+from database.models import Base
 
 
 class AndonCategory(Base):
@@ -78,7 +78,7 @@ class AndonTicket(Base):
     resolved_at = Column(DateTime, nullable=True)
 
     # 元数据扩展
-    metadata_ = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)
+    metadata_ = Column("metadata_", JSON().with_variant(JSONB, "postgresql"), default=dict)
 
     # 关系
     category = relationship("AndonCategory")

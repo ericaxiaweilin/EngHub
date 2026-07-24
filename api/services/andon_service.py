@@ -13,9 +13,8 @@ from sqlalchemy import select, func
 from database.models import (
     WorkOrder,
     DefectRecord,
-    AndonTicket,
-    AndonEscalationLog,
 )
+from core.andon.models import AndonTicket, AndonEscalationLog
 
 
 class AndonService:
@@ -86,7 +85,6 @@ class AndonService:
             priority=priority or cat["priority_hint"],
             timeout_minutes_no_response=cat["timeout_minutes"],
             metadata_=metadata_ or {},
-            created_by=created_by,
         )
 
         self.db.add(ticket)
