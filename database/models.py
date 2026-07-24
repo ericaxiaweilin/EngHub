@@ -8,6 +8,8 @@ from sqlalchemy import (
     String,
     Integer,
     DateTime,
+    Date,
+    Time,
     Boolean,
     Numeric,
     Float,
@@ -273,6 +275,17 @@ class ProductionReport(Base):
     shift = Column(String(20), default="day")
     operator_id = Column(String(50))
     remark = Column(Text)
+    # ---- 023: 岗位替代 Phase 1 扩展 ----
+    operation_seq = Column(Integer, nullable=True)
+    operation_name = Column(String(100), nullable=True)
+    machine_id = Column(String(50), nullable=True)
+    start_time = Column(DateTime, nullable=True)
+    end_time = Column(DateTime, nullable=True)
+    cycle_time_sec = Column(Float, nullable=True)
+    is_undone = Column(Boolean, default=False)
+    undone_at = Column(DateTime, nullable=True)
+    undone_by = Column(String(50), nullable=True)
+    # ----
     is_modified = Column(Boolean, default=False)
     modified_at = Column(DateTime)
     modified_by = Column(String(50))
@@ -507,6 +520,7 @@ class Inventory(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     material_id = Column(String(50), nullable=False, index=True)
     material_code = Column(String(50), nullable=False)
+    material_name = Column(String(100), nullable=True)
     factory_id = Column(String(50), nullable=False, index=True)
     warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False, index=True)
     location_id = Column(String(36), ForeignKey("locations.id"))
@@ -515,7 +529,9 @@ class Inventory(Base):
     available_qty = Column(Integer, default=0, nullable=False)
     reserved_qty = Column(Integer, default=0)
     unit_cost = Column(Numeric(10, 2))
+    unit = Column(String(20), default="pcs")
     status = Column(String(20), default="available")
+    last_movement_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
@@ -1102,6 +1118,466 @@ class CodeTable(Base):
         }
 
 
+# ============== APS 排程模型 (018) ==============
+
+class ApsSchedule(Base):
+    """排程方案（一次排程生成一个方案）"""
+    __tablename__ = "aps_schedules"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    schedule_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    mode = Column(String(20), nullable=False, default="hybrid")
+    optimize_for = Column(String(20), default="delivery")
+    status = Column(String(20), default="draft")
+    horizon_start = Column(DateTime, nullable=False)
+    horizon_end = Column(DateTime, nullable=False)
+    on_time_rate = Column(Float, nullable=True)
+    avg_utilization = Column(Float, nullable=True)
+    total_setup_minutes = Column(Float, nullable=True)
+    avg_cycle_hours = Column(Float, nullable=True)
+    total_tasks = Column(Integer, default=0)
+    unscheduled_count = Column(Integer, default=0)
+    created_by = Column(String(50), nullable=True)
+    confirmed_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    tasks = relationship("ApsScheduleTask", back_populates="schedule", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_aps_sched_factory", "factory_id", "status"),
+    )
+
+
+class ApsScheduleTask(Base):
+    """排程任务明细（每道工序一条）"""
+    __tablename__ = "aps_schedule_tasks"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    schedule_id = Column(String(36), ForeignKey("aps_schedules.id"), nullable=False, index=True)
+    work_order_id = Column(String(36), nullable=True, index=True)
+    order_code = Column(String(50), nullable=True)
+    product_code = Column(String(50), nullable=True)
+    operation_seq = Column(Integer, nullable=False)
+    operation_name = Column(String(100), nullable=True)
+    station_id = Column(String(50), nullable=False)
+    planned_start = Column(DateTime, nullable=False)
+    planned_end = Column(DateTime, nullable=False)
+    setup_seconds = Column(Float, default=0)
+    run_seconds = Column(Float, default=0)
+    quantity = Column(Integer, default=0)
+    status = Column(String(20), default="planned")
+    is_locked = Column(Boolean, default=False)
+    priority = Column(Integer, default=5)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    schedule = relationship("ApsSchedule", back_populates="tasks")
+
+    __table_args__ = (
+        Index("idx_aps_task_station", "station_id", "planned_start"),
+    )
+
+
+class ApsWorkCalendar(Base):
+    """工作日历（工位/产线的可用时间段）"""
+    __tablename__ = "aps_work_calendars"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False)
+    resource_id = Column(String(50), nullable=False)
+    resource_type = Column(String(20), default="station")
+    shift_name = Column(String(50), default="标准班")
+    day_of_week = Column(Integer, nullable=False)
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+    is_active = Column(Boolean, default=True)
+    effective_from = Column(Date, nullable=True)
+    effective_to = Column(Date, nullable=True)
+
+    __table_args__ = (
+        Index("idx_aps_cal_resource", "resource_id", "day_of_week"),
+    )
+
+
+# ============================================================
+# QMS 增强模型（019）
+# ============================================================
+
+
+class QmsInspectionItem(Base):
+    """检验项明细"""
+    __tablename__ = "qms_inspection_items"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    inspection_id = Column(String(36), ForeignKey("quality_inspections.id"), nullable=False, index=True)
+    item_name = Column(String(100), nullable=False)
+    item_code = Column(String(50), nullable=True)
+    spec_lower = Column(Float, nullable=True)
+    spec_upper = Column(Float, nullable=True)
+    target_value = Column(Float, nullable=True)
+    measured_value = Column(Float, nullable=True)
+    result = Column(String(10), nullable=True)  # OK/NG
+    measurement_method = Column(String(50), nullable=True)
+    remark = Column(String(200), nullable=True)
+
+
+class QmsSpcPoint(Base):
+    """SPC 控制图数据点"""
+    __tablename__ = "qms_spc_points"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    characteristic_code = Column(String(50), nullable=False, index=True)
+    characteristic_name = Column(String(100), nullable=True)
+    work_order_id = Column(String(36), nullable=True)
+    station_id = Column(String(50), nullable=True)
+    measured_value = Column(Float, nullable=False)
+    sample_group = Column(Integer, nullable=True)
+    ucl = Column(Float, nullable=True)
+    lcl = Column(Float, nullable=True)
+    cl = Column(Float, nullable=True)
+    is_out_of_control = Column(Boolean, default=False)
+    measured_at = Column(DateTime, default=datetime.utcnow)
+    measured_by = Column(String(50), nullable=True)
+
+    __table_args__ = (
+        Index("idx_spc_char_time", "factory_id", "characteristic_code", "measured_at"),
+    )
+
+
+class Qms8dReport(Base):
+    """8D 报告"""
+    __tablename__ = "qms_8d_reports"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    report_code = Column(String(50), unique=True, nullable=False)
+    factory_id = Column(String(50), nullable=False, index=True)
+    defect_record_id = Column(String(36), ForeignKey("defect_records.id"), nullable=True)
+    title = Column(String(200), nullable=False)
+    severity = Column(String(20), default="major")
+    status = Column(String(20), default="open")  # open/in_progress/closed/verified
+    d1_team = Column(Text, nullable=True)
+    d2_problem_description = Column(Text, nullable=True)
+    d3_containment_action = Column(Text, nullable=True)
+    d4_root_cause = Column(Text, nullable=True)
+    d5_corrective_action = Column(Text, nullable=True)
+    d6_implementation = Column(Text, nullable=True)
+    d7_preventive_action = Column(Text, nullable=True)
+    d8_congratulations = Column(Text, nullable=True)
+    opened_by = Column(String(50), nullable=True)
+    closed_by = Column(String(50), nullable=True)
+    due_date = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_8d_factory_status", "factory_id", "status"),
+    )
+
+
+# ============================================================
+# 设备 TPM 模型（020）
+# ============================================================
+
+
+class EquipmentDowntime(Base):
+    """设备停机记录"""
+    __tablename__ = "equipment_downtime"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    equipment_id = Column(String(36), ForeignKey("equipment.id"), nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=True)
+    duration_minutes = Column(Float, nullable=True)
+    downtime_category = Column(String(30), nullable=True)  # breakdown/setup/adjustment/waiting/planned_maint
+    reason_code = Column(String(50), nullable=True)
+    description = Column(Text, nullable=True)
+    reported_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class MaintenanceOrder(Base):
+    """维护工单"""
+    __tablename__ = "maintenance_orders"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    order_code = Column(String(50), unique=True, nullable=False)
+    factory_id = Column(String(50), nullable=False, index=True)
+    equipment_id = Column(String(36), ForeignKey("equipment.id"), nullable=False, index=True)
+    maintenance_type = Column(String(20), nullable=False)  # preventive/corrective/predictive
+    priority = Column(String(10), default="medium")
+    status = Column(String(20), default="open")  # open/in_progress/completed/cancelled
+    description = Column(Text, nullable=True)
+    planned_date = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    assigned_to = Column(String(50), nullable=True)
+    result_summary = Column(Text, nullable=True)
+    downtime_minutes = Column(Float, default=0)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class MaintenancePlan(Base):
+    """预防性维护计划"""
+    __tablename__ = "maintenance_plans"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    equipment_id = Column(String(36), ForeignKey("equipment.id"), nullable=False, index=True)
+    plan_name = Column(String(100), nullable=False)
+    frequency_days = Column(Integer, nullable=False)
+    last_executed_at = Column(DateTime, nullable=True)
+    next_due_at = Column(DateTime, nullable=True)
+    checklist = Column(Text, nullable=True)  # JSON array
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ============================================================
+# WMS 增强模型（021）
+# ============================================================
+
+
+class InventoryTransaction(Base):
+    """库存流水"""
+    __tablename__ = "inventory_transactions"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    inventory_id = Column(String(36), ForeignKey("inventory.id"), nullable=True)
+    material_id = Column(String(50), nullable=False, index=True)
+    batch_code = Column(String(50), nullable=True)
+    transaction_type = Column(String(20), nullable=False)  # inbound/outbound/adjust/transfer/count_diff
+    quantity = Column(Integer, nullable=False)  # 正=入, 负=出
+    before_qty = Column(Integer, nullable=True)
+    after_qty = Column(Integer, nullable=True)
+    reference_type = Column(String(30), nullable=True)
+    reference_id = Column(String(36), nullable=True)
+    operator = Column(String(50), nullable=True)
+    remark = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class InventoryCount(Base):
+    """盘点单"""
+    __tablename__ = "inventory_counts"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    count_code = Column(String(50), unique=True, nullable=False)
+    factory_id = Column(String(50), nullable=False, index=True)
+    warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False)
+    count_type = Column(String(20), default="periodic")  # periodic/cycle/spot
+    status = Column(String(20), default="draft")  # draft/counting/pending_approval/approved/rejected
+    planned_date = Column(Date, nullable=True)
+    counted_by = Column(String(50), nullable=True)
+    approved_by = Column(String(50), nullable=True)
+    total_items = Column(Integer, default=0)
+    diff_items = Column(Integer, default=0)
+    total_diff_qty = Column(Integer, default=0)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    items = relationship("InventoryCountItem", back_populates="count_order", cascade="all, delete-orphan")
+
+
+class InventoryCountItem(Base):
+    """盘点明细"""
+    __tablename__ = "inventory_count_items"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    count_id = Column(String(36), ForeignKey("inventory_counts.id"), nullable=False, index=True)
+    inventory_id = Column(String(36), ForeignKey("inventory.id"), nullable=True)
+    material_id = Column(String(50), nullable=False)
+    batch_code = Column(String(50), nullable=True)
+    system_qty = Column(Integer, nullable=False)
+    counted_qty = Column(Integer, nullable=True)
+    diff_qty = Column(Integer, nullable=True)
+    adjusted = Column(Boolean, default=False)
+    remark = Column(String(200), nullable=True)
+
+    count_order = relationship("InventoryCount", back_populates="items")
+
+
+# ============== ERPNext 参考增强（022）==============
+
+class JobCardTimeLog(Base):
+    """工序计时日志（参考 ERPNext Job Card Time Log）"""
+    __tablename__ = "job_card_time_logs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    operation_seq = Column(Integer, nullable=True)
+    operation_name = Column(String(100), nullable=True)
+    station_id = Column(String(50), nullable=True, index=True)
+    operator = Column(String(50), nullable=True)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=True)
+    duration_minutes = Column(Float, nullable=True)
+    completed_qty = Column(Integer, default=0)
+    status = Column(String(20), default="running")
+    remark = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class QualityGoal(Base):
+    """质量目标（参考 ERPNext Quality Goal）"""
+    __tablename__ = "quality_goals"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    goal_code = Column(String(50), unique=True, nullable=False)
+    goal_name = Column(String(200), nullable=False)
+    metric_type = Column(String(30), nullable=False)
+    target_value = Column(Float, nullable=False)
+    current_value = Column(Float, nullable=True)
+    unit = Column(String(20), default="%")
+    period = Column(String(20), default="monthly")
+    responsible = Column(String(50), nullable=True)
+    status = Column(String(20), default="active")
+    review_frequency_days = Column(Integer, default=30)
+    last_reviewed_at = Column(DateTime, nullable=True)
+    next_review_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    reviews = relationship("QualityGoalReview", back_populates="goal", cascade="all, delete-orphan")
+
+
+class QualityGoalReview(Base):
+    """质量目标评审记录"""
+    __tablename__ = "quality_goal_reviews"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    goal_id = Column(String(36), ForeignKey("quality_goals.id"), nullable=False, index=True)
+    review_date = Column(DateTime, default=datetime.utcnow)
+    measured_value = Column(Float, nullable=True)
+    gap = Column(Float, nullable=True)
+    status = Column(String(20), default="on_track")
+    action_plan = Column(Text, nullable=True)
+    reviewed_by = Column(String(50), nullable=True)
+    remark = Column(String(500), nullable=True)
+
+    goal = relationship("QualityGoal", back_populates="reviews")
+
+
+class PickList(Base):
+    """拣货单（参考 ERPNext Pick List）"""
+    __tablename__ = "pick_lists"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    pick_code = Column(String(50), unique=True, nullable=False)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    work_order_code = Column(String(50), nullable=True)
+    status = Column(String(20), default="draft")
+    warehouse_id = Column(String(36), nullable=True)
+    total_items = Column(Integer, default=0)
+    picked_items = Column(Integer, default=0)
+    picked_by = Column(String(50), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    items = relationship("PickListItem", back_populates="pick_list", cascade="all, delete-orphan")
+
+
+class PickListItem(Base):
+    """拣货明细"""
+    __tablename__ = "pick_list_items"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    pick_list_id = Column(String(36), ForeignKey("pick_lists.id"), nullable=False, index=True)
+    material_id = Column(String(50), nullable=False)
+    material_name = Column(String(100), nullable=True)
+    required_qty = Column(Integer, nullable=False)
+    picked_qty = Column(Integer, default=0)
+    batch_code = Column(String(50), nullable=True)
+    location = Column(String(50), nullable=True)
+    status = Column(String(20), default="pending")
+    remark = Column(String(200), nullable=True)
+
+    pick_list = relationship("PickList", back_populates="items")
+
+
+# ============== 岗位替代 Phase 1（023）==============
+
+class ShiftSummary(Base):
+    """班次汇总表（自动聚合，报表数据源）"""
+    __tablename__ = "shift_summaries"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    shift_date = Column(Date, nullable=False)
+    shift_type = Column(String(20), nullable=False)  # day/middle/night
+    station_id = Column(String(50), nullable=True)
+    work_order_id = Column(String(36), nullable=True)
+    product_id = Column(String(50), nullable=True)
+    total_output = Column(Integer, default=0)
+    good_qty = Column(Integer, default=0)
+    defect_qty = Column(Integer, default=0)
+    scrap_qty = Column(Integer, default=0)
+    yield_rate = Column(Float, default=0)
+    target_output = Column(Integer, default=0)
+    achievement_rate = Column(Float, default=0)
+    report_count = Column(Integer, default=0)
+    total_cycle_time = Column(Float, default=0)
+    operator_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_ss_unique", "factory_id", "shift_date", "shift_type", "station_id", "work_order_id", unique=True),
+    )
+
+
+class ProductionAlert(Base):
+    """生产异常预警"""
+    __tablename__ = "production_alerts"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    alert_type = Column(String(30), nullable=False)  # below_target/yield_drop/machine_stop/material_short/order_delay
+    severity = Column(String(10), nullable=False, default="warning")  # info/warning/critical
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=True)
+    source_type = Column(String(30), nullable=True)
+    source_id = Column(String(50), nullable=True)
+    metric_value = Column(Float, nullable=True)
+    threshold_value = Column(Float, nullable=True)
+    is_read = Column(Boolean, default=False)
+    is_resolved = Column(Boolean, default=False)
+    resolved_by = Column(String(50), nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    triggered_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class HourlyOutputSnapshot(Base):
+    """小时产出快照（看板趋势图数据源）"""
+    __tablename__ = "hourly_output_snapshots"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    snapshot_date = Column(Date, nullable=False)
+    snapshot_hour = Column(Integer, nullable=False)  # 0-23
+    station_id = Column(String(50), nullable=True)
+    output_qty = Column(Integer, default=0)
+    good_qty = Column(Integer, default=0)
+    defect_qty = Column(Integer, default=0)
+    target_qty = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_hos_unique", "factory_id", "snapshot_date", "snapshot_hour", "station_id", unique=True),
+    )
+
+
 # 导出所有模型
 __all__ = [
     "Base",
@@ -1147,4 +1623,30 @@ __all__ = [
     # 工序流转（016）
     "RoutingTemplate",
     "RoutingTemplateStep",
+    # APS 排程（018）
+    "ApsSchedule",
+    "ApsScheduleTask",
+    "ApsWorkCalendar",
+    # QMS 增强（019）
+    "QmsInspectionItem",
+    "QmsSpcPoint",
+    "Qms8dReport",
+    # 设备 TPM（020）
+    "EquipmentDowntime",
+    "MaintenanceOrder",
+    "MaintenancePlan",
+    # WMS 增强（021）
+    "InventoryTransaction",
+    "InventoryCount",
+    "InventoryCountItem",
+    # ERPNext 参考增强（022）
+    "JobCardTimeLog",
+    "QualityGoal",
+    "QualityGoalReview",
+    "PickList",
+    "PickListItem",
+    # 岗位替代 Phase 1（023）
+    "ShiftSummary",
+    "ProductionAlert",
+    "HourlyOutputSnapshot",
 ]

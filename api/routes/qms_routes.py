@@ -4,7 +4,7 @@ QMS API Routes
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy import select, func
@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
 from core.auth.security import get_current_user
-from database.models import User, QualityInspection, DefectRecord
+from database.models import User, QualityInspection, DefectRecord, Qms8dReport
+from api.services.qms_service import QmsService
 
 router = APIRouter(prefix="/api/v1", tags=["qms"])
 
@@ -282,3 +283,323 @@ def _serialize_defect(r: DefectRecord) -> dict:
 
 
 __all__ = ["router"]
+
+
+# ============== 增强端点（019）==============
+
+
+class InspectionItemCreate(BaseModel):
+    item_name: str
+    item_code: Optional[str] = None
+    spec_lower: Optional[float] = None
+    spec_upper: Optional[float] = None
+    target_value: Optional[float] = None
+    measurement_method: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class InspectionCreate(BaseModel):
+    factory_id: str
+    work_order_id: str
+    inspect_type: str  # IQC/IPQC/FQC/OQC
+    sample_qty: int = 5
+    items: List[InspectionItemCreate] = []
+    remark: Optional[str] = None
+
+
+class InspectionItemResult(BaseModel):
+    item_id: str
+    measured_value: Optional[float] = None
+    result: Optional[str] = None
+
+
+class InspectionSubmit(BaseModel):
+    items_result: List[InspectionItemResult]
+    defect_qty: int = 0
+
+
+class SpcPointCreate(BaseModel):
+    factory_id: str
+    characteristic_code: str
+    measured_value: float
+    characteristic_name: Optional[str] = None
+    work_order_id: Optional[str] = None
+    station_id: Optional[str] = None
+    sample_group: Optional[int] = None
+
+
+class EightDCreate(BaseModel):
+    factory_id: str
+    title: str
+    defect_record_id: Optional[str] = None
+    severity: str = "major"
+
+
+class EightDUpdate(BaseModel):
+    step: str  # d1-d8
+    content: str
+
+
+@router.post("/inspections")
+async def create_inspection(
+    req: InspectionCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建检验单"""
+    svc = QmsService(db)
+    result = await svc.create_inspection(
+        factory_id=req.factory_id,
+        work_order_id=req.work_order_id,
+        inspect_type=req.inspect_type,
+        inspector_id=current_user.username,
+        sample_qty=req.sample_qty,
+        items=[i.dict() for i in req.items],
+        remark=req.remark,
+    )
+    return result
+
+
+@router.post("/inspections/{inspection_id}/submit")
+async def submit_inspection(
+    inspection_id: str,
+    req: InspectionSubmit,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """提交检验结果"""
+    svc = QmsService(db)
+    result = await svc.submit_inspection_result(
+        inspection_id=inspection_id,
+        items_result=[i.dict() for i in req.items_result],
+        defect_qty=req.defect_qty,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.get("/qms/spc")
+async def get_spc_chart(
+    factory_id: str,
+    characteristic_code: str,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SPC 控制图数据"""
+    svc = QmsService(db)
+    return await svc.get_spc_chart(factory_id, characteristic_code, limit)
+
+
+@router.post("/qms/spc")
+async def record_spc_point(
+    req: SpcPointCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """记录 SPC 数据点"""
+    svc = QmsService(db)
+    return await svc.record_spc_point(
+        factory_id=req.factory_id,
+        characteristic_code=req.characteristic_code,
+        measured_value=req.measured_value,
+        characteristic_name=req.characteristic_name,
+        work_order_id=req.work_order_id,
+        station_id=req.station_id,
+        sample_group=req.sample_group,
+        measured_by=current_user.username,
+    )
+
+
+@router.get("/qms/8d")
+async def list_8d_reports(
+    factory_id: str,
+    status: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """8D 报告列表"""
+    query = select(Qms8dReport).where(Qms8dReport.factory_id == factory_id)
+    if status:
+        query = query.where(Qms8dReport.status == status)
+    query = query.order_by(Qms8dReport.created_at.desc())
+
+    count_q = select(func.count()).select_from(query.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(query)
+    reports = result.scalars().all()
+
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": r.id, "report_code": r.report_code, "title": r.title,
+                "severity": r.severity, "status": r.status,
+                "defect_record_id": r.defect_record_id,
+                "d1_team": r.d1_team, "d2_problem_description": r.d2_problem_description,
+                "d3_containment_action": r.d3_containment_action,
+                "d4_root_cause": r.d4_root_cause,
+                "d5_corrective_action": r.d5_corrective_action,
+                "d6_implementation": r.d6_implementation,
+                "d7_preventive_action": r.d7_preventive_action,
+                "d8_congratulations": r.d8_congratulations,
+                "opened_by": r.opened_by, "closed_by": r.closed_by,
+                "due_date": r.due_date.isoformat() if r.due_date else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in reports
+        ],
+    }
+
+
+@router.post("/qms/8d")
+async def create_8d_report(
+    req: EightDCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建 8D 报告"""
+    svc = QmsService(db)
+    return await svc.create_8d(
+        factory_id=req.factory_id,
+        title=req.title,
+        defect_record_id=req.defect_record_id,
+        severity=req.severity,
+        opened_by=current_user.username,
+    )
+
+
+@router.put("/qms/8d/{report_id}")
+async def update_8d_report(
+    report_id: str,
+    req: EightDUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """更新 8D 步骤"""
+    svc = QmsService(db)
+    result = await svc.update_8d_step(report_id, req.step, req.content)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.post("/qms/8d/{report_id}/close")
+async def close_8d_report(
+    report_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """关闭 8D 报告"""
+    svc = QmsService(db)
+    result = await svc.close_8d(report_id, closed_by=current_user.username)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.get("/qms/dashboard")
+async def quality_dashboard(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """质量看板"""
+    svc = QmsService(db)
+    return await svc.get_quality_dashboard(factory_id)
+
+
+# ============== 质量目标 (ERPNext 参考) ==============
+
+
+@router.get("/qms/goals")
+async def list_quality_goals(
+    factory_id: str,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """质量目标列表"""
+    from database.models import QualityGoal
+    stmt = select(QualityGoal).where(QualityGoal.factory_id == factory_id)
+    if status:
+        stmt = stmt.where(QualityGoal.status == status)
+    stmt = stmt.order_by(QualityGoal.created_at.desc())
+    result = await db.execute(stmt)
+    goals = result.scalars().all()
+    return {"items": [{
+        "id": g.id, "goal_code": g.goal_code, "goal_name": g.goal_name,
+        "metric_type": g.metric_type, "target_value": g.target_value,
+        "current_value": g.current_value, "unit": g.unit, "period": g.period,
+        "responsible": g.responsible, "status": g.status,
+        "last_reviewed_at": g.last_reviewed_at.isoformat() if g.last_reviewed_at else None,
+    } for g in goals]}
+
+
+@router.post("/qms/goals")
+async def create_quality_goal(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建质量目标"""
+    import uuid
+    from datetime import datetime, timedelta
+    from database.models import QualityGoal
+    goal = QualityGoal(
+        id=str(uuid.uuid4()),
+        factory_id=body.get("factory_id", "F001"),
+        goal_code=f"QG-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}",
+        goal_name=body["goal_name"],
+        metric_type=body["metric_type"],
+        target_value=float(body["target_value"]),
+        unit=body.get("unit", "%"),
+        period=body.get("period", "monthly"),
+        responsible=body.get("responsible"),
+        review_frequency_days=body.get("review_frequency_days", 30),
+        next_review_at=datetime.utcnow() + timedelta(days=body.get("review_frequency_days", 30)),
+    )
+    db.add(goal)
+    await db.commit()
+    return {"success": True, "id": goal.id, "goal_code": goal.goal_code}
+
+
+@router.post("/qms/goals/{goal_id}/review")
+async def review_quality_goal(
+    goal_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """评审质量目标"""
+    import uuid
+    from datetime import datetime, timedelta
+    from database.models import QualityGoal, QualityGoalReview
+    stmt = select(QualityGoal).where(QualityGoal.id == goal_id)
+    result = await db.execute(stmt)
+    goal = result.scalar_one_or_none()
+    if not goal:
+        raise HTTPException(status_code=404, detail="目标不存在")
+
+    measured = float(body.get("measured_value", 0))
+    gap = measured - goal.target_value
+    review = QualityGoalReview(
+        id=str(uuid.uuid4()),
+        goal_id=goal_id,
+        measured_value=measured,
+        gap=gap,
+        status=body.get("status", "on_track"),
+        action_plan=body.get("action_plan"),
+        reviewed_by=current_user.username,
+    )
+    db.add(review)
+    goal.current_value = measured
+    goal.last_reviewed_at = datetime.utcnow()
+    goal.next_review_at = datetime.utcnow() + timedelta(days=goal.review_frequency_days or 30)
+    await db.commit()
+    return {"success": True, "gap": gap}

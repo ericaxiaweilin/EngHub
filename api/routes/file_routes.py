@@ -29,8 +29,8 @@ router = APIRouter(prefix="/api/v1/files", tags=["files"])
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(Path(__file__).resolve().parents[2] / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# 上传大小上限（默认 20MB），防止大文件占满磁盘
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(20 * 1024 * 1024)))
+# 上传大小上限（默认 100MB），支持视频文件
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(100 * 1024 * 1024)))
 
 
 def _ensure_same_factory(file: FileRecord, user: User) -> None:
@@ -77,6 +77,7 @@ async def upload_file(
 
     result = record.to_dict()
     result["is_image"] = (file.content_type or "").startswith("image/")
+    result["is_video"] = (file.content_type or "").startswith("video/")
     return result
 
 

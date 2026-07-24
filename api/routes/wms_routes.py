@@ -16,6 +16,7 @@ from api.services.wms_service import (
     WarehouseService,
     LocationService,
     InventoryService,
+    WmsService,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["wms"])
@@ -379,55 +380,173 @@ async def reserve_inventory(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# --- Inventory Count Endpoints ---
+# --- Inventory Count Endpoints (021 增强) ---
+
+class CountCreate(BaseModel):
+    factory_id: str
+    warehouse_id: str
+    count_type: str = "periodic"
+    planned_date: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class CountItemSubmit(BaseModel):
+    item_id: str
+    counted_qty: int
+    remark: Optional[str] = None
+
 
 @router.post("/inventory/count")
 async def create_inventory_count(
-    factory_id: str,
-    warehouse_id: str,
-    count_date: date,
-    count_type: str = "periodic",
+    req: CountCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """创建盘点单"""
-    # TODO: Implement inventory count
-    return {"id": "cnt-001", "status": "draft"}
+    from datetime import date as ddate
+    svc = WmsService(db)
+    planned = ddate.fromisoformat(req.planned_date) if req.planned_date else None
+    return await svc.create_count_order(
+        factory_id=req.factory_id,
+        warehouse_id=req.warehouse_id,
+        count_type=req.count_type,
+        planned_date=planned,
+        remark=req.remark,
+        created_by=current_user.username,
+    )
 
 
-@router.post("/inventory/count/{count_id}/submit")
-async def submit_count_result(
-    count_id: str,
-    data: CountSubmit,
+@router.get("/inventory/count")
+async def list_inventory_counts(
+    factory_id: str,
+    status: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """提交盘点结果"""
-    # TODO: Implement inventory count submission
+    """盘点单列表"""
+    from sqlalchemy import select
+    from database.models import InventoryCount
+    query = select(InventoryCount).where(InventoryCount.factory_id == factory_id)
+    if status:
+        query = query.where(InventoryCount.status == status)
+    query = query.order_by(InventoryCount.created_at.desc())
+    result = await db.execute(query)
+    counts = result.scalars().all()
     return {
-        "count_id": count_id,
-        "status": "pending_approval",
-        "total_difference": 0
+        "items": [
+            {
+                "id": c.id, "count_code": c.count_code,
+                "warehouse_id": c.warehouse_id, "count_type": c.count_type,
+                "status": c.status, "total_items": c.total_items,
+                "diff_items": c.diff_items, "total_diff_qty": c.total_diff_qty,
+                "counted_by": c.counted_by, "approved_by": c.approved_by,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in counts
+        ]
     }
 
 
-# --- Trace Endpoints ---
+@router.post("/inventory/count/{count_id}/items")
+async def submit_count_item(
+    count_id: str,
+    req: CountItemSubmit,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """录入盘点明细"""
+    svc = WmsService(db)
+    result = await svc.submit_count_item(count_id, req.item_id, req.counted_qty, req.remark)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.post("/inventory/count/{count_id}/approve")
+async def approve_count(
+    count_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """审批盘点"""
+    svc = WmsService(db)
+    result = await svc.approve_count(count_id, approved_by=current_user.username)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+# --- Trace & Analytics Endpoints (021 增强) ---
+
 
 @router.get("/inventory/material/{material_id}/trace")
 async def trace_material(
     material_id: str,
-    batch_code: str = None,
+    factory_id: str = "F001",
+    batch_code: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """物料追溯"""
-    # TODO: Implement material traceability
+    svc = WmsService(db)
+    return await svc.trace_material(factory_id, material_id, batch_code)
+
+
+@router.get("/inventory/transactions")
+async def list_transactions(
+    factory_id: str,
+    material_id: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """库存流水"""
+    from sqlalchemy import select
+    from database.models import InventoryTransaction
+    query = select(InventoryTransaction).where(InventoryTransaction.factory_id == factory_id)
+    if material_id:
+        query = query.where(InventoryTransaction.material_id == material_id)
+    if transaction_type:
+        query = query.where(InventoryTransaction.transaction_type == transaction_type)
+    query = query.order_by(InventoryTransaction.created_at.desc()).limit(50)
+    result = await db.execute(query)
+    txns = result.scalars().all()
     return {
-        "material_id": material_id,
-        "batch_code": batch_code,
-        "inbound_records": [],
-        "outbound_records": []
+        "items": [
+            {
+                "id": t.id, "material_id": t.material_id,
+                "batch_code": t.batch_code, "transaction_type": t.transaction_type,
+                "quantity": t.quantity, "before_qty": t.before_qty, "after_qty": t.after_qty,
+                "reference_type": t.reference_type, "operator": t.operator,
+                "remark": t.remark,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in txns
+        ]
     }
+
+
+@router.get("/inventory/alerts")
+async def stock_alerts(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """库存预警"""
+    svc = WmsService(db)
+    return await svc.get_stock_alerts(factory_id)
+
+
+@router.get("/inventory/fifo-check")
+async def fifo_check(
+    factory_id: str,
+    material_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """FIFO 合规检查"""
+    svc = WmsService(db)
+    return await svc.check_fifo(factory_id, material_id)
 
 
 __all__ = ["router"]
