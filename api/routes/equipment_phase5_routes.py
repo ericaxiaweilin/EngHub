@@ -172,6 +172,16 @@ async def fault_prediction(
     return await svc.predict_faults(factory_id)
 
 
+@router.get("/repair-sop")
+async def get_repair_sop(
+    fault_type: str = Query(..., description="故障类型（如 主轴故障/液压泄漏/电气故障）"),
+    current_user: User = Depends(get_current_user),
+):
+    """获取维修 SOP（标准作业程序）"""
+    svc = MaintenanceService(None)
+    return await svc.get_repair_sop(fault_type)
+
+
 @router.get("/{task_id}")
 async def get_task_detail(
     task_id: str,
@@ -254,16 +264,6 @@ async def generate_inspection_template(
     """根据设备类型自动生成点检项（替代维护员手动填写）"""
     svc = MaintenanceService(db)
     return await svc.generate_inspection_checklist(equipment_id, task_id)
-
-
-@router.get("/repair-sop")
-async def get_repair_sop(
-    fault_type: str = Query(..., description="故障类型（如 主轴故障/液压泄漏/电气故障）"),
-    current_user: User = Depends(get_current_user),
-):
-    """获取维修 SOP（标准作业程序）"""
-    svc = MaintenanceService(None)
-    return await svc.get_repair_sop(fault_type)
 
 
 @router.post("/spare-parts-check")
