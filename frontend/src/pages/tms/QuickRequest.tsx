@@ -7,7 +7,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
   Card, Row, Col, Form, Input, Select, Button, message, Table, Tag, Space,
-  Typography, Radio, Drawer, InputNumber, Divider, DatePicker, Tooltip, Upload, Modal,
+  Typography, Radio, Drawer, InputNumber, Divider, DatePicker, Tooltip, Upload, Modal, Tabs, Spin,
 } from 'antd'
 import type { UploadFile, UploadProps } from 'antd'
 import {
@@ -33,7 +33,16 @@ const CALL_TYPES = [
   { value: 'support_call', label: '支援呼叫', icon: <PhoneOutlined />, color: '#1890ff', desc: '技术支援/人员协助' },
 ]
 
-/* ==================== 行业工单模板定义 ==================== */
+/* ==================== 模块分组定义 ==================== */
+const MODULE_TABS = [
+  { key: 'qms', label: 'QMS 品质', color: '#f5222d', icon: <ExclamationCircleOutlined /> },
+  { key: 'equipment', label: '设备管理', color: '#fa8c16', icon: <ToolOutlined /> },
+  { key: 'wms', label: '仓储物流', color: '#faad14', icon: <AlertOutlined /> },
+  { key: 'production', label: '生产制造', color: '#52c41a', icon: <AuditOutlined /> },
+  { key: 'pp', label: 'PMC 计划', color: '#1890ff', icon: <SwapOutlined /> },
+]
+
+/* ==================== 行业工单模板定义（静态回退） ==================== */
 interface TemplateFieldDef {
   key: string
   label: string
@@ -230,6 +239,18 @@ const STATUS_MAP: Record<string, { color: string; text: string }> = {
 }
 
 /* ==================== 主组件 ==================== */
+interface ApiTemplate {
+  id: string
+  template_code: string
+  template_name: string
+  module: string
+  description: string
+  form_fields: TemplateFieldDef[]
+  standard_ref?: string
+  badge_text?: string
+  color: string
+}
+
 const QuickRequest: React.FC = () => {
   const user = getStoredUser()
   const [mode, setMode] = useState<'call' | 'template'>('template')
@@ -247,6 +268,10 @@ const QuickRequest: React.FC = () => {
   const [previewOpen, setPreviewOpen] = useState(false)
   const [previewUrl, setPreviewUrl] = useState('')
   const [previewIsVideo, setPreviewIsVideo] = useState(false)
+  // 动态模板状态
+  const [apiTemplates, setApiTemplates] = useState<ApiTemplate[]>([])
+  const [activeModule, setActiveModule] = useState('qms')
+  const [templatesLoading, setTemplatesLoading] = useState(false)
 
   const fetchMyRequests = useCallback(async () => {
     setLoading(true)
@@ -265,6 +290,29 @@ const QuickRequest: React.FC = () => {
   }, [user?.username])
 
   useEffect(() => { fetchMyRequests() }, [fetchMyRequests])
+
+  /* ---------- 加载数据库模板 ---------- */
+  useEffect(() => {
+    const loadTemplates = async () => {
+      setTemplatesLoading(true)
+      try {
+        const res: any = await api.get('/api/v1/work-order-templates')
+        const list: ApiTemplate[] = Array.isArray(res) ? res : (res?.data || [])
+        if (list.length > 0) setApiTemplates(list)
+      } catch (e) {
+        console.warn('加载动态模板失败，使用静态回退', e)
+      } finally {
+        setTemplatesLoading(false)
+      }
+    }
+    loadTemplates()
+  }, [])
+
+  /* ---------- 模块模板计算 ---------- */
+  const getModuleTemplates = (moduleKey: string): ApiTemplate[] => {
+    return apiTemplates.filter(t => t.module === moduleKey)
+  }
+  const hasApiTemplates = apiTemplates.length > 0
 
   /* ---------- 提交呼叫请求 ---------- */
   const submitCallRequest = async () => {
@@ -465,40 +513,98 @@ const QuickRequest: React.FC = () => {
 
       {mode === 'template' ? (
         !selectedTemplate ? (
-          /* ---------- 模板卡片网格 ---------- */
-          <Row gutter={[16, 16]}>
-            {INDUSTRY_TEMPLATES.map(tpl => (
-              <Col xs={24} sm={12} lg={8} key={tpl.code}>
-                <Card
-                  hoverable
-                  onClick={() => { setSelectedTemplate(tpl); templateForm.resetFields() }}
-                  style={{ height: '100%', borderRadius: 12, overflow: 'hidden' }}
-                  bodyStyle={{ padding: 24, display: 'flex', flexDirection: 'column', height: '100%' }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                    <div style={{
-                      width: 52, height: 52, borderRadius: 12, background: tpl.bgColor,
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 26, color: tpl.color,
-                    }}>
-                      {tpl.icon}
-                    </div>
-                    <Tag style={{ fontSize: 10 }}>{tpl.badge}</Tag>
-                  </div>
-                  <div style={{ marginTop: 16, flex: 1 }}>
-                    <Text strong style={{ fontSize: 16 }}>{tpl.name}</Text>
-                    <Text type="secondary" style={{ fontSize: 11, marginLeft: 8 }}>{tpl.nameEn}</Text>
-                    <p style={{ color: '#666', fontSize: 13, marginTop: 8, marginBottom: 12 }}>{tpl.desc}</p>
-                  </div>
-                  <Divider style={{ margin: '0 0 10px' }} />
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <Text type="secondary" style={{ fontSize: 11 }}>{tpl.standard}</Text>
-                    <Text style={{ color: tpl.color, fontSize: 12 }}>{tpl.fields.length} 个字段 →</Text>
-                  </div>
-                </Card>
-              </Col>
-            ))}
-          </Row>
+          /* ---------- 模块分组模板卡片 ---------- */
+          <Spin spinning={templatesLoading}>
+            {hasApiTemplates ? (
+              <Tabs
+                activeKey={activeModule}
+                onChange={setActiveModule}
+                items={MODULE_TABS.map(mod => {
+                  const tpls = getModuleTemplates(mod.key)
+                  return {
+                    key: mod.key,
+                    label: <span style={{ color: activeModule === mod.key ? mod.color : undefined }}>{mod.icon} {mod.label} <Tag style={{ marginLeft: 4 }}>{tpls.length}</Tag></span>,
+                    children: tpls.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '40px 0', color: '#999' }}>该模块暂无模板</div>
+                    ) : (
+                      <Row gutter={[16, 16]}>
+                        {tpls.map(tpl => (
+                          <Col xs={24} sm={12} lg={8} key={tpl.id}>
+                            <Card
+                              hoverable
+                              onClick={() => {
+                                setSelectedTemplate({
+                                  code: tpl.template_code,
+                                  name: tpl.template_name,
+                                  nameEn: '',
+                                  desc: tpl.description || '',
+                                  icon: mod.icon,
+                                  color: tpl.color || mod.color,
+                                  bgColor: `${tpl.color || mod.color}10`,
+                                  badge: tpl.badge_text || '',
+                                  standard: tpl.standard_ref || '',
+                                  fields: tpl.form_fields || [],
+                                })
+                                templateForm.resetFields()
+                              }}
+                              style={{ height: '100%', borderRadius: 12, overflow: 'hidden', borderLeft: `3px solid ${tpl.color || mod.color}` }}
+                              bodyStyle={{ padding: 20, display: 'flex', flexDirection: 'column', height: '100%' }}
+                            >
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                                <Text strong style={{ fontSize: 15, color: tpl.color || mod.color }}>{tpl.template_name}</Text>
+                                {tpl.badge_text && <Tag color={tpl.color || mod.color} style={{ fontSize: 10 }}>{tpl.badge_text}</Tag>}
+                              </div>
+                              <p style={{ color: '#666', fontSize: 12, marginTop: 8, marginBottom: 12, flex: 1 }}>{tpl.description}</p>
+                              <Divider style={{ margin: '0 0 8px' }} />
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <Text type="secondary" style={{ fontSize: 11 }}>{tpl.standard_ref || ''}</Text>
+                                <Text style={{ color: tpl.color || mod.color, fontSize: 12 }}>{(tpl.form_fields || []).length} 个字段 →</Text>
+                              </div>
+                            </Card>
+                          </Col>
+                        ))}
+                      </Row>
+                    ),
+                  }
+                })}
+              />
+            ) : (
+              /* ---------- 静态回退（API未返回模板时） ---------- */
+              <Row gutter={[16, 16]}>
+                {INDUSTRY_TEMPLATES.map(tpl => (
+                  <Col xs={24} sm={12} lg={8} key={tpl.code}>
+                    <Card
+                      hoverable
+                      onClick={() => { setSelectedTemplate(tpl); templateForm.resetFields() }}
+                      style={{ height: '100%', borderRadius: 12, overflow: 'hidden' }}
+                      bodyStyle={{ padding: 24, display: 'flex', flexDirection: 'column', height: '100%' }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                        <div style={{
+                          width: 52, height: 52, borderRadius: 12, background: tpl.bgColor,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 26, color: tpl.color,
+                        }}>
+                          {tpl.icon}
+                        </div>
+                        <Tag style={{ fontSize: 10 }}>{tpl.badge}</Tag>
+                      </div>
+                      <div style={{ marginTop: 16, flex: 1 }}>
+                        <Text strong style={{ fontSize: 16 }}>{tpl.name}</Text>
+                        <Text type="secondary" style={{ fontSize: 11, marginLeft: 8 }}>{tpl.nameEn}</Text>
+                        <p style={{ color: '#666', fontSize: 13, marginTop: 8, marginBottom: 12 }}>{tpl.desc}</p>
+                      </div>
+                      <Divider style={{ margin: '0 0 10px' }} />
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Text type="secondary" style={{ fontSize: 11 }}>{tpl.standard}</Text>
+                        <Text style={{ color: tpl.color, fontSize: 12 }}>{tpl.fields.length} 个字段 →</Text>
+                      </div>
+                    </Card>
+                  </Col>
+                ))}
+              </Row>
+            )}
+          </Spin>
         ) : (
           /* ---------- 模板表单 ---------- */
           <Card

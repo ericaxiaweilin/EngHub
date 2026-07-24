@@ -389,7 +389,9 @@ export default function AIAssistantWidget() {
       for (const f of files) {
         const fd = new FormData()
         fd.append('file', f)
-        const res: any = await api.post('/api/v1/files/upload', fd)
+        const res: any = await api.post('/api/v1/files/upload', fd, {
+          headers: { 'Content-Type': undefined },  // 移除默认 application/json，让浏览器自动设置 multipart/form-data + boundary
+        })
         setPendingAttachments(prev => [...prev, {
           file_id: res.id,
           filename: res.filename,

@@ -985,26 +985,47 @@ async def list_products(
 @router.get("/work-order-templates")
 async def list_work_order_templates(
     request: Request = None,
+    module: str = Query(None, description="按模块过滤: qms/equipment/wms/production/pp"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取当前工厂的工单模板列表"""
+    """获取当前工厂的工单模板列表（含动态表单字段定义，支持按模块过滤）"""
     from sqlalchemy import text as sa_text
+    import json as _json
     fid = (request.headers.get("x-factory-id") if request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
-    rows = (await db.execute(sa_text("""
-        SELECT id, factory_id, template_code, template_name, wo_type, description, default_priority, is_active
+    sql = """
+        SELECT id, factory_id, template_code, template_name, wo_type, description,
+               default_priority, is_active, module, form_fields, standard_ref,
+               badge_text, color, sort_order
         FROM work_order_templates
         WHERE factory_id = :fid AND is_active = true
-        ORDER BY wo_type, template_code
-    """), {"fid": fid})).fetchall()
-    return [
-        {
+    """
+    params: dict = {"fid": fid}
+    if module:
+        sql += " AND module = :module"
+        params["module"] = module
+    sql += " ORDER BY module, sort_order, template_code"
+    rows = (await db.execute(sa_text(sql), params)).fetchall()
+    result = []
+    for r in rows:
+        fields_raw = r[9]
+        if isinstance(fields_raw, str):
+            try:
+                fields_raw = _json.loads(fields_raw)
+            except Exception:
+                fields_raw = []
+        result.append({
             "id": r[0], "factory_id": r[1], "template_code": r[2],
             "template_name": r[3], "wo_type": r[4], "description": r[5],
             "default_priority": r[6], "is_active": r[7],
-        }
-        for r in rows
-    ]
+            "module": r[8] or "production",
+            "form_fields": fields_raw or [],
+            "standard_ref": r[10],
+            "badge_text": r[11],
+            "color": r[12] or "#1677ff",
+            "sort_order": r[13] or 0,
+        })
+    return result
 
 
 __all__ = ["router"]
