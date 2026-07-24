@@ -48,6 +48,8 @@ services:
       # VL 视觉模型（图片多模态自动路由）
       - LLM_VISION_URL=${LLM_VISION_URL:-http://host.docker.internal:8019}
       - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
+      # OCR 专用模型（文字提取，经网关路由）
+      - LLM_OCR_MODEL=${LLM_OCR_MODEL:-openai/qwen-vl-ocr}
     ports:
       - "18888:8000"
     depends_on:

@@ -41,6 +41,15 @@ MAX_TOOL_ROUNDS = int(os.getenv("LLM_MAX_TOOL_ROUNDS", "5"))
 # Vision 模型（图片多模态路由）—— 带图片时自动切换到此模型
 VISION_URL = os.getenv("LLM_VISION_URL", "http://host.docker.internal:8019").rstrip("/")
 VISION_MODEL = os.getenv("LLM_VISION_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+# OCR 专用模型（文字提取）—— 用户意图为识别/提取文字时走此模型（经网关路由到 DashScope）
+OCR_MODEL = os.getenv("LLM_OCR_MODEL", "openai/qwen-vl-ocr")
+
+# OCR 意图关键词（用户消息含这些词 + 附带图片 → 走 OCR 专用模型）
+_OCR_KEYWORDS = frozenset([
+    "ocr", "识别", "提取文字", "读取文字", "识别文字", "文字识别",
+    "扫描", "识别内容", "读取内容", "提取内容", "看图识字",
+    "识别图纸", "读取图纸", "识别报告", "识别文件",
+])
 
 SYSTEM_PROMPT = (
     "你是 EngHub MES 制造执行系统的智能助手，可以直接操作系统完成用户的请求。"
@@ -54,7 +63,8 @@ SYSTEM_PROMPT = (
     "优先调用 run_workflow 工具运行预置工作流（生产日度复盘/质量异常分诊/全面合规检查/一键建单下达），"
     "而不是逐个调用单步工具。\n"
     "【多模态附件】用户可能上传图片或文件。若收到图片，请结合图片内容回答（如识别设备/工件/缺陷/图纸/仪表盘），"
-    "描述你看到的内容并给出专业判断；若收到文件，基于文字与附件信息回答。\n"
+    "描述你看到的内容并给出专业判断；若用户要求“识别/OCR/提取文字”，请完整提取图片中所有文字内容（保留原始结构与格式）；"
+    "若收到文件，基于文字与附件信息回答。\n"
     "【严禁推诿】绝对不要回答“建议你进入XX看板/日报中心/实时看板查看”、"
     "“具体数值需结合你的实时数据源/PLC采集”这类把用户打发走的话。"
     "你能直接读到真实数据库，必须立即调用工具取数并以表格/清单形式呈现给用户。\n"
@@ -147,9 +157,22 @@ async def chat_tools():
     }
 
 
-async def _call_llm(payload: Dict[str, Any], use_vision: bool = False) -> httpx.Response:
-    """调用 LLM。use_vision=True 时路由到 VL 模型端点（支持图片多模态）。"""
-    base_url = VISION_URL if use_vision else GATEWAY_URL
+def _detect_ocr_intent(text: str) -> bool:
+    """检测用户消息是否表达 OCR/文字提取意图。"""
+    t = text.lower()
+    return any(kw in t for kw in _OCR_KEYWORDS)
+
+
+async def _call_llm(
+    payload: Dict[str, Any],
+    use_vision: bool = False,
+    base_url_override: Optional[str] = None,
+) -> httpx.Response:
+    """调用 LLM。
+
+    路由优先级：base_url_override > use_vision(VISION_URL) > GATEWAY_URL
+    """
+    base_url = base_url_override or (VISION_URL if use_vision else GATEWAY_URL)
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
@@ -481,19 +504,27 @@ async def chat(
     }
     # 图片多模态：自动路由到 VL 模型（VL 模型不支持 tool calling，纯视觉问答）
     use_vision = bool(image_records)
-    if use_vision:
+    use_ocr = use_vision and _detect_ocr_intent(last_user)
+    if use_ocr:
+        # OCR 专用模型（经网关路由，文字提取更精准）
+        payload["model"] = OCR_MODEL
+    elif use_vision:
         payload["model"] = VISION_MODEL
     elif request.enable_tools:
         payload["tools"] = TOOL_DEFINITIONS
         payload["tool_choice"] = "auto"
 
-    # 多模态降级标记：VL 模型不可用时，剔除图片以纯文本重试
+    # 多模态降级标记：VL/OCR 模型不可用时，剔除图片以纯文本重试
     vision_dropped = False
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):
             try:
-                resp = await _call_llm(payload, use_vision=use_vision and not vision_dropped)
+                # OCR 走网关（base_url_override=None 即 GATEWAY_URL），VL 走本地 VISION_URL
+                resp = await _call_llm(
+                    payload,
+                    use_vision=(use_vision and not use_ocr and not vision_dropped),
+                )
             except Exception:
                 # VL 模型连接失败（未启动/网络不可达）→ 降级到主模型纯文本
                 if use_vision and not vision_dropped:
@@ -963,14 +994,24 @@ async def chat_stream(
             "messages": messages,
             "temperature": request.temperature,
         }
-        if request.enable_tools:
+        # 图片多模态路由：OCR 意图 → OCR 模型（经网关）；普通图片 → 本地 VL
+        use_vision_s = bool(image_records)
+        use_ocr_s = use_vision_s and _detect_ocr_intent(last_user)
+        if use_ocr_s:
+            payload["model"] = OCR_MODEL
+        elif use_vision_s:
+            payload["model"] = VISION_MODEL
+        elif request.enable_tools:
             payload["tools"] = TOOL_DEFINITIONS
             payload["tool_choice"] = "auto"
 
         vision_dropped = False
         try:
             for _ in range(MAX_TOOL_ROUNDS):
-                resp = await _call_llm(payload)
+                resp = await _call_llm(
+                    payload,
+                    use_vision=(use_vision_s and not use_ocr_s and not vision_dropped),
+                )
 
                 # 网关不支持 tools → 降级纯问答
                 if resp.status_code >= 400 and request.enable_tools and payload.get("tools"):
