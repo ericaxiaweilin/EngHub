@@ -276,23 +276,66 @@ def _parse_spreadsheet_record(
         return None
 
 
-def _spreadsheet_to_markdown(table: Dict[str, Any], max_rows: int = 30) -> str:
-    """把结构化表格渲染为 Markdown 表格文本，供模型直接阅读真实数据。"""
+def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 3) -> str:
+    """智能摘要：表头 + 统计 + 样本行，替代全量 Markdown dump。
+
+    AI 只需知道表格结构、关键统计和少量样本即可回答大部分问题；
+    完整数据由前端 Univer 在线表格渲染，无需塞入上下文。"""
     cols = table["columns"]
-    lines = ["| " + " | ".join(c["label"] for c in cols) + " |"]
-    lines.append("|" + "|".join(["---"] * len(cols)) + "|")
-    for r in table["rows"][:max_rows]:
-        lines.append("| " + " | ".join(str(r.get(c["key"], "")) for c in cols) + " |")
-    total = len(table["rows"])
-    if total > max_rows:
-        lines.append(f"\n（共 {total} 行，仅展示前 {max_rows} 行）")
-    return "\n".join(lines)
+    rows = table["rows"]
+    total_rows = len(rows)
+    col_labels = [c["label"] for c in cols]
+
+    # --- 推断列类型 + 统计 ---
+    col_stats: List[str] = []
+    for c in cols:
+        key, label = c["key"], c["label"]
+        values = [r.get(key, "") for r in rows if r.get(key, "") != ""]
+        if not values:
+            col_stats.append(f"  - {label}: 全空")
+            continue
+        # 尝试数值推断
+        nums = []
+        for v in values:
+            try:
+                nums.append(float(str(v).replace(",", "")))
+            except (ValueError, TypeError):
+                break
+        if nums and len(nums) == len(values):
+            col_stats.append(
+                f"  - {label} [数值]: min={min(nums):.2f}, max={max(nums):.2f}, "
+                f"avg={sum(nums)/len(nums):.2f}, 非空{len(nums)}条"
+            )
+        else:
+            unique = set(str(v) for v in values)
+            top = list(unique)[:5]
+            col_stats.append(
+                f"  - {label} [文本]: {len(unique)}种取值"
+                + (f", 如: {', '.join(top)}" if len(unique) <= 20 else f", 前5: {', '.join(top)}")
+            )
+
+    # --- 样本行（前 N 行，Markdown 表格） ---
+    sample_lines = []
+    if rows:
+        sample_lines.append("| " + " | ".join(col_labels) + " |")
+        sample_lines.append("|" + "|".join(["---"] * len(cols)) + "|")
+        for r in rows[:sample_rows]:
+            sample_lines.append("| " + " | ".join(str(r.get(c["key"], "")) for c in cols) + " |")
+
+    parts = [
+        f"共 {total_rows} 行 × {len(cols)} 列",
+        "列信息：\n" + "\n".join(col_stats),
+    ]
+    if sample_lines:
+        parts.append(f"前{min(sample_rows, total_rows)}行样本：\n" + "\n".join(sample_lines))
+    parts.append("（完整数据已在用户的在线表格中展示，用户可直接查看/筛选/编辑）")
+    return "\n".join(parts)
 
 
 def _attachment_text_note(records: List[FileRecord]) -> str:
     """附件文字摘要。
 
-    - Excel/CSV：解析并渲染真实内容为 Markdown 表格，模型可直接读取分析；
+    - Excel/CSV：智能摘要（表头+统计+样本），完整数据由 Univer 在线表格渲染；
     - 图片/其他文件：仅告知文件名/类型/大小（用于不支持 vision 时的优雅降级）。"""
     if not records:
         return ""
@@ -301,7 +344,7 @@ def _attachment_text_note(records: List[FileRecord]) -> str:
         if _is_spreadsheet_record(rec):
             table = _parse_spreadsheet_record(rec)
             if table:
-                lines.append(f"- 表格文件：{rec.filename}，真实内容如下：\n{_spreadsheet_to_markdown(table)}")
+                lines.append(f"- 表格文件：{rec.filename}\n{_spreadsheet_to_summary(table)}")
                 continue
         kind = "图片" if _is_image_record(rec) else "文件"
         lines.append(f"- {kind}：{rec.filename}（{rec.content_type or '未知类型'}，{rec.size} 字节）")
