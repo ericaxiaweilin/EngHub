@@ -1,5 +1,11 @@
 /* EngHub - 纯色一致性UI */
 
+/* AI 流式输出打字动画 */
+@keyframes typingBlink {
+  0%, 80%, 100% { opacity: 0.25; }
+  40% { opacity: 1; }
+}
+
 * {
   margin: 0;
   padding: 0;

@@ -242,7 +242,7 @@ export default function AIAssistantWidget() {
     ;(event.currentTarget as HTMLDivElement).releasePointerCapture(event.pointerId)
   }, [])
 
-  // ---------- 发送消息 ----------
+  // ---------- 发送消息（SSE 流式输出） ----------
   const sendMessage = async (preset?: string) => {
     const text = (preset ?? input).trim()
     if (loading) return
@@ -254,32 +254,104 @@ export default function AIAssistantWidget() {
     const history = [...messages, userMsg]
     setMessages(history)
     setLoading(true)
+
+    // 占位 assistant 消息，流式填充内容
+    const streamMsg: ChatMsg = { role: 'assistant', content: '', time: now(), actions: [] }
+    setMessages(prev => [...prev, streamMsg])
+
     try {
       const payload: any = {
         messages: history.slice(-10).map(m => ({ role: m.role, content: m.content })),
       }
-      // 附件随最后一条用户消息提交（后端按 file_id 加载，图片走多模态）
       if (atts.length > 0) {
         payload.attachments = atts.map(a => ({
           file_id: a.file_id,
           kind: a.is_image ? 'image' : 'file',
         }))
       }
-      const res: any = await api.post('/api/v1/chat', payload)
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: res.reply || '抱歉，暂时无法回答。',
-        time: now(),
-        degraded: res.degraded,
-        actions: res.actions || [],
-      }])
+      const token = localStorage.getItem('token')
+      const resp = await fetch('/api/v1/chat/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      })
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let accContent = ''
+      let accActions: ToolAction[] = []
+      let degraded = false
+
+      const applyUpdate = () => {
+        setMessages(prev => {
+          const updated = [...prev]
+          updated[updated.length - 1] = {
+            role: 'assistant',
+            content: accContent,
+            time: streamMsg.time,
+            degraded,
+            actions: accActions.length > 0 ? [...accActions] : [],
+          }
+          return updated
+        })
+      }
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        // 按 SSE 帧分割（以 \n\n 分隔）
+        const frames = buffer.split('\n\n')
+        buffer = frames.pop() || ''
+        for (const frame of frames) {
+          if (!frame.trim()) continue
+          let eventType = 'message'
+          let dataStr = ''
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7)
+            else if (line.startsWith('data: ')) dataStr += line.slice(6)
+          }
+          if (!dataStr) continue
+          try {
+            const data = JSON.parse(dataStr)
+            if (eventType === 'delta') {
+              accContent += data.content || ''
+              applyUpdate()
+            } else if (eventType === 'action') {
+              accActions = [...accActions, data]
+              applyUpdate()
+            } else if (eventType === 'done') {
+              degraded = !!data.degraded
+              applyUpdate()
+            } else if (eventType === 'error') {
+              accContent += data.message || '服务异常'
+              degraded = true
+              applyUpdate()
+            }
+          } catch { /* 忽略解析失败的帧 */ }
+        }
+      }
+      // 流结束但无内容
+      if (!accContent) {
+        accContent = '抱歉，暂时无法回答。'
+        applyUpdate()
+      }
     } catch {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: '网络异常，请稍后重试。',
-        time: now(),
-        degraded: true,
-      }])
+      setMessages(prev => {
+        const updated = [...prev]
+        updated[updated.length - 1] = {
+          role: 'assistant',
+          content: '网络异常，请稍后重试。',
+          time: streamMsg.time,
+          degraded: true,
+        }
+        return updated
+      })
     } finally {
       setLoading(false)
     }
@@ -576,7 +648,14 @@ export default function AIAssistantWidget() {
                                 ))}
                               </div>
                             )}
-                            {m.content}
+                            {m.content || (
+                              // 流式输出中：内容尚未到达时显示打字动画
+                              <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
+                                <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s infinite' }} />
+                                <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s 0.2s infinite' }} />
+                                <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s 0.4s infinite' }} />
+                              </span>
+                            )}
                             {/* AI 已执行的操作 */}
                             {m.role === 'assistant' && m.actions && m.actions.length > 0 && (
                               <div style={{ marginTop: 8, borderTop: '1px dashed #d9d9d9', paddingTop: 6 }}>

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -436,6 +437,243 @@ def _degraded_message(reason: str) -> str:
         f"⚠️ AI 服务暂不可用（{reason}）。\n\n"
         "请检查后端环境变量 `LLM_GATEWAY_URL` / `LLM_API_KEY` / `LLM_MODEL` "
         "是否指向可用的 litellm 网关。配置完成后即可正常对话与执行操作。"
+    )
+
+
+# ==================== 流式输出（SSE） ====================
+
+def _sse(event: str, data: Any) -> str:
+    """格式化一条 SSE 帧。"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+async def _stream_llm_tokens(payload: Dict[str, Any]):
+    """以 stream 模式调用网关，逐块 yield SSE delta 帧。
+
+    返回时通过 generator 的 return value 无法传递信息，
+    因此用包装类记录是否产生了有效内容。"""
+    payload = {**payload, "stream": True}
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        async with client.stream(
+            "POST",
+            f"{GATEWAY_URL}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+                raise RuntimeError(f"gateway {resp.status_code}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    text = delta.get("content") or ""
+                    if text:
+                        yield _sse("delta", {"content": text})
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    continue
+
+
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SSE 流式对话：工具执行实时推送 action 事件，最终回复逐 token 流式输出。"""
+    model = request.model or MODEL
+    operator = current_user.username or current_user.id
+    factory_id = current_user.factory_id
+
+    last_user = next(
+        (m.content for m in reversed(request.messages) if m.role == "user"), ""
+    )
+
+    async def generate():
+        actions: List[ToolAction] = []
+
+        # ---- 加载附件 ----
+        att_records = await _load_attachment_records(db, request.attachments, current_user) \
+            if request.attachments else []
+        image_records = [r for r in att_records if _is_image_record(r)]
+
+        # ---- 确定性业务底座：命中意图 → 执行工具 → 流式格式化 ----
+        intent = resolve_intent(last_user) if request.enable_tools else None
+        if intent:
+            tool_name = intent["tool"]
+            tool_args = intent.get("args") or {}
+            result = await execute_tool(db, tool_name, tool_args, operator=operator, factory_id=factory_id)
+            is_error = "error" in result
+            action = ToolAction(
+                tool=tool_name,
+                label=TOOL_LABELS.get(tool_name, tool_name),
+                arguments=tool_args,
+                result=result,
+                is_write=tool_name in WRITE_TOOLS,
+                is_sim=tool_name in SIM_TOOLS,
+                success=not is_error,
+            )
+            yield _sse("action", action.model_dump())
+
+            if is_error:
+                yield _sse("delta", {"content": f"⚠️ 查询失败：{result.get('error')}"})
+                yield _sse("done", {"model": model, "degraded": False})
+                return
+
+            data_str = json.dumps(result, ensure_ascii=False, default=str)
+            att_note = _attachment_text_note(att_records)
+            format_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": (
+                    f"用户问题：{last_user}{att_note}\n\n"
+                    f"系统已通过工具 `{tool_name}` 从真实数据库取到如下数据（JSON）：\n{data_str}\n\n"
+                    "请严格基于以上真实数据，用简洁专业的中文、以 Markdown 表格或清单形式直接回答用户，并给出简要分析。"
+                    "数据已齐全，禁止说'建议查看看板/日报中心'之类的推诿话术，直接呈现数据。"
+                )},
+            ]
+            got_content = False
+            try:
+                async for frame in _stream_llm_tokens({"model": model, "messages": format_messages, "temperature": 0.3}):
+                    got_content = True
+                    yield frame
+            except Exception:  # noqa: BLE001
+                pass
+            if not got_content:
+                yield _sse("delta", {"content": f"已从数据库取到真实数据：\n```json\n{data_str}\n```"})
+            yield _sse("done", {"model": model, "degraded": False})
+            return
+
+        # ---- 非确定性路径：tool-calling 循环（非流式执行工具），最终轮流式输出 ----
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        history = [m.model_dump() for m in request.messages]
+        non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
+        injected = False
+        for idx in range(len(history) - 1, -1, -1):
+            if history[idx].get("role") == "user":
+                text = history[idx].get("content") or ""
+                if non_image_note:
+                    text = f"{text}{non_image_note}"
+                history[idx]["content"] = _build_multimodal_content(text, image_records)
+                injected = True
+                break
+        if not injected and image_records:
+            history.append({"role": "user", "content": _build_multimodal_content(last_user, image_records)})
+        messages += history
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": request.temperature,
+        }
+        if request.enable_tools:
+            payload["tools"] = TOOL_DEFINITIONS
+            payload["tool_choice"] = "auto"
+
+        vision_dropped = False
+        try:
+            for _ in range(MAX_TOOL_ROUNDS):
+                resp = await _call_llm(payload)
+
+                # 网关不支持 tools → 降级纯问答
+                if resp.status_code >= 400 and request.enable_tools and payload.get("tools"):
+                    payload.pop("tools", None)
+                    payload.pop("tool_choice", None)
+                    resp = await _call_llm(payload)
+
+                # vision 降级
+                if resp.status_code >= 400 and image_records and not vision_dropped:
+                    vision_dropped = True
+                    payload["messages"] = _strip_images_from_messages(payload["messages"])
+                    note = _attachment_text_note(image_records)
+                    if note:
+                        payload["messages"].append({
+                            "role": "user",
+                            "content": f"（当前模型暂不支持图片识别，图片已存入系统文件库。{note}\n请基于附件信息与文字内容回答。）",
+                        })
+                    resp = await _call_llm(payload)
+
+                if resp.status_code >= 400:
+                    yield _sse("delta", {"content": _degraded_message(f"网关返回 {resp.status_code}")})
+                    yield _sse("done", {"model": model, "degraded": True})
+                    return
+
+                data = resp.json()
+                choice = data.get("choices", [{}])[0]
+                msg = choice.get("message", {}) or {}
+                tool_calls = msg.get("tool_calls") or []
+
+                # 无工具调用 → 最终回复：用流式重新请求，逐 token 推送
+                if not tool_calls:
+                    got_content = False
+                    try:
+                        async for frame in _stream_llm_tokens(payload):
+                            got_content = True
+                            yield frame
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if not got_content:
+                        # 流式失败，用已获得的非流式内容兜底
+                        reply = (msg.get("content") or "").strip()
+                        if reply:
+                            yield _sse("delta", {"content": reply})
+                        else:
+                            yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
+                            yield _sse("done", {"model": model, "degraded": True})
+                            return
+                    yield _sse("done", {"model": model, "degraded": False})
+                    return
+
+                # 有工具调用 → 执行并推送 action 事件
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": tool_calls,
+                })
+                for tc in tool_calls:
+                    fn = tc.get("function", {}) or {}
+                    tool_name = fn.get("name", "")
+                    try:
+                        arguments = json.loads(fn.get("arguments") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        arguments = {}
+                    result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+                    is_error = "error" in result
+                    action = ToolAction(
+                        tool=tool_name,
+                        label=TOOL_LABELS.get(tool_name, tool_name),
+                        arguments=arguments,
+                        result=result,
+                        is_write=tool_name in WRITE_TOOLS,
+                        is_sim=tool_name in SIM_TOOLS,
+                        success=not is_error,
+                    )
+                    actions.append(action)
+                    yield _sse("action", action.model_dump())
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    })
+                payload["messages"] = messages
+
+            yield _sse("delta", {"content": "操作轮次过多，已停止。请简化您的请求后重试。"})
+            yield _sse("done", {"model": model, "degraded": True})
+        except Exception as exc:  # noqa: BLE001
+            yield _sse("delta", {"content": _degraded_message(f"网关连接失败 ({type(exc).__name__})")})
+            yield _sse("done", {"model": model, "degraded": True})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

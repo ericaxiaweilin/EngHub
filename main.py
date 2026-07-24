@@ -98,5 +98,9 @@ if FRONTEND_DIST.is_dir():
         file_path = FRONTEND_DIST / full_path
         if full_path and file_path.is_file():
             return FileResponse(str(file_path))
-        return FileResponse(str(FRONTEND_DIST / "index.html"))
+        # index.html 禁止缓存，确保发版后用户立即拿到新代码（js/css 带 hash 可长期缓存）
+        return FileResponse(
+            str(FRONTEND_DIST / "index.html"),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 

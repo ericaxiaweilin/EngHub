@@ -37,6 +37,7 @@ import BaseData from './pages/basedata/BaseData'
 import SkillMatrix from './pages/hr/SkillMatrix'
 import WarehouseList from './pages/wms/WarehouseList'
 import Login from './pages/auth/Login'
+import ModuleSelector from './pages/ModuleSelector'
 // v2.5 Modules
 import WarRoom from './pages/war-room/WarRoom'
 import AndonDashboard from './pages/andon/AndonDashboard'
@@ -83,6 +84,9 @@ const PermissionGate: React.FC<{ path: string; children: React.ReactElement }> =
   const user = getStoredUser()
   if (!user) return null
 
+  // 管理员/超管直通，不受菜单数据新旧影响
+  if (user.is_superuser || user.role === 'admin') return children
+
   const menuPath = path.startsWith('/') ? path : `/${path}`
   const menuItems = user.menu_items || []
   const hasAccess = menuItems.some((item: any) => {
@@ -93,7 +97,7 @@ const PermissionGate: React.FC<{ path: string; children: React.ReactElement }> =
   })
 
   if (!hasAccess && menuPath !== '/dashboard') {
-    return <Navigate to="/dashboard" replace />
+    return <Navigate to="/" replace />
   }
 
   return children
@@ -121,7 +125,7 @@ const App: React.FC = () => {
               </RequireAuth>
             }
           >
-            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route index element={<ModuleSelector />} />
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="production-data" element={<ProductionData />} />
             <Route path="work-orders" element={<PermissionGate path="/work-orders"><WorkOrderList /></PermissionGate>} />

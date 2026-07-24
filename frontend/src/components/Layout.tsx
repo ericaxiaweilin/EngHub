@@ -95,6 +95,33 @@ function convertMenuItems(items: any[], t: (key: string, opts?: any) => string):
   })
 }
 
+// 路由前缀 → 菜单分组 key 映射（用于侧边栏只显示当前模块）
+const ROUTE_MODULE_MAP: [string, string][] = [
+  ['/work-orders', 'g-mes'], ['/process-queue', 'g-mes'], ['/my-tasks', 'g-mes'],
+  ['/routing-templates', 'g-mes'], ['/production-report', 'g-mes'], ['/base-data', 'g-mes'],
+  ['/plant-floor', 'g-mes'], ['/report-terminal', 'g-mes'], ['/production-live', 'g-mes'],
+  ['/report-center', 'g-mes'], ['/alert-intelligence', 'g-mes'],
+  ['/inspections', 'g-qms'], ['/defects', 'g-qms'], ['/quality-center', 'g-qms'],
+  ['/quality-goals', 'g-qms'], ['/inspection-terminal', 'g-qms'], ['/spc-dashboard', 'g-qms'],
+  ['/inventory', 'g-wms'], ['/warehouses', 'g-wms'], ['/wms-center', 'g-wms'],
+  ['/wms-terminal', 'g-wms'], ['/stock-alerts', 'g-wms'],
+  ['/equipment-center', 'g-equipment'], ['/equipment/', 'g-equipment'],
+  ['/orders', 'g-aps'], ['/plans', 'g-aps'], ['/scheduling', 'g-aps'],
+  ['/andon', 'g-collab'], ['/tms/', 'g-collab'], ['/quick-request', 'g-collab'],
+  ['/war-room', 'g-collab'], ['/work-order-templates', 'g-collab'],
+  ['/simulation', '/simulation'], ['/sim-erp', '/simulation'],
+  ['/skill-matrix', 'g-hr'],
+  ['/dashboard', 'g-mes'], ['/production-data', 'g-mes'],
+  ['/settings', '/settings'],
+]
+
+function getActiveModule(pathname: string): string | null {
+  for (const [prefix, group] of ROUTE_MODULE_MAP) {
+    if (pathname.startsWith(prefix)) return group
+  }
+  return null
+}
+
 const Layout: React.FC = () => {
   const { t } = useTranslation()
   const location = useLocation()
@@ -114,11 +141,27 @@ const Layout: React.FC = () => {
     return () => { cancelled = true }
   }, [])
 
-  // 根据用户权限动态生成菜单（label 走 i18n，语言切换时随 t 重新渲染）
+  // 根据当前路由只显示对应模块的菜单
+  const activeModule = getActiveModule(location.pathname)
   const menuItems = useMemo(() => {
     if (!user) return []
-    return convertMenuItems(user.menu_items || [], t)
-  }, [user, t])
+    const allItems = convertMenuItems(user.menu_items || [], t)
+    if (!activeModule) return []  // 模块选择页不显示侧边栏
+    // 找到当前模块分组，将其 children 提升为顶级
+    const group = allItems.find((i: any) => i.key === activeModule)
+    if (group && group.children) {
+      // MES 模块合并看板组
+      if (activeModule === 'g-mes') {
+        const dashGroup = allItems.find((i: any) => i.key === 'g-dashboard')
+        const dashChildren = dashGroup?.children || []
+        return [...dashChildren, ...group.children]
+      }
+      return group.children
+    }
+    // 非分组类型（如 /simulation, /settings）直接返回
+    const single = allItems.find((i: any) => i.key === activeModule)
+    return single ? [single] : []
+  }, [user, t, activeModule])
 
   const handleLogout = () => {
     logout()
@@ -148,9 +191,9 @@ const Layout: React.FC = () => {
   return (
     <AntLayout style={{ minHeight: '100vh' }}>
       <Header style={{ background: '#001529', padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <Space size={12}>
+        <Space size={12} style={{ cursor: 'pointer' }} onClick={() => navigate('/')}>
           <Avatar shape="square" style={{ background: '#1890ff' }} icon={<ClusterOutlined />} />
-          <span style={{ fontSize: 18, fontWeight: 700, color: '#fff', letterSpacing: 1 }}>EngHub MES</span>
+          <span style={{ fontSize: 18, fontWeight: 700, color: '#fff', letterSpacing: 1 }}>EngHub</span>
           <Tag color="blue" style={{ marginLeft: 4 }}>v1.2</Tag>
           {testMode && <Tag color="red">{t('layout.testMode')}</Tag>}
         </Space>
@@ -181,6 +224,7 @@ const Layout: React.FC = () => {
         </Space>
       </Header>
       <AntLayout>
+        {menuItems.length > 0 && (
         <Sider width={220} theme="light" style={{ borderRight: '1px solid #f0f0f0' }}>
           <Menu
             mode="inline"
@@ -190,6 +234,7 @@ const Layout: React.FC = () => {
             items={menuItems}
           />
         </Sider>
+        )}
         <Content style={{ padding: 24, background: '#f0f2f5' }}>
           <div style={{ background: 'transparent' }}>
             <Outlet />
@@ -204,8 +249,8 @@ const Layout: React.FC = () => {
         currentRole={user?.role || ''}
       />
 
-      {/* 全局 AI 助手浮窗 */}
-      <AIAssistantWidget />
+      {/* 全局 AI 助手浮窗（模块选择页不渲染，避免遵住右下角的 RCC 卡片） */}
+      {activeModule && <AIAssistantWidget />}
     </AntLayout>
   )
 }

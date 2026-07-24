@@ -3,9 +3,9 @@
 import { useState, useEffect } from 'react'
 import { Card, Table, Tag, Button, Modal, Form, Input, message, Descriptions, Space } from 'antd'
 import { PlusOutlined, RiseOutlined } from '@ant-design/icons'
-import axios from 'axios'
+import api from '../../services/api'
 
-const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1'
+const FACTORY = 'F001'
 
 const CATEGORY_META: Record<string, { label: string; color: string; icon: string }> = {
   equipment_repair: { label: '设备维修', color: 'orange', icon: '🔧' },
@@ -36,7 +36,7 @@ export default function Andon2Dashboard() {
   const fetchTickets = async () => {
     setLoading(true)
     try {
-      const { data } = await axios.get(`${API_BASE}/andon/tickets`, { params: { factory_id: 'factory-001' } })
+      const data: any = await api.get('/api/v1/andon/tickets', { params: { factory_id: FACTORY } })
       setTickets(data.items || [])
     } catch (err) {
       console.error('获取安灯工单失败:', err)
@@ -55,8 +55,8 @@ export default function Andon2Dashboard() {
   const handleCreateTicket = async () => {
     try {
       const values = await form.validateFields()
-      await axios.post(`${API_BASE}/andon/tickets`, {
-        factory_id: 'factory-001',
+      await api.post('/api/v1/andon/tickets', {
+        factory_id: FACTORY,
         category_code: selectedCategory,
         title: values.title,
         description: values.description,

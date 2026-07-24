@@ -678,10 +678,6 @@ def get_menu_items_for_user(user) -> list:
         children.append({"key": "/quality-goals", "label": "质量目标"})
         children.append({"key": "/inspection-terminal", "label": "检验终端"})
         children.append({"key": "/spc-dashboard", "label": "SPC 控制图"})
-    if has_perm("/equipment/maintenance"):
-        children.append({"key": "/equipment/maintenance", "label": "设备维护"})
-    if has_perm("/equipment/oee"):
-        children.append({"key": "/equipment/oee", "label": "OEE 看板"})
         items.append({"key": "g-qms", "label": "QMS 质量管理", "children": children})
 
     # ━━━ 4. WMS 仓储管理 ━━━
@@ -703,6 +699,8 @@ def get_menu_items_for_user(user) -> list:
             "label": "设备 TPM",
             "children": [
                 {"key": "/equipment-center", "label": "设备中心"},
+                {"key": "/equipment/maintenance", "label": "设备维护"},
+                {"key": "/equipment/oee", "label": "OEE 看板"},
             ],
         })
 
