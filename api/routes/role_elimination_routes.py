@@ -244,3 +244,48 @@ async def delivery_alerts(
     from api.services.order_tracking_service import OrderTrackingService
     svc = OrderTrackingService(db)
     return await svc.delivery_alert_scan(factory_id)
+
+
+# ==================== 异常处理引擎（岗位消除安全网） ====================
+
+
+@router.post("/exception/raise")
+async def raise_exception(
+    factory_id: str = Query(...),
+    scenario_key: str = Query(..., description="异常场景key"),
+    source_id: Optional[str] = Query(None),
+    context: Dict[str, Any] = {},
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """触发异常事件（自动分级+升级+SOP）"""
+    from api.services.exception_engine_service import ExceptionEngine
+    engine = ExceptionEngine(db)
+    return await engine.raise_exception(factory_id, scenario_key, context, source_id)
+
+
+@router.get("/exception/dashboard")
+async def exception_dashboard(
+    factory_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """异常看板：未处理+历史统计"""
+    from api.services.exception_engine_service import ExceptionEngine
+    engine = ExceptionEngine(db)
+    return await engine.exception_dashboard(factory_id)
+
+
+@router.get("/exception/scenarios")
+async def list_scenarios(
+    current_user: User = Depends(get_current_user),
+):
+    """查看所有异常场景定义（各岗位消除后的异常处理SOP）"""
+    from api.services.exception_engine_service import EXCEPTION_SCENARIOS
+    return {
+        "total": len(EXCEPTION_SCENARIOS),
+        "scenarios": [
+            {"key": k, **v}
+            for k, v in EXCEPTION_SCENARIOS.items()
+        ],
+    }

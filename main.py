@@ -209,6 +209,26 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 自派发任务异常: {e}")
 
+        # 异常超时升级 —— 每 5 分钟扫描（岗位消除安全网）
+        try:
+            import time as _t6
+            if not hasattr(_periodic_scheduler, "_last_escalation"):
+                _periodic_scheduler._last_escalation = 0
+            if _t6.time() - _periodic_scheduler._last_escalation > 300:  # 5min
+                _periodic_scheduler._last_escalation = _t6.time()
+                from api.services.exception_engine_service import ExceptionEngine
+                async with db_config.session_factory() as db:
+                    engine = ExceptionEngine(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            res = await engine.check_escalation(fid)
+                            if res.get("escalated_count"):
+                                _logger.info(f"[scheduler] 异常升级: {fid}, {res['escalated_count']} 条")
+                        except Exception as ex:
+                            _logger.warning(f"[scheduler] 异常升级失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 异常升级任务异常: {e}")
+
         await asyncio.sleep(_SCHEDULER_INTERVAL)
 
 
