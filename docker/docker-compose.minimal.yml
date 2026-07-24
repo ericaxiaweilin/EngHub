@@ -56,6 +56,8 @@ services:
     networks:
       - default
       - model-stack
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     # 内存限制 2GB (Python应用需要更多内存)
     deploy:
