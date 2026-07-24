@@ -58,6 +58,35 @@ class BatchReportRequest(BaseModel):
 
 # ==================== 报工终端 ====================
 
+
+@router.post("/reports/self-service")
+async def self_service_report(
+    factory_id: str = Query(...),
+    work_order_code: str = Query(..., description="扫码获取的工单号"),
+    good_qty: int = Query(..., ge=0),
+    defect_qty: int = Query(0, ge=0),
+    scrap_qty: int = Query(0, ge=0),
+    station_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """操作工扫码自助报工（消除生产文员）
+
+    操作工自己扫码→填数→提交，不需要文员转录纸质报工条。
+    系统自动：校验→更新工单→判断完工→异常升级通知主管。
+    """
+    svc = ReportService(db)
+    return await svc.self_service_report(
+        factory_id=factory_id,
+        work_order_code=work_order_code,
+        good_qty=good_qty,
+        defect_qty=defect_qty,
+        scrap_qty=scrap_qty,
+        station_id=station_id,
+        operator_id=current_user.username if current_user else None,
+    )
+
+
 @router.post("/reports/quick")
 async def quick_report(
     req: QuickReportRequest,

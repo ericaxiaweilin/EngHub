@@ -407,3 +407,103 @@ class ReportService:
                 threshold_value=90.0,
             )
             self.db.add(alert)
+
+    # ==================== 操作工自助报工（消除生产文员） ====================
+
+    async def self_service_report(
+        self,
+        factory_id: str,
+        work_order_code: str,
+        good_qty: int,
+        defect_qty: int = 0,
+        scrap_qty: int = 0,
+        station_id: Optional[str] = None,
+        operator_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """操作工扫码自助报工（完全替代生产文员录入）。
+
+        流程：扫码获取工单号 → 填数量 → 提交
+        系统自动：校验 → 更新工单 → 判断完工 → 异常升级
+        生产文员消除逻辑：操作工自己报，不需要人转录纸质报工条。
+        """
+        # 1. 扫码查找工单（支持工单号/编码，不需要UUID）
+        result = await self.db.execute(
+            select(WorkOrder).where(
+                WorkOrder.factory_id == factory_id,
+                WorkOrder.work_order_code == work_order_code,
+            )
+        )
+        wo = result.scalar_one_or_none()
+        if not wo:
+            return {"success": False, "error": f"工单 {work_order_code} 不存在"}
+
+        # 2. 状态校验
+        if wo.status not in ("released", "in_progress"):
+            return {"success": False, "error": f"工单状态 {wo.status}，不可报工（需 released/in_progress）"}
+
+        # 3. 数量校验（不能超报）
+        total_report = good_qty + defect_qty + scrap_qty
+        remaining = (wo.planned_qty or 0) - (wo.completed_qty or 0)
+        if total_report > remaining and remaining > 0:
+            return {
+                "success": False,
+                "error": f"报工数量 {total_report} 超过剩余 {remaining}（计划{wo.planned_qty}，已完成{wo.completed_qty}）",
+                "hint": "请确认数量是否正确",
+            }
+
+        # 4. 执行报工（复用 quick_report 逻辑）
+        report_result = await self.quick_report(
+            factory_id=factory_id,
+            work_order_id=wo.id,
+            station_id=station_id or wo.assigned_station_id or "default",
+            good_qty=good_qty,
+            defect_qty=defect_qty,
+            scrap_qty=scrap_qty,
+            operator_id=operator_id,
+        )
+
+        # 5. 自动完工判断
+        auto_completed = False
+        await self.db.refresh(wo)
+        if wo.completed_qty >= (wo.planned_qty or 0) and wo.planned_qty > 0:
+            wo.status = "completed"
+            wo.actual_complete = datetime.utcnow()
+            auto_completed = True
+
+        # 6. 异常升级（不良率>20% → 通知主管，不是文员）
+        anomaly = None
+        if total_report >= 5:
+            defect_rate = (defect_qty + scrap_qty) / total_report * 100
+            if defect_rate > 20:
+                anomaly = {
+                    "type": "high_defect",
+                    "defect_rate": round(defect_rate, 1),
+                    "action": "已自动通知主管",
+                }
+                # 写入通知（发给主管，不是文员）
+                from database.models import Notification
+                notif = Notification(
+                    id=_gen_id(),
+                    factory_id=factory_id,
+                    category="anomaly",
+                    title=f"❗ 报工异常：{work_order_code} 不良率 {defect_rate:.0f}%",
+                    content=f"操作工 {operator_id or '未知'} 报工 {total_report} 件，不良 {defect_qty}+报废 {scrap_qty}，不良率 {defect_rate:.1f}%",
+                    severity="critical" if defect_rate > 40 else "warning",
+                    source_type="work_order",
+                    source_id=wo.id,
+                )
+                self.db.add(notif)
+
+        await self.db.commit()
+
+        return {
+            "success": True,
+            "report_code": report_result.get("report_code"),
+            "work_order_code": work_order_code,
+            "good_qty": good_qty,
+            "defect_qty": defect_qty,
+            "scrap_qty": scrap_qty,
+            "auto_completed": auto_completed,
+            "anomaly": anomaly,
+            "message": "✅ 报工成功" + ("，工单已自动完工" if auto_completed else "") + (f"，⚠️ 不良率{anomaly['defect_rate']}%已通知主管" if anomaly else ""),
+        }

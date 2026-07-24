@@ -213,3 +213,34 @@ async def suggest_routing(
     from api.services.process_engineering_service import ProcessEngineeringService
     svc = ProcessEngineeringService(db)
     return await svc.suggest_routing(factory_id, product_features)
+
+
+# ==================== 跟单文员/销售文员完全消除 ====================
+
+
+@router.get("/order-tracking/track")
+async def track_order(
+    factory_id: str = Query(...),
+    order_code: str = Query(..., description="销售订单号"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """订单全链路进度追踪（替代跟单员查系统→回复客户）
+
+    客户/销售问“我的货到哪了” → 系统自动回答。
+    """
+    from api.services.order_tracking_service import OrderTrackingService
+    svc = OrderTrackingService(db)
+    return await svc.track_order(factory_id, order_code)
+
+
+@router.get("/order-tracking/delivery-alerts")
+async def delivery_alerts(
+    factory_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """交期预警自动扫描（替代跟单员记着哪个单快到期）"""
+    from api.services.order_tracking_service import OrderTrackingService
+    svc = OrderTrackingService(db)
+    return await svc.delivery_alert_scan(factory_id)
