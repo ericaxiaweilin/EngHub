@@ -43,6 +43,7 @@ from api.routes.qms_phase4_routes import router as qms_phase4_router
 from api.routes.equipment_phase5_routes import router as equipment_phase5_router
 from api.routes.hr_routes import router as hr_router
 from api.routes.notification_routes import router as notification_router
+from api.routes.role_elimination_routes import router as role_elimination_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -81,6 +82,7 @@ app.include_router(qms_phase4_router)  # 岗位替代 Phase 4: 检验终端/SPC/
 app.include_router(equipment_phase5_router)  # 岗位替代 Phase 5: 维保终端/OEE/故障预测
 app.include_router(hr_router)  # HR 人力档案 + 工厂切换
 app.include_router(notification_router)  # 站内通知（报告/异常/系统）
+app.include_router(role_elimination_router)  # 岗位替代（调度员/采购员/工艺员）
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 
@@ -186,6 +188,26 @@ async def _periodic_scheduler():
                             _logger.warning(f"[scheduler] 设备PM失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 设备PM任务异常: {e}")
+
+        # 事件驱动自派发 —— 每 2 分钟扫描一次（替代调度员手动派工）
+        try:
+            import time as _t5
+            if not hasattr(_periodic_scheduler, "_last_dispatch"):
+                _periodic_scheduler._last_dispatch = 0
+            if _t5.time() - _periodic_scheduler._last_dispatch > 120:  # 2min
+                _periodic_scheduler._last_dispatch = _t5.time()
+                from api.services.dispatch_service import auto_dispatch_station
+                async with db_config.session_factory() as db:
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            res = await auto_dispatch_station(db, fid)
+                            if res.get("dispatched_count"):
+                                _logger.info(f"[scheduler] 自派发: {fid}, {res['dispatched_count']} 单")
+                        except Exception as ex:
+                            _logger.warning(f"[scheduler] 自派发失败 {fid}: {ex}")
+                    await db.commit()
+        except Exception as e:
+            _logger.warning(f"[scheduler] 自派发任务异常: {e}")
 
         await asyncio.sleep(_SCHEDULER_INTERVAL)
 
