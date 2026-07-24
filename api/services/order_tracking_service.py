@@ -43,7 +43,7 @@ class OrderTrackingService:
         # 查找销售订单
         so_result = await self.db.execute(text("""
             SELECT id, order_code, customer_name, product_id, quantity,
-                   status, order_date, required_date, created_at
+                   status, delivery_date, created_at
             FROM sales_orders
             WHERE factory_id = :fid AND (order_code = :code OR id = :code)
         """), {"fid": factory_id, "code": order_code})
@@ -98,7 +98,7 @@ class OrderTrackingService:
             })
 
         # 交期判断
-        required_date = so.get("required_date")
+        required_date = so.get("delivery_date")
         delivery_risk = None
         if required_date and current_stage != "已完工":
             if isinstance(required_date, str):
@@ -115,7 +115,7 @@ class OrderTrackingService:
             "customer": so.get("customer_name", ""),
             "product": so.get("product_id", ""),
             "quantity": total_qty,
-            "order_date": str(so.get("order_date", ""))[:10],
+            "order_date": str(so.get("created_at", ""))[:10],
             "required_date": str(required_date) if required_date else None,
             "current_stage": current_stage,
             "progress_pct": progress_pct,
@@ -185,23 +185,23 @@ class OrderTrackingService:
         """
         # 查找未完成且交期在3天内的销售订单
         result = await self.db.execute(text("""
-            SELECT so.id, so.order_code, so.customer_name, so.required_date,
+            SELECT so.id, so.order_code, so.customer_name, so.delivery_date,
                    COALESCE(SUM(wo.completed_qty), 0) as total_completed,
                    COALESCE(SUM(wo.planned_qty), 0) as total_planned
             FROM sales_orders so
             LEFT JOIN work_orders wo ON wo.sales_order_id = so.id AND wo.factory_id = :fid
             WHERE so.factory_id = :fid
               AND so.status NOT IN ('completed', 'cancelled', 'closed')
-              AND so.required_date IS NOT NULL
-              AND so.required_date <= CURRENT_DATE + INTERVAL '3 days'
-            GROUP BY so.id, so.order_code, so.customer_name, so.required_date
-            ORDER BY so.required_date ASC
+              AND so.delivery_date IS NOT NULL
+              AND so.delivery_date <= CURRENT_DATE + INTERVAL '3 days'
+            GROUP BY so.id, so.order_code, so.customer_name, so.delivery_date
+            ORDER BY so.delivery_date ASC
         """), {"fid": factory_id})
         at_risk = [dict(r) for r in result.mappings().all()]
 
         alerts = []
         for order in at_risk:
-            required = order["required_date"]
+            required = order["delivery_date"]
             if isinstance(required, str):
                 required = date.fromisoformat(required[:10])
             days_left = (required - date.today()).days
