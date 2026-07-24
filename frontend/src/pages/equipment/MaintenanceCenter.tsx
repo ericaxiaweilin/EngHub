@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react'
 import {
-  Card, Table, Tag, Space, Button, Modal, Form, Input, InputNumber, Select,
-  message, Typography, Row, Col, Statistic, Badge, Alert,
+  Card, Table, Tag, Space, Button, Modal, Form, Input, Select,
+  message, Typography, Row, Col, Statistic, Alert,
 } from 'antd'
 import {
-  ToolOutlined, PlusOutlined, ThunderboltOutlined, ScheduleOutlined,
+  ToolOutlined, PlusOutlined, ScheduleOutlined,
   CheckCircleOutlined, WarningOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'

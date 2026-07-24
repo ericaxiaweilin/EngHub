@@ -3,7 +3,7 @@
  */
 import { useState, useEffect } from 'react'
 import { Card, Table, Tag, Statistic, Row, Col, Select, Input, Space, Progress, Tabs } from 'antd'
-import { TeamOutlined, UserOutlined, CheckCircleOutlined, ApartmentOutlined } from '@ant-design/icons'
+import { TeamOutlined, CheckCircleOutlined, ApartmentOutlined } from '@ant-design/icons'
 import api from '../../services/api'
 
 interface Employee {
