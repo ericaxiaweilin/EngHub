@@ -256,8 +256,7 @@ class ProcurementService:
                    COUNT(po.id) as total_orders,
                    COUNT(CASE WHEN po.status = 'closed' THEN 1 END) as completed_orders,
                    COUNT(CASE WHEN po.actual_date <= po.expected_date THEN 1 END) as on_time_count,
-                   AVG(CASE WHEN po.actual_date IS NOT NULL AND po.expected_date IS NOT NULL
-                       THEN EXTRACT(EPOCH FROM (po.actual_date - po.expected_date))/86400 END) as avg_delay_days
+                   AVG(po.actual_date - po.expected_date) as avg_delay_days
             FROM suppliers s
             LEFT JOIN purchase_orders po ON po.supplier_id = s.id AND po.factory_id = :fid
             WHERE s.factory_id = :fid
