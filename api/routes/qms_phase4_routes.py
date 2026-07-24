@@ -265,3 +265,41 @@ async def upsert_spc_config(
         ucl=req.ucl, cl=req.cl, lcl=req.lcl, usl=req.usl, lsl=req.lsl,
         subgroup_size=req.subgroup_size,
     )
+
+
+# ==================== AQL + 检验计划 + 自动判定 ====================
+
+
+@router.get("/qms/aql-sampling")
+async def aql_sampling(
+    batch_qty: int = Query(..., ge=1, description="批量"),
+    aql: float = Query(1.0, description="AQL 值"),
+    level: str = Query("II", description="检验水平"),
+    current_user: User = Depends(get_current_user),
+):
+    """AQL 抽样方案（GB/T 2828.1）"""
+    svc = InspectionService(None)
+    return svc.get_aql_sampling_plan(batch_qty, aql, level)
+
+
+@router.post("/qms/inspection/{task_id}/auto-plan")
+async def auto_inspection_plan(
+    task_id: str,
+    inspect_type: str = Query("IQC", description="IQC/IPQC/FQC"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """自动生成检验计划（按检验类型生成标准检验项）"""
+    svc = InspectionService(db)
+    return await svc.generate_inspection_plan(task_id, inspect_type)
+
+
+@router.post("/qms/inspection/{task_id}/auto-judge")
+async def auto_judge(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """自动判定 + 生成检验报告"""
+    svc = InspectionService(db)
+    return await svc.auto_judge_and_report(task_id)

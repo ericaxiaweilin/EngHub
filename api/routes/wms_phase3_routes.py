@@ -308,3 +308,42 @@ async def stock_health(
     """库存健康度概览"""
     svc = StockAlertService(db)
     return await svc.stock_health_summary(factory_id)
+
+
+# ==================== 补货 + FIFO + 批次追溯 ====================
+
+
+@router.get("/wms/replenishment")
+async def replenishment_suggestions(
+    factory_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """自动补货建议（安全库存+日均消耗→补货量）"""
+    svc = WmsOperationService(db)
+    return await svc.replenishment_suggestions(factory_id)
+
+
+@router.get("/wms/fifo-pick")
+async def fifo_pick(
+    factory_id: str = Query(...),
+    material_code: str = Query(...),
+    qty: int = Query(..., ge=1),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """FIFO 出库推荐（按入库时间推荐批次）"""
+    svc = WmsOperationService(db)
+    return await svc.fifo_pick_suggestion(factory_id, material_code, qty)
+
+
+@router.get("/wms/batch-trace")
+async def batch_trace(
+    factory_id: str = Query(...),
+    batch_code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """批次追溯（原料→入库→出库→工单→成品）"""
+    svc = WmsOperationService(db)
+    return await svc.batch_trace(factory_id, batch_code)

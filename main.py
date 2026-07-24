@@ -167,6 +167,26 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 排产任务异常: {e}")
 
+        # 设备 PM 自动排程 —— 每 12 小时跑一次
+        try:
+            import time as _t4
+            if not hasattr(_periodic_scheduler, "_last_pm"):
+                _periodic_scheduler._last_pm = 0
+            if _t4.time() - _periodic_scheduler._last_pm > 43200:  # 12h
+                _periodic_scheduler._last_pm = _t4.time()
+                from api.services.maintenance_service import MaintenanceService
+                async with db_config.session_factory() as db:
+                    mnt_svc = MaintenanceService(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            res = await mnt_svc.auto_schedule_pm(fid, created_by="scheduler")
+                            if res.get("tasks_created"):
+                                _logger.info(f"[scheduler] 设备PM: {fid}, 生成 {res['tasks_created']} 个保养任务")
+                        except Exception as ex:
+                            _logger.warning(f"[scheduler] 设备PM失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 设备PM任务异常: {e}")
+
         await asyncio.sleep(_SCHEDULER_INTERVAL)
 
 

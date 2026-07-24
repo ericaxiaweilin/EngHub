@@ -239,3 +239,40 @@ async def oee_summary(
     """工厂 OEE 概览"""
     svc = OeeService(db)
     return await svc.get_factory_oee_summary(factory_id)
+
+
+# ==================== 点检模板 + SOP + 备件请购 ====================
+
+
+@router.post("/inspection-template")
+async def generate_inspection_template(
+    equipment_id: str = Query(...),
+    task_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """根据设备类型自动生成点检项（替代维护员手动填写）"""
+    svc = MaintenanceService(db)
+    return await svc.generate_inspection_checklist(equipment_id, task_id)
+
+
+@router.get("/repair-sop")
+async def get_repair_sop(
+    fault_type: str = Query(..., description="故障类型（如 主轴故障/液压泄漏/电气故障）"),
+    current_user: User = Depends(get_current_user),
+):
+    """获取维修 SOP（标准作业程序）"""
+    svc = MaintenanceService(None)
+    return await svc.get_repair_sop(fault_type)
+
+
+@router.post("/spare-parts-check")
+async def check_spare_parts(
+    factory_id: str = Query(...),
+    parts_used: str = Query(..., description="使用备件，格式: CODE:QTY,CODE:QTY"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """维修后备件库存检查 + 自动请购建议"""
+    svc = MaintenanceService(db)
+    return await svc.check_spare_parts_and_suggest(factory_id, parts_used)

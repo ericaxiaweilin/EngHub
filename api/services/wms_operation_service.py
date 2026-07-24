@@ -472,3 +472,156 @@ class WmsOperationService:
 
         result = await self.db.execute(text(query), params)
         return {"items": [dict(r) for r in result.mappings().all()]}
+
+    # ==================== 自动补货建议 ====================
+
+    async def replenishment_suggestions(self, factory_id: str) -> Dict[str, Any]:
+        """自动补货建议：基于安全库存 + 日均消耗计算补货量。
+
+        仓管员核心能力：系统自动告诉你要补什么、补多少。
+        """
+        # 获取安全库存配置
+        config_result = await self.db.execute(text("""
+            SELECT material_code, material_name, safety_stock, reorder_point, reorder_qty
+            FROM stock_safety_configs WHERE factory_id = :fid AND is_active = TRUE
+        """), {"fid": factory_id})
+        configs = [dict(r) for r in config_result.mappings().all()]
+
+        suggestions = []
+        for cfg in configs:
+            code = cfg["material_code"]
+            # 当前库存
+            inv_result = await self.db.execute(text("""
+                SELECT COALESCE(SUM(available_qty), 0) as avail FROM inventory
+                WHERE factory_id = :fid AND material_code = :code
+            """), {"fid": factory_id, "code": code})
+            avail = inv_result.scalar() or 0
+
+            reorder_point = cfg.get("reorder_point") or cfg.get("safety_stock") or 0
+            if avail <= reorder_point:
+                # 计算日均消耗（近30天出库）
+                consumption_result = await self.db.execute(text("""
+                    SELECT COALESCE(SUM(ABS(qty_change)), 0) as consumed
+                    FROM inventory_transactions
+                    WHERE factory_id = :fid AND material_code = :code
+                        AND qty_change < 0 AND created_at >= NOW() - INTERVAL '30 days'
+                """), {"fid": factory_id, "code": code})
+                consumed_30d = consumption_result.scalar() or 0
+                daily_avg = consumed_30d / 30
+
+                # 补货量 = 配置量 或 安全库存*2 - 当前库存
+                suggested_qty = cfg.get("reorder_qty") or max(int(reorder_point * 2 - avail), 1)
+
+                suggestions.append({
+                    "material_code": code,
+                    "material_name": cfg.get("material_name", ""),
+                    "current_stock": int(avail),
+                    "reorder_point": reorder_point,
+                    "safety_stock": cfg.get("safety_stock", 0),
+                    "daily_consumption": round(daily_avg, 1),
+                    "days_of_stock": round(avail / daily_avg, 1) if daily_avg > 0 else 999,
+                    "suggested_qty": suggested_qty,
+                    "urgency": "high" if avail <= (cfg.get("safety_stock") or 0) else "medium",
+                })
+
+        suggestions.sort(key=lambda x: x["days_of_stock"])
+        return {
+            "suggestions": suggestions,
+            "total_items": len(suggestions),
+            "urgent_count": sum(1 for s in suggestions if s["urgency"] == "high"),
+        }
+
+    # ==================== FIFO 出库推荐 ====================
+
+    async def fifo_pick_suggestion(self, factory_id: str, material_code: str, qty_needed: int) -> Dict[str, Any]:
+        """FIFO 出库推荐：按入库时间从早到晚推荐批次。
+
+        仓管员核心能力：系统告诉你从哪个批次拣货。
+        """
+        # 按创建时间升序（最早入库的优先）
+        result = await self.db.execute(text("""
+            SELECT id, batch_code, available_qty, warehouse_id, location_id, created_at
+            FROM inventory
+            WHERE factory_id = :fid AND material_code = :code AND available_qty > 0
+            ORDER BY created_at ASC
+        """), {"fid": factory_id, "code": material_code})
+        batches = [dict(r) for r in result.mappings().all()]
+
+        picks = []
+        remaining = qty_needed
+        for batch in batches:
+            if remaining <= 0:
+                break
+            pick_qty = min(batch["available_qty"], remaining)
+            picks.append({
+                "inventory_id": batch["id"],
+                "batch_code": batch["batch_code"],
+                "warehouse_id": batch["warehouse_id"],
+                "location_id": batch["location_id"],
+                "pick_qty": pick_qty,
+                "inbound_date": batch["created_at"].isoformat() if batch["created_at"] else None,
+            })
+            remaining -= pick_qty
+
+        return {
+            "material_code": material_code,
+            "qty_needed": qty_needed,
+            "picks": picks,
+            "total_picked": qty_needed - max(remaining, 0),
+            "shortage": max(remaining, 0),
+            "fifo_compliant": remaining <= 0,
+        }
+
+    # ==================== 批次追溯链 ====================
+
+    async def batch_trace(self, factory_id: str, batch_code: str) -> Dict[str, Any]:
+        """批次追溯：原料批次 → 入库记录 → 出库/领料 → 关联工单 → 成品。
+
+        仓管员核心能力：完整追溯一个批次的全生命周期。
+        """
+        # 1. 库存记录
+        inv_result = await self.db.execute(text("""
+            SELECT * FROM inventory WHERE factory_id = :fid AND batch_code = :batch
+        """), {"fid": factory_id, "batch": batch_code})
+        inv_records = [dict(r) for r in inv_result.mappings().all()]
+
+        # 2. 交易记录（出入库历史）
+        txn_result = await self.db.execute(text("""
+            SELECT * FROM inventory_transactions
+            WHERE factory_id = :fid AND material_code IN (
+                SELECT DISTINCT material_code FROM inventory WHERE batch_code = :batch AND factory_id = :fid
+            ) AND batch_code = :batch
+            ORDER BY created_at ASC
+        """), {"fid": factory_id, "batch": batch_code})
+        transactions = [dict(r) for r in txn_result.mappings().all()]
+
+        # 3. 关联工单（通过领料出库记录）
+        wo_links = []
+        for txn in transactions:
+            if txn.get("reference_type") == "work_order" and txn.get("reference_id"):
+                wo_links.append({
+                    "work_order_id": txn["reference_id"],
+                    "qty": abs(txn.get("qty_change", 0)),
+                    "date": txn["created_at"].isoformat() if txn.get("created_at") else None,
+                })
+
+        # 4. 汇总
+        total_in = sum(t.get("qty_change", 0) for t in transactions if t.get("qty_change", 0) > 0)
+        total_out = abs(sum(t.get("qty_change", 0) for t in transactions if t.get("qty_change", 0) < 0))
+        current_stock = sum(r.get("available_qty", 0) for r in inv_records)
+
+        return {
+            "batch_code": batch_code,
+            "factory_id": factory_id,
+            "inventory_records": inv_records,
+            "transactions": transactions,
+            "work_order_links": wo_links,
+            "summary": {
+                "total_inbound": total_in,
+                "total_outbound": total_out,
+                "current_stock": current_stock,
+                "transaction_count": len(transactions),
+                "linked_work_orders": len(wo_links),
+            },
+        }
+

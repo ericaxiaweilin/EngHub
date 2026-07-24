@@ -1,13 +1,17 @@
 """
 设备维保服务 - 岗位替代 Phase 5: 替代设备维护员
-点检/保养/维修工单 + 自动排程 + 故障预测
+点检/保养/维修工单 + 自动排程 + 故障预测 + 点检模板 + SOP + 备件请购
 """
 import uuid
+import json
+import logging
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+
+_logger = logging.getLogger("maintenance")
 
 
 def _gen_id() -> str:
@@ -252,3 +256,169 @@ class MaintenanceService:
         await self.db.commit()
 
         return {"success": True, "is_alarm": is_alarm, "metric_value": metric_value}
+
+    # ==================== 点检模板自动生成 ====================
+
+    # 按设备类型的标准点检模板
+    INSPECTION_TEMPLATES: Dict[str, List[Dict]] = {
+        "CNC": [
+            {"item_name": "主轴温度", "category": "温度", "standard_value": "≤ 60℃"},
+            {"item_name": "导轨润滑", "category": "润滑", "standard_value": "油膜均匀"},
+            {"item_name": "冷却液液位", "category": "液位", "standard_value": "≥ 2/3"},
+            {"item_name": "刀具磨损", "category": "刀具", "standard_value": "磨损量≤0.2mm"},
+            {"item_name": "气压表读数", "category": "气压", "standard_value": "0.5-0.7MPa"},
+            {"item_name": "异响/振动", "category": "声音", "standard_value": "无异常"},
+        ],
+        "注塑机": [
+            {"item_name": "模具温度", "category": "温度", "standard_value": "按工艺卡"},
+            {"item_name": "液压油温", "category": "温度", "standard_value": "≤ 55℃"},
+            {"item_name": "射嘴清洁", "category": "清洁", "standard_value": "无堵塞"},
+            {"item_name": "安全门开关", "category": "安全", "standard_value": "灵敏可靠"},
+            {"item_name": "加热圈电流", "category": "电气", "standard_value": "额定±10%"},
+        ],
+        "SMT": [
+            {"item_name": "吸嘴真空度", "category": "真空", "standard_value": "≥ -60kPa"},
+            {"item_name": "锡膏厚度", "category": "印刷", "standard_value": "0.12-0.15mm"},
+            {"item_name": "回流焊温度曲线", "category": "温度", "standard_value": "峰值 245±5℃"},
+            {"item_name": "抛料率", "category": "质量", "standard_value": "≤ 0.3%"},
+            {"item_name": "导轨清洁", "category": "清洁", "standard_value": "无锡珠残留"},
+        ],
+        "default": [
+            {"item_name": "外观检查", "category": "外观", "standard_value": "无损伤/渗漏"},
+            {"item_name": "运行声音", "category": "声音", "standard_value": "无异响"},
+            {"item_name": "润滑状态", "category": "润滑", "standard_value": "油位正常"},
+            {"item_name": "安全防护", "category": "安全", "standard_value": "护罩/急停正常"},
+            {"item_name": "清洁状态", "category": "清洁", "standard_value": "无积尘/杂物"},
+        ],
+    }
+
+    async def generate_inspection_checklist(self, equipment_id: str, task_id: str) -> Dict[str, Any]:
+        """根据设备类型自动生成点检项"""
+        # 获取设备类型
+        eq_result = await self.db.execute(text(
+            "SELECT equipment_type, equipment_name FROM equipment WHERE id = :id"
+        ), {"id": equipment_id})
+        eq = eq_result.mappings().first()
+        eq_type = eq["equipment_type"] if eq else None
+
+        # 匹配模板（模糊匹配：包含关键词即可）
+        template = self.INSPECTION_TEMPLATES.get("default")
+        if eq_type:
+            for key, items in self.INSPECTION_TEMPLATES.items():
+                if key != "default" and key.lower() in (eq_type or "").lower():
+                    template = items
+                    break
+
+        # 写入点检项
+        await self.add_checklist(task_id, template)
+        return {
+            "success": True,
+            "equipment_type": eq_type,
+            "items_generated": len(template),
+            "template_used": [t["item_name"] for t in template],
+        }
+
+    # ==================== 维修 SOP 推送 ====================
+
+    REPAIR_SOPS: Dict[str, List[Dict[str, str]]] = {
+        "主轴故障": [
+            {"step": "1", "action": "停机并挂牌上锁", "safety": "必须"},
+            {"step": "2", "action": "检查主轴温度、异响、振动", "tool": "红外测温仪/振动笔"},
+            {"step": "3", "action": "检查轴承间隙（轴向/径向）", "tool": "百分表"},
+            {"step": "4", "action": "检查润滑系统（油量/油泵/油路）", "tool": ""},
+            {"step": "5", "action": "更换轴承或调整预紧力", "tool": "专用拉马"},
+            {"step": "6", "action": "试运行 30min，监测温升≤ 15℃", "safety": "试运行前确认护罩安装"},
+        ],
+        "液压泄漏": [
+            {"step": "1", "action": "停机卸压", "safety": "必须"},
+            {"step": "2", "action": "定位泄漏点（密封圈/油管/接头）", "tool": ""},
+            {"step": "3", "action": "更换密封件或紧固接头", "tool": "扭矩扳手"},
+            {"step": "4", "action": "补充液压油至标准液位", "tool": ""},
+            {"step": "5", "action": "试压运行，观察 10min 无渗漏", "safety": "戴护目镜"},
+        ],
+        "电气故障": [
+            {"step": "1", "action": "断电并验电", "safety": "必须，挂禁止合闸牌"},
+            {"step": "2", "action": "检查报警代码，查阅电气原理图", "tool": "万用表"},
+            {"step": "3", "action": "检查接触器/继电器/保险丝", "tool": "万用表"},
+            {"step": "4", "action": "检查接线端子是否松动/烧蚀", "tool": ""},
+            {"step": "5", "action": "更换故障元件，紧固接线", "tool": ""},
+            {"step": "6", "action": "送电试运行，确认报警消除", "safety": "送电前确认人员撤离"},
+        ],
+    }
+
+    async def get_repair_sop(self, fault_type: str) -> Dict[str, Any]:
+        """根据故障类型获取维修 SOP"""
+        # 模糊匹配
+        sop = None
+        matched_key = None
+        for key, steps in self.REPAIR_SOPS.items():
+            if key in fault_type or fault_type in key:
+                sop = steps
+                matched_key = key
+                break
+
+        if not sop:
+            # 通用 SOP
+            sop = [
+                {"step": "1", "action": "停机并确认安全", "safety": "必须"},
+                {"step": "2", "action": "记录故障现象（拍照/录像）", "tool": ""},
+                {"step": "3", "action": "分析故障原因", "tool": ""},
+                {"step": "4", "action": "执行维修/更换", "tool": ""},
+                {"step": "5", "action": "试运行确认", "safety": "确认防护装置复位"},
+            ]
+            matched_key = "通用维修"
+
+        return {"fault_type": fault_type, "matched_sop": matched_key, "steps": sop, "total_steps": len(sop)}
+
+    # ==================== 备件自动请购 ====================
+
+    async def check_spare_parts_and_suggest(self, factory_id: str, parts_used: str) -> Dict[str, Any]:
+        """维修完成后检查备件库存，不足则生成请购建议。
+
+        parts_used 格式："物料编码:数量,物料编码:数量" 或 JSON
+        """
+        suggestions = []
+        parts_list = []
+
+        # 解析 parts_used
+        try:
+            parts_list = json.loads(parts_used)
+        except (json.JSONDecodeError, TypeError):
+            # 尝试 "CODE:QTY,CODE:QTY" 格式
+            if parts_used and ":" in parts_used:
+                for item in parts_used.split(","):
+                    parts = item.strip().split(":")
+                    if len(parts) == 2:
+                        parts_list.append({"material_code": parts[0].strip(), "qty": int(parts[1].strip())})
+
+        for part in parts_list:
+            code = part.get("material_code", "")
+            used_qty = part.get("qty", 0)
+            if not code:
+                continue
+
+            # 查询库存
+            inv_result = await self.db.execute(text("""
+                SELECT COALESCE(SUM(available_qty), 0) as avail
+                FROM inventory WHERE factory_id = :fid AND material_code = :code
+            """), {"fid": factory_id, "code": code})
+            avail = inv_result.scalar() or 0
+
+            # 安全库存 = 用量 * 2（简化）
+            safety_stock = used_qty * 2
+            if avail < safety_stock:
+                suggestions.append({
+                    "material_code": code,
+                    "current_stock": int(avail),
+                    "used_in_repair": used_qty,
+                    "safety_stock": safety_stock,
+                    "suggested_order_qty": max(safety_stock - int(avail), used_qty),
+                    "urgency": "high" if avail == 0 else "medium",
+                })
+
+        return {
+            "parts_checked": len(parts_list),
+            "suggestions": suggestions,
+            "need_purchase": len(suggestions) > 0,
+            "message": f"{len(suggestions)} 种备件需请购" if suggestions else "备件库存充足",
+        }
