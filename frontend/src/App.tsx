@@ -35,6 +35,7 @@ import ProductionLive from './pages/mes/ProductionLive'
 import ReportCenter from './pages/mes/ReportCenter'
 import BaseData from './pages/basedata/BaseData'
 import SkillMatrix from './pages/hr/SkillMatrix'
+import HrRoster from './pages/hr/HrRoster'
 import WarehouseList from './pages/wms/WarehouseList'
 import Login from './pages/auth/Login'
 import ModuleSelector from './pages/ModuleSelector'
@@ -158,6 +159,7 @@ const App: React.FC = () => {
             <Route path="report-center" element={<PermissionGate path="/report-center"><ReportCenter /></PermissionGate>} />
             <Route path="equipment-center" element={<PermissionGate path="/equipment-center"><EquipmentCenter /></PermissionGate>} />
             <Route path="skill-matrix" element={<PermissionGate path="/skill-matrix"><SkillMatrix /></PermissionGate>} />
+            <Route path="hr-roster" element={<PermissionGate path="/hr-roster"><HrRoster /></PermissionGate>} />
             {/* 仿真引擎：车间负荷 / 人因合规 / 审计记录 统一模块 */}
             <Route path="simulation" element={<PermissionGate path="/simulation"><SimulationEngine /></PermissionGate>} />
             <Route path="sim-erp/factory" element={<Navigate to="/simulation?tab=factory" replace />} />

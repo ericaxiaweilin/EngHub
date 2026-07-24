@@ -2,16 +2,19 @@
  * AI 助手浮窗 + 内网 IM 联系人
  * 可拖拽移动、最小化/最大化，参考 luaguage ChatbotWidget 交互模式
  */
-import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message } from 'antd'
+import React, { useState, useRef, useEffect, useCallback, lazy, Suspense } from 'react'
+import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message, Table } from 'antd'
 import {
   RobotOutlined, TeamOutlined, SendOutlined, MinusOutlined,
   ExpandOutlined, CompressOutlined, CloseOutlined,
   ToolOutlined, SafetyCertificateOutlined, DesktopOutlined, ApiOutlined,
   ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined,
   AlertOutlined, ExperimentOutlined, PhoneOutlined,
-  PaperClipOutlined, FileOutlined, DownloadOutlined,
+  PaperClipOutlined, FileOutlined, DownloadOutlined, TableOutlined,
 } from '@ant-design/icons'
+
+// Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
+const SpreadsheetEditor = lazy(() => import('./SpreadsheetEditor'))
 import api from '../services/api'
 import { tmsApi } from '../services/tms'
 import { getStoredUser } from '../services/auth'
@@ -60,6 +63,13 @@ interface MsgAttachment {
   size?: number
 }
 
+// ---------- 结构化表格数据（后端 table 事件推送） ----------
+interface TableData {
+  title: string
+  columns: { key: string; label: string }[]
+  rows: Record<string, any>[]
+}
+
 // ---------- 聊天消息 ----------
 interface ChatMsg {
   role: 'user' | 'assistant'
@@ -68,6 +78,7 @@ interface ChatMsg {
   degraded?: boolean
   actions?: ToolAction[]
   attachments?: MsgAttachment[]
+  tables?: TableData[]
 }
 
 // ---------- 快捷指令 ----------
@@ -145,6 +156,8 @@ export default function AIAssistantWidget() {
   const [callType, setCallType] = useState('equipment_fault')
   const [callForm] = Form.useForm()
   const [callSubmitting, setCallSubmitting] = useState(false)
+  // 电子表格弹窗（chatbot 查询结果 → Univer 在线表格）
+  const [sheetTable, setSheetTable] = useState<TableData | null>(null)
 
   const user = getStoredUser()
 
@@ -285,6 +298,7 @@ export default function AIAssistantWidget() {
       let buffer = ''
       let accContent = ''
       let accActions: ToolAction[] = []
+      let accTables: TableData[] = []
       let degraded = false
 
       const applyUpdate = () => {
@@ -296,6 +310,7 @@ export default function AIAssistantWidget() {
             time: streamMsg.time,
             degraded,
             actions: accActions.length > 0 ? [...accActions] : [],
+            tables: accTables.length > 0 ? [...accTables] : [],
           }
           return updated
         })
@@ -324,6 +339,9 @@ export default function AIAssistantWidget() {
               applyUpdate()
             } else if (eventType === 'action') {
               accActions = [...accActions, data]
+              applyUpdate()
+            } else if (eventType === 'table') {
+              accTables = [...accTables, data as TableData]
               applyUpdate()
             } else if (eventType === 'done') {
               degraded = !!data.degraded
@@ -763,6 +781,52 @@ export default function AIAssistantWidget() {
                                 ))}
                               </div>
                             )}
+                            {/* 结构化表格（chatbot 查询结果 → 可交互表格 + Univer 电子表格） */}
+                            {m.role === 'assistant' && m.tables && m.tables.length > 0 && (
+                              <div style={{ marginTop: 8 }}>
+                                {m.tables.map((tbl, ti) => (
+                                  <div key={ti} style={{
+                                    background: '#fff', border: '1px solid #e6f4ff',
+                                    borderRadius: 8, overflow: 'hidden', marginTop: ti > 0 ? 8 : 0,
+                                    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+                                  }}>
+                                    <div style={{
+                                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                                      padding: '6px 10px', background: '#f0f7ff', borderBottom: '1px solid #e6f4ff',
+                                    }}>
+                                      <Space size={4}>
+                                        <TableOutlined style={{ color: '#1677ff' }} />
+                                        <Text strong style={{ fontSize: 11 }}>{tbl.title}</Text>
+                                        <Tag color="blue" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>{tbl.rows.length} 行</Tag>
+                                      </Space>
+                                      <Button
+                                        type="link" size="small"
+                                        icon={<TableOutlined />}
+                                        style={{ fontSize: 11, padding: 0, height: 'auto' }}
+                                        onClick={() => setSheetTable(tbl)}
+                                      >
+                                        在电子表格中打开
+                                      </Button>
+                                    </div>
+                                    <Table
+                                      size="small"
+                                      dataSource={tbl.rows.map((r, ri) => ({ ...r, _rowKey: ri }))}
+                                      rowKey="_rowKey"
+                                      columns={tbl.columns.map(c => ({
+                                        title: c.label,
+                                        dataIndex: c.key,
+                                        key: c.key,
+                                        ellipsis: true,
+                                        render: (v: any) => v === null || v === undefined ? '-' : String(v),
+                                      }))}
+                                      pagination={tbl.rows.length > 5 ? { pageSize: 5, size: 'small', showTotal: undefined } : false}
+                                      scroll={{ x: 'max-content' }}
+                                      style={{ fontSize: 11 }}
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                             <div style={{
                               fontSize: 10,
                               color: m.role === 'user' ? 'rgba(255,255,255,0.7)' : '#999',
@@ -1112,6 +1176,36 @@ export default function AIAssistantWidget() {
             <Input.TextArea rows={3} placeholder="简要描述现场情况..." />
           </Form.Item>
         </Form>
+      </Modal>
+
+      {/* 电子表格弹窗（chatbot 查询结果 → Univer 类 Excel 在线表格，支持公式/筛选/复制粘贴） */}
+      <Modal
+        title={
+          <Space>
+            <TableOutlined style={{ color: '#1677ff' }} />
+            <span>{sheetTable?.title || '电子表格'}</span>
+            <Tag color="blue" style={{ fontSize: 10 }}>Univer 在线表格</Tag>
+          </Space>
+        }
+        open={!!sheetTable}
+        onCancel={() => setSheetTable(null)}
+        footer={
+          <Button onClick={() => setSheetTable(null)}>关闭</Button>
+        }
+        width="85vw"
+        style={{ top: 32 }}
+        destroyOnClose
+      >
+        {sheetTable && (
+          <Suspense fallback={<div style={{ textAlign: 'center', padding: 48 }}><Spin tip="加载电子表格组件..." /></div>}>
+            <SpreadsheetEditor
+              headers={sheetTable.columns.map(c => c.label)}
+              initialData={sheetTable.rows.map(r => sheetTable.columns.map(c => r[c.key] ?? ''))}
+              height={Math.min(520, Math.max(280, sheetTable.rows.length * 28 + 80))}
+              sheetName={sheetTable.title}
+            />
+          </Suspense>
+        )}
       </Modal>
     </>
   )

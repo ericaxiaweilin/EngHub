@@ -39,6 +39,7 @@ from api.routes.production_phase2_routes import router as production_phase2_rout
 from api.routes.wms_phase3_routes import router as wms_phase3_router
 from api.routes.qms_phase4_routes import router as qms_phase4_router
 from api.routes.equipment_phase5_routes import router as equipment_phase5_router
+from api.routes.hr_routes import router as hr_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -75,6 +76,7 @@ app.include_router(production_phase2_router)  # 岗位替代 Phase 2: 订单管�
 app.include_router(wms_phase3_router)  # 岗位替代 Phase 3: 仓管操作/库存预警/盘点
 app.include_router(qms_phase4_router)  # 岗位替代 Phase 4: 检验终端/SPC/不良分析
 app.include_router(equipment_phase5_router)  # 岗位替代 Phase 5: 维保终端/OEE/故障预测
+app.include_router(hr_router)  # HR 人力档案 + 工厂切换
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 

@@ -16,6 +16,11 @@ api.interceptors.request.use(
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+    // 全局工厂切换（开发账户切换后存入 localStorage）
+    const factoryId = localStorage.getItem('active_factory_id');
+    if (factoryId) {
+      config.headers['X-Factory-Id'] = factoryId;
+    }
     return config;
   },
   (error) => {

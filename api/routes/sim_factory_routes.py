@@ -11,8 +11,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.sim_factory.engine import FactoryLoadEngine
 from core.sim_factory.models import (
@@ -28,6 +29,10 @@ from core.sim_factory.scenarios import (
     get_scenario_meta,
     list_scenarios,
 )
+from database.db_config import get_db
+from database.models import User
+from core.auth.security import get_current_user
+from api.services.sim_data_feeder import build_live_config, get_live_data_summary
 
 router = APIRouter(prefix="/api/v1/sim-factory", tags=["sim-factory"])
 engine = FactoryLoadEngine()
@@ -143,4 +148,47 @@ async def factory_sim_dashboard_summary(
     data["scenario_id"] = sid
     data["scenario_name"] = meta.get("scenario_name", sid)
     _SIM_SUMMARY_CACHE[sid] = {"ts": now, "data": data}
+    return data
+
+
+# ==================== 实时数据仿真（人/设备/物料/工艺 从 DB 拉取） ====================
+
+@router.get("/live-data")
+async def sim_live_data_summary(
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """查看当前工厂喂入仿真引擎的真实数据摘要（人/设备/物料/工艺）"""
+    fid = request.headers.get("x-factory-id") or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
+    return await get_live_data_summary(db, fid)
+
+
+@router.post("/run-live")
+async def run_live_simulation(
+    horizon_days: int = Query(default=14, ge=5, le=60),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """基于真实 DB 数据运行仿真（人力档案 + 工位设备 + 库存物料 + 工艺路线）"""
+    fid = request.headers.get("x-factory-id") or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
+    try:
+        config = await build_live_config(db, fid, horizon_days)
+    except Exception as exc:
+        raise HTTPException(400, f"构建实时配置失败: {exc}") from exc
+
+    if not config.sections:
+        raise HTTPException(400, f"工厂 {fid} 无人力/工位数据，无法仿真")
+
+    try:
+        result = engine.run(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    data: Dict[str, Any] = result.model_dump(mode="json")
+    data["is_simulation"] = True
+    data["data_source"] = "live_db"
+    data["factory_id"] = fid
+    data["input_summary"] = await get_live_data_summary(db, fid)
     return data

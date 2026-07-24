@@ -79,7 +79,7 @@ const MODULES: ModuleDef[] = [
     desc: '技能矩阵 · 人员资质 · 培训管理',
     icon: <TeamOutlined style={{ fontSize: 36 }} />,
     color: '#13c2c2',
-    path: '/skill-matrix',
+    path: '/hr-roster',
   },
   {
     key: 'collab',

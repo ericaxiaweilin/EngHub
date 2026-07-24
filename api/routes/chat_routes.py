@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -58,6 +58,9 @@ SYSTEM_PROMPT = (
     "【预警情报中枢】你不仅是查询助手，更是预警情报审查员。当系统产生被动预警（安灯工单/质量缺陷/设备故障/工单超时）时，"
     "你会自动进行初步审查（严重度/根因/建议/分派）。用户可随时问你“有什么预警”“预警简报”获取当前态势，"
     "也可以说“巡检”让你主动扫描异常。审查结果包含严重度判定、根因假设、处置建议和推荐分派对象。\n"
+    "【流程知识库】系统内置了完整的流程知识：工单全生命周期（8阶段：创建→下达→派工→执行→报工→质检→完工→入库）、"
+    "6大职位标准作业流程(操作员/品检员/设备工程师/PMC计划员/生产主管/仓管员)、各环节RACI责任矩阵。"
+    "用户问流程/职责/该找谁类问题时，调用 query_process_knowledge 工具获取标准答案。\n"
     "请用简洁专业的中文回答制造与车间管理相关问题。"
 )
 
@@ -286,13 +289,14 @@ async def _run_deterministic(
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
+    http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
     """转发对话到 litellm 网关，支持 tool calling 循环执行 MES 操作。"""
     model = request.model or MODEL
     operator = current_user.username or current_user.id
-    factory_id = current_user.factory_id  # 当前工厂：供工具查询做数据隔离，保证与页面口径一致
+    factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
 
     last_user = next(
         (m.content for m in reversed(request.messages) if m.role == "user"), ""
@@ -440,6 +444,225 @@ def _degraded_message(reason: str) -> str:
     )
 
 
+# ==================== 结构化表格提取（chatbot → 在线表格） ====================
+
+# 各查询工具结果 → 表格列定义（key=字段名, label=中文表头）
+_TABLE_COLUMNS: Dict[str, List[Dict[str, str]]] = {
+    "query_work_orders": [
+        {"key": "work_order_code", "label": "工单号"},
+        {"key": "product_name", "label": "产品"},
+        {"key": "planned_qty", "label": "计划数"},
+        {"key": "completed_qty", "label": "完成数"},
+        {"key": "progress_pct", "label": "进度%"},
+        {"key": "status", "label": "状态"},
+        {"key": "priority", "label": "优先级"},
+        {"key": "planned_due", "label": "交期"},
+    ],
+    "query_inventory": [
+        {"key": "material_code", "label": "物料编码"},
+        {"key": "material_id", "label": "物料ID"},
+        {"key": "warehouse_id", "label": "仓库"},
+        {"key": "batch_code", "label": "批次"},
+        {"key": "total_qty", "label": "总数量"},
+        {"key": "available_qty", "label": "可用"},
+        {"key": "reserved_qty", "label": "预留"},
+        {"key": "status", "label": "状态"},
+    ],
+    "query_defects": [
+        {"key": "record_code", "label": "记录编号"},
+        {"key": "defect_type", "label": "不良类型"},
+        {"key": "severity", "label": "严重度"},
+        {"key": "quantity", "label": "数量"},
+        {"key": "disposition", "label": "处置"},
+        {"key": "root_cause_category", "label": "根因分类"},
+        {"key": "description", "label": "描述"},
+        {"key": "created_at", "label": "时间"},
+    ],
+    "query_equipment": [
+        {"key": "equipment_code", "label": "设备编号"},
+        {"key": "equipment_name", "label": "设备名称"},
+        {"key": "equipment_type", "label": "类型"},
+        {"key": "status", "label": "状态"},
+        {"key": "station_id", "label": "工位"},
+    ],
+}
+
+# 工具结果中存放列表数据的字段名
+_TABLE_LIST_KEY: Dict[str, str] = {
+    "query_work_orders": "work_orders",
+    "query_inventory": "inventory",
+    "query_defects": "defects",
+    "query_equipment": "equipment",
+}
+
+# 生产汇总 → 指标型表格（指标/数值 两列）
+_SUMMARY_LABELS: Dict[str, str] = {
+    "date": "日期",
+    "today_good_output": "今日良品产出",
+    "today_defect": "今日不良数",
+    "yield_rate_pct": "良率(%)",
+    "today_report_count": "今日报工次数",
+    "active_work_orders": "在制工单",
+    "pending_work_orders": "待开工单",
+    "total_work_orders": "工单总数",
+    "equipment_total": "设备总数",
+    "equipment_running": "运行中设备",
+    "equipment_fault": "故障设备",
+    "equipment_utilization_pct": "设备利用率(%)",
+}
+
+
+def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """从查询工具结果中提取结构化表格数据，供前端渲染可交互表格/电子表格。
+
+    返回 {title, columns: [{key, label}], rows: [{...}]} 或 None（不适用表格的工具）。
+    """
+    # 指标汇总型 → 转为 指标/数值 两列表格
+    if tool_name == "get_production_summary":
+        rows = [
+            {"metric": _SUMMARY_LABELS.get(k, k), "value": v}
+            for k, v in result.items()
+            if k != "error"
+        ]
+        if not rows:
+            return None
+        return {
+            "title": "生产概况汇总",
+            "columns": [{"key": "metric", "label": "指标"}, {"key": "value", "label": "数值"}],
+            "rows": rows,
+        }
+
+    # 单条详情型 → 字段/值 两列表格
+    if tool_name == "get_work_order_detail":
+        label_map = {
+            "work_order_code": "工单号", "product_name": "产品", "planned_qty": "计划数",
+            "completed_qty": "完成数", "good_qty": "良品数", "defect_qty": "不良数",
+            "scrap_qty": "报废数", "progress_pct": "进度(%)", "status": "状态",
+            "priority": "优先级", "planned_due": "交期", "station_id": "工位",
+            "routing_step": "当前工序", "created_at": "创建时间", "actual_start": "实际开工",
+            "remark": "备注",
+        }
+        rows = [
+            {"field": label_map.get(k, k), "value": v}
+            for k, v in result.items()
+            if k not in ("id", "product_id", "error") and v is not None
+        ]
+        if not rows:
+            return None
+        return {
+            "title": f"工单详情 {result.get('work_order_code', '')}",
+            "columns": [{"key": "field", "label": "字段"}, {"key": "value", "label": "值"}],
+            "rows": rows,
+        }
+
+    # 列表型查询工具
+    list_key = _TABLE_LIST_KEY.get(tool_name)
+    columns = _TABLE_COLUMNS.get(tool_name)
+    if not list_key or not columns:
+        # ---- 流程知识工具：根据返回类型动态构建表格 ----
+        if tool_name == "query_process_knowledge":
+            return _extract_knowledge_table(result)
+        return None
+    items = result.get(list_key)
+    if not isinstance(items, list) or not items:
+        return None
+    return {
+        "title": TOOL_LABELS.get(tool_name, tool_name),
+        "columns": columns,
+        "rows": items,
+    }
+
+
+def _extract_knowledge_table(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """流程知识查询结果 → 结构化表格（工单流/职位SOP/RACI/概览）。"""
+    rtype = result.get("type", "")
+
+    # 工单全生命周期 / 单阶段
+    if rtype in ("work_order_flow", "work_order_stage"):
+        stages = result.get("stages") or []
+        if not stages:
+            return None
+        return {
+            "title": result.get("title", "工单流程"),
+            "columns": [
+                {"key": "stage", "label": "阶段"},
+                {"key": "status", "label": "状态"},
+                {"key": "role", "label": "负责角色"},
+                {"key": "actions", "label": "动作"},
+                {"key": "blockpoint", "label": "卡点/异常处理"},
+            ],
+            "rows": stages,
+        }
+
+    # 职位 SOP → 步骤表
+    if rtype == "position_sop":
+        pos = result.get("position") or {}
+        flow = pos.get("daily_flow") or []
+        if not flow:
+            return None
+        rows = [
+            {"step": s.get("step"), "task": s.get("task"), "detail": s.get("detail")}
+            for s in flow
+        ]
+        return {
+            "title": result.get("title", "职位SOP"),
+            "columns": [
+                {"key": "step", "label": "序号"},
+                {"key": "task", "label": "任务"},
+                {"key": "detail", "label": "说明"},
+            ],
+            "rows": rows,
+        }
+
+    # RACI 责任归属
+    if rtype == "who_handles":
+        raci = result.get("raci") or []
+        if not raci:
+            return None
+        return {
+            "title": result.get("title", "责任归属"),
+            "columns": [
+                {"key": "role", "label": "角色"},
+                {"key": "responsibility", "label": "RACI"},
+                {"key": "meaning", "label": "含义"},
+            ],
+            "rows": raci,
+        }
+
+    # 全阶段主要负责人
+    if rtype == "who_handles_all":
+        stages = result.get("stages") or []
+        if not stages:
+            return None
+        return {
+            "title": result.get("title", "各环节负责人"),
+            "columns": [
+                {"key": "stage", "label": "阶段"},
+                {"key": "status", "label": "状态"},
+                {"key": "primary_role", "label": "主要负责人"},
+                {"key": "blockpoint", "label": "卡点处理"},
+            ],
+            "rows": stages,
+        }
+
+    # 职位概览
+    if rtype == "position_overview":
+        positions = result.get("positions") or []
+        if not positions:
+            return None
+        return {
+            "title": result.get("title", "职位概览"),
+            "columns": [
+                {"key": "position", "label": "职位"},
+                {"key": "duties", "label": "核心职责"},
+                {"key": "steps", "label": "SOP步骤数"},
+            ],
+            "rows": positions,
+        }
+
+    return None
+
+
 # ==================== 流式输出（SSE） ====================
 
 def _sse(event: str, data: Any) -> str:
@@ -485,13 +708,14 @@ async def _stream_llm_tokens(payload: Dict[str, Any]):
 @router.post("/stream")
 async def chat_stream(
     request: ChatRequest,
+    http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """SSE 流式对话：工具执行实时推送 action 事件，最终回复逐 token 流式输出。"""
     model = request.model or MODEL
     operator = current_user.username or current_user.id
-    factory_id = current_user.factory_id
+    factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
 
     last_user = next(
         (m.content for m in reversed(request.messages) if m.role == "user"), ""
@@ -527,6 +751,11 @@ async def chat_stream(
                 yield _sse("delta", {"content": f"⚠️ 查询失败：{result.get('error')}"})
                 yield _sse("done", {"model": model, "degraded": False})
                 return
+
+            # 推送结构化表格数据（前端渲染可交互表格 + Univer 电子表格）
+            table_data = _extract_table_data(tool_name, result)
+            if table_data:
+                yield _sse("table", table_data)
 
             data_str = json.dumps(result, ensure_ascii=False, default=str)
             att_note = _attachment_text_note(att_records)

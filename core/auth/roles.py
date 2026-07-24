@@ -736,9 +736,10 @@ def get_menu_items_for_user(user) -> list:
         items.append({"key": "/simulation", "label": "仿真引擎"})
 
     # ━━━ 9. 人员 ━━━
-    if any(m in modules_with_access for m in ["hr", "skill_matrix", "training"]):
+    if any(m in modules_with_access for m in ["hr", "skill_matrix", "training"]) or is_admin:
         children = []
-        if "skill_matrix" in modules_with_access or "hr" in modules_with_access:
+        children.append({"key": "/hr-roster", "label": "人力档案"})
+        if "skill_matrix" in modules_with_access or "hr" in modules_with_access or is_admin:
             children.append({"key": "/skill-matrix", "label": "技能矩阵"})
         if children:
             items.append({"key": "g-hr", "label": "人员", "children": children})

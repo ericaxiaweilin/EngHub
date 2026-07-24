@@ -3,7 +3,7 @@ MES API Routes
 工单管理、生产报工、工艺路线、工位管理、设备管理
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from typing import Optional, List
 from pydantic import BaseModel
 from datetime import datetime
@@ -978,6 +978,33 @@ async def list_products(
         ],
         "total": len(products),
     }
+
+
+# ==================== 工单模板 ====================
+
+@router.get("/work-order-templates")
+async def list_work_order_templates(
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取当前工厂的工单模板列表"""
+    from sqlalchemy import text as sa_text
+    fid = (request.headers.get("x-factory-id") if request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
+    rows = (await db.execute(sa_text("""
+        SELECT id, factory_id, template_code, template_name, wo_type, description, default_priority, is_active
+        FROM work_order_templates
+        WHERE factory_id = :fid AND is_active = true
+        ORDER BY wo_type, template_code
+    """), {"fid": fid})).fetchall()
+    return [
+        {
+            "id": r[0], "factory_id": r[1], "template_code": r[2],
+            "template_name": r[3], "wo_type": r[4], "description": r[5],
+            "default_priority": r[6], "is_active": r[7],
+        }
+        for r in rows
+    ]
 
 
 __all__ = ["router"]

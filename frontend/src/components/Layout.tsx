@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Layout as AntLayout, Menu, Avatar, Space, Tag, Dropdown, Button } from 'antd'
+import { Layout as AntLayout, Menu, Avatar, Space, Tag, Dropdown, Button, Select, message } from 'antd'
 import { useTranslation } from 'react-i18next'
 import {
   DashboardOutlined,
@@ -29,6 +29,7 @@ import {
 } from '@ant-design/icons'
 import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
+import api from '../services/api'
 import RoleSwitcher from './RoleSwitcher'
 import AIAssistantWidget from './AIAssistantWidget'
 import GlobalSearch from './GlobalSearch'
@@ -110,7 +111,7 @@ const ROUTE_MODULE_MAP: [string, string][] = [
   ['/andon', 'g-collab'], ['/tms/', 'g-collab'], ['/quick-request', 'g-collab'],
   ['/war-room', 'g-collab'], ['/work-order-templates', 'g-collab'],
   ['/simulation', '/simulation'], ['/sim-erp', '/simulation'],
-  ['/skill-matrix', 'g-hr'],
+  ['/skill-matrix', 'g-hr'], ['/hr-roster', 'g-hr'],
   ['/dashboard', 'g-mes'], ['/production-data', 'g-mes'],
   ['/settings', '/settings'],
 ]
@@ -120,6 +121,49 @@ function getActiveModule(pathname: string): string | null {
     if (pathname.startsWith(prefix)) return group
   }
   return null
+}
+
+// ---------- 工厂切换器（仅开发账户可见） ----------
+const FactorySwitcher: React.FC = () => {
+  const [factories, setFactories] = useState<{ id: string; name: string; short_name: string }[]>([])
+  const [current, setCurrent] = useState(localStorage.getItem('active_factory_id') || '')
+
+  useEffect(() => {
+    api.get('/api/v1/hr/factories')
+      .then((res: any) => {
+        setFactories(res.items || [])
+        if (!current && res.items?.length > 0) {
+          setCurrent(res.items[0].id)
+          localStorage.setItem('active_factory_id', res.items[0].id)
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  const handleSwitch = async (fid: string) => {
+    try {
+      const res: any = await api.post('/api/v1/hr/factory/switch', { factory_id: fid })
+      localStorage.setItem('active_factory_id', fid)
+      setCurrent(fid)
+      message.success(`已切换到 ${res.factory_name}`)
+      // 刷新页面让所有模块重新加载数据
+      setTimeout(() => window.location.reload(), 600)
+    } catch {
+      message.error('切换失败')
+    }
+  }
+
+  return (
+    <Select
+      value={current || undefined}
+      onChange={handleSwitch}
+      size="small"
+      style={{ width: 110 }}
+      popupMatchSelectWidth={false}
+      options={factories.map(f => ({ value: f.id, label: f.short_name || f.name }))}
+      placeholder="工厂"
+    />
+  )
 }
 
 const Layout: React.FC = () => {
@@ -200,7 +244,13 @@ const Layout: React.FC = () => {
         <Space size={16}>
           {/* 全站搜索 */}
           <GlobalSearch />
-          {user?.factory_id && <Tag color="geekblue">{t('layout.factory')} {user.factory_id}</Tag>}
+          {/* 工厂切换器（仅开发账户） */}
+          {user && (user.is_superuser || user.username === 'eric') && (
+            <FactorySwitcher />
+          )}
+          {user?.factory_id && !(user.is_superuser || user.username === 'eric') && (
+            <Tag color="geekblue">{t('layout.factory')} {user.factory_id}</Tag>
+          )}
           
           {/* 测试模式：角色切换按钮 */}
           {testMode && (

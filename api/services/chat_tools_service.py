@@ -456,6 +456,40 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_hr_roster",
+            "description": "查询人力档案/花名册：按部门、工序、状态统计人员分布，或搜索具体员工。用于'人力''花名册''人员分布''多少人'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "department": {"type": "string", "description": "部门筛选（如 生产一部）"},
+                    "station": {"type": "string", "description": "工序/岗位筛选（如 焊接）"},
+                    "keyword": {"type": "string", "description": "姓名/工号模糊搜索"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_process_knowledge",
+            "description": "查询流程知识库：工单全生命周期流程（8阶段）、职位标准作业流程(SOP)、各环节责任归属(RACI)。"
+                           "用于'工单流程''品检员做什么''该找谁''SOP'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "enum": ["work_order_flow", "position_sop", "who_handles"],
+                        "description": "知识类型：work_order_flow=工单流程, position_sop=职位SOP, who_handles=责任归属",
+                    },
+                    "keyword": {"type": "string", "description": "过滤关键词（阶段名/职位名，如'下达''品检'）"},
+                },
+            },
+        },
+    },
 ]
 
 
@@ -1251,6 +1285,66 @@ async def _tool_run_alert_patrol(db: AsyncSession, args: Dict[str, Any], operato
     return result
 
 
+async def _tool_query_hr_roster(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """查询人力档案：按部门/工序统计 + 人员搜索"""
+    from sqlalchemy import text as sa_text
+    fid = factory_id or "FAC_MECH_001"
+    department = args.get("department")
+    station = args.get("station")
+    keyword = args.get("keyword")
+
+    # 统计概览
+    conditions = ["factory_id = :fid"]
+    params: Dict[str, Any] = {"fid": fid}
+    if department:
+        conditions.append("department = :dept")
+        params["dept"] = department
+    if station:
+        conditions.append("station = :station")
+        params["station"] = station
+    if keyword:
+        conditions.append("(name ILIKE :kw OR employee_code ILIKE :kw)")
+        params["kw"] = f"%{keyword}%"
+    where = " AND ".join(conditions)
+
+    total = (await db.execute(sa_text(f"SELECT count(*) FROM hr_employees WHERE {where}"), params)).scalar()
+    active = (await db.execute(sa_text(f"SELECT count(*) FROM hr_employees WHERE {where} AND status='active'"), params)).scalar()
+
+    # 按部门+工序统计
+    dept_rows = (await db.execute(sa_text(f"""
+        SELECT department, station, count(*) as cnt, count(*) FILTER (WHERE status='active') as act
+        FROM hr_employees WHERE {where}
+        GROUP BY department, station ORDER BY department, cnt DESC
+    """), params)).fetchall()
+
+    distribution = [
+        {"department": r[0], "station": r[1], "total": r[2], "active": r[3]}
+        for r in dept_rows
+    ]
+
+    # 如果有搜索关键词，返回具体人员列表（前20条）
+    employees = []
+    if keyword:
+        params["limit"] = 20
+        emp_rows = (await db.execute(sa_text(f"""
+            SELECT employee_code, name, gender, department, station, position, shift, skill_level, status
+            FROM hr_employees WHERE {where} ORDER BY department, station LIMIT :limit
+        """), params)).fetchall()
+        employees = [
+            {"code": r[0], "name": r[1], "gender": r[2], "department": r[3], "station": r[4],
+             "position": r[5], "shift": r[6], "skill": r[7], "status": r[8]}
+            for r in emp_rows
+        ]
+
+    return {
+        "factory_id": fid,
+        "total": total,
+        "active": active,
+        "distribution": distribution,
+        "employees": employees,
+    }
+
+
 # 执行器注册表
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
@@ -1278,7 +1372,18 @@ _TOOL_EXECUTORS = {
     "query_alert_reviews": _tool_query_alert_reviews,
     "acknowledge_alert": _tool_acknowledge_alert,
     "run_alert_patrol": _tool_run_alert_patrol,
+    "query_hr_roster": _tool_query_hr_roster,
+    "query_process_knowledge": None,  # 占位，下方单独定义（不依赖数据库）
 }
+
+
+async def _tool_query_process_knowledge(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """流程知识查询（纯知识库，不访问数据库）。"""
+    from api.services.process_knowledge_service import query_knowledge
+    return query_knowledge(topic=args.get("topic", ""), keyword=args.get("keyword", ""))
+
+
+_TOOL_EXECUTORS["query_process_knowledge"] = _tool_query_process_knowledge
 
 # 写操作工具（需要记录操作人）
 WRITE_TOOLS = {
@@ -1320,6 +1425,8 @@ TOOL_LABELS = {
     "query_alert_reviews": "预警审查记录",
     "acknowledge_alert": "确认预警",
     "run_alert_patrol": "预警巡检",
+    "query_hr_roster": "人力档案",
+    "query_process_knowledge": "流程知识",
 }
 
 
@@ -1405,6 +1512,28 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "巡检", "扫描异常", "主动巡检", "预警巡检", "扫描预警",
         ],
     },
+    {
+        "tool": "query_hr_roster",
+        "keywords": [
+            "人力", "花名册", "人员分布", "多少人", "人力档案", "员工",
+            "人事", "部门人数", "工序人数", "人力统计", "人员配置",
+            "编制", "人力配置", "车间人数",
+        ],
+    },
+    {
+        "tool": "query_process_knowledge",
+        "keywords": [
+            # 工单流
+            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
+            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
+            # 职位流
+            "品检员做什么", "操作员职责", "PMC流程", "主管职责", "仓管员职责",
+            "设备工程师职责", "日常工作流", "SOP", "标准作业", "岗位职责",
+            "职位流程", "工作流程是什么", "每天做什么",
+            # 责任归属
+            "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
+        ],
+    },
 ]
 
 
@@ -1477,6 +1606,36 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
         else:
             args["report_type"] = "production_summary"
         args["format"] = "csv" if any(k in message for k in ["csv", "CSV", "表格"]) else "json"
+    elif tool == "query_process_knowledge":
+        # 轻量提取 topic 与 keyword：
+        # 1) 责任归属类："该找谁/谁负责/卡在/超时找谁" → who_handles + 阶段关键词
+        if any(k in message for k in ["该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行"]):
+            args["topic"] = "who_handles"
+            for stage_kw in ["创建", "下达", "审批", "派工", "执行", "报工", "质检", "完工", "入库", "关闭"]:
+                if stage_kw in message:
+                    args["keyword"] = stage_kw
+                    break
+        # 2) 职位流类：消息含职位关键词 → position_sop
+        elif any(k in message for k in [
+            "品检", "操作员", "PMC", "计划员", "主管", "仓管", "设备工程",
+            "机修", "质检员", "IPQC", "生管", "岗位职责", "SOP", "标准作业",
+            "日常工作流", "每天做什么", "职位流程", "工作职责",
+        ]):
+            args["topic"] = "position_sop"
+            for pos_kw in ["品检", "操作员", "PMC", "计划员", "主管", "仓管", "设备工程", "机修", "质检", "IPQC", "生管"]:
+                if pos_kw in message:
+                    args["keyword"] = pos_kw
+                    break
+        # 3) 工单流类
+        elif any(k in message for k in [
+            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
+            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
+        ]):
+            args["topic"] = "work_order_flow"
+            for stage_kw in ["创建", "下达", "审批", "派工", "执行", "报工", "质检", "完工", "入库", "关闭"]:
+                if stage_kw in message:
+                    args["keyword"] = stage_kw
+                    break
     return {"tool": tool, "args": args}
 
 
