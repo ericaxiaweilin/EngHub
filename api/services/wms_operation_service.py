@@ -482,8 +482,8 @@ class WmsOperationService:
         """
         # 获取安全库存配置
         config_result = await self.db.execute(text("""
-            SELECT material_code, material_name, safety_stock, reorder_point, reorder_qty
-            FROM stock_safety_configs WHERE factory_id = :fid AND is_active = TRUE
+            SELECT material_code, material_name, safety_stock, reorder_point, max_stock
+            FROM safety_stock_config WHERE factory_id = :fid AND is_active = TRUE
         """), {"fid": factory_id})
         configs = [dict(r) for r in config_result.mappings().all()]
 
@@ -509,8 +509,9 @@ class WmsOperationService:
                 consumed_30d = consumption_result.scalar() or 0
                 daily_avg = consumed_30d / 30
 
-                # 补货量 = 配置量 或 安全库存*2 - 当前库存
-                suggested_qty = cfg.get("reorder_qty") or max(int(reorder_point * 2 - avail), 1)
+                # 补货量 = max_stock - 当前库存（或安全库存*2 - 当前）
+                max_stock = cfg.get("max_stock") or int(reorder_point * 2)
+                suggested_qty = max(int(max_stock - avail), 1)
 
                 suggestions.append({
                     "material_code": code,

@@ -163,11 +163,12 @@ class MaintenanceService:
 
         # 查找有保养周期且到期的设备
         result = await self.db.execute(text("""
-            SELECT DISTINCT equipment_id, equipment_name, frequency_days
+            SELECT equipment_id, equipment_name, frequency_days
             FROM maintenance_tasks
             WHERE factory_id = :fid AND frequency_days IS NOT NULL AND frequency_days > 0
                 AND status = 'completed'
-            ORDER BY completed_at DESC
+            GROUP BY equipment_id, equipment_name, frequency_days
+            ORDER BY MAX(completed_at) DESC
         """), {"fid": factory_id})
         completed = result.mappings().all()
 
