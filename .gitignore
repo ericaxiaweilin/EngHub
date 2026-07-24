@@ -49,3 +49,4 @@ htmlcov/
 mes-project-deploy.tar.gz
 .agnes/
 .deploy_tmp/
+uploads/
