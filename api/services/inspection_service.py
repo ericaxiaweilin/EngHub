@@ -311,6 +311,10 @@ class InspectionService:
 
     async def generate_inspection_plan(self, task_id: str, inspect_type: str) -> Dict[str, Any]:
         """根据检验类型自动生成检验项（替代质检员手动填写）"""
+        # 先检查任务是否存在
+        detail = await self.get_task_detail(task_id)
+        if "error" in detail:
+            return detail
         template = self.INSPECTION_TEMPLATES.get(inspect_type.upper(), self.INSPECTION_TEMPLATES["IQC"])
         await self.add_items(task_id, template)
         return {
