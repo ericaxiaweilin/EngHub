@@ -39,6 +39,7 @@ opentelemetry-sdk==1.29.0
 
 # Utilities
 tenacity==9.0.0
+openpyxl==3.1.5  # 解析 chatbot 上传的 Excel(.xlsx) 附件
 
 # Testing
 pytest==8.3.4

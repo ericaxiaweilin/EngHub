@@ -45,6 +45,9 @@ services:
       - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-gateway:4000}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-openai/qwen-plus}
+      # VL 视觉模型（图片多模态自动路由）
+      - LLM_VISION_URL=${LLM_VISION_URL:-http://host.docker.internal:8019}
+      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
     ports:
       - "18888:8000"
     depends_on:

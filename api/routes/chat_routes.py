@@ -38,6 +38,9 @@ API_KEY = os.getenv("LLM_API_KEY", "")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
 MAX_TOOL_ROUNDS = int(os.getenv("LLM_MAX_TOOL_ROUNDS", "5"))
+# Vision 模型（图片多模态路由）—— 带图片时自动切换到此模型
+VISION_URL = os.getenv("LLM_VISION_URL", "http://host.docker.internal:8019").rstrip("/")
+VISION_MODEL = os.getenv("LLM_VISION_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
 
 SYSTEM_PROMPT = (
     "你是 EngHub MES 制造执行系统的智能助手，可以直接操作系统完成用户的请求。"
@@ -50,8 +53,8 @@ SYSTEM_PROMPT = (
     "【工作流优先】当用户请求复合任务（如'帮我复盘今天生产'、'质量异常分诊'、'全面合规检查'、'建一个工单并下达'）时，"
     "优先调用 run_workflow 工具运行预置工作流（生产日度复盘/质量异常分诊/全面合规检查/一键建单下达），"
     "而不是逐个调用单步工具。\n"
-    "【多模态附件】用户可能上传图片或文件。若收到图片，请结合图片内容回答（如识别设备/工件/异常）；"
-    "若提示图片已存入文件库（当前不支持识图），请基于文字与附件信息回答并说明。\n"
+    "【多模态附件】用户可能上传图片或文件。若收到图片，请结合图片内容回答（如识别设备/工件/缺陷/图纸/仪表盘），"
+    "描述你看到的内容并给出专业判断；若收到文件，基于文字与附件信息回答。\n"
     "【严禁推诿】绝对不要回答“建议你进入XX看板/日报中心/实时看板查看”、"
     "“具体数值需结合你的实时数据源/PLC采集”这类把用户打发走的话。"
     "你能直接读到真实数据库，必须立即调用工具取数并以表格/清单形式呈现给用户。\n"
@@ -144,13 +147,15 @@ async def chat_tools():
     }
 
 
-async def _call_llm(payload: Dict[str, Any]) -> httpx.Response:
+async def _call_llm(payload: Dict[str, Any], use_vision: bool = False) -> httpx.Response:
+    """调用 LLM。use_vision=True 时路由到 VL 模型端点（支持图片多模态）。"""
+    base_url = VISION_URL if use_vision else GATEWAY_URL
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         return await client.post(
-            f"{GATEWAY_URL}/v1/chat/completions",
+            f"{base_url}/v1/chat/completions",
             json=payload,
             headers=headers,
         )
@@ -200,12 +205,104 @@ def _build_multimodal_content(text: str, image_records: List[FileRecord]) -> Any
     return parts
 
 
+# ---- Excel/CSV 附件解析（让模型真正"读到"表格内容，而非只知道文件名） ----
+
+_SPREADSHEET_CONTENT_TYPES = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+    "application/vnd.ms-excel",  # .xls
+    "text/csv",
+    "application/csv",
+)
+
+
+def _is_spreadsheet_record(rec: FileRecord) -> bool:
+    """判断附件是否为 Excel/CSV 表格文件（按扩展名 + content_type 双重识别）。"""
+    fn = (rec.filename or "").lower()
+    ct = (rec.content_type or "").lower()
+    return fn.endswith((".xlsx", ".xlsm", ".xls", ".csv")) or ct in _SPREADSHEET_CONTENT_TYPES
+
+
+def _parse_spreadsheet_record(
+    rec: FileRecord, max_rows: int = 100, max_cols: int = 20,
+) -> Optional[Dict[str, Any]]:
+    """解析 Excel/CSV 附件 → 结构化表格数据（与前端 TableData 结构一致）。
+
+    返回 {title, columns:[{key,label}], rows:[{...}]}；解析失败返回 None。
+    首行视作表头；截断 max_rows/max_cols 避免超大文件撑爆模型上下文。"""
+    try:
+        path = Path(rec.storage_path)
+        if not path.is_file():
+            return None
+        fn = (rec.filename or "").lower()
+        ct = (rec.content_type or "").lower()
+        grid: List[List[Any]] = []
+        if fn.endswith(".csv") or ct in ("text/csv", "application/csv"):
+            import csv as _csv
+            with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
+                for row in _csv.reader(f):
+                    grid.append(list(row))
+                    if len(grid) >= max_rows + 1:
+                        break
+        elif fn.endswith((".xlsx", ".xlsm")) or "spreadsheetml" in ct:
+            from openpyxl import load_workbook
+            wb = load_workbook(path, read_only=True, data_only=True)
+            try:
+                ws = wb.active
+                for row in ws.iter_rows(values_only=True, max_row=max_rows + 1):
+                    grid.append(list(row))
+            finally:
+                wb.close()
+        else:
+            return None  # .xls 等暂不支持的格式 → 退化为普通文件提示
+
+        # 去掉全空行
+        grid = [r for r in grid if any(c is not None and str(c).strip() != "" for c in r)]
+        if not grid:
+            return None
+
+        header = [
+            str(c).strip() if c is not None and str(c).strip() else f"列{i + 1}"
+            for i, c in enumerate(grid[0][:max_cols])
+        ]
+        columns = [{"key": f"c{i}", "label": h} for i, h in enumerate(header)]
+        rows: List[Dict[str, Any]] = []
+        for raw in grid[1:]:
+            rows.append({
+                f"c{i}": ("" if i >= len(raw) or raw[i] is None else str(raw[i]))
+                for i in range(len(header))
+            })
+        return {"title": rec.filename or "上传表格", "columns": columns, "rows": rows}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _spreadsheet_to_markdown(table: Dict[str, Any], max_rows: int = 30) -> str:
+    """把结构化表格渲染为 Markdown 表格文本，供模型直接阅读真实数据。"""
+    cols = table["columns"]
+    lines = ["| " + " | ".join(c["label"] for c in cols) + " |"]
+    lines.append("|" + "|".join(["---"] * len(cols)) + "|")
+    for r in table["rows"][:max_rows]:
+        lines.append("| " + " | ".join(str(r.get(c["key"], "")) for c in cols) + " |")
+    total = len(table["rows"])
+    if total > max_rows:
+        lines.append(f"\n（共 {total} 行，仅展示前 {max_rows} 行）")
+    return "\n".join(lines)
+
+
 def _attachment_text_note(records: List[FileRecord]) -> str:
-    """附件文字摘要（用于不支持 vision 时的优雅降级：告知模型已存为附件）。"""
+    """附件文字摘要。
+
+    - Excel/CSV：解析并渲染真实内容为 Markdown 表格，模型可直接读取分析；
+    - 图片/其他文件：仅告知文件名/类型/大小（用于不支持 vision 时的优雅降级）。"""
     if not records:
         return ""
     lines = ["\n\n【用户本次上传的附件（已存入系统文件库）】"]
     for rec in records:
+        if _is_spreadsheet_record(rec):
+            table = _parse_spreadsheet_record(rec)
+            if table:
+                lines.append(f"- 表格文件：{rec.filename}，真实内容如下：\n{_spreadsheet_to_markdown(table)}")
+                continue
         kind = "图片" if _is_image_record(rec) else "文件"
         lines.append(f"- {kind}：{rec.filename}（{rec.content_type or '未知类型'}，{rec.size} 字节）")
     return "\n".join(lines)
@@ -339,16 +436,30 @@ async def chat(
         "messages": messages,
         "temperature": request.temperature,
     }
-    if request.enable_tools:
+    # 图片多模态：自动路由到 VL 模型（VL 模型不支持 tool calling，纯视觉问答）
+    use_vision = bool(image_records)
+    if use_vision:
+        payload["model"] = VISION_MODEL
+    elif request.enable_tools:
         payload["tools"] = TOOL_DEFINITIONS
         payload["tool_choice"] = "auto"
 
-    # 多模态降级标记：网关/模型不支持 vision 时，剔除图片以纯文本重试
+    # 多模态降级标记：VL 模型不可用时，剔除图片以纯文本重试
     vision_dropped = False
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            resp = await _call_llm(payload)
+            try:
+                resp = await _call_llm(payload, use_vision=use_vision and not vision_dropped)
+            except Exception:
+                # VL 模型连接失败（未启动/网络不可达）→ 降级到主模型纯文本
+                if use_vision and not vision_dropped:
+                    vision_dropped = True
+                    payload["model"] = model
+                    payload["messages"] = _strip_images_from_messages(payload["messages"])
+                    resp = await _call_llm(payload)
+                else:
+                    raise
 
             # 网关不支持 tools 时（部分模型/网关返回 400），降级为纯问答重试一次
             if resp.status_code >= 400 and request.enable_tools and payload.get("tools"):
@@ -356,11 +467,11 @@ async def chat(
                 payload.pop("tool_choice", None)
                 resp = await _call_llm(payload)
 
-            # 网关/模型不支持 vision（仍 400 且带图片）→ 剔除图片转纯文本重试
+            # VL 模型不可用（连接失败/400）→ 剔除图片转纯文本走主模型
             if resp.status_code >= 400 and image_records and not vision_dropped:
                 vision_dropped = True
+                payload["model"] = model
                 payload["messages"] = _strip_images_from_messages(payload["messages"])
-                # 降级后以文字告知模型图片已存为附件，请其基于文字回答
                 note = _attachment_text_note(image_records)
                 if note:
                     payload["messages"].append({
@@ -728,6 +839,13 @@ async def chat_stream(
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
+
+        # ---- Excel/CSV 附件 → 推送结构化表格事件（前端渲染可交互表格 + Univer 电子表格） ----
+        for rec in att_records:
+            if _is_spreadsheet_record(rec):
+                tbl = _parse_spreadsheet_record(rec)
+                if tbl:
+                    yield _sse("table", tbl)
 
         # ---- 确定性业务底座：命中意图 → 执行工具 → 流式格式化 ----
         intent = resolve_intent(last_user) if request.enable_tools else None
