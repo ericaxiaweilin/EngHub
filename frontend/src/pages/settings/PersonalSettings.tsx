@@ -6,8 +6,9 @@
  */
 import React, { useState } from 'react'
 import { Card, Form, Input, Button, Avatar, Descriptions, Tag, Divider, message, Row, Col, Select, Switch } from 'antd'
-import { UserOutlined, LockOutlined, SettingOutlined, SafetyOutlined } from '@ant-design/icons'
+import { UserOutlined, LockOutlined, SettingOutlined, SafetyOutlined, GlobalOutlined } from '@ant-design/icons'
 import { getStoredUser } from '../../services/auth'
+import { APP_LOCALES, getStoredLocale, setStoredLocale } from '../../services/locale'
 import api from '../../services/api'
 
 const PersonalSettings: React.FC = () => {
@@ -36,7 +37,7 @@ const PersonalSettings: React.FC = () => {
   }
 
   return (
-    <div style={{ maxWidth: 800, margin: '0 auto' }}>
+    <div>
       <Row gutter={[16, 16]}>
         {/* 基本信息 */}
         <Col span={24}>
@@ -91,12 +92,12 @@ const PersonalSettings: React.FC = () => {
         <Col span={24} md={12}>
           <Card title={<><SettingOutlined /> 界面偏好</>} size="small">
             <Form layout="vertical">
-              <Form.Item label="界面语言">
-                <Select defaultValue="zh-CN" options={[
-                  { value: 'zh-CN', label: '简体中文' },
-                  { value: 'zh-TW', label: '繁體中文' },
-                  { value: 'en', label: 'English' },
-                ]} />
+              <Form.Item label={<span><GlobalOutlined /> 界面语言</span>}>
+                <Select
+                  value={getStoredLocale()}
+                  onChange={(v) => { setStoredLocale(v); message.success('语言已切换，部分界面文案将逐步生效') }}
+                  options={APP_LOCALES.map((l) => ({ value: l.value, label: l.label }))}
+                />
               </Form.Item>
               <Form.Item label="消息通知">
                 <Switch defaultChecked checkedChildren="开" unCheckedChildren="关" />

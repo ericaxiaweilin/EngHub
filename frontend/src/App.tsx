@@ -1,7 +1,7 @@
 import React from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { ConfigProvider } from 'antd'
-import zhCN from 'antd/locale/zh_CN'
+import { getAntdLocale, getStoredLocale, LOCALE_CHANGE_EVENT } from './services/locale'
 import Layout from './components/Layout'
 import Dashboard from './pages/Dashboard'
 import WorkOrderList from './pages/workorder/WorkOrderList'
@@ -27,8 +27,7 @@ import ApprovalCenter from './pages/tms/ApprovalCenter'
 import TaskDistribution from './pages/tms/TaskDistribution'
 import AgentConsole from './pages/tms/AgentConsole'
 import QuickRequest from './pages/tms/QuickRequest'
-import PersonalSettings from './pages/settings/PersonalSettings'
-import CodeTableSettings from './pages/settings/CodeTableSettings'
+import SystemSettings from './pages/settings/SystemSettings'
 
 // 纯色主题配置
 const theme = {
@@ -81,8 +80,16 @@ const PermissionGate: React.FC<{ path: string; children: React.ReactElement }> =
 }
 
 const App: React.FC = () => {
+  // 多语言：监听语言偏好变更，实时切换 antd locale
+  const [antdLocale, setAntdLocale] = React.useState(() => getAntdLocale(getStoredLocale()))
+  React.useEffect(() => {
+    const handler = () => setAntdLocale(getAntdLocale(getStoredLocale()))
+    window.addEventListener(LOCALE_CHANGE_EVENT, handler)
+    return () => window.removeEventListener(LOCALE_CHANGE_EVENT, handler)
+  }, [])
+
   return (
-    <ConfigProvider locale={zhCN} theme={theme}>
+    <ConfigProvider locale={antdLocale} theme={theme}>
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
@@ -117,8 +124,8 @@ const App: React.FC = () => {
             <Route path="tms/distribution" element={<PermissionGate path="/tms/distribution"><TaskDistribution /></PermissionGate>} />
             <Route path="tms/agent" element={<PermissionGate path="/tms/agent"><AgentConsole /></PermissionGate>} />
             <Route path="quick-request" element={<QuickRequest />} />
-            <Route path="settings" element={<PersonalSettings />} />
-            <Route path="settings/code-tables" element={<CodeTableSettings />} />
+            <Route path="settings" element={<SystemSettings />} />
+            <Route path="settings/code-tables" element={<SystemSettings defaultTab="codetables" />} />
             {/* v2.5 Smart Collaboration */}
             <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />

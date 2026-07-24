@@ -120,10 +120,7 @@ const Layout: React.FC = () => {
         disabled: true,
       },
       { type: 'divider' as const },
-      { key: 'settings', icon: <SettingOutlined />, label: '个人设置', onClick: () => navigate('/settings') },
-      ...(user?.role === 'admin' || user?.role === 'super_admin'
-        ? [{ key: 'code-tables', icon: <SettingOutlined />, label: '码表管理', onClick: () => navigate('/settings/code-tables') }]
-        : []),
+      { key: 'settings', icon: <SettingOutlined />, label: '系统设置', onClick: () => navigate('/settings') },
       { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
     ],
   }
