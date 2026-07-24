@@ -10,6 +10,7 @@ import {
   ToolOutlined, SafetyCertificateOutlined, DesktopOutlined, ApiOutlined,
   ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined,
   AlertOutlined, ExperimentOutlined, PhoneOutlined,
+  PaperClipOutlined, FileOutlined, DownloadOutlined,
 } from '@ant-design/icons'
 import api from '../services/api'
 import { tmsApi } from '../services/tms'
@@ -46,7 +47,17 @@ interface ToolAction {
   arguments: Record<string, any>
   result: Record<string, any>
   is_write: boolean
+  is_sim?: boolean
   success: boolean
+}
+
+// ---------- 附件（随消息上传的图片/文件） ----------
+interface MsgAttachment {
+  file_id: string
+  filename: string
+  content_type?: string
+  is_image?: boolean
+  size?: number
 }
 
 // ---------- 聊天消息 ----------
@@ -56,6 +67,7 @@ interface ChatMsg {
   time: string
   degraded?: boolean
   actions?: ToolAction[]
+  attachments?: MsgAttachment[]
 }
 
 // ---------- 快捷指令 ----------
@@ -65,6 +77,8 @@ const QUICK_COMMANDS = [
   '查询库存水平',
   '最近有哪些不良品？',
   '设备运行状态如何？',
+  '跑一次高温加班合规仿真',
+  '最近的仿真审计记录',
 ]
 
 // ---------- IM 聊天消息 ----------
@@ -112,6 +126,12 @@ export default function AIAssistantWidget() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
+  // 待发送附件（先调 /files/upload 拿 file_id，再随消息提交）
+  const [pendingAttachments, setPendingAttachments] = useState<MsgAttachment[]>([])
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  // 可用工作流清单（从 /chat/tools 拉取，供快捷指令区展示）
+  const [workflows, setWorkflows] = useState<{ name: string; label: string; needs_params: boolean }[]>([])
   // IM 未读
   const [unread, setUnread] = useState<Record<string, number>>({ c2: 1, c3: 2 })
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null)
@@ -132,6 +152,13 @@ export default function AIAssistantWidget() {
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight
   }, [messages, loading])
+
+  // 拉取可用工作流（仅展示无需参数的确定性流程，点击即触发）
+  useEffect(() => {
+    api.get('/api/v1/chat/tools')
+      .then((res: any) => setWorkflows((res.workflows || []).filter((w: any) => !w.needs_params)))
+      .catch(() => { /* 网关/后端未就绪时不展示工作流快捷指令 */ })
+  }, [])
 
   // ---------- 拖拽逻辑 ----------
   const onHeaderMouseDown = useCallback((e: React.MouseEvent) => {
@@ -218,14 +245,25 @@ export default function AIAssistantWidget() {
   // ---------- 发送消息 ----------
   const sendMessage = async (preset?: string) => {
     const text = (preset ?? input).trim()
-    if (!text || loading) return
+    if (loading) return
+    if (!text && pendingAttachments.length === 0) return
+    const atts = [...pendingAttachments]
     setInput('')
-    const history = [...messages, { role: 'user' as const, content: text, time: now() }]
+    setPendingAttachments([])
+    const userMsg: ChatMsg = { role: 'user', content: text, time: now(), attachments: atts }
+    const history = [...messages, userMsg]
     setMessages(history)
     setLoading(true)
     try {
-      const payload = {
+      const payload: any = {
         messages: history.slice(-10).map(m => ({ role: m.role, content: m.content })),
+      }
+      // 附件随最后一条用户消息提交（后端按 file_id 加载，图片走多模态）
+      if (atts.length > 0) {
+        payload.attachments = atts.map(a => ({
+          file_id: a.file_id,
+          kind: a.is_image ? 'image' : 'file',
+        }))
       }
       const res: any = await api.post('/api/v1/chat', payload)
       setMessages(prev => [...prev, {
@@ -244,6 +282,58 @@ export default function AIAssistantWidget() {
       }])
     } finally {
       setLoading(false)
+    }
+  }
+
+  // ---------- 选择并上传附件 → 拿 file_id 暂存，随下一条消息提交 ----------
+  const onPickFiles = () => {
+    if (!loading && !uploading) fileInputRef.current?.click()
+  }
+
+  const onFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    e.target.value = ''  // 重置，允许重复选择同名文件
+    if (files.length === 0) return
+    setUploading(true)
+    try {
+      for (const f of files) {
+        const fd = new FormData()
+        fd.append('file', f)
+        const res: any = await api.post('/api/v1/files/upload', fd)
+        setPendingAttachments(prev => [...prev, {
+          file_id: res.id,
+          filename: res.filename,
+          content_type: res.content_type,
+          is_image: res.is_image,
+          size: res.size,
+        }])
+      }
+    } catch {
+      message.error('附件上传失败')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // ---------- 下载系统文件（带鉴权 token，导出报告/附件通用） ----------
+  const downloadSystemFile = async (fileId: string, filename?: string) => {
+    try {
+      const token = localStorage.getItem('token')
+      const resp = await fetch(`/api/v1/files/${fileId}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename || fileId
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch {
+      message.error('下载失败（可能无权访问或文件不存在）')
     }
   }
 
@@ -463,6 +553,29 @@ export default function AIAssistantWidget() {
                             whiteSpace: 'pre-wrap',
                             wordBreak: 'break-word',
                           }}>
+                            {/* 消息附件（用户上传的图片/文件） */}
+                            {m.attachments && m.attachments.length > 0 && (
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                                {m.attachments.map((att, ai) => (
+                                  att.is_image ? (
+                                    <img
+                                      key={ai}
+                                      src={`/api/v1/files/${att.file_id}`}
+                                      alt={att.filename}
+                                      style={{ maxWidth: 120, maxHeight: 120, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(0,0,0,0.08)' }}
+                                    />
+                                  ) : (
+                                    <div key={ai} style={{
+                                      display: 'flex', alignItems: 'center', gap: 4,
+                                      background: m.role === 'user' ? 'rgba(255,255,255,0.18)' : '#fafafa',
+                                      border: '1px solid rgba(0,0,0,0.08)', borderRadius: 6, padding: '4px 8px', fontSize: 11,
+                                    }}>
+                                      <FileOutlined /> {att.filename}
+                                    </div>
+                                  )
+                                ))}
+                              </div>
+                            )}
                             {m.content}
                             {/* AI 已执行的操作 */}
                             {m.role === 'assistant' && m.actions && m.actions.length > 0 && (
@@ -470,11 +583,56 @@ export default function AIAssistantWidget() {
                                 <Text type="secondary" style={{ fontSize: 11 }}>
                                   <ThunderboltOutlined /> 已执行 {m.actions.length} 个操作
                                 </Text>
-                                {m.actions.map((a, idx) => (
+                                {m.actions.map((a, idx) => {
+                                  // 工作流 → 流程卡片（步骤序号 + 每步工具/结果/成功状态），区别于单工具卡片
+                                  if (a.tool === 'run_workflow' && a.result && Array.isArray(a.result.steps)) {
+                                    const wf = a.result
+                                    return (
+                                      <div key={idx} style={{
+                                        marginTop: 4,
+                                        background: '#fff7e6',
+                                        border: '1px solid #ffd591',
+                                        borderRadius: 6,
+                                        padding: '6px 8px',
+                                        fontSize: 11,
+                                      }}>
+                                        <Space size={4}>
+                                          {wf.success
+                                            ? <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                                            : <CloseCircleOutlined style={{ color: '#f5222d' }} />}
+                                          <Text strong style={{ fontSize: 11 }}>{wf.label || a.label}</Text>
+                                          <Tag color="orange" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>
+                                            工作流 {wf.completed_steps}/{wf.total_steps}
+                                          </Tag>
+                                        </Space>
+                                        <div style={{ marginTop: 4 }}>
+                                          {wf.steps.map((s: any, si: number) => (
+                                            <div key={si} style={{ display: 'flex', alignItems: 'flex-start', gap: 4, marginTop: 2 }}>
+                                              <Text type="secondary" style={{ fontSize: 10, flexShrink: 0, lineHeight: '18px' }}>{si + 1}.</Text>
+                                              {s.success
+                                                ? <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 11, marginTop: 3 }} />
+                                                : <CloseCircleOutlined style={{ color: '#f5222d', fontSize: 11, marginTop: 3 }} />}
+                                              <Text style={{ fontSize: 11, lineHeight: '18px' }}>{s.label}</Text>
+                                              {s.result && s.result.error && (
+                                                <Text type="danger" style={{ fontSize: 10, lineHeight: '18px' }}>：{s.result.error}</Text>
+                                              )}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )
+                                  }
+                                  // 色标：仿真=紫 / 写操作=绿 / 查询=蓝
+                                  const tone = a.is_sim
+                                    ? { bg: '#f9f0ff', bd: '#d3adf7', tag: 'purple' as const, text: '仿真' }
+                                    : a.is_write
+                                      ? { bg: '#f6ffed', bd: '#b7eb8f', tag: 'green' as const, text: '写操作' }
+                                      : { bg: '#f0f5ff', bd: '#adc6ff', tag: 'blue' as const, text: '查询' }
+                                  return (
                                   <div key={idx} style={{
                                     marginTop: 4,
-                                    background: a.is_write ? '#f6ffed' : '#f0f5ff',
-                                    border: `1px solid ${a.is_write ? '#b7eb8f' : '#adc6ff'}`,
+                                    background: tone.bg,
+                                    border: `1px solid ${tone.bd}`,
                                     borderRadius: 6,
                                     padding: '4px 8px',
                                     fontSize: 11,
@@ -484,20 +642,46 @@ export default function AIAssistantWidget() {
                                         ? <CheckCircleOutlined style={{ color: '#52c41a' }} />
                                         : <CloseCircleOutlined style={{ color: '#f5222d' }} />}
                                       <Text strong style={{ fontSize: 11 }}>{a.label}</Text>
-                                      <Tag color={a.is_write ? 'green' : 'blue'} style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>
-                                        {a.is_write ? '写操作' : '查询'}
+                                      <Tag color={tone.tag} style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>
+                                        {tone.text}
                                       </Tag>
                                     </Space>
                                     {a.result && a.result.error && (
                                       <div style={{ color: '#f5222d', marginTop: 2 }}>{a.result.error}</div>
                                     )}
                                   </div>
-                                ))}
+                                  )
+                                })}
                               </div>
                             )}
                             {m.degraded && m.role === 'assistant' && (
                               <div style={{ marginTop: 4 }}>
                                 <Tag color="orange" style={{ fontSize: 10 }}>离线降级模式</Tag>
+                              </div>
+                            )}
+                            {/* AI 生成的文件（导出报告等）→ 可下载卡片 */}
+                            {m.role === 'assistant' && m.actions && m.actions.some(a => a.result && a.result.file_id) && (
+                              <div style={{ marginTop: 6 }}>
+                                {m.actions.filter(a => a.result && a.result.file_id).map((a, fi) => (
+                                  <div key={fi}
+                                    onClick={() => downloadSystemFile(a.result.file_id, a.result.filename)}
+                                    style={{
+                                      display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+                                      background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6,
+                                      padding: '6px 10px', marginTop: 4,
+                                    }}>
+                                    <FileOutlined style={{ color: '#52c41a', fontSize: 16 }} />
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                      <div style={{ fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {a.result.filename || '导出文件'}
+                                      </div>
+                                      <div style={{ fontSize: 10, color: '#999' }}>
+                                        {(a.result.content_type || '')}{a.result.size ? ` · ${a.result.size} 字节` : ''}
+                                      </div>
+                                    </div>
+                                    <DownloadOutlined style={{ color: '#52c41a' }} />
+                                  </div>
+                                ))}
                               </div>
                             )}
                             <div style={{
@@ -534,17 +718,61 @@ export default function AIAssistantWidget() {
                           {cmd}
                         </Tag>
                       ))}
+                      {/* 可用工作流（橙色区分，点击即触发确定性流程） */}
+                      {workflows.map(wf => (
+                        <Tag
+                          key={wf.name}
+                          color="orange"
+                          style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px' }}
+                          onClick={() => !loading && sendMessage(wf.label)}
+                        >
+                          <ThunderboltOutlined /> {wf.label}
+                        </Tag>
+                      ))}
                     </div>
                     {/* 输入区 */}
                     <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                      {/* 待发送附件预览（上传后、发送前可移除） */}
+                      {pendingAttachments.length > 0 && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                          {pendingAttachments.map((att, i) => (
+                            <div key={att.file_id} style={{
+                              position: 'relative', display: 'flex', alignItems: 'center',
+                              border: '1px solid #d9d9d9', borderRadius: 6, overflow: 'hidden', background: '#fafafa',
+                            }}>
+                              {att.is_image ? (
+                                <img src={`/api/v1/files/${att.file_id}`} alt={att.filename}
+                                  style={{ width: 40, height: 40, objectFit: 'cover' }} />
+                              ) : (
+                                <span style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 8px', fontSize: 11, maxWidth: 140 }}>
+                                  <FileOutlined /> <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{att.filename}</span>
+                                </span>
+                              )}
+                              <CloseOutlined
+                                onClick={() => setPendingAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                                style={{
+                                  position: 'absolute', top: 2, right: 2, fontSize: 10, cursor: 'pointer',
+                                  color: '#fff', background: 'rgba(0,0,0,0.5)', borderRadius: '50%', padding: 2,
+                                }} />
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       <Space.Compact style={{ width: '100%' }}>
+                        <Button
+                          icon={<PaperClipOutlined />}
+                          onClick={onPickFiles}
+                          loading={uploading}
+                          title="上传图片/文件"
+                          style={{ borderRadius: '8px 0 0 8px' }}
+                        />
                         <TextArea
                           value={input}
                           onChange={e => setInput(e.target.value)}
                           onPressEnter={e => { if (!e.shiftKey) { e.preventDefault(); sendMessage() } }}
                           placeholder="输入问题，Enter 发送..."
                           autoSize={{ minRows: 1, maxRows: 3 }}
-                          style={{ borderRadius: '8px 0 0 8px' }}
+                          style={{ borderRadius: 0 }}
                         />
                         <Button
                           type="primary"
@@ -554,6 +782,14 @@ export default function AIAssistantWidget() {
                           style={{ borderRadius: '0 8px 8px 0', height: 'auto' }}
                         />
                       </Space.Compact>
+                      {/* 隐藏的文件选择框（图片+文件多选） */}
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        style={{ display: 'none' }}
+                        onChange={onFilesSelected}
+                      />
                     </div>
               </div>
             )}

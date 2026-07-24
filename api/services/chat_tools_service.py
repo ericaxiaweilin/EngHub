@@ -11,6 +11,10 @@ Chatbot MES 工具服务（Tool Calling）
 
 from __future__ import annotations
 
+import csv
+import io
+import json
+import re
 import uuid
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
@@ -20,13 +24,26 @@ from sqlalchemy import select, func
 
 from database.models import (
     WorkOrder, ProductionReport, Station, Equipment, Product,
-    Inventory, DefectRecord, User,
+    Inventory, DefectRecord, User, Routing, FileRecord, QualityInspection,
 )
 from core.mes.work_order_coding import (
     generate_master_work_order_code,
     derive_operation_work_orders,
 )
 from api.services.work_order_service import WorkOrderService, WoPermissionError
+from api.services.employee_skill_service import EmployeeSkillService
+from api.services.sim_erp_audit_service import SimERPAuditService
+from core.sim_erp.engine import SimERPEngine
+from core.sim_erp.models import (
+    ActionType, EnvironmentSnapshot, PhysicalInput, WorkContext,
+)
+from core.sim_erp.plugins.registry import build_default_registry
+
+
+# ==================== Sim-ERP 仿真引擎（模块级单例，直连引擎不走 HTTP） ====================
+_sim_engine = SimERPEngine()
+_sim_registry = build_default_registry()
+DEFAULT_SIM_PLUGINS = ["VN_Legal_2024", "Johnson_Global_Standard", "Factory_Policy_Default"]
 
 
 # ==================== 工具定义（OpenAI function-calling 格式） ====================
@@ -42,7 +59,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "properties": {
                     "status": {
                         "type": "string",
-                        "enum": ["pending", "released", "in_progress", "completed", "cancelled", "on_hold"],
+                        "enum": ["draft", "pending", "released", "in_progress", "completed", "cancelled", "on_hold"],
                         "description": "工单状态过滤，不传则返回全部",
                     },
                     "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
@@ -172,6 +189,211 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "shift": {"type": "string", "enum": ["day", "night"], "description": "班次，默认day", "default": "day"},
                 },
                 "required": ["work_order_id", "station_id", "good_qty"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_compliance_simulation",
+            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/连续作业时长/负重/姿势等），返回合规判定、违规规则、疲劳分、所需休息等。所有参数可选，默认一个标准装配场景。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_type": {"type": "string", "description": "作业类型，如 assembly装配/inspect检验，默认assembly"},
+                    "continuous_work_minutes": {"type": "integer", "description": "连续作业分钟数，默认240"},
+                    "temperature_c": {"type": "number", "description": "环境温度（摄氏度），默认30"},
+                    "humidity_percent": {"type": "number", "description": "湿度百分比，默认60"},
+                    "load_weight_kg": {"type": "number", "description": "负重（公斤），默认0"},
+                    "posture_angle_deg": {"type": "number", "description": "姿势角度（0-180），默认0"},
+                    "step_count": {"type": "integer", "description": "步数，默认3000"},
+                    "action_type": {"type": "string", "enum": ["walk", "lift", "push", "pull", "assemble", "inspect", "idle"], "description": "动作类型，默认walk"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_simulation_audits",
+            "description": "查询历史合规仿真审计记录。返回仿真ID、作业场景、最终状态、是否违法阻断、所需休息、罚分、时间。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_work_order",
+            "description": "完工工单（需品质角色：厂长/品质经理）。会校验实际产出与父子工单完工约束。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "work_order_code": {"type": "string", "description": "工单号或工单ID"},
+                    "completed_qty": {"type": "integer", "description": "完工数量（可选，不传则用已有报工数量）"},
+                    "good_qty": {"type": "integer", "description": "良品数（可选）"},
+                    "defect_qty": {"type": "integer", "description": "不良数（可选）"},
+                },
+                "required": ["work_order_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pause_work_order",
+            "description": "暂停工单（将生产中工单挂起）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "work_order_code": {"type": "string", "description": "工单号或工单ID"},
+                    "reason": {"type": "string", "description": "暂停原因，可选"},
+                },
+                "required": ["work_order_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resume_work_order",
+            "description": "恢复已暂停的工单。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "work_order_code": {"type": "string", "description": "工单号或工单ID"},
+                    "reason": {"type": "string", "description": "恢复原因，可选"},
+                },
+                "required": ["work_order_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "split_work_order",
+            "description": "拆分工单：从主工单拆出指定数量作为子工单（主工单量相应扣减，子工单全部完工后主工单才能完工）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "work_order_code": {"type": "string", "description": "待拆分工单号或ID"},
+                    "split_qty": {"type": "integer", "description": "拆分数量（须小于计划量）"},
+                    "remark": {"type": "string", "description": "备注，可选"},
+                },
+                "required": ["work_order_code", "split_qty"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_routing",
+            "description": "查询产品工艺路线（加工步骤/工序）。可按工艺编码或产品关键词过滤。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "工艺编码或产品ID关键词，可选"},
+                    "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_skill_matrix",
+            "description": "查询员工技能矩阵（人员-技能-等级）。可按部门/技能类别过滤，默认查当前工厂。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "department": {"type": "string", "description": "部门/厂区，可选（默认当前工厂）"},
+                    "skill_category": {"type": "string", "description": "技能类别，可选"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_workflow",
+            "description": (
+                "运行预置的 Agent 工作流（多工具编排成可复用流程）。可选工作流："
+                "daily_production_review(生产日度复盘)、"
+                "create_and_release(一键建单下达，需 params={product_id, planned_qty, planned_due})、"
+                "quality_alert_triage(质量异常分诊)、"
+                "full_compliance_check(全面合规检查)。"
+                "当用户请求复合任务（如'帮我复盘今天生产'）时优先调用本工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workflow_name": {
+                        "type": "string",
+                        "enum": [
+                            "daily_production_review", "create_and_release",
+                            "quality_alert_triage", "full_compliance_check",
+                        ],
+                        "description": "工作流名称",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "工作流用户参数。create_and_release 需要 {product_id, planned_qty, planned_due}；其余工作流可不传。",
+                    },
+                },
+                "required": ["workflow_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_work_order_form",
+            "description": "拉取工单完整表单结构：含工单全字段、进度、子工单明细、状态操作日志（审核追溯）。用于「工单表单」类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "work_order_code": {"type": "string", "description": "工单号或工单ID"},
+                },
+                "required": ["work_order_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_inspection_form",
+            "description": "拉取质量检验单表单（IQC/IPQC/FQC/OQC）：检验类型、检验员、抽样数、不良数、判定结果、缺陷明细。可按工单/检验类型过滤。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "work_order_code": {"type": "string", "description": "按工单号过滤，可选"},
+                    "inspect_type": {"type": "string", "enum": ["IQC", "IPQC", "FQC", "OQC"], "description": "检验类型过滤，可选"},
+                    "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "export_report_file",
+            "description": "把生产汇总或工单表单导出为文件（JSON/CSV），写入系统文件表并返回下载链接。用于「导出报告/生成报表」类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report_type": {
+                        "type": "string",
+                        "enum": ["production_summary", "work_order"],
+                        "description": "报告类型：production_summary生产汇总（默认）/ work_order工单表单",
+                        "default": "production_summary",
+                    },
+                    "work_order_code": {"type": "string", "description": "工单号（report_type=work_order 时必填）"},
+                    "format": {"type": "string", "enum": ["json", "csv"], "description": "文件格式，默认json", "default": "json"},
+                },
             },
         },
     },
@@ -402,7 +624,7 @@ async def _tool_create_work_order(db: AsyncSession, args: Dict[str, Any], operat
         planned_qty=planned_qty,
         planned_due=planned_due,
         priority=priority,
-        status="pending",
+        status="draft",  # 与服务层建单一致：主工单为草稿态，方可走 release 下达（职责分离门槛）
         created_by=operator,
         wo_type="master",
     )
@@ -419,7 +641,7 @@ async def _tool_create_work_order(db: AsyncSession, args: Dict[str, Any], operat
         "product_name": product.product_name,
         "planned_qty": planned_qty,
         "planned_due": planned_due_str,
-        "status": "pending（待下达）",
+        "status": "draft（草稿，待下达）",
         "operation_count": len(operations),
         "operation_codes": [op.work_order_code for op in operations],
     }
@@ -503,6 +725,430 @@ async def _tool_create_production_report(db: AsyncSession, args: Dict[str, Any],
     }
 
 
+# ==================== 仿真 / 扩展操作 工具执行器 ====================
+
+async def _resolve_work_order(db: AsyncSession, code_or_id: str, factory_id: Optional[str] = None) -> Optional[WorkOrder]:
+    """按 ID 或工单号（支持模糊）定位工单。"""
+    if not code_or_id:
+        return None
+    wo = (await db.execute(select(WorkOrder).where(WorkOrder.id == code_or_id))).scalar_one_or_none()
+    if wo:
+        return wo
+    stmt = select(WorkOrder).where(WorkOrder.work_order_code == code_or_id)
+    if factory_id:
+        stmt = stmt.where(WorkOrder.factory_id == factory_id)
+    wo = (await db.execute(stmt)).scalar_one_or_none()
+    if wo:
+        return wo
+    stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code_or_id}%")).limit(1)
+    if factory_id:
+        stmt = stmt.where(WorkOrder.factory_id == factory_id)
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def _get_user_by_name(db: AsyncSession, operator: str) -> Optional[User]:
+    return (await db.execute(select(User).where(User.username == operator))).scalar_one_or_none()
+
+
+async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    """运行 Sim-ERP 合规仿真（直连引擎），落审计记录并返回判定摘要。"""
+    task_type = args.get("task_type") or "assembly"
+    action_raw = (args.get("action_type") or "walk").lower()
+    action = action_raw if action_raw in [a.value for a in ActionType] else "walk"
+    try:
+        env = EnvironmentSnapshot(
+            temperature_c=float(args.get("temperature_c", 30.0)),
+            humidity_percent=float(args.get("humidity_percent", 60.0)),
+        )
+        wc = WorkContext(
+            task_type=task_type,
+            zone_id=args.get("zone_id") or "line-a",
+            shift_id=args.get("shift_id") or "shift-day",
+            worker_ref=args.get("worker_ref") or "worker-001",
+            action_type=ActionType(action),
+        )
+        phys = PhysicalInput(
+            time_step_minutes=float(args.get("time_step_minutes", 30.0)),
+            step_count=int(args.get("step_count", 3000)),
+            load_weight_kg=float(args.get("load_weight_kg", 0.0)),
+            posture_angle_deg=float(args.get("posture_angle_deg", 0.0)),
+            continuous_work_minutes=int(args.get("continuous_work_minutes", 240)),
+            environment=env,
+            work_context=wc,
+        )
+    except Exception as exc:  # 参数越界等 pydantic 校验失败
+        return {"error": f"仿真参数不合法：{exc}"}
+
+    plugins = _sim_registry.create_many(DEFAULT_SIM_PLUGINS)
+    record = _sim_engine.evaluate(phys, plugins)
+
+    # 落审计记录（独立事务，失败不影响返回仿真结果）
+    try:
+        await SimERPAuditService(db).create_audit_log(record)
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+
+    arb = record.arbiter_result
+    snap = record.snapshot
+    return {
+        "success": True,
+        "message": "合规仿真完成",
+        "simulation_id": record.simulation_id,
+        "final_status": arb.final_status,
+        "legal_blocked": arb.legal_blocked,
+        "fatigue_score": round(snap.fatigue_score, 1),
+        "energy_kcal": round(snap.energy_kcal, 1),
+        "max_required_break_minutes": arb.max_required_break_minutes,
+        "total_penalty_score": arb.total_penalty_score,
+        "blocking_rules": [d.rule_code for d in arb.blocking_decisions],
+        "warnings": [d.rule_code for d in arb.warnings],
+        "applied_actions": [
+            {"action_code": a.action_code, "description": a.description, "break_minutes": a.break_minutes}
+            for a in arb.applied_actions
+        ],
+        "decision_count": len(arb.decisions),
+        "scenario": {
+            "task_type": task_type,
+            "continuous_work_minutes": snap.continuous_work_minutes,
+            "temperature_c": snap.environment.temperature_c,
+            "load_weight_kg": snap.load_weight_kg,
+            "posture_angle_deg": snap.posture_angle_deg,
+        },
+    }
+
+
+async def _tool_query_simulation_audits(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """查询历史合规仿真审计记录（审计表无工厂列，不作工厂过滤）。"""
+    limit = min(int(args.get("limit", 10)), 50)
+    entities, total = await SimERPAuditService(db).list_audit_logs(page=1, page_size=limit)
+    items = [
+        {
+            "simulation_id": e.simulation_id,
+            "worker_ref": e.worker_ref,
+            "task_type": e.task_type,
+            "zone_id": e.zone_id,
+            "final_status": e.final_status,
+            "legal_blocked": e.legal_blocked,
+            "max_required_break_minutes": e.max_required_break_minutes,
+            "total_penalty_score": e.total_penalty_score,
+            "created_at": e.created_at.strftime("%Y-%m-%d %H:%M") if e.created_at else None,
+        }
+        for e in entities
+    ]
+    return {"count": len(items), "total": total, "audits": items}
+
+
+async def _tool_complete_work_order(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    ref = args.get("work_order_code") or args.get("work_order_id") or ""
+    wo = await _resolve_work_order(db, ref)
+    if not wo:
+        return {"error": f"未找到工单 {ref}"}
+    user = await _get_user_by_name(db, operator)
+
+    def _opt_int(key):
+        v = args.get(key)
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        wo = await WorkOrderService(db).complete_work_order(
+            wo.id,
+            completed_qty=_opt_int("completed_qty"),
+            good_qty=_opt_int("good_qty"),
+            defect_qty=_opt_int("defect_qty"),
+            user=user,
+        )
+    except (WoPermissionError, ValueError) as e:
+        return {"error": str(e)}
+    if not wo:
+        return {"error": "完工失败"}
+    return {
+        "success": True,
+        "message": f"工单 {wo.work_order_code} 已完工",
+        "work_order_code": wo.work_order_code,
+        "status": wo.status,
+        "completed_qty": wo.completed_qty,
+        "good_qty": wo.good_qty,
+        "defect_qty": wo.defect_qty,
+    }
+
+
+async def _tool_pause_work_order(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    ref = args.get("work_order_code") or args.get("work_order_id") or ""
+    wo = await _resolve_work_order(db, ref)
+    if not wo:
+        return {"error": f"未找到工单 {ref}"}
+    user = await _get_user_by_name(db, operator)
+    try:
+        wo = await WorkOrderService(db).pause_work_order(wo.id, reason=args.get("reason") or "", user=user)
+    except (WoPermissionError, ValueError) as e:
+        return {"error": str(e)}
+    if not wo:
+        return {"error": "暂停失败（检查工单状态是否为生产中）"}
+    return {"success": True, "message": f"工单 {wo.work_order_code} 已暂停", "work_order_code": wo.work_order_code, "status": wo.status}
+
+
+async def _tool_resume_work_order(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    ref = args.get("work_order_code") or args.get("work_order_id") or ""
+    wo = await _resolve_work_order(db, ref)
+    if not wo:
+        return {"error": f"未找到工单 {ref}"}
+    user = await _get_user_by_name(db, operator)
+    try:
+        wo = await WorkOrderService(db).resume_work_order(wo.id, reason=args.get("reason") or "", user=user)
+    except (WoPermissionError, ValueError) as e:
+        return {"error": str(e)}
+    if not wo:
+        return {"error": "恢复失败（检查工单状态是否为已暂停）"}
+    return {"success": True, "message": f"工单 {wo.work_order_code} 已恢复生产", "work_order_code": wo.work_order_code, "status": wo.status}
+
+
+async def _tool_split_work_order(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    ref = args.get("work_order_code") or args.get("work_order_id") or ""
+    wo = await _resolve_work_order(db, ref)
+    if not wo:
+        return {"error": f"未找到工单 {ref}"}
+    try:
+        split_qty = int(args.get("split_qty", 0))
+    except (TypeError, ValueError):
+        return {"error": "拆分数量不合法"}
+    if split_qty <= 0:
+        return {"error": "拆分数量必须大于0"}
+    user = await _get_user_by_name(db, operator)
+    try:
+        original, new_wo = await WorkOrderService(db).split_work_order(
+            wo.id, split_qty, remark=args.get("remark"), created_by=operator, user=user,
+        )
+    except (WoPermissionError, ValueError) as e:
+        return {"error": str(e)}
+    return {
+        "success": True,
+        "message": f"拆分成功：{original.work_order_code} 拆出子工单 {new_wo.work_order_code}",
+        "master_work_order_code": original.work_order_code,
+        "master_planned_qty": original.planned_qty,
+        "child_work_order_code": new_wo.work_order_code,
+        "child_planned_qty": new_wo.planned_qty,
+        "child_status": new_wo.status,
+    }
+
+
+async def _tool_query_routing(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    limit = min(int(args.get("limit", 10)), 50)
+    stmt = select(Routing).where(Routing.is_active == True)  # noqa: E712
+    if factory_id:
+        stmt = stmt.where(Routing.factory_id == factory_id)
+    kw = args.get("keyword")
+    if kw:
+        stmt = stmt.where((Routing.routing_code.ilike(f"%{kw}%")) | (Routing.product_id.ilike(f"%{kw}%")))
+    stmt = stmt.order_by(Routing.created_at.desc()).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    items = [
+        {
+            "routing_code": r.routing_code,
+            "product_id": r.product_id,
+            "version": r.version,
+            "step_count": len(r.steps or []),
+            "steps": r.steps,
+        }
+        for r in rows
+    ]
+    return {"count": len(items), "routings": items}
+
+
+async def _tool_query_skill_matrix(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    # department 参数复用为工厂过滤（get_skill_matrix 按 User.factory_id 筛选）
+    department = args.get("department") or factory_id
+    matrix = await EmployeeSkillService(db).get_skill_matrix(
+        department=department,
+        skill_category=args.get("skill_category"),
+    )
+    items = [m.model_dump() for m in matrix]
+    return {"count": len(items), "skill_matrix": items}
+
+
+async def _tool_run_workflow(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    """运行预置 Agent 工作流（多工具编排）。
+
+    归属 WRITE_TOOLS 以获得 operator；factory_id 从 operator 对应用户推导，
+    供工作流内的查询步骤做工厂隔离。懒加载 workflow_service 避免顶层循环导入。"""
+    from api.services.workflow_service import run_workflow  # 懒加载，避免循环导入
+
+    name = args.get("workflow_name") or ""
+    params = dict(args.get("params") or {})
+    # 参数名兼容：qty → planned_qty（与 create_work_order 参数名对齐）
+    if "qty" in params and "planned_qty" not in params:
+        params["planned_qty"] = params.pop("qty")
+
+    user = await _get_user_by_name(db, operator)
+    factory_id = user.factory_id if user else None
+    return await run_workflow(db, name, params, operator=operator, factory_id=factory_id)
+
+
+# ==================== 系统表单拉取 / 报告导出 工具执行器 ====================
+
+async def _tool_get_work_order_form(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """拉取工单完整表单结构（全字段 + 进度 + 子工单 + 状态日志）。"""
+    ref = args.get("work_order_code") or args.get("work_order_id") or ""
+    wo = await _resolve_work_order(db, ref, factory_id)
+    if not wo:
+        return {"error": f"未找到工单 {ref}"}
+    svc = WorkOrderService(db)
+    form = svc.to_dict(wo)
+    if wo.product_id:
+        p = (await db.execute(select(Product).where(Product.id == wo.product_id))).scalar_one_or_none()
+        if p:
+            form["product_name"] = p.product_name
+    form["progress"] = await svc.get_progress(wo)
+    children = await svc.get_children_detail(wo.id)
+    status_logs = await svc.get_status_logs(wo.id)
+    return {
+        "form": form,
+        "children": children,
+        "children_count": len(children),
+        "status_logs": status_logs,
+        "status_log_count": len(status_logs),
+    }
+
+
+async def _tool_get_inspection_form(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """拉取质量检验单表单（可按工单/检验类型过滤）。"""
+    limit = min(int(args.get("limit", 10)), 50)
+    stmt = select(QualityInspection).order_by(QualityInspection.created_at.desc())
+    if factory_id:
+        stmt = stmt.where(QualityInspection.factory_id == factory_id)
+    if args.get("inspect_type"):
+        stmt = stmt.where(QualityInspection.inspect_type == args["inspect_type"])
+    wo_ref = args.get("work_order_code")
+    if wo_ref:
+        wo = await _resolve_work_order(db, wo_ref, factory_id)
+        if not wo:
+            return {"error": f"未找到工单 {wo_ref}"}
+        stmt = stmt.where(QualityInspection.work_order_id == wo.id)
+    rows = (await db.execute(stmt.limit(limit))).scalars().all()
+
+    wo_ids = list({r.work_order_id for r in rows if r.work_order_id})
+    wo_map: Dict[str, str] = {}
+    if wo_ids:
+        wos = (await db.execute(select(WorkOrder).where(WorkOrder.id.in_(wo_ids)))).scalars().all()
+        wo_map = {w.id: w.work_order_code for w in wos}
+
+    items = [
+        {
+            "id": r.id,
+            "work_order_code": wo_map.get(r.work_order_id, ""),
+            "inspect_type": r.inspect_type,
+            "inspector_id": r.inspector_id,
+            "sample_qty": r.sample_qty,
+            "defect_qty": r.defect_qty,
+            "result": r.result,
+            "defect_details": r.defect_details,
+            "remark": r.remark,
+            "created_at": r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else None,
+        }
+        for r in rows
+    ]
+    return {"count": len(items), "inspections": items}
+
+
+def _to_csv(rows: Any) -> str:
+    """把平坦 dict 或 dict 列表转为 CSV 文本（嵌套值 JSON 编码）。"""
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not rows:
+        return ""
+    keys: List[str] = []
+    for r in rows:
+        for k in r.keys():
+            if k not in keys:
+                keys.append(k)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(keys)
+    for r in rows:
+        out = []
+        for k in keys:
+            v = r.get(k)
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v, ensure_ascii=False, default=str)
+            out.append(v)
+        writer.writerow(out)
+    return buf.getvalue()
+
+
+async def _tool_export_report_file(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+    """把生产汇总/工单表单导出为文件（JSON/CSV），写入 files 表并返回下载链接。"""
+    from api.routes.file_routes import UPLOAD_DIR  # 懒加载，复用落盘目录
+
+    report_type = args.get("report_type") or "production_summary"
+    fmt = (args.get("format") or "json").lower()
+    if fmt not in ("json", "csv"):
+        fmt = "json"
+    user = await _get_user_by_name(db, operator)
+    factory_id = user.factory_id if user else None
+
+    if report_type == "work_order":
+        ref = args.get("work_order_code") or ""
+        wo = await _resolve_work_order(db, ref, factory_id)
+        if not wo:
+            return {"error": f"未找到工单 {ref}，导出工单表单需提供工单号"}
+        svc = WorkOrderService(db)
+        data = {
+            "work_order": svc.to_dict(wo),
+            "children": await svc.get_children_detail(wo.id),
+            "status_logs": await svc.get_status_logs(wo.id),
+        }
+        csv_rows = data["work_order"]
+        filename_base = f"work_order_{wo.work_order_code}"
+        related_type, related_id = "work_order", wo.id
+    else:
+        data = await _tool_get_production_summary(db, {}, factory_id)
+        csv_rows = data
+        filename_base = f"production_summary_{date.today().strftime('%Y%m%d')}"
+        related_type, related_id = "report", "production_summary"
+
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    if fmt == "csv":
+        content = _to_csv(csv_rows)
+        ext, content_type = "csv", "text/csv"
+    else:
+        content = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        ext, content_type = "json", "application/json"
+
+    file_id = str(uuid.uuid4())
+    filename = f"{filename_base}_{ts}.{ext}"
+    storage_path = UPLOAD_DIR / f"{file_id}_{filename}"
+    storage_path.write_text(content, encoding="utf-8")
+
+    record = FileRecord(
+        id=file_id,
+        filename=filename,
+        content_type=content_type,
+        size=len(content.encode("utf-8")),
+        storage_path=str(storage_path),
+        uploaded_by=operator,
+        factory_id=factory_id,
+        related_type=related_type,
+        related_id=related_id,
+    )
+    db.add(record)
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": f"报告已导出：{filename}",
+        "file_id": file_id,
+        "filename": filename,
+        "download_url": f"/api/v1/files/{file_id}",
+        "format": fmt,
+        "size": len(content.encode("utf-8")),
+    }
+
+
 # 执行器注册表
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
@@ -514,10 +1160,31 @@ _TOOL_EXECUTORS = {
     "create_work_order": _tool_create_work_order,
     "release_work_order": _tool_release_work_order,
     "create_production_report": _tool_create_production_report,
+    "run_compliance_simulation": _tool_run_compliance_simulation,
+    "query_simulation_audits": _tool_query_simulation_audits,
+    "complete_work_order": _tool_complete_work_order,
+    "pause_work_order": _tool_pause_work_order,
+    "resume_work_order": _tool_resume_work_order,
+    "split_work_order": _tool_split_work_order,
+    "query_routing": _tool_query_routing,
+    "query_skill_matrix": _tool_query_skill_matrix,
+    "run_workflow": _tool_run_workflow,
+    "get_work_order_form": _tool_get_work_order_form,
+    "get_inspection_form": _tool_get_inspection_form,
+    "export_report_file": _tool_export_report_file,
 }
 
 # 写操作工具（需要记录操作人）
-WRITE_TOOLS = {"create_work_order", "release_work_order", "create_production_report"}
+WRITE_TOOLS = {
+    "create_work_order", "release_work_order", "create_production_report",
+    "complete_work_order", "pause_work_order", "resume_work_order", "split_work_order",
+    "run_compliance_simulation",
+    "run_workflow",
+    "export_report_file",
+}
+
+# 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
+SIM_TOOLS = {"run_compliance_simulation", "query_simulation_audits"}
 
 # 工具的中文标签（供前端展示）
 TOOL_LABELS = {
@@ -530,6 +1197,18 @@ TOOL_LABELS = {
     "create_work_order": "创建工单",
     "release_work_order": "下达工单",
     "create_production_report": "生产报工",
+    "run_compliance_simulation": "合规仿真",
+    "query_simulation_audits": "仿真审计记录",
+    "complete_work_order": "完工工单",
+    "pause_work_order": "暂停工单",
+    "resume_work_order": "恢复工单",
+    "split_work_order": "拆分工单",
+    "query_routing": "工艺路线",
+    "query_skill_matrix": "技能矩阵",
+    "run_workflow": "工作流编排",
+    "get_work_order_form": "工单表单",
+    "get_inspection_form": "检验单表单",
+    "export_report_file": "导出报告",
 }
 
 
@@ -575,6 +1254,33 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "设备怎么样", "设备怎样", "设备汇总", "设备稼动",
         ],
     },
+    {
+        # 仅对「查仿真记录」做确定性路由；「跑一次仿真」类参数需模型提取，交给 auto 循环
+        "tool": "query_simulation_audits",
+        "keywords": [
+            "仿真记录", "仿真审计", "审计记录", "仿真历史", "查仿真", "最近仿真",
+        ],
+    },
+    {
+        "tool": "get_inspection_form",
+        "keywords": [
+            "检验单", "检验记录", "检验表单", "质检记录", "质检单", "质量检验单",
+        ],
+    },
+    {
+        "tool": "export_report_file",
+        "keywords": [
+            "导出报告", "导出报表", "生成报告", "生成报表", "报告导出", "导出生产报告",
+            "导出成文件", "导出文件", "导出成", "导出为文件", "生成文件", "导出成csv",
+        ],
+    },
+    {
+        # 工单表单需工单号：resolve_intent 尝试轻量提取，提不到则交 auto 让模型提取
+        "tool": "get_work_order_form",
+        "keywords": [
+            "工单表单", "工单完整表单", "完整工单表单", "工单全量信息",
+        ],
+    },
 ]
 
 
@@ -588,11 +1294,32 @@ def detect_intent_tool(message: str) -> Optional[str]:
     return None
 
 
+# 工单码轻量提取正则：形如 WO-SPK-DEMO_2026 / ELEC-S20260723-001（大写字母数字开头 + 连字符段）
+_WO_CODE_RE = re.compile(r"\b[A-Z][A-Z0-9]+-[A-Za-z0-9_-]+")
+
+
+def _extract_wo_code(message: str) -> Optional[str]:
+    """从消息中轻量提取工单码候选（用于确定性路由的工单表单/导出）。提不到返回 None。"""
+    if not message:
+        return None
+    m = _WO_CODE_RE.search(message)
+    return m.group(0) if m else None
+
+
 def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
     """确定性意图解析：命中业务关键词返回 {"tool", "args"}，否则 None。
 
     后端可据此直接执行工具取真实数据（不依赖模型决策），args 通过轻量关键词规则提取。
-    写操作/多步操作不走此路径，仍由模型 auto 编排。"""
+    写操作/多步操作不走此路径，仍由模型 auto 编排。
+
+    优先级：工作流触发词（复合任务）> 单步查询工具。"""
+    # 优先匹配工作流（复合任务，如「帮我复盘今天生产」→ daily_production_review）
+    # 懒加载避免与 workflow_service 的顶层循环导入；match_workflow 仅返回无需参数的工作流
+    from api.services.workflow_service import match_workflow  # 懒加载，避免循环导入
+    wf_name = match_workflow(message)
+    if wf_name:
+        return {"tool": "run_workflow", "args": {"workflow_name": wf_name, "params": {}}}
+
     tool = detect_intent_tool(message)
     if not tool:
         return None
@@ -606,6 +1333,26 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
             args["status"] = "released"
         elif any(k in message for k in ["已完成", "完工"]):
             args["status"] = "completed"
+    elif tool == "get_work_order_form":
+        # 工单表单需工单号：轻量提取形如 WO-xxx / ELEC-S20260723-001 的工单码；提不到则交 auto 让模型提取
+        wo_code = _extract_wo_code(message)
+        if not wo_code:
+            return None
+        args["work_order_code"] = wo_code
+    elif tool == "get_inspection_form":
+        # 检验单：可选按工单过滤（提到工单号则带上）
+        wo_code = _extract_wo_code(message)
+        if wo_code:
+            args["work_order_code"] = wo_code
+    elif tool == "export_report_file":
+        # 默认导出生产汇总；消息含工单号且提及工单 → 导出工单表单
+        wo_code = _extract_wo_code(message)
+        if wo_code and "工单" in message:
+            args["report_type"] = "work_order"
+            args["work_order_code"] = wo_code
+        else:
+            args["report_type"] = "production_summary"
+        args["format"] = "csv" if any(k in message for k in ["csv", "CSV", "表格"]) else "json"
     return {"tool": tool, "args": args}
 
 
@@ -631,4 +1378,4 @@ async def execute_tool(
         return {"error": f"工具执行失败：{type(exc).__name__}: {exc}"}
 
 
-__all__ = ["TOOL_DEFINITIONS", "TOOL_LABELS", "WRITE_TOOLS", "execute_tool", "detect_intent_tool", "resolve_intent", "INTENT_RULES"]
+__all__ = ["TOOL_DEFINITIONS", "TOOL_LABELS", "WRITE_TOOLS", "SIM_TOOLS", "execute_tool", "detect_intent_tool", "resolve_intent", "INTENT_RULES"]

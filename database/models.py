@@ -215,6 +215,42 @@ class WoStatusLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
+class FileRecord(Base):
+    """文件/附件元数据（chatbot 多模态收发 + 系统表单/报告导出）。
+
+    实体落盘到容器 /app/uploads；按 factory_id 多工厂隔离，
+    related_type/related_id 关联业务对象（work_order/inspection/report/chat...）。"""
+    __tablename__ = "files"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    filename = Column(String(255), nullable=False)        # 原始文件名
+    content_type = Column(String(100), nullable=True)     # MIME 类型
+    size = Column(Integer, default=0)                     # 字节数
+    storage_path = Column(String(500), nullable=False)    # 容器内落盘路径
+    uploaded_by = Column(String(50), nullable=True)       # 上传人 username
+    factory_id = Column(String(50), nullable=True, index=True)  # 所属工厂
+    related_type = Column(String(50), nullable=True)      # 关联业务对象类型
+    related_id = Column(String(50), nullable=True)        # 关联业务对象 ID
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("idx_files_related", "related_type", "related_id"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "filename": self.filename,
+            "content_type": self.content_type,
+            "size": self.size,
+            "uploaded_by": self.uploaded_by,
+            "factory_id": self.factory_id,
+            "related_type": self.related_type,
+            "related_id": self.related_id,
+            "created_at": self.created_at.strftime("%Y-%m-%d %H:%M") if self.created_at else None,
+        }
+
+
 class ProductionReport(Base):
     """生产报工表"""
     
@@ -1033,6 +1069,8 @@ __all__ = [
     "Plan",
     "BomItem",
     "WoStatusLog",
+    # 文件/附件
+    "FileRecord",
     # 统一码表
     "CodeTable",
 ]
