@@ -220,9 +220,13 @@ async def daily_report(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """日报"""
+    """日报（含异常标注）"""
     svc = ReportGeneratorService(db)
-    return await svc.generate_daily_report(factory_id, date)
+    report = await svc.generate_daily_report(factory_id, date)
+    anomalies = await svc.detect_anomalies(report)
+    report["anomalies"] = anomalies
+    report["anomaly_count"] = len(anomalies)
+    return report
 
 
 @router.get("/reports-center/weekly")

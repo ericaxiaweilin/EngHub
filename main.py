@@ -4,6 +4,8 @@
 EngHub MES Application Entry Point
 """
 import os
+import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -40,6 +42,7 @@ from api.routes.wms_phase3_routes import router as wms_phase3_router
 from api.routes.qms_phase4_routes import router as qms_phase4_router
 from api.routes.equipment_phase5_routes import router as equipment_phase5_router
 from api.routes.hr_routes import router as hr_router
+from api.routes.notification_routes import router as notification_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -77,12 +80,100 @@ app.include_router(wms_phase3_router)  # 岗位替代 Phase 3: 仓管操作/库�
 app.include_router(qms_phase4_router)  # 岗位替代 Phase 4: 检验终端/SPC/不良分析
 app.include_router(equipment_phase5_router)  # 岗位替代 Phase 5: 维保终端/OEE/故障预测
 app.include_router(hr_router)  # HR 人力档案 + 工厂切换
+app.include_router(notification_router)  # 站内通知（报告/异常/系统）
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 
 @app.get("/health")
 def health():
     return {"status": "healthy", "version": "2.5.0"}
+
+
+# ---------- 后台定时调度器（安灯超时升级 + 提醒 + 预警巡检） ----------
+_SCHEDULER_INTERVAL = int(os.getenv("SCHEDULER_INTERVAL_SEC", "300"))  # 默认 5 分钟
+_logger = logging.getLogger("scheduler")
+
+
+async def _periodic_scheduler():
+    """后台循环：每 N 秒执行安灯超时检测 + 提醒推送 + 预警巡检 + 日报自动生成。"""
+    from database.db_config import db_config
+    from api.services.andon_service import AndonService
+    from api.services.alert_intelligence_service import patrol
+    from api.services.report_generator_service import ReportGeneratorService
+
+    await asyncio.sleep(30)  # 启动后 30s 再开始，等 DB 就绪
+    while True:
+        try:
+            async with db_config.session_factory() as db:
+                svc = AndonService(db)
+                escalations = await svc.process_timeout_escalations()
+                reminders = await svc.process_timed_reminders()
+                if escalations:
+                    _logger.info(f"[scheduler] 安灯自动升级 {len(escalations)} 条")
+                if reminders:
+                    _logger.info(f"[scheduler] 安灯提醒 {len(reminders)} 条")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 安灯巡检异常: {e}")
+
+        # 预警巡检（工单超时 + 安灯未响应）—— 每 30 分钟跑一次（避免频繁调 LLM）
+        try:
+            import time as _t
+            if not hasattr(_periodic_scheduler, "_last_patrol"):
+                _periodic_scheduler._last_patrol = 0
+            if _t.time() - _periodic_scheduler._last_patrol > 1800:
+                _periodic_scheduler._last_patrol = _t.time()
+                async with db_config.session_factory() as db:
+                    result = await patrol(db, factory_id="FAC_ELEC_DEMO_2026")
+                    if result.get("reviews_created"):
+                        _logger.info(f"[scheduler] 预警巡检: {result}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 预警巡检异常: {e}")
+
+        # 日报自动生成 —— 每 4 小时跑一次（覆盖班次交接）
+        try:
+            import time as _t2
+            if not hasattr(_periodic_scheduler, "_last_report"):
+                _periodic_scheduler._last_report = 0
+            if _t2.time() - _periodic_scheduler._last_report > 14400:  # 4h
+                _periodic_scheduler._last_report = _t2.time()
+                async with db_config.session_factory() as db:
+                    rpt_svc = ReportGeneratorService(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            res = await rpt_svc.auto_generate_and_notify(fid)
+                            _logger.info(f"[scheduler] 日报生成: {fid}, 异常 {res.get('anomalies', []).__len__()} 条")
+                        except Exception as ex:
+                            _logger.warning(f"[scheduler] 日报生成失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 日报任务异常: {e}")
+
+        # 自动排产 —— 每 8 小时跑一次（模拟计划员每日排产）
+        try:
+            import time as _t3
+            if not hasattr(_periodic_scheduler, "_last_aps"):
+                _periodic_scheduler._last_aps = 0
+            if _t3.time() - _periodic_scheduler._last_aps > 28800:  # 8h
+                _periodic_scheduler._last_aps = _t3.time()
+                from api.services.aps_service import ApsService
+                async with db_config.session_factory() as db:
+                    aps_svc = ApsService(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            res = await aps_svc.generate_schedule(fid, created_by="scheduler")
+                            if res.get("schedule_id"):
+                                _logger.info(f"[scheduler] 自动排产: {fid}, {res.get('total_tasks', 0)} 任务")
+                        except Exception as ex:
+                            _logger.warning(f"[scheduler] 自动排产失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 排产任务异常: {e}")
+
+        await asyncio.sleep(_SCHEDULER_INTERVAL)
+
+
+@app.on_event("startup")
+async def _start_scheduler():
+    asyncio.create_task(_periodic_scheduler())
+    _logger.info(f"[scheduler] 后台调度器已启动，间隔 {_SCHEDULER_INTERVAL}s")
 
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------

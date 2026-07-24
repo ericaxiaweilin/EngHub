@@ -1,8 +1,9 @@
 """
 报表生成服务 - 岗位替代 Phase 1: 自动日报/周报/月报
-替代统计员的核心工作：数据汇总 + 报表生成
+替代统计员的核心工作：数据汇总 + 报表生成 + 异常标注 + 自动触发 + 通知推送
 """
 import uuid
+import logging
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List
 from collections import defaultdict
@@ -12,8 +13,16 @@ from sqlalchemy import select, func, and_, extract
 
 from database.models import (
     ProductionReport, WorkOrder, ShiftSummary,
-    ProductionAlert, EquipmentDowntime, Station,
+    ProductionAlert, EquipmentDowntime, Station, Notification,
 )
+
+_logger = logging.getLogger("report_generator")
+
+# 异常阈值（可通过环境变量覆盖）
+import os
+YIELD_THRESHOLD = float(os.getenv("ANOMALY_YIELD_THRESHOLD", "95.0"))  # 良品率低于此值标记异常
+OUTPUT_DROP_PCT = float(os.getenv("ANOMALY_OUTPUT_DROP_PCT", "20.0"))  # 产出比昨日下降超过此百分比
+DOWNTIME_THRESHOLD = float(os.getenv("ANOMALY_DOWNTIME_MIN", "60.0"))  # 停机超过此分钟数标记异常
 
 
 class ReportGeneratorService:
@@ -361,4 +370,130 @@ class ReportGeneratorService:
                 "report_count": r[4] or 0,
             } for r in rows],
             "generated_at": datetime.utcnow().isoformat(),
+        }
+
+    # ==================== 异常标注 ====================
+
+    async def detect_anomalies(self, report: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """对已生成的报告进行异常检测，返回异常列表。
+
+        规则：
+        1. 良品率 < YIELD_THRESHOLD → critical
+        2. 今日产出比昨日下降 > OUTPUT_DROP_PCT% → warning
+        3. 停机时长 > DOWNTIME_THRESHOLD 分钟 → warning
+        4. 单工单达成率 < 50% → info
+        """
+        anomalies: List[Dict[str, Any]] = []
+        summary = report.get("summary", {})
+        factory_id = report.get("factory_id", "")
+        report_date = report.get("date", "")
+
+        # 1. 良品率异常
+        yield_rate = summary.get("yield_rate", 100)
+        if yield_rate < YIELD_THRESHOLD and summary.get("total_output", 0) > 0:
+            anomalies.append({
+                "type": "yield_drop",
+                "severity": "critical" if yield_rate < YIELD_THRESHOLD - 5 else "warning",
+                "title": f"良品率异常：{yield_rate}%（阈值 {YIELD_THRESHOLD}%）",
+                "metric": yield_rate,
+                "threshold": YIELD_THRESHOLD,
+            })
+
+        # 2. 产出比昨日下降
+        if report_date:
+            try:
+                yesterday = (date.fromisoformat(report_date) - timedelta(days=1)).isoformat()
+                yd_stmt = select(
+                    func.coalesce(func.sum(ProductionReport.good_qty + ProductionReport.defect_qty + ProductionReport.scrap_qty), 0)
+                ).where(and_(
+                    ProductionReport.factory_id == factory_id,
+                    func.date(ProductionReport.created_at) == yesterday,
+                    ProductionReport.is_undone == False,
+                ))
+                yd_result = await self.db.execute(yd_stmt)
+                yesterday_output = yd_result.scalar() or 0
+                today_output = summary.get("total_output", 0)
+                if yesterday_output > 0 and today_output > 0:
+                    drop_pct = (yesterday_output - today_output) / yesterday_output * 100
+                    if drop_pct > OUTPUT_DROP_PCT:
+                        anomalies.append({
+                            "type": "output_drop",
+                            "severity": "warning",
+                            "title": f"产出下降 {drop_pct:.0f}%（今日 {today_output} vs 昨日 {yesterday_output}）",
+                            "metric": today_output,
+                            "threshold": yesterday_output,
+                        })
+            except Exception:
+                pass
+
+        # 3. 停机异常
+        downtime_min = summary.get("downtime_minutes", 0)
+        if downtime_min > DOWNTIME_THRESHOLD:
+            anomalies.append({
+                "type": "downtime_high",
+                "severity": "warning",
+                "title": f"停机时长异常：{downtime_min:.0f} 分钟（阈值 {DOWNTIME_THRESHOLD:.0f}）",
+                "metric": downtime_min,
+                "threshold": DOWNTIME_THRESHOLD,
+            })
+
+        # 4. 工单达成率异常
+        for wo in report.get("work_orders", []):
+            if wo.get("achievement", 100) < 50 and wo.get("today_output", 0) > 0:
+                anomalies.append({
+                    "type": "wo_behind",
+                    "severity": "info",
+                    "title": f"工单 {wo.get('work_order_code', '')} 达成率仅 {wo['achievement']}%",
+                    "metric": wo["achievement"],
+                    "threshold": 50,
+                })
+
+        return anomalies
+
+    # ==================== 自动生成 + 通知 ====================
+
+    async def auto_generate_and_notify(self, factory_id: str, report_date: Optional[str] = None) -> Dict[str, Any]:
+        """定时任务调用：自动生成日报 + 异常检测 + 写入通知。
+
+        返回：{report, anomalies, notification_id}
+        """
+        report = await self.generate_daily_report(factory_id, report_date)
+        anomalies = await self.detect_anomalies(report)
+
+        # 注入异常标注到报告
+        report["anomalies"] = anomalies
+        report["anomaly_count"] = len(anomalies)
+
+        # 生成通知
+        has_critical = any(a["severity"] == "critical" for a in anomalies)
+        severity = "critical" if has_critical else ("warning" if anomalies else "info")
+        title = f"日报已生成（{report.get('date', '')}）"
+        if anomalies:
+            title += f" ⚠️ {len(anomalies)} 项异常"
+
+        content_parts = [
+            f"产出: {report['summary']['total_output']}，良品率: {report['summary']['yield_rate']}%",
+        ]
+        for a in anomalies[:5]:
+            content_parts.append(f"[{a['severity'].upper()}] {a['title']}")
+
+        notif = Notification(
+            id=str(uuid.uuid4()),
+            factory_id=factory_id,
+            recipient=None,  # 广播
+            category="report" if not anomalies else "anomaly",
+            title=title,
+            content="\n".join(content_parts),
+            severity=severity,
+            source_type="daily_report",
+            source_id=report.get("date", ""),
+        )
+        self.db.add(notif)
+        await self.db.commit()
+
+        _logger.info(f"[report] 日报自动生成完成: {factory_id} {report.get('date')}, 异常 {len(anomalies)} 条")
+        return {
+            "report": report,
+            "anomalies": anomalies,
+            "notification_id": notif.id,
         }

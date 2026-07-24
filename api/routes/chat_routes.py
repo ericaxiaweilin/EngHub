@@ -299,11 +299,11 @@ def _parse_spreadsheet_record(
         return None
 
 
-def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 3) -> str:
+def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 30) -> str:
     """智能摘要：表头 + 统计 + 样本行，替代全量 Markdown dump。
 
-    AI 只需知道表格结构、关键统计和少量样本即可回答大部分问题；
-    完整数据由前端 Univer 在线表格渲染，无需塞入上下文。"""
+    小表（≤ sample_rows 行）给出全部行以保证 AI 分析精确；大表仅给统计+前 N 行样本省 token，
+    完整数据由前端 Univer 在线表格渲染。明确告知模型数据是否完整，防止其编造表中不存在的行/值。"""
     cols = table["columns"]
     rows = table["rows"]
     total_rows = len(rows)
@@ -337,12 +337,14 @@ def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 3) -> str:
                 + (f", 如: {', '.join(top)}" if len(unique) <= 20 else f", 前5: {', '.join(top)}")
             )
 
-    # --- 样本行（前 N 行，Markdown 表格） ---
+    # --- 样本行：小表给全部行（保证精确），大表截断（省 token） ---
+    shown = rows[:sample_rows]
+    is_full = total_rows <= sample_rows
     sample_lines = []
-    if rows:
+    if shown:
         sample_lines.append("| " + " | ".join(col_labels) + " |")
         sample_lines.append("|" + "|".join(["---"] * len(cols)) + "|")
-        for r in rows[:sample_rows]:
+        for r in shown:
             sample_lines.append("| " + " | ".join(str(r.get(c["key"], "")) for c in cols) + " |")
 
     parts = [
@@ -350,8 +352,16 @@ def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 3) -> str:
         "列信息：\n" + "\n".join(col_stats),
     ]
     if sample_lines:
-        parts.append(f"前{min(sample_rows, total_rows)}行样本：\n" + "\n".join(sample_lines))
-    parts.append("（完整数据已在用户的在线表格中展示，用户可直接查看/筛选/编辑）")
+        header = (
+            "全部数据如下（请严格基于这些真实数据分析，禁止编造表中不存在的行或数值）："
+            if is_full else
+            f"前 {sample_rows} 行样本（共 {total_rows} 行，其余见用户在线表格）："
+        )
+        parts.append(header + "\n" + "\n".join(sample_lines))
+    if is_full:
+        parts.append("（以上即该表格的全部行；分析时不得新增或修改任何数据）")
+    else:
+        parts.append("（完整数据已在用户的在线表格中展示，用户可直接查看/筛选/编辑）")
     return "\n".join(parts)
 
 
@@ -368,7 +378,13 @@ def _attachment_text_note(records: List[FileRecord]) -> str:
             table = _parse_spreadsheet_record(rec)
             if table:
                 lines.append(f"- 表格文件：{rec.filename}\n{_spreadsheet_to_summary(table)}")
-                continue
+            else:
+                # 解析失败（文件缺失/格式不支持/损坏）：明确告知模型，避免其按文件名幻觉编造表格内容
+                lines.append(
+                    f"- ⚠️ 表格文件：{rec.filename} 当前无法解析或文件不可达。"
+                    f"严禁编造其内容，请直接告知用户该表格暂时无法读取，并请其重新上传。"
+                )
+            continue
         kind = "图片" if _is_image_record(rec) else "文件"
         lines.append(f"- {kind}：{rec.filename}（{rec.content_type or '未知类型'}，{rec.size} 字节）")
     return "\n".join(lines)

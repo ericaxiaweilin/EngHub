@@ -360,3 +360,195 @@ async def get_capacity_load(
     """产能负荷分析（真实排程数据）"""
     svc = ApsService(db)
     return await svc.get_capacity_load(factory_id, days=days)
+
+
+# ============== 交期回复 + 插单影响评估 ==============
+
+
+class DeliveryPromiseRequest(BaseModel):
+    factory_id: str
+    product_id: str
+    quantity: int
+    work_order_id: Optional[str] = None
+
+
+@router.post("/delivery-promise")
+async def delivery_promise(
+    req: DeliveryPromiseRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """交期回复：基于当前产能负荷，估算新订单最早可交付日期。
+
+    生产计划员核心能力：客户问“这批货什么时候能交？”→ 系统自动计算。
+    算法：当前待排工单负荷 + 新单加工时间 → 最早完工日期。
+    """
+    from sqlalchemy import func as sa_func, and_
+    from database.models import WorkOrder, Station
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+
+    # 1. 获取当前待排工单总负荷（小时）
+    pending_stmt = select(
+        sa_func.coalesce(sa_func.sum(WorkOrder.planned_qty), 0)
+    ).where(and_(
+        WorkOrder.factory_id == req.factory_id,
+        WorkOrder.status.in_(["released", "pending", "in_progress"]),
+        WorkOrder.wo_type == "master",
+    ))
+    pending_qty = (await db.execute(pending_stmt)).scalar() or 0
+
+    # 2. 获取工位数量和效率
+    station_stmt = select(sa_func.count(Station.id)).where(Station.factory_id == req.factory_id)
+    station_count = (await db.execute(station_stmt)).scalar() or 1
+
+    # 3. 计算加工时间（简化模型：每件 0.5h，效率 0.85，每天 16h 可用）
+    efficiency = 0.85
+    available_hours_per_day = 16.0
+    hours_per_unit = 0.5 / efficiency
+
+    # 当前负荷占用天数
+    current_load_hours = pending_qty * hours_per_unit
+    current_load_days = current_load_hours / (station_count * available_hours_per_day)
+
+    # 新单加工时间
+    new_order_hours = req.quantity * hours_per_unit
+    new_order_days = new_order_hours / (station_count * available_hours_per_day)
+
+    # 最早完工 = 当前负荷消化 + 新单加工
+    total_days = current_load_days + new_order_days
+    earliest_end = now + timedelta(days=max(total_days, 0.5))
+
+    # 4. 判断是否可行（30天内）
+    feasible = total_days <= 30
+    confidence = "high" if total_days <= 7 else ("medium" if total_days <= 14 else "low")
+
+    return {
+        "product_id": req.product_id,
+        "quantity": req.quantity,
+        "current_load": {
+            "pending_qty": int(pending_qty),
+            "load_days": round(current_load_days, 1),
+            "station_count": station_count,
+        },
+        "new_order": {
+            "process_days": round(new_order_days, 1),
+            "process_hours": round(new_order_hours, 1),
+        },
+        "promise": {
+            "earliest_delivery": earliest_end.strftime("%Y-%m-%d"),
+            "total_lead_days": round(total_days, 1),
+            "feasible": feasible,
+            "confidence": confidence,
+        },
+        "calculated_at": now.isoformat(),
+    }
+
+
+class RushOrderImpactRequest(BaseModel):
+    factory_id: str
+    product_id: str
+    quantity: int
+    due_date: Optional[str] = None  # ISO date
+    priority: str = "urgent"
+
+
+@router.post("/rush-order-impact")
+async def rush_order_impact(
+    req: RushOrderImpactRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """插单影响评估：模拟插入紧急单，评估对现有工单的影响。
+
+    生产计划员核心能力：“插这单会延迟哪些订单？”
+    """
+    from sqlalchemy import and_
+    from database.models import WorkOrder
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+    efficiency = 0.85
+    hours_per_unit = 0.5 / efficiency
+
+    # 插单加工时间
+    rush_hours = req.quantity * hours_per_unit
+    rush_days = rush_hours / 16.0  # 单工位
+
+    # 获取当前待排工单（按交期排序）
+    wo_stmt = select(WorkOrder).where(and_(
+        WorkOrder.factory_id == req.factory_id,
+        WorkOrder.status.in_(["released", "pending"]),
+        WorkOrder.wo_type == "master",
+    )).order_by(WorkOrder.planned_due.asc())
+    wo_result = await db.execute(wo_stmt)
+    existing_orders = list(wo_result.scalars().all())
+
+    # 模拟：插单占用产能后，现有工单延迟
+    delayed_orders = []
+    cumulative_delay_hours = rush_hours  # 插单占用的时间
+
+    for wo in existing_orders:
+        if not wo.planned_due:
+            continue
+        wo_hours = (wo.planned_qty or 0) * hours_per_unit
+        # 简化：插单后的新完工时间 = 原计划 + 累计延迟
+        original_due = wo.planned_due
+        new_end = original_due + timedelta(hours=cumulative_delay_hours)
+
+        if new_end > original_due:
+            delay_h = (new_end - original_due).total_seconds() / 3600
+            delayed_orders.append({
+                "work_order_code": wo.work_order_code,
+                "product_id": wo.product_id,
+                "planned_qty": wo.planned_qty,
+                "original_due": original_due.strftime("%Y-%m-%d") if original_due else None,
+                "new_estimated_end": new_end.strftime("%Y-%m-%d"),
+                "delay_hours": round(delay_h, 1),
+                "delay_days": round(delay_h / 24, 1),
+                "priority": wo.priority,
+            })
+
+    # 插单本身能否满足交期
+    rush_end = now + timedelta(hours=rush_hours)
+    rush_feasible = True
+    if req.due_date:
+        from datetime import date as ddate2
+        due = ddate2.fromisoformat(req.due_date)
+        rush_feasible = rush_end.date() <= due
+
+    return {
+        "rush_order": {
+            "product_id": req.product_id,
+            "quantity": req.quantity,
+            "priority": req.priority,
+            "process_hours": round(rush_hours, 1),
+            "estimated_end": rush_end.strftime("%Y-%m-%d %H:%M"),
+            "due_date": req.due_date,
+            "due_feasible": rush_feasible,
+        },
+        "impact": {
+            "affected_orders": len(delayed_orders),
+            "total_existing_orders": len(existing_orders),
+            "max_delay_hours": max((d["delay_hours"] for d in delayed_orders), default=0),
+            "delayed_orders": delayed_orders[:10],  # 最多返回10条
+        },
+        "recommendation": _rush_recommendation(delayed_orders, rush_feasible),
+        "calculated_at": now.isoformat(),
+    }
+
+
+def _rush_recommendation(delayed: list, feasible: bool) -> str:
+    """生成插单建议"""
+    if not delayed:
+        return "✅ 可以插单，不影响现有订单交期"
+    if not feasible:
+        return "❌ 插单本身无法按期交付，建议与客户协商延期或拆分批次"
+    max_delay = max(d["delay_hours"] for d in delayed)
+    if max_delay <= 24:
+        return f"⚠️ 可插单，{len(delayed)} 个订单延迟≤ 1天，影响可控"
+    elif max_delay <= 72:
+        return f"⚠️ 插单将导致 {len(delayed)} 个订单延迟 1-3 天，建议调整低优先级工单"
+    else:
+        return f"🚨 插单影响严重：{len(delayed)} 个订单延迟超过 3 天，建议拒绝或分批交付"

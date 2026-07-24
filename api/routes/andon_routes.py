@@ -318,4 +318,78 @@ async def list_categories():
     }
 
 
+@router.get("/kpi", summary="安灯 KPI 统计（MTTR/响应率/解决率）")
+async def andon_kpi(
+    factory_id: str = Query(...),
+    days: int = Query(7, ge=1, le=90, description="统计近 N 天"),
+):
+    """安灯协调员 KPI 闭环：平均响应时间、平均解决时间(MTTR)、解决率、各类别分布。"""
+    from api.services.andon_service import AndonService
+    from database.db_config import db_config
+    from datetime import datetime, timedelta
+    from sqlalchemy import select, func
+    from core.andon.models import AndonTicket
+
+    async with db_config.session_factory() as db:
+        since = datetime.utcnow() - timedelta(days=days)
+        base = select(AndonTicket).where(
+            AndonTicket.factory_id == factory_id,
+            AndonTicket.created_at >= since,
+        )
+        tickets = list((await db.execute(base)).scalars().all())
+
+    total = len(tickets)
+    if total == 0:
+        return {"period_days": days, "total": 0, "message": "无工单数据"}
+
+    resolved = [t for t in tickets if t.status == "resolved"]
+    open_tickets = [t for t in tickets if t.status in ("open", "assigned", "claimed", "upgrading")]
+
+    # MTTR：平均解决时间（分钟）
+    mttr_list = []
+    for t in resolved:
+        if t.resolved_at and t.created_at:
+            mttr_list.append((t.resolved_at - t.created_at).total_seconds() / 60)
+    mttr_avg = round(sum(mttr_list) / len(mttr_list), 1) if mttr_list else None
+
+    # 平均响应时间（抢单/派单时间 - 创建时间）
+    response_list = []
+    for t in tickets:
+        if t.claimed_at and t.created_at:
+            response_list.append((t.claimed_at - t.created_at).total_seconds() / 60)
+    response_avg = round(sum(response_list) / len(response_list), 1) if response_list else None
+
+    # 解决率
+    resolution_rate = round(len(resolved) / total * 100, 1)
+
+    # 升级率
+    escalated = [t for t in tickets if (t.escalation_level or 0) > 0]
+    escalation_rate = round(len(escalated) / total * 100, 1)
+
+    # 按类别统计
+    by_category = {}
+    for t in tickets:
+        cat = t.category_code or "unknown"
+        if cat not in by_category:
+            by_category[cat] = {"total": 0, "resolved": 0, "open": 0}
+        by_category[cat]["total"] += 1
+        if t.status == "resolved":
+            by_category[cat]["resolved"] += 1
+        elif t.status in ("open", "assigned", "claimed", "upgrading"):
+            by_category[cat]["open"] += 1
+
+    # 超时率（触发过升级的 / 总数）
+    return {
+        "period_days": days,
+        "total": total,
+        "resolved": len(resolved),
+        "open": len(open_tickets),
+        "mttr_minutes": mttr_avg,
+        "avg_response_minutes": response_avg,
+        "resolution_rate_pct": resolution_rate,
+        "escalation_rate_pct": escalation_rate,
+        "by_category": by_category,
+    }
+
+
 __all__ = ["router"]

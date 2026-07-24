@@ -1578,6 +1578,28 @@ class HourlyOutputSnapshot(Base):
     )
 
 
+class Notification(Base):
+    """站内通知（报告就绪/异常预警/系统消息）"""
+    __tablename__ = "notifications"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    recipient = Column(String(50), nullable=True, index=True)  # 用户名，空=广播
+    category = Column(String(30), nullable=False, default="system")  # report/anomaly/system/andon
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=True)
+    severity = Column(String(10), default="info")  # info/warning/critical
+    source_type = Column(String(30), nullable=True)  # daily_report/alert/andon
+    source_id = Column(String(50), nullable=True)
+    is_read = Column(Boolean, default=False)
+    read_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_notif_unread", "factory_id", "recipient", "is_read"),
+    )
+
+
 # 导出所有模型
 __all__ = [
     "Base",
@@ -1649,4 +1671,6 @@ __all__ = [
     "ShiftSummary",
     "ProductionAlert",
     "HourlyOutputSnapshot",
+    # 通知系统（030）
+    "Notification",
 ]
