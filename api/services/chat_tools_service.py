@@ -586,6 +586,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_environment",
+            "description": "查询车间环境状况：当前温度、湿度、风速、降水等（来自当地公共气象数据）。用于'环境''温度''湿度''车间环境''天气'类请求。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -1552,12 +1560,12 @@ async def _tool_query_shortage_alerts(db: AsyncSession, args: Dict[str, Any], fa
         SELECT rt.material_id, rt.min_level, rt.safety_stock, rt.max_level,
                rt.reorder_lot_size, rt.reorder_lead_time_hours,
                COALESCE(inv.total_qty, 0) as current_qty,
-               COALESCE(inv.material_name, rt.material_id) as material_name
+               COALESCE(inv.material_code, rt.material_id) as material_code
         FROM replenishment_thresholds rt
         LEFT JOIN (
-            SELECT material_id, material_name, sum(total_qty) as total_qty
+            SELECT material_id, material_code, sum(total_qty) as total_qty
             FROM inventory WHERE factory_id = :fid
-            GROUP BY material_id, material_name
+            GROUP BY material_id, material_code
         ) inv ON inv.material_id = rt.material_id
         WHERE rt.factory_id = :fid AND rt.active = true
           AND COALESCE(inv.total_qty, 0) < rt.min_level
@@ -1589,25 +1597,25 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     days = int(args.get("days", 30))
 
     rows = (await db.execute(sa_text("""
-        SELECT i.material_code, i.material_name, i.total_qty, i.unit,
-               i.last_movement_at, i.created_at,
+        SELECT i.material_code, i.total_qty,
+               i.updated_at, i.created_at,
                w.warehouse_name,
-               COALESCE(EXTRACT(DAY FROM now() - COALESCE(i.last_movement_at, i.created_at)), 0) as stagnant_days
+               COALESCE(EXTRACT(DAY FROM now() - i.updated_at), 0) as stagnant_days
         FROM inventory i
         LEFT JOIN warehouses w ON w.id = i.warehouse_id
         WHERE i.factory_id = :fid AND i.total_qty > 0
-          AND COALESCE(i.last_movement_at, i.created_at) < now() - (:days || ' days')::interval
+          AND i.updated_at < now() - (:days || ' days')::interval
         ORDER BY stagnant_days DESC
         LIMIT 30
     """), {"fid": fid, "days": str(days)})).fetchall()
 
     items = [
         {
-            "material_code": r[0], "material_name": r[1],
-            "qty": r[2], "unit": r[3],
-            "last_movement": str(r[4])[:10] if r[4] else str(r[5])[:10],
-            "warehouse": r[6],
-            "stagnant_days": int(r[7]),
+            "material_code": r[0], "material_name": r[0],
+            "qty": r[1],
+            "last_movement": str(r[2])[:10] if r[2] else str(r[3])[:10],
+            "warehouse": r[4],
+            "stagnant_days": int(r[5]),
         }
         for r in rows
     ]
@@ -1856,47 +1864,12 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "工单表单", "工单完整表单", "完整工单表单", "工单全量信息",
         ],
     },
-    {
-        "tool": "get_pending_alerts",
-        "keywords": [
-            "预警", "告警", "警报", "异常汇报", "待处理预警", "当前异常",
-            "有什么预警", "预警情况", "告警情况", "预警汇总",
-        ],
-    },
-    {
-        "tool": "run_alert_patrol",
-        "keywords": [
-            "巡检", "扫描异常", "主动巡检", "预警巡检", "扫描预警",
-        ],
-    },
-    {
-        "tool": "query_hr_roster",
-        "keywords": [
-            "人力", "花名册", "人员分布", "多少人", "人力档案", "员工",
-            "人事", "部门人数", "工序人数", "人力统计", "人员配置",
-            "编制", "人力配置", "车间人数",
-        ],
-    },
-    {
-        "tool": "query_process_knowledge",
-        "keywords": [
-            # 工单流
-            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
-            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
-            # 职位流
-            "品检员做什么", "操作员职责", "PMC流程", "主管职责", "仓管员职责",
-            "设备工程师职责", "日常工作流", "SOP", "标准作业", "岗位职责",
-            "职位流程", "工作流程是什么", "每天做什么",
-            # 责任归属
-            "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
-        ],
-    },
-    # ==================== 5M1E 预警数据意图路由 ====================
+    # ==================== 5M1E 预警数据意图路由（具体优先于通用预警） ====================
     {
         "tool": "query_downtime",
         "keywords": [
             "停机", "停机记录", "故障记录", "MTBF", "设备利用率", "设备故障率",
-            "停机时间", "故障次数", "设备停机", "停机原因", " breakdown",
+            "停机时间", "故障次数", "设备停机", "停机原因",
         ],
     },
     {
@@ -1939,6 +1912,42 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "技能矩阵", "技能等级", "技能分布", "员工技能", "技能断层",
             "谁会", "技能情况", "多能工", "技能覆盖",
+        ],
+    },
+    # ==================== 通用预警/巡检（放在 5M1E 具体规则之后） ====================
+    {
+        "tool": "get_pending_alerts",
+        "keywords": [
+            "预警", "告警", "警报", "异常汇报", "待处理预警", "当前异常",
+            "有什么预警", "预警情况", "告警情况", "预警汇总",
+        ],
+    },
+    {
+        "tool": "run_alert_patrol",
+        "keywords": [
+            "巡检", "扫描异常", "主动巡检", "预警巡检", "扫描预警",
+        ],
+    },
+    {
+        "tool": "query_hr_roster",
+        "keywords": [
+            "人力", "花名册", "人员分布", "多少人", "人力档案", "员工",
+            "人事", "部门人数", "工序人数", "人力统计", "人员配置",
+            "编制", "人力配置", "车间人数",
+        ],
+    },
+    {
+        "tool": "query_process_knowledge",
+        "keywords": [
+            # 工单流
+            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
+            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
+            # 职位流
+            "品检员做什么", "操作员职责", "PMC流程", "主管职责", "仓管员职责",
+            "设备工程师职责", "日常工作流", "SOP", "标准作业", "岗位职责",
+            "职位流程", "工作流程是什么", "每天做什么",
+            # 责任归属
+            "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
         ],
     },
 ]
