@@ -38,6 +38,23 @@ PRIORITY_RANK = {Priority.LOW: 3, Priority.MEDIUM: 2, Priority.HIGH: 1, Priority
 
 # ==================== 输入侧 ====================
 
+class RealWorkerSeed(BaseModel):
+    """真实员工种子（来自 HR 花名册 hr_employees + hr_employee_skills）。
+
+    用于把真实人力数据喂入仿真：工段配置一旦携带 real_workers，
+    引擎将用真实花名册替代合成工人，并按平均技能等级修正产能。
+    """
+
+    name: str
+    skill_level: int = Field(default=3, ge=1, le=5)        # 技能等级 1~5（L1~L5 映射）
+    shift: int = Field(default=1, ge=1, le=3)              # 所属班次
+    gender: Optional[str] = None                            # 性别
+    height_cm: Optional[float] = Field(default=None, ge=0)  # 身高(cm)
+    weight_kg: Optional[float] = Field(default=None, ge=0)  # 体重(kg)
+    role: Optional[str] = None                              # 工种/岗位
+    attendance_rate: Optional[float] = Field(default=None, ge=0.5, le=1.0)  # 出勤率
+
+
 class SectionConfig(BaseModel):
     """工段（可完全控制的核心参数）"""
 
@@ -54,6 +71,8 @@ class SectionConfig(BaseModel):
     yield_rate: float = Field(default=0.98, ge=0.5, le=1.0)       # 良品率（产出合格比例）
     role_name: str = ""                                            # 工种名（如"焊工"），空则按工段派生
     description: str = ""
+    # 真实员工花名册（空 = 合成生成，向后兼容既有场景）；非空时技能影响产能
+    real_workers: List[RealWorkerSeed] = Field(default_factory=list)
 
 
 class WorkshopConfig(BaseModel):
@@ -108,6 +127,10 @@ class FactorySimConfig(BaseModel):
     sections: List[SectionConfig] = Field(..., min_length=1)
     routings: List[RoutingDef] = Field(..., min_length=1)
     orders: List[OrderInput] = Field(..., min_length=1)
+    # 实时数据仿真来源标识（可选，配合 is_simulation 分离原则）
+    factory_id: Optional[str] = None
+    factory_name: Optional[str] = None
+    data_source: Optional[str] = None  # scenario / live_db
 
 
 # ==================== 输出侧 ====================
@@ -197,6 +220,10 @@ class WorkerDef(BaseModel):
     skill_level: int = Field(default=3, ge=1, le=5)   # 技能等级 1~5
     shift: int = Field(default=1, ge=1, le=3)         # 所属班次
     attendance_rate: float = Field(default=0.95, ge=0.5, le=1.0)  # 出勤率
+    # 真实员工档案（来自 HR 花名册；合成工人为 None）
+    gender: Optional[str] = None
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
 
 
 class SectionWorkforce(BaseModel):

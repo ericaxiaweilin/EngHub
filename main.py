@@ -47,6 +47,7 @@ from api.routes.role_elimination_routes import router as role_elimination_router
 from api.routes.workflow_analytics_routes import router as workflow_analytics_router
 from api.routes.automation_level_routes import router as automation_level_router
 from api.routes.collaboration_routes import router as collaboration_router
+from api.routes.agent_supervisor_routes import router as agent_supervisor_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -89,6 +90,7 @@ app.include_router(role_elimination_router)  # 岗位替代（调度员/采购�
 app.include_router(workflow_analytics_router)  # 工作流交叉分析（深层数据）
 app.include_router(automation_level_router)  # 自动化等级配置（L0-L3可选）
 app.include_router(collaboration_router)  # 岗位协同网络（事件+边界）
+app.include_router(agent_supervisor_router)  # 智能体监督（长任务+卡住+预测+闭环）
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 
@@ -234,6 +236,26 @@ async def _periodic_scheduler():
                             _logger.warning(f"[scheduler] 异常升级失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 异常升级任务异常: {e}")
+
+        # 智能体卡住检测 + 预测性扫描 —— 每 10 分钟
+        try:
+            import time as _t7
+            if not hasattr(_periodic_scheduler, "_last_agent_check"):
+                _periodic_scheduler._last_agent_check = 0
+            if _t7.time() - _periodic_scheduler._last_agent_check > 600:  # 10min
+                _periodic_scheduler._last_agent_check = _t7.time()
+                from api.services.agent_supervisor_service import AgentSupervisor
+                async with db_config.session_factory() as db:
+                    supervisor = AgentSupervisor(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            stalled = await supervisor.check_stalled(fid)
+                            if stalled.get("stalled_count"):
+                                _logger.info(f"[scheduler] 智能体卡住: {fid}, {stalled['stalled_count']}个任务")
+                        except Exception as ex:
+                            _logger.warning(f"[scheduler] 卡住检测失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 智能体监督任务异常: {e}")
 
         await asyncio.sleep(_SCHEDULER_INTERVAL)
 
