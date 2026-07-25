@@ -1,9 +1,9 @@
 
 
-"""
-v2.6 - 三位一体调度系统前端 UI
-RCC + 参数化面板 + Chatbot工单
-"""
+/**
+ * v2.6 - 三位一体调度系统前端 UI
+ * RCC + 参数化面板 + Chatbot工单
+ */
 
 import React, { useState, useEffect } from 'react'
 import { Card, Tabs, Table, Button, Space, Tag, Descriptions, Modal, Form, Input, Select, message, Tree, Breadcrumb, Alert } from 'antd'
