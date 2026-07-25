@@ -48,6 +48,7 @@ from api.routes.workflow_analytics_routes import router as workflow_analytics_ro
 from api.routes.automation_level_routes import router as automation_level_router
 from api.routes.collaboration_routes import router as collaboration_router
 from api.routes.agent_supervisor_routes import router as agent_supervisor_router
+from api.routes.agent_routes import router as agent_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -91,6 +92,7 @@ app.include_router(workflow_analytics_router)  # 工作流交叉分析（深层�
 app.include_router(automation_level_router)  # 自动化等级配置（L0-L3可选）
 app.include_router(collaboration_router)  # 岗位协同网络（事件+边界）
 app.include_router(agent_supervisor_router)  # 智能体监督（长任务+卡住+预测+闭环）
+app.include_router(agent_router)  # 排产+仓储智能体
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 
@@ -256,6 +258,46 @@ async def _periodic_scheduler():
                             _logger.warning(f"[scheduler] 卡住检测失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 智能体监督任务异常: {e}")
+
+        # 仓储智能体：补货检查 —— 每 60 分钟
+        try:
+            import time as _t8
+            if not hasattr(_periodic_scheduler, "_last_warehouse_check"):
+                _periodic_scheduler._last_warehouse_check = 0
+            if _t8.time() - _periodic_scheduler._last_warehouse_check > 3600:  # 60min
+                _periodic_scheduler._last_warehouse_check = _t8.time()
+                from api.services.warehouse_agent_service import WarehouseAgent
+                async with db_config.session_factory() as db:
+                    agent = WarehouseAgent(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            result = await agent.on_stock_below_safety(fid)
+                            if result.get("total_items"):
+                                _logger.info(f"[warehouse] {fid}: {result['total_items']}项物料需补货")
+                        except Exception as ex:
+                            _logger.warning(f"[warehouse] 补货检查失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 仓储智能体任务异常: {e}")
+
+        # 排产智能体：产能平衡检查 —— 每 30 分钟
+        try:
+            import time as _t9
+            if not hasattr(_periodic_scheduler, "_last_scheduling_check"):
+                _periodic_scheduler._last_scheduling_check = 0
+            if _t9.time() - _periodic_scheduler._last_scheduling_check > 1800:  # 30min
+                _periodic_scheduler._last_scheduling_check = _t9.time()
+                from api.services.scheduling_agent_service import SchedulingAgent
+                async with db_config.session_factory() as db:
+                    agent = SchedulingAgent(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            balance = await agent.capacity_balance(fid)
+                            if not balance.get("balanced", True):
+                                _logger.info(f"[scheduling] {fid}: 产能不平衡 ({balance.get('imbalance_ratio', 0):.0%})")
+                        except Exception as ex:
+                            _logger.warning(f"[scheduling] 产能检查失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 排产智能体任务异常: {e}")
 
         await asyncio.sleep(_SCHEDULER_INTERVAL)
 

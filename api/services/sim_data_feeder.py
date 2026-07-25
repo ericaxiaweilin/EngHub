@@ -78,6 +78,31 @@ def _match_section_id(token: Optional[str], name_to_sid: Dict[str, str]) -> Opti
     return None
 
 
+async def _stations_equipment_expr(db: AsyncSession) -> str:
+    """探测 stations 设备台数列，返回可用 SQL 表达式（跨 schema 容错）。
+
+    通过 information_schema 主动探测（不触发失败查询，避免 PostgreSQL
+    “current transaction is aborted” 毒化会话）：
+    - 迁移版 schema → equipment_count
+    - ORM 版 schema → equipment_ids 数组长度
+    - 都没有 → 0
+    """
+    try:
+        rows = (await db.execute(sa_text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'stations'
+              AND column_name IN ('equipment_count', 'equipment_ids')
+        """))).fetchall()
+        cols = {r[0] for r in rows}
+        if "equipment_count" in cols:
+            return "equipment_count"
+        if "equipment_ids" in cols:
+            return "COALESCE(array_length(equipment_ids, 1), 0)"
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+    return "0"
+
+
 async def build_live_config(db: AsyncSession, factory_id: str, horizon_days: int = 14) -> FactorySimConfig:
     """从 DB 真实数据构建仿真配置。
 
@@ -107,17 +132,32 @@ async def build_live_config(db: AsyncSession, factory_id: str, horizon_days: int
         lv = _parse_skill_level(level)
         emp_max_skill[emp_id] = max(emp_max_skill.get(emp_id, 0), lv)
 
-    # ━━━ 3. 设备：工位设备台数（模糊匹配工段）━━━
-    st_rows = (await db.execute(sa_text("""
-        SELECT station_name, station_type, capacity, equipment_count
-        FROM stations
-        WHERE factory_id = :fid AND status = 'active'
-    """), {"fid": factory_id})).fetchall()
+    # ━━━ 3. 设备：工位设备台数（模糊匹配工段，跨 schema 容错）━━━
+    # stations 表存在两种 schema：迁移版(equipment_count) 与 ORM 版(equipment_ids)，
+    # 先主动探测设备列（不触发失败查询），避免 PostgreSQL 中止事务毒化会话。
     station_machines: Dict[str, int] = {}
     station_type_map: Dict[str, str] = {}
-    for name, stype, _cap, eq in st_rows:
-        station_machines[name] = eq or 0
-        station_type_map[name] = stype or "production"
+    try:
+        st_rows = (await db.execute(sa_text("""
+            SELECT station_name, station_type
+            FROM stations
+            WHERE factory_id = :fid AND status = 'active'
+        """), {"fid": factory_id})).fetchall()
+        for name, stype in st_rows:
+            station_type_map[name] = stype or "production"
+    except Exception:  # noqa: BLE001 — stations 表缺失/差异时降级为无类型信息
+        await db.rollback()
+    # 设备台数：用探测出的设备列表达式查询（不会失败 → 不毒化会话）
+    eq_expr = await _stations_equipment_expr(db)
+    try:
+        eq_rows = (await db.execute(sa_text(f"""
+            SELECT station_name, {eq_expr} FROM stations
+            WHERE factory_id = :fid AND status = 'active'
+        """), {"fid": factory_id})).fetchall()
+        for name, eq in eq_rows:
+            station_machines[name] = int(eq or 0)
+    except Exception:  # noqa: BLE001 — 无设备信息时 machines=0（纯人工作业）
+        await db.rollback()
 
     # ━━━ 4. 按 (department, station) 聚合工段 + 真实花名册 ━━━
     workshops: List[WorkshopConfig] = []
@@ -319,8 +359,18 @@ async def get_live_data_summary(db: AsyncSession, factory_id: str) -> Dict[str, 
         "SELECT count(*) FILTER (WHERE status='active') FROM hr_employees WHERE factory_id = :fid"
     ), {"fid": factory_id})).scalar() or 0
     st = (await db.execute(sa_text(
-        "SELECT count(*), COALESCE(SUM(equipment_count),0) FROM stations WHERE factory_id = :fid AND status='active'"
-    ), {"fid": factory_id})).fetchone()
+        "SELECT count(*) FROM stations WHERE factory_id = :fid AND status='active'"
+    ), {"fid": factory_id})).scalar() or 0
+    # 设备总数跨 schema 容错：先探测设备列（不触发失败查询，避免毒化会话）
+    equipment_total = 0
+    eq_expr = await _stations_equipment_expr(db)
+    try:
+        equipment_total = (await db.execute(sa_text(
+            f"SELECT COALESCE(SUM({eq_expr}),0) FROM stations WHERE factory_id = :fid AND status='active'"
+        ), {"fid": factory_id})).scalar() or 0
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        equipment_total = 0
     skill_cnt = (await db.execute(sa_text("""
         SELECT count(*) FROM hr_employee_skills hes
         JOIN hr_employees e ON e.id = hes.hr_employee_id
@@ -335,7 +385,7 @@ async def get_live_data_summary(db: AsyncSession, factory_id: str) -> Dict[str, 
         "inputs": {
             "人力": {"active_workers": hr, "source": "hr_employees"},
             "技能": {"employee_skill_records": skill_cnt, "source": "hr_employee_skills+skills"},
-            "设备": {"stations": st[0], "equipment_total": st[1], "source": "stations"},
+            "设备": {"stations": st, "equipment_total": equipment_total, "source": "stations"},
             "工艺": {"routing_count": rt, "source": "routing_templates+steps"},
         },
         "ready": hr > 0,

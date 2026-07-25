@@ -483,6 +483,9 @@ export const WorkforcePanel: React.FC<{ result: FactorySimResult }> = ({ result 
     { title: '工种', dataIndex: 'role', key: 'role', render: (v: string) => <Tag color="blue">{v}</Tag> },
     { title: '技能', dataIndex: 'skill_level', key: 'skill_level', width: 150, render: (v: number) => <Rate disabled value={v} style={{ fontSize: 12 }} /> },
     { title: '班次', dataIndex: 'shift', key: 'shift', width: 70, align: 'center' as const, render: (v: number) => <Tag>{v} 班</Tag> },
+    { title: '性别', dataIndex: 'gender', key: 'gender', width: 60, align: 'center' as const, render: (v?: string) => v ? <Tag color={v === '男' ? 'blue' : 'magenta'}>{v}</Tag> : <span style={{ color: '#d9d9d9' }}>—</span> },
+    { title: '身高', dataIndex: 'height_cm', key: 'height_cm', width: 80, align: 'right' as const, render: (v?: number) => v ? `${v.toFixed(1)} cm` : <span style={{ color: '#d9d9d9' }}>—</span> },
+    { title: '体重', dataIndex: 'weight_kg', key: 'weight_kg', width: 80, align: 'right' as const, render: (v?: number) => v ? `${v.toFixed(1)} kg` : <span style={{ color: '#d9d9d9' }}>—</span> },
     { title: '出勤率', dataIndex: 'attendance_rate', key: 'attendance_rate', width: 90, align: 'right' as const, render: (v: number) => pct(v) },
   ]
   return (

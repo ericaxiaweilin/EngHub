@@ -170,6 +170,9 @@ export interface WorkerDef {
   skill_level: number
   shift: number
   attendance_rate: number
+  gender?: string
+  height_cm?: number
+  weight_kg?: number
 }
 
 export interface SectionWorkforce {

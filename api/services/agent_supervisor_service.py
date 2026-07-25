@@ -89,6 +89,24 @@ AGENTS = {
         "timeout_min": 480,
         "verify": "维修完成后确认设备是否恢复正常",
     },
+    "scheduling_agent": {
+        "name": "排产智能体",
+        "description": "事件驱动自动排程/插单重排/产能平衡/what-if模拟",
+        "trigger": "新工单下达/紧急插单/设备故障/物料延迟",
+        "sensing": "event+schedule",
+        "interval_min": 30,
+        "timeout_min": 10,
+        "verify": "排程后验证：无时间重叠+交期风险已标记+产能平衡",
+    },
+    "warehouse_agent": {
+        "name": "仓储智能体",
+        "description": "自动补货/呆滞预警/齐套检查/库位优化",
+        "trigger": "库存低于安全线/工单下达/定时扫描",
+        "sensing": "event+schedule",
+        "interval_min": 60,
+        "timeout_min": 15,
+        "verify": "补货后确认采购申请已创建+齐套结果已标记",
+    },
 }
 
 

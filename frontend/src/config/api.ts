@@ -54,6 +54,7 @@ export const API_ENDPOINTS = {
   SIM_FACTORY_RUN: `${API_BASE_URL}/api/v1/sim-factory/run`,
   SIM_FACTORY_DASHBOARD_SUMMARY: (scenarioId?: string) =>
     `${API_BASE_URL}/api/v1/sim-factory/dashboard-summary${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
+  SIM_FACTORY_SELF_TEST: `${API_BASE_URL}/api/v1/sim-factory/self-test`,
 
   // 生产看板（真实生产数据聚合，与仿真结果同构但 is_simulation=false）
   PRODUCTION_DASHBOARD_SUMMARY: (factoryId?: string) =>
