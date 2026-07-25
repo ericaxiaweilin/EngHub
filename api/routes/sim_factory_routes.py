@@ -154,6 +154,80 @@ async def factory_sim_dashboard_summary(
     return data
 
 
+# ==================== 引擎设计自检（不变式验证器） ====================
+
+@router.get("/self-test")
+async def factory_sim_self_test(
+    include_live: bool = Query(default=False, description="是否额外验证实时数据场景（需工厂数据）"),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """引擎设计自检：对内置 4 个工厂场景跑不变式验证器（validator），量化引擎设计质量。
+
+    复用 ``core/sim_factory/validator``（与 pytest 离线套件同一真相源 / DRY）。
+    仿真数据与真实生产严格分离，返回 ``is_simulation=True``。
+    无需鉴权（健康检查）；``include_live=true`` 时额外验证实时数据场景（best-effort）。
+    """
+    scenario_reports: List[Dict[str, Any]] = []
+    total_checks = total_passed = total_failed = 0
+
+    # 内置 4 个工厂场景
+    for sid, meta in SCENARIO_REGISTRY.items():
+        try:
+            cfg = meta["builder"]()
+            res = engine.run(cfg)
+            report = validate_result(cfg, res, engine=engine, scenario_id=sid)
+            scenario_reports.append({
+                "id": sid, "name": meta["scenario_name"],
+                "passed": report.passed, "failed": report.failed,
+                "total": report.total, "ok": report.ok,
+            })
+            total_checks += report.total
+            total_passed += report.passed
+            total_failed += report.failed
+        except Exception as exc:  # noqa: BLE001
+            scenario_reports.append({
+                "id": sid, "name": meta["scenario_name"],
+                "passed": 0, "failed": 1, "total": 1, "ok": False, "error": str(exc),
+            })
+            total_checks += 1
+            total_failed += 1
+
+    # 可选：实时数据场景（best-effort，失败不拖累内置场景报告）
+    if include_live:
+        fid = (request.headers.get("x-factory-id") if request else None) or "FAC_MECH_001"
+        try:
+            cfg = await build_live_config(db, fid, 14)
+            res = engine.run(cfg)
+            report = validate_result(cfg, res, scenario_id=f"live:{fid}")
+            scenario_reports.append({
+                "id": f"live:{fid}", "name": f"实时数据 ({fid})",
+                "passed": report.passed, "failed": report.failed,
+                "total": report.total, "ok": report.ok,
+            })
+            total_checks += report.total
+            total_passed += report.passed
+            total_failed += report.failed
+        except Exception as exc:  # noqa: BLE001
+            scenario_reports.append({
+                "id": f"live:{fid}", "name": f"实时数据 ({fid})",
+                "passed": 0, "failed": 0, "total": 0, "ok": False,
+                "skipped": True, "error": str(exc),
+            })
+
+    score = round(total_passed / total_checks * 100, 1) if total_checks else 0.0
+    return {
+        "engine_version": FactoryLoadEngine.VERSION,
+        "scenarios": scenario_reports,
+        "total_checks": total_checks,
+        "passed": total_passed,
+        "failed": total_failed,
+        "design_quality_score": score,
+        "is_simulation": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ==================== 实时数据仿真（人/设备/物料/工艺 从 DB 拉取） ====================
 
 @router.get("/live-data")

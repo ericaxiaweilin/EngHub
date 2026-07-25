@@ -137,14 +137,24 @@ class AgentSupervisor:
         self, task_id: str, completed_steps: int, note: str = ""
     ) -> Dict[str, Any]:
         """更新任务进度（智能体每完成一步调用）"""
+        # 先获取total_steps来计算百分比
+        pre = await self.db.execute(text(
+            "SELECT total_steps FROM agent_tasks WHERE id = :id::uuid AND status = 'running'"
+        ), {"id": task_id})
+        pre_row = pre.first()
+        if not pre_row:
+            return {"success": False, "error": "任务不存在或已完成"}
+        total_steps = pre_row[0] or 1
+        pct = round(completed_steps / total_steps * 100, 1) if total_steps > 0 else 0
+
         result = await self.db.execute(text("""
             UPDATE agent_tasks
             SET completed_steps = :cs,
-                progress_pct = CASE WHEN total_steps > 0 THEN ROUND((:cs::numeric / total_steps * 100), 1) ELSE 0 END,
+                progress_pct = :pct,
                 last_progress_at = NOW()
             WHERE id = :id::uuid AND status = 'running'
             RETURNING agent_name, task_type, total_steps, completed_steps
-        """), {"cs": completed_steps, "id": task_id})
+        """), {"cs": completed_steps, "pct": pct, "id": task_id})
         row = result.first()
         await self.db.commit()
 
