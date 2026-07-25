@@ -109,6 +109,30 @@ class WmsOperationService:
         self.db.add(txn)
         await self.db.commit()
 
+        # ═══ G2断点修复：收货自动触发IQC（美的模式：收货→30秒首检） ═══
+        iqc_triggered = False
+        if reference_type == "purchase" or (remark and "采购" in (remark or "")):
+            try:
+                from api.services.inspection_service import InspectionService
+                insp_svc = InspectionService(self.db)
+                # AQL General-II 抽样
+                import math
+                sample = min(80, max(5, int(math.sqrt(quantity))))
+                await insp_svc.create_task(
+                    factory_id=factory_id,
+                    inspect_type="IQC",
+                    material_code=material_code,
+                    material_name=material_name,
+                    batch_qty=quantity,
+                    sample_qty=sample,
+                    source_type="inbound",
+                    source_code=batch_code or material_code,
+                    created_by=operator,
+                )
+                iqc_triggered = True
+            except Exception:
+                pass  # IQC触发失败不阻塞入库
+
         return {
             "success": True,
             "type": "inbound",
@@ -118,6 +142,8 @@ class WmsOperationService:
             "warehouse_id": warehouse_id,
             "operator": operator,
             "time": now.isoformat(),
+            "iqc_triggered": iqc_triggered,
+            "iqc_note": "已自动触发来料检(IQC)" if iqc_triggered else None,
         }
 
     # ==================== 快速出库 ====================

@@ -57,3 +57,42 @@ async def material_flow(
     from api.services.workflow_analytics_service import WorkflowAnalyticsService
     svc = WorkflowAnalyticsService(db)
     return await svc.material_flow_sankey(factory_id)
+
+
+# ==================== T+3 交期管控（美的模式） ====================
+
+
+@router.get("/t3/countdown")
+async def delivery_countdown(
+    factory_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """订单交期倒计时（红黄绿灯）—— 不需要跟单员盯"""
+    from api.services.t3_delivery_service import T3DeliveryService
+    svc = T3DeliveryService(db)
+    return await svc.delivery_countdown(factory_id)
+
+
+@router.get("/t3/realtime-progress")
+async def realtime_progress(
+    factory_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """实时进度看板（工位→部门→全厂）—— 不需要文员做报表"""
+    from api.services.t3_delivery_service import T3DeliveryService
+    svc = T3DeliveryService(db)
+    return await svc.realtime_progress(factory_id)
+
+
+@router.get("/t3/overdue-alerts")
+async def overdue_alerts(
+    factory_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """超期自动预警（工单/采购/订单）—— 不需要调度员盯"""
+    from api.services.t3_delivery_service import T3DeliveryService
+    svc = T3DeliveryService(db)
+    return await svc.overdue_alerts(factory_id)
