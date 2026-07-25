@@ -140,9 +140,9 @@ class AgentSupervisor:
         result = await self.db.execute(text("""
             UPDATE agent_tasks
             SET completed_steps = :cs,
-                progress_pct = CASE WHEN total_steps > 0 THEN ROUND(:cs::real / total_steps * 100, 1) ELSE 0 END,
+                progress_pct = CASE WHEN total_steps > 0 THEN ROUND((:cs::numeric / total_steps * 100), 1) ELSE 0 END,
                 last_progress_at = NOW()
-            WHERE id = :id AND status = 'running'
+            WHERE id = :id::uuid AND status = 'running'
             RETURNING agent_name, task_type, total_steps, completed_steps
         """), {"cs": completed_steps, "id": task_id})
         row = result.first()
@@ -169,7 +169,7 @@ class AgentSupervisor:
             UPDATE agent_tasks
             SET status = :st, completed_at = NOW(), progress_pct = 100,
                 result = :res, error = :err
-            WHERE id = :id
+            WHERE id = :id::uuid
         """), {
             "st": status, "id": task_id,
             "res": str(result or {}), "err": error,
@@ -182,7 +182,7 @@ class AgentSupervisor:
         await self.db.execute(text("""
             UPDATE agent_tasks
             SET verified = TRUE, verified_at = NOW(), verify_result = :vr
-            WHERE id = :id
+            WHERE id = :id::uuid
         """), {"vr": verify_result, "id": task_id})
         await self.db.commit()
         return {"task_id": task_id, "verified": True, "verify_result": verify_result}
@@ -204,7 +204,7 @@ class AgentSupervisor:
         # 标记为 stalled
         for task in stalled:
             await self.db.execute(text("""
-                UPDATE agent_tasks SET status = 'stalled' WHERE id = :id
+                UPDATE agent_tasks SET status = 'stalled' WHERE id = :id::uuid
             """), {"id": task["id"]})
 
         if stalled:

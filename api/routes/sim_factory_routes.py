@@ -1,9 +1,10 @@
 """
 车间级 / 工段级负荷仿真路由
 
-- GET  /api/v1/sim-factory/scenarios  获取多工厂场景列表（前端工厂切换器）
-- GET  /api/v1/sim-factory/scenario   获取指定工厂场景（?scenario_id=，默认精密机械厂）
-- POST /api/v1/sim-factory/run        运行仿真（全部工段/车间/订单参数可控）
+- GET  /api/v1/sim-factory/scenarios   获取多工厂场景列表（前端工厂切换器）
+- GET  /api/v1/sim-factory/scenario    获取指定工厂场景（?scenario_id=，默认精密机械厂）
+- POST /api/v1/sim-factory/run         运行仿真（全部工段/车间/订单参数可控）
+- GET  /api/v1/sim-factory/self-test   引擎设计自检（不变式验证器，量化设计质量）
 """
 
 from __future__ import annotations
@@ -25,10 +26,12 @@ from core.sim_factory.models import (
     WorkshopConfig,
 )
 from core.sim_factory.scenarios import (
+    SCENARIO_REGISTRY,
     build_scenario,
     get_scenario_meta,
     list_scenarios,
 )
+from core.sim_factory.validator import validate_result
 from database.db_config import get_db
 from database.models import User
 from core.auth.security import get_current_user
@@ -171,7 +174,7 @@ async def run_live_simulation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """基于真实 DB 数据运行仿真（人力档案 + 工位设备 + 库存物料 + 工艺路线）"""
+    """基于真实 DB 数据运行仿真（人力档案+技能花名册 + 工位设备 + 工艺路线）"""
     fid = request.headers.get("x-factory-id") or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
     try:
         config = await build_live_config(db, fid, horizon_days)
