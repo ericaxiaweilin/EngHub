@@ -8,6 +8,7 @@
     "/process-queue": "工序佇列",
     "/my-tasks": "我的任務",
     "/routing-templates": "工藝路線模板",
+    "g-alert": "預警情報",
     "/alert-intelligence": "預警情報",
     "/production-report": "生產報工",
     "/base-data": "工位/工藝/設備",

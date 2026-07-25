@@ -8,6 +8,7 @@
     "/process-queue": "工序队列",
     "/my-tasks": "我的任务",
     "/routing-templates": "工艺路线模板",
+    "g-alert": "预警情报",
     "/alert-intelligence": "预警情报",
     "/production-report": "生产报工",
     "/base-data": "工位/工艺/设备",
