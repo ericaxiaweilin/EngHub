@@ -98,7 +98,7 @@ function convertMenuItems(items: any[], t: (key: string, opts?: any) => string):
 
 // 路由前缀 → 菜单分组 key 映射（用于侧边栏只显示当前模块）
 const ROUTE_MODULE_MAP: [string, string][] = [
-  ['/work-orders', 'g-mes'], ['/process-queue', 'g-mes'], ['/my-tasks', 'g-mes'],
+  ['/work-orders', 'g-mes'], ['/process-queue', 'g-mes'],
   ['/routing-templates', 'g-mes'], ['/production-report', 'g-mes'], ['/base-data', 'g-mes'],
   ['/plant-floor', 'g-mes'], ['/report-terminal', 'g-mes'], ['/production-live', 'g-mes'],
   ['/report-center', 'g-mes'],
@@ -109,8 +109,8 @@ const ROUTE_MODULE_MAP: [string, string][] = [
   ['/wms-terminal', 'g-wms'], ['/stock-alerts', 'g-wms'],
   ['/equipment-center', 'g-equipment'], ['/equipment/', 'g-equipment'],
   ['/orders', 'g-aps'], ['/plans', 'g-aps'], ['/scheduling', 'g-aps'],
-  ['/andon', 'g-collab'], ['/tms/', 'g-collab'], ['/quick-request', 'g-collab'],
-  ['/war-room', 'g-collab'], ['/work-order-templates', 'g-collab'],
+  ['/andon', 'g-collab'], ['/tms/', 'g-collab'], ['/quick-request', 'g-collab'], ['/my-tasks', 'g-collab'],
+  ['/war-room', 'g-collab'], ['/work-order-templates', 'g-collab'], ['/rcc', 'g-collab'],
   ['/simulation', '/simulation'], ['/sim-erp', '/simulation'],
   ['/skill-matrix', 'g-hr'], ['/hr-roster', 'g-hr'],
   ['/dashboard', 'g-mes'], ['/production-data', 'g-mes'],
