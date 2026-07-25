@@ -1,8 +1,9 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Col, Row, Space, Tag } from 'antd'
+import { Button, Card, Col, Progress, Row, Space, Table, Tag, message } from 'antd'
 import {
-  AuditOutlined, HeatMapOutlined, SafetyCertificateOutlined, ThunderboltOutlined,
+  AuditOutlined, CheckCircleOutlined, CloseCircleOutlined, HeatMapOutlined,
+  ReloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
 import { API_ENDPOINTS } from '../../config/api'
@@ -16,7 +17,7 @@ import AuditRecords from './AuditRecords'
  * 本组件负责：模块身份头部（引擎活状态）、能力面 Tab 选择、URL 同步、面板保活。
  * ==================================================================== */
 
-const TAB_KEYS = ['factory', 'compliance', 'audit'] as const
+const TAB_KEYS = ['factory', 'compliance', 'audit', 'selftest'] as const
 type TabKey = typeof TAB_KEYS[number]
 
 interface TabDef {
@@ -26,6 +27,116 @@ interface TabDef {
   desc: string
   accent: string
   node: React.ReactNode
+}
+
+/* ==================== 引擎自检面板 ==================== */
+
+interface SelfTestScenario {
+  id: string
+  name: string
+  passed: number
+  failed: number
+  total: number
+  ok: boolean
+}
+
+interface SelfTestReport {
+  engine_version: string
+  scenarios: SelfTestScenario[]
+  total_checks: number
+  passed: number
+  failed: number
+  design_quality_score: number
+  is_simulation: boolean
+  timestamp: string
+}
+
+const EngineSelfTest: React.FC = () => {
+  const [report, setReport] = useState<SelfTestReport | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const runTest = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r: any = await api.get(API_ENDPOINTS.SIM_FACTORY_SELF_TEST, { params: { include_live: true } })
+      setReport(r)
+      if (r.failed === 0) message.success(`引擎自检通过：${r.passed}/${r.total_checks} 项不变式全过`)
+      else message.warning(`引擎自检：${r.failed} 项未通过`)
+    } catch {
+      message.error('引擎自检请求失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { runTest() }, [runTest])
+
+  const columns: any[] = [
+    { title: '场景', dataIndex: 'name', key: 'name', render: (v: string, r: SelfTestScenario) => <Space size={6}><span style={{ fontWeight: 600 }}>{v}</span><Tag style={{ margin: 0, fontSize: 10 }}>{r.id}</Tag></Space> },
+    { title: '通过', dataIndex: 'passed', key: 'passed', width: 80, align: 'center' as const, render: (v: number) => <span style={{ color: '#52c41a', fontWeight: 700 }}>{v}</span> },
+    { title: '失败', dataIndex: 'failed', key: 'failed', width: 80, align: 'center' as const, render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : '#52c41a', fontWeight: 700 }}>{v}</span> },
+    { title: '总计', dataIndex: 'total', key: 'total', width: 80, align: 'center' as const },
+    { title: '状态', dataIndex: 'ok', key: 'ok', width: 90, align: 'center' as const, render: (v: boolean) => v ? <Tag color="success" icon={<CheckCircleOutlined />}>通过</Tag> : <Tag color="error" icon={<CloseCircleOutlined />}>失败</Tag> },
+  ]
+
+  return (
+    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <Card size="small"
+        title={<Space size={6}><ThunderboltOutlined />引擎设计质量自检</Space>}
+        extra={<Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={runTest}>重新自检</Button>}
+      >
+        {report ? (
+          <Row gutter={[16, 16]} align="middle">
+            <Col span={6} style={{ textAlign: 'center' }}>
+              <Progress
+                type="circle"
+                percent={Number(report.design_quality_score.toFixed(1))}
+                size={100}
+                strokeColor={report.design_quality_score >= 100 ? '#52c41a' : report.design_quality_score >= 80 ? '#faad14' : '#f5222d'}
+                format={(p) => <span style={{ fontSize: 18, fontWeight: 700 }}>{p}%</span>}
+              />
+              <div style={{ fontSize: 12, color: '#8c8c8c', marginTop: 6 }}>设计质量分</div>
+            </Col>
+            <Col span={18}>
+              <Row gutter={[12, 12]}>
+                <Col span={8}>
+                  <Card size="small" styles={{ body: { padding: '10px 14px' } }}>
+                    <div style={{ fontSize: 11, color: '#8c8c8c' }}>引擎版本</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#1890ff' }}>v{report.engine_version}</div>
+                  </Card>
+                </Col>
+                <Col span={8}>
+                  <Card size="small" styles={{ body: { padding: '10px 14px' } }}>
+                    <div style={{ fontSize: 11, color: '#8c8c8c' }}>不变式检查</div>
+                    <div style={{ fontSize: 18, fontWeight: 700 }}>
+                      <span style={{ color: '#52c41a' }}>{report.passed}</span>
+                      <span style={{ color: '#8c8c8c', fontSize: 13 }}> / {report.total_checks}</span>
+                    </div>
+                  </Card>
+                </Col>
+                <Col span={8}>
+                  <Card size="small" styles={{ body: { padding: '10px 14px' } }}>
+                    <div style={{ fontSize: 11, color: '#8c8c8c' }}>场景数</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#722ed1' }}>{report.scenarios.length}</div>
+                  </Card>
+                </Col>
+              </Row>
+              <div style={{ fontSize: 11, color: '#8c8c8c', marginTop: 8 }}>
+                自检时间：{new Date(report.timestamp).toLocaleString()} · 仿真数据（is_simulation=true）
+              </div>
+            </Col>
+          </Row>
+        ) : (
+          <div style={{ textAlign: 'center', padding: 24, color: '#8c8c8c' }}>{loading ? '正在运行引擎自检…' : '点击“重新自检”开始'}</div>
+        )}
+      </Card>
+      {report && (
+        <Card size="small" title="场景明细" styles={{ body: { padding: 0 } }}>
+          <Table dataSource={report.scenarios} columns={columns} rowKey="id" size="small" pagination={false} />
+        </Card>
+      )}
+    </Space>
+  )
 }
 
 const TABS: TabDef[] = [
@@ -43,6 +154,11 @@ const TABS: TabDef[] = [
     key: 'audit', icon: <AuditOutlined />, accent: '#722ed1',
     name: '合规审计记录', desc: '仿真留痕 · 裁决回放 · CSV 导出',
     node: <AuditRecords />,
+  },
+  {
+    key: 'selftest', icon: <CheckCircleOutlined />, accent: '#13c2c2',
+    name: '引擎自检', desc: '不变式验证 · 设计质量分 · 确定性检查',
+    node: <EngineSelfTest />,
   },
 ]
 
@@ -117,7 +233,7 @@ const SimulationEngine: React.FC = () => {
           </Row>
 
           {/* ── 能力面 Tab 选择器 ── */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginTop: 18 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginTop: 18 }}>
             {TABS.map((t) => {
               const active = t.key === tab
               return (

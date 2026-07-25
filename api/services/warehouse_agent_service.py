@@ -119,7 +119,7 @@ class WarehouseAgent:
 
         # 获取BOM
         bom_result = await self.db.execute(text("""
-            SELECT b.material_code, b.material_name, b.quantity_per_unit, b.unit,
+            SELECT b.material_code, b.material_name, b.qty_per_unit, b.unit,
                    COALESCE(i.available_qty, 0) as available_qty
             FROM bom_items b
             LEFT JOIN inventory i ON b.material_code = i.material_code AND i.factory_id = :fid
@@ -138,7 +138,7 @@ class WarehouseAgent:
         material_status = []
         shortage_count = 0
         for item in bom_items:
-            required = (item["quantity_per_unit"] or 1) * planned_qty
+            required = (item["qty_per_unit"] or 1) * planned_qty
             available = item["available_qty"]
             is_short = available < required
             if is_short:
@@ -188,11 +188,11 @@ class WarehouseAgent:
                    EXTRACT(DAY FROM NOW() - COALESCE(last_txn.last_activity, i.created_at)) as idle_days
             FROM inventory i
             LEFT JOIN (
-                SELECT material_code, MAX(created_at) as last_activity
+                SELECT material_id, MAX(created_at) as last_activity
                 FROM inventory_transactions
                 WHERE factory_id = :fid
-                GROUP BY material_code
-            ) last_txn ON i.material_code = last_txn.material_code
+                GROUP BY material_id
+            ) last_txn ON i.material_id = last_txn.material_id
             WHERE i.factory_id = :fid AND i.available_qty > 0
               AND COALESCE(last_txn.last_activity, i.created_at) < NOW() - :days * INTERVAL '1 day'
             ORDER BY idle_days DESC
@@ -225,13 +225,13 @@ class WarehouseAgent:
         """定时：库位优化建议（高频物料应靠近出货区）"""
         # 获取出库频率
         result = await self.db.execute(text("""
-            SELECT it.material_code, COUNT(*) as outbound_count,
-                   i.location_code, i.abc_class
+            SELECT it.material_id, COUNT(*) as outbound_count,
+                   i.location_code, i.abc_class, i.material_code
             FROM inventory_transactions it
-            JOIN inventory i ON it.material_code = i.material_code AND i.factory_id = :fid
+            JOIN inventory i ON it.material_id = i.material_id AND i.factory_id = :fid
             WHERE it.factory_id = :fid AND it.transaction_type = 'outbound'
               AND it.created_at > NOW() - INTERVAL '30 days'
-            GROUP BY it.material_code, i.location_code, i.abc_class
+            GROUP BY it.material_id, i.location_code, i.abc_class, i.material_code
             ORDER BY outbound_count DESC
         """), {"fid": factory_id})
         freq_data = [dict(r) for r in result.mappings().all()]
@@ -283,7 +283,7 @@ class WarehouseAgent:
             WHERE i.factory_id = :fid AND i.available_qty > 0
               AND NOT EXISTS (
                   SELECT 1 FROM inventory_transactions it
-                  WHERE it.material_code = i.material_code AND it.factory_id = :fid
+                  WHERE it.material_id = i.material_id AND it.factory_id = :fid
                     AND it.created_at > NOW() - INTERVAL '90 days'
               )
         """), {"fid": factory_id})
