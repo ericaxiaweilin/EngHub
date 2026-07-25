@@ -34,6 +34,8 @@ class EmployeeCreate(BaseModel):
     hire_date: Optional[str] = None
     skill_level: str = "L1"
     phone: Optional[str] = None
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
 
 
 class EmployeeUpdate(BaseModel):
@@ -46,6 +48,16 @@ class EmployeeUpdate(BaseModel):
     status: Optional[str] = None
     skill_level: Optional[str] = None
     phone: Optional[str] = None
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
+
+
+class EmployeeSkillAssign(BaseModel):
+    """给花名册员工分配/更新内部工序技能"""
+    skill_id: int
+    level: str = "L1"  # L1-L5
+    certified_date: Optional[str] = None
+    expiry_date: Optional[str] = None
 
 
 class FactorySwitch(BaseModel):
@@ -156,7 +168,7 @@ async def list_employees(
     params["offset"] = offset
     rows = (await db.execute(text(f"""
         SELECT id, employee_code, name, gender, department, station, position,
-               shift, hire_date, status, skill_level, phone
+               shift, hire_date, status, skill_level, phone, height_cm, weight_kg
         FROM hr_employees WHERE {where}
         ORDER BY department, station, employee_code
         LIMIT :limit OFFSET :offset
@@ -173,6 +185,8 @@ async def list_employees(
                 "department": r[4], "station": r[5], "position": r[6],
                 "shift": r[7], "hire_date": str(r[8]) if r[8] else None,
                 "status": r[9], "skill_level": r[10], "phone": r[11],
+                "height_cm": float(r[12]) if r[12] is not None else None,
+                "weight_kg": float(r[13]) if r[13] is not None else None,
             }
             for r in rows
         ],
@@ -257,12 +271,13 @@ async def create_employee(
     code = f"{prefix}-{seq:04d}"
     emp_id = str(uuid.uuid4())
     await db.execute(text("""
-        INSERT INTO hr_employees (id, factory_id, employee_code, name, gender, department, station, position, shift, hire_date, status, skill_level, phone)
-        VALUES (:id, :fid, :code, :name, :gender, :dept, :station, :pos, :shift, COALESCE(:hire, CURRENT_DATE), 'active', :skill, :phone)
+        INSERT INTO hr_employees (id, factory_id, employee_code, name, gender, department, station, position, shift, hire_date, status, skill_level, phone, height_cm, weight_kg)
+        VALUES (:id, :fid, :code, :name, :gender, :dept, :station, :pos, :shift, COALESCE(:hire, CURRENT_DATE), 'active', :skill, :phone, :height, :weight)
     """), {
         "id": emp_id, "fid": fid, "code": code, "name": body.name, "gender": body.gender,
         "dept": body.department, "station": body.station, "pos": body.position,
         "shift": body.shift, "hire": body.hire_date, "skill": body.skill_level, "phone": body.phone,
+        "height": body.height_cm, "weight": body.weight_kg,
     })
     await db.commit()
     return {"id": emp_id, "employee_code": code, "message": f"已添加 {body.name}"}
@@ -278,7 +293,7 @@ async def update_employee(
     """更新员工信息"""
     updates = []
     params: Dict[str, Any] = {"id": emp_id}
-    for field in ["name", "gender", "department", "station", "position", "shift", "status", "skill_level", "phone"]:
+    for field in ["name", "gender", "department", "station", "position", "shift", "status", "skill_level", "phone", "height_cm", "weight_kg"]:
         val = getattr(body, field, None)
         if val is not None:
             updates.append(f"{field} = :{field}")
@@ -341,16 +356,189 @@ async def batch_import(
             seq += 1
             total_created += 1
             name = random.choice(surnames) + random.choice(given) + (random.choice(given) if random.random() < 0.55 else "")
+            gender = "男" if random.random() < 0.62 else "女"
+            if gender == "男":
+                height = round(random.uniform(165, 180), 1)
+                weight = round(random.uniform(55, 75), 1)
+            else:
+                height = round(random.uniform(155, 168), 1)
+                weight = round(random.uniform(45, 60), 1)
             await db.execute(text("""
-                INSERT INTO hr_employees (id, factory_id, employee_code, name, gender, department, station, position, shift, hire_date, status, skill_level)
+                INSERT INTO hr_employees (id, factory_id, employee_code, name, gender, department, station, position, shift, hire_date, status, skill_level, height_cm, weight_kg)
                 VALUES (:id, :fid, :code, :name, :gender, :dept, :station, '操作员',
                         CASE WHEN random() < 0.6 THEN '白班' ELSE '夜班' END,
                         CURRENT_DATE - (random() * 2000)::INT, 'active',
-                        CASE WHEN random() < 0.3 THEN 'L2' ELSE 'L1' END)
+                        CASE WHEN random() < 0.3 THEN 'L2' ELSE 'L1' END, :height, :weight)
             """), {
                 "id": str(uuid.uuid4()), "fid": fid, "code": f"{prefix}-{seq:04d}",
-                "name": name, "gender": "男" if random.random() < 0.62 else "女",
+                "name": name, "gender": gender,
                 "dept": item.department, "station": item.station,
+                "height": height, "weight": weight,
             })
     await db.commit()
     return {"message": f"已导入 {total_created} 人", "total_created": total_created}
+
+
+# ==================== 内部工序技能库 + 员工技能 + 人力调配 ====================
+
+# 技能等级映射（用于调配候选人等级过滤）
+SKILL_LEVELS = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5}
+
+
+@router.get("/skill-library")
+async def get_skill_library(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """内部工序技能库（按工序大类分组）"""
+    rows = (await db.execute(text(
+        "SELECT id, code, name, category FROM skills WHERE is_active = TRUE ORDER BY category, code"
+    ))).fetchall()
+    groups: Dict[str, List[Dict]] = {}
+    for r in rows:
+        groups.setdefault(r[3] or "未分类", []).append({"id": r[0], "code": r[1], "name": r[2]})
+    return [{"category": cat, "skills": skills} for cat, skills in groups.items()]
+
+
+@router.get("/employees/{emp_id}/skills")
+async def get_employee_skills(
+    emp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取某花名册员工的内部工序技能列表"""
+    rows = (await db.execute(text("""
+        SELECT s.id, s.code, s.name, s.category, hes.level, hes.certified_date, hes.expiry_date,
+               (hes.expiry_date IS NULL OR hes.expiry_date >= CURRENT_DATE) AS is_valid
+        FROM hr_employee_skills hes
+        JOIN skills s ON s.id = hes.skill_id
+        WHERE hes.hr_employee_id = :eid
+        ORDER BY s.category, s.code
+    """), {"eid": emp_id})).fetchall()
+    return [
+        {
+            "skill_id": r[0], "code": r[1], "name": r[2], "category": r[3],
+            "level": r[4],
+            "certified_date": str(r[5]) if r[5] else None,
+            "expiry_date": str(r[6]) if r[6] else None,
+            "is_valid": bool(r[7]),
+        }
+        for r in rows
+    ]
+
+
+@router.post("/employees/{emp_id}/skills")
+async def assign_employee_skill(
+    emp_id: str,
+    body: EmployeeSkillAssign,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """给花名册员工分配/更新内部工序技能（upsert）"""
+    if body.level not in SKILL_LEVELS:
+        raise HTTPException(400, "技能等级无效，应为 L1-L5")
+    skill = (await db.execute(text("SELECT id, name FROM skills WHERE id = :sid"), {"sid": body.skill_id})).fetchone()
+    if not skill:
+        raise HTTPException(404, f"技能 {body.skill_id} 不存在")
+    emp = (await db.execute(text("SELECT id FROM hr_employees WHERE id = :eid"), {"eid": emp_id})).fetchone()
+    if not emp:
+        raise HTTPException(404, "员工不存在")
+    await db.execute(text("""
+        INSERT INTO hr_employee_skills (hr_employee_id, skill_id, level, certified_date, expiry_date)
+        VALUES (:eid, :sid, :level, :cdate, :edate)
+        ON CONFLICT (hr_employee_id, skill_id) DO UPDATE SET
+            level = EXCLUDED.level,
+            certified_date = EXCLUDED.certified_date,
+            expiry_date = EXCLUDED.expiry_date,
+            updated_at = NOW()
+    """), {
+        "eid": emp_id, "sid": body.skill_id, "level": body.level,
+        "cdate": body.certified_date, "edate": body.expiry_date,
+    })
+    await db.commit()
+    return {"message": f"已分配技能 {skill[1]}", "skill_id": body.skill_id, "level": body.level}
+
+
+@router.delete("/employees/{emp_id}/skills/{skill_id}")
+async def remove_employee_skill(
+    emp_id: str,
+    skill_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """移除花名册员工的某项技能"""
+    result = await db.execute(text(
+        "DELETE FROM hr_employee_skills WHERE hr_employee_id = :eid AND skill_id = :sid"
+    ), {"eid": emp_id, "sid": skill_id})
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(404, "未找到该技能记录")
+    return {"message": "已移除技能"}
+
+
+@router.get("/dispatch-candidates")
+async def dispatch_candidates(
+    category: Optional[str] = Query(None, description="工序大类，如 组立/焊接/检测"),
+    skill_id: Optional[int] = Query(None, description="具体技能 ID"),
+    min_level: str = Query("L2", description="最低技能等级 L1-L5"),
+    limit: int = Query(50, ge=1, le=500),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """人力调配候选人：按工序技能（大类或具体技能）+ 最低等级，查找能顶岗的在职员工"""
+    if not category and not skill_id:
+        raise HTTPException(400, "请提供 category（工序大类）或 skill_id（具体技能）")
+    min_num = SKILL_LEVELS.get(min_level, 2)
+    valid_levels = [lv for lv, n in SKILL_LEVELS.items() if n >= min_num]
+    fid = _get_active_factory(current_user, request)
+
+    conditions = [
+        "e.factory_id = :fid",
+        "e.status = 'active'",
+        "(hes.expiry_date IS NULL OR hes.expiry_date >= CURRENT_DATE)",
+    ]
+    params: Dict[str, Any] = {"fid": fid}
+    # 等级过滤（参数化 IN，避免驱动数组绑定差异）
+    level_placeholders = ", ".join(f":lv{i}" for i in range(len(valid_levels)))
+    for i, lv in enumerate(valid_levels):
+        params[f"lv{i}"] = lv
+    conditions.append(f"hes.level IN ({level_placeholders})")
+    if skill_id:
+        conditions.append("hes.skill_id = :sid")
+        params["sid"] = skill_id
+    if category:
+        conditions.append("s.category = :cat")
+        params["cat"] = category
+    where = " AND ".join(conditions)
+    params["limit"] = limit
+
+    rows = (await db.execute(text(f"""
+        SELECT e.id, e.employee_code, e.name, e.gender, e.height_cm, e.weight_kg,
+               e.department, e.station, e.shift, e.skill_level,
+               s.id, s.code, s.name, s.category, hes.level
+        FROM hr_employee_skills hes
+        JOIN hr_employees e ON e.id = hes.hr_employee_id
+        JOIN skills s ON s.id = hes.skill_id
+        WHERE {where}
+        ORDER BY hes.level DESC, e.department, e.station
+        LIMIT :limit
+    """), params)).fetchall()
+
+    return {
+        "total": len(rows),
+        "min_level": min_level,
+        "factory_id": fid,
+        "items": [
+            {
+                "id": r[0], "employee_code": r[1], "name": r[2], "gender": r[3],
+                "height_cm": float(r[4]) if r[4] is not None else None,
+                "weight_kg": float(r[5]) if r[5] is not None else None,
+                "department": r[6], "station": r[7], "shift": r[8], "skill_level": r[9],
+                "matched_skill": {
+                    "id": r[10], "code": r[11], "name": r[12], "category": r[13], "level": r[14],
+                },
+            }
+            for r in rows
+        ],
+    }

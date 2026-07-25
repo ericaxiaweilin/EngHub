@@ -1,9 +1,15 @@
 /**
- * HR 人力档案 - 花名册 + 部门/工序人力分布统计
+ * HR 人力档案 - 花名册 + 部门/工序人力分布 + 员工技能档案 + 人力调配
  */
 import { useState, useEffect } from 'react'
-import { Card, Table, Tag, Statistic, Row, Col, Select, Input, Space, Progress, Tabs } from 'antd'
-import { TeamOutlined, CheckCircleOutlined, ApartmentOutlined } from '@ant-design/icons'
+import {
+  Card, Table, Tag, Statistic, Row, Col, Select, Input, Space, Progress, Tabs,
+  Drawer, Descriptions, Button, Modal, message, Popconfirm, Empty,
+} from 'antd'
+import {
+  TeamOutlined, CheckCircleOutlined, ApartmentOutlined, PlusOutlined,
+  DeleteOutlined, SwapOutlined, SafetyCertificateOutlined, UserOutlined,
+} from '@ant-design/icons'
 import api from '../../services/api'
 
 interface Employee {
@@ -18,6 +24,8 @@ interface Employee {
   hire_date: string
   status: string
   skill_level: string
+  height_cm?: number | null
+  weight_kg?: number | null
 }
 
 interface DeptStat {
@@ -36,6 +44,32 @@ interface HrStats {
   genders: { gender: string; count: number }[]
 }
 
+interface SkillItem { id: number; code: string; name: string }
+interface SkillGroup { category: string; skills: SkillItem[] }
+interface EmpSkill {
+  skill_id: number
+  code: string
+  name: string
+  category: string
+  level: string
+  certified_date?: string | null
+  expiry_date?: string | null
+  is_valid: boolean
+}
+interface Candidate {
+  id: string
+  employee_code: string
+  name: string
+  gender: string
+  height_cm?: number | null
+  weight_kg?: number | null
+  department: string
+  station: string
+  shift: string
+  skill_level: string
+  matched_skill: { id: number; code: string; name: string; category: string; level: string }
+}
+
 const STATUS_MAP: Record<string, { color: string; text: string }> = {
   active: { color: 'green', text: '在职' },
   leave: { color: 'orange', text: '休假' },
@@ -43,6 +77,7 @@ const STATUS_MAP: Record<string, { color: string; text: string }> = {
 }
 
 const SKILL_COLORS: Record<string, string> = { L1: 'default', L2: 'blue', L3: 'cyan', L4: 'purple', L5: 'gold' }
+const LEVEL_OPTIONS = ['L1', 'L2', 'L3', 'L4', 'L5'].map(l => ({ value: l, label: l }))
 
 export default function HrRoster() {
   const [stats, setStats] = useState<HrStats | null>(null)
@@ -56,9 +91,31 @@ export default function HrRoster() {
   const [status, setStatus] = useState<string | undefined>()
   const [keyword, setKeyword] = useState('')
 
-  // 加载统计
+  // 技能库
+  const [skillLibrary, setSkillLibrary] = useState<SkillGroup[]>([])
+
+  // 员工详情抽屉
+  const [detailVisible, setDetailVisible] = useState(false)
+  const [currentEmp, setCurrentEmp] = useState<Employee | null>(null)
+  const [empSkills, setEmpSkills] = useState<EmpSkill[]>([])
+  const [empSkillsLoading, setEmpSkillsLoading] = useState(false)
+
+  // 添加技能弹窗
+  const [addSkillVisible, setAddSkillVisible] = useState(false)
+  const [newSkillId, setNewSkillId] = useState<number | undefined>()
+  const [newSkillLevel, setNewSkillLevel] = useState<string>('L1')
+
+  // 人力调配
+  const [dispatchCategory, setDispatchCategory] = useState<string | undefined>()
+  const [dispatchSkillId, setDispatchSkillId] = useState<number | undefined>()
+  const [dispatchMinLevel, setDispatchMinLevel] = useState<string>('L2')
+  const [candidates, setCandidates] = useState<Candidate[]>([])
+  const [candidatesLoading, setCandidatesLoading] = useState(false)
+
+  // 加载统计 + 技能库
   useEffect(() => {
     api.get('/api/v1/hr/stats').then((res: any) => setStats(res)).catch(() => {})
+    api.get('/api/v1/hr/skill-library').then((res: any) => setSkillLibrary(res || [])).catch(() => {})
   }, [])
 
   // 加载花名册
@@ -77,10 +134,66 @@ export default function HrRoster() {
 
   useEffect(() => { loadEmployees() }, [page, pageSize, dept, station, status])
 
+  // ── 员工详情抽屉 ──
+  const loadEmpSkills = (empId: string) => {
+    setEmpSkillsLoading(true)
+    api.get(`/api/v1/hr/employees/${empId}/skills`)
+      .then((res: any) => setEmpSkills(res || []))
+      .catch(() => setEmpSkills([]))
+      .finally(() => setEmpSkillsLoading(false))
+  }
+
+  const openDetail = (emp: Employee) => {
+    setCurrentEmp(emp)
+    setDetailVisible(true)
+    loadEmpSkills(emp.id)
+  }
+
+  const handleAddSkill = () => {
+    if (!currentEmp || !newSkillId) { message.warning('请选择技能'); return }
+    api.post(`/api/v1/hr/employees/${currentEmp.id}/skills`, { skill_id: newSkillId, level: newSkillLevel })
+      .then(() => {
+        message.success('技能已分配')
+        setAddSkillVisible(false)
+        setNewSkillId(undefined)
+        setNewSkillLevel('L1')
+        loadEmpSkills(currentEmp.id)
+      })
+      .catch(() => {})
+  }
+
+  const handleRemoveSkill = (skillId: number) => {
+    if (!currentEmp) return
+    api.delete(`/api/v1/hr/employees/${currentEmp.id}/skills/${skillId}`)
+      .then(() => { message.success('已移除'); loadEmpSkills(currentEmp.id) })
+      .catch(() => {})
+  }
+
+  // ── 人力调配查询 ──
+  const queryDispatch = () => {
+    if (!dispatchCategory && !dispatchSkillId) { message.warning('请选择工序大类或具体技能'); return }
+    setCandidatesLoading(true)
+    const params: any = { min_level: dispatchMinLevel, limit: 200 }
+    if (dispatchCategory) params.category = dispatchCategory
+    if (dispatchSkillId) params.skill_id = dispatchSkillId
+    api.get('/api/v1/hr/dispatch-candidates', { params })
+      .then((res: any) => setCandidates(res.items || []))
+      .catch(() => setCandidates([]))
+      .finally(() => setCandidatesLoading(false))
+  }
+
   const columns = [
     { title: '工号', dataIndex: 'employee_code', width: 100 },
     { title: '姓名', dataIndex: 'name', width: 90 },
     { title: '性别', dataIndex: 'gender', width: 60 },
+    {
+      title: '身高(cm)', dataIndex: 'height_cm', width: 85,
+      render: (v: number | null) => (v != null ? v : '-'),
+    },
+    {
+      title: '体重(kg)', dataIndex: 'weight_kg', width: 85,
+      render: (v: number | null) => (v != null ? v : '-'),
+    },
     { title: '部门', dataIndex: 'department', width: 120 },
     { title: '工序/岗位', dataIndex: 'station', width: 100 },
     { title: '职位', dataIndex: 'position', width: 80 },
@@ -92,6 +205,17 @@ export default function HrRoster() {
 
   // 部门人力分布柱状
   const maxDept = stats ? Math.max(...stats.departments.map(d => d.total)) : 1
+
+  // 调配候选技能选项（按所选大类过滤）
+  const dispatchSkillOptions = dispatchCategory
+    ? (skillLibrary.find(g => g.category === dispatchCategory)?.skills || [])
+    : skillLibrary.flatMap(g => g.skills)
+
+  // 添加技能弹窗的分组选项
+  const groupedSkillOptions = skillLibrary.map(g => ({
+    label: g.category,
+    options: g.skills.map(s => ({ value: s.id, label: `${s.name}（${s.code}）` })),
+  }))
 
   return (
     <div style={{ padding: 24 }}>
@@ -145,12 +269,64 @@ export default function HrRoster() {
                 rowKey="id"
                 size="small"
                 loading={loading}
+                onRow={(record) => ({ onClick: () => openDetail(record), style: { cursor: 'pointer' } })}
                 pagination={{
                   current: page, pageSize, total, showSizeChanger: true, showTotal: t => `共 ${t} 人`,
                   onChange: (p, ps) => { setPage(p); setPageSize(ps) },
                 }}
-                scroll={{ x: 900 }}
+                scroll={{ x: 1100 }}
               />
+            </Card>
+          ),
+        },
+        {
+          key: 'dispatch',
+          label: <span><SwapOutlined /> 人力调配</span>,
+          children: (
+            <Card size="small" title="按工序技能查找可顶岗员工">
+              <Space wrap style={{ marginBottom: 16 }}>
+                <Select allowClear placeholder="工序大类" style={{ width: 140 }} value={dispatchCategory}
+                  onChange={v => { setDispatchCategory(v); setDispatchSkillId(undefined) }}
+                  options={skillLibrary.map(g => ({ value: g.category, label: g.category }))} />
+                <Select allowClear showSearch placeholder="具体技能（可选）" style={{ width: 180 }} value={dispatchSkillId}
+                  onChange={v => setDispatchSkillId(v)}
+                  optionFilterProp="label"
+                  options={dispatchSkillOptions.map(s => ({ value: s.id, label: `${s.name}（${s.code}）` }))} />
+                <Select placeholder="最低等级" style={{ width: 110 }} value={dispatchMinLevel}
+                  onChange={v => setDispatchMinLevel(v)} options={LEVEL_OPTIONS} />
+                <Button type="primary" icon={<SwapOutlined />} onClick={queryDispatch} loading={candidatesLoading}>查询候选人</Button>
+              </Space>
+              {candidates.length > 0 ? (
+                <Table
+                  dataSource={candidates}
+                  rowKey={(r) => r.id + '-' + r.matched_skill.id}
+                  size="small"
+                  loading={candidatesLoading}
+                  pagination={{ pageSize: 20, showTotal: t => `共 ${t} 名候选人` }}
+                  scroll={{ x: 1000 }}
+                  columns={[
+                    { title: '工号', dataIndex: 'employee_code', width: 100 },
+                    { title: '姓名', dataIndex: 'name', width: 90 },
+                    { title: '性别', dataIndex: 'gender', width: 60 },
+                    { title: '身高(cm)', dataIndex: 'height_cm', width: 85, render: (v: number | null) => (v != null ? v : '-') },
+                    { title: '体重(kg)', dataIndex: 'weight_kg', width: 85, render: (v: number | null) => (v != null ? v : '-') },
+                    { title: '部门', dataIndex: 'department', width: 120 },
+                    { title: '原工序', dataIndex: 'station', width: 90 },
+                    { title: '班次', dataIndex: 'shift', width: 80, render: (v: string) => <Tag>{v}</Tag> },
+                    {
+                      title: '匹配技能', key: 'matched', width: 180,
+                      render: (_: any, r: Candidate) => (
+                        <Space size={4}>
+                          <Tag color="blue">{r.matched_skill.category}·{r.matched_skill.name}</Tag>
+                          <Tag color={SKILL_COLORS[r.matched_skill.level]}>{r.matched_skill.level}</Tag>
+                        </Space>
+                      ),
+                    },
+                  ]}
+                />
+              ) : (
+                <Empty description={candidatesLoading ? '查询中...' : '请选择条件后点击查询'} />
+              )}
             </Card>
           ),
         },
@@ -204,6 +380,87 @@ export default function HrRoster() {
           ),
         },
       ]} />
+
+      {/* 员工详情抽屉 */}
+      <Drawer
+        title={<span><UserOutlined /> 员工档案 {currentEmp ? `- ${currentEmp.name}` : ''}</span>}
+        width={520}
+        open={detailVisible}
+        onClose={() => setDetailVisible(false)}
+      >
+        {currentEmp && (
+          <>
+            <Descriptions column={2} size="small" bordered style={{ marginBottom: 20 }}>
+              <Descriptions.Item label="工号">{currentEmp.employee_code}</Descriptions.Item>
+              <Descriptions.Item label="姓名">{currentEmp.name}</Descriptions.Item>
+              <Descriptions.Item label="性别">{currentEmp.gender}</Descriptions.Item>
+              <Descriptions.Item label="状态">
+                <Tag color={STATUS_MAP[currentEmp.status]?.color}>{STATUS_MAP[currentEmp.status]?.text || currentEmp.status}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="身高">{currentEmp.height_cm != null ? `${currentEmp.height_cm} cm` : '-'}</Descriptions.Item>
+              <Descriptions.Item label="体重">{currentEmp.weight_kg != null ? `${currentEmp.weight_kg} kg` : '-'}</Descriptions.Item>
+              <Descriptions.Item label="部门">{currentEmp.department}</Descriptions.Item>
+              <Descriptions.Item label="工序/岗位">{currentEmp.station}</Descriptions.Item>
+              <Descriptions.Item label="职位">{currentEmp.position}</Descriptions.Item>
+              <Descriptions.Item label="班次">{currentEmp.shift}</Descriptions.Item>
+              <Descriptions.Item label="综合技能等级">
+                <Tag color={SKILL_COLORS[currentEmp.skill_level]}>{currentEmp.skill_level}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="入职日期">{currentEmp.hire_date || '-'}</Descriptions.Item>
+            </Descriptions>
+
+            <Card
+              size="small"
+              title={<span><SafetyCertificateOutlined /> 内部工序技能</span>}
+              extra={<Button size="small" type="primary" icon={<PlusOutlined />} onClick={() => setAddSkillVisible(true)}>添加技能</Button>}
+            >
+              {empSkillsLoading ? (
+                <div style={{ textAlign: 'center', padding: 16 }}>加载中...</div>
+              ) : empSkills.length === 0 ? (
+                <Empty description="暂无技能记录" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              ) : (
+                <Space direction="vertical" style={{ width: '100%' }} size={8}>
+                  {empSkills.map(s => (
+                    <div key={s.skill_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 10px', background: '#fafafa', borderRadius: 6 }}>
+                      <Space>
+                        <Tag color="blue">{s.category}</Tag>
+                        <span style={{ fontWeight: 500 }}>{s.name}</span>
+                        <Tag color={SKILL_COLORS[s.level]}>{s.level}</Tag>
+                        {!s.is_valid && <Tag color="error">已过期</Tag>}
+                      </Space>
+                      <Popconfirm title="确认移除该技能？" onConfirm={() => handleRemoveSkill(s.skill_id)} okText="移除" cancelText="取消">
+                        <Button size="small" type="text" danger icon={<DeleteOutlined />} />
+                      </Popconfirm>
+                    </div>
+                  ))}
+                </Space>
+              )}
+            </Card>
+          </>
+        )}
+      </Drawer>
+
+      {/* 添加技能弹窗 */}
+      <Modal
+        title="添加内部工序技能"
+        open={addSkillVisible}
+        onOk={handleAddSkill}
+        onCancel={() => setAddSkillVisible(false)}
+        okText="分配"
+        cancelText="取消"
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <div>
+            <div style={{ marginBottom: 6 }}>技能（按工序大类分组）</div>
+            <Select showSearch placeholder="选择技能" style={{ width: '100%' }} value={newSkillId}
+              onChange={v => setNewSkillId(v)} optionFilterProp="label" options={groupedSkillOptions} />
+          </div>
+          <div>
+            <div style={{ marginBottom: 6 }}>技能等级</div>
+            <Select style={{ width: '100%' }} value={newSkillLevel} onChange={v => setNewSkillLevel(v)} options={LEVEL_OPTIONS} />
+          </div>
+        </Space>
+      </Modal>
     </div>
   )
 }

@@ -44,6 +44,7 @@ from api.routes.equipment_phase5_routes import router as equipment_phase5_router
 from api.routes.hr_routes import router as hr_router
 from api.routes.notification_routes import router as notification_router
 from api.routes.role_elimination_routes import router as role_elimination_router
+from api.routes.workflow_analytics_routes import router as workflow_analytics_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -83,6 +84,7 @@ app.include_router(equipment_phase5_router)  # 岗位替代 Phase 5: 维保终�
 app.include_router(hr_router)  # HR 人力档案 + 工厂切换
 app.include_router(notification_router)  # 站内通知（报告/异常/系统）
 app.include_router(role_elimination_router)  # 岗位替代（调度员/采购员/工艺员）
+app.include_router(workflow_analytics_router)  # 工作流交叉分析（深层数据）
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 
