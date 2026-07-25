@@ -490,6 +490,36 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_collaboration",
+            "description": "查询岗位协同规则。可查：1)某事件该谁处理/通知谁/边界在哪 2)某岗位能做什么/不能做什么 3)检查某岗位是否有权执行某动作。用于回答'这个事该谁管''谁能决定''通知谁'类问题。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query_type": {
+                        "type": "string",
+                        "enum": ["event_rule", "role_boundary", "check_permission"],
+                        "description": "event_rule=查事件规则, role_boundary=查岗位边界, check_permission=检查权限",
+                    },
+                    "event_key": {
+                        "type": "string",
+                        "description": "事件标识(query_type=event_rule时必填)。可选: quality_incoming_fail/quality_process_fail/equipment_breakdown/material_shortage/delivery_risk/urgent_order/ecn_change/shipment_ready/supplier_delay/safety_incident",
+                    },
+                    "role_key": {
+                        "type": "string",
+                        "description": "岗位标识(query_type=role_boundary/check_permission时必填)。可选: operator/team_leader/workshop_manager/qc_inspector/qc_engineer/warehouse_keeper/buyer/planner/sales/maintenance/process_engineer",
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "要检查的动作(query_type=check_permission时必填)，如'让步接收''停机''排产'",
+                    },
+                },
+                "required": ["query_type"],
+            },
+        },
+    },
 ]
 
 
@@ -1384,6 +1414,45 @@ async def _tool_query_process_knowledge(db: AsyncSession, args: Dict[str, Any], 
 
 
 _TOOL_EXECUTORS["query_process_knowledge"] = _tool_query_process_knowledge
+
+
+async def _tool_query_collaboration(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """岗位协同规则查询（事件规则/岗位边界/权限检查）。"""
+    from api.services.collaboration_service import CollaborationService
+    svc = CollaborationService(db)
+    query_type = args.get("query_type", "event_rule")
+
+    if query_type == "event_rule":
+        event_key = args.get("event_key", "")
+        if not event_key:
+            return {"error": "请提供 event_key", "available_events": [
+                "quality_incoming_fail", "quality_process_fail", "equipment_breakdown",
+                "material_shortage", "delivery_risk", "urgent_order",
+                "ecn_change", "shipment_ready", "supplier_delay", "safety_incident",
+            ]}
+        return await svc.query_event_rule(event_key)
+
+    elif query_type == "role_boundary":
+        role_key = args.get("role_key", "")
+        if not role_key:
+            return {"error": "请提供 role_key", "available_roles": [
+                "operator", "team_leader", "workshop_manager", "qc_inspector",
+                "qc_engineer", "warehouse_keeper", "buyer", "planner",
+                "sales", "maintenance", "process_engineer",
+            ]}
+        return await svc.get_role_boundaries(role_key)
+
+    elif query_type == "check_permission":
+        role_key = args.get("role_key", "")
+        action = args.get("action", "")
+        if not role_key or not action:
+            return {"error": "请提供 role_key 和 action"}
+        return await svc.check_permission(role_key, action)
+
+    return {"error": f"未知 query_type: {query_type}"}
+
+
+_TOOL_EXECUTORS["query_collaboration"] = _tool_query_collaboration
 
 # 写操作工具（需要记录操作人）
 WRITE_TOOLS = {

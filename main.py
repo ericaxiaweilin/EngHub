@@ -46,6 +46,7 @@ from api.routes.notification_routes import router as notification_router
 from api.routes.role_elimination_routes import router as role_elimination_router
 from api.routes.workflow_analytics_routes import router as workflow_analytics_router
 from api.routes.automation_level_routes import router as automation_level_router
+from api.routes.collaboration_routes import router as collaboration_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -87,6 +88,7 @@ app.include_router(notification_router)  # 站内通知（报告/异常/系统�
 app.include_router(role_elimination_router)  # 岗位替代（调度员/采购员/工艺员）
 app.include_router(workflow_analytics_router)  # 工作流交叉分析（深层数据）
 app.include_router(automation_level_router)  # 自动化等级配置（L0-L3可选）
+app.include_router(collaboration_router)  # 岗位协同网络（事件+边界）
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 

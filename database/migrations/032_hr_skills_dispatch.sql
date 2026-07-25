@@ -104,11 +104,32 @@ WITH station_skill AS (
     ) AS m(station, skill_code)
 )
 INSERT INTO hr_employee_skills (hr_employee_id, skill_id, level, certified_date)
-SELECT e.id, s.id, e.skill_level, CURRENT_DATE - (random() * 730)::INT
+SELECT e.id, s.id,
+       -- 等级归一化：电子厂 skill_level 为中文（初级/中级/高级/技师），统一映射到 L1-L5
+       CASE e.skill_level
+           WHEN '初级' THEN 'L1'
+           WHEN '中级' THEN 'L2'
+           WHEN '高级' THEN 'L3'
+           WHEN '技师' THEN 'L4'
+           WHEN '高级技师' THEN 'L5'
+           ELSE e.skill_level END,
+       CURRENT_DATE - (random() * 730)::INT
 FROM hr_employees e
 JOIN station_skill ss ON ss.station = e.station
 JOIN skills s ON s.code = ss.skill_code
 ON CONFLICT (hr_employee_id, skill_id) DO NOTHING;
+
+-- ── 4.1b 归一化已存在记录的等级词汇（幂等）──
+-- 对已先于本修正运行过 032 的库，hr_employee_skills.level 可能残留中文等级，
+-- 统一映射到 L1-L5，确保人力调配的等级过滤（min_level=L2 等）跨厂一致。
+UPDATE hr_employee_skills SET level = CASE level
+    WHEN '初级' THEN 'L1'
+    WHEN '中级' THEN 'L2'
+    WHEN '高级' THEN 'L3'
+    WHEN '技师' THEN 'L4'
+    WHEN '高级技师' THEN 'L5'
+    ELSE level END
+WHERE level IN ('初级', '中级', '高级', '技师', '高级技师');
 
 -- ── 4.2 回填身高体重（仅对缺失者，按性别给合理随机值）──
 UPDATE hr_employees SET
