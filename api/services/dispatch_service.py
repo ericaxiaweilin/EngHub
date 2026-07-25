@@ -333,6 +333,30 @@ async def auto_dispatch_station(
     """
     from sqlalchemy import text as sql_text
 
+    # 检查自动化等级（L0/L1不自动派发，只推荐）
+    from api.services.automation_level_service import AutomationLevelService
+    lvl_svc = AutomationLevelService(db)
+    dispatch_level = await lvl_svc.get_level(factory_id, "auto_dispatch")
+
+    if dispatch_level < 2:
+        # L0/L1: 不自动执行，只返回推荐方案
+        result = await db.execute(sql_text("""
+            SELECT work_order_code, work_center, priority, planned_due
+            FROM work_orders
+            WHERE factory_id = :fid AND status = 'released' AND wo_type = 'operation'
+              AND assigned_station_id IS NULL
+            ORDER BY priority DESC, planned_due ASC
+            LIMIT 10
+        """), {"fid": factory_id})
+        pending = [dict(r._mapping) for r in result.fetchall()]
+        return {
+            "dispatched": 0,
+            "mode": f"L{dispatch_level}_recommend_only",
+            "message": f"当前 L{dispatch_level} 模式：系统只推荐，需调度员确认后手动派发",
+            "recommended_orders": pending,
+        }
+
+    # L2/L3: 自动派发
     # 查找空闲工位（无在制工单的工位）
     if station_id:
         free_stations = [station_id]

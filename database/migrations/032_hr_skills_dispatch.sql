@@ -68,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_hr_emp_skill_skill ON hr_employee_skills(skill_id
 -- ── 4.1 种子：按 station 给现有员工赋对应工序技能（level 沿用 skill_level）──
 WITH station_skill AS (
     SELECT * FROM (VALUES
+        -- 机械厂工序
         ('焊接',   'HJ-DH'),
         ('焊接',   'HJ-HH'),
         ('组立',   'ZL-LS'),
@@ -77,7 +78,29 @@ WITH station_skill AS (
         ('精加工', 'JG-JJ'),
         ('加工',   'JG-JJ'),
         ('滚轮',   'JG-GL'),
-        ('涂装',   'TZ-PT')
+        ('涂装',   'TZ-PT'),
+        -- 电子厂组装线 → 组立
+        ('组装一线', 'ZL-LS'),
+        ('组装一线', 'ZL-TS'),
+        ('组装二线', 'ZL-LS'),
+        ('组装二线', 'ZL-TS'),
+        ('组装三线', 'ZL-LS'),
+        ('组装三线', 'ZL-TS'),
+        -- DIP/波峰焊 → 焊接（锡焊）
+        ('DIP-A线', 'HJ-XH'),
+        ('DIP-B线', 'HJ-XH'),
+        ('波峰焊',   'HJ-XH'),
+        -- 包装线 → 包装
+        ('包装线', 'BZ-NB'),
+        ('包装线', 'BZ-WB'),
+        -- 功能测试/老化 → 检测（功能检测）
+        ('FCT测试', 'JC-GN'),
+        ('ICT测试', 'JC-GN'),
+        ('老化房',   'JC-GN'),
+        -- 巡检/来料/出货检 → 检测（外观检测）
+        ('IPQC巡检',  'JC-WG'),
+        ('IQC来料检', 'JC-WG'),
+        ('OQC出货检', 'JC-WG')
     ) AS m(station, skill_code)
 )
 INSERT INTO hr_employee_skills (hr_employee_id, skill_id, level, certified_date)

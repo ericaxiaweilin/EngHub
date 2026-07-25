@@ -109,27 +109,40 @@ class WmsOperationService:
         self.db.add(txn)
         await self.db.commit()
 
-        # ═══ G2断点修复：收货自动触发IQC（美的模式：收货→30秒首检） ═══
+        # ═══ G2断点修复：收货自动触发IQC（按自动化等级决定行为） ═══
         iqc_triggered = False
+        iqc_action = "none"
         if reference_type == "purchase" or (remark and "采购" in (remark or "")):
             try:
-                from api.services.inspection_service import InspectionService
-                insp_svc = InspectionService(self.db)
-                # AQL General-II 抽样
-                import math
-                sample = min(80, max(5, int(math.sqrt(quantity))))
-                await insp_svc.create_task(
-                    factory_id=factory_id,
-                    inspect_type="IQC",
-                    material_code=material_code,
-                    material_name=material_name,
-                    batch_qty=quantity,
-                    sample_qty=sample,
-                    source_type="inbound",
-                    source_code=batch_code or material_code,
-                    created_by=operator,
-                )
-                iqc_triggered = True
+                from api.services.automation_level_service import AutomationLevelService
+                lvl_svc = AutomationLevelService(self.db)
+                iqc_level = await lvl_svc.get_level(factory_id, "auto_iqc")
+
+                if iqc_level >= 2:
+                    # L2/L3: 自动创建IQC任务+抽样
+                    from api.services.inspection_service import InspectionService
+                    insp_svc = InspectionService(self.db)
+                    import math
+                    sample = min(80, max(5, int(math.sqrt(quantity))))
+                    await insp_svc.create_task(
+                        factory_id=factory_id,
+                        inspect_type="IQC",
+                        material_code=material_code,
+                        material_name=material_name,
+                        batch_qty=quantity,
+                        sample_qty=sample,
+                        source_type="inbound",
+                        source_code=batch_code or material_code,
+                        created_by=operator,
+                    )
+                    iqc_triggered = True
+                    iqc_action = "auto_task_created" if iqc_level == 2 else "auto_task_and_judge"
+                elif iqc_level == 1:
+                    # L1: 只提醒品质部有待检（不自动创建任务）
+                    iqc_action = "notify_qc"
+                else:
+                    # L0: 纯手工，不做任何事
+                    iqc_action = "manual"
             except Exception:
                 pass  # IQC触发失败不阻塞入库
 
@@ -143,7 +156,8 @@ class WmsOperationService:
             "operator": operator,
             "time": now.isoformat(),
             "iqc_triggered": iqc_triggered,
-            "iqc_note": "已自动触发来料检(IQC)" if iqc_triggered else None,
+            "iqc_action": iqc_action,
+            "iqc_note": {"auto_task_created": "已自动创建IQC任务", "auto_task_and_judge": "已自动创建IQC+自动判定", "notify_qc": "已提醒品质部(L1)", "manual": "手工模式-需人通知品质部", "none": "非采购入库"}.get(iqc_action, ""),
         }
 
     # ==================== 快速出库 ====================

@@ -426,6 +426,11 @@ class ReportService:
         系统自动：校验 → 更新工单 → 判断完工 → 异常升级
         生产文员消除逻辑：操作工自己报，不需要人转录纸质报工条。
         """
+        # 0. 检查自动化等级（决定系统行为深度）
+        from api.services.automation_level_service import AutomationLevelService
+        lvl_svc = AutomationLevelService(self.db)
+        report_level = await lvl_svc.get_level(factory_id, "self_report")
+
         # 1. 扫码查找工单（支持工单号/编码，不需要UUID）
         result = await self.db.execute(
             select(WorkOrder).where(
@@ -462,37 +467,48 @@ class ReportService:
             operator_id=operator_id,
         )
 
-        # 5. 自动完工判断
+        # 5. 自动完工判断（L2+才自动完工，L1需文员确认）
         auto_completed = False
         await self.db.refresh(wo)
         if wo.completed_qty >= (wo.planned_qty or 0) and wo.planned_qty > 0:
-            wo.status = "completed"
-            wo.actual_complete = datetime.utcnow()
-            auto_completed = True
+            if report_level >= 2:
+                wo.status = "completed"
+                wo.actual_complete = datetime.utcnow()
+                auto_completed = True
+            else:
+                # L1: 标记待确认，不自动关单
+                pass
 
-        # 6. 异常升级（不良率>20% → 通知主管，不是文员）
+        # 6. 异常升级（L1只记录，L2+通知主管，L3+触发异常引擎）
         anomaly = None
         if total_report >= 5:
             defect_rate = (defect_qty + scrap_qty) / total_report * 100
             if defect_rate > 20:
-                anomaly = {
-                    "type": "high_defect",
-                    "defect_rate": round(defect_rate, 1),
-                    "action": "已自动通知主管",
-                }
-                # 写入通知（发给主管，不是文员）
-                from database.models import Notification
-                notif = Notification(
-                    id=_gen_id(),
-                    factory_id=factory_id,
-                    category="anomaly",
-                    title=f"❗ 报工异常：{work_order_code} 不良率 {defect_rate:.0f}%",
-                    content=f"操作工 {operator_id or '未知'} 报工 {total_report} 件，不良 {defect_qty}+报废 {scrap_qty}，不良率 {defect_rate:.1f}%",
-                    severity="critical" if defect_rate > 40 else "warning",
-                    source_type="work_order",
-                    source_id=wo.id,
-                )
-                self.db.add(notif)
+                if report_level >= 2:
+                    anomaly = {
+                        "type": "high_defect",
+                        "defect_rate": round(defect_rate, 1),
+                        "action": "已自动通知主管" if report_level == 2 else "已触发异常引擎自动升级",
+                    }
+                    from database.models import Notification
+                    notif = Notification(
+                        id=_gen_id(),
+                        factory_id=factory_id,
+                        category="anomaly",
+                        title=f"❗ 报工异常：{work_order_code} 不良率 {defect_rate:.0f}%",
+                        content=f"操作工 {operator_id or '未知'} 报工 {total_report} 件，不良 {defect_qty}+报废 {scrap_qty}，不良率 {defect_rate:.1f}%",
+                        severity="critical" if defect_rate > 40 else "warning",
+                        source_type="work_order",
+                        source_id=wo.id,
+                    )
+                    self.db.add(notif)
+                else:
+                    # L1: 只记录异常，不自动通知
+                    anomaly = {
+                        "type": "high_defect",
+                        "defect_rate": round(defect_rate, 1),
+                        "action": "已记录(L1模式-需文员确认处理)",
+                    }
 
         await self.db.commit()
 
