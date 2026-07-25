@@ -28,6 +28,7 @@ from api.routes.test_switch import test_router
 from api.routes.data_consistency_routes import router as data_consistency_router
 from api.routes.expert_system_routes import router as expert_system_router
 from api.routes.work_order_template_routes import router as work_order_template_router
+from api.routes.rcc_routes import router as rcc_router
 from api.routes.production_dashboard_routes import router as production_dashboard_router
 from api.routes.search_routes import router as search_router
 from api.routes.code_table_routes import router as code_table_router
@@ -95,6 +96,7 @@ app.include_router(collaboration_router)  # 岗位协同网络（事件+边界�
 app.include_router(agent_supervisor_router)  # 智能体监督（长任务+卡住+预测+闭环）
 app.include_router(agent_router)  # 排产+仓储智能体
 app.include_router(crew_router)  # CrewAI推理层+个人知识层
+app.include_router(rcc_router)
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 
