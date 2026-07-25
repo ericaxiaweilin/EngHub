@@ -250,87 +250,96 @@ class AgentSupervisor:
         predictions = []
 
         # 1. 预测工单超期（按当前速度，N天后会超期）
-        result = await self.db.execute(text("""
-            SELECT wo.work_order_code, wo.planned_qty, wo.completed_qty, wo.planned_due,
-                   wo.actual_start,
-                   CASE WHEN wo.completed_qty > 0 AND wo.actual_start IS NOT NULL
-                        THEN (wo.planned_qty - wo.completed_qty) * 
-                             EXTRACT(EPOCH FROM (NOW() - wo.actual_start)) / wo.completed_qty / 86400.0
-                        ELSE NULL END as estimated_remaining_days
-            FROM work_orders wo
-            WHERE wo.factory_id = :fid AND wo.status = 'in_progress'
-              AND wo.planned_due IS NOT NULL
-        """), {"fid": factory_id})
+        try:
+            result = await self.db.execute(text("""
+                SELECT wo.work_order_code, wo.planned_qty, wo.completed_qty, wo.planned_due,
+                       wo.actual_start,
+                       CASE WHEN wo.completed_qty > 0 AND wo.actual_start IS NOT NULL
+                            THEN (wo.planned_qty - wo.completed_qty) * 
+                                 EXTRACT(EPOCH FROM (NOW() - wo.actual_start)) / wo.completed_qty / 86400.0
+                            ELSE NULL END as estimated_remaining_days
+                FROM work_orders wo
+                WHERE wo.factory_id = :fid AND wo.status = 'in_progress'
+                  AND wo.planned_due IS NOT NULL
+            """), {"fid": factory_id})
 
-        for row in result.fetchall():
-            r = dict(row._mapping)
-            remaining_days = r.get("estimated_remaining_days")
-            due_date = r.get("planned_due")
-            if remaining_days and due_date:
-                days_to_due = (due_date - datetime.utcnow()).total_seconds() / 86400
-                if remaining_days > days_to_due and days_to_due > 0:
-                    predictions.append({
-                        "type": "delivery_risk",
-                        "severity": "high" if days_to_due < 3 else "medium",
-                        "target": r["work_order_code"],
-                        "prediction": f"按当前速度需{remaining_days:.1f}天完成，但距交期只有{days_to_due:.1f}天",
-                        "suggestion": "建议提前调整排产优先级或安排加班",
-                        "auto_action": "已自动提升该工单优先级" if days_to_due < 3 else "建议关注",
-                    })
+            for row in result.fetchall():
+                r = dict(row._mapping)
+                remaining_days = r.get("estimated_remaining_days")
+                due_date = r.get("planned_due")
+                if remaining_days and due_date:
+                    days_to_due = (due_date - datetime.utcnow()).total_seconds() / 86400
+                    if remaining_days > days_to_due and days_to_due > 0:
+                        predictions.append({
+                            "type": "delivery_risk",
+                            "severity": "high" if days_to_due < 3 else "medium",
+                            "target": r["work_order_code"],
+                            "prediction": f"按当前速度需{remaining_days:.1f}天完成，但距交期只有{days_to_due:.1f}天",
+                            "suggestion": "建议提前调整排产优先级或安排加班",
+                            "auto_action": "已自动提升该工单优先级" if days_to_due < 3 else "建议关注",
+                        })
+        except Exception as e:
+            _logger.warning(f"[predict] 工单超期预测失败: {e}")
 
         # 2. 预测库存耗尽（按当前消耗速度）
-        result2 = await self.db.execute(text("""
+        try:
+            result2 = await self.db.execute(text("""
             SELECT i.material_code, i.available_qty,
                    COALESCE(consumption.daily_avg, 0) as daily_consumption
             FROM inventory i
             LEFT JOIN (
                 SELECT material_code, 
-                       SUM(quantity) / GREATEST(MAX(created_at::date - MIN(created_at::date), 1) as daily_avg
+                       SUM(quantity)::real / GREATEST((MAX(created_at::date) - MIN(created_at::date)), 1) as daily_avg
                 FROM inventory_transactions
                 WHERE factory_id = :fid AND transaction_type = 'outbound'
                   AND created_at > NOW() - INTERVAL '7 days'
                 GROUP BY material_code
             ) consumption ON i.material_code = consumption.material_code
             WHERE i.factory_id = :fid AND i.available_qty > 0
-        """), {"fid": factory_id})
+            """), {"fid": factory_id})
 
-        for row in result2.fetchall():
-            r = dict(row._mapping)
-            daily = r.get("daily_consumption", 0)
-            if daily and daily > 0:
-                days_left = r["available_qty"] / daily
-                if days_left < 5:
-                    predictions.append({
-                        "type": "material_shortage",
-                        "severity": "high" if days_left < 2 else "medium",
-                        "target": r["material_code"],
-                        "prediction": f"按当前消耗速度，{days_left:.1f}天后库存耗尽",
-                        "suggestion": "建议立即补货" if days_left < 2 else "建议本周内补货",
-                        "auto_action": "已自动生成采购申请" if days_left < 2 else "已加入补货计划",
-                    })
+            for row in result2.fetchall():
+                r = dict(row._mapping)
+                daily = r.get("daily_consumption", 0)
+                if daily and daily > 0:
+                    days_left = r["available_qty"] / daily
+                    if days_left < 5:
+                        predictions.append({
+                            "type": "material_shortage",
+                            "severity": "high" if days_left < 2 else "medium",
+                            "target": r["material_code"],
+                            "prediction": f"按当前消耗速度，{days_left:.1f}天后库存耗尽",
+                            "suggestion": "建议立即补货" if days_left < 2 else "建议本周内补货",
+                            "auto_action": "已自动生成采购申请" if days_left < 2 else "已加入补货计划",
+                        })
+        except Exception as e:
+            _logger.warning(f"[predict] 库存预测失败: {e}")
 
         # 3. 预测设备PM超期
-        result3 = await self.db.execute(text("""
-            SELECT equipment_code, equipment_name, last_maintenance_at,
-                   maintenance_cycle_days,
-                   last_maintenance_at + (maintenance_cycle_days || ' days')::interval as next_pm_due
-            FROM equipment
-            WHERE factory_id = :fid AND status = 'running'
-              AND last_maintenance_at IS NOT NULL
-              AND maintenance_cycle_days IS NOT NULL
-              AND last_maintenance_at + (maintenance_cycle_days || ' days')::interval < NOW() + INTERVAL '3 days'
-        """), {"fid": factory_id})
+        try:
+            result3 = await self.db.execute(text("""
+                SELECT equipment_code, equipment_name, last_maintenance_at,
+                       maintenance_cycle_days,
+                       last_maintenance_at + (maintenance_cycle_days || ' days')::interval as next_pm_due
+                FROM equipment
+                WHERE factory_id = :fid AND status = 'running'
+                  AND last_maintenance_at IS NOT NULL
+                  AND maintenance_cycle_days IS NOT NULL
+                  AND last_maintenance_at + (maintenance_cycle_days || ' days')::interval < NOW() + INTERVAL '3 days'
+            """), {"fid": factory_id})
 
-        for row in result3.fetchall():
-            r = dict(row._mapping)
-            predictions.append({
-                "type": "equipment_pm_due",
-                "severity": "medium",
-                "target": r["equipment_code"],
-                "prediction": f"{r['equipment_name']} PM即将到期（{r.get('next_pm_due', '近期')}）",
-                "suggestion": "建议安排保养，避免故障停机",
-                "auto_action": "已自动生成PM工单",
-            })
+            for row in result3.fetchall():
+                r = dict(row._mapping)
+                predictions.append({
+                    "type": "equipment_pm_due",
+                    "severity": "medium",
+                    "target": r["equipment_code"],
+                    "prediction": f"{r['equipment_name']} PM即将到期（{r.get('next_pm_due', '近期')}）",
+                    "suggestion": "建议安排保养，避免故障停机",
+                    "auto_action": "已自动生成PM工单",
+                })
+        except Exception as e:
+            _logger.warning(f"[predict] 设备PM预测失败: {e}")
 
         return {
             "factory_id": factory_id,
