@@ -345,6 +345,112 @@ async def patrol(
         alerts_found += 1
         reviews_created += 1
 
+    # 3. 设备故障停机（近 24h 内 breakdown 且无对应审查）
+    try:
+        from sqlalchemy import text as sa_text
+        dt_rows = (await db.execute(sa_text("""
+            SELECT d.id, d.equipment_id, e.equipment_code, e.equipment_name,
+                   d.duration_minutes, d.reason_code, d.start_time
+            FROM equipment_downtime d
+            LEFT JOIN equipment e ON e.id = d.equipment_id
+            WHERE d.factory_id = :fid AND d.downtime_category = 'breakdown'
+              AND d.start_time >= now() - interval '24 hours'
+            ORDER BY d.start_time DESC LIMIT 10
+        """), {"fid": factory_id})).fetchall()
+        for r in dt_rows:
+            existing = await db.execute(
+                select(AlertIntelligenceReview).where(
+                    AlertIntelligenceReview.alert_source == "equipment",
+                    AlertIntelligenceReview.alert_ref_id == r[0],
+                    AlertIntelligenceReview.status == "pending",
+                )
+            )
+            if existing.scalar_one_or_none():
+                continue
+            context = (
+                f"设备故障停机预警：\n"
+                f"- 设备：{r[2]} ({r[3]})\n"
+                f"- 停机时长：{r[4] or '未知'} 分钟\n"
+                f"- 原因代码：{r[5] or '未填写'}\n"
+                f"- 发生时间：{r[6]}"
+            )
+            await review_alert(db, factory_id, "equipment", r[0], r[2] or "", context)
+            alerts_found += 1
+            reviews_created += 1
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+
+    # 4. 缺料预警（库存 < 补货阈值 min_level）
+    try:
+        from sqlalchemy import text as sa_text
+        short_rows = (await db.execute(sa_text("""
+            SELECT rt.id, rt.material_id, rt.min_level, rt.safety_stock,
+                   COALESCE(inv.total_qty, 0) as cur_qty
+            FROM replenishment_thresholds rt
+            LEFT JOIN (
+                SELECT material_id, sum(total_qty) as total_qty
+                FROM inventory WHERE factory_id = :fid GROUP BY material_id
+            ) inv ON inv.material_id = rt.material_id
+            WHERE rt.factory_id = :fid AND rt.active = true
+              AND COALESCE(inv.total_qty, 0) < rt.safety_stock
+            LIMIT 10
+        """), {"fid": factory_id})).fetchall()
+        for r in short_rows:
+            existing = await db.execute(
+                select(AlertIntelligenceReview).where(
+                    AlertIntelligenceReview.alert_source == "inventory",
+                    AlertIntelligenceReview.alert_ref_id == r[0],
+                    AlertIntelligenceReview.status == "pending",
+                )
+            )
+            if existing.scalar_one_or_none():
+                continue
+            context = (
+                f"缺料预警（低于安全库存）：\n"
+                f"- 物料：{r[1]}\n"
+                f"- 当前库存：{r[4]}\n"
+                f"- 安全库存：{r[3]}，最低水位：{r[2]}\n"
+                f"- 缺口：{r[2] - r[4]}"
+            )
+            await review_alert(db, factory_id, "inventory", r[0], r[1], context)
+            alerts_found += 1
+            reviews_created += 1
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+
+    # 5. SPC 失控（近 24h 新增越限点）
+    try:
+        from sqlalchemy import text as sa_text
+        spc_rows = (await db.execute(sa_text("""
+            SELECT id, characteristic_code, characteristic_name,
+                   measured_value, ucl, lcl, station_id
+            FROM qms_spc_points
+            WHERE factory_id = :fid AND is_out_of_control = true
+              AND measured_at >= now() - interval '24 hours'
+            LIMIT 10
+        """), {"fid": factory_id})).fetchall()
+        for r in spc_rows:
+            existing = await db.execute(
+                select(AlertIntelligenceReview).where(
+                    AlertIntelligenceReview.alert_source == "defect",
+                    AlertIntelligenceReview.alert_ref_id == r[0],
+                    AlertIntelligenceReview.status == "pending",
+                )
+            )
+            if existing.scalar_one_or_none():
+                continue
+            context = (
+                f"SPC过程失控预警：\n"
+                f"- 特性：{r[2] or r[1]}\n"
+                f"- 测量值：{r[3]}，UCL={r[4]}，LCL={r[5]}\n"
+                f"- 工位：{r[6] or '未知'}"
+            )
+            await review_alert(db, factory_id, "defect", r[0], r[1], context)
+            alerts_found += 1
+            reviews_created += 1
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+
     return {
         "patrol_time": now.strftime("%Y-%m-%d %H:%M:%S"),
         "alerts_found": alerts_found,

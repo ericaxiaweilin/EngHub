@@ -520,6 +520,72 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    # ==================== 5M1E 预警数据工具 ====================
+    {
+        "type": "function",
+        "function": {
+            "name": "query_downtime",
+            "description": "查询设备停机记录与MTBF统计。返回近期停机事件（类别/时长/原因）及设备平均故障间隔。用于'停机''故障''MTBF''设备利用率'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["breakdown", "setup", "adjustment", "waiting", "planned_maint"],
+                        "description": "停机类别过滤，可选",
+                    },
+                    "limit": {"type": "integer", "description": "返回条数，默认15", "default": 15},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_maintenance_due",
+            "description": "查询即将到期或已逾期的设备保养计划。返回设备、计划名、周期、上次执行、下次到期、逾期天数。用于'保养到期''维保''预防性维护'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_ahead": {"type": "integer", "description": "向前看几天（默认7天内到期）", "default": 7},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_shortage_alerts",
+            "description": "查询缺料预警：当前库存低于补货阈值（min_level）的物料清单。返回物料、当前库存、安全库存、最低水位、缺口量。用于'缺料''补货''低于安全库存'类请求。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_stagnant",
+            "description": "查询呆滞物料：超过N天无库存流动的物料。返回物料、仓库、数量、最后流动日期、呆滞天数。用于'呆滞''滞料''长期不动'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "呆滞天数阈值（默认30天无流动）", "default": 30},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_spc_anomalies",
+            "description": "查询SPC失控点：近期超出控制限（UCL/LCL）的质量特性测量。返回特性名、测量值、控制限、工位、时间。用于'SPC''失控''越限''过程能力'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "返回条数，默认20", "default": 20},
+                },
+            },
+        },
+    },
 ]
 
 
@@ -1375,6 +1441,216 @@ async def _tool_query_hr_roster(db: AsyncSession, args: Dict[str, Any], factory_
     }
 
 
+# ==================== 5M1E 预警数据工具执行器 ====================
+
+async def _tool_query_downtime(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """设备停机记录 + MTBF 统计"""
+    from sqlalchemy import text as sa_text
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+    limit = min(int(args.get("limit", 15)), 50)
+    category = args.get("category")
+
+    conditions = ["d.factory_id = :fid"]
+    params: Dict[str, Any] = {"fid": fid}
+    if category:
+        conditions.append("d.downtime_category = :cat")
+        params["cat"] = category
+    where = " AND ".join(conditions)
+
+    rows = (await db.execute(sa_text(f"""
+        SELECT d.equipment_id, e.equipment_code, e.equipment_name,
+               d.start_time, d.end_time, d.duration_minutes,
+               d.downtime_category, d.reason_code, d.description
+        FROM equipment_downtime d
+        LEFT JOIN equipment e ON e.id = d.equipment_id
+        WHERE {where}
+        ORDER BY d.start_time DESC LIMIT :lim
+    """), {**params, "lim": limit})).fetchall()
+
+    events = [
+        {
+            "equipment_code": r[1], "equipment_name": r[2],
+            "start": str(r[3]) if r[3] else None,
+            "end": str(r[4]) if r[4] else None,
+            "duration_min": round(r[5], 1) if r[5] else None,
+            "category": r[6], "reason": r[7], "description": r[8],
+        }
+        for r in rows
+    ]
+
+    # MTBF 统计（近30天 breakdown 类）
+    mtbf_rows = (await db.execute(sa_text("""
+        SELECT e.equipment_code, e.equipment_name,
+               count(*) as fault_count,
+               COALESCE(sum(d.duration_minutes), 0) as total_min
+        FROM equipment_downtime d
+        LEFT JOIN equipment e ON e.id = d.equipment_id
+        WHERE d.factory_id = :fid AND d.downtime_category = 'breakdown'
+          AND d.start_time >= now() - interval '30 days'
+        GROUP BY e.equipment_code, e.equipment_name
+        ORDER BY fault_count DESC LIMIT 10
+    """), {"fid": fid})).fetchall()
+
+    mtbf = [
+        {
+            "equipment_code": r[0], "equipment_name": r[1],
+            "fault_count_30d": r[2],
+            "total_downtime_min": round(r[3], 1),
+            "mtbf_hours": round((30 * 24) / max(r[2], 1), 1),
+        }
+        for r in mtbf_rows
+    ]
+
+    return {"factory_id": fid, "events": events, "event_count": len(events), "mtbf_30d": mtbf}
+
+
+async def _tool_query_maintenance_due(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """保养到期/逾期预警"""
+    from sqlalchemy import text as sa_text
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+    days_ahead = int(args.get("days_ahead", 7))
+
+    rows = (await db.execute(sa_text("""
+        SELECT p.plan_name, p.frequency_days, p.last_executed_at, p.next_due_at,
+               e.equipment_code, e.equipment_name, e.status as eq_status,
+               (p.next_due_at - now()) as remaining
+        FROM maintenance_plans p
+        LEFT JOIN equipment e ON e.id = p.equipment_id
+        WHERE p.factory_id = :fid AND p.is_active = true
+          AND p.next_due_at <= now() + (:days || ' days')::interval
+        ORDER BY p.next_due_at ASC
+    """), {"fid": fid, "days": str(days_ahead)})).fetchall()
+
+    items = []
+    for r in rows:
+        remaining = r[7]
+        overdue_days = -int(remaining.total_seconds() // 86400) if remaining and remaining.total_seconds() < 0 else 0
+        items.append({
+            "plan_name": r[0], "frequency_days": r[1],
+            "last_executed": str(r[2])[:10] if r[2] else None,
+            "next_due": str(r[3])[:10] if r[3] else None,
+            "equipment_code": r[4], "equipment_name": r[5],
+            "equipment_status": r[6],
+            "overdue_days": overdue_days,
+            "status": "逾期" if overdue_days > 0 else "即将到期",
+        })
+
+    overdue = [i for i in items if i["overdue_days"] > 0]
+    return {
+        "factory_id": fid, "days_ahead": days_ahead,
+        "total_due": len(items), "overdue_count": len(overdue),
+        "plans": items,
+    }
+
+
+async def _tool_query_shortage_alerts(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """缺料预警：库存 < 补货阈值 min_level"""
+    from sqlalchemy import text as sa_text
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+
+    rows = (await db.execute(sa_text("""
+        SELECT rt.material_id, rt.min_level, rt.safety_stock, rt.max_level,
+               rt.reorder_lot_size, rt.reorder_lead_time_hours,
+               COALESCE(inv.total_qty, 0) as current_qty,
+               COALESCE(inv.material_name, rt.material_id) as material_name
+        FROM replenishment_thresholds rt
+        LEFT JOIN (
+            SELECT material_id, material_name, sum(total_qty) as total_qty
+            FROM inventory WHERE factory_id = :fid
+            GROUP BY material_id, material_name
+        ) inv ON inv.material_id = rt.material_id
+        WHERE rt.factory_id = :fid AND rt.active = true
+          AND COALESCE(inv.total_qty, 0) < rt.min_level
+        ORDER BY (rt.min_level - COALESCE(inv.total_qty, 0)) DESC
+    """), {"fid": fid})).fetchall()
+
+    items = [
+        {
+            "material_id": r[0], "material_name": r[7],
+            "current_qty": r[6], "min_level": r[1],
+            "safety_stock": r[2], "max_level": r[3],
+            "gap": r[1] - r[6],
+            "reorder_lot": r[4], "lead_time_hours": r[5],
+            "severity": "critical" if r[6] < r[2] else "warning",
+        }
+        for r in rows
+    ]
+    critical = [i for i in items if i["severity"] == "critical"]
+    return {
+        "factory_id": fid, "shortage_count": len(items),
+        "critical_count": len(critical), "items": items,
+    }
+
+
+async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """呆滞物料：超过 N 天无库存流动"""
+    from sqlalchemy import text as sa_text
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+    days = int(args.get("days", 30))
+
+    rows = (await db.execute(sa_text("""
+        SELECT i.material_code, i.material_name, i.total_qty, i.unit,
+               i.last_movement_at, i.created_at,
+               w.warehouse_name,
+               COALESCE(EXTRACT(DAY FROM now() - COALESCE(i.last_movement_at, i.created_at)), 0) as stagnant_days
+        FROM inventory i
+        LEFT JOIN warehouses w ON w.id = i.warehouse_id
+        WHERE i.factory_id = :fid AND i.total_qty > 0
+          AND COALESCE(i.last_movement_at, i.created_at) < now() - (:days || ' days')::interval
+        ORDER BY stagnant_days DESC
+        LIMIT 30
+    """), {"fid": fid, "days": str(days)})).fetchall()
+
+    items = [
+        {
+            "material_code": r[0], "material_name": r[1],
+            "qty": r[2], "unit": r[3],
+            "last_movement": str(r[4])[:10] if r[4] else str(r[5])[:10],
+            "warehouse": r[6],
+            "stagnant_days": int(r[7]),
+        }
+        for r in rows
+    ]
+    return {"factory_id": fid, "threshold_days": days, "stagnant_count": len(items), "items": items}
+
+
+async def _tool_query_spc_anomalies(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """SPC 失控点：超出 UCL/LCL 的测量"""
+    from sqlalchemy import text as sa_text
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+    limit = min(int(args.get("limit", 20)), 50)
+
+    rows = (await db.execute(sa_text("""
+        SELECT characteristic_code, characteristic_name, measured_value,
+               ucl, lcl, cl, station_id, measured_at, measured_by
+        FROM qms_spc_points
+        WHERE factory_id = :fid AND is_out_of_control = true
+        ORDER BY measured_at DESC LIMIT :lim
+    """), {"fid": fid, "lim": limit})).fetchall()
+
+    items = [
+        {
+            "characteristic": r[1] or r[0],
+            "measured_value": round(r[2], 3) if r[2] is not None else None,
+            "ucl": r[3], "lcl": r[4], "cl": r[5],
+            "deviation": round(r[2] - r[3], 3) if r[2] is not None and r[3] is not None and r[2] > r[3]
+                         else round(r[2] - r[4], 3) if r[2] is not None and r[4] is not None else None,
+            "station": r[6], "measured_at": str(r[7])[:16] if r[7] else None,
+            "measured_by": r[8],
+        }
+        for r in rows
+    ]
+
+    # 汇总：近7天失控总数
+    total_7d = (await db.execute(sa_text("""
+        SELECT count(*) FROM qms_spc_points
+        WHERE factory_id = :fid AND is_out_of_control = true
+          AND measured_at >= now() - interval '7 days'
+    """), {"fid": fid})).scalar() or 0
+
+    return {"factory_id": fid, "anomaly_count": len(items), "total_7d": total_7d, "anomalies": items}
+
+
 # 执行器注册表
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
@@ -1404,6 +1680,12 @@ _TOOL_EXECUTORS = {
     "run_alert_patrol": _tool_run_alert_patrol,
     "query_hr_roster": _tool_query_hr_roster,
     "query_process_knowledge": None,  # 占位，下方单独定义（不依赖数据库）
+    # 5M1E 预警数据工具
+    "query_downtime": _tool_query_downtime,
+    "query_maintenance_due": _tool_query_maintenance_due,
+    "query_shortage_alerts": _tool_query_shortage_alerts,
+    "query_stagnant": _tool_query_stagnant,
+    "query_spc_anomalies": _tool_query_spc_anomalies,
 }
 
 
@@ -1496,6 +1778,12 @@ TOOL_LABELS = {
     "run_alert_patrol": "预警巡检",
     "query_hr_roster": "人力档案",
     "query_process_knowledge": "流程知识",
+    # 5M1E 预警数据工具
+    "query_downtime": "停机记录",
+    "query_maintenance_due": "保养到期",
+    "query_shortage_alerts": "缺料预警",
+    "query_stagnant": "呆滞物料",
+    "query_spc_anomalies": "SPC失控",
 }
 
 
@@ -1601,6 +1889,56 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "职位流程", "工作流程是什么", "每天做什么",
             # 责任归属
             "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
+        ],
+    },
+    # ==================== 5M1E 预警数据意图路由 ====================
+    {
+        "tool": "query_downtime",
+        "keywords": [
+            "停机", "停机记录", "故障记录", "MTBF", "设备利用率", "设备故障率",
+            "停机时间", "故障次数", "设备停机", "停机原因", " breakdown",
+        ],
+    },
+    {
+        "tool": "query_maintenance_due",
+        "keywords": [
+            "保养到期", "维保", "预防性维护", "保养计划", "维护到期",
+            "设备保养", "逾期保养", "PM到期", "维护计划",
+        ],
+    },
+    {
+        "tool": "query_shortage_alerts",
+        "keywords": [
+            "缺料", "补货", "低于安全库存", "缺料预警", "物料不足",
+            "库存不足", "低于最低水位", "补货预警", "缺料清单",
+        ],
+    },
+    {
+        "tool": "query_stagnant",
+        "keywords": [
+            "呆滞", "滞料", "呆滞物料", "长期不动", "库存积压",
+            "无流动", "呆滞料", "滞库", "积压物料",
+        ],
+    },
+    {
+        "tool": "query_spc_anomalies",
+        "keywords": [
+            "SPC", "失控", "越限", "过程能力", "控制图", "超出控制限",
+            "SPC异常", "质量失控", "UCL", "LCL", "过程异常",
+        ],
+    },
+    {
+        "tool": "query_routing",
+        "keywords": [
+            "工艺路线", "工序", "加工步骤", "工艺流程", "产品工艺",
+            "工艺查询", "路线查询", "工序查询",
+        ],
+    },
+    {
+        "tool": "query_skill_matrix",
+        "keywords": [
+            "技能矩阵", "技能等级", "技能分布", "员工技能", "技能断层",
+            "谁会", "技能情况", "多能工", "技能覆盖",
         ],
     },
 ]

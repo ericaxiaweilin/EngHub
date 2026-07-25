@@ -49,6 +49,7 @@ from api.routes.automation_level_routes import router as automation_level_router
 from api.routes.collaboration_routes import router as collaboration_router
 from api.routes.agent_supervisor_routes import router as agent_supervisor_router
 from api.routes.agent_routes import router as agent_router
+from api.routes.crew_routes import router as crew_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -93,6 +94,7 @@ app.include_router(automation_level_router)  # 自动化等级配置（L0-L3可�
 app.include_router(collaboration_router)  # 岗位协同网络（事件+边界）
 app.include_router(agent_supervisor_router)  # 智能体监督（长任务+卡住+预测+闭环）
 app.include_router(agent_router)  # 排产+仓储智能体
+app.include_router(crew_router)  # CrewAI推理层+个人知识层
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 
