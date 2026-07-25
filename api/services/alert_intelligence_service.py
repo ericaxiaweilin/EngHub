@@ -451,6 +451,46 @@ async def patrol(
     except Exception:  # noqa: BLE001
         await db.rollback()
 
+    # 6. 环境异常（公共气象 API 检测高温/高湿/大风）
+    try:
+        import httpx
+        lat, lon = 10.8231, 106.6297  # 默认胡志明市工业区
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
+            f"&timezone=Asia/Ho_Chi_Minh"
+        )
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(url)
+            cur = resp.json().get("current", {})
+        temp = cur.get("temperature_2m")
+        hum = cur.get("relative_humidity_2m")
+        wind = cur.get("wind_speed_10m")
+        env_alerts = []
+        if temp is not None and temp > 35:
+            env_alerts.append(f"高温 {temp}°C（阈值35°C）")
+        if hum is not None and hum > 85:
+            env_alerts.append(f"高湿 {hum}%（阈值85%）")
+        if wind is not None and wind > 40:
+            env_alerts.append(f"大风 {wind}km/h（阈值40）")
+        if env_alerts:
+            ref_id = f"env_{now.strftime('%Y%m%d%H')}"
+            existing = await db.execute(
+                select(AlertIntelligenceReview).where(
+                    AlertIntelligenceReview.alert_source == "environment",
+                    AlertIntelligenceReview.alert_ref_id == ref_id,
+                    AlertIntelligenceReview.status == "pending",
+                )
+            )
+            if not existing.scalar_one_or_none():
+                context = f"车间环境异常预警：\n" + "\n".join(f"- {a}" for a in env_alerts)
+                await review_alert(db, factory_id, "environment", ref_id, "环境异常", context)
+                alerts_found += 1
+                reviews_created += 1
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+
     return {
         "patrol_time": now.strftime("%Y-%m-%d %H:%M:%S"),
         "alerts_found": alerts_found,

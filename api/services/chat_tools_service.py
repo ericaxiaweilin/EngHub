@@ -1659,6 +1659,72 @@ async def _tool_query_spc_anomalies(db: AsyncSession, args: Dict[str, Any], fact
     return {"factory_id": fid, "anomaly_count": len(items), "total_7d": total_7d, "anomalies": items}
 
 
+# 工厂坐标配置（默认越南胡志明市工业区，可按 factory_id 扩展）
+_FACTORY_COORDS = {
+    "FAC_ELEC_DEMO_2026": (10.8231, 106.6297),  # 胡志明市
+    "FAC_MECH_001": (10.8231, 106.6297),
+}
+_DEFAULT_COORDS = (10.8231, 106.6297)
+
+
+async def _tool_query_environment(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """车间环境状况：调用 Open-Meteo 免费公共气象 API（无需 key）"""
+    import httpx
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+    lat, lon = _FACTORY_COORDS.get(fid, _DEFAULT_COORDS)
+
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+        f"precipitation,wind_speed_10m,surface_pressure"
+        f"&timezone=Asia/Ho_Chi_Minh"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"气象数据获取失败: {e}", "factory_id": fid}
+
+    cur = data.get("current", {})
+    temp = cur.get("temperature_2m")
+    humidity = cur.get("relative_humidity_2m")
+    feels = cur.get("apparent_temperature")
+    precip = cur.get("precipitation")
+    wind = cur.get("wind_speed_10m")
+    pressure = cur.get("surface_pressure")
+
+    # 环境评估（车间接标准）
+    alerts = []
+    if temp is not None and temp > 35:
+        alerts.append(f"高温预警：当前 {temp}°C，超过车间接标准 35°C，建议加强通风/开启降温")
+    if temp is not None and temp < 10:
+        alerts.append(f"低温提示：当前 {temp}°C，注意员工保暖")
+    if humidity is not None and humidity > 85:
+        alerts.append(f"湿度偏高：{humidity}%，注意电子元器件防潮/金属件防锈")
+    if humidity is not None and humidity < 30:
+        alerts.append(f"湿度偏低：{humidity}%，注意静电防护(ESD)")
+    if wind is not None and wind > 40:
+        alerts.append(f"大风预警：风速 {wind} km/h，注意室外作业安全")
+
+    return {
+        "factory_id": fid,
+        "source": "当地公共气象数据(Open-Meteo)",
+        "current": {
+            "temperature_c": temp,
+            "feels_like_c": feels,
+            "humidity_pct": humidity,
+            "precipitation_mm": precip,
+            "wind_speed_kmh": wind,
+            "pressure_hpa": pressure,
+        },
+        "assessment": "正常" if not alerts else "注意",
+        "alerts": alerts,
+        "observation_time": cur.get("time", ""),
+    }
+
+
 # 执行器注册表
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
@@ -1694,6 +1760,7 @@ _TOOL_EXECUTORS = {
     "query_shortage_alerts": _tool_query_shortage_alerts,
     "query_stagnant": _tool_query_stagnant,
     "query_spc_anomalies": _tool_query_spc_anomalies,
+    "query_environment": _tool_query_environment,
 }
 
 
@@ -1792,6 +1859,7 @@ TOOL_LABELS = {
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",
+    "query_environment": "车间环境",
 }
 
 
@@ -1898,6 +1966,13 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "SPC", "失控", "越限", "过程能力", "控制图", "超出控制限",
             "SPC异常", "质量失控", "UCL", "LCL", "过程异常",
+        ],
+    },
+    {
+        "tool": "query_environment",
+        "keywords": [
+            "环境", "温度", "湿度", "车间环境", "天气", "风速",
+            "降温", "静电", "ESD", "环境温度", "车间温度",
         ],
     },
     {
