@@ -139,7 +139,7 @@ class AgentSupervisor:
         """更新任务进度（智能体每完成一步调用）"""
         # 先获取total_steps来计算百分比
         pre = await self.db.execute(text(
-            "SELECT total_steps FROM agent_tasks WHERE id = :id::uuid AND status = 'running'"
+            "SELECT total_steps FROM agent_tasks WHERE id = CAST(:id AS uuid) AND status = 'running'"
         ), {"id": task_id})
         pre_row = pre.first()
         if not pre_row:
@@ -152,7 +152,7 @@ class AgentSupervisor:
             SET completed_steps = :cs,
                 progress_pct = :pct,
                 last_progress_at = NOW()
-            WHERE id = :id::uuid AND status = 'running'
+            WHERE id = CAST(:id AS uuid) AND status = 'running'
             RETURNING agent_name, task_type, total_steps, completed_steps
         """), {"cs": completed_steps, "pct": pct, "id": task_id})
         row = result.first()
@@ -179,7 +179,7 @@ class AgentSupervisor:
             UPDATE agent_tasks
             SET status = :st, completed_at = NOW(), progress_pct = 100,
                 result = :res, error = :err
-            WHERE id = :id::uuid
+            WHERE id = CAST(:id AS uuid)
         """), {
             "st": status, "id": task_id,
             "res": str(result or {}), "err": error,
@@ -192,7 +192,7 @@ class AgentSupervisor:
         await self.db.execute(text("""
             UPDATE agent_tasks
             SET verified = TRUE, verified_at = NOW(), verify_result = :vr
-            WHERE id = :id::uuid
+            WHERE id = CAST(:id AS uuid)
         """), {"vr": verify_result, "id": task_id})
         await self.db.commit()
         return {"task_id": task_id, "verified": True, "verify_result": verify_result}
@@ -214,7 +214,7 @@ class AgentSupervisor:
         # 标记为 stalled
         for task in stalled:
             await self.db.execute(text("""
-                UPDATE agent_tasks SET status = 'stalled' WHERE id = :id::uuid
+                UPDATE agent_tasks SET status = 'stalled' WHERE id = CAST(:id AS uuid)
             """), {"id": task["id"]})
 
         if stalled:
