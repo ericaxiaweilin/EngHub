@@ -104,7 +104,7 @@ class EmployeeSkillService:
         """
         query = (
             select(User, EmployeeSkill, Skill)
-            .join(EmployeeSkill, cast(User.id, String(36)) == EmployeeSkill.user_id)
+            .join(EmployeeSkill, User.id == EmployeeSkill.user_id)
             .join(Skill, EmployeeSkill.skill_id == Skill.id)
             .where((EmployeeSkill.expiry_date.is_(None)) | (EmployeeSkill.expiry_date >= datetime.utcnow()))
         )
