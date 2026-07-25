@@ -140,6 +140,35 @@ export default function RCCDashboard() {
     }
   }
 
+  const handleAnalyzeImpact = async (paramId: string) => {
+    try {
+      // placeholder: 实际影响分析 API 待接入
+      console.log('影响分析 paramId:', paramId)
+    } catch (err) {
+      message.error('获取影响分析失败')
+    }
+  }
+
+  const handleApproveTask = async (taskId: string) => {
+    try {
+      await axios.post(`${API_BASE}/tasks/${taskId}/approve`)
+      message.success('任务已通过')
+      fetchTasks()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || '审批失败')
+    }
+  }
+
+  const handleRejectTask = async (taskId: string) => {
+    try {
+      await axios.post(`${API_BASE}/tasks/${taskId}/reject`)
+      message.success('任务已驳回')
+      fetchTasks()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || '拒绝失败')
+    }
+  }
+
   return (
     <Card title="🔗 EngHub v2.6 — 三位一体调度系统">
       <Breadcrumb items={[
