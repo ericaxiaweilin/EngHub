@@ -163,7 +163,7 @@ class PersonalKnowledgeService:
                    COUNT(*) as knowledge_count,
                    MAX(pk.created_at) as last_contribution
             FROM personal_knowledge pk
-            JOIN employees e ON pk.employee_id = e.id
+            JOIN hr_employees e ON pk.employee_id = e.id
             WHERE pk.factory_id = :fid
               AND (pk.title ILIKE :term OR pk.content ILIKE :term OR pk.tags::text ILIKE :term)
             GROUP BY pk.employee_id, e.name, e.position
@@ -177,7 +177,7 @@ class PersonalKnowledgeService:
             SELECT pd.employee_id, e.name as employee_name, e.position,
                    COUNT(*) as decision_count
             FROM personal_decisions pd
-            JOIN employees e ON pd.employee_id = e.id
+            JOIN hr_employees e ON pd.employee_id = e.id
             WHERE pd.factory_id = :fid
               AND (pd.situation ILIKE :term OR pd.decision_type ILIKE :term)
             GROUP BY pd.employee_id, e.name, e.position
@@ -239,7 +239,7 @@ class PersonalKnowledgeService:
 
         # 获取员工信息
         emp_result = await self.db.execute(text(
-            "SELECT name, position FROM employees WHERE id = :eid AND factory_id = :fid"
+            "SELECT name, position FROM hr_employees WHERE id = :eid AND factory_id = :fid"
         ), {"eid": employee_id, "fid": factory_id})
         emp = emp_result.first()
         emp_name = emp[0] if emp else "未知"
@@ -378,7 +378,7 @@ class PersonalKnowledgeService:
         try:
             # 获取现有标签
             result = await self.db.execute(text(
-                "SELECT expertise_tags FROM employees WHERE id = :eid AND factory_id = :fid"
+                "SELECT expertise_tags FROM hr_employees WHERE id = :eid AND factory_id = :fid"
             ), {"eid": employee_id, "fid": factory_id})
             row = result.first()
             existing = []
@@ -391,7 +391,7 @@ class PersonalKnowledgeService:
             # 合并
             merged = list(set(existing + tags))
             await self.db.execute(text(
-                "UPDATE employees SET expertise_tags = :tags WHERE id = :eid AND factory_id = :fid"
+                "UPDATE hr_employees SET expertise_tags = :tags WHERE id = :eid AND factory_id = :fid"
             ), {"tags": json.dumps(merged, ensure_ascii=False), "eid": employee_id, "fid": factory_id})
             await self.db.commit()
         except Exception as e:

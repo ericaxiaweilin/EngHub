@@ -43,4 +43,4 @@ CREATE INDEX IF NOT EXISTS idx_pd_employee ON personal_decisions(factory_id, emp
 CREATE INDEX IF NOT EXISTS idx_pd_type ON personal_decisions(decision_type);
 
 -- 员工表增加专长标签
-ALTER TABLE employees ADD COLUMN IF NOT EXISTS expertise_tags JSONB DEFAULT '[]';
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS expertise_tags JSONB DEFAULT '[]';
