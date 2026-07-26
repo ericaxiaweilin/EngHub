@@ -1,22 +1,146 @@
 """
 v2.6 - RCC Data Layer API Routes
 RCC = Resource Control Center — 全局统筹人/物/工单计算
-不是UI面板，而是给上游系统（SchedulingAgent, WarehouseAgent, AlertIntelligence）提供数据基线。
 
-新增端点：
-- GET /rcc/baseline → 全量RCC基线概览
-- GET /rcc/baseline/people → 人力基线
-- GET /rcc/baseline/equipment → 设备基线
-- GET /rcc/baseline/work_orders → 工单统筹基线
-- GET /rcc/baseline/process → 工艺基线
-- POST /rcc/calculate → 触发统筹计算并返回完整基线
-- POST /rcc/sync-baseline → 同步最新DB数据到RCC基线
+综合数据层接口：
+- GET /rcc/data → 按传入或默认工厂ID返回真实基线+决策
+- GET /rcc/data?mode=global → 聚合所有工厂数据（RCCDashboard默认模式）
+- GET /rcc/data?factory_id=xxx → 单工厂详细视图
 """
 
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from typing import Optional, Dict, Any
 
 router = APIRouter(prefix="/api/v1/rcc", tags=["rcc"])
+
+
+@router.get("/data", summary="综合数据层接口")
+async def get_rcc_data(
+    factory_id: Optional[str] = Query(None, description="工厂ID"),
+    mode: str = Query("single", description="single|global"),
+):
+    """
+    综合数据层接口：从上游业务模块直接汇总人/设备/工单/环境/工艺真实基线、
+    实时产能、瓶颈预警和调度建议，供 RCCDashboard 展示。
+    
+    - mode=single + factory_id=指定 → 查询该工厂详细基线
+    - mode=global → 聚合所有工厂数据，适合 RCC 全局视角
+    - factory_id=None + mode=single（默认）→ 尝试从上下文获取默认工厂
+    """
+    from database.db_config import get_db
+    
+    db_generator = get_db()
+    db = await db_generator.__anext__()
+    try:
+        # 1. 全量计算引擎
+        from core.rcc.calculator import RCCResourceCalculator
+        calc = RCCResourceCalculator(db)
+        
+        # 2. 资源决策引擎
+        from core.rcc.resource_decision import RCCResourceDecisionEngine
+        engine = RCCResourceDecisionEngine(db)
+        
+        # 3. 可调参数 + 逻辑链汇总
+        from sqlalchemy import text as sql_text
+        
+        # 获取所有工厂列表
+        factories_result = await db.execute(sql_text(
+            "SELECT DISTINCT factory_id FROM hr_employees WHERE factory_id IS NOT NULL"
+        ))
+        all_factories = [r[0] for r in factories_result if r[0]]
+        
+        if mode == "global":
+            # 全局聚合模式：遍历所有工厂，汇总人/设备/工单
+            merged_people = {"active_workers": 0, "attendance_rate_pct": 0, "alerts": [], 
+                           "headcount": {}, "skill_distribution": {}}
+            merged_equipment = {"total": 0, "status_distribution": {}, "pm_overdue_count": 0}
+            merged_work_orders = {"status": {}, "urgent_count": 0, "delivery_risk_count": 0}
+            merged_environment = {"has_data": False, "warnings": [], "alert": False}
+            merged_process = {"yield_baseline_30d": None, "routing_count": 0, "top_defects": []}
+            
+            for fid in all_factories:
+                fb = await calc.full_baseline_sync(fid)
+                fbl = fb.get("baseline", {})
+                
+                p = fbl.get("people", {})
+                merged_people["active_workers"] += p.get("active_workers", 0)
+                merged_people["headcount"].update(p.get("headcount", {}))
+                if p.get("skills"):
+                    for k, v in p["skills"].items():
+                        merged_people["skill_distribution"][k] = merged_people["skill_distribution"].get(k, 0) + v
+                merged_people["alerts"].extend(p.get("alerts", []))
+                
+                e = fbl.get("equipment", {})
+                merged_equipment["total"] += e.get("total", 0)
+                for k, v in e.get("statuses", {}).items():
+                    merged_equipment["status_distribution"][k] = merged_equipment["status_distribution"].get(k, 0) + v
+                
+                w = fbl.get("work_orders", {})
+                for k, v in w.get("status", {}).items():
+                    merged_work_orders["status"][k] = merged_work_orders["status"].get(k, 0) + v
+                merged_work_orders["urgent_count"] += w.get("urgent_count", 0)
+                merged_work_orders["delivery_risk_count"] += w.get("delivery_risk_count", 0)
+                
+                env = fbl.get("environment", {})
+                if env.get("has_data"):
+                    merged_environment["has_data"] = True
+                merged_environment["warnings"].extend(env.get("warnings", []))
+                if env.get("alert"):
+                    merged_environment["alert"] = True
+            
+            baseline = {
+                "people": merged_people,
+                "equipment": merged_equipment,
+                "work_orders": merged_work_orders,
+                "environment": merged_environment,
+                "process": merged_process,
+            }
+            
+            decisions = {"global_mode": True, "factories_aggregated": all_factories}
+        else:
+            # 单工厂模式
+            effective_factory_id = factory_id or (all_factories[0] if all_factories else None)
+            if not effective_factory_id:
+                return {
+                    "success": False,
+                    "message": "没有可用的工厂数据",
+                    "baseline": {},
+                    "decisions": {}
+                }
+            
+            baseline = await calc.full_baseline_sync(effective_factory_id)
+            decisions = await engine.full_resource_decision(effective_factory_id)
+        
+        # 4. 可调参数 + 逻辑链汇总
+        params_result = await db.execute(sql_text(
+            "SELECT COUNT(*)::int AS total, "
+            "COUNT(*) FILTER (WHERE sensitivity='high')::int AS high_sensitive "
+            "FROM global_adjustable_params"
+        ))
+        param_summary = dict(params_result.mappings().first()) or {}
+        
+        chains_result = await db.execute(sql_text(
+            "SELECT COUNT(*)::int AS total, "
+            "COUNT(*) FILTER (WHERE enabled=true)::int AS enabled_count "
+            "FROM deterministic_logic_chains"
+        ))
+        chain_summary = dict(chains_result.mappings().first()) or {}
+        
+        return {
+            "success": True,
+            "mode": mode,
+            "factory_id": effective_factory_id if mode == "single" else None,
+            "generated_at": baseline.get("synced_at") if isinstance(baseline, dict) else None,
+            "params_summary": param_summary,
+            "chains_summary": chain_summary,
+            "baseline": baseline.get("baseline", baseline) if isinstance(baseline, dict) else baseline,
+            "decisions": decisions,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        if hasattr(db_generator, 'aclose'):
+            await db_generator.aclose()
 
 
 @router.get("/baseline", summary="RCC全量基线概览")

@@ -1,53 +1,83 @@
-
-
 /**
  * v2.6 - 三位一体调度系统前端 UI
- * RCC + 参数化面板 + Chatbot工单
+ * RCC + 参数化面板 + Chatbot工单 + 资源调度视图（接入真实基线数据）
  */
 
-import React, { useState, useEffect } from 'react'
-import { Card, Tabs, Table, Button, Space, Tag, Descriptions, Modal, Form, Input, Select, message, Tree, Breadcrumb, Alert } from 'antd'
-import { SettingOutlined, RobotOutlined, TeamOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, SwapOutlined, SafetyOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { useState, useEffect } from 'react'
+import { Card, Tabs, Table, Button, Space, Tag, Descriptions, Modal, Form, Input, Select, message, Tree, Breadcrumb, Alert, Row, Col, Statistic, Tabs as AntTabs, Progress, Timeline, Badge } from 'antd'
+import { SettingOutlined, RobotOutlined, TeamOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, SwapOutlined, SafetyOutlined, ThunderboltOutlined, WarningOutlined, ToolOutlined, FileTextOutlined, EnvironmentOutlined, ProfileOutlined } from '@ant-design/icons'
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1/rcc'
 
+interface RccDataResponse {
+  success: boolean
+  factory_id: string
+  generated_at?: string
+  params_summary: { total: number; high_sensitive: number; people_params: number; equipment_params: number; wo_params: number; env_params: number; process_params: number }
+  chains_summary: { total: number; enabled_count: number; disabled_count: number }
+  baseline: Record<string, any>
+  decisions: Record<string, any>
+}
+
 export default function RCCDashboard() {
   const [selectedOrg, setSelectedOrg] = useState('rcc-root')
   const [orgTree, setOrgTree] = useState([])
-  const [params, setParams] = useState([])
-  const [rccTasks, setRccTasks] = useState([])
-  const [chatbotTickets, setChatbotTickets] = useState([])
-  const [logicChains, setLogicChains] = useState([])
-  const [selectedParam, setSelectedParam] = useState(null)
+  const [params, setParams] = useState<any[]>([])
+  const [rccTasks, setRccTasks] = useState<any[]>([])
+  const [chatbotTickets, setChatbotTickets] = useState<any[]>([])
+  const [logicChains, setLogicChains] = useState<any[]>([])
+  const [rccData, setRccData] = useState<RccDataResponse | null>(null)
+  const [loadingData, setLoadingData] = useState(false)
+  const [selectedParam, setSelectedParam] = useState<any>(null)
   const [newTicketVisible, setNewTicketVisible] = useState(false)
   const [newTicketForm] = Form.useForm()
 
   useEffect(() => {
     fetchOrgTree()
-    fetchParams()
-    fetchTasks()
-    fetchTickets()
-    fetchLogicChains()
+    fetchAll()
   }, [])
 
   const fetchOrgTree = async () => {
     try {
-      // 简化版：使用预设组织树
+      // 从 API 动态获取工厂列表
+      let factoryList = [
+        'FAC_ELEC_DEMO_2026',
+        'FAC_MECH_001'
+      ]
+      
+      try {
+        const res = await axios.get(`${API_BASE}/data?mode=global`)
+        if (res.data?.factories_aggregated) {
+          factoryList = res.data.factories_aggregated
+        }
+      } catch (e) {
+        console.warn('获取工厂列表失败，使用默认列表')
+      }
+      
       setOrgTree([
-        { title: 'RCC 资源控制中心', key: 'rcc-root', children: [
-          { title: '产线A', key: 'line-a', children: [
-            { title: 'SMT贴片工位01', key: 'smt-station-01' },
-            { title: 'CNC加工中心01', key: 'cnc-station-01' },
-          ]},
-          { title: '产线B', key: 'line-b' },
-          { title: '品质部', key: 'quality-dept' },
-          { title: '人力资源部', key: 'hr-office' },
+        { title: '🏭 RCC 资源控制中心', key: 'rcc-root', children: [
+          ...factoryList.map(f => ({
+            title: `${f} (点击切换)`,
+            key: f,
+            onClick: () => { fetchFactoryBaseline(f); setSelectedOrg(f); fetchRccData(); },
+          })),
+          { title: '📊 全局汇总', key: 'rcc-root' },
         ]}
       ])
     } catch (err) {
       console.error('获取组织树失败:', err)
     }
+  }
+
+  const fetchAll = async () => {
+    await Promise.all([
+      fetchParams(),
+      fetchTasks(),
+      fetchTickets(),
+      fetchLogicChains(),
+      fetchRccData(),
+    ])
   }
 
   const fetchParams = async () => {
@@ -86,6 +116,35 @@ export default function RCCDashboard() {
     }
   }
 
+  const fetchRccData = async () => {
+    setLoadingData(true)
+    try {
+      // RCC 全局视角默认走 mode=global，遍历所有工厂汇总
+      const res = await axios.get(`${API_BASE}/data?mode=global`)
+      setRccData(res.data)
+    } catch (err: any) {
+      console.error('获取RCC综合数据失败:', err)
+      const detail = err.response?.data?.detail || '获取综合数据失败'
+      if (!detail.includes('404')) {
+        console.warn(detail)
+      }
+    } finally {
+      setLoadingData(false)
+    }
+  }
+
+  const fetchFactoryBaseline = async (fid: string) => {
+    setLoadingData(true)
+    try {
+      const res = await axios.get(`${API_BASE}/data?mode=single&factory_id=${fid}`)
+      setRccData(res.data)
+    } catch (err: any) {
+      console.error(`获取工厂 ${fid} 基线失败:`, err)
+    } finally {
+      setLoadingData(false)
+    }
+  }
+
   const handleAdjustParam = async (paramId: string, newValue: string, reason: string) => {
     try {
       await axios.put(`${API_BASE}/params/${paramId}`, {
@@ -96,6 +155,7 @@ export default function RCCDashboard() {
       })
       message.success('参数调整成功')
       fetchParams()
+      fetchRccData()
     } catch (err: any) {
       message.error(err.response?.data?.detail || '参数调整失败')
     }
@@ -142,8 +202,8 @@ export default function RCCDashboard() {
 
   const handleAnalyzeImpact = async (paramId: string) => {
     try {
-      // placeholder: 实际影响分析 API 待接入
-      console.log('影响分析 paramId:', paramId)
+      const res = await axios.get(`${API_BASE}/params/${paramId}/impact?new_value=test`)
+      setSelectedParam({ ...selectedParam, impact_analysis: res.data?.data || null })
     } catch (err) {
       message.error('获取影响分析失败')
     }
@@ -161,7 +221,7 @@ export default function RCCDashboard() {
 
   const handleRejectTask = async (taskId: string) => {
     try {
-      await axios.post(`${API_BASE}/tasks/${taskId}/reject`)
+      await axios.post(`${API_BASE}/tasks/${taskId}/reject`, { reason: "测试驳回" })
       message.success('任务已驳回')
       fetchTasks()
     } catch (err: any) {
@@ -169,8 +229,38 @@ export default function RCCDashboard() {
     }
   }
 
+  const getStatValue = (path: string[], fallback: number = 0): number => {
+    const keys = path.split('.')
+    let val: any = rccData
+    for (const k of keys) {
+      if (val === null || val === undefined) return fallback
+      val = val[k]
+    }
+    return typeof val === 'number' ? val : fallback
+  }
+
   return (
-    <Card title="🔗 EngHub v2.6 — 三位一体调度系统">
+    <Card title="🔗 EngHub v2.6 — 三位一体调度系统" loading={loadingData}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+        <Tree
+          treeData={orgTree}
+          onSelect={(keys) => {
+            if (keys.length > 0 && keys[0] !== 'rcc-root') {
+              setSelectedOrg(keys[0] as string)
+              fetchFactoryBaseline(keys[0] as string)
+            }
+          }}
+          defaultExpandAll
+        />
+        <Space>
+          <Tag color="blue">当前模式: {rccData?.mode === 'global' ? '全局汇总' : rccData?.factory_id || '单工厂'}</Tag>
+          <Button icon={<SwapOutlined />} onClick={() => {
+            setSelectedOrg('rcc-root')
+            fetchRccData()
+          }}>返回全局</Button>
+        </Space>
+      </div>
+      
       <Breadcrumb items={[
         { title: '首页' },
         { title: 'RCC资源控制中心' },
@@ -181,9 +271,8 @@ export default function RCCDashboard() {
         {/* Tab 1: 总览 */}
         <Tabs.TabPane tab="📊 总览" key="overview">
           <Space wrap style={{ marginBottom: 16 }}>
-            <Button type="primary" icon={<ThunderboltOutlined />} onClick={() => fetchParams()}>刷新参数</Button>
-            <Button icon={<SwapOutlined />} onClick={() => fetchTasks()}>刷新RCC任务</Button>
-            <Button icon={<RobotOutlined />} onClick={() => fetchTickets()}>刷新Chatbot工单</Button>
+            <Button type="primary" icon={<ThunderboltOutlined />} onClick={() => fetchAll()}>刷新全部</Button>
+            <Button icon={<SwapOutlined />} onClick={() => fetchRccData()} loading={loadingData}>刷新RCC基线</Button>
             <Button icon={<SafetyOutlined />} onClick={() => fetchLogicChains()}>刷新逻辑链</Button>
             <Button type="dashed" icon={<SettingOutlined />} onClick={() => setNewTicketVisible(true)}>新建Chatbot工单</Button>
           </Space>
@@ -191,7 +280,17 @@ export default function RCCDashboard() {
           <Row gutter={16}>
             <Col span={6}>
               <Card size="small">
-                <Statistic title="可调参数数" value={params.length} prefix={<SettingOutlined />} />
+                <Statistic title="可调参数数" value={getStatValue('params_summary.total')} prefix={<SettingOutlined />} suffix={`(高敏 ${getStatValue('params_summary.high_sensitive')})`} />
+              </Card>
+            </Col>
+            <Col span={6}>
+              <Card size="small">
+                <Statistic title="激活逻辑链" value={getStatValue('chains_summary.enabled_count')} prefix={<SafetyOutlined />} suffix={`/ 共 ${getStatValue('chains_summary.total')}`} />
+              </Card>
+            </Col>
+            <Col span={6}>
+              <Card size="small">
+                <Statistic title="在岗人数" value={getStatValue(['baseline', 'people', 'active_workers'], 0)} prefix={<TeamOutlined />} suffix="人" />
               </Card>
             </Col>
             <Col span={6}>
@@ -199,14 +298,56 @@ export default function RCCDashboard() {
                 <Statistic title="待审批RCC任务" value={rccTasks.filter(t => t.status === 'pending').length} prefix={<ClockCircleOutlined />} />
               </Card>
             </Col>
-            <Col span={6}>
-              <Card size="small">
-                <Statistic title="活跃Chatbot工单" value={chatbotTickets.filter(t => t.status === 'open').length} prefix={<RobotOutlined />} />
+          </Row>
+
+          {/* 五维基线卡片 */}
+          <Row gutter={16} style={{ marginTop: 16 }}>
+            <Col span={8}>
+              <Card size="small" title={<><TeamOutlined /> 人力统筹</>}>
+                <Descriptions column={1} size="small" bordered>
+                  <Descriptions.Item label="在岗人数">{getStatValue(['baseline', 'people', 'active_workers'], 0)} / {getStatValue(['baseline', 'people', 'alert_count'])} 预警</Descriptions.Item>
+                  <Descriptions.Item label="出勤率">{getStatValue(['baseline', 'people', 'attendance_rate_pct'], 0)}%</Descriptions.Item>
+                  <Descriptions.Item label="技能分布">{JSON.stringify(rccData?.baseline?.people?.skills || {})}</Descriptions.Item>
+                </Descriptions>
               </Card>
             </Col>
-            <Col span={6}>
-              <Card size="small">
-                <Statistic title="激活逻辑链" value={logicChains.filter(c => c.enabled).length} prefix={<SafetyOutlined />} />
+            <Col span={8}>
+              <Card size="small" title={<><ToolOutlined /> 设备统筹</>}>
+                <Descriptions column={1} size="small" bordered>
+                  <Descriptions.Item label="设备总数">{getStatValue(['baseline', 'equipment', 'total'], 0)}</Descriptions.Item>
+                  <Descriptions.Item label="OEE目标">{getStatValue(['baseline', 'equipment', 'oee_target_pct'], 0)}%</Descriptions.Item>
+                  <Descriptions.Item label="PM逾期">{getStatValue(['baseline', 'equipment', 'pm_overdue_count'], 0)} 台</Descriptions.Item>
+                </Descriptions>
+              </Card>
+            </Col>
+            <Col span={8}>
+              <Card size="small" title={<><FileTextOutlined /> 工单统筹</>}>
+                <Descriptions column={1} size="small" bordered>
+                  <Descriptions.Item label="急单数量">{getStatValue(['baseline', 'work_orders', 'urgent_count'], 0)}</Descriptions.Item>
+                  <Descriptions.Item label="交期风险">{getStatValue(['baseline', 'work_orders', 'delivery_risk_count'], 0)}</Descriptions.Item>
+                  <Descriptions.Item label="状态分布">{JSON.stringify(rccData?.baseline?.work_orders?.status || {})}</Descriptions.Item>
+                </Descriptions>
+              </Card>
+            </Col>
+          </Row>
+
+          <Row gutter={16} style={{ marginTop: 16 }}>
+            <Col span={12}>
+              <Card size="small" title={<><EnvironmentOutlined /> 环境基线</>}>
+                <Descriptions column={1} size="small" bordered>
+                  <Descriptions.Item label="有数据">{rccData?.baseline?.environment?.has_data ? '✅' : '❌'}</Descriptions.Item>
+                  <Descriptions.Item label="预警数">{getStatValue(['baseline', 'environment', 'warning_count'], 0)}</Descriptions.Item>
+                  <Descriptions.Item label="告警">{rccData?.baseline?.environment?.alert ? <Tag color="red">有告警</Tag> : <Tag color="green">正常</Tag>}</Descriptions.Item>
+                </Descriptions>
+              </Card>
+            </Col>
+            <Col span={12}>
+              <Card size="small" title={<><ProfileOutlined /> 工艺基线</>}>
+                <Descriptions column={1} size="small" bordered>
+                  <Descriptions.Item label="良品率(30d)">{rccData?.baseline?.process?.yield_baseline_30d || '-'}%</Descriptions.Item>
+                  <Descriptions.Item label="工艺路线数">{getStatValue(['baseline', 'process', 'routing_count'], 0)}</Descriptions.Item>
+                  <Descriptions.Item label="Top缺陷">{(rccData?.baseline?.process?.top_defects || []).map((d: any) => `${d.defect_type}(${d.cnt})`).join(', ') || '-'}</Descriptions.Item>
+                </Descriptions>
               </Card>
             </Col>
           </Row>
@@ -220,7 +361,7 @@ export default function RCCDashboard() {
             pagination={false}
             size="small"
             columns={[
-              { title: '参数代码', dataIndex: 'param_code', width: 200 },
+              { title: '参数代码', dataIndex: 'param_code', width: 250 },
               { title: '参数名称', dataIndex: 'param_name', width: 200 },
               { title: '类别', dataIndex: 'category', width: 100, render: (cat: string) => <Tag color="blue">{cat}</Tag> },
               { title: '类型', dataIndex: 'param_type', width: 80 },
@@ -240,6 +381,7 @@ export default function RCCDashboard() {
 
         {/* Tab 3: RCC任务审批 */}
         <Tabs.TabPane tab="🏛️ RCC调度任务" key="rcc-tasks">
+          <Alert message="RCC调度任务由业务事件自动触发（如设备故障、物料齐套不足等），当前由逻辑链引擎驱动" type="info" showIcon style={{ marginBottom: 16 }} />
           <Table
             dataSource={rccTasks}
             rowKey="id"
@@ -286,7 +428,25 @@ export default function RCCDashboard() {
           />
         </Tabs.TabPane>
 
-        {/* Tab 5: 确定性逻辑链 */}
+        {/* Tab 5: 资源调度视图 */}
+        <Tabs.TabPane tab="📈 资源调度视图" key="resource-view">
+          {rccData ? (
+            <Row gutter={16}>
+              <Col span={24}>
+                <Card title="资源决策概览" size="small">
+                  <Descriptions column={1} bordered size="small">
+                    <Descriptions.Item label="工厂ID">{rccData.factory_id}</Descriptions.Item>
+                    <Descriptions.Item label="生成时间">{rccData.generated_at ? new Date(rccData.generated_at).toLocaleString() : '-'}</Descriptions.Item>
+                  </Descriptions>
+                </Card>
+              </Col>
+            </Row>
+          ) : (
+            <Alert message="请刷新RCC基线后查看资源调度视图" type="info" showIcon />
+          )}
+        </Tabs.TabPane>
+
+        {/* Tab 6: 确定性逻辑链 */}
         <Tabs.TabPane tab="🔗 逻辑链" key="logic-chains">
           <Table
             dataSource={logicChains}
@@ -294,8 +454,8 @@ export default function RCCDashboard() {
             pagination={false}
             size="small"
             columns={[
-              { title: '链代码', dataIndex: 'chain_code', width: 200 },
-              { title: '链名称', dataIndex: 'chain_name', width: 200 },
+              { title: '链代码', dataIndex: 'chain_code', width: 250 },
+              { title: '链名称', dataIndex: 'chain_name', width: 250 },
               { title: '触发事件', dataIndex: 'trigger_event', width: 200 },
               { title: '条件数量', dataIndex: 'conditions', width: 80, render: (c: any) => c ? c.length : 0 },
               { title: '动作数量', dataIndex: 'action_sequence', width: 80, render: (a: any) => a ? a.length : 0 },
@@ -357,5 +517,3 @@ export default function RCCDashboard() {
     </Card>
   )
 }
-
-

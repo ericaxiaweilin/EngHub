@@ -51,6 +51,7 @@ import TaskDistribution from './pages/tms/TaskDistribution'
 import AgentConsole from './pages/tms/AgentConsole'
 import QuickRequest from './pages/tms/QuickRequest'
 import SystemSettings from './pages/settings/SystemSettings'
+import ExpertSystemChat from './pages/expert/ExpertChat'
 
 // 纯色主题配置
 const theme = {
