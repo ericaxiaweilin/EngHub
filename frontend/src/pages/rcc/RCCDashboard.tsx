@@ -5,7 +5,7 @@
 
 import { useState, useEffect } from 'react'
 import { Card, Tabs, Table, Button, Space, Tag, Descriptions, Modal, Form, Input, Select, message, Tree, Breadcrumb, Alert, Row, Col, Statistic } from 'antd'
-import { SettingOutlined, RobotOutlined, TeamOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, SwapOutlined, SafetyOutlined, ThunderboltOutlined, WarningOutlined, ToolOutlined, FileTextOutlined, EnvironmentOutlined, ProfileOutlined } from '@ant-design/icons'
+import { SettingOutlined, RobotOutlined, TeamOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, SwapOutlined, SafetyOutlined, ThunderboltOutlined, ToolOutlined, FileTextOutlined, EnvironmentOutlined, ProfileOutlined } from '@ant-design/icons'
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1/rcc'
@@ -95,13 +95,6 @@ export default function RCCDashboard() {
     setLoadingData(true)
     try { setRccData((await axios.get(`${API_BASE}/data?mode=single&factory_id=${fid}`)).data) } catch (e: any) {}
     finally { setLoadingData(false) }
-  }
-
-  const handleAdjustParam = async (paramId: string, newValue: string, reason: string) => {
-    try {
-      await axios.put(`${API_BASE}/params/${paramId}`, { new_value: newValue, changed_by: 'user', reason, source: 'panel' })
-      message.success('参数调整成功'); fetchParams(); fetchRccData()
-    } catch (e: any) { message.error(e.response?.data?.detail || '参数调整失败') }
   }
 
   const handleCreateTicket = async (values: any) => {
