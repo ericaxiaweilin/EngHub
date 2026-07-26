@@ -149,12 +149,13 @@ export default function RCCDashboard() {
       setLoadingData(false)
     }
   }
-)
-      message.success('参数调整成功')
-      fetchParams()
-      fetchRccData()
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || '参数调整失败')
+
+  const handleAnalyzeImpact = async (paramId: string) => {
+    try {
+      const res = await axios.get(`${API_BASE}/params/${paramId}/impact?new_value=test`)
+      setSelectedParam({ ...selectedParam, impact_analysis: res.data?.data || null })
+    } catch (err) {
+      message.error('获取影响分析失败')
     }
   }
 
