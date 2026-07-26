@@ -4,7 +4,7 @@
  */
 
 import { useState, useEffect } from 'react'
-import { Card, Tabs, Table, Button, Space, Tag, Descriptions, Modal, Form, Input, Select, message, Tree, Breadcrumb, Alert, Row, Col, Statistic, Tabs as AntTabs, Progress, Timeline, Badge } from 'antd'
+import { Card, Tabs, Table, Button, Space, Tag, Descriptions, Modal, Form, Input, Select, message, Tree, Breadcrumb, Alert, Row, Col, Statistic } from 'antd'
 import { SettingOutlined, TeamOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, SwapOutlined, SafetyOutlined, ThunderboltOutlined, ToolOutlined, FileTextOutlined, EnvironmentOutlined, ProfileOutlined } from '@ant-design/icons'
 import axios from 'axios'
 
@@ -56,15 +56,16 @@ export default function RCCDashboard() {
         console.warn('获取工厂列表失败，使用默认列表')
       }
       
-      const treeItems: any[] = factoryList.map((f) => ({
+      const treeItems = factoryList.map((f) => ({
         title: `${f}`,
         key: f,
+        onClick: () => { fetchFactoryBaseline(f); setSelectedOrg(f); fetchRccData(); },
       }));
       setOrgTree([{
         title: '🏭 RCC 资源控制中心',
         key: 'rcc-root',
-        children: [...treeItems, { title: '📊 全局汇总', key: 'rcc-root' }]
-      }])
+        children: [...treeItems, { title: '📊 全局汇总', key: 'rcc-root' }],
+      } as any])
     } catch (err) {
       console.error('获取组织树失败:', err)
     }
