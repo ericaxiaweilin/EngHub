@@ -5,14 +5,15 @@
 
 import { useState, useEffect } from 'react'
 import { Card, Tabs, Table, Button, Space, Tag, Descriptions, Modal, Form, Input, Select, message, Tree, Breadcrumb, Alert, Row, Col, Statistic, Tabs as AntTabs, Progress, Timeline, Badge } from 'antd'
-import { SettingOutlined, RobotOutlined, TeamOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, SwapOutlined, SafetyOutlined, ThunderboltOutlined, WarningOutlined, ToolOutlined, FileTextOutlined, EnvironmentOutlined, ProfileOutlined } from '@ant-design/icons'
+import { SettingOutlined, TeamOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, SwapOutlined, SafetyOutlined, ThunderboltOutlined, ToolOutlined, FileTextOutlined, EnvironmentOutlined, ProfileOutlined } from '@ant-design/icons'
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1/rcc'
 
 interface RccDataResponse {
   success: boolean
-  factory_id: string
+  mode?: string
+  factory_id?: string
   generated_at?: string
   params_summary: { total: number; high_sensitive: number; people_params: number; equipment_params: number; wo_params: number; env_params: number; process_params: number }
   chains_summary: { total: number; enabled_count: number; disabled_count: number }
@@ -55,16 +56,15 @@ export default function RCCDashboard() {
         console.warn('获取工厂列表失败，使用默认列表')
       }
       
-      setOrgTree([
-        { title: '🏭 RCC 资源控制中心', key: 'rcc-root', children: [
-          ...factoryList.map(f => ({
-            title: `${f} (点击切换)`,
-            key: f,
-            onClick: () => { fetchFactoryBaseline(f); setSelectedOrg(f); fetchRccData(); },
-          })),
-          { title: '📊 全局汇总', key: 'rcc-root' },
-        ]}
-      ])
+      const treeItems: any[] = factoryList.map((f) => ({
+        title: `${f}`,
+        key: f,
+      }));
+      setOrgTree([{
+        title: '🏭 RCC 资源控制中心',
+        key: 'rcc-root',
+        children: [...treeItems, { title: '📊 全局汇总', key: 'rcc-root' }]
+      }])
     } catch (err) {
       console.error('获取组织树失败:', err)
     }
@@ -145,7 +145,7 @@ export default function RCCDashboard() {
     }
   }
 
-  const handleAdjustParam = async (paramId: string, newValue: string, reason: string) => {
+  const _unusedHandleAdjustParam = async (paramId: string, newValue: string, reason: string) => {
     try {
       await axios.put(`${API_BASE}/params/${paramId}`, {
         new_value: newValue,
@@ -229,8 +229,8 @@ export default function RCCDashboard() {
     }
   }
 
-  const getStatValue = (path: string[], fallback: number = 0): number => {
-    const keys = path.split('.')
+  const getStatValue = (path: string | string[], fallback: number = 0): number => {
+    const keys = (Array.isArray(path) ? path : path.split('.')).map(String)
     let val: any = rccData
     for (const k of keys) {
       if (val === null || val === undefined) return fallback
