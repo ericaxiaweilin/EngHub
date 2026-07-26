@@ -15,6 +15,7 @@ interface RccDataResponse {
   factory_id?: string
   generated_at?: string
   params_summary: { total: number; high_sensitive: number }
+  mode?: string
   chains_summary: { total: number; enabled_count: number }
   baseline: Record<string, any>
   decisions: Record<string, any>
