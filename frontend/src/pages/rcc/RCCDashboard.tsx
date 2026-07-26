@@ -23,7 +23,7 @@ interface RccDataResponse {
 
 export default function RCCDashboard() {
   const [selectedOrg, setSelectedOrg] = useState('rcc-root')
-  const [orgTree, setOrgTree] = useState([])
+  const [orgTree, setOrgTree] = useState<any[]>([])
   const [params, setParams] = useState<any[]>([])
   const [rccTasks, setRccTasks] = useState<any[]>([])
   const [chatbotTickets, setChatbotTickets] = useState<any[]>([])
@@ -56,16 +56,20 @@ export default function RCCDashboard() {
         console.warn('获取工厂列表失败，使用默认列表')
       }
       
-      const treeItems = factoryList.map((f) => ({
-        title: `${f}`,
-        key: f,
-        onClick: () => { fetchFactoryBaseline(f); setSelectedOrg(f); fetchRccData(); },
-      }));
-      setOrgTree([{
-        title: '🏭 RCC 资源控制中心',
-        key: 'rcc-root',
-        children: [...treeItems, { title: '📊 全局汇总', key: 'rcc-root' }],
-      } as any])
+      setOrgTree([
+        {
+          title: '🏭 RCC 资源控制中心',
+          key: 'rcc-root',
+          children: [
+            ...factoryList.map((f) => ({
+              title: `${f}`,
+              key: f,
+              onClick: () => { fetchFactoryBaseline(f); setSelectedOrg(f); fetchRccData(); },
+            })),
+            { title: '📊 全局汇总', key: 'rcc-root' },
+          ],
+        },
+      ])
     } catch (err) {
       console.error('获取组织树失败:', err)
     }
@@ -145,15 +149,7 @@ export default function RCCDashboard() {
       setLoadingData(false)
     }
   }
-
-  const _unusedHandleAdjustParam = async (paramId: string, newValue: string, reason: string) => {
-    try {
-      await axios.put(`${API_BASE}/params/${paramId}`, {
-        new_value: newValue,
-        changed_by: "user",
-        reason: reason,
-        source: "panel",
-      })
+)
       message.success('参数调整成功')
       fetchParams()
       fetchRccData()
