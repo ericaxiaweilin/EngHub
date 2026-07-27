@@ -87,7 +87,7 @@ class EmployeeSkillItem(BaseModel):
 class EmployeeSkillResponse(BaseModel):
     """员工技能详情"""
     id: int
-    user_id: int
+    user_id: str
     skill_id: int
     level: SkillLevelEnum
     score: Optional[float]
@@ -117,17 +117,20 @@ class SkillMatrixItem(BaseModel):
 
 class SkillMatrixResponse(BaseModel):
     """技能矩阵响应"""
-    user_id: int
+    user_id: str
     name: str
-    department: Optional[str]
-    skills: List[SkillMatrixItem]
+    department: Optional[str] = None
+    factory_id: Optional[str] = None
+    skills: List[dict] = []
+    total_skill_count: int = 0
+    max_level: Optional[str] = None
 
 
 # ==================== Training Record ====================
 
 class TrainingRecordCreate(BaseModel):
     """创建培训记录"""
-    user_id: int = Field(..., description="员工 ID")
+    user_id: str = Field(..., description="员工 ID")
     skill_id: int = Field(..., description="技能 ID")
     training_type: str = Field(..., description="培训类型")
     trainer: Optional[str] = Field(None, description="培训师")
@@ -141,7 +144,7 @@ class TrainingRecordCreate(BaseModel):
 class TrainingRecordResponse(BaseModel):
     """培训记录响应"""
     id: int
-    user_id: int
+    user_id: str
     skill_id: int
     training_type: str
     trainer: Optional[str]
@@ -160,8 +163,17 @@ class TrainingRecordResponse(BaseModel):
 
 class EmployeeSkillMatch(BaseModel):
     """员工技能匹配结果"""
-    user_id: int
+    user_id: str
     username: str
     department: Optional[str]
     matched_skills: List[dict]
     match_score: float  # 匹配度百分比
+
+
+class SkillMatchResult(BaseModel):
+    """任务技能匹配结果"""
+    task_id: str
+    task_type: Optional[str] = None
+    matched_user_ids: List[str] = []
+    score_details: List[dict] = []
+    recommended_user: Optional[str] = None
