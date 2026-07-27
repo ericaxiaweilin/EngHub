@@ -738,3 +738,276 @@ class WorkOrderService:
             "created_at": wo.created_at.isoformat() if wo.created_at else None,
             "updated_at": wo.updated_at.isoformat() if wo.updated_at else None,
         }
+
+    # ==================== 增强的拆单功能 ====================
+    
+    async def split_preview(
+        self,
+        work_order_id: str,
+        method: str = "simple",
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """拆分预览：模拟并返回拟生成的工单列表，支持多种模式"""
+        from sqlalchemy import json
+        
+        original_wo = await self.get_work_order_by_id(work_order_id)
+        if not original_wo:
+            raise ValueError("Work order not found")
+        
+        if method == "simple":
+            if not parameters or "split_qty" not in parameters:
+                raise ValueError("Specify 'split_qty' for simple split mode")
+            split_qty = parameters["split_qty"]
+            if split_qty >= original_wo.planned_qty:
+                raise ValueError("Split quantity must be less than planned quantity")
+            
+            child_seq = await self._count_children(original_wo.id) + 1
+            child_code = f"{original_wo.work_order_code}-SPL{child_seq:02d}"
+            
+            return {
+                "method": "simple",
+                "master_wo": {"code": original_wo.work_order_code, "new_planned_qty": original_wo.planned_qty - split_qty},
+                "children": [{"code": child_code, "planned_qty": split_qty, "status": "draft"}],
+                "total_children": 1,
+            }
+        
+        elif method == "by_routing":
+            routing_id = original_wo.routing_id
+            if not routing_id:
+                raise ValueError("No routing assigned to this work order")
+            
+            steps_stmt = select(RoutingTemplateStep).where(RoutingTemplateStep.routing_template_id == routing_id)
+            steps_result = await self.db.execute(steps_stmt)
+            steps = steps_result.scalars().all()
+            
+            if not steps:
+                raise ValueError("No routing steps defined")
+            
+            children = []
+            for i, step in enumerate(steps):
+                child_code = f"{original_wo.work_order_code}-{step.step_code:03d}"
+                children.append({
+                    "code": child_code, "planned_qty": original_wo.planned_qty,
+                    "station_id": step.station_id, "process_code": step.process_code,
+                    "operation_seq": step.sequence, "status": "draft"
+                })
+            
+            return {"method": "by_routing", "master_wo": {"code": original_wo.work_order_code, "new_planned_qty": original_wo.planned_qty},
+                   "children": children, "total_children": len(children)}
+        
+        elif method == "by_batch":
+            if not parameters or "batch_size" not in parameters:
+                raise ValueError("Specify 'batch_size' for batch split mode")
+            batch_size = parameters["batch_size"]
+            if batch_size <= 0:
+                raise ValueError("Batch size must be positive")
+            
+            children = []
+            remaining = original_wo.planned_qty
+            batch_num = 1
+            
+            while remaining > 0:
+                qty = min(batch_size, remaining)
+                child_code = f"{original_wo.work_order_code}-BATCH{batch_num:03d}"
+                children.append({"code": child_code, "planned_qty": qty, "batch_number": batch_num, "status": "draft"})
+                remaining -= qty
+                batch_num += 1
+            
+            return {"method": "by_batch", "master_wo": {"code": original_wo.work_order_code, "new_planned_qty": 0},
+                   "children": children, "total_children": len(children), "batch_count": len(children)}
+        
+        elif method == "by_ratio":
+            if not parameters or "ratios" not in parameters:
+                raise ValueError("Specify 'ratios' array for ratio split mode")
+            ratios = parameters["ratios"]
+            total_ratio = sum(ratios)
+            if total_ratio <= 0:
+                raise ValueError("Total ratio must be greater than zero")
+            
+            children = []
+            for i, ratio in enumerate(ratios):
+                qty = round(original_wo.planned_qty * ratio / total_ratio)
+                if qty == 0 and original_wo.planned_qty > 0:
+                    qty = 1
+                child_code = f"{original_wo.work_order_code}-R{i+1:02d}"
+                children.append({"code": child_code, "planned_qty": qty, "ratio": ratio, "status": "draft"})
+            
+            total_split = sum(c["planned_qty"] for c in children)
+            if total_split < original_wo.planned_qty and children:
+                children[-1]["planned_qty"] += original_wo.planned_qty - total_split
+            
+            return {"method": "by_ratio", "master_wo": {"code": original_wo.work_order_code, "new_planned_qty": 0},
+                   "children": children, "total_children": len(children), "total_ratio": total_ratio}
+        
+        else:
+            raise ValueError(f"Unknown split method: {method}")
+    
+    async def _count_children(self, parent_id: str) -> int:
+        result = await self.db.execute(select(func.count(WorkOrder.id)).where(WorkOrder.parent_work_order_id == parent_id))
+        return result.scalar() or 0
+    
+    async def split_advanced(
+        self, work_order_id: str, method: str = "simple", parameters: Dict = None, operator: str = "system", remark: str = ""
+    ) -> Dict[str, Any]:
+        """高级拆分执行函数 - 支持多种模式并持久化到数据库"""
+        parameters = parameters or {}
+        original_wo = await self.get_work_order_by_id(work_order_id)
+        if not original_wo:
+            raise ValueError("Work order not found")
+        if original_wo.status not in [WOStatus.DRAFT, WOStatus.PENDING, WOStatus.RELEASED]:
+            raise ValueError("只能拆分草稿/待下发/已下达的工单")
+        
+        children_created = []
+        
+        if method == "simple":
+            split_qty = parameters.get("split_qty")
+            if not split_qty or split_qty >= original_wo.planned_qty:
+                raise ValueError("Invalid split quantity")
+            child_seq = await self._count_children(original_wo.id) + 1
+            child_code = f"{original_wo.work_order_code}-SPL{child_seq:02d}"
+            new_wo = WorkOrder(work_order_code=child_code, factory_id=original_wo.factory_id, product_id=original_wo.product_id,
+                               planned_qty=split_qty, unit=original_wo.unit, planned_due=original_wo.planned_due, priority=original_wo.priority,
+                               status=WOStatus.DRAFT, sales_order_id=original_wo.sales_order_id, routing_id=original_wo.routing_id,
+                               assigned_station_id=original_wo.assigned_station_id, bom_version=original_wo.bom_version, wo_type="operation",
+                               parent_work_order_id=original_wo.id, remark=f"Split from {original_wo.work_order_code}. {remark or ''}", created_by=operator)
+            self.db.add(new_wo)
+            children_created.append(new_wo)
+            original_wo.planned_qty -= split_qty
+            original_wo.wo_type = "master"
+            original_wo.remark = f"{original_wo.remark or ''}\n[Split]: Created {child_code} with qty {split_qty}"
+            original_wo.updated_at = datetime.utcnow()
+        
+        elif method == "by_routing":
+            routing_id = original_wo.routing_id
+            if not routing_id:
+                raise ValueError("No routing assigned to this work order")
+            steps_stmt = select(RoutingTemplateStep).where(RoutingTemplateStep.routing_template_id == routing_id).order_by(RoutingTemplateStep.sequence)
+            steps_result = await self.db.execute(steps_stmt)
+            steps = steps_result.scalars().all()
+            for i, step in enumerate(steps):
+                child_code = f"{original_wo.work_order_code}-{step.step_code:03d}"
+                existing = await self.db.execute(select(WorkOrder).where(WorkOrder.parent_work_order_id == original_wo.id, WorkOrder.work_order_code == child_code))
+                if existing.scalar(): continue
+                new_wo = WorkOrder(work_order_code=child_code, factory_id=original_wo.factory_id, product_id=original_wo.product_id,
+                                   planned_qty=original_wo.planned_qty, unit=original_wo.unit, planned_due=original_wo.planned_due, priority=original_wo.priority,
+                                   status=WOStatus.DRAFT, sales_order_id=original_wo.sales_order_id, routing_id=routing_id, assigned_station_id=step.station_id,
+                                   bom_version=original_wo.bom_version, wo_type="operation", parent_work_order_id=original_wo.id,
+                                   process_code=step.process_code, operation_seq=i + 1, remark=f"Routing split for step {step.step_code}. {remark or ''}", created_by=operator)
+                self.db.add(new_wo)
+                children_created.append(new_wo)
+            original_wo.wo_type = "master"
+            original_wo.updated_at = datetime.utcnow()
+        
+        elif method == "by_batch":
+            batch_size = parameters.get("batch_size")
+            if not batch_size or batch_size <= 0:
+                raise ValueError("Invalid batch size")
+            remaining = original_wo.planned_qty
+            batch_num = 1
+            while remaining > 0:
+                qty = min(batch_size, remaining)
+                child_code = f"{original_wo.work_order_code}-BATCH{batch_num:03d}"
+                new_wo = WorkOrder(work_order_code=child_code, factory_id=original_wo.factory_id, product_id=original_wo.product_id,
+                                   planned_qty=qty, unit=original_wo.unit, planned_due=original_wo.planned_due, priority=original_wo.priority,
+                                   status=WOStatus.DRAFT, sales_order_id=original_wo.sales_order_id, routing_id=original_wo.routing_id,
+                                   assigned_station_id=original_wo.assigned_station_id, bom_version=original_wo.bom_version, wo_type="operation",
+                                   parent_work_order_id=original_wo.id, batch_number=batch_num, remark=f"Batch split #{batch_num}. {remark or ''}", created_by=operator)
+                self.db.add(new_wo)
+                children_created.append(new_wo)
+                remaining -= qty
+                batch_num += 1
+            original_wo.planned_qty = 0
+            original_wo.wo_type = "master"
+            original_wo.updated_at = datetime.utcnow()
+        
+        elif method == "by_ratio":
+            ratios = parameters.get("ratios")
+            if not ratios:
+                raise ValueError("Specify ratios for ratio split mode")
+            total_ratio = sum(ratios)
+            children_data = []
+            for i, ratio in enumerate(ratios):
+                qty = round(original_wo.planned_qty * ratio / total_ratio)
+                children_data.append({"ratio": ratio, "qty": qty, "code_prefix": f"R{i+1:02d}"})
+            total_split = sum(d["qty"] for d in children_data)
+            if total_split < original_wo.planned_qty and children_data:
+                children_data[-1]["qty"] += original_wo.planned_qty - total_split
+            for i, data in enumerate(children_data):
+                child_code = f"{original_wo.work_order_code}-{data['code_prefix']}"
+                new_wo = WorkOrder(work_order_code=child_code, factory_id=original_wo.factory_id, product_id=original_wo.product_id,
+                                   planned_qty=data["qty"], unit=original_wo.unit, planned_due=original_wo.planned_due, priority=original_wo.priority,
+                                   status=WOStatus.DRAFT, sales_order_id=original_wo.sales_order_id, routing_id=original_wo.routing_id,
+                                   assigned_station_id=original_wo.assigned_station_id, bom_version=original_wo.bom_version, wo_type="operation",
+                                   parent_work_order_id=original_wo.id, ratio=data["ratio"], remark=f"Ratio split {i+1}/{len(ratios)}. {remark or ''}", created_by=operator)
+                self.db.add(new_wo)
+                children_created.append(new_wo)
+            original_wo.planned_qty = 0
+            original_wo.wo_type = "master"
+            original_wo.updated_at = datetime.utcnow()
+        
+        else:
+            raise ValueError(f"Unknown split method: {method}")
+        
+        await self.db.commit()
+        await self.db.refresh(original_wo)
+        for child in children_created:
+            await self.db.refresh(child)
+        self._log_status(original_wo, "split", original_wo.status, original_wo.status, operator, comment=f"Advanced split ({method}): {len(children_created)} children created")
+        await self.db.commit()
+        return {"master_work_order": self.to_dict(original_wo), "work_orders_created": [self.to_dict(c) for c in children_created],
+                "total_created": len(children_created), "method": method}
+    
+    async def reverse_split(self, work_order_id: str, latest_only: bool = True, operator: str = "system") -> Dict[str, Any]:
+        """反拆分：将最近拆分的子工单合并回主工单"""
+        master_wo = await self.get_work_order_by_id(work_order_id)
+        if not master_wo or master_wo.wo_type != "master":
+            raise ValueError("Not a valid master work order")
+        children = await self._get_children(master_wo.id)
+        if not children:
+            return {"message": "No child work orders to reverse"}
+        if latest_only:
+            children = [children[-1]]
+        total_child_qty = sum(c.planned_qty for c in children)
+        master_wo.planned_qty += total_child_qty
+        master_wo.updated_at = datetime.utcnow()
+        for child in children:
+            child.status = WOStatus.CANCELLED
+            child.remark = f"[Reversed]: Merged back to master {master_wo.work_order_code} on {datetime.utcnow().isoformat()}"
+        self._log_status(master_wo, "reverse_split", master_wo.status, master_wo.status, operator, comment=f"Reversed split: {len(children)} child(ren) merged back")
+        await self.db.commit()
+        await self.db.refresh(master_wo)
+        return {"master_work_order": self.to_dict(master_wo), "reversed_children": [self.to_dict(c) for c in children], "quantity_merged": total_child_qty}
+    
+    async def get_split_history(self, work_order_id: str) -> List[Dict]:
+        from sqlalchemy import text
+        result = await self.db.execute(text("""SELECT * FROM order_decomposition_logs WHERE work_order_id = :id ORDER BY created_at DESC""", {"id": work_order_id}))
+        logs = result.mappings().all()
+        return [dict(log) for log in logs]
+    
+    async def get_work_order_tree(self, work_order_id: str) -> Dict[str, Any]:
+        """获取工单树形结构（含所有层级）"""
+        master = await self.get_work_order_by_id(work_order_id)
+        if not master:
+            raise ValueError("Work order not found")
+        children = await self._get_children(master.id)
+        tree = {"master": self.to_dict(master), "children": []}
+        if children:
+            sorted_children = sorted(children, key=lambda x: (x.operation_seq or x.created_at, x.id))
+            for child in sorted_children:
+                child_data = self.to_dict(child)
+                grandchildren = await self._get_children(child.id)
+                if grandchildren:
+                    child_data["subtree"] = await self._build_subtree(grandchildren)
+                tree["children"].append(child_data)
+        return tree
+    
+    async def _build_subtree(self, children: List[WorkOrder]) -> List[Dict]:
+        sorted_children = sorted(children, key=lambda x: (x.operation_seq or x.created_at, x.id))
+        result = []
+        for child in sorted_children:
+            child_data = self.to_dict(child)
+            grandchildren = await self._get_children(child.id)
+            if grandchildren:
+                child_data["subtree"] = await self._build_subtree(grandchildren)
+            result.append(child_data)
+        return result

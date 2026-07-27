@@ -9,6 +9,7 @@ import WorkOrderDetail from './pages/workorder/WorkOrderDetail'
 import ProcessQueue from './pages/workorder/ProcessQueue'
 import MyTasks from './pages/workorder/MyTasks'
 import RoutingTemplates from './pages/workorder/RoutingTemplates'
+import WorkOrderSplitPage from './pages/workorder/WorkOrderSplitPage'
 import AlertIntelligence from './pages/alerts/AlertIntelligence'
 import ProductionReport from './pages/reporting/ProductionReport'
 import InspectionList from './pages/qms/InspectionList'
@@ -133,6 +134,8 @@ const App: React.FC = () => {
             <Route path="production-data" element={<ProductionData />} />
             <Route path="work-orders" element={<PermissionGate path="/work-orders"><WorkOrderList /></PermissionGate>} />
             <Route path="work-orders/:id" element={<PermissionGate path="/work-orders"><WorkOrderDetail /></PermissionGate>} />
+
+            <Route path="work-orders/:id/split" element={<PermissionGate path="/work-orders/split"><WorkOrderSplitPage /></PermissionGate>} />
                         <Route path="process-queue" element={<PermissionGate path="/process-queue"><ProcessQueue /></PermissionGate>} />
                         <Route path="my-tasks" element={<MyTasks />} />
                         <Route path="routing-templates" element={<PermissionGate path="/routing-templates"><RoutingTemplates /></PermissionGate>} />

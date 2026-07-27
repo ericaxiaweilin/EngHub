@@ -4,7 +4,8 @@ MES API Routes
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+import json
 from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -681,6 +682,104 @@ async def split_work_order(
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/work-orders/{work_order_id}/split-preview")
+async def split_work_order_preview(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    method: str = Query(default="simple", description="Split method: simple|by_routing|by_batch|by_ratio"),
+    parameters: Optional[str] = None,
+):
+    """拆分预览：模拟拆分操作并返回拟生成的工单列表，不实际修改数据"""
+    service = WorkOrderService(db)
+    try:
+        params = json.loads(parameters) if parameters else {}
+        result = await service.split_preview(work_order_id, method, params)
+        return {"preview": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/work-orders/{work_order_id}/split-advanced")
+async def split_work_order_advanced(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    req: Dict[str, Any] = None,
+):
+    """高级拆分执行 - 支持多种拆分模式（simple/by_routing/by_batch/by_ratio）"""
+    from sqlalchemy import text
+    
+    method = req.get("method", "simple")
+    parameters = req.get("parameters", {})
+    remark = req.get("remark", "")
+    
+    service = WorkOrderService(db)
+    try:
+        result = await service.split_advanced(
+            work_order_id=work_order_id,
+            method=method,
+            parameters=parameters,
+            operator=current_user.username,
+            remark=remark,
+        )
+        return {"success": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/work-orders/{work_order_id}/reverse-split")
+async def reverse_split_work_order(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    latest_only: bool = Query(default=True, description="Only reverse the most recent split"),
+):
+    """反拆分：将子工单合并回主工单"""
+    service = WorkOrderService(db)
+    try:
+        result = await service.reverse_split(work_order_id, latest_only=latest_only, operator=current_user.username)
+        return {"success": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/work-orders/{work_order_id}/split-history")
+async def get_work_order_split_history(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取工单拆分历史"""
+    service = WorkOrderService(db)
+    try:
+        history = await service.get_split_history(work_order_id)
+        return {"history": history, "total": len(history)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/work-orders/{work_order_id}/tree")
+async def get_work_order_tree(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取工单树形结构（包含所有层级的子工单）"""
+    service = WorkOrderService(db)
+    try:
+        tree = await service.get_work_order_tree(work_order_id)
+        return {"tree": tree}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/work-orders/{work_order_id}/status-logs")
