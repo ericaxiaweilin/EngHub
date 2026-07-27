@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     Text,
     JSON,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship
@@ -698,3 +699,337 @@ __all__ = [
     "TMSAgentAction",
     "TMSWebhookSubscription",
 ]
+
+# ============================================================
+# IE Module Models - Industrial Engineering
+# ============================================================
+
+class StandardOperationTime(Base):
+    """标准工时管理 - 精益生产核心
+    
+    定义每个工序的标准作业时间（Standard Operation Time, SOT），
+    支持版本控制、有效期管理和宽放率计算
+    """
+    
+    __tablename__ = "standard_operation_times"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    routing_step = Column(String(20), nullable=False)
+    operation_name = Column(String(100), nullable=False)
+    station_id = Column(String(50), nullable=True, index=True)
+    work_center = Column(String(50), nullable=True)
+    standard_time_min = Column(Float, nullable=False)
+    unit_time_type = Column(String(20), default="per_unit")
+    setup_time_min = Column(Float, default=0.0)
+    batch_size = Column(Integer, default=1)
+    rating_factor = Column(Float, default=1.0)
+    allowance_rate = Column(Float, default=0.15)
+    effective_standard_time = Column(Float, nullable=False)
+    version = Column(String(10), default="v1")
+    is_active = Column(Boolean, default=True)
+    validity_start = Column(DateTime, nullable=False)
+    validity_end = Column(DateTime, nullable=True)
+    
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_factory_product_routing', 'factory_id', 'product_id', 'routing_step'),
+        Index('idx_validity_status', 'validity_start', 'is_active'),
+    )
+
+
+class TimeStudyRecord(Base):
+    """时间研究记录 - 实际观测数据采集
+    
+    用于记录操作员在工位上的实际作业观测数据，
+    通过多个周期的观测计算平均时间和正常时间
+    """
+    
+    __tablename__ = "time_study_records"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    station_id = Column(String(50), nullable=False, index=True)
+    operation_name = Column(String(100), nullable=False)
+    operator_id = Column(String(50), nullable=False)
+    observer_id = Column(String(50), nullable=False)
+    observation_date = Column(DateTime, nullable=False)
+    observed_cycles = Column(JSON, default=list)
+    cycle_count = Column(Integer, nullable=True)
+    average_time = Column(Float, nullable=True)
+    rating_factor = Column(Float, default=1.0)
+    normal_time = Column(Float, nullable=True)
+    allowed_time = Column(Float, nullable=True)
+    allowance_rate = Column(Float, default=0.15)
+    method = Column(String(50), default="direct")
+    status = Column(String(20), default="pending")
+    created_by = Column(String(50))
+    approved_by = Column(String(50), nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_factory_station_op', 'factory_id', 'station_id', 'operation_name'),
+    )
+
+
+class LineBalanceAnalysis(Base):
+    """产线平衡分析 - 识别瓶颈和优化机会
+    
+    对生产线进行平衡分析，计算节拍时间、平衡率、
+    识别瓶颈工作站并提供改善建议
+    """
+    
+    __tablename__ = "line_balance_analyses"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    line_id = Column(String(50), nullable=False)
+    analysis_date = Column(DateTime, nullable=False)
+    takt_time_min = Column(Float, nullable=False)
+    cycle_time_max = Column(Float, nullable=True)
+    cycle_time_avg = Column(Float, nullable=True)
+    balance_rate = Column(Float, nullable=True)
+    idle_time_total = Column(Float, nullable=True)
+    workstation_count = Column(Integer, nullable=True)
+    is_balanced = Column(Boolean, default=False)
+    workstation_details = Column(JSON, default=list)
+    bottleneck_station = Column(String(50), nullable=True)
+    bottleneck_time = Column(Float, nullable=True)
+    recommendations = Column(JSON, default=list)
+    
+    created_by = Column(String(50))
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_factory_line_product', 'factory_id', 'line_id', 'product_id'),
+    )
+
+
+class ProcessAnalysis(Base):
+    """工序价值分析 - VA/NVA分解
+    
+    对单个工序进行价值流分析，区分增值时间（VA）和非增值时间（NVA），
+    计算效率评分和改善潜力
+    """
+    
+    __tablename__ = "process_analyses"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    operation_code = Column(String(20), nullable=False)
+    analysis_date = Column(DateTime, nullable=False)
+    total_process_time_min = Column(Float, nullable=False)
+    va_time_min = Column(Float, nullable=True)
+    nva_time_min = Column(Float, nullable=True)
+    wait_time_min = Column(Float, default=0.0)
+    move_time_min = Column(Float, default=0.0)
+    inspect_time_min = Column(Float, default=0.0)
+    va_ratio = Column(Float, nullable=True)
+    lead_time = Column(Float, nullable=True)
+    efficiency_score = Column(Float, nullable=True)
+    
+    created_by = Column(String(50))
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_factory_product_op', 'factory_id', 'product_id', 'operation_code'),
+    )
+
+
+class ActionStudy(Base):
+    """动作研究 - 基于MTM/MODAPTS的详细动作分解
+    
+    用于详细记录和分析操作中的每一个动作，
+    支持MTM（Methods-Time Measurement）和MODAPTS方法
+    """
+    
+    __tablename__ = "action_studies"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    operation_name = Column(String(100), nullable=False)
+    station_id = Column(String(50), nullable=True, index=True)
+    operator_id = Column(String(50), nullable=False)
+    
+    study_date = Column(DateTime, nullable=False)
+    method_type = Column(String(20), default="mtm")
+    recorded_by = Column(String(50), nullable=False)
+    
+    motions = Column(JSON, default=list)
+    total_time_cycles = Column(Float, nullable=False)
+    analysis_result = JSON
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_action_factory_product_op', 'factory_id', 'product_id', 'operation_name'),
+    )
+
+
+class MethodStudy(Base):
+    """方法研究 - 多方案对比与最优选择
+    
+    记录不同操作方法，支持版本控制，
+    可对比并选择最优的标准作业方法
+    """
+    
+    __tablename__ = "method_studies"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    original_operation = Column(String(100), nullable=False)
+    
+    version = Column(String(10), default="v1")
+    is_basement_method = Column(Boolean, default=False)
+    is_optimal_method = Column(Boolean, default=False)
+    
+    description = Column(Text)
+    action_sequence = Column(JSON, default=list)
+    required_resources = Column(JSON, default=list)
+    
+    setup_time_min = Column(Float, default=0.0)
+    cycle_time_min = Column(Float, nullable=False)
+    total_standard_time_min = Column(Float, nullable=False)
+    
+    validity_start = Column(DateTime, nullable=False)
+    validity_end = Column(DateTime, nullable=True)
+    
+    created_by = Column(String(50))
+    approved_by = Column(String(50), nullable=True)
+    status = Column(String(20), default="draft")
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        UniqueConstraint('factory_id', 'product_id', 'original_operation', 'version', 
+                         name='unique_method_factory_product_op_version'),
+        Index('idx_method_validity', 'validity_start', 'is_optimal_method'),
+    )
+
+
+class WorkCellLayout(Base):
+    """工站布局设计 - 精益布局优化
+    
+    记录和规划工站的物理布局和物料流动路径，
+    支持5S和精益布局优化分析
+    """
+    
+    __tablename__ = "work_cell_layouts"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_cell_id = Column(String(50), nullable=False)
+    product_family_id = Column(String(50), nullable=False)
+    
+    layout_diagram_url = Column(String(200), nullable=True)
+    material_flow_path = Column(JSON, default=list)
+    operator_movement_path = Column(JSON, default=list)
+    
+    takt_time_alignment = Column(String(20), default="aligned")
+    storage_location_type = Column(String(20), default="in_process")
+    
+    last_updated = Column(DateTime, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_cell_product', 'work_cell_id', 'product_family_id'),
+        Index('idx_factory_cell', 'factory_id', 'work_cell_id'),
+    )
+
+
+class KanbanSystem(Base):
+    """Kanban看板系统 - 拉动式生产管理
+    
+    管理看板卡片状态，支持连续看板、移动看板等类型，
+    实现拉动式生产控制
+    """
+    
+    __tablename__ = "kanban_systems"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    kanban_id = Column(String(50), unique=True, nullable=False)
+    kanban_type = Column(String(20), default="continuous")
+    
+    upstream_station = Column(String(50))
+    downstream_station = Column(String(50))
+    product_id = Column(String(50), nullable=False)
+    part_number = Column(String(50))
+    
+    max_card_count = Column(Integer, default=5)
+    current_card_count = Column(Integer, default=0)
+    safety_stock_level = Column(Integer, default=2)
+    
+    card_status = Column(String(20), default="available")
+    last_used_at = Column(DateTime, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_upstream_downstream', 'upstream_station', 'downstream_station'),
+        Index('idx_product_kanban', 'product_id', 'kanban_type'),
+    )
+
+
+class FiveSAudit(Base):
+    """5S审计 - 现场整理整顿评估
+    
+    定期执行5S检查（整理、整顿、清扫、清洁、素养），
+    跟踪现场管理改善情况
+    """
+    
+    __tablename__ = "five_s_audits"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_center_id = Column(String(50), nullable=False)
+    
+    audit_date = Column(DateTime, nullable=False)
+    auditor_id = Column(String(50), nullable=False)
+    
+    seiri_score = Column(Integer, default=0)
+    seiton_score = Column(Integer, default=0)
+    seiso_score = Column(Integer, default=0)
+    seiketsu_score = Column(Integer, default=0)
+    shitsuke_score = Column(Integer, default=0)
+    
+    total_score = Column(Integer, default=0)
+    score_percentage = Column(Float, default=0.0)
+    
+    improvement_items = Column(JSON, default=list)
+    next_audit_date = Column(DateTime, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_work_center_audit', 'work_center_id', 'audit_date'),
+        Index('idx_factory_date', 'factory_id', 'audit_date'),
+    )
+
+
+# Update __all__ to include new models
+__all__.extend([
+    "StandardOperationTime", "TimeStudyRecord", "LineBalanceAnalysis", "ProcessAnalysis",
+    "ActionStudy", "MethodStudy", "WorkCellLayout", "KanbanSystem", "FiveSAudit",
+])
