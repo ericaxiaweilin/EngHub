@@ -16,7 +16,7 @@ export const API_ENDPOINTS = {
   STATIONS: `${API_BASE_URL}/api/v1/stations`,
   EQUIPMENT: `${API_BASE_URL}/api/v1/equipment`,
   PRODUCTS: `${API_BASE_URL}/api/v1/products`,
-  
+
   // PP
   PLANS: `${API_BASE_URL}/api/v1/plans`,
   PLAN: (id: string) => `${API_BASE_URL}/api/v1/plans/${id}`,
@@ -27,11 +27,11 @@ export const API_ENDPOINTS = {
   MRP_CALCULATE: `${API_BASE_URL}/api/v1/mrp/calculate`,
   CAPACITY_ANALYSIS: `${API_BASE_URL}/api/v1/capacity/analysis`,
   INVENTORY_ALERTS: `${API_BASE_URL}/api/v1/inventory/alerts`,
-  
+
   // QMS
   INSPECTIONS: `${API_BASE_URL}/api/v1/inspections`,
   DEFECTS: `${API_BASE_URL}/api/v1/defects`,
-  
+
   // WMS
   WAREHOUSES: `${API_BASE_URL}/api/v1/warehouses`,
   INVENTORY: `${API_BASE_URL}/api/v1/inventory`,
@@ -64,6 +64,28 @@ export const API_ENDPOINTS = {
   // AI Assistant
   CHAT: `${API_BASE_URL}/api/v1/chat`,
   CHAT_HEALTH: `${API_BASE_URL}/api/v1/chat/health`,
+
+  // IE - Standard Time Management
+  IE_STANDARD_TIMES: `${API_BASE_URL}/api/v1/ie/standard-times`,
+  IE_STANDARD_TIME: (id: string) => `${API_BASE_URL}/api/v1/ie/standard-times/${id}`,
+  IE_STANDARD_TIMES_BY_PRODUCT: (product_id: string, factory_id: string) =>
+    `${API_BASE_URL}/api/v1/ie/products/${product_id}/standard-times?factory_id=${factory_id}`,
+
+  // IE - Time Study Management
+  IE_TIME_STUDIES: `${API_BASE_URL}/api/v1/ie/time-studies`,
+  IE_LINE_BALANCE_ANALYSES: `${API_BASE_URL}/api/v1/ie/line-balance-analyses`,
+  IE_PROCESS_ANALYSES: `${API_BASE_URL}/api/v1/ie/process-analyses`,
+  IE_LEAN_METRICS: `${API_BASE_URL}/api/v1/ie/lean-metrics`,
+
+  // IE Advanced
+  IE_ADVANCED_ACTION_STUDIES: `${API_BASE_URL}/api/v1/ie-advanced/action-studies`,
+  IE_ADVANCED_METHOD_STUDIES: `${API_BASE_URL}/api/v1/ie-advanced/method-studies`,
+  IE_ADVANCED_WORK_CELLS: `${API_BASE_URL}/api/v1/ie-advanced/work-cells`,
+  IE_ADVANCED_KANBANS: `${API_BASE_URL}/api/v1/ie-advanced/kanbans`,
+  IE_ADVANCED_5S_AUDITS: `${API_BASE_URL}/api/v1/ie-advanced/5s-audits`,
+  IE_ADVANCED_5S_AUDITS_BY_CENTER: (work_center_id: string) =>
+    `${API_BASE_URL}/api/v1/ie-advanced/5s-audits/work-centers/${work_center_id}`,
+
 };
 
 export default API_BASE_URL;

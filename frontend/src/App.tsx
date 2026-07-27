@@ -1,5 +1,5 @@
-import React from 'react'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import React, { Suspense } from 'react'
+import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom'
 import { ConfigProvider } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import Layout from './components/Layout'
@@ -22,6 +22,17 @@ import { isAuthenticated, getStoredUser } from './services/auth'
 import ApprovalCenter from './pages/tms/ApprovalCenter'
 import TaskDistribution from './pages/tms/TaskDistribution'
 import AgentConsole from './pages/tms/AgentConsole'
+// IE Module
+import StandardTimes from './pages/ie/StandardTimes'
+import TimeStudies from './pages/ie/TimeStudies'
+import LineBalanceAnalyses from './pages/ie/LineBalanceAnalyses'
+import ProcessAnalyses from './pages/ie/ProcessAnalyses'
+import LeanMetrics from './pages/ie/LeanMetrics'
+import ActionStudies from './pages/ie-advanced/ActionStudies'
+import MethodStudies from './pages/ie-advanced/MethodStudies'
+import WorkCells from './pages/ie-advanced/WorkCells'
+import Kanbans from './pages/ie-advanced/Kanbans'
+import FiveSAudits from './pages/ie-advanced/FiveSAudits'
 
 // 纯色主题配置
 const theme = {
@@ -109,10 +120,57 @@ const App: React.FC = () => {
             <Route path="tms/approval" element={<PermissionGate path="/tms/approval"><ApprovalCenter /></PermissionGate>} />
             <Route path="tms/distribution" element={<PermissionGate path="/tms/distribution"><TaskDistribution /></PermissionGate>} />
             <Route path="tms/agent" element={<PermissionGate path="/tms/agent"><AgentConsole /></PermissionGate>} />
+            {/* IE Module - 精益生产工程 */}
+            <Route
+              path="ie"
+              element={
+                <PermissionGate path="/ie-standard-times">
+                  <IEPage />
+                </PermissionGate>
+              }
+            >
+              <Route path="standard-times" element={<StandardTimes />} />
+              <Route path="time-studies" element={<TimeStudies />} />
+              <Route path="line-balance" element={<LineBalanceAnalyses />} />
+              <Route path="process-analyses" element={<ProcessAnalyses />} />
+              <Route path="lean-metrics" element={<LeanMetrics />} />
+            </Route>
+            <Route
+              path="ie-advanced"
+              element={
+                <PermissionGate path="/ie-standard-times">
+                  <IEAdvancedPage />
+                </PermissionGate>
+              }
+            >
+              <Route path="action-studies" element={<ActionStudies />} />
+              <Route path="method-studies" element={<MethodStudies />} />
+              <Route path="work-cells" element={<WorkCells />} />
+              <Route path="kanbans" element={<Kanbans />} />
+              <Route path="5s-audits" element={<FiveSAudits />} />
+            </Route>
           </Route>
         </Routes>
       </BrowserRouter>
     </ConfigProvider>
+  )
+}
+
+// IE Page Wrapper Component
+const IEPage: React.FC = () => {
+  return (
+    <Suspense fallback={null}>
+      <Outlet />
+    </Suspense>
+  )
+}
+
+// IE Advanced Page Wrapper Component
+const IEAdvancedPage: React.FC = () => {
+  return (
+    <Suspense fallback={null}>
+      <Outlet />
+    </Suspense>
   )
 }
 

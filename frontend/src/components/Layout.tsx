@@ -46,6 +46,16 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/ai': <RobotOutlined />,
   '/users': <UserOutlined />,
   '/roles': <SettingOutlined />,
+  '/ie-standard-times': <SwapOutlined />, // 标准工时
+  '/ie-time-studies': <SwapOutlined />, // 时间研究
+  '/ie-line-balance': <SwapOutlined />, // 线平衡分析
+  '/ie-process-analyses': <SwapOutlined />, // 工艺分析
+  '/ie-lean-metrics': <SwapOutlined />, // 精益指标
+  '/ie-action-studies': <SwapOutlined />, // 动作研究
+  '/ie-method-studies': <SwapOutlined />, // 方法研究
+  '/ie-work-cells': <SwapOutlined />, // 工作单元
+  '/ie-kanbans': <SwapOutlined />, // Kanban
+  '/ie-5s-audits': <SwapOutlined />, // 5S审核
 }
 
 // 将后端 menu_items 转换为 Ant Design Menu 格式
