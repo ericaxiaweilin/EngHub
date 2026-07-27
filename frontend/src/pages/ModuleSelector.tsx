@@ -10,6 +10,7 @@ import {
   ThunderboltOutlined,
   TeamOutlined,
   DashboardOutlined,
+  LineChartOutlined,
 } from '@ant-design/icons'
 
 const { Title, Text, Paragraph } = Typography
@@ -88,6 +89,14 @@ const MODULES: ModuleDef[] = [
     icon: <DashboardOutlined style={{ fontSize: 36 }} />,
     color: '#2f54eb',
     path: '/andon',
+  },
+  {
+    key: 'ie',
+    title: 'IE',
+    desc: '标准工时 · 时间研究 · 线平衡 · 精益指标 · 5S审核',
+    icon: <LineChartOutlined style={{ fontSize: 36 }} />,
+    color: '#a0d911',
+    path: '/ie/standard-times',
   },
 ]
 

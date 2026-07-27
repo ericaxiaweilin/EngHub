@@ -53,6 +53,17 @@ import AgentConsole from './pages/tms/AgentConsole'
 import QuickRequest from './pages/tms/QuickRequest'
 import SystemSettings from './pages/settings/SystemSettings'
 import ExpertSystemChat from './pages/expert/ExpertChat'
+// IE 精益生产模块
+import StandardTimes from './pages/ie/StandardTimes'
+import TimeStudies from './pages/ie/TimeStudies'
+import LineBalanceAnalyses from './pages/ie/LineBalanceAnalyses'
+import ProcessAnalyses from './pages/ie/ProcessAnalyses'
+import LeanMetrics from './pages/ie/LeanMetrics'
+import ActionStudies from './pages/ie-advanced/ActionStudies'
+import MethodStudies from './pages/ie-advanced/MethodStudies'
+import WorkCells from './pages/ie-advanced/WorkCells'
+import Kanbans from './pages/ie-advanced/Kanbans'
+import FiveSAudits from './pages/ie-advanced/FiveSAudits'
 
 // 纯色主题配置
 const theme = {
@@ -184,6 +195,17 @@ const App: React.FC = () => {
             <Route path="rcc" element={<PermissionGate path="/rcc"><RCCDashboard /></PermissionGate>} />
             <Route path="expert" element={<PermissionGate path="/ai"><ExpertSystemChat /></PermissionGate>} />
             <Route path="war-room" element={<PermissionGate path="/simulation"><WarRoom /></PermissionGate>} />
+            {/* IE 精益生产 */}
+            <Route path="ie/standard-times" element={<PermissionGate path="/ie/standard-times"><StandardTimes /></PermissionGate>} />
+            <Route path="ie/time-studies" element={<PermissionGate path="/ie/standard-times"><TimeStudies /></PermissionGate>} />
+            <Route path="ie/line-balance" element={<PermissionGate path="/ie/standard-times"><LineBalanceAnalyses /></PermissionGate>} />
+            <Route path="ie/process-analyses" element={<PermissionGate path="/ie/standard-times"><ProcessAnalyses /></PermissionGate>} />
+            <Route path="ie/lean-metrics" element={<PermissionGate path="/ie/standard-times"><LeanMetrics /></PermissionGate>} />
+            <Route path="ie/action-studies" element={<PermissionGate path="/ie/standard-times"><ActionStudies /></PermissionGate>} />
+            <Route path="ie/method-studies" element={<PermissionGate path="/ie/standard-times"><MethodStudies /></PermissionGate>} />
+            <Route path="ie/work-cells" element={<PermissionGate path="/ie/standard-times"><WorkCells /></PermissionGate>} />
+            <Route path="ie/kanbans" element={<PermissionGate path="/ie/standard-times"><Kanbans /></PermissionGate>} />
+            <Route path="ie/5s-audits" element={<PermissionGate path="/ie/standard-times"><FiveSAudits /></PermissionGate>} />
           </Route>
         </Routes>
       </BrowserRouter>

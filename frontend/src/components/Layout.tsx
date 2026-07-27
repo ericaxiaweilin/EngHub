@@ -26,6 +26,7 @@ import {
   AppstoreOutlined,
   FieldTimeOutlined,
   AlertOutlined,
+  LineChartOutlined,
 } from '@ant-design/icons'
 import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
@@ -72,6 +73,16 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/my-tasks': <CheckSquareOutlined />,
   '/alert-intelligence': <AlertOutlined />,
   '/settings': <SettingOutlined />,
+  '/ie/standard-times': <LineChartOutlined />,
+  '/ie/time-studies': <LineChartOutlined />,
+  '/ie/line-balance': <LineChartOutlined />,
+  '/ie/process-analyses': <LineChartOutlined />,
+  '/ie/lean-metrics': <LineChartOutlined />,
+  '/ie/action-studies': <LineChartOutlined />,
+  '/ie/method-studies': <LineChartOutlined />,
+  '/ie/work-cells': <LineChartOutlined />,
+  '/ie/kanbans': <LineChartOutlined />,
+  '/ie/5s-audits': <LineChartOutlined />,
 }
 
 // 将后端 menu_items 转换为 Ant Design Menu 格式（label 优先取 i18n 翻译，缺失时回退后端原文）
@@ -115,6 +126,7 @@ const ROUTE_MODULE_MAP: [string, string][] = [
   ['/skill-matrix', 'g-hr'], ['/hr-roster', 'g-hr'],
   ['/dashboard', 'g-mes'], ['/production-data', 'g-mes'],
   ['/settings', '/settings'],
+  ['/ie/', 'g-ie'],
 ]
 
 function getActiveModule(pathname: string): string | null {
@@ -205,7 +217,23 @@ const Layout: React.FC = () => {
     }
     // 非分组类型（如 /simulation, /settings）直接返回
     const single = allItems.find((i: any) => i.key === activeModule)
-    return single ? [single] : []
+    if (single) return [single]
+    // IE 模块 fallback（后端未配置菜单时硬编码）
+    if (activeModule === 'g-ie') {
+      return [
+        { key: '/ie/standard-times', icon: <LineChartOutlined />, label: <Link to="/ie/standard-times">标准工时</Link> },
+        { key: '/ie/time-studies', icon: <LineChartOutlined />, label: <Link to="/ie/time-studies">时间研究</Link> },
+        { key: '/ie/line-balance', icon: <LineChartOutlined />, label: <Link to="/ie/line-balance">线平衡分析</Link> },
+        { key: '/ie/process-analyses', icon: <LineChartOutlined />, label: <Link to="/ie/process-analyses">工艺分析</Link> },
+        { key: '/ie/lean-metrics', icon: <LineChartOutlined />, label: <Link to="/ie/lean-metrics">精益指标</Link> },
+        { key: '/ie/action-studies', icon: <LineChartOutlined />, label: <Link to="/ie/action-studies">动作研究</Link> },
+        { key: '/ie/method-studies', icon: <LineChartOutlined />, label: <Link to="/ie/method-studies">方法研究</Link> },
+        { key: '/ie/work-cells', icon: <LineChartOutlined />, label: <Link to="/ie/work-cells">工作单元</Link> },
+        { key: '/ie/kanbans', icon: <LineChartOutlined />, label: <Link to="/ie/kanbans">看板</Link> },
+        { key: '/ie/5s-audits', icon: <LineChartOutlined />, label: <Link to="/ie/5s-audits">5S审核</Link> },
+      ]
+    }
+    return []
   }, [user, t, activeModule])
 
   const handleLogout = () => {

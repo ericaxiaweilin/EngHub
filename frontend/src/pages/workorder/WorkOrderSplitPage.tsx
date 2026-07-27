@@ -5,7 +5,7 @@ import {
 } from 'antd'
 import { 
   PlusOutlined, MinusOutlined, SplitCellsOutlined, UndoOutlined, ReloadOutlined, 
-  RightCircleOutlined, TreeOutlined, HistoryOutlined
+  RightCircleOutlined, ApartmentOutlined, HistoryOutlined
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import type { TreeDataNode } from 'antd/lib/tree/interface'
@@ -369,7 +369,7 @@ const WorkOrderSplitPage: React.FC = () => {
       <Card title="父子关系树形图">
         <Row gutter={8} style={{ marginBottom: 16 }}>
           <Col>
-            <Button type={treeView ? 'primary' : 'dashed'} icon={<TreeOutlined />} onClick={() => setTreeView(!treeView)}>
+            <Button type={treeView ? 'primary' : 'dashed'} icon={<ApartmentOutlined />} onClick={() => setTreeView(!treeView)}>
               {treeView ? '收起树形' : '展开树形'}
             </Button>
             <Button type={historyView ? 'primary' : 'dashed'} icon={<HistoryOutlined />} style={{ marginLeft: 8 }} onClick={() => setHistoryView(!historyView)}>
