@@ -10,11 +10,13 @@ from .base import (
 # 工厂函数
 from .kingdee import create_kingdee_integrator
 from .sap import create_sap_integrator
+from .engflow_adapter import create_engflow_adapter
 
 # 注册表 - 用于动态加载
 ERP_CREATORS = {
     "kingdee": create_kingdee_integrator,
     "sap": create_sap_integrator,
+    "engflow": create_engflow_adapter,
 }
 
 
@@ -24,14 +26,14 @@ def register_erp_config(erp_id: str, config: ERPConfig) -> None:
     
     参数:
         erp_id: 这个 ERP 实例的唯一标识符（如 "kingdee_prod", "sap_dev"）
-        config: ERPConfig 实例
+        config: ERPConfig 配置对象
     """
     if config.erp_type not in ERP_CREATORS:
         raise ValueError(f"Unsupported ERP type: {config.erp_type}")
     
     integrator = ERP_CREATORS[config.erp_type](config)
     ERPIntegrationService.register(erp_id, integrator)
-    logger.info(f"Registered ERP instance '{erp_id}' ({config.erp_type})")
+    logger.info(f"ERP integration {erp_id} configured ({config.erp_type})")
 
 
 def get_erp_instance(erp_id: str) -> Optional[ERPIntegrator]:
@@ -52,10 +54,6 @@ def list_registered_erps() -> List[str]:
     return ERPIntegrationService.list_all()
 
 
-def test_all_erps() -> Dict[str, Any]:"""
-    测试所有已注册的 ERP 连接状态
-    
-    返回:
-        字典，key 为 ERP ID，value 为测试结果（True/False 或错误信息）
-    """
+def test_all_erps() -> Dict[str, Any]:
+    """测试所有已注册的 ERP 连接状态"""
     return ERPIntegrationService.sync_all()
