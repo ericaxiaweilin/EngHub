@@ -21,7 +21,21 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship
 import uuid
 
-Base = declarative_base()
+
+class _BaseMixin:
+    """给所有模型提供 to_dict 序列化能力"""
+    def to_dict(self) -> dict:
+        from sqlalchemy import inspect as sa_inspect
+        result = {}
+        for col in sa_inspect(self).mapper.column_attrs:
+            val = getattr(col.key, self)
+            if hasattr(val, 'isoformat'):
+                val = val.isoformat()
+            result[col.key] = val
+        return result
+
+
+Base = declarative_base(cls=_BaseMixin)
 
 
 def generate_uuid():
@@ -136,7 +150,7 @@ class User(Base):
     
     # 关系
     role_obj = relationship("Role", back_populates="users", foreign_keys=[role_id])
-    user_roles = relationship("UserRole", back_populates="user_obj", foreign_keys="UserRole.user_id")
+    user_roles = relationship("UserRole", back_populates="user_obj", foreign_keys="User.user_id")
     
     __table_args__ = (
         Index("idx_user_factory_role", "factory_id", "role"),
@@ -554,7 +568,7 @@ class TMSTask(Base):
     approval_flow_id = Column(UUID(as_uuid=True), nullable=True)
 
     # Agent 元数据
-    agent_context = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # Agent 可读写上下文
+    agent_context = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 可读写上下文
     metadata_ = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)  # 扩展字段
 
     # 关联
@@ -628,7 +642,7 @@ class TMSDistributionLog(Base):
     strategy = Column(String(50), nullable=False)
     candidate_scores = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 各候选人评分
     selected_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
-    reason = Column(Text)  # 分发决策理由
+    reason = Column(Text)  # 决策理由
     triggered_by = Column(String(100), nullable=False)  # "system" / "agent:xxx" / "user:xxx"
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -671,45 +685,98 @@ class TMSWebhookSubscription(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
-# 导出所有模型
-__all__ = [
-    "Base",
-    "User",
-    "WorkOrder",
-    "ProductionReport",
-    "ProductionReportComment",
-    "Product",
-    "Station",
-    "Routing",
-    "Equipment",
-    "Warehouse",
-    "Location",
-    "Inventory",
-    "InboundOrder",
-    "OutboundOrder",
-    "Skill",
-    "EmployeeSkill",
-    "TrainingRecord",
-    "SimERPAuditLog",
-    # TMS Models
-    "TMSTask",
-    "TMSApprovalFlow",
-    "TMSApprovalRecord",
-    "TMSDistributionLog",
-    "TMSAgentAction",
-    "TMSWebhookSubscription",
-]
+# ============================================================
+# QMS Module Models - Quality Management System
+# ============================================================
+
+class Defect(Base):
+    """不良品单表 - 质量缺陷记录"""
+    
+    __tablename__ = "defects"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    defect_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    defect_type = Column(String(50), nullable=False)  # appearance, dimension, function, etc.
+    quantity = Column(Integer, nullable=False)
+    severity = Column(String(20), nullable=False)  # critical, major, minor, observation
+    inspection_id = Column(String(36), ForeignKey("inspections.id"), nullable=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
+    material_id = Column(String(50), nullable=True)
+    batch_id = Column(String(50), nullable=True)
+    station_id = Column(String(50), nullable=True)
+    description = Column(Text)
+    status = Column(String(20), default="open", nullable=False)  # open, in_progress, resolved, closed, cancelled
+    disposition = Column(String(20))  # rework, repair, scrap, concession, return
+    disposition_by = Column(String(50))
+    disposition_at = Column(DateTime)
+    disposition_qty = Column(Integer)
+    disposition_remark = Column(Text)
+    ocap_status = Column(String(20), default="pending")  # pending, triggered, in_progress, completed
+    ocap_triggered_at = Column(DateTime)
+    ocap_trigger_reason = Column(Text)
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    __table_args__ = (
+        Index('idx_factory_defect_type', 'factory_id', 'defect_type'),
+        Index('idx_factory_status', 'factory_id', 'status'),
+    )
+
+
+class Inspection(Base):
+    """检验单表 - IQC/IPQC/FQC/OQC检验记录"""
+    
+    __tablename__ = "inspections"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    inspection_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    inspection_type = Column(String(20), nullable=False)  # iqc, ipqc, fqc, oqc
+    product_id = Column(String(50), nullable=True)
+    material_id = Column(String(50), nullable=True)
+    batch_id = Column(String(50), nullable=True)
+    batch_size = Column(Integer, default=0)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
+    aql_level = Column(Float, default=1.0)
+    inspection_level = Column(String(20), default="general_ii")
+    sample_size = Column(Integer, nullable=True)
+    status = Column(String(20), default="pending", nullable=False)  # pending, in_progress, passed, failed, rejected
+    inspected_qty = Column(Integer, default=0)
+    defective_qty = Column(Integer, default=0)
+    inspector_id = Column(String(50))
+    inspected_at = Column(DateTime)
+    aql_result = Column(JSON)  # AQL判定结果，包含result, sample_size, ac, re, defective_count
+    remarks = Column(Text)
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    __table_args__ = (
+        Index('idx_factory_type', 'factory_id', 'inspection_type'),
+        Index('idx_factory_status', 'factory_id', 'status'),
+        Index('idx_factory_work_order', 'factory_id', 'work_order_id'),
+    )
+
 
 # ============================================================
-# IE Module Models - Industrial Engineering
+# PP Module Models - Production Planning (add if needed)
+# ============================================================
+
+
+# ============================================================
+# Extended IE Models - Industrial Engineering (partial, for completeness)
+# Note: These were originally defined in a separate migration/file
+# For simplicity in this implementation, they are included here
 # ============================================================
 
 class StandardOperationTime(Base):
-    """标准工时管理 - 精益生产核心
-    
-    定义每个工序的标准作业时间（Standard Operation Time, SOT），
-    支持版本控制、有效期管理和宽放率计算
-    """
+    """标准工时管理 - 精益生产核心"""
     
     __tablename__ = "standard_operation_times"
     
@@ -745,11 +812,7 @@ class StandardOperationTime(Base):
 
 
 class TimeStudyRecord(Base):
-    """时间研究记录 - 实际观测数据采集
-    
-    用于记录操作员在工位上的实际作业观测数据，
-    通过多个周期的观测计算平均时间和正常时间
-    """
+    """时间研究记录"""
     
     __tablename__ = "time_study_records"
     
@@ -782,11 +845,7 @@ class TimeStudyRecord(Base):
 
 
 class LineBalanceAnalysis(Base):
-    """产线平衡分析 - 识别瓶颈和优化机会
-    
-    对生产线进行平衡分析，计算节拍时间、平衡率、
-    识别瓶颈工作站并提供改善建议
-    """
+    """产线平衡分析"""
     
     __tablename__ = "line_balance_analyses"
     
@@ -818,11 +877,7 @@ class LineBalanceAnalysis(Base):
 
 
 class ProcessAnalysis(Base):
-    """工序价值分析 - VA/NVA分解
-    
-    对单个工序进行价值流分析，区分增值时间（VA）和非增值时间（NVA），
-    计算效率评分和改善潜力
-    """
+    """工序价值分析"""
     
     __tablename__ = "process_analyses"
     
@@ -852,11 +907,7 @@ class ProcessAnalysis(Base):
 
 
 class ActionStudy(Base):
-    """动作研究 - 基于MTM/MODAPTS的详细动作分解
-    
-    用于详细记录和分析操作中的每一个动作，
-    支持MTM（Methods-Time Measurement）和MODAPTS方法
-    """
+    """动作研究"""
     
     __tablename__ = "action_studies"
     
@@ -884,11 +935,7 @@ class ActionStudy(Base):
 
 
 class MethodStudy(Base):
-    """方法研究 - 多方案对比与最优选择
-    
-    记录不同操作方法，支持版本控制，
-    可对比并选择最优的标准作业方法
-    """
+    """方法研究"""
     
     __tablename__ = "method_studies"
     
@@ -927,11 +974,7 @@ class MethodStudy(Base):
 
 
 class WorkCellLayout(Base):
-    """工站布局设计 - 精益布局优化
-    
-    记录和规划工站的物理布局和物料流动路径，
-    支持5S和精益布局优化分析
-    """
+    """工站布局设计"""
     
     __tablename__ = "work_cell_layouts"
     
@@ -957,11 +1000,7 @@ class WorkCellLayout(Base):
 
 
 class KanbanSystem(Base):
-    """Kanban看板系统 - 拉动式生产管理
-    
-    管理看板卡片状态，支持连续看板、移动看板等类型，
-    实现拉动式生产控制
-    """
+    """Kanban看板系统"""
     
     __tablename__ = "kanban_systems"
     
@@ -992,11 +1031,7 @@ class KanbanSystem(Base):
 
 
 class FiveSAudit(Base):
-    """5S审计 - 现场整理整顿评估
-    
-    定期执行5S检查（整理、整顿、清扫、清洁、素养），
-    跟踪现场管理改善情况
-    """
+    """5S审计"""
     
     __tablename__ = "five_s_audits"
     
@@ -1028,8 +1063,44 @@ class FiveSAudit(Base):
     )
 
 
-# Update __all__ to include new models
-__all__.extend([
-    "StandardOperationTime", "TimeStudyRecord", "LineBalanceAnalysis", "ProcessAnalysis",
-    "ActionStudy", "MethodStudy", "WorkCellLayout", "KanbanSystem", "FiveSAudit",
-])
+# Complete __all__ list with all models
+__all__ = [
+    "Base",
+    "User",
+    "WorkOrder",
+    "ProductionReport",
+    "ProductionReportComment",
+    "Product",
+    "Station",
+    "Routing",
+    "Equipment",
+    "Warehouse",
+    "Location",
+    "Inventory",
+    "InboundOrder",
+    "OutboundOrder",
+    "Skill",
+    "EmployeeSkill",
+    "TrainingRecord",
+    "SimERPAuditLog",
+    # TMS Models
+    "TMSTask",
+    "TMSApprovalFlow",
+    "TMSApprovalRecord",
+    "TMSDistributionLog",
+    "TMSAgentAction",
+    "TMSWebhookSubscription",
+    # QMS Models
+    "Defect",
+    "Inspection",
+    # IE Models
+    "StandardOperationTime",
+    "TimeStudyRecord",
+    "LineBalanceAnalysis",
+    "ProcessAnalysis",
+    "ActionStudy",
+    "MethodStudy",
+    "WorkCellLayout",
+    "KanbanSystem",
+    "FiveSAudit",
+]
