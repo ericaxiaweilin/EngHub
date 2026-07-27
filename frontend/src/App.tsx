@@ -22,6 +22,7 @@ import { isAuthenticated, getStoredUser } from './services/auth'
 import ApprovalCenter from './pages/tms/ApprovalCenter'
 import TaskDistribution from './pages/tms/TaskDistribution'
 import AgentConsole from './pages/tms/AgentConsole'
+import ModuleSelect from './pages/ModuleSelect'
 // IE Module
 import StandardTimes from './pages/ie/StandardTimes'
 import TimeStudies from './pages/ie/TimeStudies'
@@ -90,6 +91,7 @@ const App: React.FC = () => {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/modules" element={<RequireAuth><ModuleSelect /></RequireAuth>} />
           <Route
             path="/"
             element={
@@ -98,7 +100,7 @@ const App: React.FC = () => {
               </RequireAuth>
             }
           >
-            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route index element={<Navigate to="/modules" replace />} />
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="work-orders" element={<PermissionGate path="/work-orders"><WorkOrderList /></PermissionGate>} />
             <Route path="work-orders/:id" element={<PermissionGate path="/work-orders"><WorkOrderDetail /></PermissionGate>} />
