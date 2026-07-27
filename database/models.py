@@ -1749,7 +1749,7 @@ class MethodStudy(Base):
     
     __table_args__ = (
         UniqueConstraint('factory_id', 'product_id', 'original_operation', 'version', 
-                       name='unique_method_factory_product_op_version'),
+                         name='unique_method_factory_product_op_version'),
         Index('idx_method_validity', 'validity_start', 'is_optimal_method'),
     )
 
