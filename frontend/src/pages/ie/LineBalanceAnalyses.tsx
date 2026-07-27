@@ -1,178 +1,137 @@
 import React, { useEffect, useState } from 'react'
 import {
-  Card, Table, Button, Tag, Space, Modal, Form, Input, Select, message, DatePicker, Empty, Row, Col,
-  InputNumber,
+  Card, Table, Button, Tag, Space, Modal, Form, Input, Select, InputNumber,
+  message, Row, Col, Statistic, Popconfirm, Tooltip, Progress,
 } from 'antd'
-import { PlusOutlined, SyncOutlined } from '@ant-design/icons'
+import { PlusOutlined, DeleteOutlined, PlayCircleOutlined, DashboardOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import type { ColumnsType } from 'antd/es/table'
+import api from '../../services/api'
+import { API_ENDPOINTS } from '../../config/api'
 
-interface LineBalanceAnalysis {
+interface LineBalance {
   id: string
   factory_id: string
   line_id: string
   product_id: string
-  balance_rate: number
-  takt_time_min: number
-  bottleneck_station?: string
+  takt_time: number
+  cycle_time: number
+  balance_efficiency: number
+  num_stations: number
+  total_workload: number
+  status: string
   created_at: string
 }
 
 const LineBalanceAnalyses: React.FC = () => {
   const [factory, setFactory] = useState('F001')
-  const [product, setProduct] = useState('')
-  const [data, setData] = useState<LineBalanceAnalysis[]>([])
+  const [data, setData] = useState<LineBalance[]>([])
   const [loading, setLoading] = useState(false)
-  const [analyzing, setAnalyzing] = useState(false)
-  const [showForm, setShowForm] = useState(false)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [form] = Form.useForm()
 
   const fetchData = async () => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ factory_id: factory })
-      if (product) params.set('product_id', product)
-      const res = await fetch(`http://localhost:8000/api/v1/ie/line-balance-analyses?${params.toString()}&limit=500`)
-      const data = await res.json()
-      setData(Array.isArray(data) ? data : [])
-    } catch (e) {
-      console.error('Error fetching line balance analyses', e)
-      setData([])
-    } finally {
-      setLoading(false)
-    }
+      const res = await api.get(API_ENDPOINTS.IE_LINE_BALANCE_ANALYSES, { params: { factory_id: factory, limit: 200 } })
+      setData(res.items || res || [])
+    } catch { setData([]) } finally { setLoading(false) }
   }
 
-  const analyzeBalance = async () => {
-    setAnalyzing(true)
+  useEffect(() => { fetchData() }, [factory])
+
+  const avgEff = data.length > 0 ? (data.reduce((s, d) => s + (d.balance_efficiency || 0), 0) / data.length).toFixed(1) : '0'
+
+  const handleCreate = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/v1/ie/line-balance-analyses', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ factory_id: factory, product_id: product, line_id: 'LINE-001' }),
-      })
-      const result = await res.json()
-      message.success('分析完成！')
+      const values = await form.validateFields()
+      await api.post(API_ENDPOINTS.IE_LINE_BALANCE_ANALYSES, { ...values, factory_id: factory })
+      message.success('分析已创建')
+      setModalOpen(false)
+      form.resetFields()
       fetchData()
-    } catch (e) {
-      console.error('Line balance analysis failed', e)
-      message.error('分析失败')
-    } finally {
-      setAnalyzing(false)
-      setShowForm(false)
+    } catch (e: any) {
+      if (e?.errorFields) return
+      message.error(e?.response?.data?.detail || '创建失败')
     }
   }
 
-  useEffect(() => { fetchData() }, [factory, product])
+  const handleDelete = async (id: string) => {
+    try {
+      await api.delete(`${API_ENDPOINTS.IE_LINE_BALANCE_ANALYSES}/${id}`)
+      message.success('已删除')
+      fetchData()
+    } catch { message.error('删除失败') }
+  }
 
-  const columns: ColumnsType<LineBalanceAnalysis> = [
+  const columns: ColumnsType<LineBalance> = [
+    { title: '产线', dataIndex: 'line_id', key: 'line_id', width: 100 },
+    { title: '产品', dataIndex: 'product_id', key: 'product_id', width: 110, ellipsis: true },
     {
-      title: '工厂ID',
-      dataIndex: 'factory_id',
-      key: 'factory_id',
-      width: 100,
+      title: '节拍时间(s)', dataIndex: 'takt_time', key: 'takt_time', width: 110,
+      render: v => <span style={{ fontWeight: 600 }}>{(v || 0).toFixed(1)}</span>,
     },
     {
-      title: '产线ID',
-      dataIndex: 'line_id',
-      key: 'line_id',
-      width: 120,
+      title: '周期时间(s)', dataIndex: 'cycle_time', key: 'cycle_time', width: 110,
+      render: v => (v || 0).toFixed(1),
+    },
+    { title: '工位数', dataIndex: 'num_stations', key: 'num_stations', width: 80 },
+    {
+      title: '平衡效率', dataIndex: 'balance_efficiency', key: 'balance_efficiency', width: 140,
+      sorter: (a, b) => a.balance_efficiency - b.balance_efficiency,
+      render: v => {
+        const pct = Math.round((v || 0) * 100)
+        return <Progress percent={pct} size="small" strokeColor={pct >= 85 ? '#52c41a' : pct >= 70 ? '#faad14' : '#ff4d4f'} />
+      },
     },
     {
-      title: '产品ID',
-      dataIndex: 'product_id',
-      key: 'product_id',
-      width: 120,
+      title: '状态', dataIndex: 'status', key: 'status', width: 80,
+      render: v => <Tag color={v === 'completed' ? 'green' : v === 'running' ? 'blue' : 'default'}>{v === 'completed' ? '完成' : v === 'running' ? '运行中' : v || '-'}</Tag>,
     },
+    { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 110, render: v => v ? dayjs(v).format('YYYY-MM-DD') : '-' },
     {
-      title: '平衡率(%)',
-      dataIndex: 'balance_rate',
-      key: 'balance_rate',
-      width: 100,
-      render: (val) => <Tag color={val > 80 ? 'green' : val > 60 ? 'blue' : 'orange'}>{(val * 100).toFixed(1)}%</Tag>,
-    },
-    {
-      title: '节拍时间(min)',
-      dataIndex: 'takt_time_min',
-      key: 'takt_time_min',
-      width: 120,
-      render: (val) => val.toFixed(2),
-    },
-    {
-      title: '瓶颈工位',
-      dataIndex: 'bottleneck_station',
-      key: 'bottleneck_station',
-      width: 140,
-    },
-    {
-      title: '创建日期',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      width: 120,
-      render: (val) => dayjs(val).format('YYYY-MM-DD HH:mm'),
+      title: '操作', key: 'action', width: 70, fixed: 'right',
+      render: (_, r) => (
+        <Popconfirm title="确认删除?" onConfirm={() => handleDelete(r.id)}>
+          <Tooltip title="删除"><Button type="link" size="small" danger icon={<DeleteOutlined />} /></Tooltip>
+        </Popconfirm>
+      ),
     },
   ]
 
   return (
-    <Card title="产线平衡分析">
-      <Row gutter={16} align="middle" style={{ marginBottom: 16 }}>
-        <Col span={3}>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowForm(true)}>
-            执行分析
-          </Button>
-        </Col>
-        <Col span={3}>
-          <Button type="link" icon={<SyncOutlined />} onClick={fetchData}>
-            刷新列表
-          </Button>
-        </Col>
-        <Col span={4}>
-          <Select value={factory} onChange={setFactory} style={{ width: 120 }}>
-            <Select.Option value="F001">F001 厂区</Select.Option>
-          </Select>
-        </Col>
-        <Col span={4}>
-          <Select value={product} onChange={setProduct} placeholder="选择产品" style={{ width: 150 }}>
-            <Select.Option value="P001">P001 产品A</Select.Option>
-            <Select.Option value="P002">P002 产品B</Select.Option>
-          </Select>
-        </Col>
+    <div>
+      <Row gutter={16} style={{ marginBottom: 16 }}>
+        <Col span={6}><Card size="small"><Statistic title="分析记录" value={data.length} prefix={<DashboardOutlined />} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="平均平衡效率" value={avgEff} suffix="%" valueStyle={{ color: '#1890ff' }} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="达标(≥85%)" value={data.filter(d => (d.balance_efficiency || 0) >= 0.85).length} valueStyle={{ color: '#52c41a' }} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="需改善(<70%)" value={data.filter(d => (d.balance_efficiency || 0) < 0.7).length} valueStyle={{ color: '#ff4d4f' }} /></Card></Col>
       </Row>
 
-      {showForm && (
-        <Modal
-          title="执行产线平衡分析"
-          open={true}
-          okText="分析"
-          onCancel={() => setShowForm(false)}
-          onOk={analyzeBalance}
-          footer={(_, { OkBtn }) => (
-            <Space>
-              <OkBtn loading={analyzing} />
-            </Space>
-          )}
-        >
-          <p>请输入产线和分析参数</p>
-          <InputNumber
-            label="产线ID"
-            value={undefined}
-            placeholder="输入产线ID"
-            style={{ width: 200 }}
-          />
-        </Modal>
-      )}
+      <Card title="产线平衡分析" extra={
+        <Space>
+          <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
+            <Select.Option value="F001">F001 厂区</Select.Option>
+            <Select.Option value="F01">F01 厂区</Select.Option>
+          </Select>
+          <Button type="primary" icon={<PlayCircleOutlined />} size="small" onClick={() => { form.resetFields(); setModalOpen(true) }}>执行新分析</Button>
+        </Space>
+      }>
+        <Table dataSource={data} columns={columns} loading={loading} rowKey="id" scroll={{ x: 1000 }} size="middle"
+          pagination={{ pageSize: 15, showTotal: t => `共 ${t} 条` }} />
+      </Card>
 
-      {data.length > 0 ? (
-        <Table
-          dataSource={data}
-          columns={columns}
-          loading={loading || analyzing}
-          pagination={{ pageSize: 10 }}
-          rowKey="id"
-        />
-      ) : (
-        <Empty description={loading ? '加载中...' : '暂无分析记录'} style={{ margin: '40px 0' }} />
-      )}
-    </Card>
+      <Modal title="执行线平衡分析" open={modalOpen} onOk={handleCreate} onCancel={() => setModalOpen(false)} okText="开始分析" cancelText="取消">
+        <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
+          <Form.Item name="line_id" label="产线ID" rules={[{ required: true }]}><Input placeholder="如 LINE-01" /></Form.Item>
+          <Form.Item name="product_id" label="产品ID" rules={[{ required: true }]}><Input placeholder="如 PRD-001" /></Form.Item>
+          <Row gutter={16}>
+            <Col span={12}><Form.Item name="takt_time" label="节拍时间(s)" rules={[{ required: true }]}><InputNumber min={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col span={12}><Form.Item name="num_stations" label="工位数" initialValue={4}><InputNumber min={1} style={{ width: '100%' }} /></Form.Item></Col>
+          </Row>
+        </Form>
+      </Modal>
+    </div>
   )
 }
 

@@ -1,16 +1,23 @@
 import React, { useEffect, useState } from 'react'
-import { Card, Table, Button, Tag, Space, message, Empty, Row, Col } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
+import {
+  Card, Table, Button, Tag, Space, Modal, Form, Input, Select,
+  message, Row, Col, Statistic, Popconfirm,
+} from 'antd'
+import { PlusOutlined, EditOutlined, DeleteOutlined, FileSearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import type { ColumnsType } from 'antd/es/table'
+import api from '../../services/api'
+import { API_ENDPOINTS } from '../../config/api'
 
 interface MethodStudy {
   id: string
   factory_id: string
-  product_id: string
-  original_operation: string
-  version: string
-  is_basement_method: boolean
-  is_optimal_method: boolean
+  operation_name: string
+  current_method: string
+  proposed_method: string
+  time_saving_pct: number
+  status: string
+  analyst: string
   created_at: string
 }
 
@@ -18,54 +25,106 @@ const MethodStudies: React.FC = () => {
   const [factory, setFactory] = useState('F001')
   const [data, setData] = useState<MethodStudy[]>([])
   const [loading, setLoading] = useState(false)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [editing, setEditing] = useState<MethodStudy | null>(null)
+  const [form] = Form.useForm()
 
   const fetchData = async () => {
     setLoading(true)
     try {
-      const res = await fetch(`http://localhost:8000/api/v1/ie-advanced/method-studies?factory_id=${factory}&limit=50`)
-      // Simplified - backend may return different structure
-      const result = await res.json()
-      setData(Array.isArray(result) ? result : [])
-    } catch (e) {
-      console.error('Error fetching method studies', e)
-      setData([])
-    } finally {
-      setLoading(false)
-    }
+      const res = await api.get(API_ENDPOINTS.IE_ADVANCED_METHOD_STUDIES, { params: { factory_id: factory, limit: 200 } })
+      setData(res.items || res || [])
+    } catch { setData([]) } finally { setLoading(false) }
   }
 
   useEffect(() => { fetchData() }, [factory])
 
-  const columns = [
-    { title: '工厂ID', dataIndex: 'factory_id', key: 'factory_id', width: 100 },
-    { title: '产品ID', dataIndex: 'product_id', key: 'product_id', width: 120 },
-    { title: '原始操作', dataIndex: 'original_operation', key: 'original_operation', width: 200 },
-    { title: '版本', dataIndex: 'version', key: 'version', width: 80 },
-    { title: '基础方法', dataIndex: 'is_basement_method', key: 'is_basement_method', width: 100, render: (val: boolean) => <Tag color={val ? 'green' : 'gray'}>{val ? '是' : '否'}</Tag> },
-    { title: '最优方法', dataIndex: 'is_optimal_method', key: 'is_optimal_method', width: 100, render: (val: boolean) => <Tag color={val ? 'gold' : 'gray'}>{val ? '是' : '否'}</Tag> },
-    { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 120, render: (val: string) => dayjs(val).format('YYYY-MM-DD HH:mm') },
+  const handleSave = async () => {
+    try {
+      const values = await form.validateFields()
+      if (editing) {
+        await api.put(`${API_ENDPOINTS.IE_ADVANCED_METHOD_STUDIES}/${editing.id}`, values)
+        message.success('更新成功')
+      } else {
+        await api.post(API_ENDPOINTS.IE_ADVANCED_METHOD_STUDIES, { ...values, factory_id: factory })
+        message.success('创建成功')
+      }
+      setModalOpen(false); form.resetFields(); setEditing(null); fetchData()
+    } catch (e: any) {
+      if (e?.errorFields) return
+      message.error(e?.response?.data?.detail || '操作失败')
+    }
+  }
+
+  const handleDelete = async (id: string) => {
+    try { await api.delete(`${API_ENDPOINTS.IE_ADVANCED_METHOD_STUDIES}/${id}`); message.success('已删除'); fetchData() }
+    catch { message.error('删除失败') }
+  }
+
+  const columns: ColumnsType<MethodStudy> = [
+    { title: '工序', dataIndex: 'operation_name', key: 'operation_name', width: 130, ellipsis: true },
+    { title: '现行方法', dataIndex: 'current_method', key: 'current_method', width: 180, ellipsis: true },
+    { title: '改善方案', dataIndex: 'proposed_method', key: 'proposed_method', width: 180, ellipsis: true },
+    {
+      title: '节省时间', dataIndex: 'time_saving_pct', key: 'time_saving_pct', width: 100,
+      sorter: (a, b) => a.time_saving_pct - b.time_saving_pct,
+      render: v => <Tag color={v >= 20 ? 'green' : v >= 10 ? 'blue' : 'default'}>{(v || 0).toFixed(1)}%</Tag>,
+    },
+    {
+      title: '状态', dataIndex: 'status', key: 'status', width: 80,
+      render: v => <Tag color={v === 'implemented' ? 'green' : v === 'approved' ? 'blue' : v === 'pending' ? 'orange' : 'default'}>
+        {v === 'implemented' ? '已实施' : v === 'approved' ? '已批准' : v === 'pending' ? '待审' : v || '-'}
+      </Tag>,
+    },
+    { title: '分析员', dataIndex: 'analyst', key: 'analyst', width: 80, render: v => v || '-' },
+    { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 100, render: v => v ? dayjs(v).format('YYYY-MM-DD') : '-' },
+    {
+      title: '操作', key: 'action', width: 90, fixed: 'right',
+      render: (_, r) => (
+        <Space size={4}>
+          <Button type="link" size="small" icon={<EditOutlined />} onClick={() => { setEditing(r); form.setFieldsValue(r); setModalOpen(true) }} />
+          <Popconfirm title="确认删除?" onConfirm={() => handleDelete(r.id)}><Button type="link" size="small" danger icon={<DeleteOutlined />} /></Popconfirm>
+        </Space>
+      ),
+    },
   ]
 
   return (
-    <Card title="方法研究管理">
-      <Row gutter={16} align="middle" style={{ marginBottom: 16 }}>
-        <Col span={3}>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => message.info('Create button not implemented yet')}>
-            新增方案
-          </Button>
-        </Col>
-        <Col span={4}>
-          <Select value={factory} onChange={setFactory} style={{ width: 120 }}>
-            <Select.Option value="F001">F001 厂区</Select.Option>
-          </Select>
-        </Col>
+    <div>
+      <Row gutter={16} style={{ marginBottom: 16 }}>
+        <Col span={8}><Card size="small"><Statistic title="方案总数" value={data.length} prefix={<FileSearchOutlined />} /></Card></Col>
+        <Col span={8}><Card size="small"><Statistic title="已实施" value={data.filter(d => d.status === 'implemented').length} valueStyle={{ color: '#52c41a' }} /></Card></Col>
+        <Col span={8}><Card size="small"><Statistic title="平均节省" value={data.length ? (data.reduce((s, d) => s + (d.time_saving_pct || 0), 0) / data.length).toFixed(1) : 0} suffix="%" valueStyle={{ color: '#1890ff' }} /></Card></Col>
       </Row>
-      {data.length > 0 ? (
-        <Table dataSource={data} columns={columns} loading={loading} pagination={{ pageSize: 10 }} rowKey="id" />
-      ) : (
-        <Empty description={loading ? '加载中...' : '暂无方法研究方案'} style={{ margin: '40px 0' }} />
-      )}
-    </Card>
+
+      <Card title="方法研究" extra={
+        <Space>
+          <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
+            <Select.Option value="F001">F001 厂区</Select.Option><Select.Option value="F01">F01 厂区</Select.Option>
+          </Select>
+          <Button type="primary" icon={<PlusOutlined />} size="small" onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true) }}>新增</Button>
+        </Space>
+      }>
+        <Table dataSource={data} columns={columns} loading={loading} rowKey="id" scroll={{ x: 1000 }} size="middle" pagination={{ pageSize: 15, showTotal: t => `共 ${t} 条` }} />
+      </Card>
+
+      <Modal title={editing ? '编辑方法研究' : '新增方法研究'} open={modalOpen} onOk={handleSave} onCancel={() => { setModalOpen(false); setEditing(null) }} okText="保存" cancelText="取消" width={560}>
+        <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
+          <Form.Item name="operation_name" label="工序名称" rules={[{ required: true }]}><Input /></Form.Item>
+          <Form.Item name="current_method" label="现行方法" rules={[{ required: true }]}><Input.TextArea rows={2} /></Form.Item>
+          <Form.Item name="proposed_method" label="改善方案" rules={[{ required: true }]}><Input.TextArea rows={2} /></Form.Item>
+          <Row gutter={16}>
+            <Col span={8}><Form.Item name="time_saving_pct" label="节省时间(%)"><Input type="number" /></Form.Item></Col>
+            <Col span={8}><Form.Item name="analyst" label="分析员"><Input /></Form.Item></Col>
+            <Col span={8}>
+              <Form.Item name="status" label="状态" initialValue="pending">
+                <Select><Select.Option value="pending">待审</Select.Option><Select.Option value="approved">已批准</Select.Option><Select.Option value="implemented">已实施</Select.Option><Select.Option value="rejected">驳回</Select.Option></Select>
+              </Form.Item>
+            </Col>
+          </Row>
+        </Form>
+      </Modal>
+    </div>
   )
 }
 

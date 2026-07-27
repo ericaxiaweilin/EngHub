@@ -1,152 +1,108 @@
 import React, { useEffect, useState } from 'react'
 import {
-  Card, Table, Button, Tag, Space, Empty, Row, Col, Statistic,
+  Card, Table, Tag, Space, Select, Row, Col, Statistic, Progress, Empty,
 } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
+import {
+  DashboardOutlined, ClockCircleOutlined, ThunderboltOutlined, WarningOutlined,
+} from '@ant-design/icons'
 import dayjs from 'dayjs'
 import type { ColumnsType } from 'antd/es/table'
+import api from '../../services/api'
+import { API_ENDPOINTS } from '../../config/api'
 
-interface LeanProcess {
-  operation: string
-  va: number
-  nva: number
-  ratio: number
-  efficiency: number
+interface LeanMetric {
+  id: string
+  factory_id: string
+  metric_name: string
+  metric_category: string
+  value: number
+  target_value: number
+  unit: string
+  period: string
+  status: string
+  recorded_at: string
 }
 
-interface LeanMetricsData {
-  factory_id: string
-  product_id?: string
-  total_value_added_time: number
-  total_non_value_added_time: number
-  overall_va_ratio: number
-  analysis_count: number
-  processes: LeanProcess[]
+const CATEGORY_MAP: Record<string, { color: string; text: string }> = {
+  quality: { color: 'green', text: '质量' },
+  cost: { color: 'blue', text: '成本' },
+  delivery: { color: 'purple', text: '交期' },
+  efficiency: { color: 'orange', text: '效率' },
+  safety: { color: 'red', text: '安全' },
 }
 
 const LeanMetrics: React.FC = () => {
   const [factory, setFactory] = useState('F001')
-  const [metrics, setMetrics] = useState<LeanMetricsData | null>(null)
+  const [data, setData] = useState<LeanMetric[]>([])
   const [loading, setLoading] = useState(false)
 
-  const fetchMetrics = async () => {
+  const fetchData = async () => {
     setLoading(true)
     try {
-      const res = await fetch(`http://localhost:8000/api/v1/ie/lean-metrics?factory_id=${factory}&limit=500`)
-      const data = await res.json()
-      setMetrics(data as LeanMetricsData | null)
-    } catch (e) {
-      console.error('Error fetching lean metrics', e)
-      setMetrics(null)
-    } finally {
-      setLoading(false)
-    }
+      const res = await api.get(API_ENDPOINTS.IE_LEAN_METRICS, { params: { factory_id: factory, limit: 200 } })
+      setData(res.items || res || [])
+    } catch { setData([]) } finally { setLoading(false) }
   }
 
-  useEffect(() => { fetchMetrics() }, [factory])
+  useEffect(() => { fetchData() }, [factory])
 
-  const columns: ColumnsType<LeanProcess> = [
+  const onTarget = data.filter(d => d.value >= d.target_value).length
+  const avgAchieve = data.length > 0
+    ? (data.reduce((s, d) => s + (d.target_value > 0 ? d.value / d.target_value : 0), 0) / data.length * 100).toFixed(0)
+    : '0'
+
+  const columns: ColumnsType<LeanMetric> = [
+    { title: '指标名称', dataIndex: 'metric_name', key: 'metric_name', width: 160, ellipsis: true },
     {
-      title: '工序',
-      dataIndex: 'operation',
-      key: 'operation',
-      width: 200,
+      title: '类别', dataIndex: 'metric_category', key: 'metric_category', width: 80,
+      filters: Object.entries(CATEGORY_MAP).map(([k, v]) => ({ text: v.text, value: k })),
+      onFilter: (v, r) => r.metric_category === v,
+      render: v => { const c = CATEGORY_MAP[v] || { color: 'default', text: v }; return <Tag color={c.color}>{c.text}</Tag> },
     },
     {
-      title: '增值时间(min)',
-      dataIndex: 'va',
-      key: 'va',
-      width: 140,
-      render: (val) => val.toFixed(2),
+      title: '当前值', dataIndex: 'value', key: 'value', width: 100,
+      render: (v, r) => <span style={{ fontWeight: 600, color: v >= r.target_value ? '#52c41a' : '#ff4d4f' }}>{v}{r.unit}</span>,
     },
+    { title: '目标值', dataIndex: 'target_value', key: 'target_value', width: 100, render: (v, r) => `${v}${r.unit}` },
     {
-      title: '非增值时间(min)',
-      dataIndex: 'nva',
-      key: 'nva',
-      width: 140,
-      render: (val) => val.toFixed(2),
+      title: '达成率', key: 'achievement', width: 140,
+      sorter: (a, b) => (a.value / a.target_value) - (b.value / b.target_value),
+      render: (_, r) => {
+        const pct = r.target_value > 0 ? Math.round(r.value / r.target_value * 100) : 0
+        return <Progress percent={Math.min(pct, 100)} size="small" strokeColor={pct >= 100 ? '#52c41a' : pct >= 80 ? '#faad14' : '#ff4d4f'} format={() => `${pct}%`} />
+      },
     },
+    { title: '周期', dataIndex: 'period', key: 'period', width: 90 },
     {
-      title: '增值比率(%)',
-      dataIndex: 'ratio',
-      key: 'ratio',
-      width: 120,
-      render: (val) => <Tag color={val > 0.7 ? 'green' : val > 0.4 ? 'blue' : 'red'}>{(val * 100).toFixed(1)}%</Tag>,
+      title: '状态', dataIndex: 'status', key: 'status', width: 80,
+      render: v => <Tag color={v === 'on_track' ? 'green' : v === 'at_risk' ? 'orange' : 'red'}>{v === 'on_track' ? '达标' : v === 'at_risk' ? '风险' : '落后'}</Tag>,
     },
-    {
-      title: '效率评分',
-      dataIndex: 'efficiency',
-      key: 'efficiency',
-      width: 100,
-      render: (val) => val.toFixed(1),
-    },
+    { title: '记录时间', dataIndex: 'recorded_at', key: 'recorded_at', width: 110, render: v => v ? dayjs(v).format('YYYY-MM-DD') : '-' },
   ]
 
   return (
-    <Card title="精益指标看板">
-      <Row gutter={16} align="middle" style={{ marginBottom: 24 }}>
-        <Col span={3}>
-          <Button type="primary" icon={<ReloadOutlined />} onClick={fetchMetrics} loading={loading}>
-            刷新数据
-          </Button>
-        </Col>
-        <Col span={4}>
-          <Select value={factory} onChange={setFactory} style={{ width: 120 }}>
-            <Select.Option value="F001">F001 厂区</Select.Option>
-          </Select>
-        </Col>
+    <div>
+      <Row gutter={16} style={{ marginBottom: 16 }}>
+        <Col span={6}><Card size="small"><Statistic title="指标总数" value={data.length} prefix={<DashboardOutlined />} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="达标指标" value={onTarget} prefix={<ThunderboltOutlined />} valueStyle={{ color: '#52c41a' }} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="平均达成率" value={avgAchieve} suffix="%" prefix={<ClockCircleOutlined />} valueStyle={{ color: '#1890ff' }} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="落后指标" value={data.filter(d => d.status === 'behind').length} prefix={<WarningOutlined />} valueStyle={{ color: '#ff4d4f' }} /></Card></Col>
       </Row>
 
-      {!metrics || loading ? (
-        <Empty description={loading ? '加载中...' : '暂无数据'} style={{ margin: '40px 0' }} />
-      ) : (
-        <>
-          <Row gutter={24} style={{ marginBottom: 24 }}>
-            <Col span={6}>
-              <Statistic
-                title="总增值时间"
-                unit="min"
-                value={metrics.total_value_added_time}
-                precision={2}
-              />
-            </Col>
-            <Col span={6}>
-              <Statistic
-                title="总非增值时间"
-                unit="min"
-                value={metrics.total_non_value_added_time}
-                precision={2}
-              />
-            </Col>
-            <Col span={6}>
-              <Statistic
-                title="增值比率"
-                unit="%"
-                value={metrics.overall_va_ratio * 100}
-                precision={1}
-              />
-            </Col>
-            <Col span={6}>
-              <Statistic
-                title="分析工序数"
-                value={metrics.analysis_count}
-              />
-            </Col>
-          </Row>
-
-          {metrics.processes.length > 0 ? (
-            <Table
-              dataSource={metrics.processes}
-              columns={columns}
-              pagination={{ pageSize: 10 }}
-              rowKey="operation"
-            />
-          ) : (
-            <Empty description={metrics.analysis_count === 0 ? '暂无工序分析数据' : '无详细过程数据'} style={{ margin: '40px 0' }} />
-          )}
-        </>
-      )}
-    </Card>
+      <Card title="精益指标看板" extra={
+        <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
+          <Select.Option value="F001">F001 厂区</Select.Option>
+          <Select.Option value="F01">F01 厂区</Select.Option>
+        </Select>
+      }>
+        {data.length > 0 ? (
+          <Table dataSource={data} columns={columns} loading={loading} rowKey="id" scroll={{ x: 1000 }} size="middle"
+            pagination={{ pageSize: 15, showTotal: t => `共 ${t} 条` }} />
+        ) : (
+          <Empty description={loading ? '加载中...' : '暂无精益指标数据'} style={{ margin: '40px 0' }} />
+        )}
+      </Card>
+    </div>
   )
 }
 
