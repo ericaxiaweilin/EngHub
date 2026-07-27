@@ -90,11 +90,10 @@ async def production_dashboard_summary(
     outbounds: List[OutboundOrder] = list(ob_res.scalars().all())
 
     # 人员技能（按厂区用户）
-    # 注意：DB 中 employee_skills.user_id 为 varchar(36) 而 users.id 为 uuid，
-    # 直接 JOIN 会报 'operator does not exist: character varying = uuid'，须显式 cast
+    # employee_skills.user_id 和 users.id 均为 uuid 类型，直接 JOIN
     skill_res = await db.execute(
         select(EmployeeSkill, User)
-        .join(User, EmployeeSkill.user_id == cast(User.id, String))
+        .join(User, EmployeeSkill.user_id == User.id)
         .where(User.factory_id == factory_id)
     )
     skill_rows = skill_res.all()
@@ -233,7 +232,7 @@ async def production_dashboard_summary(
             st_name = st.station_name if st else "未知工位"
             s_day = release_day + i * step_span
             e_day = s_day + step_span
-            work_h = (wo.planned_qty / max(st.capacity_per_hour if st else 20, 1)) if st else 4
+            work_h = ((wo.planned_qty or 0) / max(st.capacity_per_hour if st else 20, 1)) if st else 4
             ops.append({
                 "op_no": step.get("step_no", i + 1),
                 "name": step.get("name", f"工序{i+1}"),
@@ -245,11 +244,12 @@ async def production_dashboard_summary(
                 "work_hours": round(work_h, 1),
             })
             # PO 工序状态
+            cur_step = wo.current_routing_step if wo.current_routing_step is not None else -1
             if wo.status == "completed":
                 op_status = "done"
-            elif wo.current_routing_step > i:
+            elif cur_step > i:
                 op_status = "done"
-            elif wo.current_routing_step == i and wo.status == "in_progress":
+            elif cur_step == i and wo.status == "in_progress":
                 op_status = "in_progress"
             else:
                 op_status = "pending"
@@ -334,7 +334,7 @@ async def production_dashboard_summary(
         active = len([wo for wo in work_orders if wo.status == "in_progress"])
         wip_curve.append({
             "day": d,
-            "wip_qty": sum(max(0, wo.planned_qty - wo.completed_qty) for wo in work_orders if wo.status in ("in_progress", "released")),
+            "wip_qty": sum(max(0, (wo.planned_qty or 0) - (wo.completed_qty or 0)) for wo in work_orders if wo.status in ("in_progress", "released")),
             "active_orders": active,
         })
 

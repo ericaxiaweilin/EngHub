@@ -15,6 +15,8 @@ from api.routes import (
     auth_router,
     chat_router,
     employee_skill_router,
+    ie_router,
+    ie_advanced_router,
     mes_router,
     pp_router,
     qms_router,
@@ -53,6 +55,7 @@ from api.routes.collaboration_routes import router as collaboration_router
 from api.routes.agent_supervisor_routes import router as agent_supervisor_router
 from api.routes.agent_routes import router as agent_router
 from api.routes.crew_routes import router as crew_router
+from core.org_panel.api_adapter import router as org_panel_router
 
 app = FastAPI(
     title="EngHub MES",
@@ -62,6 +65,8 @@ app = FastAPI(
 
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(ie_router)           # Industrial Engineering Module - 精益生产IE基础模块
+app.include_router(ie_advanced_router)  # Advanced IE Module - 精益生产IE扩展模块
 app.include_router(mes_router)
 app.include_router(pp_router)
 app.include_router(qms_router)
@@ -101,6 +106,7 @@ app.include_router(crew_router)  # CrewAI推理层+个人知识层
 app.include_router(rcc_router)
 app.include_router(rcc_data_router)
 app.include_router(rcc_decision_router)
+app.include_router(org_panel_router)  # 全组织层级参数驱动仿真面板
 app.include_router(test_router)  # 测试模式角色切换（仅 TEST_MODE=true 时可用）
 
 

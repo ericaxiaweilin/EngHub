@@ -3,6 +3,8 @@ API Routes
 """
 
 from .mes_routes import router as mes_router
+from .ie_routes import router as ie_router
+from .ie_routes_extended import router as ie_advanced_router
 from .pp_routes import router as pp_router
 from .qms_routes import router as qms_router
 from .wms_routes import router as wms_router
@@ -21,6 +23,8 @@ except ImportError:
 
 __all__ = [
     "mes_router",
+    "ie_router",
+    "ie_advanced_router",
     "pp_router",
     "qms_router",
     "wms_router",
