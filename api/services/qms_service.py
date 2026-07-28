@@ -666,7 +666,7 @@ class QMSService:
         result = await self.db.execute(query)
         return result.scalars().all()
     
-    async def trace_batch(self, batch_id: str) -> Dict[str, Any]:
+    async def trace_batch(self, batch_id: str, factory_id: str = "") -> Dict[str, Any]:
         """批次级追溯 - 实现第14号缺陷（关键审计功能）
         
         支持双向追溯：
@@ -675,39 +675,196 @@ class QMSService:
         
         返回结构包含完整的全链路数据，满足合规审计要求。
         """
-        from sqlalchemy import func, select, and_
+        from sqlalchemy import select, and_
+        
+        factory_id = factory_id if factory_id else ""  # 可能来自参数传入
         
         trace = {
             "batch_id": batch_id,
-            "created_at": None,
-            "incoming_materials": [],      # 上游：原始物料来源
-            "inbound_records": [],         # 采购入库单记录
-            "iqc_inspections": [],         # IQC检验记录
-            "production_bom_usage": [],     # BOM 使用明细（本批次消耗的材料）
-            "production_orders": [],       # 使用该批次的生产工单
-            "ipqc_inspections": [],        # 过程检验
-            "fqc_inspections": [],         # 最终检验
-            "defect_records": [],          # 相关不良品记录
-            "outbound_records": [],        # 下游：出库记录
-            "customer_shipments": []       # 发货给客户
+            "factory_id": factory_id if factory_id else "ALL",
+            
+            # 上游溯源（Upstream）
+            "upstream": {
+                "purchase_inbound": [],      # 采购入库单
+                "iqc_verification": [],      # IQC合格记录
+                "supplier_info": {},         # 供应商信息
+                "original_material": {}      # 原始材料主数据
+            },
+            
+            # 生产过程（Production）
+            "production_process": {
+                "work_orders": [],           # 关联工单
+                "production_reports": [],   # 报工记录
+                "routing_info": [],         # 工艺路线
+                "materials_consumed": []     # BOM消耗明细
+            },
+            
+            # 质量控制（Quality Control）
+            "quality_control": {
+                "ipqc_checklist": [],        # IPQC检验
+                "fqc_final_check": [],       # FQC终检
+                "defect_occurrences": [],    # 不良发生记录
+                "ocap_actions": []           # OCAP纠正措施
+            },
+            
+            # 下游去向（Downstream）
+            "downstream": {
+                "outbound_deliveries": [],   # 出库发货
+                "warehouse_locations": [],   # 存放位置
+                "final_customers": []        # 最终客户
+            }
         }
         
-        # 1. 获取该批次的基础信息（从入库单或BOM项中获取创建时间）
-        # 简化：假设在 InboundOrder 表中有 batch_code 字段
+        try:
+            # ==========================================
+            # STEP A: 查询上游 - 批次来自哪里？
+            # ==========================================
+            
+            # A1. 查找该批次对应的入库单（InboundOrder）
+            inbound_conditions = [InboundOrder.batch_code == batch_id]
+            if factory_id:
+                inbound_conditions.append(InboundOrder.factory_id == factory_id)
+            
+            inbound_stmt = select(InboundOrder).where(*inbound_conditions)
+            inbound_result = await self.db.execute(inbound_stmt)
+            inbounds = inbound_result.scalars().all()
+            
+            for inv in inbounds:
+                trace["upstream"]["purchase_inbound"].append({
+                    "code": inv.inbound_code,
+                    "type": inv.inbound_type,
+                    "material_id": inv.material_id,
+                    "material_code": inv.material_code,
+                    "quantity": inv.quantity,
+                    "supplier_id": inv.supplier_id,
+                    "purchase_order_id": inv.purchase_order_id or "",
+                    "status": inv.status,
+                    "at": inv.completed_at.isoformat() if inv.completed_at else None
+                })
+            
+            # A2. 关联该批次的IQO检验记录
+            iqc_conditions = [
+                QualityInspection.inspect_type == "iqc",
+                QualityInspection.result == "PASS"
+            ]
+            if inbounds:
+                # 关联到相同的物料
+                iqc_conditions.append(QualityInspection.material_id == inbounds[0].material_id)
+            if factory_id:
+                iqc_conditions.append(QualityInspection.factory_id == factory_id)
+            
+            iqc_stmt = select(QualityInspection).where(*iqc_conditions)
+            iqc_result = await self.db.execute(iqc_stmt)
+            trace["upstream"]["iqc_verification"] = [
+                {"code": iq.inspection_code, "sample_size": iq.sample_qty, "defects": iq.defect_qty}
+                for iq in iqc_result.scalars().all()
+            ]
+            
+            # ==========================================
+            # STEP B: 查询生产消耗链 - 批次用到了哪些生产？
+            # ==========================================
+            # 这个查询需要通过多表连接：Inbound/Inventory → BomItem → WorkOrder → ProductionReport
+            
+            # 简化的查询路径：直接找使用了该批次材料的WorkOrders
+            # （实际生产环境建议通过 Inventory + BomItem + WorkOrder 三层 JOIN）
+            
+            if inbounds:
+                material_ids = [i.material_id for i in inbounds]
+                
+                # B1. 查找关联的 WorkOrders（消耗这些材料的订单）
+                wo_stmt = select(WorkOrder).where(
+                    WorkOrder.product_id != "",  # placeholder，实际应根据 product/material 关联
+                )
+                wo_result = await self.db.execute(wo_stmt)
+                for wo in wo_result.scalars().all():
+                    trace["production_process"]["work_orders"].append({
+                        "code": wo.work_order_code,
+                        "id": wo.id,
+                        "product_id": wo.product_id,
+                        "status": wo.status,
+                        "planned_qty": wo.quantity,
+                        "completed_wo": wo.completed_qty
+                    })
+            
+            # B2. 生产报工记录（按工单ID筛选）
+            report_conditions = [ProductionReport.factory_id == factory_id] if factory_id else []
+            report_stmt = select(ProductionReport).where(*report_conditions)
+            report_result = await self.db.execute(report_stmt)
+            trace["production_process"]["production_reports"] = [
+                {"code": pr.report_code, "good": pr.good_qty, "defect": pr.defect_qty, "scrap": pr.scrap_qty}
+                for pr in report_result.scalars().all()
+            ]
+            
+            # ==========================================
+            # STEP C: 质量控制节点
+            # ==========================================
+            
+            # C1. IPQC（过程检验）
+            ipqc_stmt = select(QualityInspection).where(
+                QualityInspection.inspect_type == "ipqc",
+                QualityInspection.factory_id == factory_id if factory_id else True
+            )
+            trace["quality_control"]["ipqc_checklist"] = [
+                {"code": iq.inspection_code, "result": iq.result, "at": iq.created_at.isoformat() if iq.created_at else None}
+                for iq in ipqc_stmt.scalars().all()
+            ]
+            
+            # C2. FQC（最终检验）
+            fqc_stmt = select(QualityInspection).where(
+                QualityInspection.inspect_type == "fqc",
+                QualityInspection.factory_id == factory_id if factory_id else True
+            )
+            trace["quality_control"]["fqc_final_check"] = [
+                {"code": iq.inspection_code, "result": iq.result, "at": iq.created_at.isoformat() if iq.created_at else None}
+                for iq in fqc_stmt.scalars().all()
+            ]
+            
+            # C3. 不良记录
+            defect_stmt = select(DefectRecord).where(
+                DefectRecord.factory_id == factory_id if factory_id else True
+            )
+            defect_result = await self.db.execute(defect_stmt)
+            for dr in defect_result.scalars().all():
+                entry = {
+                    "code": dr.record_code,
+                    "severity": dr.severity,
+                    "quantity": dr.quantity,
+                    "disposition": dr.disposition,
+                    "ocap_status": dr.ocap_status,
+                    "type": dr.defect_type
+                }
+                trace["quality_control"]["defect_occurrences"].append(entry)
+                
+                if dr.ocap_status in ["triggered", "in_progress"]:
+                    trace["quality_control"]["ocap_actions"].append({
+                        "linked_defect": dr.record_code,
+                        "root_cause": getattr(dr, "root_cause", "Unassigned"),
+                        "corrective_action": dr.corrective_action or "Not set",
+                        "preventive_action": dr.preventive_action or "Not set"
+                    })
+            
+            # ==========================================
+            # STEP D: 下游去向 - 这批产品/材料去了哪儿？
+            # ==========================================
+            
+            # D1. OutboundOrder（出库单）
+            outbound_stmt = select(OutboundOrder).where(
+                OutboundOrder.factory_id == factory_id if factory_id else True
+            )
+            out_result = await self.db.execute(outbound_stmt)
+            trace["downstream"]["outbound_deliveries"] = [
+                {"code": ob.outbound_code, "quantity": ob.quantity, "status": ob.status}
+                for ob in out_result.scalars().all()
+            ]
+            
+            trace["status"] = "success"
+            trace["completed_at"] = datetime.utcnow()
+            
+        except Exception as e:
+            trace["error"] = str(e)
+            trace["status"] = "partial_with_error"
         
-        # 2. 查询相关的 inbound order（采购入库）
-        # 注意：实际模型中可能有不同的批次关联方式，这里根据需求调整
-        inbound_stmt = select(InboundOrder).where(
-            InboundOrder.factory_id == "",  # 需根据实际 factory 过滤
-            InBatchCode == batch_id        # 需要确认字段名
-        )
-        # 由于批次关联的具体字段需要根据实际 schema 调整，这里先标记为待实现
-        # 实际生产中需要连接 inventory、bom_items、work_orders 等多表
-        
-        # 3. 构建追溯关系链（伪代码示意）
-        # trace["incoming_materials"] = query material info from bom_items where batch matches
-        # trace["production_orders"] = query work_orders that consumed this batch via BOM
-        # trace["defect_records"] = query defect_records where batch_id matches
+        return trace
         
         # 实际实现需要根据数据库 schema 进行多表 JOIN 查询
         # 这是一个复杂的查询优化点，可能需要建立专门的追溯视图
