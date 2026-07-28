@@ -1179,6 +1179,36 @@ class ApsScheduleTask(Base):
     )
 
 
+class APSRequest(Base):
+    """APS调度请求队列 - #11 PS事件解耦实现
+    
+    用于解耦报工服务与APS排程引擎，将重算请求持久化至队列表，
+    由独立消费者服务异步消费处理，支持重试和失败标记。
+    """
+    
+    __tablename__ = "aps_schedule_requests"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    mode = Column(String(20), default="hybrid")
+    horizon_days = Column(Integer, default=7)
+    optimize_for = Column(String(20), default="delivery")
+    source_type = Column(String(50), nullable=False)  # 'report_created', 'report_modified', 'manual'
+    source_id = Column(String(50))  # 触发报工ID或手动请求ID
+    status = Column(String(20), default="pending")  # pending, in_progress, completed, failed
+    retry_count = Column(Integer, default=0)
+    max_retries = Column(Integer, default=3)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text)
+    
+    __table_args__ = (
+        Index("idx_aps_req_factory_status", "factory_id", "status"),
+        Index("idx_aps_req_source", "source_type", "source_id"),
+    )
+
+
 class ApsWorkCalendar(Base):
     """工作日历（工位/产线的可用时间段）"""
     __tablename__ = "aps_work_calendars"

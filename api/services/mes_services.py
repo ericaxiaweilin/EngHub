@@ -75,39 +75,15 @@ class ProductionReportService:
         # 根据良品数量反向扣减 BOM 材料用量
         await self._backflush_materials(self.db, work_order_id, good_qty, created_by)
         
-        # #11 APS动态排程反馈 - 触发APS重新计算剩余工单计划
+        # #11 PS事件解耦（增强版）- 将APS重算请求写入数据库队列，由消费者服务异步处理
         if factory_id and work_order_id:
-            await self._notify_aps_on_report_update(work_order_id, factory_id)
+            await self._enqueue_aps_replan(work_order_id, factory_id, report.id, 'report_created', created_by or 'system')
         
         return report
     
-    async def _notify_aps_on_report_update(self, work_order_id: str, factory_id: str):
-        """#11 APS动态排程反馈 - 报工完成后触发APS重新计算
-        
-        使用 asyncio.create_task 异步调用，避免阻塞报工事务。
-        如果 APS 调度失败将记录日志但不影响主流程。
-        """
-        from logging import getLogger
-        
-        logger = getLogger(__name__)
-        
-        # 异步启动 APS 重排程（不等待完成）
-        async def trigger_aps_replan():
-            try:
-                aps_service = ApsService(self.db)
-                await aps_service.generate_schedule(
-                    factory_id=factory_id,
-                    mode="hybrid",
-                    horizon_days=7,
-                    optimize_for="delivery",
-                    updated_by="system"  # 修改参数以匹配 create_signature
-                )
-                logger.info(f"[APS] 重新排程完成 for work_order: {work_order_id}")
-            except Exception as e:
-                logger.error(f"[APS] 重排程失败: {e}")
-        
-        asyncio.create_task(trigger_aps_replan())
+    async def _update_work_order_qty(self, work_order_id: str):
         """更新工单完工数量"""
+        from sqlalchemy import func
         from sqlalchemy import func
         
         result = await self.db.execute(
@@ -233,6 +209,42 @@ class ProductionReportService:
             await db.rollback()
             # 记录错误日志
             return False
+    
+    async def _enqueue_aps_replan(self, work_order_id: str, factory_id: str, report_id: str, 
+                                  source_type: str, created_by: str) -> None:
+        """#11 PS事件解耦（增强版）- 将APS重算请求写入数据库队列，由消费者服务异步处理
+        
+        实现模式：生产者（报工服务）→ 队列表（APSRequest）→ 消费者服务 → APS引擎
+        优势：解耦报工与排程逻辑、支持重试机制、防止故障扩散、可水平扩展消费者
+        注意：此方法仅将请求入队，不等待 APS 计算完成
+        
+        Args:
+            work_order_id: 关联工单ID
+            factory_id: 工厂ID
+            report_id: 触发报工ID
+            source_type: 触发源 ('report_created', 'report_modified', 'manual')
+            created_by: 操作用户ID
+        """
+        from uuid import uuid4
+        from datetime import datetime
+        
+        # 插入APS调度请求到队列表
+        request = APSRequest(
+            id=str(uuid4()),
+            factory_id=factory_id,
+            mode='hybrid',
+            horizon_days=7,
+            optimize_for='delivery',
+            source_type=source_type,
+            source_id=report_id,
+            status='pending',
+            retry_count=0,
+            max_retries=3,
+            created_at=datetime.utcnow(),
+        )
+        
+        self.db.add(request)
+        await self.db.commit()
     
     async def list_reports(
         self,
