@@ -55,7 +55,7 @@ class MRPCalculateRequest(BaseModel):
 # --- MPS Endpoints ---
 
 
-@router.get("/plans")
+@router.get("/plans", description="获取生产计划列表。支持按工厂、状态、产品、日期范围过滤，默认按优先级分数降序排序返回分页结果。这是MPS主生产计划查询接口，用于生产计划员查看和管理所有生产计划任务。")
 async def list_plans(
     factory_id: str,
     status: Optional[str] = None,
@@ -96,14 +96,14 @@ async def list_plans(
     }
 
 
-@router.post("/plans")
+@router.post("/plans", description="创建新的主生产计划(MPS)。根据交期紧迫度和客户等级自动计算优先级分数，支持销售订单关联和计划类型指定。创建后计划状态为draft，需经确认审批后才能进一步处理。")
 async def create_plan(
     plan: PlanCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """创建生产计划（支持优先级自动计算）"""
-    plan_id = f"plan-{datetime.utcnow().strftime("%Y%m%d%H%M%S")}"
+    plan_id = f"plan-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
     
     # 计算优先级分数（基于交期紧迫度+客户等级）
     required_date = datetime.fromisoformat(plan.required_date)
@@ -129,7 +129,7 @@ async def create_plan(
     priority_score = min(due_score + level_score + plan.priority, 150)
     
     new_plan = Plan(
-        plan_code=f"MPS-{plan.factory_id[:8]}-{datetime.utcnow().strftime("%Y%m")}-{int(time.time())}",
+        plan_code=f"MPS-{plan.factory_id[:8]}-{datetime.utcnow().strftime('%Y%m')}-{int(time.time())}",
         factory_id=plan.factory_id,
         product_id=plan.product_id,
         quantity=plan.quantity,
@@ -147,7 +147,7 @@ async def create_plan(
     return _serialize_plan(new_plan)
 
 
-@router.get("/plans/{plan_id}")
+@router.get("/plans/{plan_id}", description="获取指定计划的详细信息。返回包括计划编码、产品、数量、需求日期、优先级分数、状态流转记录等完整信息，用于生产计划员查看和管理单个生产计划任务。")
 async def get_plan(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
@@ -160,7 +160,7 @@ async def get_plan(
     return _serialize_plan(p)
 
 
-@router.post("/plans/{plan_id}/confirm")
+@router.post("/plans/{plan_id}/confirm", description="确认生产计划，将状态从draft转换为confirmed。此操作表示计划已通过审核，可以进入下一步释放流程。仅草稿状态的计划可被确认。")
 async def confirm_plan(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
@@ -181,7 +181,7 @@ async def confirm_plan(
     return _serialize_plan(p)
 
 
-@router.post("/plans/{plan_id}/release")
+@router.post("/plans/{plan_id}/release", description="下达生产计划，将状态从confirmed转换为released。此操作会检查产能冲突并自动生成MES工单，触发APS排程集成。仅已确认的计划可被下达。")
 async def release_plan(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
@@ -200,7 +200,7 @@ async def release_plan(
     if conflicts:
         for c in conflicts:
             if c["severity"] == "HIGH":
-                raise HTTPException(status_code=409, detail=f"产能冲突: {c["message"]}")
+                raise HTTPException(status_code=409, detail=f"产能冲突: {c['message']}")
     
     p.status = "released"
     p.released_by = current_user.username if current_user else "system"
@@ -234,7 +234,7 @@ async def release_plan(
     return _serialize_plan(p)
 
 
-@router.post("/plans/{plan_id}/complete")
+@router.post("/plans/{plan_id}/complete", description="完成生产计划。将计划状态标记为completed，记录完成人和完成时间。用于在MES工单执行完成后更新MPS计划状态。")
 async def complete_plan(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
@@ -255,7 +255,7 @@ async def complete_plan(
     return _serialize_plan(p)
 
 
-@router.post("/plans/{plan_id}/cancel")
+@router.post("/plans/{plan_id}/cancel", description="取消生产计划。将计划状态标记为cancelled，填写取消原因。用于在计划不再需要时取消相关生产任务。")
 async def cancel_plan(
     plan_id: str,
     reason: str = Body(..., description="取消原因"),
@@ -278,7 +278,7 @@ async def cancel_plan(
     return _serialize_plan(p)
 
 
-@router.put("/plans/{plan_id}")
+@router.put("/plans/{plan_id}", description="更新生产计划。支持修改数量、优先级、客户等级等字段，可选地触发变更审批工作流和APS重排。用于对已创建计划的调整和优化。")
 async def update_plan(
     plan_id: str,
     updates: PlanUpdate,
@@ -466,7 +466,7 @@ async def list_plan_versions(
 # --- Capacity Analysis Endpoints ---
 
 
-@router.get("/capacity/analysis")
+@router.get("/capacity/analysis", description="产能负荷分析。获取指定工站在给定时间范围内的产能使用情况，包括总可用工时、已分配工时、剩余可用工时和负荷率。用于识别瓶颈工站和产能规划决策。")
 async def analyze_capacity(
     factory_id: str,
     station_id: str,
@@ -527,7 +527,7 @@ async def analyze_capacity(
     return load_analysis
 
 
-@router.post("/conflict/detect")
+@router.post("/conflict/detect", description="产能冲突检测。检查指定计划在给定工站的产能分配是否存在过载情况，返回冲突详情和建议的调整方案。在生产计划下达前用于验证可行性。")
 async def detect_conflicts(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
@@ -561,7 +561,7 @@ async def detect_conflicts(
             conflicts.append({
                 "type": "capacity_overload",
                 "station_id": sample_station,
-                "message": f"工站 {sample_station} 负荷率 {capacity_result["utilization_rate"]}%，可能无法按时交付",
+                "message": f"工站 {sample_station} 负荷率 {capacity_result['utilization_rate']}%，可能无法按时交付",
                 "severity": "HIGH"
             })
     
@@ -576,7 +576,7 @@ async def detect_conflicts(
     return {"conflicts": conflicts, "count": len(conflicts)}
 
 
-@router.get("/plans/{plan_id}/capacity-conflict")
+@router.get("/plans/{plan_id}/capacity-conflict", description="检查单个计划的产能冲突。验证指定计划在关联工站的排期是否存在负荷超过阈值（如90%）的冲突情况，返回冲突列表和警告信息。")
 async def check_plan_capacity_conflict(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
@@ -634,7 +634,7 @@ async def check_plan_capacity_conflict(
 # --- MRP Endpoints ---
 
 
-@router.post("/mrp/calculate")
+@router.post("/mrp/calculate", description="执行物料需求计划(MRP)计算。基于指定MPS计划的BOM展开，计算毛需求、扣除库存可用量和在途量，得出净需求量并生成采购建议。这是生产计划与采购执行的关键桥梁接口。")
 async def calculate_mrp(
     request: MRPCalculateRequest,
     db: AsyncSession = Depends(get_db),
@@ -708,7 +708,7 @@ async def calculate_mrp(
         })
     
     mrp_result = {
-        "id": f"MRP-{datetime.utcnow().strftime("%Y%m%d%H%M%S")}-{request.plan_id[:8]}",
+        "id": f"MRP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{request.plan_id[:8]}",
         "plan_id": request.plan_id,
         "plan_code": p.plan_code,
         "product_id": p.product_id,

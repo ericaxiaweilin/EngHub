@@ -293,6 +293,48 @@ class FileRecord(Base):
         }
 
 
+class Plan(Base):
+    """生产计划表 (MPS)"""
+    
+    __tablename__ = "pp_plans"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    plan_code = Column(String(50), unique=True, nullable=False, index=True)
+    plan_type = Column(String(20), nullable=False, default='mps')
+    product_id = Column(String(50), nullable=False, index=True)
+    sales_order_id = Column(String(50))
+    quantity = Column(Integer, nullable=False)
+    required_date = Column(Date, nullable=False)
+    due_date = Column(Date)
+    customer_level = Column(String(10), default='b')
+    priority = Column(Integer, default=50)
+    priority_score = Column(Numeric(10, 2))
+    status = Column(String(20), nullable=False, default='draft')
+    
+    station_id = Column(String(50))
+    scheduled_start_date = Column(Date)
+    scheduled_end_date = Column(Date)
+    
+    mrp_status = Column(String(20), default='pending')
+    
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    confirmed_by = Column(String(50))
+    released_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    confirmed_at = Column(DateTime)
+    released_at = Column(DateTime)
+    
+    __table_args__ = (
+        Index("idx_plan_factory", "factory_id"),
+        Index("idx_plan_status", "status"),
+        Index("idx_plan_product", "product_id"),
+        Index("idx_plan_required_date", "required_date"),
+    )
+
+
 class ProductionReport(Base):
     """生产报工表"""
     
