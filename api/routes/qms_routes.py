@@ -4,7 +4,7 @@ QMS API Routes
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy import select, func
