@@ -235,6 +235,35 @@ async def process_defect(
     return await submit_disposition(defect_id, disposition, db, current_user)
 
 
+@router.patch("/defects/{defect_id}")
+async def update_defect_ocap(
+    defect_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """更新缺陷OCAP信息 - 前端 OcapDetail 调用"""
+    r = await db.get(DefectRecord, defect_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="不良品记录不存在")
+    
+    # OCAP 字段更新
+    ocap_fields = [
+        "ocap_status", "ocap_trigger_reason", "root_cause",
+        "corrective_action", "preventive_action", "responsible_dept",
+        "severity", "defect_type", "description"
+    ]
+    for field in ocap_fields:
+        if field in data and data[field] is not None:
+            setattr(r, field, data[field])
+    
+    r.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(r)
+    
+    return _serialize_defect(r)
+
+
 def _serialize_defect(r: DefectRecord) -> dict:
     """序列化缺陷记录，字段对齐前端 Defect 接口 + 完整品质追溯"""
     return {
@@ -570,9 +599,23 @@ async def create_quality_goal(
 
 
 @router.post("/qms/goals/{goal_id}/review")
-async 
+async def review_quality_goal(
+    goal_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """评审质量目标"""
+    goal = await db.get(QualityGoal, goal_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="质量目标不存在")
+    goal.status = "reviewed"
+    goal.reviewed_at = datetime.utcnow()
+    goal.reviewed_by = current_user.username if current_user else "system"
+    await db.commit()
+    return {"success": True, "message": "质量目标已评审"}
 
-# --- IQ C 来料检验专属接口 ---
+
+# --- IQC 来料检验专属接口 ---
 
 class IQCCreateRequest(BaseModel):
     """IQ C 创建请求体"""
@@ -704,39 +747,6 @@ async def get_iqc_stats(
     
     stats = await qms.get_iqc_statistics(factory_id)
     return {"success": True, "data": stats}
-def review_quality_goal(
-    goal_id: str,
-    body: dict,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """评审质量目标"""
-    import uuid
-    from datetime import datetime, timedelta
-    from database.models import QualityGoal, QualityGoalReview
-    stmt = select(QualityGoal).where(QualityGoal.id == goal_id)
-    result = await db.execute(stmt)
-    goal = result.scalar_one_or_none()
-    if not goal:
-        raise HTTPException(status_code=404, detail="目标不存在")
-
-    measured = float(body.get("measured_value", 0))
-    gap = measured - goal.target_value
-    review = QualityGoalReview(
-        id=str(uuid.uuid4()),
-        goal_id=goal_id,
-        measured_value=measured,
-        gap=gap,
-        status=body.get("status", "on_track"),
-        action_plan=body.get("action_plan"),
-        reviewed_by=current_user.username,
-    )
-    db.add(review)
-    goal.current_value = measured
-    goal.last_reviewed_at = datetime.utcnow()
-    goal.next_review_at = datetime.utcnow() + timedelta(days=goal.review_frequency_days or 30)
-    await db.commit()
-    return {"success": True, "gap": gap}
 
 
 # --- FAI 首件检验专属接口 ---
@@ -756,7 +766,7 @@ class FAICreateRequest(BaseModel):
     sample_qty: int = 1
 
 
-@router.post("/faicreate")
+@router.post("/fai/create")
 async def create_fai_request(
     body: FAICreateRequest,
     db: AsyncSession = Depends(get_db),
@@ -828,7 +838,7 @@ class IPCCreateRequest(BaseModel):
     check_items: Optional[List[Dict]] = None
 
 
-@router.post("/ipcreatoe")
+@router.post("/ipc/create")
 async def create_ipc_request(
     body: IPCCreateRequest,
     db: AsyncSession = Depends(get_db),
@@ -896,7 +906,7 @@ class OQCCreateRequest(BaseModel):
     check_items: Optional[List[Dict]] = None
 
 
-@router.post("/oqcreatoe")
+@router.post("/oqc/create")
 async def create_oqc_request(
     body: OQCCreateRequest,
     db: AsyncSession = Depends(get_db),

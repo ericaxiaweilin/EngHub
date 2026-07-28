@@ -154,7 +154,7 @@ const ProcessQueue: React.FC = () => {
         }
         
         return (
-          <Space direction="vertical" align={center}>
+          <Space direction="vertical" align="center">
             {startButton}
             {lockTip}
             {record.status === 'in_progress' && canComplete && (

@@ -199,12 +199,13 @@ export default function RCCCommandCenter() {
     const avgLoadRate = ((people.work_center_load || []).reduce((sum: number, wc: any) => sum + (wc.load_rate || 0), 0)) / 
                        Math.max((people.work_center_load || []).length, 1)
 
-    const scenarios = [
+    const scenarioList = [
       { label: '满负荷', value: '满', condition: avgLoadRate >= 0.85, icon: <FireOutlined style={{ color: '#ff4d4f' }} />, color: '#ff4d4f' },
       { label: '高负荷', value: '高', condition: avgLoadRate >= 0.7, icon: <WarningOutlined style={{ color: '#faad14' }} />, color: '#faad14' },
-      { label: '中负荷', value: '中', condition: avgLoadRate >= 0.4, icon: <DashboardOutlinedIcon style={{ color: '#1890ff' }} />, color: '#1890ff' },
+      { label: '中负荷', value: '中', condition: avgLoadRate >= 0.4, icon: <DashboardOutlined style={{ color: '#1890ff' }} />, color: '#1890ff' },
       { label: '低负荷', value: '低', condition: avgLoadRate < 0.4, icon: <CaretDownOutlined style={{ color: '#52c41a' }} />, color: '#52c41a' },
-    ].find(s => s.condition) || scenarios[2]
+    ]
+    const scenarios = scenarioList.find(s => s.condition) || scenarioList[2]
 
     return (
       <div>
@@ -374,9 +375,9 @@ export default function RCCCommandCenter() {
             <Card size="small" title="决策依据">
               <Descriptions column={1} bordered>
                 <Descriptions.Item label="在岗人数">{getStatValue(['baseline', 'people', 'active_workers'], 0)} 人</Descriptions.Item>
-                <Descriptions.Item label="可用设备">{getStatValue(['baseline', 'equipment', 'status_distribution'] as any, {})?.running || 0} 台</Descriptions.Item>
-                <Descriptions.Item label="当前工单">{Object.keys(getStatValue(['baseline', 'work_orders', 'status'] as any, {})).reduce((s: number, k: string) => s + (getStatValue(['baseline', 'work_orders', 'status'] as any, {})[k] as number), 0)} 个</Descriptions.Item>
-                <Descriptions.Item label="平均负荷">{Math.round(getStatValue(['baseline', 'people', 'work_center_load']) as any * 100)}%</Descriptions.Item>
+                <Descriptions.Item label="可用设备">{(rccData?.baseline?.equipment?.status_distribution as any)?.running || 0} 台</Descriptions.Item>
+                <Descriptions.Item label="当前工单">{Object.values(rccData?.baseline?.work_orders?.status || {}).reduce((s: number, v: any) => s + (Number(v) || 0), 0)} 个</Descriptions.Item>
+                <Descriptions.Item label="平均负荷">{Math.round(((rccData?.baseline?.people?.work_center_load || []) as any[]).reduce((s: number, wc: any) => s + (wc?.load_rate || 0), 0) / Math.max((rccData?.baseline?.people?.work_center_load || [] as any[]).length, 1) * 100)}%</Descriptions.Item>
               </Descriptions>
             </Card>
             
@@ -625,7 +626,7 @@ export default function RCCCommandCenter() {
   // ==================== 主渲染 ====================
   return (
     <Card 
-      title={<><DashboardOutlinedIcon /> EngHub RCC — 生产调度指挥中心</>} 
+      title={<><DashboardOutlined /> EngHub RCC — 生产调度指挥中心</>}
       loading={loadingData}
       extra={
         <Space>

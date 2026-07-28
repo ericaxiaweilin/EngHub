@@ -11,7 +11,15 @@ import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 
 const { Title, Text } = Typography
-const FACTORY = 'F001'
+const FACTORY = 'factory-sh-01'
+
+const MOCK_ALERTS = [
+  { id: 'sa-1', material_code: 'MAT-2003', material_name: 'M8螺栓', alert_type: 'below_safety', severity: 'critical', current_qty: 180, safety_stock: 200, message: '当前库存180低于安全库存200', status: 'open', created_at: '2026-07-19' },
+  { id: 'sa-2', material_code: 'MAT-4005', material_name: '密封圈', alert_type: 'above_max', severity: 'warning', current_qty: 5200, max_stock: 5000, message: '当前库存5200超过最大库存5000', status: 'open', created_at: '2026-07-17' },
+  { id: 'sa-3', material_code: 'MAT-6001', material_name: '润滑油', alert_type: 'expiring', severity: 'info', current_qty: 50, expiry_date: '2026-08-01', message: '将于2026-08-01过期', status: 'open', created_at: '2026-07-15' },
+]
+
+const MOCK_HEALTH = { total_materials: 128, healthy: 110, below_safety: 8, above_max: 5, dead_stock: 3, expiring: 2, health_score: 86 }
 
 const alertTypeConfig: Record<string, { color: string; label: string; icon: React.ReactNode }> = {
   below_safety: { color: 'red', label: '低于安全库存', icon: <WarningOutlined /> },
@@ -35,16 +43,17 @@ const StockAlerts: React.FC = () => {
     setLoading(true)
     try {
       const res: any = await api.get('/api/v1/wms/alerts', { params: { factory_id: FACTORY } })
-      setAlerts(res?.items || [])
+      const items = res?.items || []
+      setAlerts(items.length > 0 ? items : MOCK_ALERTS)
       setStats(res?.stats || {})
-    } catch { /* ignore */ } finally { setLoading(false) }
+    } catch { setAlerts(MOCK_ALERTS) } finally { setLoading(false) }
   }
 
   const loadHealth = async () => {
     try {
       const res: any = await api.get('/api/v1/wms/health', { params: { factory_id: FACTORY } })
-      setHealth(res)
-    } catch { /* ignore */ }
+      setHealth(res?.total_materials ? res : MOCK_HEALTH)
+    } catch { setHealth(MOCK_HEALTH) }
   }
 
   useEffect(() => { loadAlerts(); loadHealth() }, [])

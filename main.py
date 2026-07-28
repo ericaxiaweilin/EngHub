@@ -323,6 +323,10 @@ async def _start_scheduler():
     asyncio.create_task(_periodic_scheduler())
     _logger.info(f"[scheduler] 后台调度器已启动，间隔 {_SCHEDULER_INTERVAL}s")
 
+    # 幂等技能种子：确保 skills + hr_employee_skills 数据存在（防 DB 重建后丢失）
+    from scripts.seed_skills_startup import run_skill_seed
+    asyncio.create_task(run_skill_seed())
+
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------
 FRONTEND_DIST = Path(os.environ.get("FRONTEND_DIST", str(Path(__file__).parent / "frontend_dist")))

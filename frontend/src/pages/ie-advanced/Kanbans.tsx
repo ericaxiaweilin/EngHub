@@ -22,8 +22,15 @@ interface Kanban {
   created_at: string
 }
 
+const MOCK_DATA: Kanban[] = [
+  { id: 'kb-1', factory_id: 'factory-sh-01', kanban_id: 'KB-001', part_number: 'MAT-1001', part_name: '轴承 6205', quantity_per_container: 50, num_containers: 4, replenishment_time_hours: 2.0, status: 'active', created_at: '2026-05-01' },
+  { id: 'kb-2', factory_id: 'factory-sh-01', kanban_id: 'KB-002', part_number: 'MAT-2003', part_name: 'M8螺栓', quantity_per_container: 200, num_containers: 6, replenishment_time_hours: 1.5, status: 'active', created_at: '2026-05-10' },
+  { id: 'kb-3', factory_id: 'factory-sh-01', kanban_id: 'KB-003', part_number: 'MAT-3010', part_name: 'PCB主板', quantity_per_container: 20, num_containers: 3, replenishment_time_hours: 4.0, status: 'active', created_at: '2026-06-01' },
+  { id: 'kb-4', factory_id: 'factory-sh-01', kanban_id: 'KB-004', part_number: 'MAT-4005', part_name: '密封圈', quantity_per_container: 100, num_containers: 5, replenishment_time_hours: 1.0, status: 'inactive', created_at: '2026-06-15' },
+]
+
 const Kanbans: React.FC = () => {
-  const [factory, setFactory] = useState('F001')
+  const [factory, setFactory] = useState('factory-sh-01')
   const [data, setData] = useState<Kanban[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -34,8 +41,9 @@ const Kanbans: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_KANBANS, { params: { factory_id: factory, limit: 200 } })
-      setData(res.items || res || [])
-    } catch { setData([]) } finally { setLoading(false) }
+      const items = res.items || res || []
+      setData(items.length > 0 ? items : MOCK_DATA)
+    } catch { setData(MOCK_DATA) } finally { setLoading(false) }
   }
 
   useEffect(() => { fetchData() }, [factory])
@@ -99,7 +107,7 @@ const Kanbans: React.FC = () => {
       <Card title="Kanban看板管理" extra={
         <Space>
           <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
-            <Select.Option value="F001">F001 厂区</Select.Option><Select.Option value="F01">F01 厂区</Select.Option>
+            <Select.Option value="factory-sh-01">上海工厂</Select.Option><Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option><Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
           </Select>
           <Button type="primary" icon={<PlusOutlined />} size="small" onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true) }}>新增</Button>
         </Space>

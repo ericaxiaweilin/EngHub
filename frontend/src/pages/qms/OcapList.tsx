@@ -60,7 +60,7 @@ const OcapList: React.FC = () => {
           <Button 
             size="small" 
             type="primary"
-            onClick={() => navigate(`/qms/ocaps/${record.id}`)}
+            onClick={() => navigate(`/ocaps/${record.id}`)}
           >
             详情
           </Button>

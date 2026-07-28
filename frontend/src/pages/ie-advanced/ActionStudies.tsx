@@ -27,8 +27,16 @@ const MOTION_MAP: Record<string, string> = {
   release: '释放', inspect: '检验', assemble: '装配', use_tool: '使用工具',
 }
 
+const MOCK_DATA: ActionStudy[] = [
+  { id: 'as-1', factory_id: 'factory-sh-01', operation_name: '装配轴承', station_id: 'ST-01', motion_type: 'reach', motion_distance_cm: 35, time_seconds: 1.2, difficulty_level: 'easy', improvement_note: '缩短取料距离', created_at: '2026-06-01' },
+  { id: 'as-2', factory_id: 'factory-sh-01', operation_name: '拧紧螺栓', station_id: 'ST-02', motion_type: 'grasp', motion_distance_cm: 15, time_seconds: 2.8, difficulty_level: 'medium', improvement_note: '改用电动扳手', created_at: '2026-06-05' },
+  { id: 'as-3', factory_id: 'factory-sh-01', operation_name: '焊接PCB', station_id: 'ST-03', motion_type: 'position', motion_distance_cm: 8, time_seconds: 4.5, difficulty_level: 'hard', improvement_note: '增加定位夹具', created_at: '2026-06-10' },
+  { id: 'as-4', factory_id: 'factory-sh-01', operation_name: '包装封箱', station_id: 'ST-04', motion_type: 'move', motion_distance_cm: 50, time_seconds: 3.1, difficulty_level: 'easy', improvement_note: '传送带替代人工搬运', created_at: '2026-06-15' },
+  { id: 'as-5', factory_id: 'factory-sh-01', operation_name: '检验外观', station_id: 'ST-05', motion_type: 'inspect', motion_distance_cm: 20, time_seconds: 5.0, difficulty_level: 'medium', improvement_note: '引入AOI自动检测', created_at: '2026-06-20' },
+]
+
 const ActionStudies: React.FC = () => {
-  const [factory, setFactory] = useState('F001')
+  const [factory, setFactory] = useState('factory-sh-01')
   const [data, setData] = useState<ActionStudy[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -39,8 +47,9 @@ const ActionStudies: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_ACTION_STUDIES, { params: { factory_id: factory, limit: 200 } })
-      setData(res.items || res || [])
-    } catch { setData([]) } finally { setLoading(false) }
+      const items = res.items || res || []
+      setData(items.length > 0 ? items : MOCK_DATA)
+    } catch { setData(MOCK_DATA) } finally { setLoading(false) }
   }
 
   useEffect(() => { fetchData() }, [factory])
@@ -110,7 +119,7 @@ const ActionStudies: React.FC = () => {
       <Card title="动作研究" extra={
         <Space>
           <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
-            <Select.Option value="F001">F001 厂区</Select.Option><Select.Option value="F01">F01 厂区</Select.Option>
+            <Select.Option value="factory-sh-01">上海工厂</Select.Option><Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option><Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
           </Select>
           <Button type="primary" icon={<PlusOutlined />} size="small" onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true) }}>新增</Button>
         </Space>

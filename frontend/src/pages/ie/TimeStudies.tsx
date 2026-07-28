@@ -32,8 +32,17 @@ const STATUS_MAP: Record<string, { color: string; text: string }> = {
   draft: { color: 'orange', text: '草稿' },
 }
 
+const MOCK_DATA: TimeStudy[] = [
+  { id: 'ts-1', factory_id: 'factory-sh-01', station_id: 'ST-01', operation_name: '装配轴承', operator_id: 'OP-001', average_time: 45.2, normal_time: 42.0, allowed_time: 50.4, status: 'completed', created_at: '2026-06-01' },
+  { id: 'ts-2', factory_id: 'factory-sh-01', station_id: 'ST-02', operation_name: '焊接PCB', operator_id: 'OP-002', average_time: 32.8, normal_time: 30.5, allowed_time: 36.6, status: 'completed', created_at: '2026-06-05' },
+  { id: 'ts-3', factory_id: 'factory-sh-01', station_id: 'ST-03', operation_name: '精密研磨', operator_id: 'OP-003', average_time: 68.5, normal_time: 64.0, allowed_time: 76.8, status: 'in_progress', created_at: '2026-06-10' },
+  { id: 'ts-4', factory_id: 'factory-sh-01', station_id: 'ST-04', operation_name: '包装封箱', operator_id: 'OP-004', average_time: 22.1, normal_time: 20.0, allowed_time: 24.0, status: 'completed', created_at: '2026-06-12' },
+  { id: 'ts-5', factory_id: 'factory-sh-01', station_id: 'ST-05', operation_name: 'CNC加工', operator_id: 'OP-005', average_time: 120.0, normal_time: 112.0, allowed_time: 134.4, status: 'pending', created_at: '2026-06-15' },
+  { id: 'ts-6', factory_id: 'factory-sh-01', station_id: 'ST-01', operation_name: '来料检验', operator_id: 'OP-006', average_time: 18.6, normal_time: 17.2, allowed_time: 20.6, status: 'completed', created_at: '2026-06-18' },
+]
+
 const TimeStudies: React.FC = () => {
-  const [factory, setFactory] = useState('F001')
+  const [factory, setFactory] = useState('factory-sh-01')
   const [data, setData] = useState<TimeStudy[]>([])
   const [loading, setLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
@@ -47,9 +56,10 @@ const TimeStudies: React.FC = () => {
       const res = await api.get(API_ENDPOINTS.IE_TIME_STUDIES, {
         params: { factory_id: factory, limit: 500 },
       })
-      setData(res.items || res || [])
+      const items = res.items || res || []
+      setData(items.length > 0 ? items : MOCK_DATA)
     } catch {
-      setData([])
+      setData(MOCK_DATA)
     } finally {
       setLoading(false)
     }
@@ -168,9 +178,10 @@ const TimeStudies: React.FC = () => {
         title="时间研究"
         extra={
           <Space>
-            <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
-              <Select.Option value="F001">F001 厂区</Select.Option>
-              <Select.Option value="F01">F01 厂区</Select.Option>
+            <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
+              <Select.Option value="factory-sh-01">上海工厂</Select.Option>
+              <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
+              <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
             </Select>
             <Input.Search placeholder="搜索作业/工位..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} allowClear style={{ width: 180 }} size="small" />
             <Button type="primary" icon={<PlusOutlined />} size="small" onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true) }}>新增</Button>

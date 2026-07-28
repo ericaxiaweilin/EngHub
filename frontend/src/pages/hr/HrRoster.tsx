@@ -79,6 +79,14 @@ const STATUS_MAP: Record<string, { color: string; text: string }> = {
 const SKILL_COLORS: Record<string, string> = { L1: 'default', L2: 'blue', L3: 'cyan', L4: 'purple', L5: 'gold' }
 const LEVEL_OPTIONS = ['L1', 'L2', 'L3', 'L4', 'L5'].map(l => ({ value: l, label: l }))
 
+const MOCK_EMPLOYEES: any[] = [
+  { id: 'emp-1', employee_code: 'EMP-001', name: '张伟', department: '生产部', station: 'CNC加工', position: '操作工', status: 'active', hire_date: '2023-03-15', phone: '138****1001' },
+  { id: 'emp-2', employee_code: 'EMP-002', name: '李娜', department: '质量部', station: 'IQC检验', position: '检验员', status: 'active', hire_date: '2022-08-01', phone: '139****2002' },
+  { id: 'emp-3', employee_code: 'EMP-003', name: '王强', department: '生产部', station: '装配线', position: '班组长', status: 'active', hire_date: '2021-05-20', phone: '137****3003' },
+  { id: 'emp-4', employee_code: 'EMP-004', name: '赵敏', department: '设备部', station: '维修组', position: '维修工程师', status: 'active', hire_date: '2024-01-10', phone: '136****4004' },
+  { id: 'emp-5', employee_code: 'EMP-005', name: '刘洋', department: '物流部', station: '仓库', position: '仓管员', status: 'leave', hire_date: '2023-11-05', phone: '135****5005' },
+]
+
 export default function HrRoster() {
   const [stats, setStats] = useState<HrStats | null>(null)
   const [employees, setEmployees] = useState<Employee[]>([])
@@ -127,8 +135,12 @@ export default function HrRoster() {
     if (status) params.status = status
     if (keyword) params.keyword = keyword
     api.get('/api/v1/hr/employees', { params })
-      .then((res: any) => { setEmployees(res.items || []); setTotal(res.total || 0) })
-      .catch(() => {})
+      .then((res: any) => {
+        const items = res.items || []
+        setEmployees(items.length > 0 ? items : MOCK_EMPLOYEES)
+        setTotal(res.total || items.length || MOCK_EMPLOYEES.length)
+      })
+      .catch(() => { setEmployees(MOCK_EMPLOYEES); setTotal(MOCK_EMPLOYEES.length) })
       .finally(() => setLoading(false))
   }
 

@@ -1,14 +1,13 @@
 import React, { useEffect, useState } from 'react'
 import { 
   Card, Table, Tag, Space, Button, Modal, Form, Input, InputNumber, Select,
-  message, Typography, Row, Col, Tree, Spin, Tabs, Tooltip, InputTextArea
+  message, Typography, Row, Col, Tree, Spin, Tabs
 } from 'antd'
 import { 
   PlusOutlined, MinusOutlined, SplitCellsOutlined, UndoOutlined, ReloadOutlined, 
   RightCircleOutlined, ApartmentOutlined, HistoryOutlined
 } from '@ant-design/icons'
-import type { ColumnsType } from 'antd/es/table'
-import type { TreeDataNode } from 'antd/lib/tree/interface'
+import type { TreeDataNode } from 'antd'
 import dayjs from 'dayjs'
 import api from '../../services/api'
 import { getStoredUser, hasPermission } from '../../services/auth'
@@ -82,7 +81,7 @@ const WorkOrderSplitPage: React.FC = () => {
     setLoading(true)
     api.get(`/api/v1/work-orders/${workOrderId}`)
       .then(res => {
-        setWorkOrder(res as WorkOrder)
+        setWorkOrder(res.data as WorkOrder)
         loadTree()
         loadHistory()
       })
@@ -97,7 +96,7 @@ const WorkOrderSplitPage: React.FC = () => {
     if (!workOrderId) return
     try {
       const res = await api.get(`/api/v1/work-orders/${workOrderId}/tree`)
-      window.currentWoTree = res.data.tree
+      ;(window as any).currentWoTree = res.data.tree
     } catch (err) {
       console.error('Failed to load tree', err)
     }
@@ -127,7 +126,7 @@ const WorkOrderSplitPage: React.FC = () => {
       })
       setPreview(res.data.result)
     } catch (err) {
-      message.error('预览失败：' + (err.response?.data?.detail || err.message))
+      message.error('预览失败：' + ((err as any).response?.data?.detail || (err as any).message))
     }
   }
 
@@ -135,7 +134,7 @@ const WorkOrderSplitPage: React.FC = () => {
   const executeSplit = async () => {
     if (!workOrderId || !workOrder || !preview) return
     
-    const confirmResult = await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve) => {
       Modal.confirm({
         title: `确认拆分操作`,
         content: <p>即将执行 <strong>{splitMethod}</strong> 拆分，生成 <strong>{preview.total_children}</strong> 个子工单。</p>,
@@ -145,7 +144,7 @@ const WorkOrderSplitPage: React.FC = () => {
     })
     
     try {
-      const res = await api.post(`/api/v1/work-orders/${workOrderId}/split-advanced`, {
+      await api.post(`/api/v1/work-orders/${workOrderId}/split-advanced`, {
         method: splitMethod,
         parameters,
         remark: '通过独立拆单页面执行'
@@ -158,7 +157,7 @@ const WorkOrderSplitPage: React.FC = () => {
       loadTree()
       loadHistory()
     } catch (err) {
-      message.error('拆分失败：' + (err.response?.data?.detail || err.message))
+      message.error('拆分失败：' + ((err as any).response?.data?.detail || (err as any).message))
     }
   }
 
@@ -166,7 +165,7 @@ const WorkOrderSplitPage: React.FC = () => {
   const reverseSplit = async () => {
     if (!workOrderId) return
     
-    const confirmResult = await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve) => {
       Modal.confirm({
         title: '反拆分警告',
         content: '将把子工单合并回主工单，此操作不可逆。确定继续？',
@@ -176,13 +175,13 @@ const WorkOrderSplitPage: React.FC = () => {
     })
     
     try {
-      const res = await api.delete(`/api/v1/work-orders/${workOrderId}/reverse-split`)
+      await api.delete(`/api/v1/work-orders/${workOrderId}/reverse-split`)
       message.success('反拆分成功！')
       setPreview(null)
       loadTree()
       loadHistory()
     } catch (err) {
-      message.error('反拆分失败：' + (err.response?.data?.detail || err.message))
+      message.error('反拆分失败：' + ((err as any).response?.data?.detail || (err as any).message))
     }
   }
 
@@ -254,7 +253,7 @@ const WorkOrderSplitPage: React.FC = () => {
   }
 
   if (loading) {
-    return <div style={{ padding: 24 }}><Spin message="加载中工单信息..." /></div>
+    return <div style={{ padding: 24 }}><Spin tip="加载中工单信息..." /></div>
   }
 
   if (!workOrder) {
@@ -301,8 +300,8 @@ const WorkOrderSplitPage: React.FC = () => {
             <div><Text strong>良率：</Text>{((workOrder.good_qty / Math.max(workOrder.completed_qty, 1)) * 100).toFixed(1)}%</div>
           </Col>
           <Col span={6}>
-            <div><Text strong>状态：</Text><Tag color={workOrder.status}>{workOrder.status_text || workOrder.status}</Tag></div>
-            <div><Text strong>优先级：</Text><Tag color={{ urgent: 'red', high: 'orange', medium: 'blue', low: 'default' }[workOrder.priority]}>{workOrder.priority_text || workOrder.priority}</Tag></div>
+            <div><Text strong>状态：</Text><Tag color={workOrder.status}>{(workOrder as any).status_text || workOrder.status}</Tag></div>
+            <div><Text strong>优先级：</Text><Tag color={{ urgent: 'red', high: 'orange', medium: 'blue', low: 'default' }[workOrder.priority]}>{(workOrder as any).priority_text || workOrder.priority}</Tag></div>
             <div><Text strong>交期：</Text>{workOrder.planned_due ? dayjs(workOrder.planned_due).format('YYYY-MM-DD') : '无'}</div>
           </Col>
           <Col span={6}>
@@ -333,7 +332,7 @@ const WorkOrderSplitPage: React.FC = () => {
           </Col>
         </Row>
         <Row style={{ marginTop: 16 }}>
-          <Button type="primary" icon={ReloadOutlined} onClick={previewSplit}>
+          <Button type="primary" icon={<ReloadOutlined />} onClick={previewSplit}>
             预览拆分结果
           </Button>
         </Row>
@@ -349,7 +348,7 @@ const WorkOrderSplitPage: React.FC = () => {
               { title: '计划量', dataIndex: 'planned_qty', key: 'qty', width: 120, align: 'right' },
               { title: '状态', dataIndex: 'status', key: 'status', width: 100 },
             ]}
-            row={(record) => record.isMaster ? { background: '#f0f8ff' } : {}}
+            rowClassName={(record: any) => record.isMaster ? 'row-master-highlight' : ''}
           />
           <Row gutter={16} style={{ marginTop: 16 }}>
             <Col span={12}>
@@ -380,10 +379,10 @@ const WorkOrderSplitPage: React.FC = () => {
         
         {treeView && (
           <div style={{ padding: 16, border: '1px solid #f0f0f0', borderRadius: 4, maxHeight: 400, overflow: 'auto' }}>
-            {window.currentWoTree ? (
+            {(window as any).currentWoTree ? (
               <Tree 
-                treeData={buildTreeData(window.currentWoTree)} 
-                expandedKeys={window.currentWoTree.master_wo.code ? [window.currentWoTree.master_wo.code] : []}
+                treeData={buildTreeData((window as any).currentWoTree)} 
+                expandedKeys={(window as any).currentWoTree.master_wo.code ? [(window as any).currentWoTree.master_wo.code] : []}
                 onExpand={(expandedKeys) => console.log('Expanded:', expandedKeys)}
               />
             ) : (

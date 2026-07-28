@@ -56,18 +56,78 @@ class ApsService:
 
     
 
-    async def reschedule_incremente(
+    
         self,
         factory_id: str,
-        affected_wo_ids: List[str],
+        affected_wo_ids: Optional[List[str]] = None,
+        horizon_days: int = 7,
+        optimize_for: str = "delivery",
+        created_by: str = "system",
+    ) -> Dict[str, Any]:
+        """增量重排：仅对指定工单进行局部调度优化
+        
+        Args:
+            factory_id: 工厂ID
+            affected_wo_ids: 受影响的工单ID列表（如为空则全量重排）
+            horizon_days: 排程展望期（天）
+            optimize_for: 优化目标（delivery/cost/efficiency）
+            created_by: 操作人
+            
+        Returns:
+            包含差异报告和调度结果的字典
+        """
+        from core.aps.incremental_scheduler import IncrementalReplanner
+        
+        replanner = IncrementalReplanner(self.db)
+        
+        result = replanner.perform_incremental_replan(
+            factory_id=factory_id,
+            horizon_days=horizon_days,
+            affected_wo_ids=affected_wo_ids,
+            optimize_for=optimize_for,
+            created_by=created_by,
+        )
+        
+
+
+    ) -> Dict[str, Any]:
+        """增量重排：仅对指定工单进行局部调度优化
+        
+        Args:
+            factory_id: 工厂ID
+            affected_wo_ids: 受影响的工单ID列表（如为空则全量重排）
+            horizon_days: 排程展望期（天）
+            optimize_for: 优化目标（delivery/cost/efficiency）
+            created_by: 操作人
+            
+        Returns:
+            包含差异报告和调度结果的字典
+        """
+        from core.aps.incremental_scheduler import IncrementalReplanner
+        
+        replanner = IncrementalReplanner(self.db)
+        
+        result = replanner.perform_incremental_replan(
+            factory_id=factory_id,
+            horizon_days=horizon_days,
+            affected_wo_ids=affected_wo_ids,
+            optimize_for=optimize_for,
+            created_by=created_by,
+        )
+        
+        return result
+async def reschedule_incremente(
+        self,
+        factory_id: str,
+        affected_wo_ids: Optional[List[str]] = None,
         created_by: str = "system",
     ) -> Dict[str, Any]:
         """增量重排：仅对受影响的工单进行局部重算
         
         Args:
-            factory_id: 工厂ID
-            affected_wo_ids: 需要重新排程的工单ID列表（受影响的部分）
-            created_by: 操作用户
+        factory_id: str,
+        affected_wo_ids: Optional[List[str]] = None,
+        created_by: str = "system",
         
         Returns:
             {
@@ -83,7 +143,7 @@ class ApsService:
         from datetime import datetime, timedelta
         import uuid
         
-        if not affected_wo_ids:
+        affected_wo_ids: Optional[List[str]] = None,
             return {
                 "success": True,
                 "schedule_id": None,
@@ -94,18 +154,18 @@ class ApsService:
                 "metrics": {},
             }
         
-        schedule_id = f"INCR-{factory_id[:6]}-{int(uuid.uuid4().hex[:8], 16)}"
+    ) -> Dict[str, Any]:
         
         tasks = []
-        current_time = datetime.now()
+    ) -> Dict[str, Any]:
         
-        for idx, wo_id in enumerate(affected_wo_ids):
-            for op_seq in range(1, 4):
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
                 setup_sec = 300 + idx * 30
                 run_sec = 600 + idx * 100 + op_seq * 100
                 
-                planned_start = current_time + timedelta(hours=idx * 2 + op_seq * 0.5)
-                planned_end = planned_start + timedelta(seconds=setup_sec + run_sec)
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
                 
                 tasks.append({
                     "work_order_id": wo_id,
@@ -113,7 +173,7 @@ class ApsService:
                     "product_code": f"PROD-{idx}",
                     "operation_seq": op_seq,
                     "operation_name": f"工序{op_seq}",
-                    "station_id": f"STA-{(idx+op_seq)%3+1}",
+    ) -> Dict[str, Any]:
                     "planned_start": planned_start,
                     "planned_end": planned_end,
                     "setup_seconds": setup_sec,
@@ -122,37 +182,37 @@ class ApsService:
                     "status": "planned",
                     "is_locked": False,
                     "priority": 50 + idx * 10,
-                })
+    ) -> Dict[str, Any]:
         
-        total_run = sum(t["run_seconds"] for t in tasks)
-        stations = set(t["station_id"] for t in tasks)
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         
         diff_report = {
-            "affected_wo_count": len(affected_wo_ids),
-            "operations_replanned": len(tasks),
-            "stations_affected": list(stations),
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
             "total_processing_seconds": total_run,
-            "change_summary": f"对 {len(affected_wo_ids)} 个工单执行局部重算，生成 {len(tasks)} 条操作计划",
+    ) -> Dict[str, Any]:
         }
         
         metrics = {
-            "total_tasks": len(tasks),
-            "avg_setup_time_seconds": round(sum(t["setup_seconds"] for t in tasks) / len(tasks)) if tasks else 0,
-            "max_station_utilization": min(95.0, 70.0 + len(affected_wo_ids) * 5),
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
             "estimated_on_time_delivery": 92.0,
         }
         
         return {
             "success": True,
             "schedule_id": schedule_id,
-            "affected_wo_count": len(affected_wo_ids),
-            "tasks_processed": len(tasks),
-            "message": f"成功处理 {len(affected_wo_ids)} 个工单的增量重排",
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
             "diff_report": diff_report,
             "metrics": metrics,
         }
 
-    def _get_mock_routing_for_product(self, product_code: str) -> List[Dict]:
+        self,
         """获取产品的模拟工艺路线"""
         # 实际应从 RoutingTable 查询
         routings = {
@@ -168,12 +228,12 @@ class ApsService:
                 {"seq": 30, "name": "包装", "station": "STA-PACK-01", "setup_time": 100, "run_rate": 4.0},
             ],
         }
-        return routings.get(product_code, [{"seq": 10, "name": "通用工序", "station": "STA-GEN-01", "setup_time": 300, "run_rate": 1.0}])
+    ) -> Dict[str, Any]:
     
-    def _calculate_priority_for_op(self, operation: Dict) -> int:
+        self,
         """计算任务优先级（基于数量、紧迫度等简化指标）"""
         base = 50
-        quantity_bonus = min(50, max(0, (operation["quantity"] - 100) // 10))
+    ) -> Dict[str, Any]:
         return base + quantity_bonus
     
     def _generate_incremental_diff_report(
@@ -184,43 +244,43 @@ class ApsService:
     ) -> Dict:
         """生成增量变更对比报告"""
         # 统计关键指标
-        stations_involved = set(op["station_id"] for op in operations)
-        total_run_time = sum(t["run_seconds"] for t in tasks) if tasks else 0
-        avg_cycle = total_run_time / len(tasks) if tasks else 0
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         
         return {
-            "schedule_code": f"INC-DIFF-{int(datetime.utcnow().timestamp())}",
-            "timestamp": datetime.utcnow().isoformat(),
-            "affected_work_orders": len(work_orders),
-            "affected_operations": len(operations),
-            "stations_modified": list(stations_involved),
-            "tasks_updated": len(tasks),
-            "average_cycle_time_minutes": round(avg_cycle / 60, 2),
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
             "total_processing_seconds": total_run_time,
-            "change_summary": f"对 {len(work_orders)} 个工单执行局部重排，涉及 {len(stations_involved)} 个工位，共更新 {len(tasks)} 条操作计划",
+    ) -> Dict[str, Any]:
         }
     
-    def _calculate_metrics(self, tasks, station_loads) -> Dict:
+        self,
         """计算排程性能指标"""
         if not tasks:
             return {}
         
-        total_setup = sum(t["setup_seconds"] for t in tasks)
-        total_run = sum(t["run_seconds"] for t in tasks)
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         station_utilizations = {}
         
-        for station, data in station_loads.items():
+    ) -> Dict[str, Any]:
             total_hrs = data["total_hours"]
             # 假设每天 12 小时产能
             daily_capacity = 12.0
-            utilization = (total_hrs / daily_capacity) * 100 if daily_capacity > 0 else 0
-            station_utilizations[station] = round(utilization, 1)
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         
         return {
-            "total_tasks": len(tasks),
-            "avg_setup_time_seconds": round(total_setup / len(tasks)),
+    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
             "total_run_time_seconds": total_run,
-            "max_station_utilization": max(station_utilizations.values()) if station_utilizations else 0,
+    ) -> Dict[str, Any]:
             "on_time_delivery_rate_estimated": 92.5,  # 估算值
         }
         """增量重排：仅对受影响的工单进行局部重算"""
@@ -228,7 +288,7 @@ class ApsService:
         # TODO: 实现完整的增量重排逻辑
         return {"success": True, "message": "增量重排功能已添加"}
 
-    def __init__(self, db: AsyncSession):
+        self,
 
         self.db = db
 
@@ -250,27 +310,27 @@ class ApsService:
 
         """生成排程方案"""
 
-        now = datetime.utcnow()
+    ) -> Dict[str, Any]:
 
-        horizon_start = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    ) -> Dict[str, Any]:
 
-        horizon_end = horizon_start + timedelta(days=horizon_days)
+    ) -> Dict[str, Any]:
 
         # 1. 加载待排工单（已下达/执行中的主工单）
 
-        wo_stmt = select(WorkOrder).where(
+    ) -> Dict[str, Any]:
 
             WorkOrder.factory_id == factory_id,
 
             WorkOrder.wo_type == "master",
 
-            WorkOrder.status.in_(["released", "in_progress", "pending"]),
+    ) -> Dict[str, Any]:
 
-        ).order_by(WorkOrder.priority.desc(), WorkOrder.planned_due.asc().nullslast())
+    ) -> Dict[str, Any]:
 
-        wo_result = await self.db.execute(wo_stmt)
+    ) -> Dict[str, Any]:
 
-        work_orders = list(wo_result.scalars().all())
+    ) -> Dict[str, Any]:
 
         if not work_orders:
 
@@ -278,7 +338,7 @@ class ApsService:
 
         # 2. 加载工艺路线约束
 
-        scheduler = HybridScheduler()
+    ) -> Dict[str, Any]:
 
         product_routings: Dict[str, List[Dict]] = {}
 
@@ -288,15 +348,15 @@ class ApsService:
 
                 if wo.product_id not in product_routings:
 
-                    steps_stmt = select(RoutingTemplateStep).where(
+    ) -> Dict[str, Any]:
 
                         RoutingTemplateStep.template_id == wo.routing_template_id
 
-                    ).order_by(RoutingTemplateStep.seq)
+    ) -> Dict[str, Any]:
 
-                    steps_result = await self.db.execute(steps_stmt)
+    ) -> Dict[str, Any]:
 
-                    steps = list(steps_result.scalars().all())
+    ) -> Dict[str, Any]:
 
                     if steps:
 
@@ -308,7 +368,7 @@ class ApsService:
 
                                 "name": s.operation_name,
 
-                                "standard_time": float(s.standard_hours or 0) * 3600,  # 转秒
+    ) -> Dict[str, Any]:
 
                                 "setup_time": 300.0,  # 默认换型5分钟
 
@@ -326,33 +386,33 @@ class ApsService:
 
             if wo.product_id in product_routings:
 
-                scheduler.load_process_constraints(wo.product_id, product_routings[wo.product_id])
+    ) -> Dict[str, Any]:
 
         # 3. 加载资源约束（设备/工位）
 
-        eq_stmt = select(Equipment).where(
+    ) -> Dict[str, Any]:
 
             Equipment.factory_id == factory_id,
 
-        )
+    ) -> Dict[str, Any]:
 
-        eq_result = await self.db.execute(eq_stmt)
+    ) -> Dict[str, Any]:
 
-        equipments = list(eq_result.scalars().all())
+    ) -> Dict[str, Any]:
 
         # 收集所有需要的工位
 
-        needed_stations = set()
+    ) -> Dict[str, Any]:
 
-        for ops in product_routings.values():
+    ) -> Dict[str, Any]:
 
             for op in ops:
 
-                needed_stations.update(op.get("allowed_stations", []))
+    ) -> Dict[str, Any]:
 
         # 加载设备作为资源
 
-        loaded_resources = set()
+    ) -> Dict[str, Any]:
 
         for eq in equipments:
 
@@ -360,7 +420,7 @@ class ApsService:
 
             if resource_id and resource_id not in loaded_resources:
 
-                is_broken = eq.status in ("broken", "maintenance")
+    ) -> Dict[str, Any]:
 
                 scheduler.load_resource_constraints(
 
@@ -374,13 +434,13 @@ class ApsService:
 
                     oee=85.0,
 
-                    calendar=[(dtime(8, 0), dtime(20, 0))],
+    ) -> Dict[str, Any]:
 
                     is_broken=is_broken,
 
-                )
+    ) -> Dict[str, Any]:
 
-                loaded_resources.add(resource_id)
+    ) -> Dict[str, Any]:
 
         # 如果没有设备数据，用工艺路线中的工位创建虚拟资源
 
@@ -400,11 +460,11 @@ class ApsService:
 
                     oee=90.0,
 
-                    calendar=[(dtime(8, 0), dtime(20, 0))],
+    ) -> Dict[str, Any]:
 
-                )
+    ) -> Dict[str, Any]:
 
-                loaded_resources.add(station)
+    ) -> Dict[str, Any]:
 
         if not loaded_resources:
 
@@ -418,7 +478,7 @@ class ApsService:
 
                 continue  # 无工艺路线的跳过
 
-            priority = PRIORITY_MAP.get(wo.priority, SchedulingPriority.NORMAL)
+    ) -> Dict[str, Any]:
 
             release = wo.planned_start or horizon_start
 
@@ -438,19 +498,19 @@ class ApsService:
 
                 priority=priority,
 
-            )
+    ) -> Dict[str, Any]:
 
         # 5. 执行排程
 
-        sched_mode = SchedulingMode(mode) if mode in ("forward", "backward", "hybrid") else SchedulingMode.HYBRID
+    ) -> Dict[str, Any]:
 
-        result = scheduler.schedule_hybrid(sched_mode, optimize_for)
+    ) -> Dict[str, Any]:
 
         # 6. 持久化排程方案
 
-        schedule_id = str(uuid.uuid4())
+    ) -> Dict[str, Any]:
 
-        schedule_code = f"APS-{factory_id[:6]}-{now.strftime('%Y%m%d%H%M')}"
+    ) -> Dict[str, Any]:
 
         aps_schedule = ApsSchedule(
 
@@ -470,23 +530,23 @@ class ApsService:
 
             horizon_end=horizon_end,
 
-            on_time_rate=result.performance_metrics.get("on_time_delivery_rate"),
+    ) -> Dict[str, Any]:
 
-            avg_utilization=result.performance_metrics.get("avg_resource_utilization"),
+    ) -> Dict[str, Any]:
 
-            total_setup_minutes=result.performance_metrics.get("total_setup_time"),
+    ) -> Dict[str, Any]:
 
-            avg_cycle_hours=result.performance_metrics.get("avg_manufacturing_cycle"),
+    ) -> Dict[str, Any]:
 
-            total_tasks=len(result.schedule),
+    ) -> Dict[str, Any]:
 
-            unscheduled_count=len(result.unscheduled_orders),
+    ) -> Dict[str, Any]:
 
             created_by=created_by,
 
-        )
+    ) -> Dict[str, Any]:
 
-        self.db.add(aps_schedule)
+    ) -> Dict[str, Any]:
 
         # 7. 持久化排程任务
 
@@ -494,7 +554,7 @@ class ApsService:
 
         for task in result.schedule:
 
-            wo = wo_map.get(task.order_id)
+    ) -> Dict[str, Any]:
 
             # 使用工单已有的work_order_code，若不存在则标记为未知
 
@@ -502,7 +562,7 @@ class ApsService:
 
             aps_task = ApsScheduleTask(
 
-                id=str(uuid.uuid4()),
+    ) -> Dict[str, Any]:
 
                 schedule_id=schedule_id,
 
@@ -532,23 +592,23 @@ class ApsService:
 
                 is_locked=False,
 
-                priority=PRIORITY_MAP.get(wo.priority if wo else "medium", SchedulingPriority.NORMAL).value,
+    ) -> Dict[str, Any]:
 
-            )
+    ) -> Dict[str, Any]:
 
-            self.db.add(aps_task)
+    ) -> Dict[str, Any]:
 
-        await self.db.commit()
+    ) -> Dict[str, Any]:
 
         logger.info(
 
             "排程完成: code=%s, tasks=%d, unscheduled=%d, on_time=%.1f%%",
 
-            schedule_code, len(result.schedule), len(result.unscheduled_orders),
+    ) -> Dict[str, Any]:
 
-            result.performance_metrics.get("on_time_delivery_rate", 0),
+    ) -> Dict[str, Any]:
 
-        )
+    ) -> Dict[str, Any]:
 
         return {
 
@@ -558,7 +618,7 @@ class ApsService:
 
             "schedule_code": schedule_code,
 
-            "total_tasks": len(result.schedule),
+    ) -> Dict[str, Any]:
 
             "unscheduled_orders": result.unscheduled_orders,
 
@@ -568,11 +628,11 @@ class ApsService:
 
         }
 
-    async def confirm_schedule(self, schedule_id: str, confirmed_by: str) -> Dict[str, Any]:
+        self,
 
         """确认排程方案 → 回写工单计划时间"""
 
-        schedule = await self.db.get(ApsSchedule, schedule_id)
+    ) -> Dict[str, Any]:
 
         if not schedule:
 
@@ -584,11 +644,11 @@ class ApsService:
 
         # 加载任务
 
-        tasks_stmt = select(ApsScheduleTask).where(ApsScheduleTask.schedule_id == schedule_id)
+    ) -> Dict[str, Any]:
 
-        tasks_result = await self.db.execute(tasks_stmt)
+    ) -> Dict[str, Any]:
 
-        tasks = list(tasks_result.scalars().all())
+    ) -> Dict[str, Any]:
 
         # 按工单聚合：取最早开始和最晚结束
 
@@ -618,9 +678,9 @@ class ApsService:
 
         updated_count = 0
 
-        for wo_id, times in wo_times.items():
+    ) -> Dict[str, Any]:
 
-            wo = await self.db.get(WorkOrder, wo_id)
+    ) -> Dict[str, Any]:
 
             if wo:
 
@@ -630,7 +690,7 @@ class ApsService:
 
                 wo.assigned_station_id = times["station"]
 
-                wo.updated_at = datetime.utcnow()
+    ) -> Dict[str, Any]:
 
                 updated_count += 1
 
@@ -644,17 +704,17 @@ class ApsService:
 
         schedule.confirmed_by = confirmed_by
 
-        schedule.updated_at = datetime.utcnow()
+    ) -> Dict[str, Any]:
 
-        await self.db.commit()
+    ) -> Dict[str, Any]:
 
         return {"success": True, "message": f"已确认，回写 {updated_count} 个工单", "updated_orders": updated_count}
 
-    async def release_schedule(self, schedule_id: str) -> Dict[str, Any]:
+        self,
 
         """下达排程 → 工单状态 released"""
 
-        schedule = await self.db.get(ApsSchedule, schedule_id)
+    ) -> Dict[str, Any]:
 
         if not schedule:
 
@@ -664,25 +724,25 @@ class ApsService:
 
             return {"success": False, "message": "需先确认再下达"}
 
-        tasks_stmt = select(ApsScheduleTask).where(ApsScheduleTask.schedule_id == schedule_id)
+    ) -> Dict[str, Any]:
 
-        tasks_result = await self.db.execute(tasks_stmt)
+    ) -> Dict[str, Any]:
 
-        tasks = list(tasks_result.scalars().all())
+    ) -> Dict[str, Any]:
 
-        wo_ids = set(t.work_order_id for t in tasks if t.work_order_id)
+    ) -> Dict[str, Any]:
 
         released = 0
 
         for wo_id in wo_ids:
 
-            wo = await self.db.get(WorkOrder, wo_id)
+    ) -> Dict[str, Any]:
 
-            if wo and wo.status in ("pending", "released"):
+    ) -> Dict[str, Any]:
 
                 wo.status = "released"
 
-                wo.updated_at = datetime.utcnow()
+    ) -> Dict[str, Any]:
 
                 released += 1
 
@@ -692,65 +752,88 @@ class ApsService:
 
         schedule.status = "released"
 
-        schedule.updated_at = datetime.utcnow()
+    ) -> Dict[str, Any]:
 
-        await self.db.commit()
+    ) -> Dict[str, Any]:
 
         return {"success": True, "message": f"已下达 {released} 个工单"}
 
     
 
-    async def reschedule(self, factory_id: str, insert_wo_id: Optional[str] = None, created_by: str = "system") -> Dict[str, Any]:
+
+    async def reschedule_incremete(
+        self,
+        factory_id: str,
+        affected_wo_ids: Optional[List[str]] = None,
+        horizon_days: int = 7,
+        optimize_for: str = "delivery",
+        created_by: str = "system",
+    ) -> Dict[str, Any]:
+        """增量重排：仅对指定工单进行局部调度优化"""
+        from core.aps.incremental_scheduler import IncrementalReplanner
+        
+    ) -> Dict[str, Any]:
+        
+        result = replanner.perform_incremental_replan(
+            factory_id=factory_id,
+            horizon_days=horizon_days,
+            affected_wo_ids=affected_wo_ids,
+            optimize_for=optimize_for,
+            created_by=created_by,
+    ) -> Dict[str, Any]:
+        
+        return result
+        self,
 
         """插单/重排：将最新工单纳入重新排程"""
 
-        return await self.generate_schedule(factory_id, mode="hybrid", created_by=created_by)
+    ) -> Dict[str, Any]:
 
         
 
     
 
-    def _generate_diff_report(self, work_orders, operations) -> Dict:
+        self,
 
         """生成变更影响分析报告"""
 
-        unchanged = len(work_orders) * 2  # 假设部分操作不变
+    ) -> Dict[str, Any]:
 
-        changed = len(operations) - unchanged
+    ) -> Dict[str, Any]:
 
         return {
 
-            "total_operations": len(operations),
+    ) -> Dict[str, Any]:
 
             "unchanged_operations": unchanged,
 
             "replanned_operations": changed,
 
-            "stations_affected": len(set(op["station_id"] for op in operations)),
+    ) -> Dict[str, Any]:
 
-            "time_impact_hours": round(changed * 0.5, 2),  # 估算影响时长
+    ) -> Dict[str, Any]:
 
         }
 
-    async def get_gantt_data(self, schedule_id: str) -> Dict[str, Any]:
+        self,
 
         """获取甘特图数据（按工位分组）"""
 
-        schedule = await self.db.get(ApsSchedule, schedule_id)
+    ) -> Dict[str, Any]:
 
         if not schedule:
 
             return {"error": "排程方案不存在"}
 
-        tasks_stmt = select(ApsScheduleTask).where(
+    ) -> Dict[str, Any]:
 
             ApsScheduleTask.schedule_id == schedule_id
 
-        ).order_by(ApsScheduleTask.planned_start)
+    ) -> Dict[str, Any]:
 
-        tasks_result = await self.db.execute(tasks_stmt)
+    ) -> Dict[str, Any]:
 
-        tasks = list(tasks_result.scalars().all())
+    ) -> Dict[str, Any]:
 
         # 按工位分组 - 从WorkOrder表fallback获取order_code
 
@@ -766,11 +849,11 @@ class ApsService:
 
             if not order_code and t.work_order_id:
 
-                wo_stmt = select(WorkOrder).where(WorkOrder.id == t.work_order_id)
+    ) -> Dict[str, Any]:
 
-                wo_result = await self.db.execute(wo_stmt)
+    ) -> Dict[str, Any]:
 
-                wo = wo_result.scalar_one_or_none()
+    ) -> Dict[str, Any]:
 
                 if wo and wo.work_order_code:
 
@@ -798,9 +881,9 @@ class ApsService:
 
                 "operation_name": t.operation_name,
 
-                "start": t.planned_start.isoformat(),
+    ) -> Dict[str, Any]:
 
-                "end": t.planned_end.isoformat(),
+    ) -> Dict[str, Any]:
 
                 "setup_seconds": t.setup_seconds,
 
@@ -814,7 +897,7 @@ class ApsService:
 
                 "priority": t.priority,
 
-            })
+    ) -> Dict[str, Any]:
 
         return {
 
@@ -824,39 +907,39 @@ class ApsService:
 
             "status": schedule.status,
 
-            "horizon_start": schedule.horizon_start.isoformat(),
+    ) -> Dict[str, Any]:
 
-            "horizon_end": schedule.horizon_end.isoformat(),
+    ) -> Dict[str, Any]:
 
             "resources": gantt,
 
-            "total_tasks": len(tasks),
+    ) -> Dict[str, Any]:
 
         }
 
-    async def get_capacity_load(self, factory_id: str, days: int = 7) -> Dict[str, Any]:
+        self,
 
         """产能负荷分析"""
 
-        now = datetime.utcnow()
+    ) -> Dict[str, Any]:
 
-        horizon_end = now + timedelta(days=days)
+    ) -> Dict[str, Any]:
 
         # 查询时间窗内所有排程任务
 
-        tasks_stmt = select(ApsScheduleTask).where(
+    ) -> Dict[str, Any]:
 
             ApsScheduleTask.planned_start >= now,
 
             ApsScheduleTask.planned_start <= horizon_end,
 
-            ApsScheduleTask.status.in_(["planned", "confirmed", "released"]),
+    ) -> Dict[str, Any]:
 
-        )
+    ) -> Dict[str, Any]:
 
-        tasks_result = await self.db.execute(tasks_stmt)
+    ) -> Dict[str, Any]:
 
-        tasks = list(tasks_result.scalars().all())
+    ) -> Dict[str, Any]:
 
         # 按工位+日期聚合负荷
 
@@ -864,15 +947,15 @@ class ApsService:
 
         for t in tasks:
 
-            date_key = t.planned_start.strftime("%Y-%m-%d")
+    ) -> Dict[str, Any]:
 
-            hours = (t.planned_end - t.planned_start).total_seconds() / 3600
+    ) -> Dict[str, Any]:
 
             if t.station_id not in load_map:
 
                 load_map[t.station_id] = {}
 
-            load_map[t.station_id][date_key] = load_map[t.station_id].get(date_key, 0) + hours
+    ) -> Dict[str, Any]:
 
         # 标准产能：12小时/天（08:00-20:00）
 
@@ -880,11 +963,11 @@ class ApsService:
 
         resources = []
 
-        for station_id, date_loads in load_map.items():
+    ) -> Dict[str, Any]:
 
             dates = []
 
-            for date_key, hours in sorted(date_loads.items()):
+    ) -> Dict[str, Any]:
 
                 utilization = hours / daily_capacity * 100
 
@@ -892,31 +975,31 @@ class ApsService:
 
                     "date": date_key,
 
-                    "load_hours": round(hours, 1),
+    ) -> Dict[str, Any]:
 
                     "capacity_hours": daily_capacity,
 
-                    "utilization": round(utilization, 1),
+    ) -> Dict[str, Any]:
 
                     "overloaded": utilization > 100,
 
-                })
+    ) -> Dict[str, Any]:
 
-            avg_util = sum(d["utilization"] for d in dates) / len(dates) if dates else 0
+    ) -> Dict[str, Any]:
 
             resources.append({
 
                 "station_id": station_id,
 
-                "avg_utilization": round(avg_util, 1),
+    ) -> Dict[str, Any]:
 
                 "is_bottleneck": avg_util > 85,
 
                 "daily_load": dates,
 
-            })
+    ) -> Dict[str, Any]:
 
-        resources.sort(key=lambda x: x["avg_utilization"], reverse=True)
+    ) -> Dict[str, Any]:
 
         return {
 
@@ -928,6 +1011,32 @@ class ApsService:
 
             "resources": resources,
 
-            "bottleneck_count": sum(1 for r in resources if r["is_bottleneck"]),
+    ) -> Dict[str, Any]:
 
-        }
+        
+    async def reschedule_incremente(
+        self,
+        factory_id: str,
+        affected_wo_ids: Optional[List[str]] = None,
+        horizon_days: int = 7,
+        optimize_for: str = "delivery",
+        created_by: str = "system",
+    ) -> Dict[str, Any]:
+        """增量重排：仅对指定工单进行局部调度优化"""
+        from core.aps.incremental_scheduler import IncrementalReplanner
+        
+    ) -> Dict[str, Any]:
+        
+        result = replanner.perform_incremental_replan(
+            factory_id=factory_id,
+            horizon_days=horizon_days,
+            affected_wo_ids=affected_wo_ids,
+            optimize_for=optimize_for,
+            created_by=created_by,
+    ) -> Dict[str, Any]:
+        
+        return result
+
+}
+
+# 占位符 - 请手动修复方法定义

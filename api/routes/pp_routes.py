@@ -443,8 +443,8 @@ async def list_change_requests(
     return {
         "success": True,
         "data": [
-.request.to_dict() for request in requests
-]
+            request.to_dict() for request in requests
+        ]
     }
 
 
@@ -574,6 +574,61 @@ async def detect_conflicts(
         })
     
     return {"conflicts": conflicts, "count": len(conflicts)}
+
+
+@router.get("/plans/{plan_id}/capacity-conflict")
+async def check_plan_capacity_conflict(
+    plan_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """检查计划产能冲突 - 前端 PlanList 调用"""
+    p = await db.get(Plan, plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="计划不存在")
+    
+    conflicts = []
+    has_conflict = False
+    
+    # 检查产能冲突
+    factory_stations = await db.execute(
+        select(Station.id).where(Station.factory_id == p.factory_id)
+    )
+    station_ids = [s[0] for s in factory_stations.all()]
+    
+    if station_ids:
+        sample_station = station_ids[0]
+        from_date = p.required_date.isoformat() if p.required_date else datetime.now().isoformat()
+        to_date = (p.required_date + timedelta(days=7)).isoformat() if p.required_date else (datetime.now() + timedelta(days=7)).isoformat()
+        
+        # 简化的产能检查
+        wo_stmt = select(WorkOrder).where(
+            WorkOrder.factory_id == p.factory_id,
+            WorkOrder.status.in_(["released", "in_progress"]),
+        )
+        wo_result = await db.execute(wo_stmt)
+        active_orders = wo_result.scalars().all()
+        
+        # 如果活跃工单数量过多，认为有冲突
+        if len(active_orders) > 10:
+            has_conflict = True
+            conflicts.append({
+                "type": "capacity_overload",
+                "message": f"当前有 {len(active_orders)} 个活跃工单，产能可能不足",
+            })
+    
+    # 检查交期风险
+    if p.required_date and p.required_date < datetime.now().date():
+        has_conflict = True
+        conflicts.append({
+            "type": "delivery_risk",
+            "message": "需求日期已过期",
+        })
+    
+    return {
+        "has_conflict": has_conflict,
+        "conflicts": conflicts,
+    }
 
 
 # --- MRP Endpoints ---
@@ -774,7 +829,7 @@ async def reschedule_on_plan_change(
     if not p:
         raise HTTPException(status_code=404, detail="计划不存在")
     if p.status not in ["released", "in_progress"]:
-        raise HTTPException(status_code=400, detail"只有已下达或执行中的计划支持重排")
+        raise HTTPException(status_code=400, detail="只有已下达或执行中的计划支持重排")
     
     from core.pp.aps_integration import PPAPSLinker
     linker = PPAPSLinker(db)

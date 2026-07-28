@@ -48,7 +48,7 @@ const OcapDetail: React.FC = () => {
     }).catch(() => {
       message.error('加载缺陷详情失败')
       setLoading(false)
-      navigate('/qms/ocaps')
+      navigate('/ocaps')
     })
   }, [id, navigate, form])
 
@@ -56,7 +56,7 @@ const OcapDetail: React.FC = () => {
     try {
       await updateDefectOCAP(id, values)
       message.success('OCAP信息已更新')
-      navigate('/qms/ocaps')
+      navigate('/ocaps')
     } catch {
       message.error('更新失败')
     }
@@ -97,7 +97,7 @@ const OcapDetail: React.FC = () => {
           <Form.Item wrapperCol={{ offset: 4 }}>
             <Space>
               <Button type="primary" htmlType="submit">保存OCAP信息</Button>
-              <Button onClick={() => navigate('/qms/ocaps')}>返回列表</Button>
+              <Button onClick={() => navigate('/ocaps')}>返回列表</Button>
             </Space>
           </Form.Item>
         </Form>

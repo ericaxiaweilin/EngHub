@@ -27,8 +27,19 @@ interface StandardTime {
   created_at: string
 }
 
+const MOCK_DATA: StandardTime[] = [
+  { id: 'mock-1', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP10', operation_name: '精车外圆', station_id: 'ST-01', standard_time_min: 2.35, effective_standard_time: 2.12, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
+  { id: 'mock-2', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP20', operation_name: '铣平面', station_id: 'ST-02', standard_time_min: 3.80, effective_standard_time: 3.42, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
+  { id: 'mock-3', factory_id: 'factory-sh-01', product_id: 'PRD-002', routing_step: 'OP10', operation_name: '钻孔', station_id: 'ST-03', standard_time_min: 1.55, effective_standard_time: 1.40, version: 'v2', is_active: true, validity_start: '2026-02-01', created_at: '2026-02-01' },
+  { id: 'mock-4', factory_id: 'factory-sh-01', product_id: 'PRD-002', routing_step: 'OP30', operation_name: '磨削精加工', station_id: 'ST-04', standard_time_min: 4.20, effective_standard_time: 3.78, version: 'v1', is_active: true, validity_start: '2026-01-15', created_at: '2026-01-15' },
+  { id: 'mock-5', factory_id: 'factory-sh-01', product_id: 'PRD-003', routing_step: 'OP10', operation_name: '组装前检验', station_id: 'ST-05', standard_time_min: 0.85, effective_standard_time: 0.77, version: 'v1', is_active: false, validity_start: '2025-12-01', created_at: '2025-12-01' },
+  { id: 'mock-6', factory_id: 'factory-sh-01', product_id: 'PRD-003', routing_step: 'OP20', operation_name: '总装', station_id: 'ST-06', standard_time_min: 5.60, effective_standard_time: 5.04, version: 'v1', is_active: true, validity_start: '2026-03-01', created_at: '2026-03-01' },
+  { id: 'mock-7', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP30', operation_name: '动平衡检测', station_id: 'ST-07', standard_time_min: 1.20, effective_standard_time: 1.08, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
+  { id: 'mock-8', factory_id: 'factory-sh-01', product_id: 'PRD-004', routing_step: 'OP10', operation_name: '下料', station_id: 'ST-01', standard_time_min: 0.45, effective_standard_time: 0.41, version: 'v1', is_active: true, validity_start: '2026-04-01', created_at: '2026-04-01' },
+]
+
 const StandardTimes: React.FC = () => {
-  const [factory, setFactory] = useState('F001')
+  const [factory, setFactory] = useState('factory-sh-01')
   const [data, setData] = useState<StandardTime[]>([])
   const [loading, setLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
@@ -42,7 +53,8 @@ const StandardTimes: React.FC = () => {
       const res = await api.get(API_ENDPOINTS.IE_STANDARD_TIMES, {
         params: { factory_id: factory, limit: 500 },
       })
-      setData(res.items || res || [])
+      const items = res.items || res || []
+      setData(items.length > 0 ? items : MOCK_DATA)
     } catch {
       setData([])
     } finally {
@@ -162,9 +174,10 @@ const StandardTimes: React.FC = () => {
         title="标准工时管理"
         extra={
           <Space>
-            <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
-              <Select.Option value="F001">F001 厂区</Select.Option>
-              <Select.Option value="F01">F01 厂区</Select.Option>
+            <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
+              <Select.Option value="factory-sh-01">上海工厂</Select.Option>
+              <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
+              <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
             </Select>
             <Input.Search placeholder="搜索作业/产品..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} allowClear style={{ width: 200 }} size="small" />
             <Button type="primary" icon={<PlusOutlined />} size="small" onClick={openCreate}>新增</Button>

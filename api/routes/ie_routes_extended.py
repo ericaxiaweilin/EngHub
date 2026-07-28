@@ -20,7 +20,7 @@ from api.services.ie_service_extended import (
 )
 from core.auth.security import get_current_user
 
-router = APIRouter(prefix="/api/v1/ie", tags=["ie-advanced"])
+router = APIRouter(prefix="/api/v1/ie-advanced", tags=["ie-advanced"])
 
 
 # ============================================================
@@ -563,3 +563,254 @@ async def export_standard_times_report(
         "request_id": f"export_{datetime.utcnow().timestamp()}",
         "message": "Report generation initiated. Check status later.",
     }
+
+
+# ============================================================
+# 补全：列表/更新/删除接口 (CRUD Completion)
+# ============================================================
+
+# ---------- 方法研究 列表/更新/删除 ----------
+
+@router.get("/method-studies", response_model=List[Dict[str, Any]])
+async def list_method_studies(
+    factory_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """方法研究列表"""
+    query = select(MethodStudy)
+    if factory_id:
+        query = query.where(MethodStudy.factory_id == factory_id)
+    if product_id:
+        query = query.where(MethodStudy.product_id == product_id)
+    result = await db.execute(query.order_by(MethodStudy.created_at.desc()).limit(limit))
+    return [row.to_dict() for row in result.scalars().all()]
+
+
+@router.put("/method-studies/{ms_id}")
+async def update_method_study(
+    ms_id: str,
+    ms_data: MethodStudyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """更新方法研究"""
+    result = await db.execute(select(MethodStudy).where(MethodStudy.id == ms_id))
+    ms = result.scalar_one_or_none()
+    if not ms:
+        raise HTTPException(status_code=404, detail="Method study not found")
+    for field in ["product_id", "original_operation", "version", "is_basement_method",
+                  "is_optimal_method", "description", "action_sequence", "required_resources",
+                  "setup_time_min", "cycle_time_min", "total_standard_time_min", "status"]:
+        if hasattr(ms_data, field) and getattr(ms_data, field) is not None:
+            setattr(ms, field, getattr(ms_data, field))
+    ms.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(ms)
+    return ms.to_dict()
+
+
+@router.delete("/method-studies/{ms_id}")
+async def delete_method_study(
+    ms_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """删除方法研究"""
+    result = await db.execute(select(MethodStudy).where(MethodStudy.id == ms_id))
+    ms = result.scalar_one_or_none()
+    if not ms:
+        raise HTTPException(status_code=404, detail="Method study not found")
+    await db.delete(ms)
+    await db.commit()
+    return {"status": "deleted", "id": ms_id}
+
+
+# ---------- 动作研究 更新/删除 ----------
+
+@router.put("/action-studies/{study_id}")
+async def update_action_study(
+    study_id: str,
+    study_data: ActionStudyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """更新动作研究"""
+    result = await db.execute(select(ActionStudy).where(ActionStudy.id == study_id))
+    study = result.scalar_one_or_none()
+    if not study:
+        raise HTTPException(status_code=404, detail="Action study not found")
+    for field in ["product_id", "operation_name", "therblig_type", "motion_distance_cm",
+                  "motion_time_sec", "difficulty_factor", "improvement_notes"]:
+        if hasattr(study_data, field) and getattr(study_data, field) is not None:
+            setattr(study, field, getattr(study_data, field))
+    study.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(study)
+    return study.to_dict()
+
+
+@router.delete("/action-studies/{study_id}")
+async def delete_action_study(
+    study_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """删除动作研究"""
+    result = await db.execute(select(ActionStudy).where(ActionStudy.id == study_id))
+    study = result.scalar_one_or_none()
+    if not study:
+        raise HTTPException(status_code=404, detail="Action study not found")
+    await db.delete(study)
+    await db.commit()
+    return {"status": "deleted", "id": study_id}
+
+
+# ---------- 工站布局 列表/更新/删除 ----------
+
+@router.get("/work-cells", response_model=List[Dict[str, Any]])
+async def list_work_cells(
+    factory_id: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """工站布局列表"""
+    query = select(WorkCellLayout)
+    if factory_id:
+        query = query.where(WorkCellLayout.factory_id == factory_id)
+    result = await db.execute(query.order_by(WorkCellLayout.created_at.desc()).limit(limit))
+    return [row.to_dict() for row in result.scalars().all()]
+
+
+@router.put("/work-cells/{cell_id}")
+async def update_work_cell(
+    cell_id: str,
+    cell_data: WorkCellLayoutInput,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """更新工站布局"""
+    result = await db.execute(select(WorkCellLayout).where(WorkCellLayout.id == cell_id))
+    cell = result.scalar_one_or_none()
+    if not cell:
+        raise HTTPException(status_code=404, detail="Work cell not found")
+    for field in ["work_cell_id", "product_family_id", "layout_diagram_url",
+                  "material_flow_path", "operator_movement_path", "takt_time_alignment",
+                  "storage_location_type"]:
+        if hasattr(cell_data, field) and getattr(cell_data, field) is not None:
+            setattr(cell, field, getattr(cell_data, field))
+    cell.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(cell)
+    return cell.to_dict()
+
+
+@router.delete("/work-cells/{cell_id}")
+async def delete_work_cell(
+    cell_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """删除工站布局"""
+    result = await db.execute(select(WorkCellLayout).where(WorkCellLayout.id == cell_id))
+    cell = result.scalar_one_or_none()
+    if not cell:
+        raise HTTPException(status_code=404, detail="Work cell not found")
+    await db.delete(cell)
+    await db.commit()
+    return {"status": "deleted", "id": cell_id}
+
+
+# ---------- 看板 列表/更新/删除 ----------
+
+@router.get("/kanbans", response_model=List[Dict[str, Any]])
+async def list_kanbans(
+    factory_id: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """看板列表"""
+    query = select(KanbanSystem)
+    if factory_id:
+        query = query.where(KanbanSystem.factory_id == factory_id)
+    result = await db.execute(query.order_by(KanbanSystem.created_at.desc()).limit(limit))
+    return [row.to_dict() for row in result.scalars().all()]
+
+
+@router.put("/kanbans/{kanban_id}")
+async def update_kanban(
+    kanban_id: str,
+    kanban_data: KanbanCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """更新看板"""
+    result = await db.execute(select(KanbanSystem).where(KanbanSystem.id == kanban_id))
+    kanban = result.scalar_one_or_none()
+    if not kanban:
+        raise HTTPException(status_code=404, detail="Kanban not found")
+    for field in ["kanban_type", "upstream_station", "downstream_station", "product_id",
+                  "part_number", "max_card_count", "current_card_count", "safety_stock_level",
+                  "card_status"]:
+        if hasattr(kanban_data, field) and getattr(kanban_data, field) is not None:
+            setattr(kanban, field, getattr(kanban_data, field))
+    kanban.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(kanban)
+    return kanban.to_dict()
+
+
+@router.delete("/kanbans/{kanban_id}")
+async def delete_kanban(
+    kanban_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """删除看板"""
+    result = await db.execute(select(KanbanSystem).where(KanbanSystem.id == kanban_id))
+    kanban = result.scalar_one_or_none()
+    if not kanban:
+        raise HTTPException(status_code=404, detail="Kanban not found")
+    await db.delete(kanban)
+    await db.commit()
+    return {"status": "deleted", "id": kanban_id}
+
+
+# ---------- 5S审计 列表/删除 ----------
+
+@router.get("/5s-audits", response_model=List[Dict[str, Any]])
+async def list_five_s_audits(
+    factory_id: Optional[str] = None,
+    work_center_id: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """5S审计列表"""
+    query = select(FiveSAudit)
+    if factory_id:
+        query = query.where(FiveSAudit.factory_id == factory_id)
+    if work_center_id:
+        query = query.where(FiveSAudit.work_center_id == work_center_id)
+    result = await db.execute(query.order_by(FiveSAudit.audit_date.desc()).limit(limit))
+    return [row.to_dict() for row in result.scalars().all()]
+
+
+@router.delete("/5s-audits/{audit_id}")
+async def delete_five_s_audit(
+    audit_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """删除5S审计记录"""
+    result = await db.execute(select(FiveSAudit).where(FiveSAudit.id == audit_id))
+    audit = result.scalar_one_or_none()
+    if not audit:
+        raise HTTPException(status_code=404, detail="5S audit not found")
+    await db.delete(audit)
+    await db.commit()
+    return {"status": "deleted", "id": audit_id}

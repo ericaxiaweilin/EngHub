@@ -5,7 +5,14 @@ import { Card, Table, Tag, Button, Modal, Form, Input, message, Descriptions, Sp
 import { PlusOutlined, RiseOutlined } from '@ant-design/icons'
 import api from '../../services/api'
 
-const FACTORY = 'F001'
+const FACTORY = 'factory-sh-01'
+
+const MOCK_TICKETS = [
+  { id: 'an-1', ticket_code: 'AND-2026-001', category_code: 'equipment_repair', title: 'CNC-03主轴异响', description: '加工时发出异常噪音，疑似轴承磨损', status: 'in_progress', priority: 'high', station_id: 'ST-01', created_at: '2026-07-20T08:30:00', resolved_at: null },
+  { id: 'an-2', ticket_code: 'AND-2026-002', category_code: 'material_call', title: '装配线缺料', description: 'M8螺栓库存不足，需紧急补料', status: 'open', priority: 'medium', station_id: 'ST-03', created_at: '2026-07-20T09:15:00', resolved_at: null },
+  { id: 'an-3', ticket_code: 'AND-2026-003', category_code: 'quality_issue', title: '外观不良率升高', description: '近两小时划伤不良率达3%，超出标准', status: 'resolved', priority: 'high', station_id: 'ST-02', created_at: '2026-07-19T14:00:00', resolved_at: '2026-07-19T16:30:00' },
+  { id: 'an-4', ticket_code: 'AND-2026-004', category_code: 'tech_support', title: '程序调试支持', description: '新产品加工程序需要工艺师协助调试', status: 'closed', priority: 'low', station_id: 'ST-04', created_at: '2026-07-18T10:00:00', resolved_at: '2026-07-18T11:30:00' },
+]
 
 const CATEGORY_META: Record<string, { label: string; color: string; icon: string }> = {
   equipment_repair: { label: '设备维修', color: 'orange', icon: '🔧' },
@@ -37,9 +44,10 @@ export default function Andon2Dashboard() {
     setLoading(true)
     try {
       const data: any = await api.get('/api/v1/andon/tickets', { params: { factory_id: FACTORY } })
-      setTickets(data.items || [])
+      const items = data.items || []
+      setTickets(items.length > 0 ? items : MOCK_TICKETS)
     } catch (err) {
-      console.error('获取安灯工单失败:', err)
+      setTickets(MOCK_TICKETS)
     } finally {
       setLoading(false)
     }

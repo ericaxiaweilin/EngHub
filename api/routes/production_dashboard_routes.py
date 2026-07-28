@@ -232,7 +232,7 @@ async def production_dashboard_summary(
             st_name = st.station_name if st else "未知工位"
             s_day = release_day + i * step_span
             e_day = s_day + step_span
-            work_h = ((wo.planned_qty or 0) / max(st.capacity_per_hour if st else 20, 1)) if st else 4
+            work_h = ((wo.planned_qty or 0) / max((st.capacity_per_hour or 20) if st else 20, 1)) if st else 4
             ops.append({
                 "op_no": step.get("step_no", i + 1),
                 "name": step.get("name", f"工序{i+1}"),

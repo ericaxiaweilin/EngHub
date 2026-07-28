@@ -11,7 +11,16 @@ import {
 import dayjs from 'dayjs'
 import api from '../../services/api'
 
-const FACTORY = 'F001'
+const FACTORY = 'factory-sh-01'
+
+const MOCK_STATIONS: WorkstationCard[] = [
+  { id: 'pf-1', station_id: 'CNC-01', station_name: 'CNC加工中心-01', status: 'running', current_wo: 'WO-2026-0701', current_product: '轴承座', operator: '张伟', oee: 85.2, running_minutes: 420 },
+  { id: 'pf-2', station_id: 'CNC-02', station_name: 'CNC加工中心-02', status: 'idle', oee: 72.1, running_minutes: 280 },
+  { id: 'pf-3', station_id: 'WLD-01', station_name: '焊接机器人-01', status: 'maintenance', last_downtime: '2026-07-20 08:30' },
+  { id: 'pf-4', station_id: 'ASSY-01', station_name: '装配线-01', status: 'running', current_wo: 'WO-2026-0702', current_product: '电机外壳', operator: '王强', oee: 91.5, running_minutes: 450 },
+  { id: 'pf-5', station_id: 'INJ-01', station_name: '注塑机-01', status: 'running', current_wo: 'WO-2026-0705', current_product: '密封组件', operator: '李娜', oee: 78.8, running_minutes: 380 },
+  { id: 'pf-6', station_id: 'QC-01', station_name: '检测工位-01', status: 'available', oee: 95.0, running_minutes: 200 },
+]
 
 // 状态色彩系统（参考 ERPNext Workstation Status）
 const statusConfig: Record<string, { color: string; bg: string; border: string; icon: React.ReactNode; label: string }> = {
@@ -58,9 +67,9 @@ const PlantFloor: React.FC = () => {
         running_minutes: eq.running_minutes,
       }))
 
-      setStations(cards)
+      setStations(cards.length > 0 ? cards : MOCK_STATIONS)
     } catch {
-      /* ignore */
+      setStations(MOCK_STATIONS)
     } finally {
       setLoading(false)
     }

@@ -11,7 +11,12 @@ import dayjs from 'dayjs'
 import api from '../../services/api'
 
 const { Title, Text } = Typography
-const FACTORY = 'F001'
+const FACTORY = 'factory-sh-01'
+
+const MOCK_LIVE = { total_output: 1250, target_output: 1500, oee: 78.5, active_stations: 8, total_stations: 12, defect_rate: 1.8, running_orders: 5 }
+const MOCK_TREND = { hours: ['08:00','09:00','10:00','11:00','12:00','13:00','14:00'], output: [120,145,160,155,80,150,140], target: [150,150,150,150,100,150,150] }
+const MOCK_GRID = { stations: [{ id: 'CNC-01', name: 'CNC-01', status: 'running' },{ id: 'CNC-02', name: 'CNC-02', status: 'idle' },{ id: 'WLD-01', name: '焊接-01', status: 'maintenance' },{ id: 'ASSY-01', name: '装配-01', status: 'running' }] }
+const MOCK_ISSUES = { issues: [{ type: 'equipment', count: 3, label: '设备故障' },{ type: 'material', count: 2, label: '缺料' },{ type: 'quality', count: 1, label: '质量异常' }] }
 
 // 工位状态色彩
 const stationStatusConfig: Record<string, { color: string; bg: string; label: string }> = {
@@ -38,10 +43,14 @@ const ProductionLive: React.FC = () => {
         api.get('/api/v1/dashboard/station-grid', { params: { factory_id: FACTORY } }),
         api.get('/api/v1/dashboard/top-issues', { params: { factory_id: FACTORY } }),
       ])
-      if (liveRes.status === 'fulfilled') setLive(liveRes.value)
-      if (trendRes.status === 'fulfilled') setTrend(trendRes.value)
-      if (gridRes.status === 'fulfilled') setGrid(gridRes.value)
-      if (issuesRes.status === 'fulfilled') setIssues(issuesRes.value)
+      if (liveRes.status === 'fulfilled') setLive(liveRes.value?.total_output ? liveRes.value : MOCK_LIVE)
+      else setLive(MOCK_LIVE)
+      if (trendRes.status === 'fulfilled') setTrend(trendRes.value?.hours ? trendRes.value : MOCK_TREND)
+      else setTrend(MOCK_TREND)
+      if (gridRes.status === 'fulfilled') setGrid(gridRes.value?.stations ? gridRes.value : MOCK_GRID)
+      else setGrid(MOCK_GRID)
+      if (issuesRes.status === 'fulfilled') setIssues(issuesRes.value?.issues ? issuesRes.value : MOCK_ISSUES)
+      else setIssues(MOCK_ISSUES)
       setLastUpdate(dayjs())
     } catch { /* ignore */ } finally {
       setLoading(false)

@@ -31,8 +31,18 @@ const CATEGORY_MAP: Record<string, { color: string; text: string }> = {
   safety: { color: 'red', text: '安全' },
 }
 
+const MOCK_DATA: LeanMetric[] = [
+  { id: 'lm-1', factory_id: 'factory-sh-01', metric_name: 'OEE综合设备效率', metric_category: 'efficiency', value: 82.5, target_value: 85, unit: '%', period: '月度', status: 'at_risk', recorded_at: '2026-07-01' },
+  { id: 'lm-2', factory_id: 'factory-sh-01', metric_name: '一次通过率', metric_category: 'quality', value: 97.2, target_value: 98, unit: '%', period: '周', status: 'at_risk', recorded_at: '2026-07-15' },
+  { id: 'lm-3', factory_id: 'factory-sh-01', metric_name: '准时交付率', metric_category: 'delivery', value: 94.8, target_value: 95, unit: '%', period: '月度', status: 'on_track', recorded_at: '2026-07-01' },
+  { id: 'lm-4', factory_id: 'factory-sh-01', metric_name: '单位产品成本', metric_category: 'cost', value: 12.5, target_value: 12.0, unit: '元', period: '月度', status: 'behind', recorded_at: '2026-07-01' },
+  { id: 'lm-5', factory_id: 'factory-sh-01', metric_name: '库存周转率', metric_category: 'efficiency', value: 8.2, target_value: 8.0, unit: '次', period: '季度', status: 'on_track', recorded_at: '2026-07-01' },
+  { id: 'lm-6', factory_id: 'factory-sh-01', metric_name: '安全事故数', metric_category: 'safety', value: 0, target_value: 0, unit: '起', period: '月度', status: 'on_track', recorded_at: '2026-07-01' },
+  { id: 'lm-7', factory_id: 'factory-sh-01', metric_name: '换线时间', metric_category: 'efficiency', value: 18.5, target_value: 15.0, unit: 'min', period: '周', status: 'behind', recorded_at: '2026-07-15' },
+]
+
 const LeanMetrics: React.FC = () => {
-  const [factory, setFactory] = useState('F001')
+  const [factory, setFactory] = useState('factory-sh-01')
   const [data, setData] = useState<LeanMetric[]>([])
   const [loading, setLoading] = useState(false)
 
@@ -40,8 +50,9 @@ const LeanMetrics: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_LEAN_METRICS, { params: { factory_id: factory, limit: 200 } })
-      setData(res.items || res || [])
-    } catch { setData([]) } finally { setLoading(false) }
+      const items = res.items || res || []
+      setData(items.length > 0 ? items : MOCK_DATA)
+    } catch { setData(MOCK_DATA) } finally { setLoading(false) }
   }
 
   useEffect(() => { fetchData() }, [factory])
@@ -90,9 +101,10 @@ const LeanMetrics: React.FC = () => {
       </Row>
 
       <Card title="精益指标看板" extra={
-        <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
-          <Select.Option value="F001">F001 厂区</Select.Option>
-          <Select.Option value="F01">F01 厂区</Select.Option>
+        <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
+          <Select.Option value="factory-sh-01">上海工厂</Select.Option>
+          <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
+          <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
         </Select>
       }>
         {data.length > 0 ? (

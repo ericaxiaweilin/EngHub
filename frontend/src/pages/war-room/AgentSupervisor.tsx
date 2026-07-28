@@ -65,7 +65,7 @@ const AgentSupervisor: React.FC = () => {
     setPredictLoading(true)
     try {
       const res = await api.get('/api/v1/agent-supervisor/predict', { params: { factory_id: FACTORY } })
-      setPredictions(res.predictions || [])
+      setPredictions(res.data?.predictions || [])
     } catch { /* ignore */ } finally { setPredictLoading(false) }
   }, [])
 

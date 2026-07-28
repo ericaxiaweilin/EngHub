@@ -552,3 +552,92 @@ def _rush_recommendation(delayed: list, feasible: bool) -> str:
         return f"⚠️ 插单将导致 {len(delayed)} 个订单延迟 1-3 天，建议调整低优先级工单"
     else:
         return f"🚨 插单影响严重：{len(delayed)} 个订单延迟超过 3 天，建议拒绝或分批交付"
+
+
+# ============== 前端兼容接口 (Phase 2) ==============
+
+
+class ScheduleWithAlgorithmRequest(BaseModel):
+    factory_id: str
+    algorithm: str = "EDD"  # EDD/SPT/CR/PRIORITY
+    horizon_days: int = 7
+
+
+@router.post("/schedule")
+async def schedule_with_algorithm(
+    req: ScheduleWithAlgorithmRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """有限产能排程（算法选择）- 前端 SchedulingCenter 调用"""
+    svc = ApsService(db)
+    # 算法映射到 optimize_for
+    algo_map = {
+        "EDD": "delivery",
+        "SPT": "efficiency",
+        "CR": "delivery",
+        "PRIORITY": "delivery",
+    }
+    optimize_for = algo_map.get(req.algorithm, "delivery")
+    result = await svc.generate_schedule(
+        factory_id=req.factory_id,
+        mode="hybrid",
+        horizon_days=req.horizon_days,
+        optimize_for=optimize_for,
+        created_by=current_user.username,
+    )
+    if not result.get("success") and not result.get("schedule_id"):
+        raise HTTPException(status_code=400, detail=result.get("message", "排程失败"))
+    # 添加算法信息
+    result["algorithm"] = req.algorithm
+    result["conflict_count"] = result.get("unscheduled_count", 0)
+    return result
+
+
+@router.get("/conflicts")
+async def detect_conflicts(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """冲突检测 - 前端 SchedulingCenter 调用"""
+    from sqlalchemy import and_
+    from database.models import WorkOrder
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+    conflicts = []
+
+    # 1. 交期风险检测：已下达工单中，计划完成时间已过期但未完成的
+    overdue_stmt = select(WorkOrder).where(and_(
+        WorkOrder.factory_id == factory_id,
+        WorkOrder.status.in_(["released", "in_progress"]),
+        WorkOrder.planned_due < now,
+    ))
+    overdue_result = await db.execute(overdue_stmt)
+    overdue_orders = overdue_result.scalars().all()
+
+    for wo in overdue_orders:
+        delay_hours = (now - wo.planned_due).total_seconds() / 3600 if wo.planned_due else 0
+        conflicts.append({
+            "type": "delivery_risk",
+            "work_order": wo.work_order_code,
+            "delay_hours": round(delay_hours, 1),
+            "message": f"工单 {wo.work_order_code} 已延期 {round(delay_hours/24, 1)} 天",
+        })
+
+    # 2. 无BOM工单检测
+    no_bom_stmt = select(WorkOrder).where(and_(
+        WorkOrder.factory_id == factory_id,
+        WorkOrder.status.in_(["released", "pending"]),
+        WorkOrder.product_id.isnot(None),
+    ))
+    no_bom_result = await db.execute(no_bom_stmt)
+    # 简化：假设所有工单都有BOM（实际需要查询BOM表）
+
+    return {
+        "factory_id": factory_id,
+        "conflicts": conflicts[:20],  # 最多返回20条
+        "total": len(conflicts),
+        "checked_at": now.isoformat(),
+    }

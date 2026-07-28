@@ -27,6 +27,15 @@ import {
   FieldTimeOutlined,
   AlertOutlined,
   LineChartOutlined,
+  HourglassOutlined,
+  BarChartOutlined,
+  ExperimentOutlined,
+  AuditOutlined,
+  ProjectOutlined,
+  LayoutOutlined,
+  DragOutlined,
+  RiseOutlined,
+  BranchesOutlined,
 } from '@ant-design/icons'
 import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
@@ -224,16 +233,16 @@ const Layout: React.FC = () => {
     // IE 模块 fallback（后端未配置菜单时硬编码）
     if (activeModule === 'g-ie') {
       return [
-        { key: '/ie/standard-times', icon: <LineChartOutlined />, label: <Link to="/ie/standard-times">标准工时</Link> },
-        { key: '/ie/time-studies', icon: <LineChartOutlined />, label: <Link to="/ie/time-studies">时间研究</Link> },
-        { key: '/ie/line-balance', icon: <LineChartOutlined />, label: <Link to="/ie/line-balance">线平衡分析</Link> },
-        { key: '/ie/process-analyses', icon: <LineChartOutlined />, label: <Link to="/ie/process-analyses">工艺分析</Link> },
-        { key: '/ie/lean-metrics', icon: <LineChartOutlined />, label: <Link to="/ie/lean-metrics">精益指标</Link> },
-        { key: '/ie/action-studies', icon: <LineChartOutlined />, label: <Link to="/ie/action-studies">动作研究</Link> },
-        { key: '/ie/method-studies', icon: <LineChartOutlined />, label: <Link to="/ie/method-studies">方法研究</Link> },
-        { key: '/ie/work-cells', icon: <LineChartOutlined />, label: <Link to="/ie/work-cells">工作单元</Link> },
-        { key: '/ie/kanbans', icon: <LineChartOutlined />, label: <Link to="/ie/kanbans">看板</Link> },
-        { key: '/ie/5s-audits', icon: <LineChartOutlined />, label: <Link to="/ie/5s-audits">5S审核</Link> },
+        { key: '/ie/standard-times', icon: <FieldTimeOutlined />, label: <Link to="/ie/standard-times">标准工时</Link> },
+        { key: '/ie/time-studies', icon: <HourglassOutlined />, label: <Link to="/ie/time-studies">时间研究</Link> },
+        { key: '/ie/line-balance', icon: <BarChartOutlined />, label: <Link to="/ie/line-balance">线平衡分析</Link> },
+        { key: '/ie/process-analyses', icon: <BranchesOutlined />, label: <Link to="/ie/process-analyses">工艺分析</Link> },
+        { key: '/ie/lean-metrics', icon: <RiseOutlined />, label: <Link to="/ie/lean-metrics">精益指标</Link> },
+        { key: '/ie/action-studies', icon: <DragOutlined />, label: <Link to="/ie/action-studies">动作研究</Link> },
+        { key: '/ie/method-studies', icon: <ExperimentOutlined />, label: <Link to="/ie/method-studies">方法研究</Link> },
+        { key: '/ie/work-cells', icon: <LayoutOutlined />, label: <Link to="/ie/work-cells">工作单元</Link> },
+        { key: '/ie/kanbans', icon: <ProjectOutlined />, label: <Link to="/ie/kanbans">看板</Link> },
+        { key: '/ie/5s-audits', icon: <AuditOutlined />, label: <Link to="/ie/5s-audits">5S审核</Link> },
       ]
     }
     return []

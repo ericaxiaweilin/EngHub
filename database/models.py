@@ -41,7 +41,7 @@ class Role(Base):
 
     __tablename__ = "roles"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     role_code = Column(String(50), unique=True, nullable=False, index=True)  # factory_manager, operator...
     role_name = Column(String(100), nullable=False)  # 厂长、操作员...
     position = Column(String(30), nullable=False, index=True)  # 职位层级
@@ -68,7 +68,7 @@ class Permission(Base):
 
     __tablename__ = "permissions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     module = Column(String(50), nullable=False, index=True)  # work_order, production_report...
     action = Column(String(30), nullable=False, index=True)  # view, create, edit, delete, approve...
     module_name = Column(String(50))  # 中文模块名
@@ -86,7 +86,7 @@ class UserRole(Base):
 
     __tablename__ = "user_roles"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
     role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False, index=True)
     is_primary = Column(Boolean, default=True)  # 是否主角色
@@ -108,7 +108,7 @@ class RolePermission(Base):
 
     __tablename__ = "role_permissions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False, index=True)
     permission_id = Column(UUID(as_uuid=True), ForeignKey("permissions.id"), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -123,7 +123,7 @@ class User(Base):
     
     __tablename__ = "users"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     username = Column(String(50), unique=True, nullable=False, index=True)
     email = Column(String(100), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
@@ -1040,7 +1040,7 @@ class QualityDefect(Base):
     
     __tablename__ = "quality_defects"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     inspection_id = Column(UUID(as_uuid=True), ForeignKey("quality_inspections.id"), nullable=False)  # 关联的检验记录
     
     # 缺陷信息
@@ -1066,7 +1066,7 @@ class CAPACase(Base):
     
     __tablename__ = "capa_cases"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     case_number = Column(String(50), unique=True, nullable=False)  # CAPA编号（如 CAPA-2026-001）
     
     # 问题来源：可以关联到具体的质量检验记录
@@ -1130,7 +1130,7 @@ class QualityCost(Base):
     
     __tablename__ = "quality_costs"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     
     # 成本类别
     
@@ -1162,7 +1162,7 @@ class ApsSchedule(Base):
     __tablename__ = "aps_schedules"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50))
     status = Column(String(20))
     schedule_code = Column(String(50))
@@ -1186,7 +1186,7 @@ class ApsScheduleTask(Base):
     __tablename__ = "aps_schedule_tasks"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     schedule_id = Column(UUID(as_uuid=True))
     station_id = Column(String(50))
     planned_start = Column(DateTime)

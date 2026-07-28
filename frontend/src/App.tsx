@@ -47,7 +47,7 @@ import WarRoom from './pages/war-room/WarRoom'
 import AgentSupervisor from './pages/war-room/AgentSupervisor'
 import AndonDashboard from './pages/andon/AndonDashboard'
 import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
-import RCCDashboard from './pages/rcc/RCCDashboard'
+import RCCCommandCenter from './pages/rcc/RCCCommandCenter'
 import { isAuthenticated, getStoredUser } from './services/auth'
 // TMS 模块
 import ApprovalCenter from './pages/tms/ApprovalCenter'
@@ -206,7 +206,7 @@ const App: React.FC = () => {
             <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
-            <Route path="rcc" element={<PermissionGate path="/rcc"><RCCDashboard /></PermissionGate>} />
+            <Route path="rcc" element={<PermissionGate path="/rcc"><RCCCommandCenter /></PermissionGate>} />
             <Route path="expert" element={<PermissionGate path="/ai"><ExpertSystemChat /></PermissionGate>} />
             <Route path="war-room" element={<PermissionGate path="/simulation"><WarRoom /></PermissionGate>} />
                         <Route path="agent-supervisor" element={<PermissionGate path="/simulation"><AgentSupervisor /></PermissionGate>} />
