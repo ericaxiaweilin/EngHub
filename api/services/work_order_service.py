@@ -423,14 +423,84 @@ class WorkOrderService:
         await self.db.refresh(work_order)
         return work_order
     
+    async def _check_prerequisite_steps(self, work_order: WorkOrder) -> bool:
+        """
+        工序依赖锁止检查 - 第2号缺陷修复
+        
+        对于工序工单（operation），在开工前检查前一道工序是否已开始生产。
+        规则：当前步骤 seq > 1 时，必须有至少一个前序步骤的工单处于 in_progress/completed 状态。
+        
+        返回: True 可通过，False 被阻断
+        """
+        # 主工单无需检查前序（它是根工序）
+        if work_order.wo_type == "master":
+            return True
+        
+        # 工序工单：检查 current_routing_step 的前序
+        step_seq = work_order.current_routing_step
+        if step_seq is None or step_seq <= 1:
+            # 第一步或无步序标记，允许开工
+            return True
+        
+        factory_id = work_order.factory_id
+        routing_template_id = work_order.routing_template_id
+        
+        if not routing_template_id:
+            # 没有绑定模板，按宽松模式处理（可能使用旧式 Routing.steps）
+            return True
+        
+        # 查询该路由模板的前一个步骤（step_seq - 1）的所有操作工单
+        from database.models import WorkOrder as WOModel
+        
+        prev_step_query = select(WOModel).where(
+            WOModel.routing_template_id == routing_template_id,
+            WOModel.current_routing_step == step_seq - 1,
+            WOModel.wo_type == "operation",
+            WOModel.factory_id == factory_id,
+            WOModel.status.in_([WOStatus.RELEASED.value, WOStatus.IN_PROGRESS.value, WOStatus.COMPLETED.value])
+        )
+        
+        result = await self.db.execute(prev_step_query)
+        has_prev_started = result.scalar_one_or_none() is not None
+        
+        if not has_prev_started:
+            # 检查是否有前序工单但尚未开始（用于提供错误信息）
+            pending_prev_query = select(WOModel).where(
+                WOModel.routing_template_id == routing_template_id,
+                WOModel.current_routing_step == step_seq - 1,
+                WOModel.wo_type == "operation",
+                WOModel.factory_id == factory_id,
+                WOModel.status.in_([WOStatus.PENDING.value, WOStatus.RELEASED.value])
+            )
+            pending_result = await self.db.execute(pending_prev_query)
+            pending_prev = pending_prev_query.scalars().all()
+            
+            if pending_prev:
+                pending_codes = ", ".join(wo.work_order_code for wo in pending_prev[:3])
+                raise ValueError(
+                    f"工序锁止：步骤 {step_seq-1} 尚未开始生产（工单：{pending_codes}等）。"
+                    f"请先让前道工序开工后，再执行本工单 {work_order.work_order_code} 的步骤 {step_seq}。"
+                )
+            else:
+                # 前序步骤没有任何工单（可能未派生），也视为阻塞
+                raise ValueError(
+                    f"工序锁止：步骤 {step_seq-1} 无待开工工单。"
+                    "请检查工艺路线是否正确派生了前序工序工单。"
+                )
+        
+        return True
+    
     async def start_work_order(self, work_order_id: str, user=None) -> Optional[WorkOrder]:
-        """已下达 → 生产中（父子约束：含子工单的主工单不直接生产）"""
+        """已下达 → 生产中（父子约束+工序依赖锁止：含子工单的主工单不直接生产）"""
         work_order = await self.get_work_order_by_id(work_order_id)
         if not work_order:
             return None
         
         if work_order.status not in [WOStatus.PENDING, WOStatus.RELEASED]:
             raise ValueError(f"只能开工待下发/已下达的工单，当前状态: {work_order.status}")
+        
+        # 【新增】工序依赖锁止 - 确保按工艺顺序执行（第2号缺陷修复）
+        await self._check_prerequisite_steps(work_order)
         
         # 父子约束：已拆分的主工单由子工单分别组织生产，进度自动汇总
         children = await self._get_children(work_order_id)

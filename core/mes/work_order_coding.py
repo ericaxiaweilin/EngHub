@@ -308,6 +308,7 @@ async def derive_operation_work_orders(
             process_code=op_code,
             operation_seq=op_seq,
             parent_work_order_id=master_wo.id,
+            current_routing_step=step.get("step_no"),  # ← 新增：记录该工单对应的工艺步骤序号
             created_by=created_by,
             remark=f"由主工单 {master_wo.work_order_code} 派生｜{op_name}（{step_name}）第{op_seq}道",
         )
