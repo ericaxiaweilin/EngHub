@@ -113,12 +113,12 @@ class StandardTimeService:
         if routing_step:
             query = query.where(StandardOperationTime.routing_step == routing_step)
         
-        result = await query.order_by(StandardOperationTime.routing_step)
+        result = await self.db.execute(query.order_by(StandardOperationTime.routing_step))
         return result.scalars().all()
     
     async def get_sot_by_id(self, sot_id: str) -> Optional[StandardOperationTime]:
         """根据ID获取标准工时"""
-        result = await select(StandardOperationTime).where(StandardOperationTime.id == sot_id)
+        result = await self.db.execute(select(StandardOperationTime).where(StandardOperationTime.id == sot_id))
         return result.scalar_one_or_none()
     
     async def update_standard_time(
@@ -177,7 +177,7 @@ class StandardTimeService:
             StandardOperationTime.allowance_rate
         ).order_by(StandardOperationTime.routing_step)
         
-        result = await query.all()
+        result = (await self.db.execute(query)).scalars().all()
         return [
             {
                 "product_id": r.product_id,
@@ -273,7 +273,7 @@ class TimeStudyService:
         return record
     
     async def _get_ts_by_id(self, ts_id: str) -> Optional[TimeStudyRecord]:
-        result = await select(TimeStudyRecord).where(TimeStudyRecord.id == ts_id)
+        result = await self.db.execute(select(TimeStudyRecord).where(TimeStudyRecord.id == ts_id))
         return result.scalar_one_or_none()
     
     @staticmethod
@@ -332,7 +332,7 @@ class TimeStudyService:
         if status:
             query = query.where(TimeStudyRecord.status == status)
         
-        result = await query.order_by(TimeStudyRecord.observation_date.desc()).limit(limit)
+        result = await self.db.execute(query.order_by(TimeStudyRecord.observation_date.desc()).limit(limit))
         return result.scalars().all()
     
     async def get_ts_analysis(self, ts_id: str) -> Optional[Dict[str, Any]]:
@@ -397,7 +397,7 @@ class LineBalanceService:
             StandardOperationTime.is_active == True
         )
         
-        sot_result = await sot_query.all()
+        sot_result = (await self.db.execute(sot_query)).scalars().all()
         
         if not sot_result:
             raise ValueError("No standard times found for this product")
@@ -514,7 +514,7 @@ class LineBalanceService:
             query = query.where(LineBalanceAnalysis.line_id == line_id)
         
         query = query.order_by(LineBalanceAnalysis.analysis_date.desc()).limit(limit)
-        result = await query.all()
+        result = (await self.db.execute(query)).scalars().all()
         return result
 
 
@@ -582,7 +582,7 @@ class ProcessAnalysisService:
             ProcessAnalysis.product_id == product_id
         ).order_by(ProcessAnalysis.analysis_date.desc()).limit(limit)
         
-        result = await query.all()
+        result = (await self.db.execute(query)).scalars().all()
         return [r.to_dict() for r in result]
     
     async def calculate_leaning_metrics(
@@ -641,7 +641,7 @@ class PerformanceRatingService:
             ProductionReport.status == "completed"
         )
         
-        result = await query.all()
+        result = (await self.db.execute(query)).all()
         total_good = sum(r.good_qty for r in result) if result else 0
         
         # 获取对应产品的标准工时
@@ -653,7 +653,7 @@ class PerformanceRatingService:
             or_(StandardOperationTime.validity_end > start_date, StandardOperationTime.validity_end == None)
         )
         
-        sot_result = await sot_query.first()
+        sot_result = (await self.db.execute(sot_query)).first()
         standard_time_per_unit = sot_result[0] if sot_result else None
         
         if standard_time_per_unit is None:

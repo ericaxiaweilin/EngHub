@@ -737,3 +737,259 @@ def review_quality_goal(
     goal.next_review_at = datetime.utcnow() + timedelta(days=goal.review_frequency_days or 30)
     await db.commit()
     return {"success": True, "gap": gap}
+
+
+# --- FAI 首件检验专属接口 ---
+
+class FAICreateRequest(BaseModel):
+    """FAI 创建请求体"""
+    work_order_id: str
+    factory_id: str
+    product_id: str
+    product_name: str
+    batch_no: str
+    machine_id: str
+    operator_id: str
+    inspector_id: str
+    fail_level: str = "level2"
+    structure: str = "manual"
+    sample_qty: int = 1
+
+
+@router.post("/faicreate")
+async def create_fai_request(
+    body: FAICreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建首件检验记录"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)  # 传递db会话
+    
+    try:
+        record = await qms.create_fai_record(
+            work_order_id=body.work_order_id,
+            factory_id=body.factory_id,
+            product_id=body.product_id,
+            product_name=body.product_name,
+            batch_no=body.batch_no,
+            machine_id=body.machine_id,
+            operator_id=body.operator_id,
+            inspector_id=body.inspector_id,
+            fail_level=body.fail_level,
+            structure=body.structure,
+            sample_qty=body.sample_qty,
+        )
+        return {"success": True, "data": record}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fai/list")
+async def list_fai_records(
+    factory_id: str = Query(..., description="工厂ID"),
+    work_order_id: Optional[str] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出首件检验记录列表"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)
+    
+    records = await qms.list_fai_records(factory_id, work_order_id, status)  # 需要实现该方法
+    return {"success": True, "data": records}
+
+
+@router.get("/fai/{fai_id}")
+async def get_fai_record(fai_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """获取首件检验详情"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)
+    
+    record = await qms.get_fai_record(fai_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="FAI记录不存在")
+    return {"success": True, "data": record}
+
+
+# --- IPC 制程巡检专属接口 ---
+
+class IPCCreateRequest(BaseModel):
+    """IPC 创建请求体"""
+    work_order_id: str
+    factory_id: str
+    product_id: str
+    process_stage: str
+    frequency_type: str = "time_based"
+    frequency_value: int = 60
+    operator_id: str = ""
+    inspector_id: str = ""
+    check_items: Optional[List[Dict]] = None
+
+
+@router.post("/ipcreatoe")
+async def create_ipc_request(
+    body: IPCCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建IPC巡检记录"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    try:
+        record = await qms.create_ipc_record(
+            work_order_id=body.work_order_id,
+            factory_id=body.factory_id,
+            product_id=body.product_id,
+            process_stage=body.process_stage,
+            frequency_type=body.frequency_type,
+            frequency_value=body.frequency_value,
+            operator_id=body.operator_id,
+            inspector_id=body.inspector_id,
+            check_items=body.check_items,
+        )
+        return {"success": True, "data": record}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ipc/list")
+async def list_ipc_records(
+    factory_id: str = Query(..., description="工厂ID"),
+    work_order_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出IPC巡检记录列表"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    records = await qms.list_ipc_records(factory_id, limit=50)
+    return {"success": True, "data": records}
+
+
+@router.get("/ipc/{ipc_id}")
+async def get_ipc_record(ipc_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """获取IPC检验详情"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)
+    
+    record = await qms.get_ipc_record(ipc_id)  # 需要实现该方法
+    if not record:
+        raise HTTPException(status_code=404, detail="IPC记录不存在")
+    return {"success": True, "data": record}
+
+
+# --- OQC 出货检验专属接口 ---
+
+class OQCCreateRequest(BaseModel):
+    """OQC 创建请求体"""
+    order_id: str
+    customer_id: str
+    product_id: str
+    product_name: str
+    batch_no: str
+    quantity_to_ship: int
+    inspector_id: str
+    check_items: Optional[List[Dict]] = None
+
+
+@router.post("/oqcreatoe")
+async def create_oqc_request(
+    body: OQCCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建出货检验记录"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    try:
+        record = await qms.create_oqc_record(
+            order_id=body.order_id,
+            customer_id=body.customer_id,
+            product_id=body.product_id,
+            product_name=body.product_name,
+            batch_no=body.batch_no,
+            quantity_to_ship=body.quantity_to_ship,
+            inspector_id=body.inspector_id,
+            check_items=body.check_items,
+        )
+        return {"success": True, "data": record}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/oqc/list")
+async def list_oqc_records(
+    customer_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出出货检验记录列表"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)
+    
+    records = await qms.list_oqc_records(customer_id)
+    return {"success": True, "data": records}
+
+
+# --- CAPA 纠正预防措施专属接口 ---
+
+class CAPACreateRequest(BaseModel):
+    """CAPA创建请求体"""
+    title: str
+    severity: str  # critical/major/minor
+    source_type: Optional[str] = None
+    source_id: Optional[str] = None
+    creator: str = "system"
+
+
+@router.post("/capa/create")
+async def create_capa_request(
+    body: CAPACreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建CAPA案件"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    try:
+        case = await qms.create_capa_case(
+            title=body.title,
+            severity=body.severity,
+            source_type=body.source_type,
+            source_id=body.source_id,
+            creator=current_user.username if current_user else body.creator,
+        )
+        return {"success": True, "data": case}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/cases/{case_id}")
+async def get_capa_case(case_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """获取CAPA案件详情"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)
+    
+    case = qms.get_capa_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="CAPA案件不存在")
+    return {"success": True, "data": case}
+
+@router.get("/cases/list")
+async def list_capa_cases(
+    factory_id: Optional[str] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出CAPA案件列表"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)
+    
+    cases = qms.list_capa_cases(factory_id, status)
+    return {"success": True, "data": cases}

@@ -71,7 +71,7 @@ class ExtendedTimeStudyService(TimeStudyService):
             ProductionReport.work_order_id
         )
         
-        result = await query.all()
+        result = (await self.db.execute(query)).all()
         total_good = sum(r.total_good for r in result) if result else 0
         
         # 获取该工站的标准时间
@@ -79,7 +79,7 @@ class ExtendedTimeStudyService(TimeStudyService):
             StandardOperationTime.station_id == station_id,
             StandardOperationTime.is_active == True,
         )
-        sot_result = await sot_query.first()
+        sot_result = (await self.db.execute(sot_query)).first()
         standard_time = sot_result[0] if sot_result else None
         
         # 计算理论产出和实际效率
@@ -349,7 +349,7 @@ class PerformanceRatingService:
             ProductionReport.status == "completed"
         )
         
-        result = await query.all()
+        result = (await self.db.execute(query)).all()
         total_good = sum(r.good_qty for r in result) if result else 0
         
         # 获取对应产品的标准工时
@@ -361,7 +361,7 @@ class PerformanceRatingService:
             or_(StandardOperationTime.validity_end > start_date, StandardOperationTime.validity_end == None)
         )
         
-        sot_result = await sot_query.first()
+        sot_result = (await self.db.execute(sot_query)).first()
         standard_time_per_unit = sot_result[0] if sot_result else None
         
         if standard_time_per_unit is None:

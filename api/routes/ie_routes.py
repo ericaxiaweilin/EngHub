@@ -529,7 +529,7 @@ async def get_process_analysis(
 @router.get("/lean-metrics", response_model=Dict[str, Any])
 async def calculate_lean_metrics(
     factory_id: str,
-    product_id: str,
+    product_id: str = None,
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)
 ):

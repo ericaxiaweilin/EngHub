@@ -247,7 +247,7 @@ async def list_action_studies(
     if operator_id:
         query = query.where(ActionStudy.operator_id == operator_id)
     
-    result = await query.order_by(ActionStudy.study_date.desc()).limit(limit)
+    result = await db.execute(query.order_by(ActionStudy.study_date.desc()).limit(limit))
     return [row.to_dict() for row in result.scalars().all()]
 
 
@@ -301,7 +301,7 @@ async def approve_method_study(
     current_user = Depends(get_current_user)
 ):
     """批准方法研究（设为最优方法）"""
-    method_study = await select(MethodStudy).where(MethodStudy.id == ms_id)
+    method_study = await db.execute(select(MethodStudy).where(MethodStudy.id == ms_id))
     method_study = method_study.scalar_one_or_none()
     if not method_study:
         raise HTTPException(status_code=404, detail="Method study not found")
@@ -407,7 +407,7 @@ async def update_kanban_card_count(
     current_user = Depends(get_current_user)
 ):
     """更新看板卡片数量（使用或归还卡片）"""
-    kanban = await select(KanbanSystem).where(KanbanSystem.kanban_id == kanban_id)
+    kanban = await db.execute(select(KanbanSystem).where(KanbanSystem.kanban_id == kanban_id))
     kanban = kanban.scalar_one_or_none()
     if not kanban:
         raise HTTPException(status_code=404, detail="Kanban not found")
