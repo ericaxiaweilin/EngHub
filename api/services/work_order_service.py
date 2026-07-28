@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from database.models import WorkOrder, ProductionReport, WoStatusLog
+from database.models import WorkOrder, ProductionReport, WoStatusLog, QualityInspection
 from core.mes.work_order_coding import (
     generate_master_work_order_code,
     derive_operation_work_orders,
@@ -549,6 +549,46 @@ class WorkOrderService:
         # 审核门槛 2：有实际产出才能完工
         if not (work_order.completed_qty or 0) > 0:
             raise ValueError("完工数量为 0：无实际产出不能完工（请先报工）")
+        
+        # 【新增】品质检验 gate - 关键业务流程控制
+        # 对于关联了工艺路线的工单，必须完成所有QC控制点的检验才能完工
+        if work_order.routing_id:
+            from database.models import QualityInspection
+            
+            # 至少需要有一份该工单的检验记录且结果为 PASS（合格）
+            # IPQC（过程检验）用于工序工单，FQC（最终检验）用于主工单
+            required_types = []
+            if work_order.wo_type == "operation":
+                required_types = ["ipqc"]  # 工序工单需要IPQC
+            else:
+                required_types = ["fqc"]   # 主工单需要FQC
+            
+            inspect_check = await self.db.execute(
+                select(QualityInspection).where(
+                    QualityInspection.work_order_id == work_order.id,
+                    QualityInspection.result == "PASS",
+                    QualityInspection.inspect_type.in_(required_types)
+                )
+            )
+            
+            if not inspect_check.first():
+                type_name = "IPQC（过程检验）" if work_order.wo_type == "operation" else "FQC（最终检验）"
+                raise ValueError(
+                    f"工单 {work_order.work_order_code} 必须先通过{type_name}才能完工。"
+                    "请先创建并提交对应检验单，结果必须为合格（PASS）。"
+                )
+                # 如果是IPQC类型的工单（工序工单），需要IPQC检验通过
+                if work_order.process_code:
+                    raise ValueError(
+                        f"工序工单 {work_order.work_order_code} 必须先通过IPQC检验才能完工。"
+                        "请创建并提交IPQC检验单，状态为合格后方可完工。"
+                    )
+                # 如果是主工单，需要FQC检验通过
+                else:
+                    raise ValueError(
+                        f"主工单 {work_order.work_order_code} 必须先通过最终检验（FQC）才能完工。"
+                        "请创建并提交FQC检验单，状态为合格后方可完工。"
+                    )
         
         from_status = work_order.status
         work_order.status = WOStatus.COMPLETED

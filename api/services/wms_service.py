@@ -23,6 +23,35 @@ class WmsService:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def validate_inbound_material_quality(self, material_id: str, factory_id: str, inbound_type: str) -> bool:
+        """验证物料入库前是否已通过必要的品质检验（针对采购入库）"""
+        # 仅采购入库需要IQO检验
+        if inbound_type.lower() != "purchase":
+            return True  # 内部流转无需IQO
+        
+        # 查询是否有合格的 IQC 检验记录
+        from database.models import QualityInspection
+        from sqlalchemy import select
+        
+        check_stmt = select(QualityInspection).where(
+            QualityInspection.factory_id == factory_id,
+            QualityInspection.material_id == material_id,
+            QualityInspection.inspect_type == "iqc",
+            QualityInspection.result == "PASS"
+        ).order_by(QualityInspection.created_at.desc())
+        
+        result = await self.db.execute(check_stmt)
+        latest_inspection = result.scalar_one_or_none()
+        
+        if latest_inspection:
+            # 检查检验批次是否匹配（如果有 batch_code）
+            # 这里简化实现，实际应关联 batch_id
+            
+            return True
+        
+        # 也可以返回 (has_valid_inspection, inspection_id) 元组
+        return False
+
     # ============== 库存流水 ==============
 
     async def record_transaction(
@@ -533,6 +562,26 @@ class InventoryService:
         created_by: Optional[str] = None,
     ) -> InboundOrder:
         """创建入库单并更新库存"""
+        # 【新增】采购入库强制 IQC 校验 - 解决第13号缺陷（严重缺陷）
+        if inbound_type.lower() == "purchase":
+            # 检查是否存在已合格的 IQC 检验记录
+            from database.models import QualityInspection
+            check_stmt = select(QualityInspection).where(
+                QualityInspection.factory_id == factory_id,
+                QualityInspection.material_id == material_id,
+                QualityInspection.inspect_type == "iqc",
+                QualityInspection.result == "PASS"
+            ).order_by(QualityInspection.created_at.desc())
+            
+            result = await self.db.execute(check_stmt)
+            latest_qc = result.scalar_one_or_none()
+            
+            if not latest_qc:
+                raise ValueError(
+                    f"物料 {material_code} (ID: {material_id}) 尚未通过 IQC 来料检验。"
+                    "请创建 IQC 检验单并获得 PASS 合格结果后，方可办理采购入库。"
+                )
+        
         # 生成入库单号
         inbound_code = f"IN-{datetime.now().strftime('%Y%m%d')}-{await self._get_next_in_number(factory_id)}"
         
