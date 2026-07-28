@@ -88,6 +88,7 @@ export default function Andon2Dashboard() {
     },
     {
       title: '类别',
+      dataIndex: 'category_code',
       key: 'category_code',
       render: (val: string) => {
         const meta = CATEGORY_META[val] || { label: val, color: 'default' }
