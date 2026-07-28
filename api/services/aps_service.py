@@ -182,11 +182,14 @@ class ApsService:
         wo_map = {wo.id: wo for wo in work_orders}
         for task in result.schedule:
             wo = wo_map.get(task.order_id)
+            # 使用工单已有的work_order_code，若不存在则标记为未知
+            order_code = wo.work_order_code if wo and wo.work_order_code else None
+            
             aps_task = ApsScheduleTask(
                 id=str(uuid.uuid4()),
                 schedule_id=schedule_id,
                 work_order_id=task.order_id,
-                order_code=wo.work_order_code if wo else None,
+                order_code=order_code,
                 product_code=task.product_code,
                 operation_seq=task.operation_sequence,
                 operation_name=None,
@@ -314,15 +317,29 @@ class ApsService:
         tasks_result = await self.db.execute(tasks_stmt)
         tasks = list(tasks_result.scalars().all())
 
-        # 按工位分组
+        # 按工位分组 - 从WorkOrder表fallback获取order_code
+        from database.models import WorkOrder
+        
         gantt: Dict[str, List[Dict]] = {}
         for t in tasks:
+            # 若order_code为空，尝试从WorkOrder表获取
+            order_code = t.order_code
+            if not order_code and t.work_order_id:
+                wo_stmt = select(WorkOrder).where(WorkOrder.id == t.work_order_id)
+                wo_result = await self.db.execute(wo_stmt)
+                wo = wo_result.scalar_one_or_none()
+                if wo and wo.work_order_code:
+                    order_code = wo.work_order_code
+            
+            if not order_code:
+                order_code = f"UNKNOWN-{t.work_order_id[:8]}" if t.work_order_id else "UNKNOWN"
+            
             if t.station_id not in gantt:
                 gantt[t.station_id] = []
             gantt[t.station_id].append({
                 "id": t.id,
                 "work_order_id": t.work_order_id,
-                "order_code": t.order_code,
+                "order_code": order_code,
                 "product_code": t.product_code,
                 "operation_seq": t.operation_seq,
                 "operation_name": t.operation_name,

@@ -283,6 +283,7 @@ async def production_dashboard_summary(
         }
         orders_out.append({
             "order_id": wo.id,
+            "order_code": wo.work_order_code,
             "product_id": wo.product_id,
             "product_name": pname,
             "quantity": wo.planned_qty,
@@ -296,7 +297,8 @@ async def production_dashboard_summary(
             "ops": ops,
         })
         production_orders_out.append({
-            "po_id": f"PO-{wo.work_order_code}",
+            "po_id": f"PO-{wo.work_order_code or wo.id or 'UNKNOWN'}",
+            "order_code": wo.work_order_code or str(wo.id)[:8] or "UNKNOWN",
             "order_id": wo.id,
             "product_name": pname,
             "quantity": wo.planned_qty,
@@ -376,7 +378,7 @@ async def production_dashboard_summary(
         outbound_out.append({
             "outbound_id": ob.outbound_code,
             "order_id": ob.work_order_id or "-",
-            "po_id": f"PO-{wo.work_order_code}" if wo else "-",
+            "po_id": f"PO-{wo.work_order_code or 'UNKNOWN'}" if wo else "-",
             "product_name": prod.product_name if prod else ob.material_id,
             "quantity": ob.quantity,
             "good_qty": ob.quantity,
@@ -435,7 +437,7 @@ async def production_dashboard_summary(
             if wo.planned_due < now:
                 alerts.append({
                     "level": "critical", "category": "delay",
-                    "title": f"工单 {wo.work_order_code} 已逾期",
+                    "title": f"工单 {wo.work_order_code or wo.id} 已逾期",
                     "detail": f"交期 {wo.planned_due.strftime('%m-%d')}，当前状态 {wo.status}",
                     "section_id": wo.assigned_station_id, "order_id": wo.id, "day": horizon_days - 1,
                 })
