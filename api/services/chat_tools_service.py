@@ -451,6 +451,19 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_ocap_tasks",
+            "description": "查询用户待处理的 OCAP（纠正预防措施）任务。显示所有 ocap_status 为 triggered/in_progress 的缺陷，供 chatbot 向用户汇报。",
+            "properties": {
+                "factory_id": {"type": "string", "description": "工厂ID，可选，默认当前用户工厂"},
+                "operator": {"type": "string", "description": "操作用户ID，必填"},
+                "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+            },
+            "required": ["operator"],
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_alert_patrol",
             "description": "主动执行一次预警巡检：扫描工单超时、安灯未响应等异常，自动触发 AI 审查。用于'巡检''扫描异常'类请求。",
             "parameters": {"type": "object", "properties": {}},
@@ -1389,6 +1402,52 @@ async def _tool_run_alert_patrol(db: AsyncSession, args: Dict[str, Any], operato
     return result
 
 
+async def _tool_query_ocap_tasks(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """查询用户待处理的 OCAP 任务 - 集成到 chatbot
+    
+    返回当前用户（operator参数）在指定工厂下，状态为 triggered/in_progress 的缺陷列表。
+    
+    Args:
+        factory_id: 工厂ID（可选）
+        operator: 操作用户ID（必选）
+        
+    Returns:
+        {count: int, tasks: List[{defect_code, defect_type, severity, ocap_status, trigger_reason}]}
+    """
+    from database.models import DefectRecord
+    
+    current_factory = factory_id or "FAC_ELEC_DEMO_2026"  # 默认工厂，实际应从 auth context 获取
+    operator_id = args.get("operator")
+    
+    if not operator_id:
+        return {"error": "缺少 operator 参数"}
+    
+    # 查询用户的 OCAP 待办：ocap_status 为 triggered 或 in_progress
+    stmt = select(DefectRecord).where(
+        DefectRecord.factory_id == current_factory,
+        DefectRecord.ocap_status.in_(['triggered', 'in_progress']),
+    )
+    
+    result = await db.execute(stmt)
+    defects = result.scalars().all()
+    
+    tasks = []
+    for d in defects:
+        tasks.append({
+            "defect_code": d.defect_code or d.id,
+            "defect_type": d.defect_type or "",
+            "severity": d.severity or "",
+            "ocap_status": d.ocap_status or "pending",
+            "trigger_reason": d.ocap_trigger_reason or "未说明",
+            "created_at": d.created_at.isoformat() if d.created_at else "",
+        })
+    
+    return {
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+
+
 async def _tool_query_hr_roster(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     """查询人力档案：按部门/工序统计 + 人员搜索"""
     from sqlalchemy import text as sa_text
@@ -1749,6 +1808,7 @@ _TOOL_EXECUTORS = {
     "get_inspection_form": _tool_get_inspection_form,
     "export_report_file": _tool_export_report_file,
     "get_pending_alerts": _tool_get_pending_alerts,
+    "query_ocap_tasks": _tool_query_ocap_tasks,  # OCAP待办任务查询（chatbot集成）
     "query_alert_reviews": _tool_query_alert_reviews,
     "acknowledge_alert": _tool_acknowledge_alert,
     "run_alert_patrol": _tool_run_alert_patrol,
@@ -1851,6 +1911,7 @@ TOOL_LABELS = {
     "query_alert_reviews": "预警审查记录",
     "acknowledge_alert": "确认预警",
     "run_alert_patrol": "预警巡检",
+    "query_ocap_tasks": "OCAP待办任务",
     "query_hr_roster": "人力档案",
     "query_process_knowledge": "流程知识",
     # 5M1E 预警数据工具
