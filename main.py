@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from api.routes import (
     auth_router,
+    bom_router,
     chat_router,
     employee_skill_router,
     ie_router,
@@ -65,6 +66,7 @@ app = FastAPI(
 
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(bom_router)            # BOM - EngFlow 数据对接
 app.include_router(ie_router)           # Industrial Engineering Module - 精益生产IE基础模块
 app.include_router(ie_advanced_router)  # Advanced IE Module - 精益生产IE扩展模块
 app.include_router(mes_router)

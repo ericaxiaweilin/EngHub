@@ -4,6 +4,7 @@ Database Models - SQLAlchemy ORM Models
 """
 from datetime import datetime, timedelta
 from sqlalchemy import (
+    BigInteger,
     Column,
     String,
     Integer,
@@ -1095,6 +1096,29 @@ class CAPACase(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
+
+    # ==================== CAPA 增强字段（5Why分析 + 鱼骨图 + 效果验证）====================
+
+    # 5Why层层追问记录（最多5层）
+    why_analysis = Column(JSONB, default={})  # {"why1": "...", "why2": "...", ..., "root_cause": "..."}
+    
+    # 鱼骨图（石川图）- 维度分类
+    fishbone_dimensions = Column(JSONB, default={"man": [], "machine": [], "material": [], "method": [], "measurement": [], "environment": []})
+    
+    # 临时遏制措施（D3）详细说明
+    interim_actions_detailed = Column(JSONB, default={})  # {"description": "...", "owner": "...", "deadline": "...", "status": "..."}
+    
+    # D5永久纠正措施的详细行动计划列表
+    corrective_action_plans = Column(JSONB, default=[])  # [{"action": "", "owner": "", "deadline": "", "status": "", "completion_pct": 0}]
+    
+    # D6效果验证结果
+    verification_results = Column(JSONB, default={})  # {"before": {...}, "after": {...}, "improved": bool, "verified_by": ""}
+    
+    # D7预防措施文档更新
+    preventive_updates = Column(JSONB, default={})   # {"sop_updated": bool, "documents_changed": [], "training_conducted": bool}
+    
+    # D8经验教训及标准化建议
+    lessons_learned_doc = Column(Text)  # 更长的文本字段用于存储经验总结
     __table_args__ = (
         Index("idx_case_number", "case_number", unique=True),
         Index("idx_status", "status"),
@@ -1129,4 +1153,151 @@ class QualityCost(Base):
     __table_args__ = (
         Index("idx_cost_date", "cost_date"),
     )
+
+
+# ==================== APS 排程模型 ====================
+
+class ApsSchedule(Base):
+    """排程计划"""
+    __tablename__ = "aps_schedules"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50))
+    status = Column(String(20))
+    schedule_code = Column(String(50))
+    mode = Column(String(20), default="hybrid")
+    optimize_for = Column(String(20), default="delivery")
+    horizon_start = Column(DateTime)
+    horizon_end = Column(DateTime)
+    on_time_rate = Column(Float)
+    avg_utilization = Column(Float)
+    total_setup_minutes = Column(Float)
+    avg_cycle_hours = Column(Float)
+    total_tasks = Column(Integer, default=0)
+    unscheduled_count = Column(Integer, default=0)
+    created_by = Column(String(50))
+    confirmed_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ApsScheduleTask(Base):
+    """排程任务明细"""
+    __tablename__ = "aps_schedule_tasks"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    schedule_id = Column(UUID(as_uuid=True))
+    station_id = Column(String(50))
+    planned_start = Column(DateTime)
+    planned_end = Column(DateTime)
+    status = Column(String(20))
+    setup_minutes = Column(Float, default=0)
+    material_ready = Column(Boolean, default=True)
+    sequence_in_station = Column(Integer)
+    work_order_id = Column(String(36))
+    order_code = Column(String(50))
+    product_code = Column(String(50))
+    operation_seq = Column(Integer, default=0)
+    operation_name = Column(String(100))
+    setup_seconds = Column(Float, default=0)
+    run_seconds = Column(Float, default=0)
+    quantity = Column(Integer, default=0)
+    is_locked = Column(Boolean, default=False)
+    priority = Column(Integer, default=5)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ApsWorkCalendar(Base):
+    """工作日历"""
+    __tablename__ = "aps_work_calendars"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False)
+    resource_id = Column(String(50), nullable=False)
+    resource_type = Column(String(20), default="station")
+    shift_name = Column(String(50), default="标准班")
+    day_of_week = Column(Integer, nullable=False)
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+    is_active = Column(Boolean, default=True)
+    effective_from = Column(Date)
+    effective_to = Column(Date)
+
+
+# ==================== EngHub BOM 同步表 ====================
+
+class BomItem(Base):
+    """映射 EngFlow bom_items 源表（只读查询用）"""
+    __tablename__ = "bom_items"
+    __table_args__ = {"extend_existing": True}
+
+    row_id = Column(BigInteger, primary_key=True)
+    company_id = Column(String(50))
+    product_sap_code = Column(String(100))
+    level = Column(Integer)
+    part_number = Column(String(100))
+    description = Column(Text)
+    quantity = Column(Float)
+    unit = Column(String(20))
+    unit_price = Column(Float)
+    total_cost = Column(Float)
+    vendor_code = Column(String(50))
+    vendor_name = Column(String(255))
+    parent_sap = Column(String(100))
+    model_name = Column(String(100))
+    # EngHub 扩展字段
+    id = Column(String(36))
+    factory_id = Column(String(50))
+    product_id = Column(String(50))
+    bom_version = Column(String(50))
+    material_code = Column(String(50))
+    material_name = Column(String(100))
+    qty_per_unit = Column(Float, default=1)
+    remark = Column(String(255))
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+class EngHubBomItem(Base):
+    """EngHub 本地 BOM 缓存（从 EngFlow bom_items 同步）"""
+    __tablename__ = "enghub_bom_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_row_id = Column(BigInteger, unique=True, index=True)  # 对应 bom_items.row_id
+    product_model = Column(String(100), index=True)              # model_name
+    part_number = Column(String(100), index=True)
+    description = Column(Text)
+    level = Column(Integer)
+    quantity = Column(Float)
+    unit = Column(String(20))
+    unit_price = Column(Float)
+    total_cost = Column(Float)
+    vendor_code = Column(String(50))
+    vendor_name = Column(String(255))
+    parent_part = Column(String(100), index=True)                # parent_sap
+    category_l1 = Column(String(100))
+    category_l2 = Column(String(100))
+    material_family = Column(String(100))                        # from part_master
+    component_type = Column(String(100))
+    synced_at = Column(DateTime, default=datetime.utcnow)
+    source_updated_at = Column(DateTime)                         # 源表 updated_at 快照
+
+    __table_args__ = (
+        Index("idx_enghub_bom_model_part", "product_model", "part_number"),
+    )
+
+
+class EngHubBomSyncLog(Base):
+    """BOM 同步日志"""
+    __tablename__ = "enghub_bom_sync_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sync_type = Column(String(20))       # full / incremental
+    status = Column(String(20))          # running / success / failed
+    records_synced = Column(Integer, default=0)
+    watermark = Column(DateTime)         # 同步水位线（源表最大 updated_at）
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    error_message = Column(Text)
 
