@@ -11,55 +11,55 @@ from sqlalchemy import text
 
 FACTORY = "FAC_MECH_001"
 
-# 产品 -> 工艺路线定义 (seq, process_code, operation_name, work_center, standard_hours, is_qc_gate)
+# 产品 -> 工艺路线定义 (seq, process_code, operation_name, work_center, standard_hours单件工时, is_qc_gate)
 ROUTING_DEFS = {
     "FG-DUMBBELL-01": {
         "name": "哑铃生产工艺",
         "code": "RT-DUMBBELL-V1",
         "steps": [
-            (1, "OP10", "来料检验", "ST-QC-01", 0.5, True),
-            (2, "OP20", "注塑成型", "ST-ZS-01", 2.0, False),
-            (3, "OP30", "浸塑处理", "ST-JS-01", 1.5, False),
-            (4, "OP40", "哑铃组装", "ST-YL-01", 2.5, False),
-            (5, "OP50", "成品检验", "ST-QC-02", 0.5, True),
-            (6, "OP60", "包装入库", "ST-PK-01", 1.0, False),
+            (1, "OP10", "来料检验", "ST-QC-01", 0.003, True),
+            (2, "OP20", "注塑成型", "ST-ZS-01", 0.008, False),
+            (3, "OP30", "浸塑处理", "ST-JS-01", 0.006, False),
+            (4, "OP40", "哑铃组装", "ST-YL-01", 0.010, False),
+            (5, "OP50", "成品检验", "ST-QC-02", 0.003, True),
+            (6, "OP60", "包装入库", "ST-PK-01", 0.004, False),
         ],
     },
     "FG-WIRE-01": {
         "name": "线材生产工艺",
         "code": "RT-WIRE-V1",
         "steps": [
-            (1, "OP10", "来料检验", "ST-QC-01", 0.5, True),
-            (2, "OP20", "线材加工", "ST-XC-01", 2.0, False),
-            (3, "OP30", "焊接", "ST-HJ-01", 1.5, False),
-            (4, "OP40", "组立一线", "ST-ZL-01", 2.0, False),
-            (5, "OP50", "成品检验", "ST-QC-02", 0.5, True),
-            (6, "OP60", "包装入库", "ST-PK-01", 1.0, False),
+            (1, "OP10", "来料检验", "ST-QC-01", 0.003, True),
+            (2, "OP20", "线材加工", "ST-XC-01", 0.008, False),
+            (3, "OP30", "焊接", "ST-HJ-01", 0.010, False),
+            (4, "OP40", "组立一线", "ST-ZL-01", 0.008, False),
+            (5, "OP50", "成品检验", "ST-QC-02", 0.003, True),
+            (6, "OP60", "包装入库", "ST-PK-01", 0.004, False),
         ],
     },
     "FG-WHEEL-01": {
         "name": "滚轮生产工艺",
         "code": "RT-WHEEL-V1",
         "steps": [
-            (1, "OP10", "来料检验", "ST-QC-01", 0.5, True),
-            (2, "OP20", "粗加工", "ST-JG-01", 2.5, False),
-            (3, "OP30", "精加工", "ST-JJG-01", 3.0, False),
-            (4, "OP40", "涂装", "ST-TZ-01", 1.5, False),
-            (5, "OP50", "滚轮组装", "ST-GL-01", 2.0, False),
-            (6, "OP60", "成品检验", "ST-QC-02", 0.5, True),
-            (7, "OP70", "包装入库", "ST-PK-01", 1.0, False),
+            (1, "OP10", "来料检验", "ST-QC-01", 0.003, True),
+            (2, "OP20", "粗加工", "ST-JG-01", 0.012, False),
+            (3, "OP30", "精加工", "ST-JJG-01", 0.015, False),
+            (4, "OP40", "涂装", "ST-TZ-01", 0.006, False),
+            (5, "OP50", "滚轮组装", "ST-GL-01", 0.008, False),
+            (6, "OP60", "成品检验", "ST-QC-02", 0.003, True),
+            (7, "OP70", "包装入库", "ST-PK-01", 0.004, False),
         ],
     },
     "FG-METER-01": {
         "name": "仪表生产工艺",
         "code": "RT-METER-V1",
         "steps": [
-            (1, "OP10", "来料检验", "ST-QC-01", 0.5, True),
-            (2, "OP20", "注塑成型", "ST-ZS-01", 2.0, False),
-            (3, "OP30", "仪表装配", "ST-YB-01", 2.5, False),
-            (4, "OP40", "机电装配", "ST-JD-01", 2.0, False),
-            (5, "OP50", "成品检验", "ST-QC-02", 0.5, True),
-            (6, "OP60", "包装入库", "ST-PK-01", 1.0, False),
+            (1, "OP10", "来料检验", "ST-QC-01", 0.003, True),
+            (2, "OP20", "注塑成型", "ST-ZS-01", 0.008, False),
+            (3, "OP30", "仪表装配", "ST-YB-01", 0.010, False),
+            (4, "OP40", "机电装配", "ST-JD-01", 0.008, False),
+            (5, "OP50", "成品检验", "ST-QC-02", 0.003, True),
+            (6, "OP60", "包装入库", "ST-PK-01", 0.004, False),
         ],
     },
 }
@@ -79,7 +79,16 @@ async def seed():
             row = existing.fetchone()
             if row:
                 template_id = str(row[0])
-                print(f"[skip] {defn['code']} already exists: {template_id}")
+                # 已存在：更新工序工时为单件工时
+                for seq, pcode, op_name, wc, hours, is_qc in defn["steps"]:
+                    await session.execute(
+                        text("""
+                            UPDATE routing_template_steps SET standard_hours = :hours, work_center = :wc
+                            WHERE template_id = :tid AND seq = :seq
+                        """),
+                        {"hours": hours, "wc": wc, "tid": template_id, "seq": seq},
+                    )
+                print(f"[updated] {defn['code']} steps hours")
             else:
                 template_id = str(uuid.uuid4())
                 await session.execute(
@@ -110,7 +119,7 @@ async def seed():
                 text("""
                     UPDATE work_orders SET routing_template_id = :tid
                     WHERE factory_id = :factory AND product_id = :pid
-                      AND (routing_template_id IS NULL OR routing_template_id = '')
+                      AND routing_template_id IS NULL
                       AND status IN ('released', 'in_progress', 'pending', 'created')
                 """),
                 {"tid": template_id, "factory": FACTORY, "pid": product_id},

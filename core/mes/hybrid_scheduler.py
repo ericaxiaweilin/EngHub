@@ -300,15 +300,12 @@ class HybridScheduler:
         start: datetime.datetime,
         duration: float,
     ) -> bool:
-        """检查是否在工作日历内"""
-        end = start + datetime.timedelta(seconds=duration)
-        
+        """检查是否在工作日历内（只要求开始时间在工作时段内，任务可跨天）"""
         for work_start, work_end in resource.calendar:
-            # 简化处理：假设在同一天
             slot_start = datetime.datetime.combine(start.date(), work_start)
             slot_end = datetime.datetime.combine(start.date(), work_end)
             
-            if start >= slot_start and end <= slot_end:
+            if slot_start <= start < slot_end:
                 return True
         
         return False
