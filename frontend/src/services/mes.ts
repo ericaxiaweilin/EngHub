@@ -434,6 +434,13 @@ export const createDefect = (data: Record<string, any>) =>
 export const processDefect = (id: string, data: Record<string, any>) =>
   api.post(`${API_ENDPOINTS.DEFECTS}/${id}/process`, data);
 
+// #9 OCAP闭环 - 新增OCAP相关API调用
+export const getDefect = (id: string) =>
+  api.get<any, Defect>(`${API_ENDPOINTS.DEFECTS}/${id}`)
+
+export const updateDefectOCAP = (id: string, data: Record<string, any>) =>
+  api.patch(API_ENDPOINTS.DEFECTS + `/${id}`, data)
+
 // ============== WMS ==============
 
 export const listWarehouses = (params?: Record<string, any>) =>

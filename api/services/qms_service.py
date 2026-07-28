@@ -26,6 +26,7 @@ from database.models import (
     Product, BomItem
 )
 from api.services.work_order_service import WorkOrderService, WOStatus
+from core.qms.aql_config import get_aql_config  # #8 AQL 可配置化 - 加载默认/自定义标准
 # WMS服务导入（仅在需要时使用，避免循环导入）
 
 
@@ -73,28 +74,20 @@ class OcapStatus(str, Enum):
 
 # ==================== AQL 判定服务 ====================
 
+from core.qms.aql_config import get_aql_config
+
+# 在模块首次导入时加载一次全局配置（应用启动时）
+_sample_size_codes_global, _aql_standards_global = get_aql_config()
+
+
 class AQLService:
-    """AQL查表计算服务 - 支持可配置标准"""
+    """AQL查表计算服务 - 支持可配置标准（通过 CodeTable 注入）"""
     
-    # AQL标准样本大小代码表（简化版，实际可扩展为可配置表）
-    SAMPLE_SIZE_CODES = {
-        (2, 8): "A", (9, 15): "B", (16, 25): "C", (26, 50): "D",
-        (51, 90): "E", (91, 150): "F", (151, 280): "G", (281, 500): "H",
-        (501, 1200): "J", (1201, 3200): "K", (3201, 10000): "L",
-    }
+    # AQL标准样本大小代码表（从全局配置加载）
+    SAMPLE_SIZE_CODES = _sample_size_codes_global
     
-    # AQL判定标准 (Ac=合格判定数, Re=不合格判定数) - 支持多等级
-    AQL_STANDARDS = {
-        "A": {"0.65": (1, 2), "1.0": (2, 3), "1.5": (3, 4)},
-        "B": {"0.65": (1, 2), "1.0": (2, 3), "1.5": (3, 4)},
-        "C": {"0.65": (1, 2), "1.0": (2, 3), "1.5": (3, 4), "2.5": (5, 6)},
-        "D": {"0.65": (1, 2), "1.0": (2, 3), "1.5": (3, 4), "2.5": (5, 6)},
-        "E": {"0.65": (1, 2), "1.0": (2, 3), "1.5": (3, 4), "2.5": (5, 6)},
-        "F": {"0.40": (1, 2), "0.65": (2, 3), "1.0": (3, 4), "1.5": (5, 6), "2.5": (7, 8)},
-        "G": {"0.40": (1, 2), "0.65": (2, 3), "1.0": (3, 4), "1.5": (5, 6), "2.5": (7, 8)},
-        "H": {"0.25": (1, 2), "0.40": (2, 3), "0.65": (3, 4), "1.0": (5, 6), "1.5": (7, 8), "2.5": (10, 11)},
-        "J": {"0.15": (1, 2), "0.25": (2, 3), "0.40": (3, 4), "0.65": (5, 6), "1.0": (7, 8), "1.5": (10, 11)},
-    }
+    # AQL判定标准 (Ac=合格判定数, Re=不合格判定数) - 支持多等级（从全局配置加载）
+    AQL_STANDARDS = _aql_standards_global
     
     def get_sample_size_code(self, batch_size: int) -> str:
         for (min_size, max_size), code in self.SAMPLE_SIZE_CODES.items():

@@ -14,6 +14,8 @@ import AlertIntelligence from './pages/alerts/AlertIntelligence'
 import ProductionReport from './pages/reporting/ProductionReport'
 import InspectionList from './pages/qms/InspectionList'
 import DefectList from './pages/qms/DefectList'
+import OcapList from './pages/qms/OcapList'  // #9 OCAP闭环 - 新增OCAP管理页面
+import OcapDetail from './pages/qms/OcapDetail'  // #9 OCAP闭环 - OCAP详情页面
 import InventoryList from './pages/wms/InventoryList'
 import SimulationEngine from './pages/simulation/SimulationEngine'
 import ProductionData from './pages/ProductionData'
@@ -154,6 +156,9 @@ const App: React.FC = () => {
             <Route path="production-report" element={<PermissionGate path="/production-report"><ProductionReport /></PermissionGate>} />
             <Route path="inspections" element={<PermissionGate path="/inspections"><InspectionList /></PermissionGate>} />
             <Route path="defects" element={<PermissionGate path="/defects"><DefectList /></PermissionGate>} />
+            // #9 OCAP闭环 - 新增OCAP管理路由
+            <Route path="ocaps" element={<PermissionGate path="/qms/ocaps"><OcapList /></PermissionGate>} />
+            <Route path="ocaps/:id" element={<PermissionGate path="/qms/ocaps/detail"><OcapDetail /></PermissionGate>} />
             <Route path="quality-center" element={<PermissionGate path="/quality-center"><QualityCenter /></PermissionGate>} />
             <Route path="quality-goals" element={<PermissionGate path="/quality-goals"><QualityGoals /></PermissionGate>} />
             <Route path="inspection-terminal" element={<PermissionGate path="/inspection-terminal"><InspectionTerminal /></PermissionGate>} />

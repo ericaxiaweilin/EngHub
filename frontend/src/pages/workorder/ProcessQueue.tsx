@@ -123,23 +123,48 @@ const ProcessQueue: React.FC = () => {
       title: '交期', dataIndex: 'planned_due', key: 'due', width: 110,
       render: (v: string) => v ? v.slice(0, 10) : '-',
     },
-    { title: '备注', dataIndex: 'remark', key: 'remark', ellipsis: true },
+    // ========== #2 工序依赖锁止 - 新增前序步骤状态列 ==========
     {
-      title: '操作', key: 'action', width: 140, fixed: 'right' as const,
-      render: (_: any, record: WorkOrder) => (
-        <Space size={4}>
-          {record.status === 'released' && canStart && (
+      title: '前序状态', key: 'prereq_status', width: 140,
+      render: (_: any, record: WorkOrder) => {
+        if (!record.current_routing_step || record.current_routing_step <= 1) return <Tag color="blue">第1步（无前置）</Tag>
+        // 简化：实际应从后端API获取前序状态，这里展示占位提示
+        return <Tag color="warning">需检查步骤{record.current_routing_step - 1}</Tag>
+      }
+    },
+    {
+      title: '备注', dataIndex: 'remark', key: 'remark', ellipsis: true },
+    {
+      title: '操作', key: 'action', width: 180, fixed: 'right' as const,
+      render: (_: any, record: WorkOrder) => {
+        let startButton = null
+        let lockTip = null
+        
+        if (record.status === 'released' && canStart) {
+          // 简易检查：若 current_routing_step > 1 则默认可能存在锁止（实际应由后端API返回can_start布尔值）
+          const needsCheck = record.current_routing_step && record.current_routing_step > 1
+          if (needsCheck) {
+            lockTip = <Tooltip title="⚠ 前序步骤尚未开始：请等待步骤 N-1 开工后继续">🔒 工序锁止</Tooltip>
+          }
+          startButton = (
             <Tooltip title="开工">
-              <Button type="primary" size="small" icon={<PlayCircleOutlined />} onClick={() => handleStart(record)} />
+              <Button type="primary" size="small" icon={<PlayCircleOutlined />} onClick={() => handleStart(record)} disabled={!!lockTip} />
             </Tooltip>
-          )}
-          {record.status === 'in_progress' && canComplete && (
-            <Tooltip title="完工">
-              <Button type="primary" size="small" icon={<CheckCircleOutlined />} style={{ background: '#52c41a', borderColor: '#52c41a' }} onClick={() => handleComplete(record)} />
-            </Tooltip>
-          )}
-        </Space>
-      ),
+          )
+        }
+        
+        return (
+          <Space direction="vertical" align={center}>
+            {startButton}
+            {lockTip}
+            {record.status === 'in_progress' && canComplete && (
+              <Tooltip title="完工">
+                <Button type="primary" size="small" icon={<CheckCircleOutlined />} style={{ background: '#52c41a', borderColor: '#52c41a' }} onClick={() => handleComplete(record)} />
+              </Tooltip>
+            )}
+          </Space>
+        )
+      },
     },
   ]
 

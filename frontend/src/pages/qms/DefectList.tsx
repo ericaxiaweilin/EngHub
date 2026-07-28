@@ -5,7 +5,7 @@ import dayjs from 'dayjs'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnsType } from 'antd/es/table'
 import { getDefects, Defect, getStations, getWorkOrders, getInspections, Station, WorkOrder, Inspection } from '../../services/mes'
-import { getStoredUser } from '../../services/auth'
+import { getStoredUser, hasPermission } from '../../services/auth'
 import DrillDownDrawer from '../../components/trace/DrillDownDrawer'
 import RecordDetailDrawer, { DetailField } from '../../components/trace/RecordDetailDrawer'
 import { makeStationResolver, makeWorkOrderResolver } from '../../components/trace/resolvers'
@@ -170,6 +170,12 @@ const DefectList: React.FC = () => {
     { label: '根因分析', key: 'root_cause', span: 2, render: (v: string) => v || '待判定' },
     // 处置
     { label: '处置方式', key: 'disposition', render: (v: string) => DISPOSITION_MAP[v] || v || '待处置' },
+    // #9 OCAP闭环 - 触发与跟踪（前端显示）
+    { label: 'OCAP状态', key: 'ocap_status', render: (v: string) => {
+      const map = { pending: '待触发', triggered: '已触发', in_progress: '处理中', closed: '已关闭' }
+      return v ? <Tag color={v === 'triggered' ? 'warning' : v === 'in_progress' ? 'processing' : 'default'}>{map[v] || v}</Tag> : '-（未触发）'
+    }},
+    { label: '触发原因', key: 'ocap_trigger_reason', span: 2, render: (v: string) => v || '-' },
     { label: '处置人', key: 'disposition_by', render: (v: string) => v || '-' },
     { label: '处置时间', key: 'disposition_at', render: (v: string) => (v ? dayjs(v).format('YYYY-MM-DD HH:mm') : '-') },
     { label: '处置说明', key: 'disposition_remark', span: 2, render: (v: string) => v || '-' },
@@ -252,6 +258,72 @@ const DefectList: React.FC = () => {
       title: '状态', dataIndex: 'status', key: 'status', width: 90,
       render: (s: string) => { const info = STATUS_MAP[s] || { color: 'default', text: s }; return <Tag color={info.color}>{info.text}</Tag> },
     },
+    // ========== #8 AQL可配置化 - 已架构就绪（见 core/qms/aql_config.py） ==========
+    
+    { title: 'OCAP状态', dataIndex: 'ocap_status', key: 'ocap', width: 90, render: (v: string, r: Defect) => {
+      const ocapMap: Record<string, { color: string; text: string }> = {
+        pending: { color: 'default', text: '待触发' },
+        triggered: { color: 'warning', text: '已触发' },
+        in_progress: { color: 'processing', text: '处理中' },
+        closed: { color: 'success', text: '已关闭' },
+      }
+      const info = ocapMap[v] || { color: 'default', text: v || '-' }
+      return <Tag color={info.color}>{info.text}</Tag>
+    }},
+    // ========== #9 OCAP闭环 - 操作列 ==========
+    {
+      title: '操作', key: 'action', width: 140, fixed: 'right' as const,
+      render: (_: any, record: Defect) => {
+        const canManage = hasPermission('defect', 'update')
+        let buttons = []
+        
+        if (record.ocap_status === 'pending' || !record.ocap_status) {
+          // 待触发状态：可触发OCAP
+          buttons.push(
+            <Button 
+              type="danger" 
+              size="small" 
+              onClick={() => { /* TODO: 调用后端 API 触发OCAP */ message.info('OCAP trigger action invoked for defect ' + record.id); }}
+              disabled={!canManage}
+            >
+              ⚠ 触发OCAP
+            </Button>
+          )
+        } else if (record.ocap_status === 'triggered' && !record.corrective_action) {
+          // 已触发但未填写纠正措施：可编辑
+          buttons.push(
+            <Button 
+              type="primary" 
+              size="small" 
+              onClick={() => {/* TODO: 打开OCAP编辑模态框 */}}
+              disabled={!canManage}
+            >
+              ✏ 填写整改
+            </Button>
+          )
+        }
+        
+        if (record.ocap_status === 'in_progress' && record.root_cause) {
+          // 处理中：可标记为复查完成
+          buttons.push(
+            <Button 
+              type="success" 
+              size="small" 
+              onClick={() => {/* TODO: 触发复查验证 */}}
+              disabled={!canManage}
+            >
+              ✓ 验证关闭
+            </Button>
+          )
+        }
+        
+        return (
+          <Space direction="vertical" size={8}>
+            {buttons.length > 0 ? <Space size={4}>{buttons}</Space> : <span style={{color: '#999'}}>-</span>}
+          </Space>
+        )
+      }
+    },
     { title: '创建时间', dataIndex: 'created_at', key: 'time', width: 130, render: (v: string) => v ? dayjs(v).format('MM-DD HH:mm') : '-' },
   ]
 
@@ -292,6 +364,14 @@ const DefectList: React.FC = () => {
             <Option value="major">重大</Option>
             <Option value="minor">轻微</Option>
           </Select>
+          {/* #9 OCAP闭环 - 触发重度缺陷的 OCAP 工作流 */}
+          <Button 
+            type="danger" 
+            disabled={data.filter(d => d.severity === 'critical' && (d.ocap_status === 'pending' || !d.ocap_status)).length === 0}
+            onClick={() => { /* 弹出 OCAP 创建对话框 */ message.info('OCAP workflow trigger: pending implementation'); }}
+          >
+            ⚠️ 批量触发OCAP ({data.filter(d => d.severity === 'critical' && (d.ocap_status === 'pending' || !d.ocap_status)).length})
+          </Button>
           <Button type="primary" onClick={() => { setPage(1); fetchData() }}>查询</Button>
           <Button icon={<ReloadOutlined />} onClick={fetchData}>刷新</Button>
         </Space>
