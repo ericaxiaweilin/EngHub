@@ -19,6 +19,8 @@ from database.models import (
     BomItem,
     Inventory
 )
+from api.services.aps_service import ApsService  # #11 APS动态排程反馈 - 报工后触发重排程
+import asyncio
 
 
 class ProductionReportService:
@@ -73,9 +75,38 @@ class ProductionReportService:
         # 根据良品数量反向扣减 BOM 材料用量
         await self._backflush_materials(self.db, work_order_id, good_qty, created_by)
         
+        # #11 APS动态排程反馈 - 触发APS重新计算剩余工单计划
+        if factory_id and work_order_id:
+            await self._notify_aps_on_report_update(work_order_id, factory_id)
+        
         return report
     
-    async def _update_work_order_qty(self, work_order_id: str):
+    async def _notify_aps_on_report_update(self, work_order_id: str, factory_id: str):
+        """#11 APS动态排程反馈 - 报工完成后触发APS重新计算
+        
+        使用 asyncio.create_task 异步调用，避免阻塞报工事务。
+        如果 APS 调度失败将记录日志但不影响主流程。
+        """
+        from logging import getLogger
+        
+        logger = getLogger(__name__)
+        
+        # 异步启动 APS 重排程（不等待完成）
+        async def trigger_aps_replan():
+            try:
+                aps_service = ApsService(self.db)
+                await aps_service.generate_schedule(
+                    factory_id=factory_id,
+                    mode="hybrid",
+                    horizon_days=7,
+                    optimize_for="delivery",
+                    updated_by="system"  # 修改参数以匹配 create_signature
+                )
+                logger.info(f"[APS] 重新排程完成 for work_order: {work_order_id}")
+            except Exception as e:
+                logger.error(f"[APS] 重排程失败: {e}")
+        
+        asyncio.create_task(trigger_aps_replan())
         """更新工单完工数量"""
         from sqlalchemy import func
         
@@ -275,6 +306,10 @@ class ProductionReportService:
         
         # 重新计算工单数量
         await self._update_work_order_qty(report.work_order_id)
+        
+        # #11 APS动态排程反馈 - 报工修改后触发APS重新计算
+        if report.factory_id and report.work_order_id:
+            await self._notify_aps_on_report_update(report.work_order_id, report.factory_id)
         
         return report
 
