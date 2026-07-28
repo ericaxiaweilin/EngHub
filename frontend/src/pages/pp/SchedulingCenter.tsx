@@ -6,7 +6,7 @@ import CapacityLoad from './CapacityLoad'
 import { apsApi } from '../../services/aps'
 
 const { Text } = Typography
-const FACTORY = 'F001'
+const FACTORY = localStorage.getItem('active_factory_id') || 'FAC_MECH_001'
 
 const algorithms = [
   { value: 'EDD', label: 'EDD 最早交期优先' },

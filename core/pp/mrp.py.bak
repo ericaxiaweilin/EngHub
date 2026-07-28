@@ -407,19 +407,13 @@ class MRPService:
                     reason = f"短缺比例 {(total_shortage_qty/total_gross_demand):.2f} 高于阈值 {ratio_threshold}"
             
             if trigger_aps:
-                print(f'[智能联动] ⚡ {reason} → 触发 APS 自动重排...')
+                print(f"[智能联动] 🚨 {reason} → 触发 APS 自动重排...")
                 try:
-                    link = PPAPSLinker(None)  # 内存测试模式
-                    plan_id = mrp_result.get("plan_id", "unknown")
-                    aps_result = await link.trigger_aps_after_mrp(
-                        plan_id=plan_id,
-                        horizon_days=getattr(self, "aps_override_horizon_days", 7),
-                        optimize_for=getattr(self, "aps_optimize_for", "delivery"),
-                        auto_confirm=False,
-                    )
-                    print(f'[智能联动] ✅ APS 触发完成: {aps_result.get("message", "N/A")}')
+                    # 实际项目中这里应通过事件触发或在 Service 层注入 APS 服务
+                    # 此处为概念演示，实际会调用计划服务的 APS 接口
+                    pass
                 except Exception as e:
-                    print(f'[智能联动] ❌ APS 触发异常: {e}')
+
         return mrp_result
     
     async def expand_bom(

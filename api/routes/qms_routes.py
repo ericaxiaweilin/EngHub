@@ -570,7 +570,141 @@ async def create_quality_goal(
 
 
 @router.post("/qms/goals/{goal_id}/review")
-async def review_quality_goal(
+async 
+
+# --- IQ C 来料检验专属接口 ---
+
+class IQCCreateRequest(BaseModel):
+    """IQ C 创建请求体"""
+    inbound_order_id: str
+    factory_id: str
+    supplier_id: str
+    product_id: str
+    product_name: str
+    quantity_received: int
+    batch_no: str
+    inspector_id: str
+    sample_size: Optional[int] = None
+
+
+class IQCStartRequest(BaseModel):
+    """开始检验请求"""
+    inspector_id: str
+
+
+class IQCCompleteRequest(BaseModel):
+    """完成检验请求"""
+    result: str  # PASS or FAIL
+    sample_inspected: int
+    defects: Optional[List[Dict]] = None
+
+
+class IQCDIsposalRequest(BaseModel):
+    """处置请求"""
+    disposition: str  # accept, reject, use_as_is
+    by: str
+
+
+@router.post("/iqc/create")
+async def create_iqc_request(
+    body: IQCCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建IQ C记录（收货后触发）"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    try:
+        record = await qms.create_iqc_record(
+            inbound_order_id=body.inbound_order_id,
+            factory_id=body.factory_id,
+            supplier_id=body.supplier_id,
+            product_id=body.product_id,
+            product_name=body.product_name,
+            quantity_received=body.quantity_received,
+            batch_no=body.batch_no,
+            inspector_id=body.inspector_id,
+            sample_size=body.sample_size,
+        )
+        return {"success": True, "data": record}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/iqc/{inspection_id}/start")
+async def start_iqc_inspection(
+    inspection_id: str,
+    body: IQCStartRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """开始IQ C检验"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    success = await qms.start_iqc_inspection(inspection_id, body.inspector_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="无法开始检验：检验不存在或状态不正确")
+    
+    return {"success": True, "message": "检验已开始"}
+
+@router.put("/iqc/{inspection_id}/complete")
+async def complete_iqc_inspection(
+    inspection_id: str,
+    body: IQCCompleteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """完成IQ C检验并记录结果"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    success = await qms.complete_iqc_inspection(
+        inspection_id=inspection_id,
+        result=body.result,
+        sample_inspected=body.sample_inspected,
+        defects=body.defects,
+    )
+    if not success:
+        raise HTTPException(status_code=400, detail="无法完成检验：检验不存在或状态不正确")
+    
+    return {"success": True, "message": "检验已完成", "result": body.result}
+
+@router.post("/iqc/{inspection_id}/dispose")
+async def dispose_iqc_record(
+    inspection_id: str,
+    body: IQCDIsposalRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """处置IQ C记录"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    success = await qms.dispose_iqc_record(
+        inspection_id=inspection_id,
+        disposition=body.disposition,
+        by=body.by,
+    )
+    if not success:
+        raise HTTPException(status_code=400, detail="无法处置：检验未完成")
+    
+    return {"success": True, "message": "处置完成", "disposition": body.disposition}
+
+@router.get("/iqc/stats")
+async def get_iqc_stats(
+    factory_id: str = Query(..., description="工厂ID"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取IQ C统计信息"""
+    from api.services.qms_service import QMSService
+    qms = QMSService()
+    
+    stats = await qms.get_iqc_statistics(factory_id)
+    return {"success": True, "data": stats}
+def review_quality_goal(
     goal_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),

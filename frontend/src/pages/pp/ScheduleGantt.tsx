@@ -11,7 +11,7 @@ import {
 import dayjs from 'dayjs'
 import { apsApi, ApsSchedule, GanttData, ApsTask } from '../../services/aps'
 
-const FACTORY = 'F001'
+const FACTORY = localStorage.getItem('active_factory_id') || 'FAC_MECH_001'
 
 const statusColorMap: Record<string, string> = {
   draft: 'default',

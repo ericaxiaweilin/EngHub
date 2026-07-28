@@ -122,10 +122,13 @@ const ROUTE_MODULE_MAP: [string, string][] = [
   ['/orders', 'g-aps'], ['/plans', 'g-aps'], ['/scheduling', 'g-aps'],
   ['/andon', 'g-collab'], ['/tms/', 'g-collab'], ['/quick-request', 'g-collab'], ['/my-tasks', 'g-collab'],
   ['/war-room', 'g-collab'], ['/work-order-templates', 'g-collab'], ['/rcc', 'g-collab'],
+  ['/agent-supervisor', 'g-collab'],
   ['/simulation', '/simulation'], ['/sim-erp', '/simulation'],
   ['/skill-matrix', 'g-hr'], ['/hr-roster', 'g-hr'],
   ['/dashboard', 'g-mes'], ['/production-data', 'g-mes'],
   ['/settings', '/settings'],
+  ['/notifications', '/settings'], ['/collaboration', 'g-collab'],
+  ['/automation-level', '/settings'], ['/workflow-analytics', '/settings'],
   ['/ie/', 'g-ie'],
 ]
 

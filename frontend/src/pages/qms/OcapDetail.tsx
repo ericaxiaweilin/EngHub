@@ -53,9 +53,13 @@ const OcapDetail: React.FC = () => {
   }, [id, navigate, form])
 
   const handleSubmit = async (values: any) => {
-    try await updateDefectOCAP(id, values)
-    message.success('OCAP信息已更新')
-    navigate('/qms/ocaps')
+    try {
+      await updateDefectOCAP(id, values)
+      message.success('OCAP信息已更新')
+      navigate('/qms/ocaps')
+    } catch {
+      message.error('更新失败')
+    }
   }
 
   if (!loading && !defect) return <div>缺陷不存在</div>
@@ -95,7 +99,7 @@ const OcapDetail: React.FC = () => {
               <Button type="primary" htmlType="submit">保存OCAP信息</Button>
               <Button onClick={() => navigate('/qms/ocaps')}>返回列表</Button>
             </Space>
-          </Form.FormItem>
+          </Form.Item>
         </Form>
       </Card>
     </div>

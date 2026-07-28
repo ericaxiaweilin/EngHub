@@ -44,6 +44,7 @@ import Login from './pages/auth/Login'
 import ModuleSelector from './pages/ModuleSelector'
 // v2.5 Modules
 import WarRoom from './pages/war-room/WarRoom'
+import AgentSupervisor from './pages/war-room/AgentSupervisor'
 import AndonDashboard from './pages/andon/AndonDashboard'
 import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
 import RCCDashboard from './pages/rcc/RCCDashboard'
@@ -54,6 +55,10 @@ import TaskDistribution from './pages/tms/TaskDistribution'
 import AgentConsole from './pages/tms/AgentConsole'
 import QuickRequest from './pages/tms/QuickRequest'
 import SystemSettings from './pages/settings/SystemSettings'
+import NotificationCenter from './pages/settings/NotificationCenter'
+import CollaborationNetwork from './pages/settings/CollaborationNetwork'
+import AutomationLevel from './pages/settings/AutomationLevel'
+import WorkflowAnalytics from './pages/settings/WorkflowAnalytics'
 import ExpertSystemChat from './pages/expert/ExpertChat'
 // IE 精益生产模块
 import StandardTimes from './pages/ie/StandardTimes'
@@ -193,6 +198,10 @@ const App: React.FC = () => {
             <Route path="quick-request" element={<QuickRequest />} />
             <Route path="settings" element={<SystemSettings />} />
             <Route path="settings/code-tables" element={<SystemSettings defaultTab="codetables" />} />
+            <Route path="notifications" element={<NotificationCenter />} />
+            <Route path="collaboration" element={<CollaborationNetwork />} />
+            <Route path="automation-level" element={<AutomationLevel />} />
+            <Route path="workflow-analytics" element={<WorkflowAnalytics />} />
             {/* v2.5 Smart Collaboration */}
             <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
@@ -200,6 +209,7 @@ const App: React.FC = () => {
             <Route path="rcc" element={<PermissionGate path="/rcc"><RCCDashboard /></PermissionGate>} />
             <Route path="expert" element={<PermissionGate path="/ai"><ExpertSystemChat /></PermissionGate>} />
             <Route path="war-room" element={<PermissionGate path="/simulation"><WarRoom /></PermissionGate>} />
+                        <Route path="agent-supervisor" element={<PermissionGate path="/simulation"><AgentSupervisor /></PermissionGate>} />
             {/* IE 精益生产 */}
             <Route path="ie/standard-times" element={<PermissionGate path="/ie/standard-times"><StandardTimes /></PermissionGate>} />
             <Route path="ie/time-studies" element={<PermissionGate path="/ie/standard-times"><TimeStudies /></PermissionGate>} />

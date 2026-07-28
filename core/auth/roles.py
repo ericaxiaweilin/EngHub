@@ -634,7 +634,7 @@ def get_menu_items_for_user(user) -> list:
     """根据用户角色生成可见菜单项（模块化一级入口，参考 ERPNext Workspace 导航）"""
     user_perms = get_user_permissions(user)
     modules_with_access = set(p["module"] for p in user_perms)
-    is_admin = getattr(user, "is_superuser", False)
+    is_admin = getattr(user, "is_superuser", False) or getattr(user, "role", "") == "admin"
 
     items = []
 
@@ -726,6 +726,10 @@ def get_menu_items_for_user(user) -> list:
         collab_children.append({"key": "/tms/distribution", "label": "分发看板"})
         collab_children.append({"key": "/tms/agent", "label": "Agent控制台"})
     collab_children.append({"key": "/my-tasks", "label": "我的任务"})
+    if is_admin or "tms" in modules_with_access:
+        collab_children.append({"key": "/agent-supervisor", "label": "智能体监督"})
+    if is_admin:
+        collab_children.append({"key": "/collaboration", "label": "协同网络"})
     if user_perms and any(p.get("module") in ("work_order", "quality", "equipment") for p in user_perms):
         collab_children.append({"key": "/alert-intelligence", "label": "预警情报"})
     if collab_children:
@@ -746,7 +750,13 @@ def get_menu_items_for_user(user) -> list:
 
     # ━━━ 10. 系统（管理员）━━━
     if is_admin or "system" in modules_with_access:
-        items.append({"key": "/settings", "label": "系统设置"})
+        sys_children = [
+            {"key": "/settings", "label": "系统设置"},
+            {"key": "/notifications", "label": "通知中心"},
+            {"key": "/automation-level", "label": "自动化等级"},
+            {"key": "/workflow-analytics", "label": "工作流分析"},
+        ]
+        items.append({"key": "/settings", "label": "系统", "children": sys_children})
 
     return items
 
