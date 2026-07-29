@@ -114,7 +114,8 @@ BEGIN
                 v_hire,
                 CASE WHEN random() < 0.95 THEN 'active' WHEN random() < 0.98 THEN 'leave' ELSE 'resigned' END,
                 v_skill
-            );
+            )
+            ON CONFLICT (factory_id, employee_code) DO NOTHING;
         END LOOP;
     END LOOP;
 END $$;
