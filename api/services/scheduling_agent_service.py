@@ -313,7 +313,11 @@ class SchedulingAgent:
               AND t.planned_start > NOW()
             GROUP BY t.station_id
         """), {"fid": factory_id})
-        loads = [dict(r) for r in result.mappings().all()]
+        loads = []
+        for row in result.mappings().all():
+            load = dict(row)
+            load["total_hours"] = float(load.get("total_hours") or 0)
+            loads.append(load)
 
         if not loads:
             return {"balanced": True, "message": "无待执行排程任务"}
