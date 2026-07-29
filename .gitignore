@@ -51,3 +51,4 @@ mes-project-deploy.tar.gz
 .deploy_tmp/
 uploads/
 /upload_*.jpg
+/scripts/seed_f01_reports.py
