@@ -76,4 +76,5 @@ SELECT
   '08:00'::time,
   '20:00'::time,
   TRUE
-FROM generate_series(0, 5) AS d(dow);
+FROM generate_series(0, 5) AS d(dow)
+ON CONFLICT DO NOTHING;
