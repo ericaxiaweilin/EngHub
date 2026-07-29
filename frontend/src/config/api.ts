@@ -54,8 +54,13 @@ export const API_ENDPOINTS = {
   SIM_FACTORY_RUN: `${API_BASE_URL}/api/v1/sim-factory/run`,
   SIM_FACTORY_DASHBOARD_SUMMARY: (scenarioId?: string) =>
     `${API_BASE_URL}/api/v1/sim-factory/dashboard${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
-  PRODUCTION_DASHBOARD_SUMMARY: (factoryId?: string) =>
-    `${API_BASE_URL}/api/v1/production-dashboard/summary${factoryId ? `?factory_id=${factoryId}` : ''}`,
+  PRODUCTION_DASHBOARD_SUMMARY: (factoryId?: string, horizonDays?: number) => {
+    const params = new URLSearchParams()
+    if (factoryId) params.set('factory_id', factoryId)
+    if (horizonDays) params.set('horizon_days', String(horizonDays))
+    const qs = params.toString()
+    return `${API_BASE_URL}/api/v1/production-dashboard/summary${qs ? `?${qs}` : ''}`
+  },
 
   // Employee Skills (HR)
   SKILLS: `${API_BASE_URL}/api/v1/skills`,

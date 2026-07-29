@@ -1,15 +1,17 @@
-"""MES Pydantic Schemas
+"""MES Pydantic Schemas - Data transfer objects for Mes operations."""
 
-Data transfer objects for Mes operations. Used for request validation and response serialization."""
+from pydantic import BaseModel, Field
+from typing import Optional, Any, List, Dict
+from datetime import datetime
+from dataclasses import dataclass, asdict
 
-from pydantic import BaseModel, Field, constr
-from datetime import Optional, Any
 
+# ─── Pydantic Models (API Request/Response) ────────────────────────
 
 class WorkOrderQueryRequest(BaseModel):
     """Request parameters for querying work orders."""
     
-    factory_id: str = Field(default="F01", description="Factory ID filter")
+    factory_id: str = Field(default="F01", description="Factory ID")
     status: Optional[str] = None
     product_id: Optional[str] = None
     page: int = Field(default=1, ge=1, description="Page number")
@@ -19,7 +21,14 @@ class WorkOrderQueryRequest(BaseModel):
 class WorkOrderUpdateRequest(BaseModel):
     """Request to update work order status."""
     
-    new_status: constr(regex=r"^(created|released|in_progress|paused|resumed|completed|cancelled|rework_needed)$") = Field(..., description="New status value")
+    new_status: str = Field(..., description="New status value")
+    
+    def __root_valid__(cls, values):
+        valid_statuses = {"created", "released", "in_progress", "paused", 
+                         "resumed", "completed", "cancelled", "rework_needed"}
+        if values.get("new_status") not in valid_statuses:
+            raise ValueError(f"Invalid status: {values['new_status']}")
+        return values
 
 
 class ProductionReportRequest(BaseModel):
@@ -34,8 +43,7 @@ class ProductionReportRequest(BaseModel):
     defect_qty: int = Field(default=0, ge=0, description="Quantity of defective products")
 
 
-# ───────── Response Models ────────────────
-
+# ─── Response Models ───────────────────────────────────────────────
 
 class WorkOrderResponse(BaseModel):
     """Response model for a single work order."""
@@ -65,7 +73,7 @@ class ProductionReportResponse(BaseModel):
     good_qty: int
     defect_qty: int
     total_qty: int
-    yield_rate: float  # percentage
+    yield_rate: float
     created_at: str
 
 
@@ -77,3 +85,18 @@ class WorkOrdersListResponse(BaseModel):
     page: int
     size: int
     factory_id: str
+
+
+# ─── Internal Data Classes (NOT for API, just for internal parsing) ───
+
+@dataclass
+class WorkOrderQueryCriteria:
+    """Structured criteria for work order query - internal use only."""
+    factory_id: str = "F01"
+    status: Optional[str] = None
+    product_id: Optional[str] = None
+    page: int = 1
+    size: int = 10
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)

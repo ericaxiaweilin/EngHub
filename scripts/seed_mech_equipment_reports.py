@@ -3,7 +3,7 @@ import asyncio
 import asyncpg
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/enghub").replace("+asyncpg", "")
 FID = "FAC_MECH_001"
@@ -53,22 +53,30 @@ async def main():
         stations = ["ST-JJG-01", "ST-HJ-01", "ST-ZS-01", "ST-TZ-01", "ST-ZL-01"]
         
         for wo in work_orders[:5]:
-            for i in range(2):
-                rpt_id = str(uuid.uuid4())
-                rpt_code = f"RPT-MECH-{report_count+1:04d}"
-                station = stations[report_count % len(stations)]
-                good_qty = 100 + (report_count * 37) % 500
-                defect_qty = (report_count * 7) % 20
-                
-                await conn.execute("""
-                    INSERT INTO production_reports (id, report_code, factory_id, work_order_id,
-                        station_id, good_qty, defect_qty, scrap_qty, report_type, shift,
-                        operator_id, created_by, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'normal', 'day', 'OP-001', 'admin', NOW(), NOW())
-                    ON CONFLICT DO NOTHING
-                """, rpt_id, rpt_code, FID, wo['id'], station, good_qty, defect_qty)
-                report_count += 1
-        print(f"  已创建 {report_count} 条报工记录")
+            # 每个工单创建14天的报工记录（每天2条）
+            for day_offset in range(14):
+                for i in range(2):
+                    rpt_id = str(uuid.uuid4())
+                    rpt_code = f"RPT-MECH-{report_count+1:04d}"
+                    station = stations[report_count % len(stations)]
+                    good_qty = 50 + (report_count * 37) % 200
+                    defect_qty = (report_count * 7) % 15
+                    
+                    # 报工时间分散到14天内，避开周末
+                    report_date = datetime.utcnow() - timedelta(days=13 - day_offset)
+                    # 跳过周末
+                    if report_date.weekday() >= 5:
+                        continue
+                    
+                    await conn.execute("""
+                        INSERT INTO production_reports (id, report_code, factory_id, work_order_id,
+                            station_id, good_qty, defect_qty, scrap_qty, report_type, shift,
+                            operator_id, created_by, created_at, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'normal', 'day', 'OP-001', 'admin', $8, $8)
+                        ON CONFLICT DO NOTHING
+                    """, rpt_id, rpt_code, FID, wo['id'], station, good_qty, defect_qty, report_date)
+                    report_count += 1
+        print(f"  已创建 {report_count} 条报工记录（分布在14天内）")
     else:
         print("  ⚠️ 未找到在制工单，跳过报工数据")
 

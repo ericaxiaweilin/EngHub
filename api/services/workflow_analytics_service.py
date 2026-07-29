@@ -133,7 +133,7 @@ class WorkflowAnalyticsService:
             SELECT o.work_order_id, w.work_order_code, w.product_id,
                    count(*) as pick_count, sum(o.quantity) as total_picked
             FROM outbound_orders o
-            LEFT JOIN work_orders w ON o.work_order_id = w.id
+            LEFT JOIN work_orders w ON o.work_order_id = w.id::text
             WHERE o.factory_id = :fid AND o.outbound_type = 'production'
             GROUP BY o.work_order_id, w.work_order_code, w.product_id
             ORDER BY pick_count DESC LIMIT 15
@@ -146,7 +146,7 @@ class WorkflowAnalyticsService:
                    sum(CASE WHEN t.result = 'fail' THEN 1 ELSE 0 END) as fail_count,
                    avg(t.defect_rate) as avg_defect_rate
             FROM inspection_tasks t
-            LEFT JOIN stations st ON t.station_id = st.id
+            LEFT JOIN stations st ON t.station_id = st.id::text
             WHERE t.factory_id = :fid
             GROUP BY t.inspect_type, t.station_id, st.station_name, st.station_code
             ORDER BY insp_count DESC
@@ -184,7 +184,7 @@ class WorkflowAnalyticsService:
                    w.status, count(*) as wo_count,
                    sum(w.planned_qty) as planned, sum(w.completed_qty) as done
             FROM work_orders w
-            LEFT JOIN stations st ON w.assigned_station_id = st.id
+            LEFT JOIN stations st ON w.assigned_station_id = st.id::text
             WHERE w.factory_id = :fid
             GROUP BY st.station_name, st.station_code, w.status
             ORDER BY wo_count DESC
@@ -244,7 +244,7 @@ class WorkflowAnalyticsService:
             SELECT w.work_order_code, w.status, w.planned_qty, w.completed_qty,
                    st.station_name
             FROM work_orders w
-            LEFT JOIN stations st ON w.assigned_station_id = st.id
+            LEFT JOIN stations st ON w.assigned_station_id = st.id::text
             WHERE w.factory_id = :fid AND w.status = 'in_progress'
               AND w.completed_qty > 0
             ORDER BY w.completed_qty DESC LIMIT 10
@@ -361,8 +361,8 @@ class WorkflowAnalyticsService:
                    count(DISTINCT o.work_order_id) as wo_served,
                    sum(o.quantity) as material_consumed
             FROM outbound_orders o
-            LEFT JOIN work_orders w ON o.work_order_id = w.id
-            LEFT JOIN stations st ON w.assigned_station_id = st.id
+            LEFT JOIN work_orders w ON o.work_order_id = w.id::text
+            LEFT JOIN stations st ON w.assigned_station_id = st.id::text
             WHERE o.factory_id = :fid AND o.outbound_type = 'production'
             GROUP BY st.station_name, st.station_code
             ORDER BY material_consumed DESC

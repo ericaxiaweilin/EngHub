@@ -5,28 +5,20 @@ for a station, this strategy rejects the operation and returns an error.
 """
 
 from typing import Dict, Any
-from .base import MesRecoveryStrategy, MesRecoveryResult
+# Import from the central recovery base module
+from ..recovery.base import MesRecoveryStrategy, MesRecoveryResult
 
 
 class CapacityLimitReject(MesRecoveryStrategy):
-    """Rejects production reports when reported quantity exceeds capacity limit.
-    
-    This is a preventive strategy that stops over-production before it creates
-    inventory imbalances or scheduling issues.
-    """
+    """Rejects production reports when reported quantity exceeds capacity limit."""
     
     def __init__(self, default_capacity: int = 100):
-        """Initialize with default capacity per shift."""
         self.default_capacity = default_capacity
     
     def get_strategy_name(self) -> str:
         return "capacity_limit_reject"
     
     def should_apply(self, context: Dict[str, Any]) -> bool:
-        """Check if this strategy applies.
-        
-        Requires both reported_qty and station_id in context.
-        """
         return (
             "reported_qty" in context and 
             "station_id" in context and 
@@ -34,15 +26,8 @@ class CapacityLimitReject(MesRecoveryStrategy):
         )
     
     def execute(self, context: Dict[str, Any]) -> MesRecoveryResult:
-        """Execute the capacity limit rejection check.
-        
-        Returns the original context if within limit, otherwise returns
-        a rejected result with error details.
-        """
         reported_qty = context["reported_qty"]
         station_id = context["station_id"]
-        
-        # In real implementation, fetch actual capacity from DB/cache
         capacity = self._get_station_capacity(station_id)
         
         if reported_qty > capacity:
@@ -53,7 +38,6 @@ class CapacityLimitReject(MesRecoveryStrategy):
                 message=f"Reported quantity {reported_qty} exceeds capacity {capacity} for station {station_id}"
             )
         
-        # Within capacity, no action needed
         return MesRecoveryResult(
             strategy_name=self.get_strategy_name(),
             applied=False,
@@ -62,12 +46,6 @@ class CapacityLimitReject(MesRecoveryStrategy):
         )
     
     def _get_station_capacity(self, station_id: str) -> int:
-        """Fetch station capacity from database or cache.
-        
-        In production, this should query the Station table or read from
-        a capacity cache service. For now, uses a lookup or default.
-        """
-        # Sample hardcoded capacities - replace with DB call in real implementation
         capacity_map = {
             "ST-ASSY-01": 500,
             "ST-SMT-01": 800,

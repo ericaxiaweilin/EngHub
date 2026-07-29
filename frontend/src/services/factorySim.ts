@@ -404,5 +404,5 @@ export const getFactorySimDashboardResult = (scenarioId?: string) =>
   api.get<any, SimDashboardFullResult>(API_ENDPOINTS.SIM_FACTORY_DASHBOARD_SUMMARY(scenarioId))
 
 // 生产看板聚合数据（真实生产数据，复用仿真结果组件渲染）
-export const getProductionDashboardResult = (factoryId?: string) =>
-  api.get<any, ProductionDashboardResult>(API_ENDPOINTS.PRODUCTION_DASHBOARD_SUMMARY(factoryId))
+export const getProductionDashboardResult = (factoryId?: string, horizonDays?: number) =>
+  api.get<any, ProductionDashboardResult>(API_ENDPOINTS.PRODUCTION_DASHBOARD_SUMMARY(factoryId, horizonDays))

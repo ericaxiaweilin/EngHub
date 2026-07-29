@@ -1,31 +1,24 @@
-"""Response Formatter Module
+"""Response Formatter Module - Absolute Import Version
 
 Converts internal domain models to response DTOs.
-Handles serialization and formatting of responses before returning to clients.
 Separates concerns from business logic and data access layers.
 """
 
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from ....models.work_order import WorkOrder
-from ....models.production_report import ProductionReport
-from ....schemas.mes_schemas import WorkOrderResponse, ProductionReportResponse
+# Absolute imports - database.models is a single module file
+from database.models import WorkOrder, ProductionReport
+from api.schemas.mes_schemas import WorkOrderResponse, ProductionReportResponse
 
 
 class ResponseFormatter:
-    """Formatter for converting ORM objects to response DTOs.
-    
-    Responsibility: Transform domain models into JSON-serializable response formats.
-    Does NOT contain business rules or validation logic.
-    """
+    """Formatter for converting ORM objects to response DTOs."""
     
     def format_work_order(self, work_order: WorkOrder) -> WorkOrderResponse:
-        """Format a WorkOrder object as a response DTO."""
-        # Calculate progress percentage (simple version - in production this might be more complex)
         progress = 0.0
-        if work_order.total_qty > 0:
-            completed = work_order.good_qty + work_order.defect_qty if hasattr(work_order, 'good_qty') else 0
+        if hasattr(work_order, 'total_qty') and work_order.total_qty > 0:
+            completed = (work_order.good_qty + work_order.defect_qty) if hasattr(work_order, 'good_qty') else 0
             progress = (completed / work_order.total_qty) * 100
         
         return WorkOrderResponse(
@@ -44,9 +37,8 @@ class ResponseFormatter:
         )
     
     def format_production_report(self, report: ProductionReport) -> ProductionReportResponse:
-        """Format a ProductionReport object as a response DTO."""
-        yield_rate = 0.0
         total = report.good_qty + report.defect_qty
+        yield_rate = 0.0
         if total > 0:
             yield_rate = (report.good_qty / total) * 100
         
@@ -64,7 +56,6 @@ class ResponseFormatter:
         )
     
     def format_error(self, message: str, status_code: int = 500) -> Dict[str, Any]:
-        """Format an error response consistently across all endpoints."""
         return {
             "error": True,
             "status_code": status_code,

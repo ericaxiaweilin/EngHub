@@ -7,7 +7,7 @@
  * - 仿真结果请在「仿真引擎」中查看，不属于本看板
  */
 import React, { useCallback, useEffect, useState } from 'react'
-import { Card, Col, Empty, Row, Space, Spin, Tabs, Tag, message } from 'antd'
+import { Card, Col, Empty, Row, Select, Space, Spin, Tabs, Tag, message } from 'antd'
 import {
   AimOutlined, ApartmentOutlined, DashboardOutlined, NodeIndexOutlined,
   ProfileOutlined, RiseOutlined, SwapOutlined, TeamOutlined, AlertOutlined,
@@ -25,16 +25,25 @@ import { getStoredUser } from '../services/auth'
 const ProductionData: React.FC = () => {
   const [prodResult, setProdResult] = useState<ProductionDashboardResult | null>(null)
   const [prodLoading, setProdLoading] = useState(true)
+  const [horizonDays, setHorizonDays] = useState(14) // 默认14天
+  const [viewMode, setViewMode] = useState<'week' | 'month' | 'year'>('month')
 
   const user = getStoredUser()
   // 优先用顶部选择器选中的厂区（与其他页面一致），回退到用户所属厂区
   const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
+  // 视图模式对应的天数
+  const viewModeDays: Record<string, number> = {
+    week: 7,
+    month: 14,
+    year: 30,
+  }
+
   // 拉取生产看板聚合数据（后端返回 is_simulation=false，否则拒绝渲染）
   const fetchProdSummary = useCallback(async () => {
     setProdLoading(true)
     try {
-      const res = await getProductionDashboardResult(factoryId)
+      const res = await getProductionDashboardResult(factoryId, horizonDays)
       if (res && res.is_simulation === false) {
         setProdResult(res)
       } else {
@@ -46,9 +55,15 @@ const ProductionData: React.FC = () => {
     } finally {
       setProdLoading(false)
     }
-  }, [factoryId])
+  }, [factoryId, horizonDays])
 
   useEffect(() => { fetchProdSummary() }, [fetchProdSummary])
+
+  // 视图模式切换
+  const handleViewModeChange = (mode: 'week' | 'month' | 'year') => {
+    setViewMode(mode)
+    setHorizonDays(viewModeDays[mode])
+  }
 
   return (
     <Spin spinning={prodLoading}>
@@ -68,8 +83,24 @@ const ProductionData: React.FC = () => {
                   <Tag color="default">来源：工单 / 报工 / 设备 / 人员</Tag>
                 </Space>
               </Col>
-              <Col style={{ fontSize: 12, color: '#8c8c8c' }}>
-                回溯 {prodResult.horizon_days} 天 · {prodResult.order_count} 工单 · {prodResult.section_count} 工位
+              <Col>
+                <Space size={12}>
+                  {/* 视图切换 */}
+                  <Select
+                    value={viewMode}
+                    onChange={handleViewModeChange}
+                    size="small"
+                    style={{ width: 100 }}
+                    options={[
+                      { value: 'week', label: '周视图' },
+                      { value: 'month', label: '月视图' },
+                      { value: 'year', label: '年视图' },
+                    ]}
+                  />
+                  <span style={{ fontSize: 12, color: '#8c8c8c' }}>
+                    回溯 {prodResult.horizon_days} 天 · {prodResult.order_count} 工单 · {prodResult.section_count} 工位
+                  </span>
+                </Space>
               </Col>
             </Row>
           </Card>
