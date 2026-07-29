@@ -10,6 +10,7 @@ DEPLOY_HOST="${DEPLOY_HOST:-eric@100.96.188.77}"
 REMOTE_DIR="${REMOTE_DIR:-/home/eric/enghub}"
 CONTAINER="${CONTAINER:-enghub}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18888/health}"
+PUBLIC_URL="${PUBLIC_URL:-http://${DEPLOY_HOST#*@}:18888}"
 CHECK_ONLY=false
 if [[ "${1:-}" == "--check" ]]; then
   CHECK_ONLY=true
@@ -89,7 +90,7 @@ RELEASE_DIR="/tmp/enghub-release-${COMMIT_SHA}"
 
 info "打包提交 ${SHORT_SHA}（基线 ${BASE_SHA:0:7}）"
 git archive --format=tar.gz -o "$ARCHIVE" HEAD
-COPYFILE_DISABLE=1 tar -C frontend/dist -czf "$FRONTEND_ARCHIVE" .
+COPYFILE_DISABLE=1 tar --no-xattrs -C frontend/dist -czf "$FRONTEND_ARCHIVE" .
 git diff --name-status "$BASE_SHA" "$COMMIT_SHA" > "$MANIFEST"
 
 info "上传源码和前端产物"
@@ -190,4 +191,4 @@ printf '%s\n' "$COMMIT_SHA" > "$REMOTE_DIR/.last_deployed_commit"
 REMOTE
 
 ok "部署完成: ${SHORT_SHA}"
-printf '生产地址: %s\n' "${HEALTH_URL%/health}"
+printf '生产地址: %s\n' "$PUBLIC_URL"
