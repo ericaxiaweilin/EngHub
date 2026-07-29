@@ -28,7 +28,7 @@ INSERT INTO bom_items (id, factory_id, product_id, bom_version, material_code, m
   ('bom-spk-003', 'FAC_ELEC_DEMO_2026', 'cf72bbb9-25b1-44c7-bf01-37b8a1f579b5', 'BOM-SPK-A1', 'SPK-DRV-40MM',  '40mm全频扬声器',     2, 'pcs', 1, '左右声道各一'),
   ('bom-spk-004', 'FAC_ELEC_DEMO_2026', 'cf72bbb9-25b1-44c7-bf01-37b8a1f579b5', 'BOM-SPK-A1', 'BAT-LI-3000',   '锂电池 3000mAh',     1, 'pcs', 1, '续航8小时'),
   ('bom-spk-005', 'FAC_ELEC_DEMO_2026', 'cf72bbb9-25b1-44c7-bf01-37b8a1f579b5', 'BOM-SPK-A1', 'SPK-BT-FINISHED', '音箱成品外壳套件', 1, 'set', 1, '含面网/底座')
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT DO NOTHING;
 
 -- ===== 种子数据：精密塑胶模具 BOM（BOM-MOLD-V1）=====
 INSERT INTO bom_items (id, factory_id, product_id, bom_version, material_code, material_name, qty_per_unit, unit, level, remark) VALUES
@@ -36,4 +36,4 @@ INSERT INTO bom_items (id, factory_id, product_id, bom_version, material_code, m
   ('bom-mold-002', 'FAC_MECH_DEMO_2026', '86a3f108-8c9c-4f4f-9c87-ce7ca2e4cdd1', 'BOM-MOLD-V1', 'HOT-RUNNER-SYS',  '热流道系统',      1, 'set',   1, '4点进胶'),
   ('bom-mold-003', 'FAC_MECH_DEMO_2026', '86a3f108-8c9c-4f4f-9c87-ce7ca2e4cdd1', 'BOM-MOLD-V1', 'MOLD-BASE-S50C',  'S50C标准模架',    1, 'set',   1, 'CI型模架'),
   ('bom-mold-004', 'FAC_MECH_DEMO_2026', '86a3f108-8c9c-4f4f-9c87-ce7ca2e4cdd1', 'BOM-MOLD-V1', 'EJECTOR-PIN-6',   '6mm顶针',        12, 'pcs',   2, '顶出系统')
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT DO NOTHING;
