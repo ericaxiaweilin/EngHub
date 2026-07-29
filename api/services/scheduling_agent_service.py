@@ -259,7 +259,8 @@ class SchedulingAgent:
         capacities = [dict(r) for r in cap_result.mappings().all()]
 
         total_daily_capacity = sum(
-            c.get("available_hours_per_day", 16) * c.get("efficiency_rate", 0.85)
+            float(c.get("available_hours_per_day") or 16)
+            * float(c.get("efficiency_rate") or 0.85)
             for c in capacities
         ) or 16
 

@@ -287,10 +287,11 @@ class ApsService:
             if wo.routing_template_id:
 
                 if wo.product_id not in product_routings:
+                    routing_template_id = str(wo.routing_template_id)
 
                     steps_stmt = select(RoutingTemplateStep).where(
 
-                        RoutingTemplateStep.template_id == str(wo.routing_template_id)
+                        RoutingTemplateStep.template_id == routing_template_id
 
                     ).order_by(RoutingTemplateStep.seq)
 
