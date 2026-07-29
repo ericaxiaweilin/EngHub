@@ -29,7 +29,7 @@ CHECK ((good_qty + defect_qty + scrap_qty) >= 0);
 -- But add a comment to document the intent
 COMMENT ON CONSTRAINT CHECK_PR_GOOD_NON_NEGATIVE ON production_reports IS 'Prevents negative good quantity entry';
 COMMENT ON CONSTRAINT CHECK_PR_DEFECT_NON_NEGATIVE ON production_reports IS 'Prevents negative defect quantity entry';
-COMMENT_ONCONSTRAINT CHECK_PR_SCRAP_NON_NEGATIVE ON production_reports IS 'Prevents negative scrap quantity entry';
+COMMENT ON CONSTRAINT check_pr_scrap_non_negative ON production_reports IS 'Prevents negative scrap quantity entry';
 COMMENT ON CONSTRAINT CHECK_PR_TOTAL_NON_NEGATIVE ON production_reports IS 'Ensures total reported quantity is non-negative';
 
 -- =============================================================================

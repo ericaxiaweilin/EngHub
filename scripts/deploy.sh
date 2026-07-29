@@ -19,6 +19,7 @@ COMMIT_MESSAGE="${1:-deploy: $(date '+%Y-%m-%d %H:%M:%S')}"
 RELEASE_DIR=""
 ARCHIVE=""
 FRONTEND_ARCHIVE=""
+MANIFEST=""
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok() { printf '\033[1;32mOK\033[0m  %s\n' "$*"; }
@@ -27,6 +28,7 @@ fail() { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 cleanup() {
   [[ -n "$ARCHIVE" ]] && rm -f "$ARCHIVE"
   [[ -n "$FRONTEND_ARCHIVE" ]] && rm -f "$FRONTEND_ARCHIVE"
+  [[ -n "$MANIFEST" ]] && rm -f "$MANIFEST"
   return 0
 }
 trap cleanup EXIT
@@ -76,17 +78,24 @@ fi
 
 COMMIT_SHA="$(git rev-parse HEAD)"
 SHORT_SHA="$(git rev-parse --short HEAD)"
+BASE_SHA="$(ssh "$DEPLOY_HOST" "cat '$REMOTE_DIR/.last_deployed_commit' 2>/dev/null || true")"
+if [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+  BASE_SHA="$COMMIT_SHA"
+fi
 ARCHIVE="$(mktemp "/tmp/enghub-source-${SHORT_SHA}.XXXXXX.tgz")"
 FRONTEND_ARCHIVE="$(mktemp "/tmp/enghub-frontend-${SHORT_SHA}.XXXXXX.tgz")"
+MANIFEST="$(mktemp "/tmp/enghub-manifest-${SHORT_SHA}.XXXXXX.txt")"
 RELEASE_DIR="/tmp/enghub-release-${COMMIT_SHA}"
 
-info "打包提交 ${SHORT_SHA}"
+info "打包提交 ${SHORT_SHA}（基线 ${BASE_SHA:0:7}）"
 git archive --format=tar.gz -o "$ARCHIVE" HEAD
 COPYFILE_DISABLE=1 tar -C frontend/dist -czf "$FRONTEND_ARCHIVE" .
+git diff --name-status "$BASE_SHA" "$COMMIT_SHA" > "$MANIFEST"
 
 info "上传源码和前端产物"
 scp -q "$ARCHIVE" "$DEPLOY_HOST:/tmp/enghub-source-${COMMIT_SHA}.tgz"
 scp -q "$FRONTEND_ARCHIVE" "$DEPLOY_HOST:/tmp/enghub-frontend-${COMMIT_SHA}.tgz"
+scp -q "$MANIFEST" "$DEPLOY_HOST:/tmp/enghub-manifest-${COMMIT_SHA}.txt"
 
 info "更新服务器源码和容器"
 ssh "$DEPLOY_HOST" bash -s -- \
@@ -100,9 +109,10 @@ HEALTH_URL="$4"
 RELEASE_DIR="/tmp/enghub-release-${COMMIT_SHA}"
 SOURCE_ARCHIVE="/tmp/enghub-source-${COMMIT_SHA}.tgz"
 FRONTEND_ARCHIVE="/tmp/enghub-frontend-${COMMIT_SHA}.tgz"
+MANIFEST="/tmp/enghub-manifest-${COMMIT_SHA}.txt"
 
 cleanup() {
-  rm -rf "$RELEASE_DIR" "$SOURCE_ARCHIVE" "$FRONTEND_ARCHIVE"
+  rm -rf "$RELEASE_DIR" "$SOURCE_ARCHIVE" "$FRONTEND_ARCHIVE" "$MANIFEST"
 }
 trap cleanup EXIT
 
@@ -124,16 +134,37 @@ for file in main.py requirements.txt frontend/package.json frontend/package-lock
   fi
 done
 
-# Replace runtime code as root so deleted files cannot survive an update.
-docker exec -u 0 "$CONTAINER" sh -lc \
-  'rm -rf /app/api /app/core /app/database /app/integrations /app/frontend_dist'
-for dir in api core database integrations; do
-  docker cp "$RELEASE_DIR/source/$dir" "$CONTAINER:/app/$dir"
-done
-docker cp "$RELEASE_DIR/source/main.py" "$CONTAINER:/app/main.py"
+# Hot-patch only files changed since the last successful deployment. The
+# production image contains compatibility files that are not yet in this repo.
+while IFS=$'\t' read -r status path extra; do
+  [[ -z "$status" || -z "$path" ]] && continue
+  case "$status" in
+    R*) path="$extra" ;;
+  esac
+  case "$path" in
+    requirements*.txt)
+      echo "依赖文件已变化，热部署不支持；请先构建新镜像。" >&2
+      exit 1
+      ;;
+    database/migrations/*|database/schema_contract.json)
+      echo "跳过自动数据库迁移: $path"
+      continue
+      ;;
+    api/*|core/*|database/*.py|integrations/*|main.py)
+      if [[ "$status" == D* ]]; then
+        docker exec -u 0 "$CONTAINER" rm -f "/app/$path"
+      else
+        docker exec -u 0 "$CONTAINER" mkdir -p "/app/$(dirname "$path")"
+        docker cp "$RELEASE_DIR/source/$path" "$CONTAINER:/app/$path"
+        docker exec -u 0 "$CONTAINER" chown appuser:appgroup "/app/$path"
+      fi
+      ;;
+  esac
+done < "$MANIFEST"
+
+docker exec -u 0 "$CONTAINER" rm -rf /app/frontend_dist
 docker cp "$RELEASE_DIR/frontend_dist" "$CONTAINER:/app/frontend_dist"
-docker exec -u 0 "$CONTAINER" sh -lc \
-  'chown -R appuser:appgroup /app/api /app/core /app/database /app/integrations /app/frontend_dist /app/main.py'
+docker exec -u 0 "$CONTAINER" chown -R appuser:appgroup /app/frontend_dist
 
 docker restart "$CONTAINER" >/dev/null
 
@@ -155,6 +186,7 @@ cat /tmp/enghub-deploy-health.json
 printf '\nasset='
 curl -fsS "${HEALTH_URL%/health}/" | grep -o 'index-[A-Za-z0-9_-]*\.js' | head -1
 printf '\n'
+printf '%s\n' "$COMMIT_SHA" > "$REMOTE_DIR/.last_deployed_commit"
 REMOTE
 
 ok "部署完成: ${SHORT_SHA}"
