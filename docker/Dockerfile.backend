@@ -1,6 +1,23 @@
+# ============================================================
+# EngHub 后端镜像（含前端同源托管）
+# 多阶段构建：Stage1 用 node 构建前端 dist，Stage2 用 python 运行后端，
+# 并把前端产物拷入 /app/frontend_dist，由 FastAPI 同源托管（见 main.py 末尾
+# StaticFiles + SPA fallback）。这样容器重建后前端依然在，无需再手动 docker cp。
+# ============================================================
+
+# ---- Stage 1: 构建前端 ----
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app
+# 先拷依赖清单，利用层缓存（package.json 不变则 npm ci 复用缓存）
+COPY frontend/package*.json ./
+RUN npm ci
+# 再拷源码并构建（.dockerignore 已排除 node_modules 与 dist）
+COPY frontend/ ./
+RUN npm run build
+
+# ---- Stage 2: Python 后端 ----
 FROM python:3.11-slim
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -8,39 +25,41 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system dependencies
+# 系统依赖（编译 psycopg 等需要）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Python 依赖
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# Create non-root user for security
+# 非 root 用户
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 
-# Copy source code
+# 后端源码
 COPY core/ ./core/
 COPY api/ ./api/
 COPY integrations/ ./integrations/
 COPY database/ ./database/
 COPY main.py .
 
-# Create necessary directories
+# 前端构建产物 -> /app/frontend_dist（FastAPI 同源托管，替代 nginx）
+COPY --from=frontend-builder /app/dist ./frontend_dist
+
+# 必要目录 + 统一归属 appuser（含 frontend_dist 读权限）
 RUN mkdir -p models services logs static && \
     chown -R appuser:appgroup /app
 
-# Switch to non-root user
 USER appuser
 
-# Health check
+# 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8000/health')" || exit 1
 
 EXPOSE 8000
 
-# Run with uvicorn workers for production
+# 生产用多 worker
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

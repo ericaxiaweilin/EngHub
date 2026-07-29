@@ -56,7 +56,15 @@ const InspectionList: React.FC = () => {
   const [detail, setDetail] = useState<Inspection | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'F01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
+
+  const MOCK_INSPECTIONS: any[] = [
+    { id: 'insp-1', inspection_code: 'IQC-2026-001', inspection_type: 'iqc', status: 'passed', work_order_id: 'wo-1', product_id: 'PRD-001', sample_size: 50, defect_count: 1, inspector: '张工', factory_id: 'factory-sh-01', created_at: '2026-07-10' },
+    { id: 'insp-2', inspection_code: 'IPQC-2026-002', inspection_type: 'ipqc', status: 'passed', work_order_id: 'wo-2', product_id: 'PRD-002', sample_size: 30, defect_count: 0, inspector: '李工', factory_id: 'factory-sh-01', created_at: '2026-07-12' },
+    { id: 'insp-3', inspection_code: 'FQC-2026-003', inspection_type: 'fqc', status: 'failed', work_order_id: 'wo-3', product_id: 'PRD-003', sample_size: 100, defect_count: 8, inspector: '王工', factory_id: 'factory-sh-01', created_at: '2026-07-15' },
+    { id: 'insp-4', inspection_code: 'OQC-2026-004', inspection_type: 'oqc', status: 'passed', work_order_id: 'wo-1', product_id: 'PRD-001', sample_size: 20, defect_count: 0, inspector: '赵工', factory_id: 'factory-sh-01', created_at: '2026-07-18' },
+    { id: 'insp-5', inspection_code: 'IQC-2026-005', inspection_type: 'iqc', status: 'inspecting', work_order_id: 'wo-4', product_id: 'PRD-004', sample_size: 40, defect_count: 2, inspector: '张工', factory_id: 'factory-sh-01', created_at: '2026-07-20' },
+  ]
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -65,10 +73,12 @@ const InspectionList: React.FC = () => {
       if (typeFilter) params.inspection_type = typeFilter
       if (statusFilter) params.status = statusFilter
       const res = await getInspections(params)
-      setData(res.items || [])
-      setTotal(res.total || 0)
+      const items = res.items || []
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      message.error(err?.response?.data?.detail || '获取检验单失败')
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

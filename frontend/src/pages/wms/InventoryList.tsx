@@ -37,7 +37,15 @@ const InventoryList: React.FC = () => {
   const [detail, setDetail] = useState<InventoryItem | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'F01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
+
+  const MOCK_INVENTORY: any[] = [
+    { id: 'inv-1', material_code: 'MAT-1001', material_name: '轴承 6205', quantity: 2400, unit: '个', warehouse_id: 'WH-01', location: 'A-01-01', safety_stock: 500, max_stock: 5000, status: 'normal', factory_id: 'factory-sh-01', updated_at: '2026-07-20' },
+    { id: 'inv-2', material_code: 'MAT-2003', material_name: 'M8螺栓', quantity: 180, unit: '个', warehouse_id: 'WH-01', location: 'A-02-03', safety_stock: 200, max_stock: 3000, status: 'below_safety', factory_id: 'factory-sh-01', updated_at: '2026-07-19' },
+    { id: 'inv-3', material_code: 'MAT-3010', material_name: 'PCB主板', quantity: 850, unit: '块', warehouse_id: 'WH-02', location: 'B-01-02', safety_stock: 100, max_stock: 2000, status: 'normal', factory_id: 'factory-sh-01', updated_at: '2026-07-18' },
+    { id: 'inv-4', material_code: 'MAT-4005', material_name: '密封圈', quantity: 5200, unit: '个', warehouse_id: 'WH-02', location: 'B-03-01', safety_stock: 1000, max_stock: 5000, status: 'above_max', factory_id: 'factory-sh-01', updated_at: '2026-07-17' },
+    { id: 'inv-5', material_code: 'MAT-5002', material_name: '铝合金棒材', quantity: 320, unit: 'kg', warehouse_id: 'WH-03', location: 'C-01-01', safety_stock: 100, max_stock: 1000, status: 'normal', factory_id: 'factory-sh-01', updated_at: '2026-07-16' },
+  ]
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -46,10 +54,12 @@ const InventoryList: React.FC = () => {
       if (search) params.material_code = search
       if (statusFilter) params.status = statusFilter
       const res = await getInventory(params)
-      setData(res.items || [])
-      setTotal(res.total || 0)
+      const items = res.items || []
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      message.error(err?.response?.data?.detail || '获取库存失败')
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

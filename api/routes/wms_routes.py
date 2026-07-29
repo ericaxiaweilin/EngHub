@@ -16,6 +16,7 @@ from api.services.wms_service import (
     WarehouseService,
     LocationService,
     InventoryService,
+    WmsService,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["wms"])
@@ -40,6 +41,31 @@ class LocationCreate(BaseModel):
     capacity: Optional[int] = None
 
 
+# ============== Warehouse Pydantic Models ==============
+
+class WarehouseUpdatePartial(BaseModel):
+    """部分更新仓库（PATCH）"""
+    warehouse_name: Optional[str] = None
+    address: Optional[str] = None
+    status: Optional[str] = None
+    warehouse_type: Optional[str] = None
+
+
+class WarehouseUpdateFull(BaseModel):
+    """完全替换更新仓库（PUT）"""
+    warehouse_code: str
+    warehouse_name: str
+    factory_id: str
+    warehouse_type: str
+    address: Optional[str] = None
+    status: str = "active"
+
+
+class WarehouseDeleteResponse(BaseModel):
+    """删除响应"""
+    message: str
+
+
 class InboundCreate(BaseModel):
     factory_id: str
     warehouse_id: str
@@ -57,6 +83,38 @@ class OutboundCreate(BaseModel):
     factory_id: str
     warehouse_id: str
     material_id: str
+
+# ============== Inventory Pydantic Models ==============
+
+class InventoryUpdatePartial(BaseModel):
+    """部分更新库存（PATCH）"""
+    location_id: Optional[str] = None
+    batch_code: Optional[str] = None
+    total_qty: Optional[int] = None
+    available_qty: Optional[int] = None
+    reserved_qty: Optional[int] = None
+    unit_cost: Optional[float] = None
+    status: Optional[str] = None
+
+
+class InventoryUpdateFull(BaseModel):
+    """完全替换更新库存（PUT）"""
+    location_id: str
+    batch_code: str
+    total_qty: int
+    available_qty: int
+    reserved_qty: int
+    unit_cost: float
+    status: str
+
+
+class InventoryDeleteResponse(BaseModel):
+    """删除响应"""
+    message: str
+
+
+# --- Existing models continue below ---
+class InboundCreate(BaseModel):
     quantity: float
     work_order_id: Optional[str] = None
     batch_code: Optional[str] = None
@@ -156,6 +214,84 @@ async def get_warehouse(
     }
 
 
+# ============== Warehouse RESTful Endpoints (PUT/PATCH/DELETE) ==============
+
+
+@router.put("/warehouses/{warehouse_id}")
+async def update_warehouse_full(
+    warehouse_id: str,
+    req: WarehouseUpdateFull,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """完全替换更新仓库信息（PUT）"""
+    try:
+        service = WarehouseService(db)
+        result = await service.update_warehouse_full(
+            warehouse_id=warehouse_id,
+            data=req.dict(),
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"仓库更新失败: {str(e)}")
+
+
+@router.patch("/warehouses/{warehouse_id}")
+async def update_warehouse_partial(
+    warehouse_id: str,
+    req: WarehouseUpdatePartial,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """部分更新仓库信息（PATCH /warehouses/{id}）"""
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    
+    try:
+        service = WarehouseService(db)
+        result = await service.update_warehouse_partial(
+            warehouse_id=warehouse_id,
+            updates=updates,
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"仓库更新失败: {str(e)}")
+
+
+@router.delete("/warehouses/{warehouse_id}")
+async def delete_warehouse(
+    warehouse_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除仓库（DELETE）"""
+    try:
+        service = WarehouseService(db)
+        result = await service.delete_warehouse_soft(
+            warehouse_id=warehouse_id,
+            deleted_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"仓库删除失败: {str(e)}")
+
+
 @router.post("/warehouses/{warehouse_id}/locations")
 async def create_location(
     warehouse_id: str,
@@ -226,10 +362,7 @@ async def get_inventory(
 ):
     """获取库存信息"""
     service = InventoryService(db)
-    
-    if not material_id:
-        return {"items": [], "total": 0}
-    
+
     inventories = await service.get_inventory(
         factory_id=factory_id,
         material_id=material_id,
@@ -252,6 +385,82 @@ async def get_inventory(
         ],
         "total": len(inventories)
     }
+
+
+# ============== Inventory RESTful Endpoints (PUT/PATCH/DELETE) ==============
+
+
+@router.put("/inventory/{inventory_id}")
+async def update_inventory_full(
+    inventory_id: str,
+    req: InventoryUpdateFull,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """完全替换更新库存记录（PUT）"""
+    try:
+        service = InventoryService(db)
+        result = await service.update_inventory_full(
+            inventory_id=inventory_id,
+            data=req.dict(),
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"库存更新失败: {str(e)}")
+
+
+@router.patch("/inventory/{inventory_id}")
+async def update_inventory_partial(
+    inventory_id: str,
+    req: InventoryUpdatePartial,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """部分更新库存记录（PATCH）"""
+    # 构建只包含已提供字段的更新字典（排除None值）
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    
+    try:
+        service = InventoryService(db)
+        result = await service.update_inventory_partial(
+            inventory_id=inventory_id,
+            updates=updates,
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"库存更新失败: {str(e)}")
+
+
+@router.delete("/inventory/{inventory_id}")
+async def delete_inventory(
+    inventory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除库存记录（DELETE）"""
+    try:
+        service = InventoryService(db)
+        result = await service.delete_inventory_soft(
+            inventory_id=inventory_id,
+            deleted_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"库存删除失败: {str(e)}")
 
 
 @router.get("/inventory/available")
@@ -382,55 +591,173 @@ async def reserve_inventory(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# --- Inventory Count Endpoints ---
+# --- Inventory Count Endpoints (021 增强) ---
+
+class CountCreate(BaseModel):
+    factory_id: str
+    warehouse_id: str
+    count_type: str = "periodic"
+    planned_date: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class CountItemSubmit(BaseModel):
+    item_id: str
+    counted_qty: int
+    remark: Optional[str] = None
+
 
 @router.post("/inventory/count")
 async def create_inventory_count(
-    factory_id: str,
-    warehouse_id: str,
-    count_date: date,
-    count_type: str = "periodic",
+    req: CountCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """创建盘点单"""
-    # TODO: Implement inventory count
-    return {"id": "cnt-001", "status": "draft"}
+    from datetime import date as ddate
+    svc = WmsService(db)
+    planned = ddate.fromisoformat(req.planned_date) if req.planned_date else None
+    return await svc.create_count_order(
+        factory_id=req.factory_id,
+        warehouse_id=req.warehouse_id,
+        count_type=req.count_type,
+        planned_date=planned,
+        remark=req.remark,
+        created_by=current_user.username,
+    )
 
 
-@router.post("/inventory/count/{count_id}/submit")
-async def submit_count_result(
-    count_id: str,
-    data: CountSubmit,
+@router.get("/inventory/count")
+async def list_inventory_counts(
+    factory_id: str,
+    status: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """提交盘点结果"""
-    # TODO: Implement inventory count submission
+    """盘点单列表"""
+    from sqlalchemy import select
+    from database.models import InventoryCount
+    query = select(InventoryCount).where(InventoryCount.factory_id == factory_id)
+    if status:
+        query = query.where(InventoryCount.status == status)
+    query = query.order_by(InventoryCount.created_at.desc())
+    result = await db.execute(query)
+    counts = result.scalars().all()
     return {
-        "count_id": count_id,
-        "status": "pending_approval",
-        "total_difference": 0
+        "items": [
+            {
+                "id": c.id, "count_code": c.count_code,
+                "warehouse_id": c.warehouse_id, "count_type": c.count_type,
+                "status": c.status, "total_items": c.total_items,
+                "diff_items": c.diff_items, "total_diff_qty": c.total_diff_qty,
+                "counted_by": c.counted_by, "approved_by": c.approved_by,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in counts
+        ]
     }
 
 
-# --- Trace Endpoints ---
+@router.post("/inventory/count/{count_id}/items")
+async def submit_count_item(
+    count_id: str,
+    req: CountItemSubmit,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """录入盘点明细"""
+    svc = WmsService(db)
+    result = await svc.submit_count_item(count_id, req.item_id, req.counted_qty, req.remark)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.post("/inventory/count/{count_id}/approve")
+async def approve_count(
+    count_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """审批盘点"""
+    svc = WmsService(db)
+    result = await svc.approve_count(count_id, approved_by=current_user.username)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+# --- Trace & Analytics Endpoints (021 增强) ---
+
 
 @router.get("/inventory/material/{material_id}/trace")
 async def trace_material(
     material_id: str,
-    batch_code: str = None,
+    factory_id: str = "F001",
+    batch_code: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """物料追溯"""
-    # TODO: Implement material traceability
+    svc = WmsService(db)
+    return await svc.trace_material(factory_id, material_id, batch_code)
+
+
+@router.get("/inventory/transactions")
+async def list_transactions(
+    factory_id: str,
+    material_id: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """库存流水"""
+    from sqlalchemy import select
+    from database.models import InventoryTransaction
+    query = select(InventoryTransaction).where(InventoryTransaction.factory_id == factory_id)
+    if material_id:
+        query = query.where(InventoryTransaction.material_id == material_id)
+    if transaction_type:
+        query = query.where(InventoryTransaction.transaction_type == transaction_type)
+    query = query.order_by(InventoryTransaction.created_at.desc()).limit(50)
+    result = await db.execute(query)
+    txns = result.scalars().all()
     return {
-        "material_id": material_id,
-        "batch_code": batch_code,
-        "inbound_records": [],
-        "outbound_records": []
+        "items": [
+            {
+                "id": t.id, "material_id": t.material_id,
+                "batch_code": t.batch_code, "transaction_type": t.transaction_type,
+                "quantity": t.quantity, "before_qty": t.before_qty, "after_qty": t.after_qty,
+                "reference_type": t.reference_type, "operator": t.operator,
+                "remark": t.remark,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in txns
+        ]
     }
+
+
+@router.get("/inventory/alerts")
+async def stock_alerts(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """库存预警"""
+    svc = WmsService(db)
+    return await svc.get_stock_alerts(factory_id)
+
+
+@router.get("/inventory/fifo-check")
+async def fifo_check(
+    factory_id: str,
+    material_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """FIFO 合规检查"""
+    svc = WmsService(db)
+    return await svc.check_fifo(factory_id, material_id)
 
 
 __all__ = ["router"]

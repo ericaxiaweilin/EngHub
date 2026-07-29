@@ -75,7 +75,14 @@ class FactoryLoadEngine:
         base_cap: Dict[str, List[float]] = {}
         ot_cap: Dict[str, List[float]] = {}
         for s in config.sections:
-            labor = s.workers * s.shifts_per_day * s.hours_per_shift * s.efficiency
+            # 技能影响产能：携带真实员工花名册时，按平均技能等级修正人力产能
+            # （无 real_workers 的既有合成场景 sf=1.0，行为不变）
+            if s.real_workers:
+                avg_skill = sum(w.skill_level for w in s.real_workers) / len(s.real_workers)
+                sf = _skill_factor(avg_skill)
+            else:
+                sf = 1.0
+            labor = s.workers * s.shifts_per_day * s.hours_per_shift * s.efficiency * sf
             machine = (
                 s.machines * s.shifts_per_day * s.hours_per_shift * s.efficiency
                 if s.machines > 0 else float("inf")
@@ -833,6 +840,15 @@ class FactoryLoadEngine:
 
 def is_workday_in_cap(ot_cap, sid: str, day: int) -> bool:
     return ot_cap[sid][day] > EPS
+
+
+def _skill_factor(avg_skill: float) -> float:
+    """技能系数：以 L3 为基准 1.0，随平均技能等级单调递增（每级 ±5%），钳制 [0.75, 1.15]。
+
+    L1≈0.90 / L2≈0.95 / L3=1.00 / L4≈1.05 / L5≈1.10 —— 高技能工段产能更高。
+    纯函数，便于独立单测。
+    """
+    return max(0.75, min(1.15, 1.0 + 0.05 * (avg_skill - 3.0)))
 
 
 def _distribute(qty: int, n: int) -> List[int]:

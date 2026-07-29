@@ -11,7 +11,7 @@ const Login: React.FC = () => {
   const [form] = Form.useForm()
   const navigate = useNavigate()
   const location = useLocation() as any
-  const from = location.state?.from || '/dashboard'
+  const from = location.state?.from || '/'
 
   // 会话过期标记（由路由守卫/401 拦截器设置）
   const [expired] = useState(() => sessionStorage.getItem('session_expired') === '1')
@@ -78,9 +78,9 @@ const Login: React.FC = () => {
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
           <Avatar size={56} icon={<AppstoreOutlined />} style={{ background: '#1890ff' }} />
           <Title level={3} style={{ margin: '16px 0 4px' }}>
-            EngHub MES
+            EngHub
           </Title>
-          <Text type="secondary">制造执行系统 · 登录</Text>
+          <Text type="secondary">智能制造执行系统 · 登录</Text>
         </div>
 
         {expired && (

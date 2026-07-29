@@ -1,147 +1,194 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# EngHub 生产部署脚本
-# 适用于 6GB 内存的服务器
+# Commit the current workspace and deploy the exact commit to EngHub production.
+# Usage: ./deploy.sh "fix: describe the change"
 
-set -e
+set -Eeuo pipefail
 
-echo "=== EngHub 部署脚本 ==="
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEPLOY_HOST="${DEPLOY_HOST:-eric@100.96.188.77}"
+REMOTE_DIR="${REMOTE_DIR:-/home/eric/enghub}"
+CONTAINER="${CONTAINER:-enghub}"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18888/health}"
+PUBLIC_URL="${PUBLIC_URL:-http://${DEPLOY_HOST#*@}:18888}"
+CHECK_ONLY=false
+if [[ "${1:-}" == "--check" ]]; then
+  CHECK_ONLY=true
+  shift
+fi
+COMMIT_MESSAGE="${1:-deploy: $(date '+%Y-%m-%d %H:%M:%S')}"
+RELEASE_DIR=""
+ARCHIVE=""
+FRONTEND_ARCHIVE=""
+MANIFEST=""
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+ok() { printf '\033[1;32mOK\033[0m  %s\n' "$*"; }
+fail() { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 
-# 检查环境
-check_env() {
-    echo -e "${YELLOW}检查环境...${NC}"
-    
-    # 检查 Docker
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}错误: Docker 未安装${NC}"
-        exit 1
-    fi
-    
-    # 检查 Docker Compose
-    if ! command -v docker-compose &> /dev/null; then
-        echo -e "${RED}错误: Docker Compose 未安装${NC}"
-        exit 1
-    fi
-    
-    # 检查内存 (6GB推荐)
-    MEMORY=$(free -m | awk '/^Mem:/{print $2}')
-    if [ "$MEMORY" -lt 4096 ]; then
-        echo -e "${YELLOW}警告: 内存小于 4GB (${MEMORY}MB)，建议升级到 6GB${NC}"
-    elif [ "$MEMORY" -lt 6144 ]; then
-        echo -e "${YELLOW}提示: 当前内存 ${MEMORY}MB，建议 6GB 以获得最佳性能${NC}"
-    else
-        echo -e "${GREEN}内存检查通过: ${MEMORY}MB${NC}"
-    fi
-    
-    # 检查磁盘 (推荐20GB)
-    DISK=$(df -m . | awk 'NR==2 {print $4}')
-    if [ "$DISK" -lt 10240 ]; then
-        echo -e "${YELLOW}警告: 可用磁盘空间小于 10GB (${DISK}MB)${NC}"
-    else
-        echo -e "${GREEN}磁盘空间检查通过: ${DISK}MB${NC}"
-    fi
-    
-    echo -e "${GREEN}环境检查完成${NC}"
+cleanup() {
+  [[ -n "$ARCHIVE" ]] && rm -f "$ARCHIVE"
+  [[ -n "$FRONTEND_ARCHIVE" ]] && rm -f "$FRONTEND_ARCHIVE"
+  [[ -n "$MANIFEST" ]] && rm -f "$MANIFEST"
+  return 0
+}
+trap cleanup EXIT
+
+for command in git npm python3 rsync ssh scp tar curl; do
+  command -v "$command" >/dev/null 2>&1 || fail "缺少命令: $command"
+done
+
+cd "$ROOT_DIR"
+[[ -d .git ]] || fail "请在 EngHub Git 仓库中运行"
+[[ -f frontend/package.json ]] || fail "未找到 frontend/package.json"
+
+info "检查 SSH 和生产容器"
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$DEPLOY_HOST" \
+  "test -d '$REMOTE_DIR' && docker inspect '$CONTAINER' >/dev/null" \
+  || fail "无法连接生产服务器或容器不存在"
+
+info "检查代码格式和 Python 语法"
+git diff --check
+PYTHON_FILES="$(
+  {
+    git diff --name-only --diff-filter=ACMR HEAD -- '*.py'
+    git ls-files --others --exclude-standard -- '*.py'
+  } | sort -u
+)"
+if [[ -n "$PYTHON_FILES" ]]; then
+  while IFS= read -r file; do
+    [[ -z "$file" ]] || python3 -m py_compile "$file"
+  done <<< "$PYTHON_FILES"
+fi
+
+info "构建前端"
+npm --prefix frontend run build
+
+if [[ "$CHECK_ONLY" == true ]]; then
+  ok "部署前检查通过"
+  exit 0
+fi
+
+info "提交本地更新"
+git add -A
+if git diff --cached --quiet; then
+  ok "没有待提交变更，部署当前 HEAD"
+else
+  git commit -m "$COMMIT_MESSAGE"
+fi
+
+COMMIT_SHA="$(git rev-parse HEAD)"
+SHORT_SHA="$(git rev-parse --short HEAD)"
+BASE_SHA="$(ssh "$DEPLOY_HOST" "cat '$REMOTE_DIR/.last_deployed_commit' 2>/dev/null || true")"
+if [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+  BASE_SHA="$COMMIT_SHA"
+fi
+ARCHIVE="$(mktemp "/tmp/enghub-source-${SHORT_SHA}.XXXXXX.tgz")"
+FRONTEND_ARCHIVE="$(mktemp "/tmp/enghub-frontend-${SHORT_SHA}.XXXXXX.tgz")"
+MANIFEST="$(mktemp "/tmp/enghub-manifest-${SHORT_SHA}.XXXXXX.txt")"
+RELEASE_DIR="/tmp/enghub-release-${COMMIT_SHA}"
+
+info "打包提交 ${SHORT_SHA}（基线 ${BASE_SHA:0:7}）"
+git archive --format=tar.gz -o "$ARCHIVE" HEAD
+COPYFILE_DISABLE=1 tar --no-xattrs -C frontend/dist -czf "$FRONTEND_ARCHIVE" .
+git diff --name-status "$BASE_SHA" "$COMMIT_SHA" > "$MANIFEST"
+
+info "上传源码和前端产物"
+scp -q "$ARCHIVE" "$DEPLOY_HOST:/tmp/enghub-source-${COMMIT_SHA}.tgz"
+scp -q "$FRONTEND_ARCHIVE" "$DEPLOY_HOST:/tmp/enghub-frontend-${COMMIT_SHA}.tgz"
+scp -q "$MANIFEST" "$DEPLOY_HOST:/tmp/enghub-manifest-${COMMIT_SHA}.txt"
+
+info "更新服务器源码和容器"
+ssh "$DEPLOY_HOST" bash -s -- \
+  "$COMMIT_SHA" "$REMOTE_DIR" "$CONTAINER" "$HEALTH_URL" <<'REMOTE'
+set -Eeuo pipefail
+
+COMMIT_SHA="$1"
+REMOTE_DIR="$2"
+CONTAINER="$3"
+HEALTH_URL="$4"
+RELEASE_DIR="/tmp/enghub-release-${COMMIT_SHA}"
+SOURCE_ARCHIVE="/tmp/enghub-source-${COMMIT_SHA}.tgz"
+FRONTEND_ARCHIVE="/tmp/enghub-frontend-${COMMIT_SHA}.tgz"
+MANIFEST="/tmp/enghub-manifest-${COMMIT_SHA}.txt"
+
+cleanup() {
+  rm -rf "$RELEASE_DIR" "$SOURCE_ARCHIVE" "$FRONTEND_ARCHIVE" "$MANIFEST"
+}
+trap cleanup EXIT
+
+mkdir -p "$RELEASE_DIR/source" "$RELEASE_DIR/frontend_dist"
+tar -xzf "$SOURCE_ARCHIVE" -C "$RELEASE_DIR/source"
+tar -xzf "$FRONTEND_ARCHIVE" -C "$RELEASE_DIR/frontend_dist"
+
+# Keep the server checkout useful for inspection without touching its .git or secrets.
+for dir in api core database integrations scripts frontend/src; do
+  if [[ -d "$RELEASE_DIR/source/$dir" ]]; then
+    mkdir -p "$REMOTE_DIR/$dir"
+    rsync -a --delete "$RELEASE_DIR/source/$dir/" "$REMOTE_DIR/$dir/"
+  fi
+done
+for file in main.py requirements.txt frontend/package.json frontend/package-lock.json; do
+  if [[ -f "$RELEASE_DIR/source/$file" ]]; then
+    mkdir -p "$REMOTE_DIR/$(dirname "$file")"
+    cp "$RELEASE_DIR/source/$file" "$REMOTE_DIR/$file"
+  fi
+done
+
+# Hot-patch only files changed since the last successful deployment. The
+# production image contains compatibility files that are not yet in this repo.
+while IFS=$'\t' read -r status path extra; do
+  [[ -z "$status" || -z "$path" ]] && continue
+  case "$status" in
+    R*) path="$extra" ;;
+  esac
+  case "$path" in
+    requirements*.txt)
+      echo "依赖文件已变化，热部署不支持；请先构建新镜像。" >&2
+      exit 1
+      ;;
+    database/migrations/*|database/schema_contract.json)
+      echo "跳过自动数据库迁移: $path"
+      continue
+      ;;
+    api/*|core/*|database/*.py|integrations/*|main.py)
+      if [[ "$status" == D* ]]; then
+        docker exec -u 0 "$CONTAINER" rm -f "/app/$path"
+      else
+        docker exec -u 0 "$CONTAINER" mkdir -p "/app/$(dirname "$path")"
+        docker cp "$RELEASE_DIR/source/$path" "$CONTAINER:/app/$path"
+        docker exec -u 0 "$CONTAINER" chown appuser:appgroup "/app/$path"
+      fi
+      ;;
+  esac
+done < "$MANIFEST"
+
+docker exec -u 0 "$CONTAINER" rm -rf /app/frontend_dist
+docker cp "$RELEASE_DIR/frontend_dist" "$CONTAINER:/app/frontend_dist"
+docker exec -u 0 "$CONTAINER" chown -R appuser:appgroup /app/frontend_dist
+
+docker restart "$CONTAINER" >/dev/null
+
+healthy=0
+for _ in $(seq 1 45); do
+  if curl -fsS "$HEALTH_URL" >/tmp/enghub-deploy-health.json 2>/dev/null; then
+    healthy=1
+    break
+  fi
+  sleep 1
+done
+[[ "$healthy" -eq 1 ]] || {
+  docker logs --tail 100 "$CONTAINER" >&2
+  exit 1
 }
 
-# 创建目录结构
-setup_dirs() {
-    echo -e "${YELLOW}创建目录结构...${NC}"
-    
-    mkdir -p /opt/enghub/{data/postgres,data/redis,logs}
-    
-    echo -e "${GREEN}目录创建完成${NC}"
-}
+docker inspect "$CONTAINER" --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}'
+cat /tmp/enghub-deploy-health.json
+printf '\nasset='
+curl -fsS "${HEALTH_URL%/health}/" | grep -o 'index-[A-Za-z0-9_-]*\.js' | head -1
+printf '\n'
+printf '%s\n' "$COMMIT_SHA" > "$REMOTE_DIR/.last_deployed_commit"
+REMOTE
 
-# 拉取最新代码
-pull_code() {
-    echo -e "${YELLOW}拉取最新代码...${NC}"
-    
-    if [ -d "/opt/enghub/.git" ]; then
-        cd /opt/enghub
-        git pull origin main
-    else
-        echo -e "${RED}错误: 不是Git仓库，请先克隆代码${NC}"
-        exit 1
-    fi
-    
-    echo -e "${GREEN}代码更新完成${NC}"
-}
-
-# 部署应用
-deploy() {
-    echo -e "${YELLOW}开始部署...${NC}"
-    
-    cd /opt/enghub
-    
-    # 停止旧容器
-    echo "停止旧容器..."
-    docker-compose -f docker/docker-compose.minimal.yml down || true
-    
-    # 拉取最新镜像
-    echo "拉取最新镜像..."
-    docker-compose -f docker/docker-compose.minimal.yml pull
-    
-    # 启动服务
-    echo "启动服务..."
-    docker-compose -f docker/docker-compose.minimal.yml up -d
-    
-    # 等待服务启动
-    echo "等待服务启动..."
-    sleep 10
-    
-    # 检查服务状态
-    echo "检查服务状态..."
-    docker-compose -f docker/docker-compose.minimal.yml ps
-    
-    # 清理旧镜像
-    echo "清理旧镜像..."
-    docker system prune -f
-    
-    echo -e "${GREEN}部署完成!${NC}"
-}
-
-# 显示状态
-show_status() {
-    echo -e "${YELLOW}=== 服务状态 ===${NC}"
-    docker-compose -f /opt/enghub/docker/docker-compose.minimal.yml ps
-    
-    echo ""
-    echo -e "${GREEN}访问地址:${NC}"
-    echo "  前端: http://$(hostname -I | awk '{print $1}')"
-    echo "  后端API: http://$(hostname -I | awk '{print $1}'):8000"
-    echo "  API文档: http://$(hostname -I | awk '{print $1}'):8000/docs"
-}
-
-# 主函数
-main() {
-    case "${1:-deploy}" in
-        check)
-            check_env
-            ;;
-        deploy)
-            check_env
-            setup_dirs
-            deploy
-            show_status
-            ;;
-        status)
-            show_status
-            ;;
-        logs)
-            docker-compose -f /opt/enghub/docker/docker-compose.minimal.yml logs -f
-            ;;
-        *)
-            echo "用法: $0 [check|deploy|status|logs]"
-            exit 1
-            ;;
-    esac
-}
-
-main "$@"
+ok "部署完成: ${SHORT_SHA}"
+printf '生产地址: %s\n' "$PUBLIC_URL"

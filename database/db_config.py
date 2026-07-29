@@ -35,7 +35,7 @@ class DatabaseConfig:
         self.database_url = _normalize_database_url(
             os.getenv(
                 "DATABASE_URL",
-                "postgresql+asyncpg://enghub:enghub123@localhost:5432/enghub"
+                "sqlite+aiosqlite:///./data/enghub_dev.db"
             )
         )
         self.pool_size = int(os.getenv("DB_POOL_SIZE", "10"))

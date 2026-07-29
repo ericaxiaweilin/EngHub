@@ -1,0 +1,1576 @@
+/**
+ * AI 助手浮窗 + 内网 IM 联系人
+ * 可拖拽移动、最小化/最大化，参考 luaguage ChatbotWidget 交互模式
+ */
+import React, { useState, useRef, useEffect, useCallback, lazy, Suspense } from 'react'
+import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message, Table, Select, Empty } from 'antd'
+import {
+  RobotOutlined, TeamOutlined, SendOutlined, MinusOutlined,
+  ExpandOutlined, CompressOutlined, CloseOutlined,
+  ToolOutlined, SafetyCertificateOutlined, DesktopOutlined, ApiOutlined,
+  ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined,
+  AlertOutlined, ExperimentOutlined, PhoneOutlined,
+  PaperClipOutlined, FileOutlined, DownloadOutlined, TableOutlined,
+  CopyOutlined, ShareAltOutlined, CommentOutlined, InboxOutlined,
+  ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
+} from '@ant-design/icons'
+
+// Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
+const SpreadsheetEditor = lazy(() => import('./SpreadsheetEditor'))
+import api from '../services/api'
+import { tmsApi } from '../services/tms'
+import { getStoredUser, logout } from '../services/auth'
+
+const { Text } = Typography
+const { TextArea } = Input
+
+// ---------- IM 联系人（内网工厂人员） ----------
+interface Contact {
+  id: string
+  name: string
+  role: string
+  dept: string
+  color: string
+  icon: React.ReactNode
+  online: boolean
+  tasks: number  // 当前负责的任务/工单数
+}
+
+const FACTORY_CONTACTS: Contact[] = [
+  { id: 'c1', name: '系统管理员', role: '超级管理员', dept: 'IT部', color: '#1677ff', icon: <DesktopOutlined />, online: true, tasks: 2 },
+  { id: 'c2', name: '王品保', role: '品保主管', dept: '品质部', color: '#52c41a', icon: <SafetyCertificateOutlined />, online: true, tasks: 5 },
+  { id: 'c3', name: '李生产', role: '生产主管', dept: '生产部', color: '#fa8c16', icon: <ApiOutlined />, online: true, tasks: 8 },
+  { id: 'c4', name: '张维修', role: '设备维修工程师', dept: '设备部', color: '#f5222d', icon: <ToolOutlined />, online: false, tasks: 3 },
+  { id: 'c5', name: '陈工艺', role: '工艺工程师', dept: '工程部', color: '#722ed1', icon: <ApiOutlined />, online: true, tasks: 4 },
+  { id: 'c6', name: '刘计划', role: 'PMC计划员', dept: '计划部', color: '#13c2c2', icon: <DesktopOutlined />, online: false, tasks: 6 },
+]
+
+// ---------- 工具执行记录（AI 已执行的操作） ----------
+interface ToolAction {
+  tool: string
+  label: string
+  arguments: Record<string, any>
+  result: Record<string, any>
+  is_write: boolean
+  is_sim?: boolean
+  success: boolean
+}
+
+// ---------- 附件（随消息上传的图片/文件） ----------
+interface MsgAttachment {
+  file_id: string
+  filename: string
+  content_type?: string
+  is_image?: boolean
+  size?: number
+}
+
+// ---------- 结构化表格数据（后端 table 事件推送） ----------
+interface TableData {
+  title: string
+  columns: { key: string; label: string }[]
+  rows: Record<string, any>[]
+}
+
+// ---------- 聊天消息 ----------
+interface ChatMsg {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  time: string
+  quote?: {
+    id: string
+    role: 'user' | 'assistant'
+    content: string
+  }
+  degraded?: boolean
+  actions?: ToolAction[]
+  attachments?: MsgAttachment[]
+  tables?: TableData[]
+}
+
+// ---------- 快捷指令 ----------
+const QUICK_COMMANDS = [
+  '今天生产情况怎么样？',
+  '查询在制工单',
+  '查询库存水平',
+  '最近有哪些不良品？',
+  '设备运行状态如何？',
+  '跑一次高温加班合规仿真',
+  '最近的仿真审计记录',
+]
+
+// ---------- IM 聊天消息 ----------
+interface IMMsg {
+  id: string
+  from: 'me' | 'them' | 'system'
+  content: string
+  time: string
+  isCall?: boolean  // 工单呼叫卡片
+  callMeta?: { call_type: string; station: string; priority: string; task_code?: string }
+}
+
+interface InfoItem {
+  id: string
+  source: 'im' | 'system' | 'ai'
+  title: string
+  content: string
+  time: string
+  unread: boolean
+  sender?: string
+  backendId?: string
+}
+
+// 工单呼叫类型（与 QuickRequest 页一致，落到 TMS call_request）
+const IM_CALL_TYPES = [
+  { value: 'equipment_fault', label: '设备故障', icon: <ToolOutlined />, color: '#f5222d' },
+  { value: 'material_call', label: '物料呼叫', icon: <AlertOutlined />, color: '#fa8c16' },
+  { value: 'quality_call', label: '品质呼叫', icon: <ExperimentOutlined />, color: '#722ed1' },
+  { value: 'support_call', label: '支援呼叫', icon: <PhoneOutlined />, color: '#1890ff' },
+]
+
+const now = () => new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+const createId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+const quotePreview = (content: string) => content.replace(/\s+/g, ' ').trim().slice(0, 120)
+
+export default function AIAssistantWidget() {
+  const [open, setOpen] = useState(false)
+  const [maximized, setMaximized] = useState(false)
+  const [tab, setTab] = useState('ai')
+  // 拖拽 & 拉伸（参考 luaguage ChatbotWidget - Pointer Events 方案）
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null)
+  const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  // 拉伸状态（Pointer Capture 方案，不用 React state 避免重渲染）
+  const resizeStateRef = useRef<{
+    edge: 'left' | 'right' | 'top' | 'bottom'
+    startX: number
+    startY: number
+    startWidth: number
+    startHeight: number
+    rafId?: number
+  } | null>(null)
+  const [isResizing, setIsResizing] = useState(false)
+  // 聊天
+  const [messages, setMessages] = useState<ChatMsg[]>([
+    { id: createId('welcome'), role: 'assistant', content: '你好！我是 EngHub MES 智能助手，可以回答生产工单、报工、检验、不良品、库存、计划等问题。', time: now() },
+  ])
+  const [input, setInput] = useState('')
+  const [replyingTo, setReplyingTo] = useState<ChatMsg | null>(null)
+  const [shareMessage, setShareMessage] = useState<ChatMsg | null>(null)
+  const [shareTarget, setShareTarget] = useState('info')
+  const [loading, setLoading] = useState(false)
+  const listRef = useRef<HTMLDivElement>(null)
+  // 待发送附件（先调 /files/upload 拿 file_id，再随消息提交）
+  const [pendingAttachments, setPendingAttachments] = useState<MsgAttachment[]>([])
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  // 可用工作流清单（从 /chat/tools 拉取，供快捷指令区展示）
+  const [workflows, setWorkflows] = useState<{ name: string; label: string; needs_params: boolean }[]>([])
+  // IM 未读
+  const [unread, setUnread] = useState<Record<string, number>>({ c2: 1, c3: 2 })
+  const [selectedContact, setSelectedContact] = useState<Contact | null>(null)
+  const [infoOpen, setInfoOpen] = useState(false)
+  const [infoItems, setInfoItems] = useState<InfoItem[]>([])
+  const [infoLoading, setInfoLoading] = useState(false)
+  // IM 聊天
+  const [imMessages, setImMessages] = useState<Record<string, IMMsg[]>>({})
+  const [imInput, setImInput] = useState('')
+  const [imSending, setImSending] = useState(false)
+  const imListRef = useRef<HTMLDivElement>(null)
+  // 工单呼叫弹窗
+  const [callModalOpen, setCallModalOpen] = useState(false)
+  const [callType, setCallType] = useState('equipment_fault')
+  const [callForm] = Form.useForm()
+  const [callSubmitting, setCallSubmitting] = useState(false)
+  // 电子表格弹窗（chatbot 查询结果 → Univer 在线表格）
+  const [sheetTable, setSheetTable] = useState<TableData | null>(null)
+
+  const user = getStoredUser()
+  const infoStorageKey = `enghub-info:${user?.username || 'anonymous'}:${localStorage.getItem('active_factory_id') || 'default'}`
+
+  const addInfoItem = useCallback((item: InfoItem) => {
+    setInfoItems(prev => [item, ...prev.filter(existing => existing.id !== item.id)].slice(0, 100))
+  }, [])
+
+  const fetchSystemInfo = useCallback(async () => {
+    const factoryId = localStorage.getItem('active_factory_id')
+    if (!factoryId) return
+    setInfoLoading(true)
+    try {
+      const res: any = await api.get('/api/v1/notifications', {
+        params: { factory_id: factoryId, limit: 50 },
+      })
+      const rows = Array.isArray(res) ? res : (res.items || res.notifications || [])
+      const systemItems: InfoItem[] = rows.map((item: any) => ({
+        id: `system-${item.id}`,
+        backendId: item.id,
+        source: item.source_type === 'ai' ? 'ai' : 'system',
+        title: item.title || '系统信息',
+        content: item.content || '',
+        time: item.created_at
+          ? new Date(item.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+          : now(),
+        unread: !item.is_read,
+        sender: item.source_type === 'ai' ? 'AI 助手' : '系统',
+      }))
+      setInfoItems(prev => {
+        const localItems = prev.filter(item => !item.backendId)
+        return [...systemItems, ...localItems].slice(0, 100)
+      })
+    } catch {
+      // 信息模块仍可使用本地 IM 和 AI 分享记录。
+    } finally {
+      setInfoLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(infoStorageKey) || '[]')
+      if (Array.isArray(stored)) setInfoItems(stored)
+    } catch {
+      localStorage.removeItem(infoStorageKey)
+    }
+    fetchSystemInfo()
+    const timer = window.setInterval(fetchSystemInfo, 30000)
+    return () => window.clearInterval(timer)
+  }, [fetchSystemInfo, infoStorageKey])
+
+  useEffect(() => {
+    const localItems = infoItems.filter(item => !item.backendId)
+    localStorage.setItem(infoStorageKey, JSON.stringify(localItems))
+  }, [infoItems, infoStorageKey])
+
+  // 自动滚动到底部
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight
+  }, [messages, loading])
+
+  // 拉取可用工作流（仅展示无需参数的确定性流程，点击即触发）
+  useEffect(() => {
+    api.get('/api/v1/chat/tools')
+      .then((res: any) => setWorkflows((res.workflows || []).filter((w: any) => !w.needs_params)))
+      .catch(() => { /* 网关/后端未就绪时不展示工作流快捷指令 */ })
+  }, [])
+
+  // ---------- 拖拽逻辑 ----------
+  const onHeaderMouseDown = useCallback((e: React.MouseEvent) => {
+    if (maximized) return
+    const rect = panelRef.current?.getBoundingClientRect()
+    if (!rect) return
+    dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: rect.left, baseY: rect.top }
+    const onMove = (ev: MouseEvent) => {
+      const d = dragRef.current
+      if (!d) return
+      const nx = Math.max(0, Math.min(window.innerWidth - 390, d.baseX + ev.clientX - d.startX))
+      const ny = Math.max(0, Math.min(window.innerHeight - 60, d.baseY + ev.clientY - d.startY))
+      setPos({ x: nx, y: ny })
+    }
+    const onUp = () => {
+      dragRef.current = null
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [maximized])
+
+  // ---------- 拉伸逻辑（luaguage Pointer Events 方案） ----------
+  const handleResizeStart = useCallback((
+    event: React.PointerEvent<HTMLDivElement>,
+    edge: 'left' | 'right' | 'top' | 'bottom',
+  ) => {
+    if (maximized) return
+    const node = panelRef.current
+    if (!node) return
+    event.preventDefault()
+    // 关键：setPointerCapture 保证鼠标移出窗口也能收到事件
+    ;(event.currentTarget as HTMLDivElement).setPointerCapture(event.pointerId)
+    resizeStateRef.current = {
+      edge,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: node.offsetWidth,
+      startHeight: node.offsetHeight,
+    }
+    setIsResizing(true)
+  }, [maximized])
+
+  const handleResizeMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const state = resizeStateRef.current
+    const node = panelRef.current
+    if (!state || !node) return
+    if (state.rafId != null) cancelAnimationFrame(state.rafId)
+    const cx = event.clientX
+    const cy = event.clientY
+    state.rafId = requestAnimationFrame(() => {
+      const margin = 8
+      const minWidth = 320
+      const minHeight = 400
+      const maxWidth = Math.max(minWidth, window.innerWidth - margin * 2)
+      const maxHeight = Math.max(minHeight, window.innerHeight - margin * 2)
+      const widthDelta = state.edge === 'left'
+        ? state.startX - cx
+        : state.edge === 'right'
+          ? cx - state.startX
+          : 0
+      const heightDelta = state.edge === 'top'
+        ? state.startY - cy
+        : state.edge === 'bottom'
+          ? cy - state.startY
+          : 0
+      const nextWidth = Math.min(maxWidth, Math.max(minWidth, state.startWidth + widthDelta))
+      const nextHeight = Math.min(maxHeight, Math.max(minHeight, state.startHeight + heightDelta))
+      // 直接操作 DOM，不用 React state，避免重渲染卡顿
+      node.style.width = `${nextWidth}px`
+      node.style.height = `${nextHeight}px`
+    })
+  }, [])
+
+  const handleResizeEnd = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const state = resizeStateRef.current
+    if (state?.rafId != null) cancelAnimationFrame(state.rafId)
+    resizeStateRef.current = null
+    setIsResizing(false)
+    ;(event.currentTarget as HTMLDivElement).releasePointerCapture(event.pointerId)
+  }, [])
+
+  // ---------- 发送消息（SSE 流式输出） ----------
+  const sendMessage = async (preset?: string) => {
+    const text = (preset ?? input).trim()
+    if (loading) return
+    if (!text && pendingAttachments.length === 0) return
+    const atts = [...pendingAttachments]
+    const quote = replyingTo
+      ? { id: replyingTo.id, role: replyingTo.role, content: quotePreview(replyingTo.content) }
+      : undefined
+    setInput('')
+    setReplyingTo(null)
+    setPendingAttachments([])
+    const userMsg: ChatMsg = { id: createId('user'), role: 'user', content: text, time: now(), attachments: atts, quote }
+    const history = [...messages, userMsg]
+    setMessages(history)
+    setLoading(true)
+
+    // 占位 assistant 消息，流式填充内容
+    const streamMsg: ChatMsg = { id: createId('assistant'), role: 'assistant', content: '', time: now(), actions: [] }
+    setMessages(prev => [...prev, streamMsg])
+
+    try {
+      const payload: any = {
+        messages: history.slice(-10).map(m => ({
+          role: m.role,
+          content: m.quote
+            ? `引用${m.quote.role === 'assistant' ? 'AI 助手' : '用户'}消息：${m.quote.content}\n\n${m.content}`
+            : m.content,
+        })),
+      }
+      if (atts.length > 0) {
+        payload.attachments = atts.map(a => ({
+          file_id: a.file_id,
+          kind: a.is_image ? 'image' : 'file',
+        }))
+      }
+      const token = localStorage.getItem('token')
+      const factoryId = localStorage.getItem('active_factory_id')
+      const resp = await fetch('/api/v1/chat/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(factoryId ? { 'X-Factory-Id': factoryId } : {}),
+        },
+        body: JSON.stringify(payload),
+      })
+      if (resp.status === 401) {
+        logout()
+        sessionStorage.setItem('session_expired', '1')
+        window.location.href = '/login'
+        return
+      }
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let accContent = ''
+      let accActions: ToolAction[] = []
+      let accTables: TableData[] = []
+      let degraded = false
+
+      const applyUpdate = () => {
+        setMessages(prev => {
+          const updated = [...prev]
+          updated[updated.length - 1] = {
+            id: streamMsg.id,
+            role: 'assistant',
+            content: accContent,
+            time: streamMsg.time,
+            degraded,
+            actions: accActions.length > 0 ? [...accActions] : [],
+            tables: accTables.length > 0 ? [...accTables] : [],
+          }
+          return updated
+        })
+      }
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        // 按 SSE 帧分割（以 \n\n 分隔）
+        const frames = buffer.split('\n\n')
+        buffer = frames.pop() || ''
+        for (const frame of frames) {
+          if (!frame.trim()) continue
+          let eventType = 'message'
+          let dataStr = ''
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7)
+            else if (line.startsWith('data: ')) dataStr += line.slice(6)
+          }
+          if (!dataStr) continue
+          try {
+            const data = JSON.parse(dataStr)
+            if (eventType === 'delta') {
+              accContent += data.content || ''
+              applyUpdate()
+            } else if (eventType === 'action') {
+              accActions = [...accActions, data]
+              applyUpdate()
+            } else if (eventType === 'table') {
+              accTables = [...accTables, data as TableData]
+              applyUpdate()
+            } else if (eventType === 'done') {
+              degraded = !!data.degraded
+              applyUpdate()
+            } else if (eventType === 'error') {
+              accContent += data.message || '服务异常'
+              degraded = true
+              applyUpdate()
+            }
+          } catch { /* 忽略解析失败的帧 */ }
+        }
+      }
+      // 流结束但无内容
+      if (!accContent) {
+        accContent = '抱歉，暂时无法回答。'
+        applyUpdate()
+      }
+    } catch {
+      setMessages(prev => {
+        const updated = [...prev]
+        updated[updated.length - 1] = {
+          id: streamMsg.id,
+          role: 'assistant',
+          content: '网络异常，请稍后重试。',
+          time: streamMsg.time,
+          degraded: true,
+        }
+        return updated
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const copyChatMessage = async (chatMessage: ChatMsg) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(chatMessage.content)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = chatMessage.content
+        textarea.style.position = 'fixed'
+        textarea.style.opacity = '0'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        textarea.remove()
+      }
+      message.success('消息已复制')
+    } catch {
+      message.error('复制失败，请检查浏览器权限')
+    }
+  }
+
+  const shareChatMessage = () => {
+    if (!shareMessage) return
+    const content = shareMessage.content.trim()
+    if (!content) return
+    if (shareTarget === 'info') {
+      addInfoItem({
+        id: createId('ai'),
+        source: 'ai',
+        title: 'AI 助手分享',
+        content,
+        time: now(),
+        unread: true,
+        sender: user?.full_name || user?.username || '我',
+      })
+      message.success('已分享到内网信息')
+    } else {
+      const contact = FACTORY_CONTACTS.find(item => item.id === shareTarget)
+      if (!contact) return
+      const shared: IMMsg = {
+        id: createId('share'),
+        from: 'me',
+        content: `[AI 助手分享]\n${content}`,
+        time: now(),
+      }
+      setImMessages(prev => ({
+        ...prev,
+        [contact.id]: [...(prev[contact.id] || []), shared],
+      }))
+      message.success(`已分享给${contact.name}`)
+    }
+    setShareMessage(null)
+    setShareTarget('info')
+  }
+
+  // ---------- 选择并上传附件 → 拿 file_id 暂存，随下一条消息提交 ----------
+  const onPickFiles = () => {
+    if (!loading && !uploading) fileInputRef.current?.click()
+  }
+
+  const onFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    e.target.value = ''  // 重置，允许重复选择同名文件
+    if (files.length === 0) return
+    setUploading(true)
+    try {
+      for (const f of files) {
+        const fd = new FormData()
+        fd.append('file', f)
+        const res: any = await api.post('/api/v1/files/upload', fd, {
+          headers: { 'Content-Type': undefined },  // 移除默认 application/json，让浏览器自动设置 multipart/form-data + boundary
+        })
+        setPendingAttachments(prev => [...prev, {
+          file_id: res.id,
+          filename: res.filename,
+          content_type: res.content_type,
+          is_image: res.is_image,
+          size: res.size,
+        }])
+      }
+    } catch {
+      message.error('附件上传失败')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // ---------- 下载系统文件（带鉴权 token，导出报告/附件通用） ----------
+  const downloadSystemFile = async (fileId: string, filename?: string) => {
+    try {
+      const token = localStorage.getItem('token')
+      const resp = await fetch(`/api/v1/files/${fileId}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename || fileId
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch {
+      message.error('下载失败（可能无权访问或文件不存在）')
+    }
+  }
+
+  // ---------- IM 自动滚动 ----------
+  useEffect(() => {
+    if (imListRef.current) imListRef.current.scrollTop = imListRef.current.scrollHeight
+  }, [imMessages, selectedContact])
+
+  // ---------- IM 发送消息 ----------
+  const sendImMessage = () => {
+    const text = imInput.trim()
+    if (!text || !selectedContact || imSending) return
+    setImInput('')
+    const cid = selectedContact.id
+    const myMsg: IMMsg = { id: `m${Date.now()}`, from: 'me', content: text, time: now() }
+    setImMessages(prev => ({ ...prev, [cid]: [...(prev[cid] || []), myMsg] }))
+    setImSending(true)
+    // 内网环境：模拟对方回复（实际可对接 WebSocket）
+    const contact = selectedContact
+    setTimeout(() => {
+      const replyContent = contact.online
+        ? `收到，我是${contact.name}，看到后会尽快处理。如需紧急处理可点下方“工单呼叫”。`
+        : '（对方离线，消息已送达，上线后可见）'
+      setImMessages(prev => ({
+        ...prev,
+        [cid]: [...(prev[cid] || []), {
+          id: createId('reply'),
+          from: 'them',
+          content: replyContent,
+          time: now(),
+        }],
+      }))
+      addInfoItem({
+        id: createId('im'),
+        source: 'im',
+        title: `${contact.name} 发来消息`,
+        content: replyContent,
+        time: now(),
+        unread: true,
+        sender: contact.name,
+      })
+      setImSending(false)
+    }, 900)
+  }
+
+  const markInfoRead = async (item: InfoItem) => {
+    setInfoItems(prev => prev.map(existing => existing.id === item.id ? { ...existing, unread: false } : existing))
+    if (item.backendId) {
+      try {
+        await api.put(`/api/v1/notifications/${item.backendId}/read`)
+      } catch {
+        setInfoItems(prev => prev.map(existing => existing.id === item.id ? { ...existing, unread: true } : existing))
+      }
+    }
+  }
+
+  const markAllInfoRead = async () => {
+    setInfoItems(prev => prev.map(item => ({ ...item, unread: false })))
+    const factoryId = localStorage.getItem('active_factory_id')
+    if (factoryId) {
+      try {
+        await api.put('/api/v1/notifications/read-all', null, { params: { factory_id: factoryId } })
+      } catch {
+        fetchSystemInfo()
+      }
+    }
+  }
+
+  // ---------- 打开工单呼叫弹窗 ----------
+  const openCallModal = (type: string) => {
+    setCallType(type)
+    callForm.resetFields()
+    callForm.setFieldsValue({ priority: 'high' })
+    setCallModalOpen(true)
+  }
+
+  // ---------- 提交工单呼叫 → 直接创建 TMS 任务（不跳转页面） ----------
+  const submitCall = async () => {
+    if (!selectedContact) return
+    try {
+      const values = await callForm.validateFields()
+      setCallSubmitting(true)
+      const ct = IM_CALL_TYPES.find(c => c.value === callType)
+      const res: any = await tmsApi.createTask({
+        title: `${ct?.label}呼叫 - ${values.station}`,
+        task_type: 'call_request',
+        description: values.description,
+        priority: values.priority,
+        required_skills: [],
+        metadata: {
+          call_type: callType,
+          station: values.station,
+          requested_by: user?.username,
+          target_contact: selectedContact.name,
+          via: 'im_chat',
+        } as any,
+      })
+      const taskCode = res?.task_code || res?.data?.task_code || ''
+      const cid = selectedContact.id
+      setImMessages(prev => ({
+        ...prev,
+        [cid]: [...(prev[cid] || []), {
+          id: `c${Date.now()}`,
+          from: 'system',
+          isCall: true,
+          content: `${ct?.label}呼叫已发送给 ${selectedContact.name}`,
+          time: now(),
+          callMeta: { call_type: callType, station: values.station, priority: values.priority, task_code: taskCode },
+        }],
+      }))
+      addInfoItem({
+        id: createId('system'),
+        source: 'system',
+        title: `${ct?.label || '工单'}呼叫已创建`,
+        content: `${values.station} · ${selectedContact.name}${taskCode ? ` · ${taskCode}` : ''}`,
+        time: now(),
+        unread: true,
+        sender: '系统',
+      })
+      message.success('工单呼叫已发送，等待响应')
+      setCallModalOpen(false)
+    } catch (e: any) {
+      if (e?.errorFields) return
+      message.error('呼叫发送失败: ' + (e?.response?.data?.detail || e?.message || ''))
+    } finally {
+      setCallSubmitting(false)
+    }
+  }
+
+  // ---------- 面板样式（初始尺寸，拉伸通过直接操作 DOM） ----------
+  const panelStyle: React.CSSProperties = maximized
+    ? { position: 'fixed', inset: 0, width: '100vw', height: '100vh', borderRadius: 0, zIndex: 1000 }
+    : {
+        position: 'fixed',
+        width: 400,
+        height: 560,
+        minWidth: 320,
+        minHeight: 400,
+        maxWidth: '92vw',
+        maxHeight: '92vh',
+        borderRadius: 12,
+        zIndex: 1000,
+        // 拉伸时禁止文本选中
+        userSelect: isResizing ? 'none' : undefined,
+        ...(pos
+          ? { left: pos.x, top: pos.y }
+          : { right: 24, bottom: 24 }),
+      }
+
+  const infoUnread = infoItems.filter(item => item.unread).length
+  const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0) + infoUnread
+
+  return (
+    <>
+      {/* 悬浮按钮 */}
+      {!open && (
+        <Tooltip title="AI 助手 / 内网通讯" placement="left">
+          <Button
+            type="primary"
+            shape="circle"
+            size="large"
+            icon={<RobotOutlined />}
+            onClick={() => setOpen(true)}
+            style={{
+              position: 'fixed', right: 24, bottom: 24, zIndex: 1000,
+              width: 52, height: 52, boxShadow: '0 4px 12px rgba(22,119,255,0.4)',
+            }}
+          />
+        </Tooltip>
+      )}
+
+      {/* 面板 */}
+      {open && (
+        <div
+          ref={panelRef}
+          style={{
+            ...panelStyle,
+            background: '#fff',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            border: '1px solid #f0f0f0',
+          }}
+        >
+          {/* 头部（拖拽区域） */}
+          <div
+            onMouseDown={onHeaderMouseDown}
+            style={{
+              padding: '10px 14px',
+              background: 'linear-gradient(135deg, #1677ff 0%, #4096ff 100%)',
+              color: '#fff',
+              cursor: maximized ? 'default' : 'move',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              userSelect: 'none',
+              flexShrink: 0,
+            }}
+          >
+            <Space size={8}>
+              <RobotOutlined />
+              <Text strong style={{ color: '#fff' }}>EngHub 智能助手</Text>
+            </Space>
+            <Space size={4}>
+              <Button type="text" size="small" icon={<MinusOutlined />} style={{ color: '#fff' }}
+                onClick={() => setOpen(false)} />
+              <Button type="text" size="small"
+                icon={maximized ? <CompressOutlined /> : <ExpandOutlined />}
+                style={{ color: '#fff' }}
+                onClick={() => { setMaximized(!maximized); setPos(null) }} />
+              <Button type="text" size="small" icon={<CloseOutlined />} style={{ color: '#fff' }}
+                onClick={() => setOpen(false)} />
+            </Space>
+          </div>
+
+          {/* Tab 导航栏（仅切换，不承载内容） */}
+          <Tabs
+            activeKey={tab}
+            onChange={setTab}
+            size="small"
+            centered
+            style={{ flexShrink: 0, margin: 0, padding: '0 12px' }}
+            items={[
+              { key: 'ai', label: <span><RobotOutlined /> AI 助手</span> },
+              {
+                key: 'im',
+                label: (
+                  <Badge count={totalUnread} size="small" offset={[8, -2]}>
+                    <span><TeamOutlined /> 内网通讯</span>
+                  </Badge>
+                ),
+              },
+            ]}
+          />
+
+          {/* 内容区（直接 flex 布局，不经过 Tabs content-holder） */}
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            {tab === 'ai' && (
+              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+                {/* 消息列表 */}
+                <div ref={listRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 14px' }}>
+                      {messages.map((m) => (
+                        <div key={m.id} style={{
+                          display: 'flex',
+                          justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start',
+                          marginBottom: 10,
+                        }}>
+                          {m.role === 'assistant' && (
+                            <Avatar size={28} icon={<RobotOutlined />} style={{ background: '#1677ff', marginRight: 8, flexShrink: 0 }} />
+                          )}
+                          <div style={{
+                            maxWidth: '75%',
+                            padding: '8px 12px',
+                            borderRadius: 10,
+                            background: m.role === 'user' ? '#1677ff' : '#f5f5f5',
+                            color: m.role === 'user' ? '#fff' : '#333',
+                            fontSize: 13,
+                            lineHeight: 1.5,
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                          }}>
+                            {m.quote && (
+                              <div style={{
+                                marginBottom: 6, padding: '5px 7px', borderLeft: '3px solid currentColor',
+                                background: m.role === 'user' ? 'rgba(255,255,255,0.14)' : '#fff',
+                                borderRadius: 4, opacity: 0.82, fontSize: 11,
+                              }}>
+                                <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                                  {m.quote.role === 'assistant' ? 'AI 助手' : '用户'}
+                                </div>
+                                <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {m.quote.content}
+                                </div>
+                              </div>
+                            )}
+                            {/* 消息附件（用户上传的图片/文件） */}
+                            {m.attachments && m.attachments.length > 0 && (
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                                {m.attachments.map((att, ai) => (
+                                  att.is_image ? (
+                                    <img
+                                      key={ai}
+                                      src={`/api/v1/files/${att.file_id}`}
+                                      alt={att.filename}
+                                      style={{ maxWidth: 120, maxHeight: 120, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(0,0,0,0.08)' }}
+                                    />
+                                  ) : (
+                                    <div key={ai} style={{
+                                      display: 'flex', alignItems: 'center', gap: 4,
+                                      background: m.role === 'user' ? 'rgba(255,255,255,0.18)' : '#fafafa',
+                                      border: '1px solid rgba(0,0,0,0.08)', borderRadius: 6, padding: '4px 8px', fontSize: 11,
+                                    }}>
+                                      <FileOutlined /> {att.filename}
+                                    </div>
+                                  )
+                                ))}
+                              </div>
+                            )}
+                            {m.content || (
+                              // 流式输出中：内容尚未到达时显示打字动画
+                              <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
+                                <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s infinite' }} />
+                                <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s 0.2s infinite' }} />
+                                <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s 0.4s infinite' }} />
+                              </span>
+                            )}
+                            {/* AI 已执行的操作 */}
+                            {m.role === 'assistant' && m.actions && m.actions.length > 0 && (
+                              <div style={{ marginTop: 8, borderTop: '1px dashed #d9d9d9', paddingTop: 6 }}>
+                                <Text type="secondary" style={{ fontSize: 11 }}>
+                                  <ThunderboltOutlined /> 已执行 {m.actions.length} 个操作
+                                </Text>
+                                {m.actions.map((a, idx) => {
+                                  // 工作流 → 流程卡片（步骤序号 + 每步工具/结果/成功状态），区别于单工具卡片
+                                  if (a.tool === 'run_workflow' && a.result && Array.isArray(a.result.steps)) {
+                                    const wf = a.result
+                                    return (
+                                      <div key={idx} style={{
+                                        marginTop: 4,
+                                        background: '#fff7e6',
+                                        border: '1px solid #ffd591',
+                                        borderRadius: 6,
+                                        padding: '6px 8px',
+                                        fontSize: 11,
+                                      }}>
+                                        <Space size={4}>
+                                          {wf.success
+                                            ? <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                                            : <CloseCircleOutlined style={{ color: '#f5222d' }} />}
+                                          <Text strong style={{ fontSize: 11 }}>{wf.label || a.label}</Text>
+                                          <Tag color="orange" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>
+                                            工作流 {wf.completed_steps}/{wf.total_steps}
+                                          </Tag>
+                                        </Space>
+                                        <div style={{ marginTop: 4 }}>
+                                          {wf.steps.map((s: any, si: number) => (
+                                            <div key={si} style={{ display: 'flex', alignItems: 'flex-start', gap: 4, marginTop: 2 }}>
+                                              <Text type="secondary" style={{ fontSize: 10, flexShrink: 0, lineHeight: '18px' }}>{si + 1}.</Text>
+                                              {s.success
+                                                ? <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 11, marginTop: 3 }} />
+                                                : <CloseCircleOutlined style={{ color: '#f5222d', fontSize: 11, marginTop: 3 }} />}
+                                              <Text style={{ fontSize: 11, lineHeight: '18px' }}>{s.label}</Text>
+                                              {s.result && s.result.error && (
+                                                <Text type="danger" style={{ fontSize: 10, lineHeight: '18px' }}>：{s.result.error}</Text>
+                                              )}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )
+                                  }
+                                  // 色标：仿真=紫 / 写操作=绿 / 查询=蓝
+                                  const tone = a.is_sim
+                                    ? { bg: '#f9f0ff', bd: '#d3adf7', tag: 'purple' as const, text: '仿真' }
+                                    : a.is_write
+                                      ? { bg: '#f6ffed', bd: '#b7eb8f', tag: 'green' as const, text: '写操作' }
+                                      : { bg: '#f0f5ff', bd: '#adc6ff', tag: 'blue' as const, text: '查询' }
+                                  return (
+                                  <div key={idx} style={{
+                                    marginTop: 4,
+                                    background: tone.bg,
+                                    border: `1px solid ${tone.bd}`,
+                                    borderRadius: 6,
+                                    padding: '4px 8px',
+                                    fontSize: 11,
+                                  }}>
+                                    <Space size={4}>
+                                      {a.success
+                                        ? <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                                        : <CloseCircleOutlined style={{ color: '#f5222d' }} />}
+                                      <Text strong style={{ fontSize: 11 }}>{a.label}</Text>
+                                      <Tag color={tone.tag} style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>
+                                        {tone.text}
+                                      </Tag>
+                                    </Space>
+                                    {a.result && a.result.error && (
+                                      <div style={{ color: '#f5222d', marginTop: 2 }}>{a.result.error}</div>
+                                    )}
+                                  </div>
+                                  )
+                                })}
+                              </div>
+                            )}
+                            {m.degraded && m.role === 'assistant' && (
+                              <div style={{ marginTop: 4 }}>
+                                <Tag color="orange" style={{ fontSize: 10 }}>离线降级模式</Tag>
+                              </div>
+                            )}
+                            {/* AI 生成的文件（导出报告等）→ 可下载卡片 */}
+                            {m.role === 'assistant' && m.actions && m.actions.some(a => a.result && a.result.file_id) && (
+                              <div style={{ marginTop: 6 }}>
+                                {m.actions.filter(a => a.result && a.result.file_id).map((a, fi) => (
+                                  <div key={fi}
+                                    onClick={() => downloadSystemFile(a.result.file_id, a.result.filename)}
+                                    style={{
+                                      display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+                                      background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6,
+                                      padding: '6px 10px', marginTop: 4,
+                                    }}>
+                                    <FileOutlined style={{ color: '#52c41a', fontSize: 16 }} />
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                      <div style={{ fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {a.result.filename || '导出文件'}
+                                      </div>
+                                      <div style={{ fontSize: 10, color: '#999' }}>
+                                        {(a.result.content_type || '')}{a.result.size ? ` · ${a.result.size} 字节` : ''}
+                                      </div>
+                                    </div>
+                                    <DownloadOutlined style={{ color: '#52c41a' }} />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {/* 结构化表格（chatbot 查询结果 → 可交互表格 + Univer 电子表格） */}
+                            {m.role === 'assistant' && m.tables && m.tables.length > 0 && (
+                              <div style={{ marginTop: 8 }}>
+                                {m.tables.map((tbl, ti) => (
+                                  <div key={ti} style={{
+                                    background: '#fff', border: '1px solid #e6f4ff',
+                                    borderRadius: 8, overflow: 'hidden', marginTop: ti > 0 ? 8 : 0,
+                                    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+                                  }}>
+                                    <div style={{
+                                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                                      padding: '6px 10px', background: '#f0f7ff', borderBottom: '1px solid #e6f4ff',
+                                    }}>
+                                      <Space size={4}>
+                                        <TableOutlined style={{ color: '#1677ff' }} />
+                                        <Text strong style={{ fontSize: 11 }}>{tbl.title}</Text>
+                                        <Tag color="blue" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>{tbl.rows.length} 行</Tag>
+                                      </Space>
+                                      <Button
+                                        type="link" size="small"
+                                        icon={<TableOutlined />}
+                                        style={{ fontSize: 11, padding: 0, height: 'auto' }}
+                                        onClick={() => setSheetTable(tbl)}
+                                      >
+                                        在电子表格中打开
+                                      </Button>
+                                    </div>
+                                    <Table
+                                      size="small"
+                                      dataSource={tbl.rows.map((r, ri) => ({ ...r, _rowKey: ri }))}
+                                      rowKey="_rowKey"
+                                      columns={tbl.columns.map(c => ({
+                                        title: c.label,
+                                        dataIndex: c.key,
+                                        key: c.key,
+                                        ellipsis: true,
+                                        render: (v: any) => v === null || v === undefined ? '-' : String(v),
+                                      }))}
+                                      pagination={tbl.rows.length > 5 ? { pageSize: 5, size: 'small', showTotal: undefined } : false}
+                                      scroll={{ x: 'max-content' }}
+                                      style={{ fontSize: 11 }}
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {!!m.content && (
+                              <div style={{
+                                display: 'flex', justifyContent: 'flex-end', gap: 2,
+                                marginTop: 5, paddingTop: 4,
+                                borderTop: `1px solid ${m.role === 'user' ? 'rgba(255,255,255,0.2)' : '#e8e8e8'}`,
+                              }}>
+                                <Tooltip title="引用回复">
+                                  <Button
+                                    type="text" size="small" icon={<CommentOutlined />}
+                                    aria-label="引用回复"
+                                    onClick={() => setReplyingTo(m)}
+                                    style={{ color: m.role === 'user' ? '#fff' : '#666', width: 24, height: 22, padding: 0 }}
+                                  />
+                                </Tooltip>
+                                <Tooltip title="复制">
+                                  <Button
+                                    type="text" size="small" icon={<CopyOutlined />}
+                                    aria-label="复制消息"
+                                    onClick={() => copyChatMessage(m)}
+                                    style={{ color: m.role === 'user' ? '#fff' : '#666', width: 24, height: 22, padding: 0 }}
+                                  />
+                                </Tooltip>
+                                <Tooltip title="分享">
+                                  <Button
+                                    type="text" size="small" icon={<ShareAltOutlined />}
+                                    aria-label="分享消息"
+                                    onClick={() => setShareMessage(m)}
+                                    style={{ color: m.role === 'user' ? '#fff' : '#666', width: 24, height: 22, padding: 0 }}
+                                  />
+                                </Tooltip>
+                              </div>
+                            )}
+                            <div style={{
+                              fontSize: 10,
+                              color: m.role === 'user' ? 'rgba(255,255,255,0.7)' : '#999',
+                              marginTop: 4,
+                              textAlign: 'right',
+                            }}>{m.time}</div>
+                          </div>
+                          {m.role === 'user' && (
+                            <Avatar size={28} style={{ background: '#87d068', marginLeft: 8, flexShrink: 0 }}>
+                              {(user?.full_name || user?.username || '我')[0]}
+                            </Avatar>
+                          )}
+                        </div>
+                      ))}
+                      {loading && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                          <Avatar size={28} icon={<RobotOutlined />} style={{ background: '#1677ff' }} />
+                          <Spin size="small" />
+                          <Text type="secondary" style={{ fontSize: 12 }}>思考中...</Text>
+                        </div>
+                      )}
+                    </div>
+                    {/* 快捷指令 */}
+                    <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {QUICK_COMMANDS.map(cmd => (
+                        <Tag
+                          key={cmd}
+                          color="processing"
+                          style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px' }}
+                          onClick={() => !loading && sendMessage(cmd)}
+                        >
+                          {cmd}
+                        </Tag>
+                      ))}
+                      {/* 可用工作流（橙色区分，点击即触发确定性流程） */}
+                      {workflows.map(wf => (
+                        <Tag
+                          key={wf.name}
+                          color="orange"
+                          style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px' }}
+                          onClick={() => !loading && sendMessage(wf.label)}
+                        >
+                          <ThunderboltOutlined /> {wf.label}
+                        </Tag>
+                      ))}
+                    </div>
+                    {/* 输入区 */}
+                    <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                      {replyingTo && (
+                        <div style={{
+                          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6,
+                          padding: '6px 8px', background: '#f5f8ff', borderLeft: '3px solid #1677ff',
+                        }}>
+                          <CommentOutlined style={{ color: '#1677ff' }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <Text strong style={{ fontSize: 11 }}>
+                              引用{replyingTo.role === 'assistant' ? ' AI 助手' : '用户'}消息
+                            </Text>
+                            <div style={{ fontSize: 11, color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {quotePreview(replyingTo.content)}
+                            </div>
+                          </div>
+                          <Button type="text" size="small" icon={<CloseOutlined />} aria-label="取消引用" onClick={() => setReplyingTo(null)} />
+                        </div>
+                      )}
+                      {/* 待发送附件预览（上传后、发送前可移除） */}
+                      {pendingAttachments.length > 0 && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                          {pendingAttachments.map((att, i) => (
+                            <div key={att.file_id} style={{
+                              position: 'relative', display: 'flex', alignItems: 'center',
+                              border: '1px solid #d9d9d9', borderRadius: 6, overflow: 'hidden', background: '#fafafa',
+                            }}>
+                              {att.is_image ? (
+                                <img src={`/api/v1/files/${att.file_id}`} alt={att.filename}
+                                  style={{ width: 40, height: 40, objectFit: 'cover' }} />
+                              ) : (
+                                <span style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 8px', fontSize: 11, maxWidth: 140 }}>
+                                  <FileOutlined /> <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{att.filename}</span>
+                                </span>
+                              )}
+                              <CloseOutlined
+                                onClick={() => setPendingAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                                style={{
+                                  position: 'absolute', top: 2, right: 2, fontSize: 10, cursor: 'pointer',
+                                  color: '#fff', background: 'rgba(0,0,0,0.5)', borderRadius: '50%', padding: 2,
+                                }} />
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <Space.Compact style={{ width: '100%' }}>
+                        <Button
+                          icon={<PaperClipOutlined />}
+                          onClick={onPickFiles}
+                          loading={uploading}
+                          title="上传图片/文件"
+                          style={{ borderRadius: '8px 0 0 8px' }}
+                        />
+                        <TextArea
+                          value={input}
+                          onChange={e => setInput(e.target.value)}
+                          onPressEnter={e => { if (!e.shiftKey) { e.preventDefault(); sendMessage() } }}
+                          placeholder="输入问题，Enter 发送..."
+                          autoSize={{ minRows: 1, maxRows: 3 }}
+                          style={{ borderRadius: 0 }}
+                        />
+                        <Button
+                          type="primary"
+                          icon={<SendOutlined />}
+                          onClick={() => sendMessage()}
+                          loading={loading}
+                          style={{ borderRadius: '0 8px 8px 0', height: 'auto' }}
+                        />
+                      </Space.Compact>
+                      {/* 隐藏的文件选择框（图片+文件多选） */}
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        style={{ display: 'none' }}
+                        onChange={onFilesSelected}
+                      />
+                    </div>
+              </div>
+            )}
+            {tab === 'im' && (
+                  <div style={{ flex: 1, minHeight: 0, overflowY: selectedContact || infoOpen ? 'hidden' : 'auto', padding: selectedContact || infoOpen ? 0 : '8px 0' }}>
+                    {infoOpen ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                        <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <Button type="text" size="small" icon={<ArrowLeftOutlined />} aria-label="返回内网列表" onClick={() => setInfoOpen(false)} />
+                          <Avatar size={32} style={{ background: '#13c2c2' }} icon={<InboxOutlined />} />
+                          <div style={{ flex: 1 }}>
+                            <Text strong>信息</Text>
+                            <div><Text type="secondary" style={{ fontSize: 11 }}>IM、系统与 AI 助手信息</Text></div>
+                          </div>
+                          <Tooltip title="刷新">
+                            <Button type="text" size="small" icon={<ReloadOutlined />} loading={infoLoading} onClick={fetchSystemInfo} />
+                          </Tooltip>
+                          <Tooltip title="全部已读">
+                            <Button type="text" size="small" icon={<CheckOutlined />} disabled={infoUnread === 0} onClick={markAllInfoRead} />
+                          </Tooltip>
+                        </div>
+                        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', background: '#fafafa' }}>
+                          {infoItems.length === 0 ? (
+                            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无信息" style={{ marginTop: 48 }} />
+                          ) : (
+                            <List
+                              dataSource={infoItems}
+                              renderItem={(item) => {
+                                const sourceTone = item.source === 'im'
+                                  ? { color: 'blue', label: 'IM' }
+                                  : item.source === 'ai'
+                                    ? { color: 'purple', label: 'AI 助手' }
+                                    : { color: 'orange', label: '系统' }
+                                return (
+                                  <List.Item
+                                    onClick={() => item.unread && markInfoRead(item)}
+                                    style={{
+                                      padding: '10px 14px', cursor: item.unread ? 'pointer' : 'default',
+                                      background: item.unread ? '#f0f7ff' : '#fff',
+                                      borderLeft: item.unread ? '3px solid #1677ff' : '3px solid transparent',
+                                    }}
+                                  >
+                                    <div style={{ width: '100%', minWidth: 0 }}>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                        <Tag color={sourceTone.color} style={{ margin: 0, fontSize: 10 }}>{sourceTone.label}</Tag>
+                                        <Text strong={item.unread} style={{ flex: 1, fontSize: 12 }} ellipsis>{item.title}</Text>
+                                        {item.unread && <Badge status="processing" />}
+                                      </div>
+                                      <div style={{ marginTop: 5, fontSize: 12, color: '#555', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                        {item.content}
+                                      </div>
+                                      <div style={{ marginTop: 4, display: 'flex', justifyContent: 'space-between', color: '#999', fontSize: 10 }}>
+                                        <span>{item.sender || sourceTone.label}</span>
+                                        <span>{item.time}</span>
+                                      </div>
+                                    </div>
+                                  </List.Item>
+                                )
+                              }}
+                            />
+                          )}
+                        </div>
+                      </div>
+                    ) : selectedContact ? (
+                      /* 联系人聊天 */
+                      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                        {/* 头部 */}
+                        <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                          <Button type="text" size="small" onClick={() => setSelectedContact(null)}>←</Button>
+                          <Avatar size={32} style={{ background: selectedContact.color }} icon={selectedContact.icon} />
+                          <div style={{ flex: 1, lineHeight: 1.3 }}>
+                            <div>
+                              <Text strong>{selectedContact.name}</Text>
+                              <Text type="secondary" style={{ fontSize: 11, marginLeft: 6 }}>{selectedContact.role}</Text>
+                            </div>
+                            <Badge status={selectedContact.online ? 'success' : 'default'}
+                              text={<Text type="secondary" style={{ fontSize: 11 }}>{selectedContact.online ? '在线' : '离线'} · {selectedContact.tasks} 个任务</Text>} />
+                          </div>
+                        </div>
+                        {/* 消息区 */}
+                        <div ref={imListRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '10px 12px', background: '#fafafa' }}>
+                          {(imMessages[selectedContact.id] || []).length === 0 && (
+                            <div style={{ textAlign: 'center', color: '#999', fontSize: 12, marginTop: 24 }}>
+                              暂无消息，可直接发送或发起工单呼叫
+                            </div>
+                          )}
+                          {(imMessages[selectedContact.id] || []).map(m => (
+                            <div key={m.id} style={{ marginBottom: 10 }}>
+                              {m.isCall ? (
+                                /* 工单呼叫卡片 */
+                                <div style={{ maxWidth: '88%', margin: '0 auto', background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 8, padding: '8px 10px', fontSize: 12 }}>
+                                  <Space size={4}>
+                                    <PhoneOutlined style={{ color: '#fa8c16' }} />
+                                    <Text strong style={{ fontSize: 12 }}>{m.content}</Text>
+                                  </Space>
+                                  <div style={{ marginTop: 4, color: '#666', fontSize: 11 }}>
+                                    工位：{m.callMeta?.station} · 优先级：{m.callMeta?.priority}
+                                    {m.callMeta?.task_code && <span> · 任务号：{m.callMeta.task_code}</span>}
+                                  </div>
+                                  <div style={{ fontSize: 10, color: '#999', marginTop: 2, textAlign: 'right' }}>{m.time}</div>
+                                </div>
+                              ) : (
+                                <div style={{ display: 'flex', justifyContent: m.from === 'me' ? 'flex-end' : 'flex-start' }}>
+                                  {m.from === 'them' && (
+                                    <Avatar size={26} style={{ background: selectedContact.color, marginRight: 6, flexShrink: 0 }} icon={selectedContact.icon} />
+                                  )}
+                                  <div style={{
+                                    maxWidth: '72%', padding: '7px 10px', borderRadius: 10,
+                                    background: m.from === 'me' ? '#1677ff' : '#fff',
+                                    color: m.from === 'me' ? '#fff' : '#333',
+                                    fontSize: 12, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                    border: m.from === 'them' ? '1px solid #eee' : 'none',
+                                  }}>
+                                    {m.content}
+                                    <div style={{ fontSize: 10, color: m.from === 'me' ? 'rgba(255,255,255,0.7)' : '#999', marginTop: 3, textAlign: 'right' }}>{m.time}</div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                          {imSending && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <Avatar size={26} style={{ background: selectedContact.color }} icon={selectedContact.icon} />
+                              <Spin size="small" />
+                            </div>
+                          )}
+                        </div>
+                        {/* 工单呼叫快捷按钮 */}
+                        <div style={{ padding: '6px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                          <Text type="secondary" style={{ fontSize: 11 }}>工单呼叫（直达 {selectedContact.name}，无需跳转）</Text>
+                          <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                            {IM_CALL_TYPES.map(ct => (
+                              <Button key={ct.value} size="small" onClick={() => openCallModal(ct.value)}
+                                style={{ flex: 1, color: ct.color, borderColor: ct.color, fontSize: 11, padding: '0 2px' }}>
+                                {ct.icon} {ct.label}
+                              </Button>
+                            ))}
+                          </div>
+                        </div>
+                        {/* 输入区 */}
+                        <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                          <Space.Compact style={{ width: '100%' }}>
+                            <Input
+                              value={imInput}
+                              onChange={e => setImInput(e.target.value)}
+                              onPressEnter={sendImMessage}
+                              placeholder={`发消息给 ${selectedContact.name}...`}
+                            />
+                            <Button type="primary" icon={<SendOutlined />} onClick={sendImMessage} />
+                          </Space.Compact>
+                        </div>
+                      </div>
+                    ) : (
+                      /* 联系人列表 */
+                      <>
+                        <List.Item
+                          style={{ padding: '10px 16px', cursor: 'pointer', borderBottom: '1px solid #f0f0f0' }}
+                          onClick={() => setInfoOpen(true)}
+                        >
+                          <List.Item.Meta
+                            avatar={<Avatar style={{ background: '#13c2c2' }} icon={<InboxOutlined />} />}
+                            title={<Text strong>信息</Text>}
+                            description={<Text type="secondary" style={{ fontSize: 12 }}>接收 IM、系统和 AI 助手信息</Text>}
+                          />
+                          {infoUnread > 0 && <Badge count={infoUnread} />}
+                        </List.Item>
+                        <List
+                          dataSource={FACTORY_CONTACTS}
+                          renderItem={(c) => (
+                          <List.Item
+                            style={{ padding: '8px 16px', cursor: 'pointer' }}
+                            onClick={() => {
+                              setSelectedContact(c)
+                              setUnread(prev => ({ ...prev, [c.id]: 0 }))
+                            }}
+                          >
+                            <List.Item.Meta
+                              avatar={
+                                <Badge dot={c.online} color="green" offset={[-4, 4]}>
+                                  <Avatar style={{ background: c.color }} icon={c.icon} />
+                                </Badge>
+                              }
+                              title={
+                                <span>
+                                  {c.name}
+                                  <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>{c.role}</Text>
+                                </span>
+                              }
+                              description={
+                                <span style={{ fontSize: 12 }}>
+                                  {c.dept} · {c.online ? '在线' : '离线'}
+                                  {c.tasks > 0 && <Tag color="blue" style={{ marginLeft: 6, fontSize: 10 }}>{c.tasks} 任务</Tag>}
+                                </span>
+                              }
+                            />
+                            {unread[c.id] > 0 && <Badge count={unread[c.id]} />}
+                          </List.Item>
+                          )}
+                        />
+                      </>
+                    )}
+                  </div>
+            )}
+          </div>
+
+          {/* 拉伸手柄（四方向，参考 luaguage Pointer Events 方案） */}
+          {!maximized && (
+            <>
+              {/* 顶部手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'top')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="顶部拖拽调整高度"
+                style={{
+                  position: 'absolute', top: 0, left: '50%', transform: 'translateX(-50%)',
+                  width: '28%', maxWidth: 120, height: 10, cursor: 'ns-resize',
+                  touchAction: 'none', userSelect: 'none', zIndex: 70,
+                }}
+              >
+                <div style={{ width: 40, height: 3, margin: '4px auto 0', borderRadius: 999, background: 'rgba(0,0,0,0.15)' }} />
+              </div>
+              {/* 底部手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'bottom')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="底部拖拽调整高度"
+                style={{
+                  position: 'absolute', bottom: 0, left: '50%', transform: 'translateX(-50%)',
+                  width: '28%', maxWidth: 120, height: 10, cursor: 'ns-resize',
+                  touchAction: 'none', userSelect: 'none', zIndex: 70,
+                }}
+              >
+                <div style={{ width: 40, height: 3, margin: '4px auto 0', borderRadius: 999, background: 'rgba(0,0,0,0.15)' }} />
+              </div>
+              {/* 左下角手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'left')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="左下角拖拽缩放"
+                style={{
+                  position: 'absolute', left: 6, bottom: 6, width: 16, height: 16,
+                  cursor: 'nesw-resize', touchAction: 'none', userSelect: 'none', zIndex: 70,
+                  display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-start',
+                  borderBottomLeftRadius: 10,
+                }}
+              >
+                <div style={{ width: 10, height: 10, borderLeft: '2px solid rgba(0,0,0,0.25)', borderBottom: '2px solid rgba(0,0,0,0.25)', borderBottomLeftRadius: 8 }} />
+              </div>
+              {/* 右下角手柄 */}
+              <div
+                onPointerDown={(e) => handleResizeStart(e, 'right')}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+                onPointerCancel={handleResizeEnd}
+                title="右下角拖拽缩放"
+                style={{
+                  position: 'absolute', right: 6, bottom: 6, width: 16, height: 16,
+                  cursor: 'nwse-resize', touchAction: 'none', userSelect: 'none', zIndex: 70,
+                  display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end',
+                  borderBottomRightRadius: 10,
+                }}
+              >
+                <div style={{ width: 10, height: 10, borderRight: '2px solid rgba(0,0,0,0.25)', borderBottom: '2px solid rgba(0,0,0,0.25)', borderBottomRightRadius: 8 }} />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <Modal
+        title={<Space><ShareAltOutlined /><span>分享消息</span></Space>}
+        open={!!shareMessage}
+        onCancel={() => { setShareMessage(null); setShareTarget('info') }}
+        onOk={shareChatMessage}
+        okText="分享"
+        cancelText="取消"
+        width={400}
+      >
+        <Text type="secondary" style={{ fontSize: 12 }}>分享到</Text>
+        <Select
+          value={shareTarget}
+          onChange={setShareTarget}
+          style={{ width: '100%', marginTop: 6 }}
+          options={[
+            { value: 'info', label: '内网信息' },
+            ...FACTORY_CONTACTS.map(contact => ({
+              value: contact.id,
+              label: `${contact.name} · ${contact.role}`,
+            })),
+          ]}
+        />
+        <div style={{
+          marginTop: 12, padding: '8px 10px', maxHeight: 160, overflowY: 'auto',
+          background: '#f5f5f5', border: '1px solid #e8e8e8', borderRadius: 6,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12,
+        }}>
+          {shareMessage?.content}
+        </div>
+      </Modal>
+
+      {/* 工单呼叫弹窗（模板直达，无需跳转页面） */}
+      <Modal
+        title={
+          <Space>
+            <PhoneOutlined style={{ color: IM_CALL_TYPES.find(c => c.value === callType)?.color }} />
+            <span>{IM_CALL_TYPES.find(c => c.value === callType)?.label}呼叫</span>
+          </Space>
+        }
+        open={callModalOpen}
+        onCancel={() => setCallModalOpen(false)}
+        onOk={submitCall}
+        confirmLoading={callSubmitting}
+        okText="发送呼叫"
+        cancelText="取消"
+        width={400}
+        destroyOnClose
+      >
+        {selectedContact && (
+          <div style={{ marginBottom: 12, padding: '8px 10px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, fontSize: 12 }}>
+            <CheckCircleOutlined style={{ color: '#52c41a', marginRight: 6 }} />
+            呼叫将直达 <Text strong>{selectedContact.name}</Text>（{selectedContact.role}），并同步创建 TMS 任务
+          </div>
+        )}
+        <Form form={callForm} layout="vertical">
+          <Form.Item name="station" label="工位 / 位置" rules={[{ required: true, message: '请输入工位' }]}>
+            <Input placeholder="如: ST-ASM-01 / A栋2层" />
+          </Form.Item>
+          <Form.Item name="priority" label="紧急程度" rules={[{ required: true }]}>
+            <Radio.Group>
+              <Radio.Button value="low">低</Radio.Button>
+              <Radio.Button value="medium">中</Radio.Button>
+              <Radio.Button value="high">高</Radio.Button>
+              <Radio.Button value="urgent">紧急</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+          <Form.Item name="description" label="问题描述" rules={[{ required: true, message: '请描述问题' }]}>
+            <Input.TextArea rows={3} placeholder="简要描述现场情况..." />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* 电子表格弹窗（chatbot 查询结果 → Univer 类 Excel 在线表格，支持公式/筛选/复制粘贴） */}
+      <Modal
+        title={
+          <Space>
+            <TableOutlined style={{ color: '#1677ff' }} />
+            <span>{sheetTable?.title || '电子表格'}</span>
+            <Tag color="blue" style={{ fontSize: 10 }}>Univer 在线表格</Tag>
+          </Space>
+        }
+        open={!!sheetTable}
+        onCancel={() => setSheetTable(null)}
+        footer={
+          <Button onClick={() => setSheetTable(null)}>关闭</Button>
+        }
+        width="85vw"
+        style={{ top: 32 }}
+        destroyOnClose
+      >
+        {sheetTable && (
+          <Suspense fallback={<div style={{ textAlign: 'center', padding: 48 }}><Spin tip="加载电子表格组件..." /></div>}>
+            <SpreadsheetEditor
+              headers={sheetTable.columns.map(c => c.label)}
+              initialData={sheetTable.rows.map(r => sheetTable.columns.map(c => r[c.key] ?? ''))}
+              height={Math.min(520, Math.max(280, sheetTable.rows.length * 28 + 80))}
+              sheetName={sheetTable.title}
+            />
+          </Suspense>
+        )}
+      </Modal>
+    </>
+  )
+}

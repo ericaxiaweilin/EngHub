@@ -1,4 +1,388 @@
 """
+WMS 仓储增强服务 - 盘点/追溯/FIFO/预警/库存流水
+"""
+import uuid
+import logging
+from datetime import datetime, date
+from typing import Optional, List, Dict, Any
+
+from sqlalchemy import select, func, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database.models import (
+    Inventory, InboundOrder, OutboundOrder,
+    InventoryTransaction, InventoryCount, InventoryCountItem,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class WmsService:
+    """WMS 仓储增强服务"""
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def validate_inbound_material_quality(self, material_id: str, factory_id: str, inbound_type: str) -> bool:
+        """验证物料入库前是否已通过必要的品质检验（针对采购入库）"""
+        # 仅采购入库需要IQO检验
+        if inbound_type.lower() != "purchase":
+            return True  # 内部流转无需IQO
+        
+        # 查询是否有合格的 IQC 检验记录
+        from database.models import QualityInspection
+        from sqlalchemy import select
+        
+        check_stmt = select(QualityInspection).where(
+            QualityInspection.factory_id == factory_id,
+            QualityInspection.material_id == material_id,
+            QualityInspection.inspect_type == "iqc",
+            QualityInspection.result == "PASS"
+        ).order_by(QualityInspection.created_at.desc())
+        
+        result = await self.db.execute(check_stmt)
+        latest_inspection = result.scalar_one_or_none()
+        
+        if latest_inspection:
+            # 检查检验批次是否匹配（如果有 batch_code）
+            # 这里简化实现，实际应关联 batch_id
+            
+            return True
+        
+        # 也可以返回 (has_valid_inspection, inspection_id) 元组
+        return False
+
+    # ============== 库存流水 ==============
+
+    async def record_transaction(
+        self,
+        factory_id: str,
+        material_id: str,
+        transaction_type: str,
+        quantity: int,
+        inventory_id: Optional[str] = None,
+        batch_code: Optional[str] = None,
+        reference_type: Optional[str] = None,
+        reference_id: Optional[str] = None,
+        operator: Optional[str] = None,
+        remark: Optional[str] = None,
+    ) -> InventoryTransaction:
+        """记录库存流水"""
+        before_qty = None
+        after_qty = None
+        if inventory_id:
+            inv = await self.db.get(Inventory, inventory_id)
+            if inv:
+                before_qty = inv.total_qty
+                after_qty = inv.total_qty + quantity
+
+        txn = InventoryTransaction(
+            id=str(uuid.uuid4()),
+            factory_id=factory_id,
+            inventory_id=inventory_id,
+            material_id=material_id,
+            batch_code=batch_code,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            before_qty=before_qty,
+            after_qty=after_qty,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            operator=operator,
+            remark=remark,
+        )
+        self.db.add(txn)
+        return txn
+
+    # ============== 盘点管理 ==============
+
+    async def create_count_order(
+        self,
+        factory_id: str,
+        warehouse_id: str,
+        count_type: str = "periodic",
+        planned_date: Optional[date] = None,
+        remark: Optional[str] = None,
+        created_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """创建盘点单（自动快照系统库存）"""
+        now = datetime.utcnow()
+        count_code = f"IC-{factory_id[:4]}-{now.strftime('%Y%m%d%H%M')}"
+
+        count_order = InventoryCount(
+            id=str(uuid.uuid4()),
+            count_code=count_code,
+            factory_id=factory_id,
+            warehouse_id=warehouse_id,
+            count_type=count_type,
+            status="draft",
+            planned_date=planned_date,
+            remark=remark,
+        )
+        self.db.add(count_order)
+
+        # 快照该仓库所有库存
+        inv_stmt = select(Inventory).where(
+            Inventory.warehouse_id == warehouse_id,
+            Inventory.factory_id == factory_id,
+        )
+        inv_result = await self.db.execute(inv_stmt)
+        inventories = inv_result.scalars().all()
+
+        item_count = 0
+        for inv in inventories:
+            item = InventoryCountItem(
+                id=str(uuid.uuid4()),
+                count_id=count_order.id,
+                inventory_id=inv.id,
+                material_id=inv.material_id,
+                batch_code=inv.batch_code,
+                system_qty=inv.total_qty,
+            )
+            self.db.add(item)
+            item_count += 1
+
+        count_order.total_items = item_count
+        await self.db.commit()
+
+        return {"success": True, "count_id": count_order.id, "count_code": count_code, "total_items": item_count}
+
+    async def submit_count_item(
+        self,
+        count_id: str,
+        item_id: str,
+        counted_qty: int,
+        remark: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """录入实盘数"""
+        item = await self.db.get(InventoryCountItem, item_id)
+        if not item or item.count_id != count_id:
+            return {"success": False, "message": "盘点明细不存在"}
+
+        item.counted_qty = counted_qty
+        item.diff_qty = counted_qty - item.system_qty
+        if remark:
+            item.remark = remark
+
+        # 更新盘点单状态
+        count_order = await self.db.get(InventoryCount, count_id)
+        if count_order and count_order.status == "draft":
+            count_order.status = "counting"
+
+        await self.db.commit()
+        return {"success": True, "diff_qty": item.diff_qty}
+
+    async def approve_count(
+        self,
+        count_id: str,
+        approved_by: str,
+    ) -> Dict[str, Any]:
+        """审批盘点 → 自动调整库存 + 写流水"""
+        count_order = await self.db.get(InventoryCount, count_id)
+        if not count_order:
+            return {"success": False, "message": "盘点单不存在"}
+        if count_order.status not in ("counting", "pending_approval"):
+            return {"success": False, "message": f"状态 {count_order.status} 不可审批"}
+
+        # 加载明细
+        items_stmt = select(InventoryCountItem).where(InventoryCountItem.count_id == count_id)
+        items_result = await self.db.execute(items_stmt)
+        items = items_result.scalars().all()
+
+        adjusted_count = 0
+        total_diff = 0
+        for item in items:
+            if item.counted_qty is None:
+                continue
+            diff = item.counted_qty - item.system_qty
+            if diff != 0 and item.inventory_id:
+                # 调整库存
+                inv = await self.db.get(Inventory, item.inventory_id)
+                if inv:
+                    inv.total_qty = item.counted_qty
+                    inv.available_qty = item.counted_qty - (inv.reserved_qty or 0)
+                    inv.updated_at = datetime.utcnow()
+
+                # 写流水
+                await self.record_transaction(
+                    factory_id=count_order.factory_id,
+                    material_id=item.material_id,
+                    transaction_type="count_diff",
+                    quantity=diff,
+                    inventory_id=item.inventory_id,
+                    batch_code=item.batch_code,
+                    reference_type="count_order",
+                    reference_id=count_id,
+                    operator=approved_by,
+                    remark=f"盘点调整: {item.system_qty} → {item.counted_qty}",
+                )
+                item.adjusted = True
+                adjusted_count += 1
+                total_diff += abs(diff)
+
+        # 更新盘点单
+        count_order.status = "approved"
+        count_order.approved_by = approved_by
+        count_order.completed_at = datetime.utcnow()
+        count_order.diff_items = adjusted_count
+        count_order.total_diff_qty = total_diff
+
+        await self.db.commit()
+        return {"success": True, "message": f"盘点已审批，调整 {adjusted_count} 项", "adjusted_items": adjusted_count}
+
+    # ============== 物料追溯 ==============
+
+    async def trace_material(
+        self,
+        factory_id: str,
+        material_id: str,
+        batch_code: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """正向/反向追溯"""
+        # 入库记录
+        in_stmt = select(InboundOrder).where(
+            InboundOrder.factory_id == factory_id,
+            InboundOrder.material_id == material_id,
+        )
+        if batch_code:
+            in_stmt = in_stmt.where(InboundOrder.batch_code == batch_code)
+        in_stmt = in_stmt.order_by(InboundOrder.created_at.desc()).limit(20)
+        in_result = await self.db.execute(in_stmt)
+        inbound_records = in_result.scalars().all()
+
+        # 出库记录
+        out_stmt = select(OutboundOrder).where(
+            OutboundOrder.factory_id == factory_id,
+            OutboundOrder.material_id == material_id,
+        )
+        if batch_code:
+            out_stmt = out_stmt.where(OutboundOrder.batch_code == batch_code)
+        out_stmt = out_stmt.order_by(OutboundOrder.created_at.desc()).limit(20)
+        out_result = await self.db.execute(out_stmt)
+        outbound_records = out_result.scalars().all()
+
+        # 库存流水
+        txn_stmt = select(InventoryTransaction).where(
+            InventoryTransaction.factory_id == factory_id,
+            InventoryTransaction.material_id == material_id,
+        )
+        if batch_code:
+            txn_stmt = txn_stmt.where(InventoryTransaction.batch_code == batch_code)
+        txn_stmt = txn_stmt.order_by(InventoryTransaction.created_at.desc()).limit(30)
+        txn_result = await self.db.execute(txn_stmt)
+        transactions = txn_result.scalars().all()
+
+        return {
+            "material_id": material_id,
+            "batch_code": batch_code,
+            "inbound_records": [
+                {
+                    "id": r.id, "code": r.inbound_code, "quantity": r.quantity,
+                    "batch_code": r.batch_code, "supplier_id": r.supplier_id,
+                    "type": r.inbound_type, "status": r.status,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in inbound_records
+            ],
+            "outbound_records": [
+                {
+                    "id": r.id, "code": r.outbound_code, "quantity": r.quantity,
+                    "batch_code": r.batch_code, "type": r.outbound_type,
+                    "status": r.status,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in outbound_records
+            ],
+            "transactions": [
+                {
+                    "id": t.id, "type": t.transaction_type, "quantity": t.quantity,
+                    "before_qty": t.before_qty, "after_qty": t.after_qty,
+                    "batch_code": t.batch_code, "operator": t.operator,
+                    "remark": t.remark,
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                }
+                for t in transactions
+            ],
+        }
+
+    # ============== FIFO 检查 ==============
+
+    async def check_fifo(self, factory_id: str, material_id: Optional[str] = None) -> Dict[str, Any]:
+        """FIFO 合规检查"""
+        # 查找该物料的批次（按入库时间排序）
+        stmt = select(Inventory).where(
+            Inventory.factory_id == factory_id,
+            Inventory.total_qty > 0,
+        )
+        if material_id:
+            stmt = stmt.where(Inventory.material_id == material_id)
+        result = await self.db.execute(stmt)
+        inventories = result.scalars().all()
+
+        # 按物料分组，检查批次顺序
+        violations = []
+        by_material: Dict[str, List] = {}
+        for inv in inventories:
+            if inv.batch_code:
+                by_material.setdefault(inv.material_id, []).append(inv)
+
+        for mat_id, batches in by_material.items():
+            if len(batches) <= 1:
+                continue
+            # 按创建时间排序
+            batches.sort(key=lambda x: x.created_at or datetime.min)
+            # 如果有多个批次且最早批次仍有库存，标记为潜在 FIFO 风险
+            oldest = batches[0]
+            if oldest.total_qty > 0 and len(batches) > 1:
+                violations.append({
+                    "material_id": mat_id,
+                    "oldest_batch": oldest.batch_code,
+                    "oldest_qty": oldest.total_qty,
+                    "newer_batches": len(batches) - 1,
+                    "risk": "旧批次仍有库存，新批次已入库",
+                })
+
+        return {
+            "factory_id": factory_id,
+            "material_id": material_id,
+            "violations": violations,
+            "is_compliant": len(violations) == 0,
+        }
+
+    # ============== 库存预警 ==============
+
+    async def get_stock_alerts(self, factory_id: str) -> Dict[str, Any]:
+        """库存预警（零库存 / 低库存）"""
+        # 零库存
+        zero_stmt = select(Inventory).where(
+            Inventory.factory_id == factory_id,
+            Inventory.total_qty <= 0,
+        )
+        zero_result = await self.db.execute(zero_stmt)
+        zero_items = zero_result.scalars().all()
+
+        # 低库存（available_qty < 10 作为默认安全库存）
+        low_stmt = select(Inventory).where(
+            Inventory.factory_id == factory_id,
+            Inventory.available_qty > 0,
+            Inventory.available_qty < 10,
+        )
+        low_result = await self.db.execute(low_stmt)
+        low_items = low_result.scalars().all()
+
+        return {
+            "factory_id": factory_id,
+            "zero_stock": [
+                {"material_id": i.material_id, "material_code": i.material_code, "batch_code": i.batch_code}
+                for i in zero_items
+            ],
+            "low_stock": [
+                {"material_id": i.material_id, "material_code": i.material_code, "available_qty": i.available_qty, "batch_code": i.batch_code}
+                for i in low_items
+            ],
+            "alert_count": len(zero_items) + len(low_items),
+        }
+"""
 WMS Service - 仓库管理服务
 处理仓库、库位、库存相关的业务逻辑
 """
@@ -69,6 +453,124 @@ class WarehouseService:
         result = await self.db.execute(query)
         return result.scalars().all()
 
+    # ============== 仓库更新（PATCH） ==============
+
+    async def update_warehouse_partial(
+        self,
+        warehouse_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """部分更新仓库信息（PATCH /warehouses/{id}）"""
+        warehouse = await self.db.get(Warehouse, warehouse_id)
+        if not warehouse:
+            return {"success": False, "message": "仓库不存在"}
+
+        allowed_fields = {
+            "warehouse_name": warehouse.warehouse_name,
+            "address": warehouse.address,
+            "status": warehouse.status,
+            "warehouse_type": warehouse.warehouse_type,
+        }
+
+        for key, value in updates.items():
+            if key in allowed_fields and value is not None:
+                setattr(warehouse, key, value)
+
+        warehouse.updated_at = datetime.utcnow()
+        if updated_by:
+            warehouse.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(warehouse)
+
+        return {
+            "success": True,
+            "data": {
+                "id": warehouse.id,
+                "warehouse_code": warehouse.warehouse_code,
+                "warehouse_name": warehouse.warehouse_name,
+                "factory_id": warehouse.factory_id,
+                "warehouse_type": warehouse.warehouse_type,
+                "address": warehouse.address,
+                "status": warehouse.status,
+            }
+        }
+
+    # ============== 仓库完全更新（PUT） ==============
+
+    async def update_warehouse_full(
+        self,
+        warehouse_id: str,
+        data: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """完全替换更新仓库信息（PUT /warehouses/{id}）"""
+        warehouse = await self.db.get(Warehouse, warehouse_id)
+        if not warehouse:
+            return {"success": False, "message": "仓库不存在"}
+
+        warehouse.warehouse_code = data.get("warehouse_code", warehouse.warehouse_code)
+        warehouse.warehouse_name = data.get("warehouse_name", warehouse.warehouse_name)
+        warehouse.factory_id = data.get("factory_id", warehouse.factory_id)
+        warehouse.warehouse_type = data.get("warehouse_type", warehouse.warehouse_type)
+        warehouse.address = data.get("address", warehouse.address)
+        warehouse.status = data.get("status", warehouse.status)
+        warehouse.updated_at = datetime.utcnow()
+        if updated_by:
+            warehouse.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(warehouse)
+
+        return {
+            "success": True,
+            "data": {
+                "id": warehouse.id,
+                "warehouse_code": warehouse.warehouse_code,
+                "warehouse_name": warehouse.warehouse_name,
+                "factory_id": warehouse.factory_id,
+                "warehouse_type": warehouse.warehouse_type,
+                "address": warehouse.address,
+                "status": warehouse.status,
+            }
+        }
+
+    # ============== 仓库删除（DELETE - 软删除） ==============
+
+    async def delete_warehouse_soft(
+        self,
+        warehouse_id: str,
+        deleted_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """软删除仓库（标记为deleted，并检查是否有关联库存）"""
+        warehouse = await self.db.get(Warehouse, warehouse_id)
+        if not warehouse:
+            return {"success": False, "message": "仓库不存在"}
+
+        # 检查是否有库存关联
+        inv_stmt = select(Inventory).where(
+            Inventory.warehouse_id == warehouse.id,
+            Inventory.factory_id == warehouse.factory_id,
+        )
+        inv_result = await self.db.execute(inv_stmt)
+        inventories = inv_result.scalars().all()
+
+        if inventories:
+            return {
+                "success": False,
+                "message": f"该仓库下仍有 {len(inventories)} 条库存记录，请先清理或转移",
+            }
+
+        warehouse.status = "deleted"
+        warehouse.updated_at = datetime.utcnow()
+        if deleted_by:
+            warehouse.deleted_by = deleted_by
+
+        await self.db.commit()
+
+        return {"success": True, "message": "仓库已软删除"}
+
 
 class LocationService:
     """库位服务类"""
@@ -129,15 +631,16 @@ class InventoryService:
     async def get_inventory(
         self,
         factory_id: str,
-        material_id: str,
+        material_id: Optional[str] = None,
         warehouse_id: Optional[str] = None,
     ) -> List[Inventory]:
         """获取库存信息"""
         query = select(Inventory).where(
             Inventory.factory_id == factory_id,
-            Inventory.material_id == material_id
         )
-        
+
+        if material_id:
+            query = query.where(Inventory.material_id == material_id)
         if warehouse_id:
             query = query.where(Inventory.warehouse_id == warehouse_id)
         
@@ -177,6 +680,26 @@ class InventoryService:
         created_by: Optional[str] = None,
     ) -> InboundOrder:
         """创建入库单并更新库存"""
+        # 【新增】采购入库强制 IQC 校验 - 解决第13号缺陷（严重缺陷）
+        if inbound_type.lower() == "purchase":
+            # 检查是否存在已合格的 IQC 检验记录
+            from database.models import QualityInspection
+            check_stmt = select(QualityInspection).where(
+                QualityInspection.factory_id == factory_id,
+                QualityInspection.material_id == material_id,
+                QualityInspection.inspect_type == "iqc",
+                QualityInspection.result == "PASS"
+            ).order_by(QualityInspection.created_at.desc())
+            
+            result = await self.db.execute(check_stmt)
+            latest_qc = result.scalar_one_or_none()
+            
+            if not latest_qc:
+                raise ValueError(
+                    f"物料 {material_code} (ID: {material_id}) 尚未通过 IQC 来料检验。"
+                    "请创建 IQC 检验单并获得 PASS 合格结果后，方可办理采购入库。"
+                )
+        
         # 生成入库单号
         inbound_code = f"IN-{datetime.now().strftime('%Y%m%d')}-{await self._get_next_in_number(factory_id)}"
         
@@ -375,7 +898,130 @@ class InventoryService:
             "reserved_qty": quantity,
             "work_order_id": work_order_id
         }
-    
+
+    # ============== 库存更新（PUT/PATCH） ==============
+
+    async def update_inventory_partial(
+        self,
+        inventory_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """部分更新库存记录（PATCH /inventory/{id}）"""
+        inventory = await self.db.get(Inventory, inventory_id)
+        if not inventory:
+            return {"success": False, "message": "库存记录不存在"}
+
+        # 允许更新的字段
+        allowed_fields = {
+            "location_id": inventory.location_id,
+            "batch_code": inventory.batch_code,
+            "total_qty": inventory.total_qty,
+            "available_qty": inventory.available_qty,
+            "reserved_qty": inventory.reserved_qty,
+            "unit_cost": inventory.unit_cost,
+            "status": inventory.status,
+        }
+
+        for key, value in updates.items():
+            if key in allowed_fields:
+                setattr(inventory, key, value)
+
+        inventory.last_movement_at = datetime.utcnow()
+        inventory.updated_at = datetime.utcnow()
+        if updated_by:
+            inventory.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(inventory)
+
+        return {
+            "success": True,
+            "data": {
+                "id": inventory.id,
+                "material_id": inventory.material_id,
+                "material_code": inventory.material_code,
+                "warehouse_id": inventory.warehouse_id,
+                "location_id": inventory.location_id,
+                "batch_code": inventory.batch_code,
+                "total_qty": inventory.total_qty,
+                "available_qty": inventory.available_qty,
+                "reserved_qty": inventory.reserved_qty,
+                "unit_cost": float(inventory.unit_cost) if inventory.unit_cost else None,
+                "unit": inventory.unit,
+                "status": inventory.status,
+            }
+        }
+
+    async def update_inventory_full(
+        self,
+        inventory_id: str,
+        data: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """完全替换更新库存记录（PUT /inventory/{id}）"""
+        inventory = await self.db.get(Inventory, inventory_id)
+        if not inventory:
+            return {"success": False, "message": "库存记录不存在"}
+
+        # 完全替换所有可更新字段
+        inventory.location_id = data.get("location_id", inventory.location_id)
+        inventory.batch_code = data.get("batch_code", inventory.batch_code)
+        inventory.total_qty = data.get("total_qty", inventory.total_qty)
+        inventory.available_qty = data.get("available_qty", inventory.available_qty)
+        inventory.reserved_qty = data.get("reserved_qty", inventory.reserved_qty)
+        inventory.unit_cost = data.get("unit_cost", inventory.unit_cost)
+        inventory.unit = data.get("unit", inventory.unit)
+        inventory.status = data.get("status", inventory.status)
+        inventory.last_movement_at = datetime.utcnow()
+        inventory.updated_at = datetime.utcnow()
+        if updated_by:
+            inventory.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(inventory)
+
+        return {
+            "success": True,
+            "data": {
+                "id": inventory.id,
+                "material_id": inventory.material_id,
+                "material_code": inventory.material_code,
+                "warehouse_id": inventory.warehouse_id,
+                "location_id": inventory.location_id,
+                "batch_code": inventory.batch_code,
+                "total_qty": inventory.total_qty,
+                "available_qty": inventory.available_qty,
+                "reserved_qty": inventory.reserved_qty,
+                "unit_cost": float(inventory.unit_cost) if inventory.unit_cost else None,
+                "unit": inventory.unit,
+                "status": inventory.status,
+            }
+        }
+
+    # ============== 库存删除（DELETE - 软删除） ==============
+
+    async def delete_inventory_soft(
+        self,
+        inventory_id: str,
+        deleted_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """软删除库存记录（标记为deleted状态）"""
+        inventory = await self.db.get(Inventory, inventory_id)
+        if not inventory:
+            return {"success": False, "message": "库存记录不存在"}
+
+        # 设置状态为deleted
+        inventory.status = "deleted"
+        inventory.updated_at = datetime.utcnow()
+        if deleted_by:
+            inventory.deleted_by = deleted_by
+
+        await self.db.commit()
+        await self.db.refresh(inventory)
+
+        return {"success": True, "message": "库存已软删除"}
+
     async def _get_next_in_number(self, factory_id: str) -> int:
         """获取下一个入库单序号"""
         today = datetime.now().date()

@@ -631,115 +631,132 @@ def get_user_data_scope(user) -> dict:
 
 
 def get_menu_items_for_user(user) -> list:
-    """根据用户角色生成可见菜单项"""
+    """根据用户角色生成可见菜单项（模块化一级入口，参考 ERPNext Workspace 导航）"""
     user_perms = get_user_permissions(user)
     modules_with_access = set(p["module"] for p in user_perms)
+    is_admin = getattr(user, "is_superuser", False) or getattr(user, "role", "") == "admin"
 
     items = []
 
-    # 生产看板 - 所有人可见
+    # ━━━ 1. 看板（所有人可见）━━━
     items.append({
-        "key": "/dashboard",
-        "label": "生产看板",
-        "module": "dashboard",
+        "key": "g-dashboard",
+        "label": "看板",
+        "children": [
+            {"key": "/dashboard", "label": "生产看板"},
+            {"key": "/production-data", "label": "生产数据"},
+        ],
     })
 
-    # AI助手 - 所有人可见
-    items.append({
-        "key": "/ai",
-        "label": "AI助手",
-        "module": "ai",
-    })
-
-    # 生产制造组
-    if any(m in modules_with_access for m in ["work_order", "production_report", "station", "routing", "equipment"]):
+    # ━━━ 2. MES 制造执行 ━━━
+    if any(m in modules_with_access for m in ["work_order", "production_report", "station", "routing"]):
         children = []
         if "work_order" in modules_with_access:
             children.append({"key": "/work-orders", "label": "工单管理"})
+            children.append({"key": "/process-queue", "label": "工序队列"})
         if "production_report" in modules_with_access:
             children.append({"key": "/production-report", "label": "生产报工"})
+        if "routing" in modules_with_access:
+            children.append({"key": "/routing-templates", "label": "工艺路线模板"})
         if any(m in modules_with_access for m in ["station", "routing", "equipment"]):
-            children.append({"key": "/base-data", "label": "工位/工艺/设备"})
+            children.append({"key": "/base-data", "label": "基础数据"})
+        children.append({"key": "/plant-floor", "label": "车间看板"})
+        children.append({"key": "/report-terminal", "label": "报工终端"})
+        children.append({"key": "/production-live", "label": "实时看板"})
+        children.append({"key": "/report-center", "label": "报表中心"})
         if children:
-            items.append({
-                "key": "g-mfg",
-                "label": "生产制造",
-                "children": children,
-            })
+            items.append({"key": "g-mes", "label": "MES 制造执行", "children": children})
 
-    # 计划物料组
-    if any(m in modules_with_access for m in ["pp", "wms", "inventory", "inbound", "outbound"]):
-        children = []
-        if "pp" in modules_with_access:
-            children.append({"key": "/plans", "label": "生产计划"})
-        if any(m in modules_with_access for m in ["inventory", "wms"]):
-            children.append({"key": "/inventory", "label": "库存管理"})
-        if any(m in modules_with_access for m in ["wms", "inbound", "outbound"]):
-            children.append({"key": "/warehouses", "label": "仓库管理"})
-        if children:
-            items.append({
-                "key": "g-plan",
-                "label": "计划物料",
-                "children": children,
-            })
-
-    # 质量管理组
+    # ━━━ 3. QMS 质量管理 ━━━
     if any(m in modules_with_access for m in ["qms", "defect", "inspection"]):
         children = []
         if "inspection" in modules_with_access or "qms" in modules_with_access:
             children.append({"key": "/inspections", "label": "检验管理"})
         if "defect" in modules_with_access or "qms" in modules_with_access:
             children.append({"key": "/defects", "label": "不良品"})
-        if children:
-            items.append({
-                "key": "g-qms",
-                "label": "质量管理",
-                "children": children,
-            })
+        children.append({"key": "/quality-center", "label": "质量中心"})
+        children.append({"key": "/quality-goals", "label": "质量目标"})
+        children.append({"key": "/inspection-terminal", "label": "检验终端"})
+        children.append({"key": "/spc-dashboard", "label": "SPC 控制图"})
+        items.append({"key": "g-qms", "label": "QMS 质量管理", "children": children})
 
-    # 人员管理组
-    if any(m in modules_with_access for m in ["hr", "skill_matrix", "training"]):
+    # ━━━ 4. WMS 仓储管理 ━━━
+    if any(m in modules_with_access for m in ["wms", "inventory", "inbound", "outbound"]):
         children = []
-        if "skill_matrix" in modules_with_access or "hr" in modules_with_access:
-            children.append({"key": "/skill-matrix", "label": "员工技能矩阵"})
-        if children:
-            items.append({
-                "key": "g-hr",
-                "label": "人员",
-                "children": children,
-            })
+        if any(m in modules_with_access for m in ["inventory", "wms"]):
+            children.append({"key": "/inventory", "label": "库存管理"})
+        if any(m in modules_with_access for m in ["wms", "inbound", "outbound"]):
+            children.append({"key": "/warehouses", "label": "仓库管理"})
+        children.append({"key": "/wms-center", "label": "仓储中心"})
+        children.append({"key": "/wms-terminal", "label": "操作终端"})
+        children.append({"key": "/stock-alerts", "label": "库存预警"})
+        items.append({"key": "g-wms", "label": "WMS 仓储管理", "children": children})
 
-    # 仿真引擎
-    if "simulation" in modules_with_access:
+    # ━━━ 5. 设备 TPM ━━━
+    if "equipment" in modules_with_access or is_admin:
         items.append({
-            "key": "/simulation",
-            "label": "仿真引擎",
+            "key": "g-equipment",
+            "label": "设备 TPM",
+            "children": [
+                {"key": "/equipment-center", "label": "设备中心"},
+                {"key": "/equipment/maintenance", "label": "设备维护"},
+                {"key": "/equipment/oee", "label": "OEE 看板"},
+            ],
         })
 
-    # TMS 任务管理
+    # ━━━ 6. APS 计划排程 ━━━
+    if "pp" in modules_with_access:
+        items.append({
+            "key": "g-aps",
+            "label": "APS 计划排程",
+            "children": [
+                {"key": "/orders", "label": "销售订单"},
+                {"key": "/plans", "label": "生产计划"},
+                {"key": "/scheduling", "label": "排程中心"},
+            ],
+        })
+
+    # ━━━ 7. 协同 ━━━
+    collab_children = []
+    if "andon" in modules_with_access or is_admin:
+        collab_children.append({"key": "/andon", "label": "安灯小工单"})
+    collab_children.append({"key": "/quick-request", "label": "快速工单"})
     if "tms" in modules_with_access:
-        children = []
-        if "tms" in modules_with_access:
-            children.append({"key": "/tms/approval", "label": "审批中心"})
-            children.append({"key": "/tms/distribution", "label": "分发看板"})
-            children.append({"key": "/tms/agent", "label": "Agent控制台"})
-        if children:
-            items.append({
-                "key": "g-tms",
-                "label": "TMS 任务管理",
-                "children": children,
-            })
+        collab_children.append({"key": "/tms/approval", "label": "审批中心"})
+        collab_children.append({"key": "/tms/distribution", "label": "分发看板"})
+        collab_children.append({"key": "/tms/agent", "label": "Agent控制台"})
+    collab_children.append({"key": "/my-tasks", "label": "我的任务"})
+    if is_admin or "tms" in modules_with_access:
+        collab_children.append({"key": "/agent-supervisor", "label": "智能体监督"})
+    if is_admin:
+        collab_children.append({"key": "/collaboration", "label": "协同网络"})
+    if user_perms and any(p.get("module") in ("work_order", "quality", "equipment") for p in user_perms):
+        collab_children.append({"key": "/alert-intelligence", "label": "预警情报"})
+    if collab_children:
+        items.append({"key": "g-collab", "label": "协同", "children": collab_children})
 
-    # 系统管理 - 仅管理员
-    if getattr(user, "is_superuser", False) or user.role == "admin":
-        items.append({
-            "key": "/users",
-            "label": "用户管理",
-        })
-        items.append({
-            "key": "/roles",
-            "label": "角色管理",
-        })
+    # ━━━ 8. 仿真引擎 ━━━
+    if "simulation" in modules_with_access:
+        items.append({"key": "/simulation", "label": "仿真引擎"})
+
+    # ━━━ 9. 人员 ━━━
+    if any(m in modules_with_access for m in ["hr", "skill_matrix", "training"]) or is_admin:
+        children = []
+        children.append({"key": "/hr-roster", "label": "人力档案"})
+        if "skill_matrix" in modules_with_access or "hr" in modules_with_access or is_admin:
+            children.append({"key": "/skill-matrix", "label": "技能矩阵"})
+        if children:
+            items.append({"key": "g-hr", "label": "人员", "children": children})
+
+    # ━━━ 10. 系统（管理员）━━━
+    if is_admin or "system" in modules_with_access:
+        sys_children = [
+            {"key": "/settings", "label": "系统设置"},
+            {"key": "/notifications", "label": "通知中心"},
+            {"key": "/automation-level", "label": "自动化等级"},
+            {"key": "/workflow-analytics", "label": "工作流分析"},
+        ]
+        items.append({"key": "/settings", "label": "系统", "children": sys_children})
 
     return items
 

@@ -35,8 +35,16 @@ interface DrillConfig {
   onRowClick?: (r: any) => void
 }
 
+const MOCK_PLANS = [
+  { id: 'pp-1', plan_code: 'MPS-2026-0701', product_id: 'PRD-001', quantity: 5000, required_date: '2026-08-01', customer_level: 'a', priority: 90, status: 'released', sales_order_id: 'SO-2026-001', created_at: '2026-07-01' },
+  { id: 'pp-2', plan_code: 'MPS-2026-0702', product_id: 'PRD-002', quantity: 2000, required_date: '2026-08-10', customer_level: 'b', priority: 60, status: 'confirmed', sales_order_id: 'SO-2026-002', created_at: '2026-07-05' },
+  { id: 'pp-3', plan_code: 'MPS-2026-0703', product_id: 'PRD-003', quantity: 800, required_date: '2026-08-15', customer_level: 'c', priority: 40, status: 'draft', sales_order_id: null, created_at: '2026-07-10' },
+  { id: 'pp-4', plan_code: 'MPS-2026-0704', product_id: 'PRD-004', quantity: 3500, required_date: '2026-07-28', customer_level: 'a', priority: 95, status: 'released', sales_order_id: 'SO-2026-003', created_at: '2026-07-08' },
+  { id: 'pp-5', plan_code: 'MPS-2026-0705', product_id: 'PRD-005', quantity: 1200, required_date: '2026-08-20', customer_level: 'b', priority: 55, status: 'draft', sales_order_id: null, created_at: '2026-07-12' },
+]
+
 const PlanList: React.FC = () => {
-  const [factory, setFactory] = useState('F001')
+  const [factory, setFactory] = useState('factory-sh-01')
   const [data, setData] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
@@ -52,7 +60,8 @@ const PlanList: React.FC = () => {
     setLoading(true)
     try {
       const res = await listPlans(factory)
-      setData(res.items || [])
+      const items = res.items || []
+      setData(items)
     } catch {
       setData([])
     } finally {

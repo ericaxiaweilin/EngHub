@@ -17,6 +17,26 @@ import { makeStationResolver, makeEquipmentResolver } from '../../components/tra
 
 const { Option } = Select
 
+const MOCK_STATIONS: any[] = [
+  { id: 'st-1', station_code: 'ST-01', station_name: 'CNC加工工位', station_type: 'machining', status: 'active', factory_id: 'factory-sh-01' },
+  { id: 'st-2', station_code: 'ST-02', station_name: '装配工位A', station_type: 'assembly', status: 'active', factory_id: 'factory-sh-01' },
+  { id: 'st-3', station_code: 'ST-03', station_name: '焊接工位', station_type: 'welding', status: 'active', factory_id: 'factory-sh-01' },
+  { id: 'st-4', station_code: 'ST-04', station_name: '检验工位', station_type: 'inspection', status: 'active', factory_id: 'factory-sh-01' },
+]
+
+const MOCK_ROUTINGS: any[] = [
+  { id: 'rt-1', routing_code: 'RT-PRD001-V1', product_id: 'PRD-001', version: 'V1', steps_count: 5, is_active: true },
+  { id: 'rt-2', routing_code: 'RT-PRD002-V1', product_id: 'PRD-002', version: 'V1', steps_count: 4, is_active: true },
+  { id: 'rt-3', routing_code: 'RT-PRD003-V2', product_id: 'PRD-003', version: 'V2', steps_count: 6, is_active: true },
+]
+
+const MOCK_EQUIPMENT: any[] = [
+  { id: 'eq-1', equipment_code: 'CNC-01', equipment_name: 'CNC加工中心-01', equipment_type: 'machining', status: 'running', station_id: 'st-1', factory_id: 'factory-sh-01' },
+  { id: 'eq-2', equipment_code: 'CNC-02', equipment_name: 'CNC加工中心-02', equipment_type: 'machining', status: 'available', station_id: 'st-1', factory_id: 'factory-sh-01' },
+  { id: 'eq-3', equipment_code: 'WLD-01', equipment_name: '焊接机器人-01', equipment_type: 'welding', status: 'maintenance', station_id: 'st-3', factory_id: 'factory-sh-01' },
+  { id: 'eq-4', equipment_code: 'INJ-01', equipment_name: '注塑机-01', equipment_type: 'molding', status: 'running', station_id: 'st-2', factory_id: 'factory-sh-01' },
+]
+
 const EQUIPMENT_STATUS: Record<string, { color: string; text: string }> = {
   available: { color: 'success', text: '可用' },
   running: { color: 'processing', text: '运行中' },
@@ -39,7 +59,8 @@ const StationTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
     setLoading(true)
     try {
       const res = await getStations({ factory_id: factoryId, page_size: 100 })
-      setData(res.items || [])
+      const items = res.items || []
+      setData(items)
     } catch { setData([]) } finally { setLoading(false) }
   }, [factoryId])
 
@@ -164,7 +185,8 @@ const RoutingTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
     setLoading(true)
     try {
       const res = await getRoutings({ factory_id: factoryId, page_size: 100 })
-      setData(res.items || [])
+      const items = res.items || []
+      setData(items)
     } catch { setData([]) } finally { setLoading(false) }
   }, [factoryId])
 
@@ -261,7 +283,8 @@ const EquipmentTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
     setLoading(true)
     try {
       const res = await getEquipment({ factory_id: factoryId, page_size: 100 })
-      setData(res.items || [])
+      const items = res.items || []
+      setData(items)
     } catch { setData([]) } finally { setLoading(false) }
   }, [factoryId])
 
@@ -397,7 +420,7 @@ const EquipmentTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
 // ============== 主页面 ==============
 const BaseData: React.FC = () => {
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'F01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   return (
     <div>

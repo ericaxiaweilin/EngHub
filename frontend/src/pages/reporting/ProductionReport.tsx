@@ -55,16 +55,24 @@ const ProductionReport: React.FC = () => {
   const [reportDetail, setReportDetail] = useState<ReportType | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'F01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
+
+  const MOCK_REPORTS: any[] = [
+    { id: 'rpt-1', report_code: 'RPT-2026-0701', work_order_id: 'wo-1', station_id: 'st-1', product_id: 'PRD-001', quantity: 120, qualified_quantity: 118, defect_quantity: 2, operator: '张伟', shift: 'day', factory_id: 'factory-sh-01', created_at: '2026-07-20' },
+    { id: 'rpt-2', report_code: 'RPT-2026-0702', work_order_id: 'wo-2', station_id: 'st-2', product_id: 'PRD-002', quantity: 200, qualified_quantity: 195, defect_quantity: 5, operator: '王强', shift: 'day', factory_id: 'factory-sh-01', created_at: '2026-07-19' },
+    { id: 'rpt-3', report_code: 'RPT-2026-0703', work_order_id: 'wo-3', station_id: 'st-3', product_id: 'PRD-003', quantity: 80, qualified_quantity: 80, defect_quantity: 0, operator: '李娜', shift: 'night', factory_id: 'factory-sh-01', created_at: '2026-07-18' },
+  ]
 
   const fetchReports = useCallback(async () => {
     setLoading(true)
     try {
       const res = await getProductionReports({ factory_id: factoryId, page, page_size: 20 })
-      setReports(res.items || [])
-      setTotal(res.total || 0)
+      const items = res.items || []
+      setReports(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      message.error(err?.response?.data?.detail || '获取报工记录失败')
+      setReports([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

@@ -88,6 +88,7 @@ export const tmsApi = {
     points?: number;
     required_skills?: string[];
     deadline?: string;
+    metadata?: Record<string, any>;
   }) => api.post('/api/v1/tms/tasks', data),
 
   listTasks: (params?: {

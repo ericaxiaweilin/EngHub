@@ -1,6 +1,7 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useEffect } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Layout as AntLayout, Menu, Avatar, Space, Tag, Dropdown, Button } from 'antd'
+import { Layout as AntLayout, Menu, Avatar, Space, Tag, Dropdown, Button, Select, message } from 'antd'
+import { useTranslation } from 'react-i18next'
 import {
   DashboardOutlined,
   FileTextOutlined,
@@ -16,83 +17,236 @@ import {
   HddOutlined,
   ClusterOutlined,
   CheckSquareOutlined,
+  DatabaseOutlined,
   LogoutOutlined,
   UserOutlined,
   SettingOutlined,
   SwapOutlined,
+  ToolOutlined,
+  AppstoreOutlined,
+  FieldTimeOutlined,
+  AlertOutlined,
+  LineChartOutlined,
+  HourglassOutlined,
+  BarChartOutlined,
+  ExperimentOutlined,
+  AuditOutlined,
+  ProjectOutlined,
+  LayoutOutlined,
+  DragOutlined,
+  RiseOutlined,
+  BranchesOutlined,
 } from '@ant-design/icons'
-import { getStoredUser, logout } from '../services/auth'
+import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
+import api from '../services/api'
 import RoleSwitcher from './RoleSwitcher'
+import AIAssistantWidget from './AIAssistantWidget'
+import GlobalSearch from './GlobalSearch'
 
 const { Header, Sider, Content } = AntLayout
 
 // 菜单图标映射
 const menuIcons: Record<string, React.ReactElement> = {
+  'g-dashboard': <DashboardOutlined />,
+  'g-mes': <AppstoreOutlined />,
+  'g-qms': <SafetyOutlined />,
+  'g-wms': <InboxOutlined />,
+  'g-equipment': <ToolOutlined />,
+  'g-aps': <FieldTimeOutlined />,
+  'g-collab': <ThunderboltOutlined />,
+  'g-alert': <AlertOutlined />,
   '/dashboard': <DashboardOutlined />,
+  '/production-data': <DatabaseOutlined />,
   '/work-orders': <FileTextOutlined />,
+  '/process-queue': <ApartmentOutlined />,
   '/production-report': <EditOutlined />,
   '/base-data': <ApartmentOutlined />,
+  '/routing-templates': <FileTextOutlined />,
   '/plans': <ScheduleOutlined />,
+  '/scheduling': <FieldTimeOutlined />,
   '/inventory': <InboxOutlined />,
   '/warehouses': <HddOutlined />,
+  '/wms-center': <InboxOutlined />,
   '/inspections': <SafetyOutlined />,
   '/defects': <WarningOutlined />,
+  '/quality-center': <SafetyOutlined />,
+  '/equipment-center': <ToolOutlined />,
   '/skill-matrix': <TeamOutlined />,
   '/simulation': <ThunderboltOutlined />,
   '/tms/approval': <CheckSquareOutlined />,
   '/tms/distribution': <ThunderboltOutlined />,
   '/tms/agent': <RobotOutlined />,
-  '/ai': <RobotOutlined />,
-  '/users': <UserOutlined />,
-  '/roles': <SettingOutlined />,
-  '/ie-standard-times': <SwapOutlined />, // 标准工时
-  '/ie-time-studies': <SwapOutlined />, // 时间研究
-  '/ie-line-balance': <SwapOutlined />, // 线平衡分析
-  '/ie-process-analyses': <SwapOutlined />, // 工艺分析
-  '/ie-lean-metrics': <SwapOutlined />, // 精益指标
-  '/ie-action-studies': <SwapOutlined />, // 动作研究
-  '/ie-method-studies': <SwapOutlined />, // 方法研究
-  '/ie-work-cells': <SwapOutlined />, // 工作单元
-  '/ie-kanbans': <SwapOutlined />, // Kanban
-  '/ie-5s-audits': <SwapOutlined />, // 5S审核
+  '/quick-request': <EditOutlined />,
+  '/andon': <AlertOutlined />,
+  '/my-tasks': <CheckSquareOutlined />,
+  '/alert-intelligence': <AlertOutlined />,
+  '/settings': <SettingOutlined />,
+  '/ie/standard-times': <LineChartOutlined />,
+  '/ie/time-studies': <LineChartOutlined />,
+  '/ie/line-balance': <LineChartOutlined />,
+  '/ie/process-analyses': <LineChartOutlined />,
+  '/ie/lean-metrics': <LineChartOutlined />,
+  '/ie/action-studies': <LineChartOutlined />,
+  '/ie/method-studies': <LineChartOutlined />,
+  '/ie/work-cells': <LineChartOutlined />,
+  '/ie/kanbans': <LineChartOutlined />,
+  '/ie/5s-audits': <LineChartOutlined />,
 }
 
-// 将后端 menu_items 转换为 Ant Design Menu 格式
-function convertMenuItems(items: any[]): any[] {
+// 将后端 menu_items 转换为 Ant Design Menu 格式（label 优先取 i18n 翻译，缺失时回退后端原文）
+function convertMenuItems(items: any[], t: (key: string, opts?: any) => string): any[] {
   if (!items || !items.length) return []
 
   return items.map((item: any) => {
+    const label = t(`menu.${item.key}`, { defaultValue: item.label })
     if (item.children && item.children.length > 0) {
       return {
         key: item.key,
         icon: menuIcons[item.key] || <ClusterOutlined />,
-        label: item.label,
-        children: convertMenuItems(item.children),
+        label,
+        children: convertMenuItems(item.children, t),
       }
     }
     return {
       key: item.key,
       icon: menuIcons[item.key] || <DashboardOutlined />,
-      label: <Link to={item.key}>{item.label}</Link>,
+      label: <Link to={item.key}>{label}</Link>,
     }
   })
 }
 
+// 路由前缀 → 菜单分组 key 映射（用于侧边栏只显示当前模块）
+const ROUTE_MODULE_MAP: [string, string][] = [
+  ['/work-orders', 'g-mes'], ['/process-queue', 'g-mes'],
+  ['/routing-templates', 'g-mes'], ['/production-report', 'g-mes'], ['/base-data', 'g-mes'],
+  ['/plant-floor', 'g-mes'], ['/report-terminal', 'g-mes'], ['/production-live', 'g-mes'],
+  ['/report-center', 'g-mes'],
+  ['/alert-intelligence', 'g-alert'],
+  ['/inspections', 'g-qms'], ['/defects', 'g-qms'], ['/quality-center', 'g-qms'],
+  ['/quality-goals', 'g-qms'], ['/inspection-terminal', 'g-qms'], ['/spc-dashboard', 'g-qms'],
+  ['/inventory', 'g-wms'], ['/warehouses', 'g-wms'], ['/wms-center', 'g-wms'],
+  ['/wms-terminal', 'g-wms'], ['/stock-alerts', 'g-wms'],
+  ['/equipment-center', 'g-equipment'], ['/equipment/', 'g-equipment'],
+  ['/orders', 'g-aps'], ['/plans', 'g-aps'], ['/scheduling', 'g-aps'],
+  ['/andon', 'g-collab'], ['/tms/', 'g-collab'], ['/quick-request', 'g-collab'], ['/my-tasks', 'g-collab'],
+  ['/war-room', 'g-collab'], ['/work-order-templates', 'g-collab'], ['/rcc', 'g-collab'],
+  ['/agent-supervisor', 'g-collab'],
+  ['/simulation', '/simulation'], ['/sim-erp', '/simulation'],
+  ['/skill-matrix', 'g-hr'], ['/hr-roster', 'g-hr'],
+  ['/dashboard', 'g-mes'], ['/production-data', 'g-mes'],
+  ['/settings', '/settings'],
+  ['/notifications', '/settings'], ['/collaboration', 'g-collab'],
+  ['/automation-level', '/settings'], ['/workflow-analytics', '/settings'],
+  ['/ie/', 'g-ie'],
+]
+
+function getActiveModule(pathname: string): string | null {
+  for (const [prefix, group] of ROUTE_MODULE_MAP) {
+    if (pathname.startsWith(prefix)) return group
+  }
+  return null
+}
+
+// ---------- 工厂切换器（仅开发账户可见） ----------
+const FactorySwitcher: React.FC = () => {
+  const [factories, setFactories] = useState<{ id: string; name: string; short_name: string }[]>([])
+  const [current, setCurrent] = useState(localStorage.getItem('active_factory_id') || '')
+
+  useEffect(() => {
+    api.get('/api/v1/hr/factories')
+      .then((res: any) => {
+        setFactories(res.items || [])
+        if (!current && res.items?.length > 0) {
+          setCurrent(res.items[0].id)
+          localStorage.setItem('active_factory_id', res.items[0].id)
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  const handleSwitch = async (fid: string) => {
+    try {
+      const res: any = await api.post('/api/v1/hr/factory/switch', { factory_id: fid })
+      localStorage.setItem('active_factory_id', fid)
+      setCurrent(fid)
+      message.success(`已切换到 ${res.factory_name}`)
+      // 刷新页面让所有模块重新加载数据
+      setTimeout(() => window.location.reload(), 600)
+    } catch {
+      message.error('切换失败')
+    }
+  }
+
+  return (
+    <Select
+      value={current || undefined}
+      onChange={handleSwitch}
+      size="small"
+      style={{ width: 110 }}
+      popupMatchSelectWidth={false}
+      options={factories.map(f => ({ value: f.id, label: f.short_name || f.name }))}
+      placeholder="工厂"
+    />
+  )
+}
+
 const Layout: React.FC = () => {
+  const { t } = useTranslation()
   const location = useLocation()
   const navigate = useNavigate()
-  const user = getStoredUser()
+  const [user, setUser] = useState(getStoredUser())
   const displayName = user?.full_name || user?.username || '用户'
   const avatarChar = displayName.charAt(0).toUpperCase()
   const [switcherOpen, setSwitcherOpen] = useState(false)
   const testMode = isTestMode()
 
-  // 根据用户权限动态生成菜单
+  // 每次进入布局时静默刷新用户信息（含 menu_items），避免缓存过旧导致菜单缺失
+  useEffect(() => {
+    let cancelled = false
+    fetchMe()
+      .then((fresh) => { if (!cancelled) setUser(fresh) })
+      .catch(() => { /* token 失效等情况沿用缓存，由 RequireAuth 处理跳转 */ })
+    return () => { cancelled = true }
+  }, [])
+
+  // 根据当前路由只显示对应模块的菜单
+  const activeModule = getActiveModule(location.pathname)
   const menuItems = useMemo(() => {
     if (!user) return []
-    return convertMenuItems(user.menu_items || [])
-  }, [user])
+    const allItems = convertMenuItems(user.menu_items || [], t)
+    if (!activeModule) return []  // 模块选择页不显示侧边栏
+    // 找到当前模块分组，将其 children 提升为顶级
+    const group = allItems.find((i: any) => i.key === activeModule)
+    if (group && group.children) {
+      // MES 模块合并看板组
+      if (activeModule === 'g-mes') {
+        const dashGroup = allItems.find((i: any) => i.key === 'g-dashboard')
+        const dashChildren = dashGroup?.children || []
+        return [...dashChildren, ...group.children]
+      }
+      return group.children
+    }
+    // 非分组类型（如 /simulation, /settings）直接返回
+    const single = allItems.find((i: any) => i.key === activeModule)
+    if (single) return [single]
+    // IE 模块 fallback（后端未配置菜单时硬编码）
+    if (activeModule === 'g-ie') {
+      return [
+        { key: '/ie/standard-times', icon: <FieldTimeOutlined />, label: <Link to="/ie/standard-times">标准工时</Link> },
+        { key: '/ie/time-studies', icon: <HourglassOutlined />, label: <Link to="/ie/time-studies">时间研究</Link> },
+        { key: '/ie/line-balance', icon: <BarChartOutlined />, label: <Link to="/ie/line-balance">线平衡分析</Link> },
+        { key: '/ie/process-analyses', icon: <BranchesOutlined />, label: <Link to="/ie/process-analyses">工艺分析</Link> },
+        { key: '/ie/lean-metrics', icon: <RiseOutlined />, label: <Link to="/ie/lean-metrics">精益指标</Link> },
+        { key: '/ie/action-studies', icon: <DragOutlined />, label: <Link to="/ie/action-studies">动作研究</Link> },
+        { key: '/ie/method-studies', icon: <ExperimentOutlined />, label: <Link to="/ie/method-studies">方法研究</Link> },
+        { key: '/ie/work-cells', icon: <LayoutOutlined />, label: <Link to="/ie/work-cells">工作单元</Link> },
+        { key: '/ie/kanbans', icon: <ProjectOutlined />, label: <Link to="/ie/kanbans">看板</Link> },
+        { key: '/ie/5s-audits', icon: <AuditOutlined />, label: <Link to="/ie/5s-audits">5S审核</Link> },
+      ]
+    }
+    return []
+  }, [user, t, activeModule])
 
   const handleLogout = () => {
     logout()
@@ -114,22 +268,30 @@ const Layout: React.FC = () => {
         disabled: true,
       },
       { type: 'divider' as const },
-      { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
+      { key: 'settings', icon: <SettingOutlined />, label: t('layout.settings'), onClick: () => navigate('/settings') },
+      { key: 'logout', icon: <LogoutOutlined />, label: t('layout.logout'), onClick: handleLogout },
     ],
   }
 
   return (
     <AntLayout style={{ minHeight: '100vh' }}>
       <Header style={{ background: '#001529', padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <Space size={12}>
+        <Space size={12} style={{ cursor: 'pointer' }} onClick={() => navigate('/')}>
           <Avatar shape="square" style={{ background: '#1890ff' }} icon={<ClusterOutlined />} />
-          <span style={{ fontSize: 18, fontWeight: 700, color: '#fff', letterSpacing: 1 }}>EngHub MES</span>
+          <span style={{ fontSize: 18, fontWeight: 700, color: '#fff', letterSpacing: 1 }}>EngHub</span>
           <Tag color="blue" style={{ marginLeft: 4 }}>v1.2</Tag>
-          {testMode && <Tag color="red">测试模式</Tag>}
+          {testMode && <Tag color="red">{t('layout.testMode')}</Tag>}
         </Space>
         <Space size={16}>
-          {user?.factory_id && <Tag color="geekblue">厂区 {user.factory_id}</Tag>}
-          <Link to="/ai" style={{ color: 'rgba(255,255,255,0.85)' }}><RobotOutlined /> AI 助手</Link>
+          {/* 全站搜索 */}
+          <GlobalSearch />
+          {/* 工厂切换器（仅开发账户） */}
+          {user && (user.is_superuser || user.username === 'eric') && (
+            <FactorySwitcher />
+          )}
+          {user?.factory_id && !(user.is_superuser || user.username === 'eric') && (
+            <Tag color="geekblue">{t('layout.factory')} {user.factory_id}</Tag>
+          )}
           
           {/* 测试模式：角色切换按钮 */}
           {testMode && (
@@ -140,7 +302,7 @@ const Layout: React.FC = () => {
               onClick={() => setSwitcherOpen(true)}
               style={{ color: '#fff', borderColor: 'rgba(255,255,255,0.5)' }}
             >
-              切换角色
+              {t('layout.switchRole')}
             </Button>
           )}
 
@@ -153,6 +315,7 @@ const Layout: React.FC = () => {
         </Space>
       </Header>
       <AntLayout>
+        {menuItems.length > 0 && (
         <Sider width={220} theme="light" style={{ borderRight: '1px solid #f0f0f0' }}>
           <Menu
             mode="inline"
@@ -162,6 +325,7 @@ const Layout: React.FC = () => {
             items={menuItems}
           />
         </Sider>
+        )}
         <Content style={{ padding: 24, background: '#f0f2f5' }}>
           <div style={{ background: 'transparent' }}>
             <Outlet />
@@ -175,6 +339,9 @@ const Layout: React.FC = () => {
         onClose={() => setSwitcherOpen(false)}
         currentRole={user?.role || ''}
       />
+
+      {/* 全局 AI 助手浮窗（模块选择页不渲染，避免遵住右下角的 RCC 卡片） */}
+      {activeModule && <AIAssistantWidget />}
     </AntLayout>
   )
 }

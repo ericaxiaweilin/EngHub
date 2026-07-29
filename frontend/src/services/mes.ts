@@ -29,6 +29,8 @@ export interface WorkOrder {
   bom_version?: string;
   created_by?: string;
   updated_by?: string;
+  released_by?: string;   // 下达人（审核门槛：管理角色且非创建人）
+  completed_by?: string;  // 完工确认人（品质角色）
   remark?: string;
   created_at: string;
   updated_at?: string;
@@ -39,6 +41,15 @@ export interface WorkOrder {
   remaining_qty?: number;
   remaining_time?: string;
   is_overdue?: boolean;
+  // 工单体系化编码：层级字段
+  wo_type?: string;              // master=主工单 / operation=工序工单
+  process_code?: string;         // 行业通用工序代码（SMT/INJ/MACH...）
+  operation_seq?: number;        // 同一工序内道次序号
+  parent_work_order_id?: string; // 工序工单指向主工单
+  // 工序流转（016）
+  assigned_to?: string;          // 指派操作人
+  work_center?: string;          // 工序组
+  routing_template_id?: string;  // 工艺路线模板
 }
 
 export interface WorkOrderStats {
@@ -150,6 +161,10 @@ export interface Defect {
   id: string;
   defect_code?: string;
   work_order_id?: string;
+  production_report_id?: string;
+  product_id?: string;
+  material_id?: string;
+  batch_code?: string;
   defect_type: string;
   description?: string;
   severity?: string;
@@ -157,11 +172,30 @@ export interface Defect {
   defect_qty: number;
   defect_location?: string;
   station_id?: string;
+  equipment_id?: string;
+  // 品质追溯
+  defect_source?: string;        // incoming/process/design/operation/environment/customer
+  root_cause_category?: string;  // 5M1E
   root_cause?: string;
+  responsible_dept?: string;
+  discovery_stage?: string;      // IQC/IPQC/FQC/OQC/customer
   discovery_time?: string;
   inspection_id?: string;
-  status?: string;
+  process_step?: string;
+  // 处置
   disposition?: string;
+  disposition_by?: string;
+  disposition_at?: string;
+  disposition_remark?: string;
+  corrective_action?: string;
+  preventive_action?: string;
+  // 评审/状态
+  ocap_status?: string;
+  review_status?: string;
+  reviewed_by?: string;
+  reviewed_at?: string;
+  status?: string;
+  created_by?: string;
   created_at?: string;
 }
 
@@ -263,6 +297,25 @@ export const cancelWorkOrder = (id: string, reason: string) =>
 
 export const splitWorkOrder = (id: string, splitQty: number, remark?: string) =>
   api.post<any, { new_work_order?: WorkOrder; [k: string]: any }>(`${API_ENDPOINTS.WORK_ORDER(id)}/split`, { split_qty: splitQty, remark });
+
+// 状态操作日志（审核追溯）
+export interface WoStatusLog {
+  id: string;
+  action: string;
+  from_status?: string;
+  to_status: string;
+  operator: string;
+  operator_role?: string;
+  comment?: string;
+  created_at?: string;
+}
+
+export const getWorkOrderStatusLogs = (id: string) =>
+  api.get<any, { items: WoStatusLog[]; total: number }>(`${API_ENDPOINTS.WORK_ORDER(id)}/status-logs`);
+
+// 子工单列表（含进度）
+export const getWorkOrderChildren = (id: string) =>
+  api.get<any, { items: (WorkOrder & { progress?: { progress_rate?: number } })[]; total: number }>(`${API_ENDPOINTS.WORK_ORDER(id)}/children`);
 
 // ============== Production Reports ==============
 
@@ -381,6 +434,13 @@ export const createDefect = (data: Record<string, any>) =>
 export const processDefect = (id: string, data: Record<string, any>) =>
   api.post(`${API_ENDPOINTS.DEFECTS}/${id}/process`, data);
 
+// #9 OCAP闭环 - 新增OCAP相关API调用
+export const getDefect = (id: string) =>
+  api.get<any, Defect>(`${API_ENDPOINTS.DEFECTS}/${id}`)
+
+export const updateDefectOCAP = (id: string, data: Record<string, any>) =>
+  api.patch(API_ENDPOINTS.DEFECTS + `/${id}`, data)
+
 // ============== WMS ==============
 
 export const listWarehouses = (params?: Record<string, any>) =>
@@ -423,3 +483,100 @@ export const getChatHealth = () =>
   api.get<any, { configured: boolean; reachable: boolean; model: string; gateway: string; detail: string }>(
     API_ENDPOINTS.CHAT_HEALTH,
   );
+
+// ============== 工序流转与多视角（016） ==============
+
+export interface RoutingTemplateStep {
+  id?: string;
+  seq: number;
+  process_code: string;
+  operation_name: string;
+  work_center?: string;
+  standard_hours?: number;
+  is_parallel?: boolean;
+  is_qc_gate?: boolean;
+  remark?: string;
+}
+
+export interface RoutingTemplate {
+  id: string;
+  template_code: string;
+  template_name: string;
+  factory_id: string;
+  description?: string;
+  is_active: boolean;
+  steps: RoutingTemplateStep[];
+  created_by?: string;
+  created_at?: string;
+}
+
+export interface FlowStep {
+  id: string;
+  seq: number;
+  process_code: string;
+  work_center?: string;
+  remark?: string;
+  status: string;
+  assigned_to?: string;
+  released_by?: string;
+  completed_by?: string;
+  actual_start?: string;
+  actual_complete?: string;
+  is_qc_gate?: boolean;
+}
+
+export const getRoutingTemplates = (factoryId: string) =>
+  api.get<any, { items: RoutingTemplate[]; total: number }>('/api/v1/routing-templates', { params: { factory_id: factoryId } });
+
+export const createRoutingTemplate = (data: any) =>
+  api.post<any, RoutingTemplate>('/api/v1/routing-templates', data);
+
+export const updateRoutingTemplate = (id: string, data: any) =>
+  api.put<any, RoutingTemplate>(`/api/v1/routing-templates/${id}`, data);
+
+export const deleteRoutingTemplate = (id: string) =>
+  api.delete<any, any>(`/api/v1/routing-templates/${id}`);
+
+export const getGlobalFlow = (factoryId: string, page = 1, pageSize = 20) =>
+  api.get<any, any>('/api/v1/work-orders/global-flow', { params: { factory_id: factoryId, page, page_size: pageSize } });
+
+export const getProcessQueue = (factoryId: string, workCenter?: string, status?: string, page = 1, pageSize = 50) =>
+  api.get<any, any>('/api/v1/work-orders/queue', { params: { factory_id: factoryId, work_center: workCenter, status, page, page_size: pageSize } });
+
+export const getMyTasks = (factoryId: string, status?: string, page = 1, pageSize = 50) =>
+  api.get<any, any>('/api/v1/work-orders/my-tasks', { params: { factory_id: factoryId, status, page, page_size: pageSize } });
+
+export const getFlowDetail = (workOrderId: string) =>
+  api.get<any, { master: WorkOrder; flow_steps: FlowStep[]; total_steps: number; done_steps: number; current_step: number | null; progress_pct: number }>(`/api/v1/work-orders/${workOrderId}/flow-detail`);
+
+// ---- 预警情报审查 API（017） ----
+
+export interface AlertReview {
+  id: string;
+  factory_id: string;
+  alert_source: string;
+  source_label: string;
+  alert_ref_id: string;
+  alert_ref_code: string;
+  alert_summary: string;
+  severity_assessment: string | null;
+  root_cause_hypothesis: string[];
+  recommended_actions: string[];
+  dispatch_recommendation: string | null;
+  status: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  created_at: string | null;
+}
+
+export const getAlertReviews = (factoryId: string, params?: { source?: string; status?: string; limit?: number }) =>
+  api.get<any, { items: AlertReview[]; count: number }>('/api/v1/alert-intelligence/reviews', { params: { factory_id: factoryId, ...params } });
+
+export const getAlertSummary = (factoryId: string) =>
+  api.get<any, { total_pending: number; by_source: Record<string, number>; by_severity: Record<string, number>; top_alerts: AlertReview[] }>('/api/v1/alert-intelligence/summary', { params: { factory_id: factoryId } });
+
+export const acknowledgeAlertReview = (reviewId: string, action: 'acknowledged' | 'dismissed') =>
+  api.post<any, AlertReview>(`/api/v1/alert-intelligence/reviews/${reviewId}/acknowledge`, { action });
+
+export const runAlertPatrol = (factoryId: string) =>
+  api.post<any, { patrol_time: string; alerts_found: number; reviews_created: number; overdue_work_orders: number; stale_andon_tickets: number }>('/api/v1/alert-intelligence/patrol', null, { params: { factory_id: factoryId } });

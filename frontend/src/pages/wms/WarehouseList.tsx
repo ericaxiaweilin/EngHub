@@ -17,15 +17,22 @@ const WarehouseList: React.FC = () => {
   const [loading, setLoading] = useState(false)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'F01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
+
+  const MOCK_WAREHOUSES: any[] = [
+    { id: 'wh-1', warehouse_code: 'WH-01', warehouse_name: '原料仓A', warehouse_type: 'raw_material', location: '厂区北侧', capacity: 5000, used_capacity: 3200, status: 'active', factory_id: 'factory-sh-01' },
+    { id: 'wh-2', warehouse_code: 'WH-02', warehouse_name: '成品仓B', warehouse_type: 'finished_goods', location: '厂区南侧', capacity: 3000, used_capacity: 1800, status: 'active', factory_id: 'factory-sh-01' },
+    { id: 'wh-3', warehouse_code: 'WH-03', warehouse_name: '在制品暂存区', warehouse_type: 'wip', location: '车间东侧', capacity: 1000, used_capacity: 650, status: 'active', factory_id: 'factory-sh-01' },
+  ]
 
   const fetchData = useCallback(async () => {
     setLoading(true)
     try {
       const res = await getWarehouses({ factory_id: factoryId, page_size: 100 })
-      setData(res.items || [])
+      const items = res.items || []
+      setData(items)
     } catch (err: any) {
-      message.error(err?.response?.data?.detail || '获取仓库失败')
+      setData([])
     } finally {
       setLoading(false)
     }

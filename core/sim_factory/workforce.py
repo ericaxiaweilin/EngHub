@@ -42,7 +42,11 @@ def generate_workforce(
     is_workday: Callable[[str, int], bool],
     horizon: int,
 ) -> List[SectionWorkforce]:
-    """为每个工段确定性生成花名册与人力统计。
+    """为每个工段生成花名册与人力统计。
+
+    - 工段携带 ``real_workers``（来自 HR 花名册）时，映射真实员工（姓名/技能/班次/
+      性别/身高体重），技能等级与出勤来自真实档案；
+    - 否则按 ``seed + section_id`` 确定性合成（姓名/技能/出勤随机但可复现）。
 
     :param config: 仿真配置
     :param load: 工段 × 日 负荷工时矩阵（含波动后的最终负荷）
@@ -51,32 +55,56 @@ def generate_workforce(
     """
     workforce: List[SectionWorkforce] = []
     for s in config.sections:
-        headcount = s.workers * s.shifts_per_day
-        rng = random.Random(f"{config.seed}-{s.section_id}")
         role = s.role_name or _infer_role(s.name)
-
         workers: List[WorkerDef] = []
         shift_headcount: Dict[int, int] = {}
         skill_sum = 0
         att_sum = 0.0
-        for i in range(headcount):
-            shift = (i % s.shifts_per_day) + 1
-            shift_headcount[shift] = shift_headcount.get(shift, 0) + 1
-            name = rng.choice(_SURNAMES) + rng.choice(_GIVEN)
-            skill = rng.choice(_SKILL_POOL)
-            attendance = round(rng.uniform(0.88, 0.99), 3)
-            workers.append(WorkerDef(
-                worker_id=f"{s.section_id}-W{str(i + 1).zfill(3)}",
-                name=name,
-                section_id=s.section_id,
-                section_name=s.name,
-                role=role,
-                skill_level=skill,
-                shift=shift,
-                attendance_rate=attendance,
-            ))
-            skill_sum += skill
-            att_sum += attendance
+
+        if s.real_workers:
+            # ── 真实花名册：映射 HR 员工 ──
+            headcount = len(s.real_workers)
+            for i, rw in enumerate(s.real_workers):
+                shift = rw.shift if 1 <= rw.shift <= max(s.shifts_per_day, 1) else 1
+                shift_headcount[shift] = shift_headcount.get(shift, 0) + 1
+                attendance = rw.attendance_rate if rw.attendance_rate is not None else 0.95
+                workers.append(WorkerDef(
+                    worker_id=f"{s.section_id}-RW{str(i + 1).zfill(3)}",
+                    name=rw.name,
+                    section_id=s.section_id,
+                    section_name=s.name,
+                    role=rw.role or role,
+                    skill_level=rw.skill_level,
+                    shift=shift,
+                    attendance_rate=attendance,
+                    gender=rw.gender,
+                    height_cm=rw.height_cm,
+                    weight_kg=rw.weight_kg,
+                ))
+                skill_sum += rw.skill_level
+                att_sum += attendance
+        else:
+            # ── 合成花名册：确定性随机 ──
+            headcount = s.workers * s.shifts_per_day
+            rng = random.Random(f"{config.seed}-{s.section_id}")
+            for i in range(headcount):
+                shift = (i % s.shifts_per_day) + 1
+                shift_headcount[shift] = shift_headcount.get(shift, 0) + 1
+                name = rng.choice(_SURNAMES) + rng.choice(_GIVEN)
+                skill = rng.choice(_SKILL_POOL)
+                attendance = round(rng.uniform(0.88, 0.99), 3)
+                workers.append(WorkerDef(
+                    worker_id=f"{s.section_id}-W{str(i + 1).zfill(3)}",
+                    name=name,
+                    section_id=s.section_id,
+                    section_name=s.name,
+                    role=role,
+                    skill_level=skill,
+                    shift=shift,
+                    attendance_rate=attendance,
+                ))
+                skill_sum += skill
+                att_sum += attendance
 
         workdays = sum(1 for d in range(horizon) if is_workday(s.workshop_id, d))
         available_hours = headcount * s.hours_per_shift * max(workdays, 1)

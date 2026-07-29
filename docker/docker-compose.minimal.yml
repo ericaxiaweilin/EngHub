@@ -45,14 +45,21 @@ services:
       - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-gateway:4000}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-openai/qwen-plus}
+      # VL 视觉模型（图片多模态自动路由）
+      - LLM_VISION_URL=${LLM_VISION_URL:-http://host.docker.internal:8019}
+      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
+      # OCR 专用模型（文字提取，经网关路由）
+      - LLM_OCR_MODEL=${LLM_OCR_MODEL:-openai/qwen-vl-ocr}
     ports:
-      - "18000:8000"
+      - "18888:8000"
     depends_on:
       - postgres
       - redis
     networks:
       - default
       - model-stack
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     # 内存限制 2GB (Python应用需要更多内存)
     deploy:
@@ -62,15 +69,16 @@ services:
         reservations:
           memory: 1G
 
-  frontend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.frontend
-    ports:
-      - "18888:80"
-    depends_on:
-      - backend
-    restart: unless-stopped
+  # frontend 容器已废弃：前端由 FastAPI 同源托管（见 main.py 末尾 StaticFiles + SPA fallback）
+  # frontend:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile.frontend
+  #   ports:
+  #     - "18888:80"
+  #   depends_on:
+  #     - backend
+  #   restart: unless-stopped
 
 networks:
   default:
