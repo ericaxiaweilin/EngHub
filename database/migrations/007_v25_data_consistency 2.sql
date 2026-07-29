@@ -143,17 +143,17 @@ CREATE INDEX IF NOT EXISTS idx_prt_material ON pull_replenishment_tasks(material
 CREATE INDEX IF NOT EXISTS idx_prt_work_order ON pull_replenishment_tasks(work_order_id);
 
 -- 6. 初始化默认权限
-INSERT INTO permissions (id, module, action, module_name, action_name, description)
+INSERT INTO permissions (id, name, module, action, module_name, action_name, description)
 VALUES
-    ('00000000-0000-0000-0000-000000000090', 'andon', 'view', '安灯工单', '查看', '查看安灯小工单'),
-    ('00000000-0000-0000-0000-000000000091', 'andon', 'create', '安灯工单', '创建', '创建安灯呼叫工单'),
-    ('00000000-0000-0000-0000-000000000092', 'andon', 'claim', '安灯工单', '抢单', '认领安灯工单'),
-    ('00000000-0000-0000-0000-000000000093', 'andon', 'escalate', '安灯工单', '升级', '升级安灯工单'),
-    ('00000000-0000-0000-0000-000000000094', 'work_order_template', 'view', '程序工单模板', '查看', '查看程序工单模板'),
-    ('00000000-0000-0000-0000-000000000095', 'work_order_template', 'create', '程序工单模板', '创建', '基于模板创建工单'),
-    ('00000000-0000-0000-0000-000000000096', 'reconciliation', 'view', '数据对账', '查看', '查看数据对账结果'),
-    ('00000000-0000-0000-0000-000000000097', 'reconciliation', 'trigger', '数据对账', '执行', '手动触发数据对账'),
-    ('00000000-0000-0000-0000-000000000098', 'traceability', 'view', '追溯', '查看', '查看物料追溯链'),
-    ('00000000-0000-0000-0000-000000000099', 'replenishment', 'view', '线边仓补货', '查看', '查看补货任务'),
-    ('00000000-0000-0000-0000-000000000100', 'replenishment', 'create', '线边仓补货', '创建', '创建拉动式补货任务')
+    ('00000000-0000-0000-0000-000000000090', 'andon:view', 'andon', 'view', '安灯工单', '查看', '查看安灯小工单'),
+    ('00000000-0000-0000-0000-000000000091', 'andon:create', 'andon', 'create', '安灯工单', '创建', '创建安灯呼叫工单'),
+    ('00000000-0000-0000-0000-000000000092', 'andon:claim', 'andon', 'claim', '安灯工单', '抢单', '认领安灯工单'),
+    ('00000000-0000-0000-0000-000000000093', 'andon:escalate', 'andon', 'escalate', '安灯工单', '升级', '升级安灯工单'),
+    ('00000000-0000-0000-0000-000000000094', 'work_order_template:view', 'work_order_template', 'view', '程序工单模板', '查看', '查看程序工单模板'),
+    ('00000000-0000-0000-0000-000000000095', 'work_order_template:create', 'work_order_template', 'create', '程序工单模板', '创建', '基于模板创建工单'),
+    ('00000000-0000-0000-0000-000000000096', 'reconciliation:view', 'reconciliation', 'view', '数据对账', '查看', '查看数据对账结果'),
+    ('00000000-0000-0000-0000-000000000097', 'reconciliation:trigger', 'reconciliation', 'trigger', '数据对账', '执行', '手动触发数据对账'),
+    ('00000000-0000-0000-0000-000000000098', 'traceability:view', 'traceability', 'view', '追溯', '查看', '查看物料追溯链'),
+    ('00000000-0000-0000-0000-000000000099', 'replenishment:view', 'replenishment', 'view', '线边仓补货', '查看', '查看补货任务'),
+    ('00000000-0000-0000-0000-000000000100', 'replenishment:create', 'replenishment', 'create', '线边仓补货', '创建', '创建拉动式补货任务')
 ON CONFLICT DO NOTHING;
