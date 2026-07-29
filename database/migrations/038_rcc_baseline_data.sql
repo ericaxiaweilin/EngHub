@@ -188,7 +188,8 @@ VALUES
      'environment_abnormal',
      '[{"field":"event.warning","op":"neq","value":""}]',
      '[{"type":"notify_org_unit","target_org_unit":"rcc-root","message":"环境参数异常"}, {"type":"log_audit","reason":"环境异常事件记录"}]'::jsonb,
-     5);
+     5)
+ON CONFLICT (id) DO NOTHING;
 
 -- ✅ RCC deterministic_logic_chains 种子已写入
 
