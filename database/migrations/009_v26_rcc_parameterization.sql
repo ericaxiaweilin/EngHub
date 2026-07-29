@@ -3,6 +3,32 @@
 -- v2.6 - RCC (Resource Control Center) + 参数化面板 + Chatbot工单系统
 -- 三位一体调度系统
 
+-- 创建 org_units 表（如果不存在）
+CREATE TABLE IF NOT EXISTS org_units (
+    id VARCHAR(36) PRIMARY KEY,
+    code VARCHAR(50),
+    name VARCHAR(200),
+    parent_id VARCHAR(36) REFERENCES org_units(id) ON DELETE SET NULL,
+    level_type VARCHAR(20) DEFAULT 'operational',
+    factory_id VARCHAR(50),
+    metadata_ JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+-- 创建 position_capabilities 表（如果不存在）
+CREATE TABLE IF NOT EXISTS position_capabilities (
+    id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid(),
+    cap_code VARCHAR(50) UNIQUE,
+    cap_name VARCHAR(200),
+    skill_level_min VARCHAR(10),
+    skill_level_max VARCHAR(10),
+    org_unit_id VARCHAR(36) REFERENCES org_units(id),
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rcc_organizations (
     id VARCHAR(36) PRIMARY KEY REFERENCES org_units(id),
     org_type VARCHAR(20) NOT NULL DEFAULT 'rcc',
