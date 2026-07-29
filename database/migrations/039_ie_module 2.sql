@@ -148,23 +148,23 @@ CREATE INDEX IF NOT EXISTS idx_pa_factory ON process_analyses (factory_id, analy
 -- ============================================================
 
 -- 如果权限表不存在，先插入 IE 模块的基本权限
-INSERT INTO PERMISSIONS (module, action, module_name, action_name, description)
+INSERT INTO PERMISSIONS (id, module, action, module_name, action_name, description)
 VALUES 
-    ('ie_standard_time', 'view', '标准工时管理', '查看', '查看标准工时记录'),
-    ('ie_standard_time', 'create', '标准工时管理', '创建', '创建新标准工时'),
-    ('ie_standard_time', 'update', '标准工时管理', '修改', '修改标准工时记录'),
-    ('ie_standard_time', 'delete', '标准工时管理', '删除', '删除标准工时记录'),
+    (gen_random_uuid(), 'ie_standard_time', 'view', '标准工时管理', '查看', '查看标准工时记录'),
+    (gen_random_uuid(), 'ie_standard_time', 'create', '标准工时管理', '创建', '创建新标准工时'),
+    (gen_random_uuid(), 'ie_standard_time', 'update', '标准工时管理', '修改', '修改标准工时记录'),
+    (gen_random_uuid(), 'ie_standard_time', 'delete', '标准工时管理', '删除', '删除标准工时记录'),
     
-    ('ie_time_study', 'view', '时间研究', '查看', '查看时间研究记录'),
-    ('ie_time_study', 'create', '时间研究', '创建', '新建时间研究观测'),
-    ('ie_time_study', 'update', '时间研究', '修改', '更新时间研究记录'),
-    ('ie_time_study', 'approve', '时间研究', '批准', '批准时间研究数据以生成标准工时'),
+    (gen_random_uuid(), 'ie_time_study', 'view', '时间研究', '查看', '查看时间研究记录'),
+    (gen_random_uuid(), 'ie_time_study', 'create', '时间研究', '创建', '新建时间研究观测'),
+    (gen_random_uuid(), 'ie_time_study', 'update', '时间研究', '修改', '更新时间研究记录'),
+    (gen_random_uuid(), 'ie_time_study', 'approve', '时间研究', '批准', '批准时间研究数据以生成标准工时'),
     
-    ('ie_line_balance', 'view', '产线平衡分析', '查看', '查看产线平衡分析报告'),
-    ('ie_line_balance', 'analyze', '产线平衡分析', '执行分析', '执行产线平衡计算'),
-    ('ie_line_balance', 'report', '产线平衡分析', '导出报告', '导出平衡分析报告'),
+    (gen_random_uuid(), 'ie_line_balance', 'view', '产线平衡分析', '查看', '查看产线平衡分析报告'),
+    (gen_random_uuid(), 'ie_line_balance', 'analyze', '产线平衡分析', '执行分析', '执行产线平衡计算'),
+    (gen_random_uuid(), 'ie_line_balance', 'report', '产线平衡分析', '导出报告', '导出平衡分析报告'),
     
-    ('ie_process_analysis', 'view', '工序价值分析', '查看', '查看工序价值流分析')
+    (gen_random_uuid(), 'ie_process_analysis', 'view', '工序价值分析', '查看', '查看工序价值流分析')
 ON CONFLICT (module, action) DO NOTHING;
 
 -- ============================================================

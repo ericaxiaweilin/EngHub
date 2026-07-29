@@ -141,27 +141,27 @@ CREATE INDEX IF NOT EXISTS idx_factory_date ON five_s_audits (factory_id, audit_
 -- 6. 初始化 IE 扩展模块权限 (Permissions)
 -- ============================================================
 
-INSERT INTO permissions (module, action, module_name, action_name, description) VALUES
-    ('ie_action_study', 'view', '动作研究', '查看', '查看动作研究记录'),
-    ('ie_action_study', 'create', '动作研究', '创建', '新建动作研究'),
-    ('ie_action_study', 'update', '动作研究', '修改', '修改动作研究记录'),
+INSERT INTO permissions (id, module, action, module_name, action_name, description) VALUES
+    (gen_random_uuid(), 'ie_action_study', 'view', '动作研究', '查看', '查看动作研究记录'),
+    (gen_random_uuid(), 'ie_action_study', 'create', '动作研究', '创建', '新建动作研究'),
+    (gen_random_uuid(), 'ie_action_study', 'update', '动作研究', '修改', '修改动作研究记录'),
     
-    ('ie_method_study', 'view', '方法研究', '查看', '查看方法研究记录'),
-    ('ie_method_study', 'create', '方法研究', '创建', '新方法研究方案'),
-    ('ie_method_study', 'approve', '方法研究', '批准', '批准最优方法'),
-    ('ie_method_study', 'compare', '方法研究', '对比比较', '对比不同方法版本'),
+    (gen_random_uuid(), 'ie_method_study', 'view', '方法研究', '查看', '查看方法研究记录'),
+    (gen_random_uuid(), 'ie_method_study', 'create', '方法研究', '创建', '新方法研究方案'),
+    (gen_random_uuid(), 'ie_method_study', 'approve', '方法研究', '批准', '批准最优方法'),
+    (gen_random_uuid(), 'ie_method_study', 'compare', '方法研究', '对比比较', '对比不同方法版本'),
     
-    ('ie_work_cell', 'view', '工站布局', '查看', '查看工站布局信息'),
-    ('ie_work_cell', 'update', '工站布局', '编辑', '编辑布局设计'),
-    ('ie_work_cell', 'analyze', '工站布局', '分析布局', '进行布局效率分析'),
+    (gen_random_uuid(), 'ie_work_cell', 'view', '工站布局', '查看', '查看工站布局信息'),
+    (gen_random_uuid(), 'ie_work_cell', 'update', '工站布局', '编辑', '编辑布局设计'),
+    (gen_random_uuid(), 'ie_work_cell', 'analyze', '工站布局', '分析布局', '进行布局效率分析'),
     
-    ('ie_kanban', 'view', '看板管理', '查看', '查看看板状态'),
-    ('ie_kanban', 'update', '看板管理', '更新卡片', '更新看板卡片数量'),
-    ('ie_kanban', 'restock', '看板管理', '补货触发', '补货看板触发'),
+    (gen_random_uuid(), 'ie_kanban', 'view', '看板管理', '查看', '查看看板状态'),
+    (gen_random_uuid(), 'ie_kanban', 'update', '看板管理', '更新卡片', '更新看板卡片数量'),
+    (gen_random_uuid(), 'ie_kanban', 'restock', '看板管理', '补货触发', '补货看板触发'),
     
-    ('ie_five_s', 'view', '5S审计', '查看', '查看5S审计记录'),
-    ('ie_five_s', 'create', '5S审计', '执行审计', '执行新5S检查'),
-    ('ie_five_s', 'report', '5S审计', '生成报告', '生成5S改善报告')
+    (gen_random_uuid(), 'ie_five_s', 'view', '5S审计', '查看', '查看5S审计记录'),
+    (gen_random_uuid(), 'ie_five_s', 'create', '5S审计', '执行审计', '执行新5S检查'),
+    (gen_random_uuid(), 'ie_five_s', 'report', '5S审计', '生成报告', '生成5S改善报告')
 ON CONFLICT (module, action) DO NOTHING;
 
 -- ============================================================
