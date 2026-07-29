@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_mt_date ON maintenance_tasks(planned_date, status
 -- ============== 点检项 ==============
 CREATE TABLE IF NOT EXISTS maintenance_checklist (
   id VARCHAR(36) PRIMARY KEY,
-  task_id VARCHAR(36) NOT NULL REFERENCES maintenance_tasks(id),
+  task_id UUID NOT NULL REFERENCES maintenance_tasks(id),
   seq INT DEFAULT 1,
   item_name VARCHAR(200) NOT NULL,
   category VARCHAR(30),                      -- visual/measurement/function/safety
