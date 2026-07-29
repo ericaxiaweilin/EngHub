@@ -155,7 +155,7 @@ async def production_dashboard_summary(
         ws_id = s.workshop_id or "default"
         ws_name = s.workshop_id or "综合车间"
         workshop_ids.add(ws_id)
-        daily = station_day_hours.get(s.id, {})
+        daily = station_day_hours.get(s.station_code, {})
         cap_per_day = SHIFTS_PER_DAY * HOURS_PER_SHIFT
         total_load = sum(daily.values())
         total_cap = horizon_days * cap_per_day
