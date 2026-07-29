@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS action_studies (
     total_time_cycles FLOAT,
     analysis_result JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_factory_product_op ON action_studies (factory_id, product_id, operation_name);
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS method_studies (
     approved_by VARCHAR(50),
     status VARCHAR(20) DEFAULT 'draft',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS unique_method_factory_product_op_version 
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS work_cell_layouts (
     operator_movement_path JSON DEFAULT '[]'::json,
     takt_time_alignment VARCHAR(20) DEFAULT 'aligned',
     storage_location_type VARCHAR(20) DEFAULT 'in_process',
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS kanban_systems (
     card_status VARCHAR(20) DEFAULT 'available',
     last_used_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_upstream_downstream ON kanban_systems (upstream_station, downstream_station);
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS five_s_audits (
     improvement_items JSON DEFAULT '[]'::json,
     next_audit_date TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_work_center_audit ON five_s_audits (work_center_id, audit_date);

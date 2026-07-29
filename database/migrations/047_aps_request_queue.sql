@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS aps_schedule_requests (
     retry_count INTEGER DEFAULT 0,               -- failed retry count
     max_retries INTEGER DEFAULT 3,               -- max retry attempts before DLQ
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP NULL,
     error_message TEXT NULL,
 

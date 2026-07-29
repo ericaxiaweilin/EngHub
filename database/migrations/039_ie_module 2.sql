@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS standard_operation_times (
     created_by VARCHAR(50),
     updated_by VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Unique constraint on factory + product + step + version
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS time_study_records (
     created_by VARCHAR(50),
     approved_by VARCHAR(50),                     -- 批准人
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Indexes for common queries
@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS line_balance_analyses (
     recommendations JSON DEFAULT '[]'::json,     -- 改善建议列表
     created_by VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Indexes for common queries
@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS process_analyses (
     efficiency_score FLOAT NOT NULL,             -- 效率评分（0-100）
     created_by VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Unique constraint on factory + product + operation + date
