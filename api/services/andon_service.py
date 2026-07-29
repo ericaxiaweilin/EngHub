@@ -247,8 +247,15 @@ class AndonService:
             raise ValueError("工单不存在")
         return ticket
 
-    async def _log_event(self, ticket_id: str, event_type: str, message: str,
+    async def _log_event(self, ticket_id, event_type: str, message: str,
                          from_role: Optional[str] = None, to_role: Optional[str] = None) -> None:
+        import uuid as uuid_module
+        # 确保 ticket_id 是 UUID 对象以匹配数据库列类型
+        if isinstance(ticket_id, str):
+            try:
+                ticket_id = uuid_module.UUID(ticket_id)
+            except ValueError:
+                pass  # 保持原值
         log = AndonEscalationLog(
             ticket_id=ticket_id,
             event_type=event_type,
