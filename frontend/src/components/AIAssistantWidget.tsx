@@ -3,7 +3,7 @@
  * 可拖拽移动、最小化/最大化，参考 luaguage ChatbotWidget 交互模式
  */
 import React, { useState, useRef, useEffect, useCallback, lazy, Suspense } from 'react'
-import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message, Table } from 'antd'
+import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message, Table, Select, Empty } from 'antd'
 import {
   RobotOutlined, TeamOutlined, SendOutlined, MinusOutlined,
   ExpandOutlined, CompressOutlined, CloseOutlined,
@@ -11,6 +11,8 @@ import {
   ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined,
   AlertOutlined, ExperimentOutlined, PhoneOutlined,
   PaperClipOutlined, FileOutlined, DownloadOutlined, TableOutlined,
+  CopyOutlined, ShareAltOutlined, CommentOutlined, InboxOutlined,
+  ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
 } from '@ant-design/icons'
 
 // Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
@@ -72,9 +74,15 @@ interface TableData {
 
 // ---------- 聊天消息 ----------
 interface ChatMsg {
+  id: string
   role: 'user' | 'assistant'
   content: string
   time: string
+  quote?: {
+    id: string
+    role: 'user' | 'assistant'
+    content: string
+  }
   degraded?: boolean
   actions?: ToolAction[]
   attachments?: MsgAttachment[]
@@ -102,6 +110,17 @@ interface IMMsg {
   callMeta?: { call_type: string; station: string; priority: string; task_code?: string }
 }
 
+interface InfoItem {
+  id: string
+  source: 'im' | 'system' | 'ai'
+  title: string
+  content: string
+  time: string
+  unread: boolean
+  sender?: string
+  backendId?: string
+}
+
 // 工单呼叫类型（与 QuickRequest 页一致，落到 TMS call_request）
 const IM_CALL_TYPES = [
   { value: 'equipment_fault', label: '设备故障', icon: <ToolOutlined />, color: '#f5222d' },
@@ -111,6 +130,8 @@ const IM_CALL_TYPES = [
 ]
 
 const now = () => new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+const createId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+const quotePreview = (content: string) => content.replace(/\s+/g, ' ').trim().slice(0, 120)
 
 export default function AIAssistantWidget() {
   const [open, setOpen] = useState(false)
@@ -132,9 +153,12 @@ export default function AIAssistantWidget() {
   const [isResizing, setIsResizing] = useState(false)
   // 聊天
   const [messages, setMessages] = useState<ChatMsg[]>([
-    { role: 'assistant', content: '你好！我是 EngHub MES 智能助手，可以回答生产工单、报工、检验、不良品、库存、计划等问题。', time: now() },
+    { id: createId('welcome'), role: 'assistant', content: '你好！我是 EngHub MES 智能助手，可以回答生产工单、报工、检验、不良品、库存、计划等问题。', time: now() },
   ])
   const [input, setInput] = useState('')
+  const [replyingTo, setReplyingTo] = useState<ChatMsg | null>(null)
+  const [shareMessage, setShareMessage] = useState<ChatMsg | null>(null)
+  const [shareTarget, setShareTarget] = useState('info')
   const [loading, setLoading] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
   // 待发送附件（先调 /files/upload 拿 file_id，再随消息提交）
@@ -146,6 +170,9 @@ export default function AIAssistantWidget() {
   // IM 未读
   const [unread, setUnread] = useState<Record<string, number>>({ c2: 1, c3: 2 })
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null)
+  const [infoOpen, setInfoOpen] = useState(false)
+  const [infoItems, setInfoItems] = useState<InfoItem[]>([])
+  const [infoLoading, setInfoLoading] = useState(false)
   // IM 聊天
   const [imMessages, setImMessages] = useState<Record<string, IMMsg[]>>({})
   const [imInput, setImInput] = useState('')
@@ -160,6 +187,60 @@ export default function AIAssistantWidget() {
   const [sheetTable, setSheetTable] = useState<TableData | null>(null)
 
   const user = getStoredUser()
+  const infoStorageKey = `enghub-info:${user?.username || 'anonymous'}:${localStorage.getItem('active_factory_id') || 'default'}`
+
+  const addInfoItem = useCallback((item: InfoItem) => {
+    setInfoItems(prev => [item, ...prev.filter(existing => existing.id !== item.id)].slice(0, 100))
+  }, [])
+
+  const fetchSystemInfo = useCallback(async () => {
+    const factoryId = localStorage.getItem('active_factory_id')
+    if (!factoryId) return
+    setInfoLoading(true)
+    try {
+      const res: any = await api.get('/api/v1/notifications', {
+        params: { factory_id: factoryId, limit: 50 },
+      })
+      const rows = Array.isArray(res) ? res : (res.items || res.notifications || [])
+      const systemItems: InfoItem[] = rows.map((item: any) => ({
+        id: `system-${item.id}`,
+        backendId: item.id,
+        source: item.source_type === 'ai' ? 'ai' : 'system',
+        title: item.title || '系统信息',
+        content: item.content || '',
+        time: item.created_at
+          ? new Date(item.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+          : now(),
+        unread: !item.is_read,
+        sender: item.source_type === 'ai' ? 'AI 助手' : '系统',
+      }))
+      setInfoItems(prev => {
+        const localItems = prev.filter(item => !item.backendId)
+        return [...systemItems, ...localItems].slice(0, 100)
+      })
+    } catch {
+      // 信息模块仍可使用本地 IM 和 AI 分享记录。
+    } finally {
+      setInfoLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(infoStorageKey) || '[]')
+      if (Array.isArray(stored)) setInfoItems(stored)
+    } catch {
+      localStorage.removeItem(infoStorageKey)
+    }
+    fetchSystemInfo()
+    const timer = window.setInterval(fetchSystemInfo, 30000)
+    return () => window.clearInterval(timer)
+  }, [fetchSystemInfo, infoStorageKey])
+
+  useEffect(() => {
+    const localItems = infoItems.filter(item => !item.backendId)
+    localStorage.setItem(infoStorageKey, JSON.stringify(localItems))
+  }, [infoItems, infoStorageKey])
 
   // 自动滚动到底部
   useEffect(() => {
@@ -261,20 +342,29 @@ export default function AIAssistantWidget() {
     if (loading) return
     if (!text && pendingAttachments.length === 0) return
     const atts = [...pendingAttachments]
+    const quote = replyingTo
+      ? { id: replyingTo.id, role: replyingTo.role, content: quotePreview(replyingTo.content) }
+      : undefined
     setInput('')
+    setReplyingTo(null)
     setPendingAttachments([])
-    const userMsg: ChatMsg = { role: 'user', content: text, time: now(), attachments: atts }
+    const userMsg: ChatMsg = { id: createId('user'), role: 'user', content: text, time: now(), attachments: atts, quote }
     const history = [...messages, userMsg]
     setMessages(history)
     setLoading(true)
 
     // 占位 assistant 消息，流式填充内容
-    const streamMsg: ChatMsg = { role: 'assistant', content: '', time: now(), actions: [] }
+    const streamMsg: ChatMsg = { id: createId('assistant'), role: 'assistant', content: '', time: now(), actions: [] }
     setMessages(prev => [...prev, streamMsg])
 
     try {
       const payload: any = {
-        messages: history.slice(-10).map(m => ({ role: m.role, content: m.content })),
+        messages: history.slice(-10).map(m => ({
+          role: m.role,
+          content: m.quote
+            ? `引用${m.quote.role === 'assistant' ? 'AI 助手' : '用户'}消息：${m.quote.content}\n\n${m.content}`
+            : m.content,
+        })),
       }
       if (atts.length > 0) {
         payload.attachments = atts.map(a => ({
@@ -313,6 +403,7 @@ export default function AIAssistantWidget() {
         setMessages(prev => {
           const updated = [...prev]
           updated[updated.length - 1] = {
+            id: streamMsg.id,
             role: 'assistant',
             content: accContent,
             time: streamMsg.time,
@@ -371,6 +462,7 @@ export default function AIAssistantWidget() {
       setMessages(prev => {
         const updated = [...prev]
         updated[updated.length - 1] = {
+          id: streamMsg.id,
           role: 'assistant',
           content: '网络异常，请稍后重试。',
           time: streamMsg.time,
@@ -381,6 +473,60 @@ export default function AIAssistantWidget() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const copyChatMessage = async (chatMessage: ChatMsg) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(chatMessage.content)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = chatMessage.content
+        textarea.style.position = 'fixed'
+        textarea.style.opacity = '0'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        textarea.remove()
+      }
+      message.success('消息已复制')
+    } catch {
+      message.error('复制失败，请检查浏览器权限')
+    }
+  }
+
+  const shareChatMessage = () => {
+    if (!shareMessage) return
+    const content = shareMessage.content.trim()
+    if (!content) return
+    if (shareTarget === 'info') {
+      addInfoItem({
+        id: createId('ai'),
+        source: 'ai',
+        title: 'AI 助手分享',
+        content,
+        time: now(),
+        unread: true,
+        sender: user?.full_name || user?.username || '我',
+      })
+      message.success('已分享到内网信息')
+    } else {
+      const contact = FACTORY_CONTACTS.find(item => item.id === shareTarget)
+      if (!contact) return
+      const shared: IMMsg = {
+        id: createId('share'),
+        from: 'me',
+        content: `[AI 助手分享]\n${content}`,
+        time: now(),
+      }
+      setImMessages(prev => ({
+        ...prev,
+        [contact.id]: [...(prev[contact.id] || []), shared],
+      }))
+      message.success(`已分享给${contact.name}`)
+    }
+    setShareMessage(null)
+    setShareTarget('info')
   }
 
   // ---------- 选择并上传附件 → 拿 file_id 暂存，随下一条消息提交 ----------
@@ -454,19 +600,52 @@ export default function AIAssistantWidget() {
     // 内网环境：模拟对方回复（实际可对接 WebSocket）
     const contact = selectedContact
     setTimeout(() => {
+      const replyContent = contact.online
+        ? `收到，我是${contact.name}，看到后会尽快处理。如需紧急处理可点下方“工单呼叫”。`
+        : '（对方离线，消息已送达，上线后可见）'
       setImMessages(prev => ({
         ...prev,
         [cid]: [...(prev[cid] || []), {
-          id: `r${Date.now()}`,
+          id: createId('reply'),
           from: 'them',
-          content: contact.online
-            ? `收到，我是${contact.name}，看到后会尽快处理。如需紧急处理可点下方“工单呼叫”。`
-            : '（对方离线，消息已送达，上线后可见）',
+          content: replyContent,
           time: now(),
         }],
       }))
+      addInfoItem({
+        id: createId('im'),
+        source: 'im',
+        title: `${contact.name} 发来消息`,
+        content: replyContent,
+        time: now(),
+        unread: true,
+        sender: contact.name,
+      })
       setImSending(false)
     }, 900)
+  }
+
+  const markInfoRead = async (item: InfoItem) => {
+    setInfoItems(prev => prev.map(existing => existing.id === item.id ? { ...existing, unread: false } : existing))
+    if (item.backendId) {
+      try {
+        await api.put(`/api/v1/notifications/${item.backendId}/read`)
+      } catch {
+        setInfoItems(prev => prev.map(existing => existing.id === item.id ? { ...existing, unread: true } : existing))
+      }
+    }
+  }
+
+  const markAllInfoRead = async () => {
+    setInfoItems(prev => prev.map(item => ({ ...item, unread: false })))
+    const factoryId = localStorage.getItem('active_factory_id')
+    if (factoryId) {
+      try {
+        await api.put('/api/v1/notifications/read-all', null, { params: { factory_id: factoryId } })
+      } catch {
+        fetchSystemInfo()
+      }
+    }
   }
 
   // ---------- 打开工单呼叫弹窗 ----------
@@ -511,6 +690,15 @@ export default function AIAssistantWidget() {
           callMeta: { call_type: callType, station: values.station, priority: values.priority, task_code: taskCode },
         }],
       }))
+      addInfoItem({
+        id: createId('system'),
+        source: 'system',
+        title: `${ct?.label || '工单'}呼叫已创建`,
+        content: `${values.station} · ${selectedContact.name}${taskCode ? ` · ${taskCode}` : ''}`,
+        time: now(),
+        unread: true,
+        sender: '系统',
+      })
       message.success('工单呼叫已发送，等待响应')
       setCallModalOpen(false)
     } catch (e: any) {
@@ -541,7 +729,8 @@ export default function AIAssistantWidget() {
           : { right: 24, bottom: 24 }),
       }
 
-  const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0)
+  const infoUnread = infoItems.filter(item => item.unread).length
+  const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0) + infoUnread
 
   return (
     <>
@@ -633,8 +822,8 @@ export default function AIAssistantWidget() {
               <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
                 {/* 消息列表 */}
                 <div ref={listRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 14px' }}>
-                      {messages.map((m, i) => (
-                        <div key={i} style={{
+                      {messages.map((m) => (
+                        <div key={m.id} style={{
                           display: 'flex',
                           justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start',
                           marginBottom: 10,
@@ -653,6 +842,20 @@ export default function AIAssistantWidget() {
                             whiteSpace: 'pre-wrap',
                             wordBreak: 'break-word',
                           }}>
+                            {m.quote && (
+                              <div style={{
+                                marginBottom: 6, padding: '5px 7px', borderLeft: '3px solid currentColor',
+                                background: m.role === 'user' ? 'rgba(255,255,255,0.14)' : '#fff',
+                                borderRadius: 4, opacity: 0.82, fontSize: 11,
+                              }}>
+                                <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                                  {m.quote.role === 'assistant' ? 'AI 助手' : '用户'}
+                                </div>
+                                <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {m.quote.content}
+                                </div>
+                              </div>
+                            )}
                             {/* 消息附件（用户上传的图片/文件） */}
                             {m.attachments && m.attachments.length > 0 && (
                               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
@@ -837,6 +1040,38 @@ export default function AIAssistantWidget() {
                                 ))}
                               </div>
                             )}
+                            {!!m.content && (
+                              <div style={{
+                                display: 'flex', justifyContent: 'flex-end', gap: 2,
+                                marginTop: 5, paddingTop: 4,
+                                borderTop: `1px solid ${m.role === 'user' ? 'rgba(255,255,255,0.2)' : '#e8e8e8'}`,
+                              }}>
+                                <Tooltip title="引用回复">
+                                  <Button
+                                    type="text" size="small" icon={<CommentOutlined />}
+                                    aria-label="引用回复"
+                                    onClick={() => setReplyingTo(m)}
+                                    style={{ color: m.role === 'user' ? '#fff' : '#666', width: 24, height: 22, padding: 0 }}
+                                  />
+                                </Tooltip>
+                                <Tooltip title="复制">
+                                  <Button
+                                    type="text" size="small" icon={<CopyOutlined />}
+                                    aria-label="复制消息"
+                                    onClick={() => copyChatMessage(m)}
+                                    style={{ color: m.role === 'user' ? '#fff' : '#666', width: 24, height: 22, padding: 0 }}
+                                  />
+                                </Tooltip>
+                                <Tooltip title="分享">
+                                  <Button
+                                    type="text" size="small" icon={<ShareAltOutlined />}
+                                    aria-label="分享消息"
+                                    onClick={() => setShareMessage(m)}
+                                    style={{ color: m.role === 'user' ? '#fff' : '#666', width: 24, height: 22, padding: 0 }}
+                                  />
+                                </Tooltip>
+                              </div>
+                            )}
                             <div style={{
                               fontSize: 10,
                               color: m.role === 'user' ? 'rgba(255,255,255,0.7)' : '#999',
@@ -885,6 +1120,23 @@ export default function AIAssistantWidget() {
                     </div>
                     {/* 输入区 */}
                     <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                      {replyingTo && (
+                        <div style={{
+                          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6,
+                          padding: '6px 8px', background: '#f5f8ff', borderLeft: '3px solid #1677ff',
+                        }}>
+                          <CommentOutlined style={{ color: '#1677ff' }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <Text strong style={{ fontSize: 11 }}>
+                              引用{replyingTo.role === 'assistant' ? ' AI 助手' : '用户'}消息
+                            </Text>
+                            <div style={{ fontSize: 11, color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {quotePreview(replyingTo.content)}
+                            </div>
+                          </div>
+                          <Button type="text" size="small" icon={<CloseOutlined />} aria-label="取消引用" onClick={() => setReplyingTo(null)} />
+                        </div>
+                      )}
                       {/* 待发送附件预览（上传后、发送前可移除） */}
                       {pendingAttachments.length > 0 && (
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
@@ -947,8 +1199,66 @@ export default function AIAssistantWidget() {
               </div>
             )}
             {tab === 'im' && (
-                  <div style={{ flex: 1, minHeight: 0, overflowY: selectedContact ? 'hidden' : 'auto', padding: selectedContact ? 0 : '8px 0' }}>
-                    {selectedContact ? (
+                  <div style={{ flex: 1, minHeight: 0, overflowY: selectedContact || infoOpen ? 'hidden' : 'auto', padding: selectedContact || infoOpen ? 0 : '8px 0' }}>
+                    {infoOpen ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                        <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <Button type="text" size="small" icon={<ArrowLeftOutlined />} aria-label="返回内网列表" onClick={() => setInfoOpen(false)} />
+                          <Avatar size={32} style={{ background: '#13c2c2' }} icon={<InboxOutlined />} />
+                          <div style={{ flex: 1 }}>
+                            <Text strong>信息</Text>
+                            <div><Text type="secondary" style={{ fontSize: 11 }}>IM、系统与 AI 助手信息</Text></div>
+                          </div>
+                          <Tooltip title="刷新">
+                            <Button type="text" size="small" icon={<ReloadOutlined />} loading={infoLoading} onClick={fetchSystemInfo} />
+                          </Tooltip>
+                          <Tooltip title="全部已读">
+                            <Button type="text" size="small" icon={<CheckOutlined />} disabled={infoUnread === 0} onClick={markAllInfoRead} />
+                          </Tooltip>
+                        </div>
+                        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', background: '#fafafa' }}>
+                          {infoItems.length === 0 ? (
+                            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无信息" style={{ marginTop: 48 }} />
+                          ) : (
+                            <List
+                              dataSource={infoItems}
+                              renderItem={(item) => {
+                                const sourceTone = item.source === 'im'
+                                  ? { color: 'blue', label: 'IM' }
+                                  : item.source === 'ai'
+                                    ? { color: 'purple', label: 'AI 助手' }
+                                    : { color: 'orange', label: '系统' }
+                                return (
+                                  <List.Item
+                                    onClick={() => item.unread && markInfoRead(item)}
+                                    style={{
+                                      padding: '10px 14px', cursor: item.unread ? 'pointer' : 'default',
+                                      background: item.unread ? '#f0f7ff' : '#fff',
+                                      borderLeft: item.unread ? '3px solid #1677ff' : '3px solid transparent',
+                                    }}
+                                  >
+                                    <div style={{ width: '100%', minWidth: 0 }}>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                        <Tag color={sourceTone.color} style={{ margin: 0, fontSize: 10 }}>{sourceTone.label}</Tag>
+                                        <Text strong={item.unread} style={{ flex: 1, fontSize: 12 }} ellipsis>{item.title}</Text>
+                                        {item.unread && <Badge status="processing" />}
+                                      </div>
+                                      <div style={{ marginTop: 5, fontSize: 12, color: '#555', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                        {item.content}
+                                      </div>
+                                      <div style={{ marginTop: 4, display: 'flex', justifyContent: 'space-between', color: '#999', fontSize: 10 }}>
+                                        <span>{item.sender || sourceTone.label}</span>
+                                        <span>{item.time}</span>
+                                      </div>
+                                    </div>
+                                  </List.Item>
+                                )
+                              }}
+                            />
+                          )}
+                        </div>
+                      </div>
+                    ) : selectedContact ? (
                       /* 联系人聊天 */
                       <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
                         {/* 头部 */}
@@ -1039,9 +1349,21 @@ export default function AIAssistantWidget() {
                       </div>
                     ) : (
                       /* 联系人列表 */
-                      <List
-                        dataSource={FACTORY_CONTACTS}
-                        renderItem={(c) => (
+                      <>
+                        <List.Item
+                          style={{ padding: '10px 16px', cursor: 'pointer', borderBottom: '1px solid #f0f0f0' }}
+                          onClick={() => setInfoOpen(true)}
+                        >
+                          <List.Item.Meta
+                            avatar={<Avatar style={{ background: '#13c2c2' }} icon={<InboxOutlined />} />}
+                            title={<Text strong>信息</Text>}
+                            description={<Text type="secondary" style={{ fontSize: 12 }}>接收 IM、系统和 AI 助手信息</Text>}
+                          />
+                          {infoUnread > 0 && <Badge count={infoUnread} />}
+                        </List.Item>
+                        <List
+                          dataSource={FACTORY_CONTACTS}
+                          renderItem={(c) => (
                           <List.Item
                             style={{ padding: '8px 16px', cursor: 'pointer' }}
                             onClick={() => {
@@ -1070,8 +1392,9 @@ export default function AIAssistantWidget() {
                             />
                             {unread[c.id] > 0 && <Badge count={unread[c.id]} />}
                           </List.Item>
-                        )}
-                      />
+                          )}
+                        />
+                      </>
                     )}
                   </div>
             )}
@@ -1146,6 +1469,37 @@ export default function AIAssistantWidget() {
           )}
         </div>
       )}
+
+      <Modal
+        title={<Space><ShareAltOutlined /><span>分享消息</span></Space>}
+        open={!!shareMessage}
+        onCancel={() => { setShareMessage(null); setShareTarget('info') }}
+        onOk={shareChatMessage}
+        okText="分享"
+        cancelText="取消"
+        width={400}
+      >
+        <Text type="secondary" style={{ fontSize: 12 }}>分享到</Text>
+        <Select
+          value={shareTarget}
+          onChange={setShareTarget}
+          style={{ width: '100%', marginTop: 6 }}
+          options={[
+            { value: 'info', label: '内网信息' },
+            ...FACTORY_CONTACTS.map(contact => ({
+              value: contact.id,
+              label: `${contact.name} · ${contact.role}`,
+            })),
+          ]}
+        />
+        <div style={{
+          marginTop: 12, padding: '8px 10px', maxHeight: 160, overflowY: 'auto',
+          background: '#f5f5f5', border: '1px solid #e8e8e8', borderRadius: 6,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12,
+        }}>
+          {shareMessage?.content}
+        </div>
+      </Modal>
 
       {/* 工单呼叫弹窗（模板直达，无需跳转页面） */}
       <Modal
