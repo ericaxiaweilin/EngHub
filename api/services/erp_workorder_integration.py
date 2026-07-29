@@ -131,7 +131,9 @@ class ERPWorkOrderIntegration:
 
 # ===== 批量同步工具函数 =====
 
-async batch_sync_orders_to_erp(order_ids: List[str], erp_id: str = "kingdee_production") -> Dict[str, Any]:
+async def batch_sync_orders_to_erp(
+    order_ids: List[str], erp_id: str = "kingdee_production"
+) -> Dict[str, Any]:
     """
     批量将多个工单同步到 ERP
     
@@ -167,6 +169,6 @@ async batch_sync_orders_to_erp(order_ids: List[str], erp_id: str = "kingdee_prod
     return results
 
 
-async test_erp_connection_health() -> Dict[str, Any]:
+async def test_erp_connection_health() -> Dict[str, Any]:
     """测试所有 ERP 连接的健康状况"""
     return test_all_erps()

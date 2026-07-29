@@ -1,10 +1,5 @@
 import React, { useEffect, useState } from 'react'
 import {
-<<<<<<< HEAD
-  Card, Table, Button, Tag, Space, Modal, Form, Input, Select, message, Empty, Row, Col,
-} from 'antd'
-import { PlusOutlined, EditOutlined } from '@ant-design/icons'
-=======
   Card, Table, Button, Tag, Space, Modal, Form, Input, Select, InputNumber,
   message, Row, Col, Statistic, Popconfirm, Tooltip,
 } from 'antd'
@@ -13,48 +8,27 @@ import {
   CheckCircleOutlined, FieldTimeOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
->>>>>>> 7258e8d
 import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 import { API_ENDPOINTS } from '../../config/api'
 
-<<<<<<< HEAD
-const { Search } = Input
-
-=======
->>>>>>> 7258e8d
 interface StandardTime {
   id: string
   factory_id: string
   product_id: string
   routing_step: string
+  operation_seq?: number
   operation_name: string
   station_id?: string
   standard_time_min: number
+  setup_before_start_time_min?: number
+  post_operation_time_min?: number
   effective_standard_time: number
   version: string
   is_active: boolean
   validity_start: string
   created_at: string
 }
-
-<<<<<<< HEAD
-const StandardTimes: React.FC = () => {
-  const [factory, setFactory] = useState('F001')
-  const [data, setData] = useState<StandardTime[]>([])
-  const [loading, setLoading] = useState(false)
-  const [searchTerm, setSearchTerm] = useState('')
-=======
-const MOCK_DATA: StandardTime[] = [
-  { id: 'mock-1', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP10', operation_name: '精车外圆', station_id: 'ST-01', standard_time_min: 2.35, effective_standard_time: 2.12, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
-  { id: 'mock-2', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP20', operation_name: '铣平面', station_id: 'ST-02', standard_time_min: 3.80, effective_standard_time: 3.42, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
-  { id: 'mock-3', factory_id: 'factory-sh-01', product_id: 'PRD-002', routing_step: 'OP10', operation_name: '钻孔', station_id: 'ST-03', standard_time_min: 1.55, effective_standard_time: 1.40, version: 'v2', is_active: true, validity_start: '2026-02-01', created_at: '2026-02-01' },
-  { id: 'mock-4', factory_id: 'factory-sh-01', product_id: 'PRD-002', routing_step: 'OP30', operation_name: '磨削精加工', station_id: 'ST-04', standard_time_min: 4.20, effective_standard_time: 3.78, version: 'v1', is_active: true, validity_start: '2026-01-15', created_at: '2026-01-15' },
-  { id: 'mock-5', factory_id: 'factory-sh-01', product_id: 'PRD-003', routing_step: 'OP10', operation_name: '组装前检验', station_id: 'ST-05', standard_time_min: 0.85, effective_standard_time: 0.77, version: 'v1', is_active: false, validity_start: '2025-12-01', created_at: '2025-12-01' },
-  { id: 'mock-6', factory_id: 'factory-sh-01', product_id: 'PRD-003', routing_step: 'OP20', operation_name: '总装', station_id: 'ST-06', standard_time_min: 5.60, effective_standard_time: 5.04, version: 'v1', is_active: true, validity_start: '2026-03-01', created_at: '2026-03-01' },
-  { id: 'mock-7', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP30', operation_name: '动平衡检测', station_id: 'ST-07', standard_time_min: 1.20, effective_standard_time: 1.08, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
-  { id: 'mock-8', factory_id: 'factory-sh-01', product_id: 'PRD-004', routing_step: 'OP10', operation_name: '下料', station_id: 'ST-01', standard_time_min: 0.45, effective_standard_time: 0.41, version: 'v1', is_active: true, validity_start: '2026-04-01', created_at: '2026-04-01' },
-]
 
 const StandardTimes: React.FC = () => {
   const [factory, setFactory] = useState('factory-sh-01')
@@ -64,7 +38,6 @@ const StandardTimes: React.FC = () => {
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState<StandardTime | null>(null)
   const [form] = Form.useForm()
->>>>>>> 7258e8d
 
   const fetchData = async () => {
     setLoading(true)
@@ -72,15 +45,9 @@ const StandardTimes: React.FC = () => {
       const res = await api.get(API_ENDPOINTS.IE_STANDARD_TIMES, {
         params: { factory_id: factory, limit: 500 },
       })
-<<<<<<< HEAD
-      setData(res.items || [])
-    } catch (e) {
-      console.error('Error fetching standard times', e)
-=======
       const items = res.items || res || []
       setData(items)
     } catch {
->>>>>>> 7258e8d
       setData([])
     } finally {
       setLoading(false)
@@ -90,78 +57,6 @@ const StandardTimes: React.FC = () => {
   useEffect(() => { fetchData() }, [factory])
 
   const filteredData = data.filter(item =>
-<<<<<<< HEAD
-    item.operation_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    item.product_id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    item.routing_step.toLowerCase().includes(searchTerm.toLowerCase())
-  )
-
-  const columns: ColumnsType<StandardTime> = [
-    {
-      title: '产品ID',
-      dataIndex: 'product_id',
-      key: 'product_id',
-      width: 120,
-    },
-    {
-      title: '工序步骤',
-      dataIndex: 'routing_step',
-      key: 'routing_step',
-      width: 100,
-    },
-    {
-      title: '作业名称',
-      dataIndex: 'operation_name',
-      key: 'operation_name',
-      width: 180,
-    },
-    {
-      title: '工位ID',
-      dataIndex: 'station_id',
-      key: 'station_id',
-      width: 100,
-    },
-    {
-      title: '标准时间(min)',
-      dataIndex: 'standard_time_min',
-      key: 'standard_time_min',
-      width: 100,
-      render: (val) => val.toFixed(2),
-    },
-    {
-      title: '有效工时',
-      dataIndex: 'effective_standard_time',
-      key: 'effective_standard_time',
-      width: 100,
-      render: (val) => val.toFixed(2),
-    },
-    {
-      title: '版本',
-      dataIndex: 'version',
-      key: 'version',
-      width: 60,
-    },
-    {
-      title: '状态',
-      dataIndex: 'is_active',
-      key: 'is_active',
-      width: 80,
-      render: (bool) => <Tag color={bool ? 'green' : 'red'}>{bool ? '有效' : '无效'}</Tag>,
-    },
-    {
-      title: '生效日期',
-      dataIndex: 'validity_start',
-      key: 'validity_start',
-      width: 120,
-      render: (val) => dayjs(val).format('YYYY-MM-DD'),
-    },
-    {
-      title: '创建时间',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      width: 120,
-      render: (val) => dayjs(val).format('YYYY-MM-DD HH:mm'),
-=======
     (item.operation_name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
     (item.product_id || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
     (item.routing_step || '').toLowerCase().includes(searchTerm.toLowerCase())
@@ -217,6 +112,7 @@ const StandardTimes: React.FC = () => {
   const columns: ColumnsType<StandardTime> = [
     { title: '产品ID', dataIndex: 'product_id', key: 'product_id', width: 110, ellipsis: true },
     { title: '工序', dataIndex: 'routing_step', key: 'routing_step', width: 80 },
+    { title: '序号', dataIndex: 'operation_seq', key: 'operation_seq', width: 65, render: v => v ?? '-' },
     { title: '作业名称', dataIndex: 'operation_name', key: 'operation_name', width: 160, ellipsis: true },
     { title: '工位', dataIndex: 'station_id', key: 'station_id', width: 90, render: v => v || '-' },
     {
@@ -228,6 +124,8 @@ const StandardTimes: React.FC = () => {
       title: '有效工时', dataIndex: 'effective_standard_time', key: 'effective_standard_time', width: 100,
       render: v => (v || 0).toFixed(2),
     },
+    { title: '准备(min)', dataIndex: 'setup_before_start_time_min', key: 'setup_before_start_time_min', width: 90, render: v => v ?? '-' },
+    { title: '收尾(min)', dataIndex: 'post_operation_time_min', key: 'post_operation_time_min', width: 90, render: v => v ?? '-' },
     { title: '版本', dataIndex: 'version', key: 'version', width: 60, render: v => <Tag>{v || 'v1'}</Tag> },
     {
       title: '状态', dataIndex: 'is_active', key: 'is_active', width: 70,
@@ -247,36 +145,10 @@ const StandardTimes: React.FC = () => {
           </Popconfirm>
         </Space>
       ),
->>>>>>> 7258e8d
     },
   ]
 
   return (
-<<<<<<< HEAD
-    <Card title="标准工时管理">
-      <Row gutter={16} align="middle" style={{ marginBottom: 16 }}>
-        <Col span={4}>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => message.info('Create button not implemented yet')}>
-            新增
-          </Button>
-        </Col>
-        <Col span={4}>
-          <Select value={factory} onChange={setFactory} style={{ width: 120 }}>
-            <Select.Option value="F001">F001 厂区</Select.Option>
-          </Select>
-        </Col>
-        <Col span={4}>
-          <Search
-            placeholder="搜索操作名称..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            onSearch={() => {}}
-            allowClear
-          />
-        </Col>
-      </Row>
-      {filteredData.length > 0 ? (
-=======
     <div>
       <Row gutter={16} style={{ marginBottom: 16 }}>
         <Col span={6}>
@@ -307,24 +179,10 @@ const StandardTimes: React.FC = () => {
           </Space>
         }
       >
->>>>>>> 7258e8d
         <Table
           dataSource={filteredData}
           columns={columns}
           loading={loading}
-<<<<<<< HEAD
-          pagination={{ pageSize: 10 }}
-          rowKey="id"
-        />
-      ) : (
-        <Empty description={loading ? '加载中...' : '暂无数据'} style={{ margin: '40px 0' }} />
-      )}
-    </Card>
-  )
-}
-
-export default StandardTimes
-=======
           pagination={{ pageSize: 15, showTotal: t => `共 ${t} 条`, showSizeChanger: true }}
           rowKey="id"
           scroll={{ x: 1100 }}
@@ -358,18 +216,35 @@ export default StandardTimes
             <Input placeholder="如 精车外圆" />
           </Form.Item>
           <Row gutter={16}>
-            <Col span={8}>
+            <Col span={6}>
+              <Form.Item name="operation_seq" label="工序序号">
+                <InputNumber min={1} step={1} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
               <Form.Item name="station_id" label="工位ID">
                 <Input placeholder="可选" />
               </Form.Item>
             </Col>
-            <Col span={8}>
+            <Col span={6}>
               <Form.Item name="standard_time_min" label="标准时间(min)" rules={[{ required: true, message: '必填' }]}>
                 <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
               </Form.Item>
             </Col>
-            <Col span={8}>
+            <Col span={6}>
               <Form.Item name="effective_standard_time" label="有效工时(min)">
+                <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="setup_before_start_time_min" label="开工准备时间(min)">
+                <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="post_operation_time_min" label="作业后收尾时间(min)">
                 <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
               </Form.Item>
             </Col>
@@ -401,4 +276,3 @@ export default StandardTimes
 }
 
 export default StandardTimes
->>>>>>> 7258e8d

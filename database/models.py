@@ -24,21 +24,15 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship, backref
 import uuid
 
-
-class _BaseMixin:
-    """给所有模型提供 to_dict 序列化能力"""
-    def to_dict(self) -> dict:
-        from sqlalchemy import inspect as sa_inspect
-        result = {}
-        for col in sa_inspect(self).mapper.column_attrs:
-            val = getattr(col.key, self)
-            if hasattr(val, 'isoformat'):
-                val = val.isoformat()
-            result[col.key] = val
-        return result
+Base = declarative_base()
 
 
-Base = declarative_base(cls=_BaseMixin)
+def _model_to_dict(self):
+    """Return persisted columns without leaking SQLAlchemy internals."""
+    return {column.name: getattr(self, column.key) for column in self.__table__.columns}
+
+
+Base.to_dict = _model_to_dict
 
 
 def generate_uuid():
@@ -154,7 +148,7 @@ class User(Base):
     
     # 关系
     role_obj = relationship("Role", back_populates="users", foreign_keys=[role_id])
-    user_roles = relationship("UserRole", back_populates="user_obj", foreign_keys="User.user_id")
+    user_roles = relationship("UserRole", back_populates="user_obj", foreign_keys="UserRole.user_id")
     
     __table_args__ = (
         Index("idx_user_factory_role", "factory_id", "role"),
@@ -186,6 +180,10 @@ class WorkOrder(Base):
     actual_complete = Column(DateTime)
     assigned_station_id = Column(String(50), index=True)
     current_routing_step = Column(Integer, default=0)
+    current_stage = Column(String(100), nullable=True)
+    next_station = Column(String(100), nullable=True)
+    in_progress_status = Column(String(30), nullable=True)
+    partial_completion_percentage = Column(Float, default=0)
     bom_version = Column(String(50))
     # ---- 工单体系化编码：层级字段（主工单 <-> 工序工单）----
     parent_work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
@@ -224,19 +222,6 @@ class WorkOrder(Base):
 
 
 
-"""
-QualityInspection Model - Original Version (to be reinserted into models.py)
-
-This is the original IQC/FAI/IPC/OQC inspection record model with simple fields:
-- inspect_type (IQC/IPQC/FQC/OQC)
-- result (PASS/FAIL/PENDING)
-- sample_qty, defect_qty, good_qty
-- related work order and routing step
-"""
-
-from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Index
-from database.models import Base, generate_uuid, datetime
-
 class QualityInspection(Base):
     """质量检验记录表"""
     __tablename__ = "quality_inspections"
@@ -246,8 +231,11 @@ class QualityInspection(Base):
     work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
     routing_step_id = Column(String(36), nullable=False, index=True)
     inspect_type = Column(String(20), nullable=False)  # IQC/IPQC/FQC/OQC
+    inspection_phase = Column(String(30), nullable=True)
     inspector_id = Column(String(50), nullable=False)
     sample_qty = Column(Integer, nullable=False, default=0)
+    sampling_method = Column(String(100), nullable=True)
+    check_tool_id = Column(String(50), nullable=True)
     defect_qty = Column(Integer, nullable=False, default=0)
     result = Column(String(20), nullable=False)  # PASS/FAIL/PENDING
     defect_details = Column(JSON, nullable=True)
@@ -255,6 +243,69 @@ class QualityInspection(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     work_order = relationship("WorkOrder")
+
+
+class Inspection(Base):
+    """Compatibility inspection model used by the complete AQL workflow."""
+
+    __tablename__ = "inspections"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    inspection_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    inspection_type = Column(String(20), nullable=False)
+    product_id = Column(String(50), nullable=True)
+    material_id = Column(String(50), nullable=True)
+    batch_id = Column(String(50), nullable=True)
+    batch_size = Column(Integer, default=0)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
+    aql_level = Column(Float, default=1.0)
+    inspection_level = Column(String(20), default="general_ii")
+    sample_size = Column(Integer, nullable=True)
+    status = Column(String(20), default="pending", nullable=False)
+    inspected_qty = Column(Integer, default=0)
+    defective_qty = Column(Integer, default=0)
+    inspector_id = Column(String(50))
+    inspected_at = Column(DateTime)
+    aql_result = Column(JSON)
+    remarks = Column(Text)
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class Defect(Base):
+    """Compatibility defect model used by the AQL/OCAP workflow."""
+
+    __tablename__ = "defects"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    defect_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    defect_type = Column(String(50), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    severity = Column(String(20), nullable=False)
+    inspection_id = Column(String(36), ForeignKey("inspections.id"), nullable=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
+    material_id = Column(String(50), nullable=True)
+    batch_id = Column(String(50), nullable=True)
+    station_id = Column(String(50), nullable=True)
+    description = Column(Text)
+    status = Column(String(20), default="open", nullable=False)
+    disposition = Column(String(20))
+    disposition_by = Column(String(50))
+    disposition_at = Column(DateTime)
+    disposition_qty = Column(Integer)
+    disposition_remark = Column(Text)
+    ocap_status = Column(String(20), default="pending")
+    ocap_triggered_at = Column(DateTime)
+    ocap_trigger_reason = Column(Text)
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
 
 class WoStatusLog(Base):
     """工单状态操作日志（审核追溯：谁/什么角色/何时/做了什么）"""
@@ -325,6 +376,9 @@ class Plan(Base):
     priority = Column(Integer, default=50)
     priority_score = Column(Numeric(10, 2))
     status = Column(String(20), nullable=False, default='draft')
+    planning_cycle = Column(String(30), nullable=True)
+    release_status = Column(String(20), default="unreleased")
+    planner_id = Column(String(50), nullable=True)
     
     station_id = Column(String(50))
     scheduled_start_date = Column(Date)
@@ -365,6 +419,8 @@ class ProductionReport(Base):
     report_type = Column(String(20), default="normal")
     shift = Column(String(20), default="day")
     operator_id = Column(String(50))
+    assistant_operator_ids = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    quality_check_passed = Column(Boolean, nullable=True)
     remark = Column(Text)
     # ---- 023: 岗位替代 Phase 1 扩展 ----
     operation_seq = Column(Integer, nullable=True)
@@ -425,6 +481,9 @@ class Product(Base):
     standard_cost = Column(Float)
     selling_price = Column(Float)
     current_bom_version = Column(String(20))
+    current_routing_id = Column(String(50), nullable=True)
+    engineering_lead_time_days = Column(Float, nullable=True)
+    manufacturing_lead_time_days = Column(Float, nullable=True)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -507,6 +566,9 @@ class RoutingTemplateStep(Base):
     standard_hours = Column(Numeric(8, 2), default=0)
     is_parallel = Column(Boolean, default=False)
     is_qc_gate = Column(Boolean, default=False)
+    quality_requirement = Column(Text, nullable=True)
+    sop_document_url = Column(String(500), nullable=True)
+    tooling_requirement = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
     remark = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -582,12 +644,15 @@ class StandardOperationTime(Base):
     factory_id = Column(String(50), nullable=False, index=True)
     product_id = Column(String(50), nullable=False, index=True)
     routing_step = Column(String(50))  # 工艺路线步骤编号
+    operation_seq = Column(Integer, nullable=True)
     operation_name = Column(String(100), nullable=False)  # 工序名称
     station_id = Column(String(50))  # 工位编码
     work_center = Column(String(50))  # 加工中心
     standard_time_min = Column(Float)  # 标准工时（分钟）
     unit_time_type = Column(String(20))  # 时间类型（单件/批量等）
     setup_time_min = Column(Float)  # 准备时间（分钟）
+    setup_before_start_time_min = Column(Float, nullable=True)
+    post_operation_time_min = Column(Float, nullable=True)
     batch_size = Column(Integer)  # 批量数
     rating_factor = Column(Float)  # 速度系数
     allowance_rate = Column(Float)  # 宽放率
@@ -675,10 +740,17 @@ class ActionStudy(Base):
     operator_id = Column(String(50))
     study_date = Column(DateTime, nullable=False)
     method_type = Column(String(50))
+    recorded_by = Column(String(50), nullable=True)
+    motions = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    total_time_cycles = Column(Float, nullable=True)
+    analysis_result = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
     duration_min = Column(Float)
     energy_consumption = Column(Float)
     fatigue_level = Column(Integer)
     improvement_suggestion = Column(Text)
+    motion_analysis_result = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    ergonomic_score = Column(Float, nullable=True)
+    recommended_improvement_suggestion = Column(Text, nullable=True)
     is_optimized = Column(Boolean, default=False)
     
     created_by = Column(String(50))
@@ -700,7 +772,21 @@ class MethodStudy(Base):
     is_basement_method = Column(Boolean, default=False)
     is_optimal_method = Column(Boolean, default=False)
     description = Column(Text)
+    old_method_description = Column(Text, nullable=True)
+    improved_method_diagram_url = Column(String(500), nullable=True)
+    expected_time_saving_calculation_detail = Column(
+        JSON().with_variant(JSONB, "postgresql"), default=dict
+    )
     improved_operation = Column(Text)
+    action_sequence = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    required_resources = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    setup_time_min = Column(Float, nullable=True)
+    cycle_time_min = Column(Float, nullable=True)
+    total_standard_time_min = Column(Float, nullable=True)
+    validity_start = Column(DateTime, nullable=True)
+    validity_end = Column(DateTime, nullable=True)
+    approved_by = Column(String(50), nullable=True)
+    status = Column(String(20), default="draft")
     expected_time_saving_min = Column(Float)
     cost_impact = Column(Float)
     implementation_status = Column(String(50))
@@ -727,6 +813,7 @@ class WorkCellLayout(Base):
     material_flow_path = Column(JSON, default=dict)
     operator_movement_path = Column(JSON, default=dict)
     takt_time_alignment = Column(String(50))
+    storage_location_type = Column(String(50), nullable=True)
     description = Column(Text)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -749,8 +836,18 @@ class KanbanSystem(Base):
     part_number = Column(String(100))
     min_stock_level = Column(Integer)
     max_stock_level = Column(Integer)
+    max_card_count = Column(Integer, nullable=True)
+    current_card_count = Column(Integer, nullable=True)
+    safety_stock_level = Column(Integer, nullable=True)
+    card_status = Column(String(20), nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
     reorder_quantity = Column(Integer)
     lead_time_days = Column(Integer)
+    kanban_card_image_url = Column(String(500), nullable=True)
+    trigger_rule_type = Column(String(50), nullable=True)
+    min_max_stock_levels_detail = Column(
+        JSON().with_variant(JSONB, "postgresql"), default=dict
+    )
     holder_id = Column(String(50))
     status = Column(String(20), default="active")
     created_by = Column(String(50))
@@ -772,6 +869,10 @@ class FiveSAudit(Base):
     seiri_score = Column(Integer)  # 整理评分
     seiton_score = Column(Integer)  # 整顿评分
     seiso_score = Column(Integer)  # 清扫评分
+    seiketsu_score = Column(Integer, nullable=True)
+    shitsuke_score = Column(Integer, nullable=True)
+    improvement_items = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    next_audit_date = Column(Date, nullable=True)
     seiketsu_score = Column(Integer)  # 清洁评分
     shitsuke_score = Column(Integer)  # 素养评分
     total_score = Column(Integer)
@@ -847,6 +948,11 @@ class Equipment(Base):
     factory_id = Column(String(50), nullable=False, index=True)
     station_id = Column(String(50), index=True)
     equipment_type = Column(String(50))
+    manufacturer_model = Column(String(100), nullable=True)
+    serial_number = Column(String(100), nullable=True)
+    purchase_date = Column(Date, nullable=True)
+    warranty_expiry = Column(Date, nullable=True)
+    maintenance_interval_days = Column(Integer, nullable=True)
     status = Column(String(20), default="available")
     last_maintenance_date = Column(DateTime)
     next_maintenance_date = Column(DateTime)
@@ -889,6 +995,10 @@ class Location(Base):
     warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False, index=True)
     location_type = Column(String(20), default="rack")
     zone = Column(String(50))
+    aisle = Column(String(30), nullable=True)
+    rack = Column(String(30), nullable=True)
+    level = Column(String(30), nullable=True)
+    bin_code = Column(String(30), nullable=True)
     capacity = Column(Integer)
     status = Column(String(20), default="active")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -912,6 +1022,9 @@ class Inventory(Base):
     warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False, index=True)
     location_id = Column(String(36), ForeignKey("locations.id"))
     batch_code = Column(String(50), index=True)
+    expiry_date = Column(Date, nullable=True)
+    storage_location = Column(String(100), nullable=True)
+    qualified_status = Column(String(20), default="qualified")
     total_qty = Column(Integer, default=0, nullable=False)
     available_qty = Column(Integer, default=0, nullable=False)
     reserved_qty = Column(Integer, default=0)
@@ -987,6 +1100,8 @@ class InventoryTransaction(Base):
     after_qty = Column(Integer)
     reference_type = Column(String(30))  # e.g., work_order, inbound_order, production_order
     reference_id = Column(String(36))  # reference to related entity
+    reference_doc_no = Column(String(100), nullable=True)
+    reason_code = Column(String(50), nullable=True)
     operator = Column(String(50))
     remark = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -1030,6 +1145,9 @@ class EmployeeSkill(Base):
     certified_date = Column(DateTime)
     expiry_date = Column(DateTime)
     score = Column(Numeric(5, 2))
+    training_record_link = Column(String(500), nullable=True)
+    competency_assessment_score = Column(Numeric(5, 2), nullable=True)
+    skill_level_date = Column(Date, nullable=True)
     remarks = Column(Text)
     evaluated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -1056,6 +1174,7 @@ class TrainingRecord(Base):
     hours = Column(Numeric(5, 2))
     result = Column(String(20))
     certificate_no = Column(String(50))
+    notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     
     user = relationship("User", backref="training_records")
@@ -1126,7 +1245,7 @@ class TMSTask(Base):
     approval_flow_id = Column(String(36), nullable=True)
 
     # Agent 元数据
-    agent_context = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 可读写上下文
+    agent_context = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # Agent 可读写上下文
     metadata_ = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)  # 扩展字段
 
     # 关联
@@ -1199,13 +1318,8 @@ class TMSDistributionLog(Base):
     task_id = Column(String(36), ForeignKey("tms_tasks.id"), nullable=False, index=True)
     strategy = Column(String(50), nullable=False)
     candidate_scores = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)  # 各候选人评分
-<<<<<<< HEAD
-    selected_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
-    reason = Column(Text)  # 决策理由
-=======
     selected_user_id = Column(String(36), nullable=True)
     reason = Column(Text)  # 分发决策理由
->>>>>>> 7258e8d
     triggered_by = Column(String(100), nullable=False)  # "system" / "agent:xxx" / "user:xxx"
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -1247,138 +1361,6 @@ class TMSWebhookSubscription(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
-<<<<<<< HEAD
-# ============================================================
-# QMS Module Models - Quality Management System
-# ============================================================
-
-class Defect(Base):
-    """不良品单表 - 质量缺陷记录"""
-    
-    __tablename__ = "defects"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    defect_code = Column(String(50), unique=True, nullable=False, index=True)
-    factory_id = Column(String(50), nullable=False, index=True)
-    defect_type = Column(String(50), nullable=False)  # appearance, dimension, function, etc.
-    quantity = Column(Integer, nullable=False)
-    severity = Column(String(20), nullable=False)  # critical, major, minor, observation
-    inspection_id = Column(String(36), ForeignKey("inspections.id"), nullable=True)
-    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
-    material_id = Column(String(50), nullable=True)
-    batch_id = Column(String(50), nullable=True)
-    station_id = Column(String(50), nullable=True)
-    description = Column(Text)
-    status = Column(String(20), default="open", nullable=False)  # open, in_progress, resolved, closed, cancelled
-    disposition = Column(String(20))  # rework, repair, scrap, concession, return
-    disposition_by = Column(String(50))
-    disposition_at = Column(DateTime)
-    disposition_qty = Column(Integer)
-    disposition_remark = Column(Text)
-    ocap_status = Column(String(20), default="pending")  # pending, triggered, in_progress, completed
-    ocap_triggered_at = Column(DateTime)
-    ocap_trigger_reason = Column(Text)
-    created_by = Column(String(50))
-    updated_by = Column(String(50))
-    
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-    
-    __table_args__ = (
-        Index('idx_factory_defect_type', 'factory_id', 'defect_type'),
-        Index('idx_factory_status', 'factory_id', 'status'),
-    )
-
-
-class Inspection(Base):
-    """检验单表 - IQC/IPQC/FQC/OQC检验记录"""
-    
-    __tablename__ = "inspections"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    inspection_code = Column(String(50), unique=True, nullable=False, index=True)
-    factory_id = Column(String(50), nullable=False, index=True)
-    inspection_type = Column(String(20), nullable=False)  # iqc, ipqc, fqc, oqc
-    product_id = Column(String(50), nullable=True)
-    material_id = Column(String(50), nullable=True)
-    batch_id = Column(String(50), nullable=True)
-    batch_size = Column(Integer, default=0)
-    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
-    aql_level = Column(Float, default=1.0)
-    inspection_level = Column(String(20), default="general_ii")
-    sample_size = Column(Integer, nullable=True)
-    status = Column(String(20), default="pending", nullable=False)  # pending, in_progress, passed, failed, rejected
-    inspected_qty = Column(Integer, default=0)
-    defective_qty = Column(Integer, default=0)
-    inspector_id = Column(String(50))
-    inspected_at = Column(DateTime)
-    aql_result = Column(JSON)  # AQL判定结果，包含result, sample_size, ac, re, defective_count
-    remarks = Column(Text)
-    created_by = Column(String(50))
-    updated_by = Column(String(50))
-    
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-    
-    __table_args__ = (
-        Index('idx_factory_type', 'factory_id', 'inspection_type'),
-        Index('idx_factory_status', 'factory_id', 'status'),
-        Index('idx_factory_work_order', 'factory_id', 'work_order_id'),
-    )
-
-
-# ============================================================
-# PP Module Models - Production Planning (add if needed)
-# ============================================================
-
-
-# ============================================================
-# Extended IE Models - Industrial Engineering (partial, for completeness)
-# Note: These were originally defined in a separate migration/file
-# For simplicity in this implementation, they are included here
-# ============================================================
-
-class StandardOperationTime(Base):
-    """标准工时管理 - 精益生产核心"""
-    
-    __tablename__ = "standard_operation_times"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    product_id = Column(String(50), nullable=False, index=True)
-    routing_step = Column(String(20), nullable=False)
-    operation_name = Column(String(100), nullable=False)
-    station_id = Column(String(50), nullable=True, index=True)
-    work_center = Column(String(50), nullable=True)
-    standard_time_min = Column(Float, nullable=False)
-    unit_time_type = Column(String(20), default="per_unit")
-    setup_time_min = Column(Float, default=0.0)
-    batch_size = Column(Integer, default=1)
-    rating_factor = Column(Float, default=1.0)
-    allowance_rate = Column(Float, default=0.15)
-    effective_standard_time = Column(Float, nullable=False)
-    version = Column(String(10), default="v1")
-    is_active = Column(Boolean, default=True)
-    validity_start = Column(DateTime, nullable=False)
-    validity_end = Column(DateTime, nullable=True)
-    
-    created_by = Column(String(50))
-    updated_by = Column(String(50))
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_factory_product_routing', 'factory_id', 'product_id', 'routing_step'),
-        Index('idx_validity_status', 'validity_start', 'is_active'),
-    )
-
-
-class TimeStudyRecord(Base):
-    """时间研究记录"""
-    
-    __tablename__ = "time_study_records"
-=======
 # ==================== v2.5 Data Consistency Models ====================
 
 class DefectRecord(Base):
@@ -1397,6 +1379,10 @@ class DefectRecord(Base):
     station_id = Column(String(50), nullable=True, index=True)
     equipment_id = Column(String(36), ForeignKey("equipment.id"), nullable=True, index=True)
     defect_type = Column(String(50), nullable=False)      # appearance/dimension/function/performance/material/process/other
+    defect_classification = Column(String(50), nullable=True)
+    failure_mode = Column(String(100), nullable=True)
+    rpn_value = Column(Integer, nullable=True)
+    corrective_action_link = Column(String(500), nullable=True)
     severity = Column(String(20), nullable=False, default="minor")  # critical/major/minor/observation
     quantity = Column(Integer, nullable=False, default=0)
     disposition = Column(String(20), nullable=True)        # rework/repair/scrap/concession/return
@@ -1610,6 +1596,9 @@ class CAPACase(Base):
     
     # 状态流转
     status = Column(String(20), default="open")  # "open", "in_progress", "verified", "closed"
+    effectiveness_check_date = Column(DateTime, nullable=True)
+    verification_result = Column(Text, nullable=True)
+    preventive_scope = Column(Text, nullable=True)
     
     # 执行记录
     action_logs = Column(JSONB, default=list)  # [{"status": "...", "at": "...", "by": "...", "notes": "..."}]
@@ -1689,6 +1678,9 @@ class ApsSchedule(Base):
     schedule_code = Column(String(50))
     mode = Column(String(20), default="hybrid")
     optimize_for = Column(String(20), default="delivery")
+    priority_level = Column(String(20), nullable=True)
+    constraint_type = Column(String(50), nullable=True)
+    feasibility_status = Column(String(20), nullable=True)
     horizon_start = Column(DateTime)
     horizon_end = Column(DateTime)
     on_time_rate = Column(Float)
@@ -1712,6 +1704,9 @@ class ApsScheduleTask(Base):
     station_id = Column(String(50))
     planned_start = Column(DateTime)
     planned_end = Column(DateTime)
+    actual_start = Column(DateTime, nullable=True)
+    actual_end = Column(DateTime, nullable=True)
+    deviation_reason = Column(Text, nullable=True)
     status = Column(String(20))
     setup_minutes = Column(Float, default=0)
     material_ready = Column(Boolean, default=True)
@@ -1879,6 +1874,9 @@ class QmsSpcPoint(Base):
     factory_id = Column(String(50), nullable=False, index=True)
     characteristic_code = Column(String(50), nullable=False, index=True)  # 特征码
     characteristic_name = Column(String(100))  # 特征名称
+    control_chart_type = Column(String(30), nullable=True)
+    calculation_method = Column(String(50), nullable=True)
+    subgroup_count = Column(Integer, nullable=True)
     work_order_id = Column(String(50))  # 关联工单
     station_id = Column(String(50))  # 工位
     measured_value = Column(Float)  # 测量值
@@ -1900,298 +1898,11 @@ class ProcessCapability(Base):
     """工序能力分析"""
     
     __tablename__ = "process_capability"
->>>>>>> 7258e8d
     
     id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50), nullable=False, index=True)
     product_id = Column(String(50), nullable=False, index=True)
     station_id = Column(String(50), nullable=False, index=True)
-<<<<<<< HEAD
-    operation_name = Column(String(100), nullable=False)
-    operator_id = Column(String(50), nullable=False)
-    observer_id = Column(String(50), nullable=False)
-    observation_date = Column(DateTime, nullable=False)
-    observed_cycles = Column(JSON, default=list)
-    cycle_count = Column(Integer, nullable=True)
-    average_time = Column(Float, nullable=True)
-    rating_factor = Column(Float, default=1.0)
-    normal_time = Column(Float, nullable=True)
-    allowed_time = Column(Float, nullable=True)
-    allowance_rate = Column(Float, default=0.15)
-    method = Column(String(50), default="direct")
-    status = Column(String(20), default="pending")
-    created_by = Column(String(50))
-    approved_by = Column(String(50), nullable=True)
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_factory_station_op', 'factory_id', 'station_id', 'operation_name'),
-    )
-
-
-class LineBalanceAnalysis(Base):
-    """产线平衡分析"""
-    
-    __tablename__ = "line_balance_analyses"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    product_id = Column(String(50), nullable=False, index=True)
-    line_id = Column(String(50), nullable=False)
-    analysis_date = Column(DateTime, nullable=False)
-    takt_time_min = Column(Float, nullable=False)
-    cycle_time_max = Column(Float, nullable=True)
-    cycle_time_avg = Column(Float, nullable=True)
-    balance_rate = Column(Float, nullable=True)
-    idle_time_total = Column(Float, nullable=True)
-    workstation_count = Column(Integer, nullable=True)
-    is_balanced = Column(Boolean, default=False)
-    workstation_details = Column(JSON, default=list)
-    bottleneck_station = Column(String(50), nullable=True)
-    bottleneck_time = Column(Float, nullable=True)
-    recommendations = Column(JSON, default=list)
-    
-    created_by = Column(String(50))
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_factory_line_product', 'factory_id', 'line_id', 'product_id'),
-    )
-
-
-class ProcessAnalysis(Base):
-    """工序价值分析"""
-    
-    __tablename__ = "process_analyses"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    product_id = Column(String(50), nullable=False, index=True)
-    operation_code = Column(String(20), nullable=False)
-    analysis_date = Column(DateTime, nullable=False)
-    total_process_time_min = Column(Float, nullable=False)
-    va_time_min = Column(Float, nullable=True)
-    nva_time_min = Column(Float, nullable=True)
-    wait_time_min = Column(Float, default=0.0)
-    move_time_min = Column(Float, default=0.0)
-    inspect_time_min = Column(Float, default=0.0)
-    va_ratio = Column(Float, nullable=True)
-    lead_time = Column(Float, nullable=True)
-    efficiency_score = Column(Float, nullable=True)
-    
-    created_by = Column(String(50))
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_factory_product_op', 'factory_id', 'product_id', 'operation_code'),
-    )
-
-
-class ActionStudy(Base):
-    """动作研究"""
-    
-    __tablename__ = "action_studies"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    product_id = Column(String(50), nullable=False, index=True)
-    operation_name = Column(String(100), nullable=False)
-    station_id = Column(String(50), nullable=True, index=True)
-    operator_id = Column(String(50), nullable=False)
-    
-    study_date = Column(DateTime, nullable=False)
-    method_type = Column(String(20), default="mtm")
-    recorded_by = Column(String(50), nullable=False)
-    
-    motions = Column(JSON, default=list)
-    total_time_cycles = Column(Float, nullable=False)
-    analysis_result = JSON
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_action_factory_product_op', 'factory_id', 'product_id', 'operation_name'),
-    )
-
-
-class MethodStudy(Base):
-    """方法研究"""
-    
-    __tablename__ = "method_studies"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    product_id = Column(String(50), nullable=False, index=True)
-    original_operation = Column(String(100), nullable=False)
-    
-    version = Column(String(10), default="v1")
-    is_basement_method = Column(Boolean, default=False)
-    is_optimal_method = Column(Boolean, default=False)
-    
-    description = Column(Text)
-    action_sequence = Column(JSON, default=list)
-    required_resources = Column(JSON, default=list)
-    
-    setup_time_min = Column(Float, default=0.0)
-    cycle_time_min = Column(Float, nullable=False)
-    total_standard_time_min = Column(Float, nullable=False)
-    
-    validity_start = Column(DateTime, nullable=False)
-    validity_end = Column(DateTime, nullable=True)
-    
-    created_by = Column(String(50))
-    approved_by = Column(String(50), nullable=True)
-    status = Column(String(20), default="draft")
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        UniqueConstraint('factory_id', 'product_id', 'original_operation', 'version', 
-                         name='unique_method_factory_product_op_version'),
-        Index('idx_method_validity', 'validity_start', 'is_optimal_method'),
-    )
-
-
-class WorkCellLayout(Base):
-    """工站布局设计"""
-    
-    __tablename__ = "work_cell_layouts"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    work_cell_id = Column(String(50), nullable=False)
-    product_family_id = Column(String(50), nullable=False)
-    
-    layout_diagram_url = Column(String(200), nullable=True)
-    material_flow_path = Column(JSON, default=list)
-    operator_movement_path = Column(JSON, default=list)
-    
-    takt_time_alignment = Column(String(20), default="aligned")
-    storage_location_type = Column(String(20), default="in_process")
-    
-    last_updated = Column(DateTime, onupdate=datetime.utcnow)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_cell_product', 'work_cell_id', 'product_family_id'),
-        Index('idx_factory_cell', 'factory_id', 'work_cell_id'),
-    )
-
-
-class KanbanSystem(Base):
-    """Kanban看板系统"""
-    
-    __tablename__ = "kanban_systems"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    kanban_id = Column(String(50), unique=True, nullable=False)
-    kanban_type = Column(String(20), default="continuous")
-    
-    upstream_station = Column(String(50))
-    downstream_station = Column(String(50))
-    product_id = Column(String(50), nullable=False)
-    part_number = Column(String(50))
-    
-    max_card_count = Column(Integer, default=5)
-    current_card_count = Column(Integer, default=0)
-    safety_stock_level = Column(Integer, default=2)
-    
-    card_status = Column(String(20), default="available")
-    last_used_at = Column(DateTime, nullable=True)
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_upstream_downstream', 'upstream_station', 'downstream_station'),
-        Index('idx_product_kanban', 'product_id', 'kanban_type'),
-    )
-
-
-class FiveSAudit(Base):
-    """5S审计"""
-    
-    __tablename__ = "five_s_audits"
-    
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    factory_id = Column(String(50), nullable=False, index=True)
-    work_center_id = Column(String(50), nullable=False)
-    
-    audit_date = Column(DateTime, nullable=False)
-    auditor_id = Column(String(50), nullable=False)
-    
-    seiri_score = Column(Integer, default=0)
-    seiton_score = Column(Integer, default=0)
-    seiso_score = Column(Integer, default=0)
-    seiketsu_score = Column(Integer, default=0)
-    shitsuke_score = Column(Integer, default=0)
-    
-    total_score = Column(Integer, default=0)
-    score_percentage = Column(Float, default=0.0)
-    
-    improvement_items = Column(JSON, default=list)
-    next_audit_date = Column(DateTime, nullable=True)
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    __table_args__ = (
-        Index('idx_work_center_audit', 'work_center_id', 'audit_date'),
-        Index('idx_factory_date', 'factory_id', 'audit_date'),
-    )
-
-
-# Complete __all__ list with all models
-__all__ = [
-    "Base",
-    "User",
-    "WorkOrder",
-    "ProductionReport",
-    "ProductionReportComment",
-    "Product",
-    "Station",
-    "Routing",
-    "Equipment",
-    "Warehouse",
-    "Location",
-    "Inventory",
-    "InboundOrder",
-    "OutboundOrder",
-    "Skill",
-    "EmployeeSkill",
-    "TrainingRecord",
-    "SimERPAuditLog",
-    # TMS Models
-    "TMSTask",
-    "TMSApprovalFlow",
-    "TMSApprovalRecord",
-    "TMSDistributionLog",
-    "TMSAgentAction",
-    "TMSWebhookSubscription",
-    # QMS Models
-    "Defect",
-    "Inspection",
-    # IE Models
-    "StandardOperationTime",
-    "TimeStudyRecord",
-    "LineBalanceAnalysis",
-    "ProcessAnalysis",
-    "ActionStudy",
-    "MethodStudy",
-    "WorkCellLayout",
-    "KanbanSystem",
-    "FiveSAudit",
-]
-=======
     operation_name = Column(String(100))  # 工序名称
     characteristic = Column(String(100))  # 特性名称
     specification_min = Column(Float)  # 规格下限
@@ -2299,6 +2010,10 @@ class MaintenanceOrder(Base):
     actual_end = Column(DateTime)  # 实际结束时间
     description = Column(Text)  # 描述
     assigned_to = Column(String(50))  # 负责人
+    parts_used = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    labor_hours = Column(Float, nullable=True)
+    cost_analysis = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    failure_root_cause_code = Column(String(50), nullable=True)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_by = Column(String(50))
@@ -2463,5 +2178,3 @@ class EngHubBomSyncLog(Base):
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     error_message = Column(Text)
-
->>>>>>> 7258e8d

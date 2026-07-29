@@ -382,7 +382,11 @@ class InspectionCreate(BaseModel):
     factory_id: str
     work_order_id: str
     inspect_type: str  # IQC/IPQC/FQC/OQC
+    routing_step_id: str = "general"
+    inspection_phase: Optional[str] = None
     sample_qty: int = 5
+    sampling_method: Optional[str] = None
+    check_tool_id: Optional[str] = None
     items: List[InspectionItemCreate] = []
     remark: Optional[str] = None
 
@@ -406,6 +410,9 @@ class SpcPointCreate(BaseModel):
     work_order_id: Optional[str] = None
     station_id: Optional[str] = None
     sample_group: Optional[int] = None
+    control_chart_type: str = "xbar"
+    calculation_method: str = "three_sigma"
+    subgroup_count: Optional[int] = None
 
 
 class EightDCreate(BaseModel):
@@ -431,9 +438,13 @@ async def create_inspection(
     result = await svc.create_inspection(
         factory_id=req.factory_id,
         work_order_id=req.work_order_id,
+        routing_step_id=req.routing_step_id,
         inspect_type=req.inspect_type,
+        inspection_phase=req.inspection_phase,
         inspector_id=current_user.username,
         sample_qty=req.sample_qty,
+        sampling_method=req.sampling_method,
+        check_tool_id=req.check_tool_id,
         items=[i.dict() for i in req.items],
         remark=req.remark,
     )
@@ -488,6 +499,9 @@ async def record_spc_point(
         work_order_id=req.work_order_id,
         station_id=req.station_id,
         sample_group=req.sample_group,
+        control_chart_type=req.control_chart_type,
+        calculation_method=req.calculation_method,
+        subgroup_count=req.subgroup_count,
         measured_by=current_user.username,
     )
 

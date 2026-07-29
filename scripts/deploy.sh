@@ -9,6 +9,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_HOST="${DEPLOY_HOST:-eric@100.96.188.77}"
 REMOTE_DIR="${REMOTE_DIR:-/home/eric/enghub}"
 CONTAINER="${CONTAINER:-enghub}"
+DB_CONTAINER="${DB_CONTAINER:-engflow-postgres}"
+DB_USER="${DB_USER:-postgres}"
+DB_NAME="${DB_NAME:-bom_intelligence}"
+DEPLOY_BASE_SHA="${DEPLOY_BASE_SHA:-}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18888/health}"
 PUBLIC_URL="${PUBLIC_URL:-http://${DEPLOY_HOST#*@}:18888}"
 CHECK_ONLY=false
@@ -57,7 +61,11 @@ PYTHON_FILES="$(
 )"
 if [[ -n "$PYTHON_FILES" ]]; then
   while IFS= read -r file; do
-    [[ -z "$file" ]] || python3 -m py_compile "$file"
+    [[ -z "$file" ]] && continue
+    case "$(basename "$file")" in
+      *" 2"*) continue ;;
+    esac
+    python3 -m py_compile "$file"
   done <<< "$PYTHON_FILES"
 fi
 
@@ -70,7 +78,13 @@ if [[ "$CHECK_ONLY" == true ]]; then
 fi
 
 info "提交本地更新"
-git add -A
+git add -u
+while IFS= read -r -d '' file; do
+  case "$(basename "$file")" in
+    *" 2"*) info "跳过重复文件: $file" ;;
+    *) git add -- "$file" ;;
+  esac
+done < <(git ls-files --others --exclude-standard -z)
 if git diff --cached --quiet; then
   ok "没有待提交变更，部署当前 HEAD"
 else
@@ -79,9 +93,9 @@ fi
 
 COMMIT_SHA="$(git rev-parse HEAD)"
 SHORT_SHA="$(git rev-parse --short HEAD)"
-BASE_SHA="$(ssh "$DEPLOY_HOST" "cat '$REMOTE_DIR/.last_deployed_commit' 2>/dev/null || true")"
+BASE_SHA="${DEPLOY_BASE_SHA:-$(ssh "$DEPLOY_HOST" "cat '$REMOTE_DIR/.last_deployed_commit' 2>/dev/null || true")}"
 if [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-  BASE_SHA="$COMMIT_SHA"
+  BASE_SHA="$(git rev-parse "${COMMIT_SHA}^" 2>/dev/null || printf '%s' "$COMMIT_SHA")"
 fi
 ARCHIVE="$(mktemp "/tmp/enghub-source-${SHORT_SHA}.XXXXXX.tgz")"
 FRONTEND_ARCHIVE="$(mktemp "/tmp/enghub-frontend-${SHORT_SHA}.XXXXXX.tgz")"
@@ -100,13 +114,17 @@ scp -q "$MANIFEST" "$DEPLOY_HOST:/tmp/enghub-manifest-${COMMIT_SHA}.txt"
 
 info "更新服务器源码和容器"
 ssh "$DEPLOY_HOST" bash -s -- \
-  "$COMMIT_SHA" "$REMOTE_DIR" "$CONTAINER" "$HEALTH_URL" <<'REMOTE'
+  "$COMMIT_SHA" "$REMOTE_DIR" "$CONTAINER" "$HEALTH_URL" \
+  "$DB_CONTAINER" "$DB_USER" "$DB_NAME" <<'REMOTE'
 set -Eeuo pipefail
 
 COMMIT_SHA="$1"
 REMOTE_DIR="$2"
 CONTAINER="$3"
 HEALTH_URL="$4"
+DB_CONTAINER="$5"
+DB_USER="$6"
+DB_NAME="$7"
 RELEASE_DIR="/tmp/enghub-release-${COMMIT_SHA}"
 SOURCE_ARCHIVE="/tmp/enghub-source-${COMMIT_SHA}.tgz"
 FRONTEND_ARCHIVE="/tmp/enghub-frontend-${COMMIT_SHA}.tgz"
@@ -147,8 +165,12 @@ while IFS=$'\t' read -r status path extra; do
       echo "依赖文件已变化，热部署不支持；请先构建新镜像。" >&2
       exit 1
       ;;
-    database/migrations/*|database/schema_contract.json)
-      echo "跳过自动数据库迁移: $path"
+    database/migrations/*.sql)
+      echo "应用数据库迁移: $path"
+      docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 \
+        -U "$DB_USER" -d "$DB_NAME" < "$RELEASE_DIR/source/$path"
+      ;;
+    database/schema_contract.json)
       continue
       ;;
     api/*|core/*|database/*.py|integrations/*|main.py)

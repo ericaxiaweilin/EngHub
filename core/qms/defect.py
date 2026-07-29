@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, and_
 
 from database.models import WorkOrder, Inventory, User, Inspection, Defect
-from core.qms.inspection import AQLLevel, InspectionType, InspectionStatus
 
 
 class DefectStatus(str, Enum):
@@ -170,7 +169,7 @@ class DefectService:
             return None
         
         # 只有检验失败时才创建缺陷单
-        if inspection.status != InspectionStatus.FAILED.value:
+        if inspection.status != "failed":
             return None
         
         # 确定缺陷严重等级（根据不良品数量）

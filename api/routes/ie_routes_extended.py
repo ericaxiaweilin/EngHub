@@ -1,14 +1,5 @@
 """
 IE Module Extended API Routes - Advanced Lean Features
-精益生产IE模块扩展API：动作研究、方法研究、Kanban看板、5S审计等高级功能
-"""
-
-from fastapi import APIRouter, HTTPException, Depends, Query
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-from datetime import datetime
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 精益生产IE模块扩展：动作研究、方法研究、工站布局、看板系统、5S审计等高级功能
 """
 
@@ -37,7 +28,6 @@ router = APIRouter(prefix="/api/v1/ie-advanced", tags=["ie-advanced"])
 # ============================================================
 
 class ActionStudyCreate(BaseModel):
-    """创建动作研究记录请求体"""
     """创建动作研究请求体"""
     factory_id: str
     product_id: str
@@ -46,13 +36,12 @@ class ActionStudyCreate(BaseModel):
     operator_id: str
     method_type: str = "mtm"
     recorded_by: str
-    study_date: datetime
-    motions: List[Dict] = []
-    total_time_cycles: float
     study_date: str  # ISO format
     motions: List[Dict] = []  # [{"motion": "reach", "time_units": 2}]
     total_time_cycles: float = 0.0
     analysis_result: Dict[str, Any] = {}
+    ergonomic_score: Optional[float] = None
+    recommended_improvement_suggestion: Optional[str] = None
 
 
 class ActionStudyResponse(BaseModel):
@@ -65,12 +54,6 @@ class ActionStudyResponse(BaseModel):
     operator_id: str
     method_type: str
     recorded_by: str
-    study_date: datetime
-    created_at: datetime
-
-
-class MethodStudyCreate(BaseModel):
-    """创建方法研究方案请求体"""
     study_date: str
     motions: List[Dict]
     total_time_cycles: float
@@ -86,13 +69,10 @@ class MethodStudyCreate(BaseModel):
     is_basement_method: bool = False
     is_optimal_method: bool = False
     description: str = ""
+    old_method_description: Optional[str] = None
+    improved_method_diagram_url: Optional[str] = None
+    expected_time_saving_calculation_detail: Dict[str, Any] = {}
     action_sequence: List[Dict] = []
-    setup_time_min: float = 0.0
-    cycle_time_min: float = 0.0
-    total_standard_time_min: float = 0.0
-    validity_start: datetime
-    validity_end: Optional[datetime] = None
-    created_by: str
     required_resources: List[Dict] = []
     setup_time_min: float = 0.0
     cycle_time_min: float = 0.0
@@ -113,7 +93,6 @@ class MethodStudyResponse(BaseModel):
     version: str
     is_basement_method: bool
     is_optimal_method: bool
-    created_at: datetime
     description: str
     action_sequence: List[Dict]
     required_resources: List[Dict]
@@ -133,9 +112,6 @@ class WorkCellLayoutInput(BaseModel):
     factory_id: str
     work_cell_id: str
     product_family_id: str
-    material_flow_path: List[str] = []
-    operator_movement_path: List[str] = []
-    takt_time_alignment: str = "aligned"
     layout_diagram_url: Optional[str] = None
     material_flow_path: List[str] = []
     operator_movement_path: List[str] = []
@@ -149,7 +125,6 @@ class WorkCellLayoutResponse(BaseModel):
     factory_id: str
     work_cell_id: str
     product_family_id: str
-    last_updated: datetime
     layout_diagram_url: Optional[str]
     material_flow_path: List[str]
     operator_movement_path: List[str]
@@ -171,6 +146,9 @@ class KanbanCreate(BaseModel):
     current_card_count: int = 0
     safety_stock_level: int = 2
     card_status: str = "available"
+    kanban_card_image_url: Optional[str] = None
+    trigger_rule_type: Optional[str] = None
+    min_max_stock_levels_detail: Dict[str, Any] = {}
 
 
 class KanbanResponse(BaseModel):
@@ -178,8 +156,6 @@ class KanbanResponse(BaseModel):
     id: str
     factory_id: str
     kanban_id: str
-    card_status: str
-    current_card_count: int
     kanban_type: str
     upstream_station: Optional[str]
     downstream_station: Optional[str]
@@ -196,7 +172,6 @@ class FiveSAuditInput(BaseModel):
     """5S审计输入"""
     factory_id: str
     work_center_id: str
-    audit_date: datetime
     audit_date: str
     auditor_id: str
     seiri_score: int
@@ -211,10 +186,6 @@ class FiveSAuditInput(BaseModel):
 class FiveSAuditResponse(BaseModel):
     """5S审计响应体"""
     id: str
-    work_center_id: str
-    audit_date: datetime
-    total_score: int
-    score_percentage: float
     factory_id: str
     work_center_id: str
     audit_date: str
@@ -253,19 +224,13 @@ async def create_action_study(
         operator_id=as_data.operator_id,
         method_type=as_data.method_type,
         recorded_by=as_data.recorded_by,
-        study_date=as_data.study_date,
-        motions=as_data.motions,
-        total_time_cycles=as_data.total_time_cycles,
-        created_by=current_user.username
-    )
-    db.add(action_study)
-    await db.commit()
-    await db.refresh(action_study)
-    return {"id": action_study.id, "factory_id": action_study.factory_id, "status": "created"}
         study_date=study_date,
         motions=as_data.motions,
         total_time_cycles=as_data.total_time_cycles,
         analysis_result=as_data.analysis_result,
+        motion_analysis_result=as_data.analysis_result,
+        ergonomic_score=as_data.ergonomic_score,
+        recommended_improvement_suggestion=as_data.recommended_improvement_suggestion,
         created_by=current_user.username
     )
     
@@ -273,7 +238,7 @@ async def create_action_study(
     await db.commit()
     await db.refresh(action_study)
     
-    return ActionStudyResponse.from_pydict(action_study.to_dict())
+    return action_study.to_dict()
 
 
 @router.get("/action-studies", response_model=List[Dict[str, Any]])
@@ -287,10 +252,6 @@ async def list_action_studies(
 ):
     """查询动作研究记录列表"""
     query = select(ActionStudy).where(ActionStudy.factory_id == factory_id)
-    query = query.order_by(ActionStudy.study_date.desc()).limit(limit)
-    result = await db.execute(query)
-    rows = result.scalars().all()
-    return [{"id": r.id, "factory_id": r.factory_id, "operation_name": r.operation_name, "station_id": r.station_id, "method_type": r.method_type, "study_date": str(r.study_date)} for r in rows]
     
     if product_id:
         query = query.where(ActionStudy.product_id == product_id)
@@ -312,7 +273,6 @@ async def create_method_study(
     current_user = Depends(get_current_user)
 ):
     """创建方法研究方案"""
-    from database.models import MethodStudy
     validity_start = datetime.fromisoformat(ms_data.validity_start.replace('Z', '+00:00'))
     validity_end = None
     if ms_data.validity_end:
@@ -326,19 +286,10 @@ async def create_method_study(
         is_basement_method=ms_data.is_basement_method,
         is_optimal_method=ms_data.is_optimal_method,
         description=ms_data.description,
+        old_method_description=ms_data.old_method_description,
+        improved_method_diagram_url=ms_data.improved_method_diagram_url,
+        expected_time_saving_calculation_detail=ms_data.expected_time_saving_calculation_detail,
         action_sequence=ms_data.action_sequence,
-        required_resources=ms_data.required_resources if hasattr(ms_data, 'required_resources') else [],
-        setup_time_min=ms_data.setup_time_min,
-        cycle_time_min=ms_data.cycle_time_min,
-        total_standard_time_min=ms_data.total_standard_time_min,
-        validity_start=ms_data.validity_start,
-        validity_end=ms_data.validity_end,
-        created_by=ms_data.created_by
-    )
-    db.add(method_study)
-    await db.commit()
-    await db.refresh(method_study)
-    return {"id": method_study.id, "factory_id": method_study.factory_id, "status": "created"}
         required_resources=ms_data.required_resources,
         setup_time_min=ms_data.setup_time_min,
         cycle_time_min=ms_data.cycle_time_min,
@@ -354,7 +305,7 @@ async def create_method_study(
     await db.commit()
     await db.refresh(method_study)
     
-    return MethodStudyResponse.from_pydict(method_study.to_dict())
+    return method_study.to_dict()
 
 
 @router.put("/method-studies/{ms_id}/approve")
@@ -391,24 +342,10 @@ async def create_work_cell_layout(
     current_user = Depends(get_current_user)
 ):
     """创建工站布局设计"""
-    from database.models import WorkCellLayout
     layout = WorkCellLayout(
         factory_id=cell_data.factory_id,
         work_cell_id=cell_data.work_cell_id,
         product_family_id=cell_data.product_family_id,
-        material_flow_path=cell_data.material_flow_path,
-        operator_movement_path=cell_data.operator_movement_path,
-        takt_time_alignment=cell_data.takt_time_alignment,
-        created_by=current_user.username
-    )
-    db.add(layout)
-    await db.commit()
-    await db.refresh(layout)
-    return {"id": layout.id, "factory_id": layout.factory_id, "work_cell_id": layout.work_cell_id, "status": "created"}
-
-
-# ============================================================
-# Kanban端点 (Kanban Endpoints)
         layout_diagram_url=cell_data.layout_diagram_url,
         material_flow_path=cell_data.material_flow_path,
         operator_movement_path=cell_data.operator_movement_path,
@@ -421,7 +358,7 @@ async def create_work_cell_layout(
     await db.commit()
     await db.refresh(layout)
     
-    return WorkCellLayoutResponse.from_pydict(layout.to_dict())
+    return layout.to_dict()
 
 
 @router.get("/work-cells/{work_cell_id}", response_model=WorkCellLayoutResponse)
@@ -436,11 +373,11 @@ async def get_work_cell_layout(
     if factory_id:
         query = query.where(WorkCellLayout.factory_id == factory_id)
     
-    result = await query
+    result = await db.execute(query)
     layout = result.scalar_one_or_none()
     if not layout:
         raise HTTPException(status_code=404, detail="Work cell layout not found")
-    return WorkCellLayoutResponse.from_pydict(layout.to_dict())
+    return layout.to_dict()
 
 
 # ============================================================
@@ -453,8 +390,6 @@ async def create_kanban(
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """创建Kanban卡片"""
-    from database.models import KanbanSystem
     """创建看板卡片"""
     kanban = KanbanSystem(
         factory_id=kanban_data.factory_id,
@@ -465,15 +400,12 @@ async def create_kanban(
         product_id=kanban_data.product_id,
         part_number=kanban_data.part_number,
         max_card_count=kanban_data.max_card_count,
-        created_by=current_user.username
-    )
-    db.add(kanban)
-    await db.commit()
-    await db.refresh(kanban)
-    return {"id": kanban.id, "factory_id": kanban.factory_id, "kanban_id": kanban.kanban_id, "status": "created"}
         current_card_count=kanban_data.current_card_count,
         safety_stock_level=kanban_data.safety_stock_level,
         card_status=kanban_data.card_status,
+        kanban_card_image_url=kanban_data.kanban_card_image_url,
+        trigger_rule_type=kanban_data.trigger_rule_type,
+        min_max_stock_levels_detail=kanban_data.min_max_stock_levels_detail,
         created_by=current_user.username
     )
     
@@ -481,7 +413,7 @@ async def create_kanban(
     await db.commit()
     await db.refresh(kanban)
     
-    return KanbanResponse.from_pydict(kanban.to_dict())
+    return kanban.to_dict()
 
 
 @router.put("/kanbans/{kanban_id}/update-card-count")
@@ -504,7 +436,7 @@ async def update_kanban_card_count(
     await db.commit()
     await db.refresh(kanban)
     
-    return KanbanResponse.from_pydict(kanban.to_dict())
+    return kanban.to_dict()
 
 
 # ============================================================
@@ -518,13 +450,6 @@ async def create_five_s_audit(
     current_user = Depends(get_current_user)
 ):
     """执行5S审计"""
-    from database.models import FiveSAudit
-    
-    # Calculate total score and percentage
-    total_score = (audit_data.seiri_score + audit_data.seiton_score + 
-                   audit_data.seiso_score + audit_data.seiketsu_score + 
-                   audit_data.shitsuke_score)
-    score_percentage = round(total_score / 25 * 100, 1)
     audit_date = datetime.fromisoformat(audit_data.audit_date.replace('Z', '+00:00'))
     next_audit_date = None
     if audit_data.next_audit_date:
@@ -539,7 +464,6 @@ async def create_five_s_audit(
     five_s_audit = FiveSAudit(
         factory_id=audit_data.factory_id,
         work_center_id=audit_data.work_center_id,
-        audit_date=audit_data.audit_date,
         audit_date=audit_date,
         auditor_id=audit_data.auditor_id,
         seiri_score=audit_data.seiri_score,
@@ -557,7 +481,6 @@ async def create_five_s_audit(
     db.add(five_s_audit)
     await db.commit()
     await db.refresh(five_s_audit)
-    return {"id": five_s_audit.id, "work_center_id": five_s_audit.work_center_id, "total_score": total_score, "score_percentage": score_percentage}
     
     return FiveSAuditResponse.from_pydict(five_s_audit.to_dict())
 
@@ -572,12 +495,6 @@ async def list_five_s_audits_by_workcenter(
 ):
     """按工站查询5S审计历史记录"""
     query = select(FiveSAudit).where(FiveSAudit.work_center_id == work_center_id)
-    if factory_id:
-        query = query.where(FiveSAudit.factory_id == factory_id)
-    query = query.order_by(FiveSAudit.audit_date.desc()).limit(limit)
-    result = await db.execute(query)
-    rows = result.scalars().all()
-    return [{"id": r.id, "work_center_id": r.work_center_id, "audit_date": str(r.audit_date), "total_score": r.total_score, "score_percentage": r.score_percentage} for r in rows]
     
     if factory_id:
         query = query.where(FiveSAudit.factory_id == factory_id)
