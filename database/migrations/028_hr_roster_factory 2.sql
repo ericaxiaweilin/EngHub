@@ -17,11 +17,11 @@ CREATE TABLE IF NOT EXISTS factories (
 );
 
 -- 注册两个工厂
-INSERT INTO factories (id, name, short_name, factory_type, address, status)
+INSERT INTO factories (id, factory_name, name, short_name, factory_type, address, status)
 VALUES
-    ('FAC_MECH_001', '机械厂', '机械', 'mechanical', '工业园区A栋', 'active'),
-    ('FAC_ELEC_DEMO_2026', '电子厂', '电子', 'electronics', '科技园区B栋', 'active')
-ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, short_name = EXCLUDED.short_name;
+    ('FAC_MECH_001', '机械厂', '机械厂', '机械', 'mechanical', '工业园区A栋', 'active'),
+    ('FAC_ELEC_DEMO_2026', '电子厂', '电子厂', '电子', 'electronics', '科技园区B栋', 'active')
+ON CONFLICT (id) DO UPDATE SET factory_name = EXCLUDED.factory_name, name = EXCLUDED.name, short_name = EXCLUDED.short_name;
 
 -- ━━━ 2. 人力档案表 ━━━
 CREATE TABLE IF NOT EXISTS hr_employees (
