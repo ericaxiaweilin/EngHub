@@ -1658,6 +1658,29 @@ class EngHubBomItem(Base):
     )
 
 
+class QmsInspectionItem(Base):
+    """QMS检验项记录"""
+    
+    __tablename__ = "qms_inspection_items"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    inspection_id = Column(String(50), nullable=False, index=True)  # 检验单ID
+    item_name = Column(String(100))  # 检验项目名称
+    item_code = Column(String(50))  # 检验项目编码
+    spec_lower = Column(Float)  # 规格下限
+    spec_upper = Column(Float)  # 规格上限
+    target_value = Column(Float)  # 目标值
+    measured_value = Column(Float)  # 实测值
+    result = Column(String(20))  # 检验结果（合格/不合格等）
+    measurement_method = Column(String(100))  # 测量方法
+    remark = Column(Text)  # 备注
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Qms8dReport(Base):
     """8D报告"""
     
