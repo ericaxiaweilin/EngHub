@@ -74,11 +74,11 @@ const InspectionList: React.FC = () => {
       if (statusFilter) params.status = statusFilter
       const res = await getInspections(params)
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_INSPECTIONS)
-      setTotal(res.total || items.length || MOCK_INSPECTIONS.length)
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      setData(MOCK_INSPECTIONS)
-      setTotal(MOCK_INSPECTIONS.length)
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

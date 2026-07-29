@@ -43,8 +43,8 @@ const LineBalanceAnalyses: React.FC = () => {
     try {
       const res = await api.get(API_ENDPOINTS.IE_LINE_BALANCE_ANALYSES, { params: { factory_id: factory, limit: 200 } })
       const items = res.items || res || []
-      setData(items.length > 0 ? items : MOCK_DATA)
-    } catch { setData(MOCK_DATA) } finally { setLoading(false) }
+      setData(items)
+    } catch { setData([]) } finally { setLoading(false) }
   }
 
   useEffect(() => { fetchData() }, [factory])

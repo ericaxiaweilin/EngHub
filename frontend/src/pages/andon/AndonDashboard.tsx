@@ -45,9 +45,9 @@ export default function Andon2Dashboard() {
     try {
       const data: any = await api.get('/api/v1/andon/tickets', { params: { factory_id: FACTORY } })
       const items = data.items || []
-      setTickets(items.length > 0 ? items : MOCK_TICKETS)
+      setTickets(items)
     } catch (err) {
-      setTickets(MOCK_TICKETS)
+      setTickets([])
     } finally {
       setLoading(false)
     }
@@ -192,5 +192,4 @@ export default function Andon2Dashboard() {
     </Card>
   )
 }
-
 

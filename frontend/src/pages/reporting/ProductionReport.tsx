@@ -68,11 +68,11 @@ const ProductionReport: React.FC = () => {
     try {
       const res = await getProductionReports({ factory_id: factoryId, page, page_size: 20 })
       const items = res.items || []
-      setReports(items.length > 0 ? items : MOCK_REPORTS)
-      setTotal(res.total || items.length || MOCK_REPORTS.length)
+      setReports(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      setReports(MOCK_REPORTS)
-      setTotal(MOCK_REPORTS.length)
+      setReports([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

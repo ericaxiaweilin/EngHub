@@ -642,8 +642,12 @@ async def _tool_query_work_orders(db: AsyncSession, args: Dict[str, Any], factor
     product_ids = list({wo.product_id for wo in rows if wo.product_id})
     pname_map: Dict[str, str] = {}
     if product_ids:
-        pres = await db.execute(select(Product).where(Product.id.in_(product_ids)))
-        pname_map = {p.id: p.product_name for p in pres.scalars().all()}
+        # 修复：Product.id 是 UUID，应使用 Product.product_code 与 WorkOrder.product_id（字符串）匹配
+        pres = await db.execute(
+            select(Product.product_code, Product.product_name)
+            .where(Product.product_code.in_(product_ids))
+        )
+        pname_map = {row.product_code: row.product_name for row in pres.all()}
 
     items = [_wo_to_dict(wo, pname_map.get(wo.product_id, "")) for wo in rows]
     return {"count": len(items), "work_orders": items}

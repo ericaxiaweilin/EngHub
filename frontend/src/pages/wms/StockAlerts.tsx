@@ -44,16 +44,16 @@ const StockAlerts: React.FC = () => {
     try {
       const res: any = await api.get('/api/v1/wms/alerts', { params: { factory_id: FACTORY } })
       const items = res?.items || []
-      setAlerts(items.length > 0 ? items : MOCK_ALERTS)
+      setAlerts(items)
       setStats(res?.stats || {})
-    } catch { setAlerts(MOCK_ALERTS) } finally { setLoading(false) }
+    } catch { setAlerts([]); setStats({}) } finally { setLoading(false) }
   }
 
   const loadHealth = async () => {
     try {
       const res: any = await api.get('/api/v1/wms/health', { params: { factory_id: FACTORY } })
-      setHealth(res?.total_materials ? res : MOCK_HEALTH)
-    } catch { setHealth(MOCK_HEALTH) }
+      setHealth(res ?? null)
+    } catch { setHealth(null) }
   }
 
   useEffect(() => { loadAlerts(); loadHealth() }, [])
@@ -118,7 +118,7 @@ const StockAlerts: React.FC = () => {
       )},
   ]
 
-  const healthScore = health?.health_score ?? 100
+  const healthScore = health?.health_score ?? 0
 
   return (
     <div style={{ padding: 24 }}>

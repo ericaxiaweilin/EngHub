@@ -113,11 +113,11 @@ const DefectList: React.FC = () => {
       if (severityFilter) params.severity = severityFilter
       const res = await getDefects(params)
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_DEFECTS)
-      setTotal(res.total || items.length || MOCK_DEFECTS.length)
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      setData(MOCK_DEFECTS)
-      setTotal(MOCK_DEFECTS.length)
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

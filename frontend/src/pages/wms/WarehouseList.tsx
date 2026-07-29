@@ -30,9 +30,9 @@ const WarehouseList: React.FC = () => {
     try {
       const res = await getWarehouses({ factory_id: factoryId, page_size: 100 })
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_WAREHOUSES)
+      setData(items)
     } catch (err: any) {
-      setData(MOCK_WAREHOUSES)
+      setData([])
     } finally {
       setLoading(false)
     }

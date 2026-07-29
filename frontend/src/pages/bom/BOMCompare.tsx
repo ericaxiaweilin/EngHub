@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import {
-  Card, Row, Col, Select, Button, Table, Spin, Empty, Message, Input, Form,
+  Card, Row, Col, Select, Button, Table, Spin, Empty, message, Input, Form,
 } from 'antd';
 import { RightOutlined } from '@ant-design/icons';
 import api from '../../services/api';
@@ -43,7 +43,7 @@ const BOMCompare: React.FC = () => {
   const handleCompare = async () => {
     const values = form.getFieldsValue();
     if (!values.model || !values.a || !values.b) {
-      Message.error('请填写完整参数');
+      message.error('请填写完整参数');
       return;
     }
     setLoading(true);
@@ -58,7 +58,7 @@ const BOMCompare: React.FC = () => {
       setCompareData(res.data);
     } catch (error) {
       console.error('Compare failed:', error);
-      Message.error('对比失败');
+      message.error('对比失败');
     } finally {
       setLoading(false);
     }

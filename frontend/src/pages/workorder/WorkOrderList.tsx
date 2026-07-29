@@ -240,11 +240,11 @@ const WorkOrderList: React.FC = () => {
       if (filters.priority) params.priority = filters.priority
       const res = await getWorkOrders(params)
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_WORK_ORDERS)
-      setTotal(res.total || items.length || MOCK_WORK_ORDERS.length)
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      setData(MOCK_WORK_ORDERS)
-      setTotal(MOCK_WORK_ORDERS.length)
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

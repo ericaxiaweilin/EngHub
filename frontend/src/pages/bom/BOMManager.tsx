@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Card, Row, Col, Select, Button, Table, Spin, Empty, Message, Tabs, Space, Tag, Input,
+  Card, Row, Col, Select, Button, Table, Spin, Empty, message, Tabs, Space, Tag, Input,
 } from 'antd';
 import {
   SyncOutlined, LoadingOutlined, DeleteOutlined, EditOutlined, CopyOutlined,
-  VerticalAlignRightOutlined, SearchOutlined, } from '@ant-design/icons';
+  SearchOutlined, } from '@ant-design/icons';
 import BOMTree from './BOMTree';
 import api from '../../services/api';
 
@@ -50,7 +50,7 @@ const BOMManager: React.FC = () => {
       }
     } catch (error) {
       console.error('Load models failed:', error);
-      Message.error('加载产品型号失败');
+      message.error('加载产品型号失败');
     } finally {
       setLoading(false);
     }
@@ -64,7 +64,7 @@ const BOMManager: React.FC = () => {
       setBomData(res.data);
     } catch (error) {
       console.error('Load BOM failed:', error);
-      Message.error('加载BOM失败');
+      message.error('加载BOM失败');
     } finally {
       setLoading(false);
     }
@@ -75,14 +75,14 @@ const BOMManager: React.FC = () => {
     setSyncLoading(true);
     try {
       await api.post('/api/v1/bom/sync', { sync_type: type });
-      Message.success(`${type === 'full' ? '全量' : '增量'}同步已触发`);
+      message.success(`${type === 'full' ? '全量' : '增量'}同步已触发`);
       loadModels();
       if (selectedModel) {
         loadBOM(selectedModel);
       }
     } catch (error) {
       console.error('Sync failed:', error);
-      Message.error('同步失败');
+      message.error('同步失败');
     } finally {
       setSyncLoading(false);
     }
@@ -102,7 +102,7 @@ const BOMManager: React.FC = () => {
       });
     } catch (error) {
       console.error('Load WO BOM failed:', error);
-      Message.error('查询工单BOM失败');
+      message.error('查询工单BOM失败');
     } finally {
       setWorkOrderBOMLoading(false);
     }
@@ -252,7 +252,7 @@ const BOMManager: React.FC = () => {
             </Button>
           </TabPane>
           <TabPane tab="物料搜索" key="2">
-            <Button type="primary" icon={<VerticalAlignRightOutlined />} onClick={() => window.location.href = '/bom/search'}>
+            <Button type="primary" icon={<SearchOutlined />} onClick={() => window.location.href = '/bom/search'}>
               搜索物料
             </Button>
           </TabPane>

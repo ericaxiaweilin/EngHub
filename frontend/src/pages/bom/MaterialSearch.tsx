@@ -93,7 +93,7 @@ const MaterialSearch: React.FC = () => {
           </Select>
           <Button type="primary" icon={<SearchOutlined />} onClick={handleSearch}>
             搜索
-          </button>
+          </Button>
         </div>
 
         {loading ? (

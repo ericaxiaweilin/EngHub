@@ -60,8 +60,8 @@ const StationTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
     try {
       const res = await getStations({ factory_id: factoryId, page_size: 100 })
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_STATIONS)
-    } catch { setData(MOCK_STATIONS) } finally { setLoading(false) }
+      setData(items)
+    } catch { setData([]) } finally { setLoading(false) }
   }, [factoryId])
 
   useEffect(() => { fetch() }, [fetch])
@@ -186,8 +186,8 @@ const RoutingTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
     try {
       const res = await getRoutings({ factory_id: factoryId, page_size: 100 })
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_ROUTINGS)
-    } catch { setData(MOCK_ROUTINGS) } finally { setLoading(false) }
+      setData(items)
+    } catch { setData([]) } finally { setLoading(false) }
   }, [factoryId])
 
   useEffect(() => { fetch() }, [fetch])
@@ -284,8 +284,8 @@ const EquipmentTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
     try {
       const res = await getEquipment({ factory_id: factoryId, page_size: 100 })
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_EQUIPMENT)
-    } catch { setData(MOCK_EQUIPMENT) } finally { setLoading(false) }
+      setData(items)
+    } catch { setData([]) } finally { setLoading(false) }
   }, [factoryId])
 
   useEffect(() => { fetch() }, [fetch])

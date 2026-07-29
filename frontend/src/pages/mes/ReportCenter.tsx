@@ -32,8 +32,8 @@ const ReportCenter: React.FC = () => {
       const res: any = await api.get('/api/v1/reports-center/daily', {
         params: { factory_id: FACTORY, date: dateStr || dayjs().format('YYYY-MM-DD') }
       })
-      setDailyData(res?.summary ? res : MOCK_DAILY)
-    } catch { setDailyData(MOCK_DAILY) } finally { setLoading(false) }
+      setDailyData(res ?? null)
+    } catch { setDailyData(null) } finally { setLoading(false) }
   }, [])
 
   const loadWeekly = useCallback(async () => {
@@ -42,8 +42,8 @@ const ReportCenter: React.FC = () => {
       const res: any = await api.get('/api/v1/reports-center/weekly', {
         params: { factory_id: FACTORY }
       })
-      setWeeklyData(res?.total_output ? res : MOCK_WEEKLY)
-    } catch { setWeeklyData(MOCK_WEEKLY) } finally { setLoading(false) }
+      setWeeklyData(res ?? null)
+    } catch { setWeeklyData(null) } finally { setLoading(false) }
   }, [])
 
   const loadMonthly = useCallback(async () => {
@@ -52,8 +52,8 @@ const ReportCenter: React.FC = () => {
       const res: any = await api.get('/api/v1/reports-center/monthly', {
         params: { factory_id: FACTORY }
       })
-      setMonthlyData(res?.total_output ? res : MOCK_MONTHLY)
-    } catch { setMonthlyData(MOCK_MONTHLY) } finally { setLoading(false) }
+      setMonthlyData(res ?? null)
+    } catch { setMonthlyData(null) } finally { setLoading(false) }
   }, [])
 
   useEffect(() => {

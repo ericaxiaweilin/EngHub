@@ -67,9 +67,9 @@ const PlantFloor: React.FC = () => {
         running_minutes: eq.running_minutes,
       }))
 
-      setStations(cards.length > 0 ? cards : MOCK_STATIONS)
+      setStations(cards)
     } catch {
-      setStations(MOCK_STATIONS)
+      setStations([])
     } finally {
       setLoading(false)
     }

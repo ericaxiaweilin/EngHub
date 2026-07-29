@@ -55,11 +55,11 @@ const InventoryList: React.FC = () => {
       if (statusFilter) params.status = statusFilter
       const res = await getInventory(params)
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_INVENTORY)
-      setTotal(res.total || items.length || MOCK_INVENTORY.length)
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      setData(MOCK_INVENTORY)
-      setTotal(MOCK_INVENTORY.length)
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

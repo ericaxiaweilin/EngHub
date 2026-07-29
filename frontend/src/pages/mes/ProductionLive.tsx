@@ -43,14 +43,10 @@ const ProductionLive: React.FC = () => {
         api.get('/api/v1/dashboard/station-grid', { params: { factory_id: FACTORY } }),
         api.get('/api/v1/dashboard/top-issues', { params: { factory_id: FACTORY } }),
       ])
-      if (liveRes.status === 'fulfilled') setLive(liveRes.value?.total_output ? liveRes.value : MOCK_LIVE)
-      else setLive(MOCK_LIVE)
-      if (trendRes.status === 'fulfilled') setTrend(trendRes.value?.hours ? trendRes.value : MOCK_TREND)
-      else setTrend(MOCK_TREND)
-      if (gridRes.status === 'fulfilled') setGrid(gridRes.value?.stations ? gridRes.value : MOCK_GRID)
-      else setGrid(MOCK_GRID)
-      if (issuesRes.status === 'fulfilled') setIssues(issuesRes.value?.issues ? issuesRes.value : MOCK_ISSUES)
-      else setIssues(MOCK_ISSUES)
+      setLive(liveRes.status === 'fulfilled' ? (liveRes.value ?? null) : null)
+      setTrend(trendRes.status === 'fulfilled' ? (trendRes.value ?? null) : null)
+      setGrid(gridRes.status === 'fulfilled' ? (gridRes.value ?? null) : null)
+      setIssues(issuesRes.status === 'fulfilled' ? (issuesRes.value ?? null) : null)
       setLastUpdate(dayjs())
     } catch { /* ignore */ } finally {
       setLoading(false)

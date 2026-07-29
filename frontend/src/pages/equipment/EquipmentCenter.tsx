@@ -39,8 +39,8 @@ const EquipDashboard: React.FC = () => {
       setLoading(true)
       try {
         const res: any = await api.get('/api/v1/equipment/dashboard', { params: { factory_id: FACTORY } })
-        setData(res?.total_equipment ? res : MOCK_DASHBOARD)
-      } catch { setData(MOCK_DASHBOARD) } finally { setLoading(false) }
+        setData(res ?? null)
+      } catch { setData(null) } finally { setLoading(false) }
     })()
   }, [])
 
@@ -101,8 +101,8 @@ const MaintenancePanel: React.FC = () => {
     try {
       const res: any = await api.get('/api/v1/equipment/maintenance', { params: { factory_id: FACTORY } })
       const items = res.items || []
-      setOrders(items.length > 0 ? items : MOCK_MAINTENANCE)
-    } catch { setOrders(MOCK_MAINTENANCE) } finally { setLoading(false) }
+      setOrders(items)
+    } catch { setOrders([]) } finally { setLoading(false) }
   }, [])
   useEffect(() => { load() }, [load])
 

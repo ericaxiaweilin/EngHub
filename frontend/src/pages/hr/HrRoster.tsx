@@ -137,10 +137,10 @@ export default function HrRoster() {
     api.get('/api/v1/hr/employees', { params })
       .then((res: any) => {
         const items = res.items || []
-        setEmployees(items.length > 0 ? items : MOCK_EMPLOYEES)
-        setTotal(res.total || items.length || MOCK_EMPLOYEES.length)
+        setEmployees(items)
+        setTotal(res.total ?? items.length)
       })
-      .catch(() => { setEmployees(MOCK_EMPLOYEES); setTotal(MOCK_EMPLOYEES.length) })
+      .catch(() => { setEmployees([]); setTotal(0) })
       .finally(() => setLoading(false))
   }
 
