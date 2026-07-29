@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database.db_config import get_db
 from core.auth.security import get_current_user
 from database.models import User, QualityInspection, DefectRecord, Qms8dReport
-from api.services.qms_service import QmsService
+from api.services.qms_service import QMSService as QmsService
 
 router = APIRouter(prefix="/api/v1", tags=["qms"])
 

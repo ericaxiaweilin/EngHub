@@ -1681,8 +1681,310 @@ class QmsInspectionItem(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class QualityGoal(Base):
+    """质量目标"""
+    
+    __tablename__ = "quality_goals"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50))
+    metric_type = Column(String(50))  # 不良率、一次合格率等
+    target_value = Column(Float)
+    actual_value = Column(Float)
+    period = Column(String(20))  # 日/周/月
+    status = Column(String(20), default="active")  # active/archived
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class QualityGoalReview(Base):
+    """质量目标评审记录"""
+    
+    __tablename__ = "quality_goal_reviews"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    goal_id = Column(String(36), nullable=False)
+    review_date = Column(DateTime, nullable=False)
+    reviewer = Column(String(50))
+    comments = Column(Text)
+    approved = Column(Boolean, default=False)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class QmsSpcPoint(Base):
+    """SPC控制图数据点"""
+    
+    __tablename__ = "qms_spc_points"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    characteristic_code = Column(String(50), nullable=False, index=True)  # 特征码
+    characteristic_name = Column(String(100))  # 特征名称
+    work_order_id = Column(String(50))  # 关联工单
+    station_id = Column(String(50))  # 工位
+    measured_value = Column(Float)  # 测量值
+    sample_group = Column(Integer)  # 样本组号
+    ucl = Column(Float)  # 上控制限
+    lcl = Column(Float)  # 下控制限
+    cl = Column(Float)  # 中心线
+    is_out_of_control = Column(Boolean, default=False)  # 是否失控
+    measured_at = Column(DateTime, nullable=False)  # 测量时间
+    measured_by = Column(String(50))  # 测量人
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ProcessCapability(Base):
+    """工序能力分析"""
+    
+    __tablename__ = "process_capability"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    station_id = Column(String(50), nullable=False, index=True)
+    operation_name = Column(String(100))  # 工序名称
+    characteristic = Column(String(100))  # 特性名称
+    specification_min = Column(Float)  # 规格下限
+    specification_max = Column(Float)  # 规格上限
+    mean_value = Column(Float)  # 均值
+    standard_deviation = Column(Float)  # 标准差
+    cp = Column(Float)  # 工序能力指数
+    cpk = Column(Float)  # 工序能力潜力指数
+    sampling_size = Column(Integer)  # 抽样数量
+    sample_date = Column(DateTime, nullable=False)
+    status = Column(String(20), default="analyzed")  # analyzed/pending
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InventoryCountItem(Base):
+    """库存盘点明细记录"""
+    
+    __tablename__ = "inventory_count_items"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    count_id = Column(String(50), nullable=False)  # 盘点单ID
+    inventory_id = Column(String(36))  # 关联库存物料ID（Inventory.id）
+    material_id = Column(String(50))  # 物料ID
+    batch_code = Column(String(50))  # 批次号
+    system_qty = Column(Integer)  # 系统数量
+    counted_qty = Column(Integer)  # 实际盘点数量
+    diff_qty = Column(Integer)  # 差异数量（counted - system）
+    adjusted = Column(Boolean, default=False)  # 是否已调整
+    remark = Column(String(255))  # 备注
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ProductionAlert(Base):
+    """生产告警记录"""
+    
+    __tablename__ = "production_alerts"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    alert_type = Column(String(50))  # 告警类型（缺料/设备故障/质量异常等）
+    severity = Column(String(20))  # 严重程度（critical/high/medium/low）
+    title = Column(String(255))  # 标题
+    message = Column(Text)  # 详细信息
+    source_type = Column(String(50))  # 来源类型（equipment/work_order/quality等）
+    source_id = Column(String(36))  # 来源ID
+    metric_value = Column(Float)  # 指标值
+    threshold_value = Column(Float)  # 阈值
+    is_read = Column(Boolean, default=False)  # 是否已读
+    is_resolved = Column(Boolean, default=False)  # 是否已解决
+    resolved_by = Column(String(50))  # 解决人
+    resolved_at = Column(DateTime)  # 解决时间
+    triggered_at = Column(DateTime, nullable=False)  # 触发时间
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class EquipmentDowntime(Base):
+    """设备停机记录"""
+    
+    __tablename__ = "equipment_downtime"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    equipment_id = Column(String(50))  # 设备ID
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    start_time = Column(DateTime, nullable=False)  # 开始时间
+    end_time = Column(DateTime)  # 结束时间
+    duration_minutes = Column(Float)  # 停机分钟数
+    downtime_category = Column(String(50))  # 停机类别（故障/维护/缺料等）
+    reason_code = Column(String(50))  # 原因代码
+    description = Column(Text)  # 描述
+    reported_by = Column(String(50))  # 报告人
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MaintenanceOrder(Base):
+    """维修工单"""
+    
+    __tablename__ = "maintenance_orders"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    order_code = Column(String(50), unique=True, nullable=False)  # 工单编号
+    equipment_id = Column(String(50), nullable=False)  # 设备ID
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    order_type = Column(String(50))  # 工单类型（预防性/ corrective/紧急）
+    priority = Column(String(20), default="normal")  # 优先级
+    status = Column(String(20), default="pending")  # 状态（pending/in progress/completed/canceled）
+    scheduled_start = Column(DateTime)  # 计划开始时间
+    scheduled_end = Column(DateTime)  # 计划结束时间
+    actual_start = Column(DateTime)  # 实际开始时间
+    actual_end = Column(DateTime)  # 实际结束时间
+    description = Column(Text)  # 描述
+    assigned_to = Column(String(50))  # 负责人
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MaintenancePlan(Base):
+    """维修计划"""
+    
+    __tablename__ = "maintenance_plans"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    plan_code = Column(String(50), unique=True, nullable=False)  # 计划编号
+    equipment_id = Column(String(50), nullable=False)  # 设备ID
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    plan_type = Column(String(50))  # 计划类型（daily/weekly/monthly/yearly）
+    frequency = Column(String(50))  # 频率
+    next_run_date = Column(Date)  # 下次运行日期
+    last_run_date = Column(Date)  # 上次运行日期
+    description = Column(Text)  # 描述
+    is_active = Column(Boolean, default=True)  # 是否启用
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Notification(Base):
+    """通知记录"""
+    
+    __tablename__ = "notifications"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    title = Column(String(255), nullable=False)  # 标题
+    content = Column(Text)  # 内容
+    severity = Column(String(20))  # 严重程度
+    category = Column(String(50))  # 类别
+    recipient = Column(String(50))  # 接收人
+    is_read = Column(Boolean, default=False)  # 是否已读
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class HourlyOutputSnapshot(Base):
+    """小时产出快照"""
+    
+    __tablename__ = "hourly_output_snapshots"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    snapshot_date = Column(Date, nullable=False)  # 日期
+    snapshot_hour = Column(Integer, nullable=False)  # 小时
+    station_id = Column(String(50), nullable=False, index=True)  # 工位
+    output_qty = Column(Integer)  # 总产出
+    good_qty = Column(Integer)  # 良品数
+    defect_qty = Column(Integer)  # 不良品数
+    target_qty = Column(Integer)  # 目标产量
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InventoryCount(Base):
+    """库存盘点记录"""
+    
+    __tablename__ = "inventory_counts"
+    """库存盘点记录"""
+    
+    __tablename__ = "inventory_counts"
+    """库存盘点记录"""
+    
+    __tablename__ = "inventory_counts"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    count_code = Column(String(50), nullable=False, unique=True)  # 盘点单号
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    warehouse_id = Column(String(50))  # 仓库
+    count_type = Column(String(20))  # 盘点类型（日常/月度/年度等）
+    status = Column(String(20), default="planned")  # 计划/执行中/已完成/待审核
+    planned_date = Column(Date)  # 计划盘点日期
+    counted_by = Column(String(50))  # 盘点人
+    approved_by = Column(String(50))  # 审核人
+    total_items = Column(Integer)  # 总物品数
+    diff_items = Column(Integer)  # 差异物品数
+    total_diff_qty = Column(Integer)  # 差异总数量
+    remark = Column(Text)  # 备注
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SpcConfig(Base):
+    """SPC配置"""
+    """SPC配置"""
+    
+    __tablename__ = "spc_configs"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50))
+    station_id = Column(String(50))
+    characteristic_code = Column(String(50), nullable=False, index=True)
+    sample_size = Column(Integer, default=5)  # 子组大小
+    sample_interval = Column(Integer, nullable=False)  # 采样间隔（分钟）
+    control_rule = Column(String(50), default="westgard")  # 判异规则
+    is_active = Column(Boolean, default=True)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Qms8dReport(Base):
-    """8D报告"""
     
     __tablename__ = "qms_8d_reports"
     
