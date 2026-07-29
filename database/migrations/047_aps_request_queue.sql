@@ -8,7 +8,7 @@
 
 -- APS 调度请求队列表
 CREATE TABLE IF NOT EXISTS aps_schedule_requests (
-    id VARCHAR(36) PRIMARY KEY DEFAULT generate_uuid(),
+    id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
     factory_id VARCHAR(50) NOT NULL,
     mode VARCHAR(20) DEFAULT 'hybrid',          -- scheduling mode: hybrid/simulative/optimization
     horizon_days INTEGER DEFAULT 7,              -- scheduling horizon in days
@@ -21,12 +21,12 @@ CREATE TABLE IF NOT EXISTS aps_schedule_requests (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP NULL,
-    error_message TEXT NULL,
-
-    INDEX idx_factory_status (factory_id, status),
-    INDEX idx_source (source_type, source_id),
-    INDEX idx_retry (status, retry_count)
+    error_message TEXT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_factory_status ON aps_schedule_requests (factory_id, status);
+CREATE INDEX IF NOT EXISTS idx_aps_req_source ON aps_schedule_requests (source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_aps_req_retry ON aps_schedule_requests (status, retry_count);
 
 -- Dead Letter Queue table for failed requests
 CREATE TABLE IF NOT EXISTS aps_dlq_requests (
@@ -39,10 +39,11 @@ CREATE TABLE IF NOT EXISTS aps_dlq_requests (
     source_id VARCHAR(50),
     retry_count INTEGER,
     last_error_message TEXT,
-    failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_factory (factory_id),
-    INDEX idx_failed (failed_at)
+    failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_dlq_factory ON aps_dlq_requests (factory_id);
+CREATE INDEX IF NOT EXISTS idx_dlq_failed ON aps_dlq_requests (failed_at);
 
 -- =============================================================================
 -- Downgrade script (if needed)
