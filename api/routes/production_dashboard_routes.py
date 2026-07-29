@@ -104,7 +104,8 @@ async def production_dashboard_summary(
     hr_rows = hr_res.all()
 
     # ===== 2. 工位 → 段汇总（使用预聚合提升性能）=====
-    station_map = {s.id: s for s in stations}
+    # 注意：ProductionReport.station_id / Equipment.station_id 都是 String(50)，应与 Station.station_code 匹配
+    station_map = {s.station_code: s for s in stations}
     eq_per_station: Dict[str, int] = defaultdict(int)
     for eq in equipment:
         if eq.station_id:
