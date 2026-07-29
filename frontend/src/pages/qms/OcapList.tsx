@@ -9,7 +9,7 @@ import dayjs from 'dayjs'
 
 const OcapList: React.FC = () => {
   const user = getStoredUser()
-  const factoryId = user?.factoryId || 'F01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
   const [loading, setLoading] = useState(false)
   const [data, setData] = useState<Defect[]>([])
   const [total, setTotal] = useState(0)

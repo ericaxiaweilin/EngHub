@@ -48,6 +48,10 @@ import AgentSupervisor from './pages/war-room/AgentSupervisor'
 import AndonDashboard from './pages/andon/AndonDashboard'
 import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
 import RCCCommandCenter from './pages/rcc/RCCCommandCenter'
+// BOM 管理模块
+import BOMManager from './pages/bom/BOMManager'
+import BOMCompare from './pages/bom/BOMCompare'
+import MaterialSearch from './pages/bom/MaterialSearch'
 import { isAuthenticated, getStoredUser } from './services/auth'
 // TMS 模块
 import ApprovalCenter from './pages/tms/ApprovalCenter'
@@ -182,6 +186,9 @@ const App: React.FC = () => {
             <Route path="plant-floor" element={<PermissionGate path="/plant-floor"><PlantFloor /></PermissionGate>} />
             <Route path="report-terminal" element={<PermissionGate path="/report-terminal"><ReportTerminal /></PermissionGate>} />
             <Route path="production-live" element={<PermissionGate path="/production-live"><ProductionLive /></PermissionGate>} />
+            <Route path="bom" element={<PermissionGate path="/bom"><BOMManager /></PermissionGate>} />
+            <Route path="bom/compare" element={<BOMCompare />} />
+            <Route path="bom/search" element={<MaterialSearch />} />
             <Route path="report-center" element={<PermissionGate path="/report-center"><ReportCenter /></PermissionGate>} />
             <Route path="equipment-center" element={<PermissionGate path="/equipment-center"><EquipmentCenter /></PermissionGate>} />
             <Route path="skill-matrix" element={<PermissionGate path="/skill-matrix"><SkillMatrix /></PermissionGate>} />
@@ -205,22 +212,21 @@ const App: React.FC = () => {
             {/* v2.5 Smart Collaboration */}
             <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
-            <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
             <Route path="rcc" element={<PermissionGate path="/rcc"><RCCCommandCenter /></PermissionGate>} />
             <Route path="expert" element={<PermissionGate path="/ai"><ExpertSystemChat /></PermissionGate>} />
             <Route path="war-room" element={<PermissionGate path="/simulation"><WarRoom /></PermissionGate>} />
                         <Route path="agent-supervisor" element={<PermissionGate path="/simulation"><AgentSupervisor /></PermissionGate>} />
             {/* IE 精益生产 */}
             <Route path="ie/standard-times" element={<PermissionGate path="/ie/standard-times"><StandardTimes /></PermissionGate>} />
-            <Route path="ie/time-studies" element={<PermissionGate path="/ie/standard-times"><TimeStudies /></PermissionGate>} />
-            <Route path="ie/line-balance" element={<PermissionGate path="/ie/standard-times"><LineBalanceAnalyses /></PermissionGate>} />
-            <Route path="ie/process-analyses" element={<PermissionGate path="/ie/standard-times"><ProcessAnalyses /></PermissionGate>} />
-            <Route path="ie/lean-metrics" element={<PermissionGate path="/ie/standard-times"><LeanMetrics /></PermissionGate>} />
-            <Route path="ie/action-studies" element={<PermissionGate path="/ie/standard-times"><ActionStudies /></PermissionGate>} />
-            <Route path="ie/method-studies" element={<PermissionGate path="/ie/standard-times"><MethodStudies /></PermissionGate>} />
-            <Route path="ie/work-cells" element={<PermissionGate path="/ie/standard-times"><WorkCells /></PermissionGate>} />
-            <Route path="ie/kanbans" element={<PermissionGate path="/ie/standard-times"><Kanbans /></PermissionGate>} />
-            <Route path="ie/5s-audits" element={<PermissionGate path="/ie/standard-times"><FiveSAudits /></PermissionGate>} />
+            <Route path="ie/time-studies" element={<PermissionGate path="/ie/time-studies"><TimeStudies /></PermissionGate>} />
+            <Route path="ie/line-balance" element={<PermissionGate path="/ie/line-balance"><LineBalanceAnalyses /></PermissionGate>} />
+            <Route path="ie/process-analyses" element={<PermissionGate path="/ie/process-analyses"><ProcessAnalyses /></PermissionGate>} />
+            <Route path="ie/lean-metrics" element={<PermissionGate path="/ie/lean-metrics"><LeanMetrics /></PermissionGate>} />
+            <Route path="ie/action-studies" element={<PermissionGate path="/ie/action-studies"><ActionStudies /></PermissionGate>} />
+            <Route path="ie/method-studies" element={<PermissionGate path="/ie/method-studies"><MethodStudies /></PermissionGate>} />
+            <Route path="ie/work-cells" element={<PermissionGate path="/ie/work-cells"><WorkCells /></PermissionGate>} />
+            <Route path="ie/kanbans" element={<PermissionGate path="/ie/kanbans"><Kanbans /></PermissionGate>} />
+            <Route path="ie/5s-audits" element={<PermissionGate path="/ie/5s-audits"><FiveSAudits /></PermissionGate>} />
           </Route>
         </Routes>
       </BrowserRouter>

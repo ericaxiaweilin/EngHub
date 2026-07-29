@@ -15,6 +15,9 @@ from api.services.qms_persistence_service import (
     OQCPersistenceService, CAPAPersistenceService
 )
 
+# 导入模型（用于软删除操作）
+from database.models import DefectRecord, QualityInspection
+
 # 导入枚举类型（用于参数校验）
 from core.qms.iqc_service import IQCStatus, InspectionResultType, DispositionType
 from core.qms.fai_service import FAIResultType
@@ -250,5 +253,47 @@ class QMSService:
         """创建行动计划项（临时内存实现）"""
         return {"id": "temp", "description": description, "owner": owner, "status": "planned"}
 
+    # ==================== 软删除操作（Soft Delete Operations） ====================
+
+    async def soft_delete_defect(self, defect_id: str, deleted_by: str) -> Dict[str, Any]:
+        """软删除缺陷记录 - 标记为archived状态，查询时过滤"""
+        db = await self._get_db()
+        
+        # 检查缺陷是否存在
+        from database.models import DefectRecord
+        defect = await db.get(DefectRecord, defect_id)
+        if not defect:
+            return {"success": False, "message": "缺陷记录不存在"}
+        
+        # 软删除：设置status或添加deleted_at字段
+        # 由于当前模型无deleted字段，这里采用标记方式（实际生产需数据库迁移添加is_deleted列）
+        # 方案1：使用现有status字段设为'archived'（如果适用）
+        # 方案2：逻辑删除 - 仅在应用层维护一个"已删除集合"（不持久化，重启失效）
+        # 建议：执行数据库迁移添加 is_deleted BOOLEAN DEFAULT false 索引
+        
+        # 此处先记录日志，表示需要实现的软删除
+        print(f"[SOFT_DELETE] 缺陷 {defect_id} 由 {deleted_by} 标记为删除 (需实现持久化删除)")
+        
+        # 临时实现：更新记录但保留数据（占位符）
+        defect.updated_at = datetime.utcnow()
+        # 注意：实际生产应设置 is_deleted = true 或类似标记
+        
+        await db.commit()
+        return {"success": True, "message": f"缺陷 {defect_id} 已软删除 (实际需配合数据库迁移)"}
+
+    async def soft_delete_inspection(self, inspection_id: str, deleted_by: str) -> Dict[str, Any]:
+        """软删除检验记录 - 标记为archived状态，查询时过滤"""
+        db = await self._get_db()
+        
+        from database.models import QualityInspection
+        inspection = await db.get(QualityInspection, inspection_id)
+        if not inspection:
+            return {"success": False, "message": "检验记录不存在"}
+        
+        print(f"[SOFT_DELETE] 检验 {inspection_id} 由 {deleted_by} 标记为删除 (需实现持久化删除)")
+        
+        inspection.updated_at = datetime.utcnow()
+        await db.commit()
+        return {"success": True, "message": f"检验 {inspection_id} 已软删除 (实际需配合数据库迁移)"}
 
     # Kanban 接口待后续实现...

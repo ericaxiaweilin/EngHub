@@ -47,7 +47,7 @@ const PRIORITY_MAP: Record<string, { color: string; text: string }> = {
 
 const ProcessQueue: React.FC = () => {
   const user = getStoredUser()
-  const factoryId = user?.factory_id || ''
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || ''
   const [activeTab, setActiveTab] = useState((user as any)?.work_center || '')
   const [loading, setLoading] = useState(false)
   const [data, setData] = useState<WorkOrder[]>([])

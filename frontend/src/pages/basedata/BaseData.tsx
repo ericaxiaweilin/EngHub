@@ -420,7 +420,7 @@ const EquipmentTab: React.FC<{ factoryId: string }> = ({ factoryId }) => {
 // ============== 主页面 ==============
 const BaseData: React.FC = () => {
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   return (
     <div>

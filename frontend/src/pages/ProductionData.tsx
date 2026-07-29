@@ -27,7 +27,8 @@ const ProductionData: React.FC = () => {
   const [prodLoading, setProdLoading] = useState(true)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'F01'
+  // 优先用顶部选择器选中的厂区（与其他页面一致），回退到用户所属厂区
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   // 拉取生产看板聚合数据（后端返回 is_simulation=false，否则拒绝渲染）
   const fetchProdSummary = useCallback(async () => {

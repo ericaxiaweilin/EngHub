@@ -661,6 +661,38 @@ class OutboundOrder(Base):
     completed_at = Column(DateTime)
 
 
+class InventoryTransaction(Base):
+    """库存交易流水表（出入库记录）"""
+    
+    __tablename__ = "inventory_transactions"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    inventory_id = Column(String(36), ForeignKey("inventory.id"), nullable=False)
+    material_id = Column(String(50), nullable=False, index=True)
+    batch_code = Column(String(50))
+    transaction_type = Column(String(20), nullable=False)  # INBOUND/OUTBOUND/ADJUSTMENT/PRODUCTION_OUT/WIP_TRANSFER etc.
+    quantity = Column(Integer, nullable=False)
+    before_qty = Column(Integer)
+    after_qty = Column(Integer)
+    reference_type = Column(String(30))  # e.g., work_order, inbound_order, production_order
+    reference_id = Column(String(36))  # reference to related entity
+    operator = Column(String(50))
+    remark = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    # Relationship to WorkOrder (if transaction is linked to a production order)
+    work_order_id = Column(String(50), index=True)
+    
+    __table_args__ = (
+        Index("idx_inv_txn_factory", "factory_id"),
+        Index("idx_inv_txn_mat", "material_id"),
+        Index("idx_inv_txn_batch", "batch_code"),
+        Index("idx_inv_txn_date", "created_at"),
+        Index("idx_inv_txn_work_order", work_order_id, transaction_type),  # 针对成本核算JOIN的复合索引
+    )
+
+
 # ==================== 员工技能模型 ====================
 
 class Skill(Base):

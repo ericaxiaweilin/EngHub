@@ -17,7 +17,7 @@ const WarehouseList: React.FC = () => {
   const [loading, setLoading] = useState(false)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   const MOCK_WAREHOUSES: any[] = [
     { id: 'wh-1', warehouse_code: 'WH-01', warehouse_name: '原料仓A', warehouse_type: 'raw_material', location: '厂区北侧', capacity: 5000, used_capacity: 3200, status: 'active', factory_id: 'factory-sh-01' },

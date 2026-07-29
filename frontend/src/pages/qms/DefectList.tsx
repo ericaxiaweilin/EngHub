@@ -96,7 +96,7 @@ const DefectList: React.FC = () => {
   const [detail, setDetail] = useState<Defect | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   const MOCK_DEFECTS: any[] = [
     { id: 'df-1', defect_code: 'DEF-2026-001', defect_type: '外观', defect_name: '划伤', severity: 'minor', status: 'open', quantity: 3, work_order_id: 'wo-1', station_id: 'ST-01', product_id: 'PRD-001', factory_id: 'factory-sh-01', created_at: '2026-07-10' },

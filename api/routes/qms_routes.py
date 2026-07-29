@@ -34,6 +34,9 @@ async def list_inspections(
 ):
     """获取检验单列表"""
     query = select(QualityInspection).where(QualityInspection.factory_id == factory_id)
+    
+    # NOTE: 软删除过滤 - 待数据库迁移后生效 (需给 QualityInspection 添加 is_deleted BOOLEAN DEFAULT false 列)
+    # query = query.where(QualityInspection.is_deleted == False)
 
     if inspection_type:
         query = query.where(QualityInspection.inspect_type == inspection_type.upper())
@@ -130,6 +133,9 @@ async def list_defects(
 ):
     """获取不良品列表"""
     query = select(DefectRecord).where(DefectRecord.factory_id == factory_id)
+    
+    # NOTE: 软删除过滤 - 待数据库迁移后生效 (需给 DefectRecord 添加 is_deleted BOOLEAN DEFAULT false 列)
+    # query = query.where(DefectRecord.is_deleted == False)
 
     if defect_type:
         query = query.where(DefectRecord.defect_type == defect_type)
@@ -262,6 +268,51 @@ async def update_defect_ocap(
     await db.refresh(r)
     
     return _serialize_defect(r)
+
+
+# ============== DELETE Endpoints (Soft Delete) ==============
+
+
+@router.delete("/defects/{defect_id}")
+async def delete_defect(
+    defect_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除缺陷记录（标记为已删除，逻辑过滤查询）"""
+    from api.services.qms_service import QMSService
+    
+    try:
+        qms = QMSService(db)
+        result = await qms.soft_delete_defect(defect_id, current_user.username if current_user else "system")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"缺陷删除失败: {str(e)}")
+
+
+@router.delete("/inspections/{inspection_id}")
+async def delete_inspection(
+    inspection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除检验记录（标记为已删除，逻辑过滤查询）"""
+    from api.services.qms_service import QMSService
+    
+    try:
+        qms = QMSService(db)
+        result = await qms.soft_delete_inspection(inspection_id, current_user.username if current_user else "system")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"检验删除失败: {str(e)}")
 
 
 def _serialize_defect(r: DefectRecord) -> dict:

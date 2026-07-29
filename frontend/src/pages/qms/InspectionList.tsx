@@ -56,7 +56,7 @@ const InspectionList: React.FC = () => {
   const [detail, setDetail] = useState<Inspection | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   const MOCK_INSPECTIONS: any[] = [
     { id: 'insp-1', inspection_code: 'IQC-2026-001', inspection_type: 'iqc', status: 'passed', work_order_id: 'wo-1', product_id: 'PRD-001', sample_size: 50, defect_count: 1, inspector: '张工', factory_id: 'factory-sh-01', created_at: '2026-07-10' },

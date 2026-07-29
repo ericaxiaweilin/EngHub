@@ -41,6 +41,31 @@ class LocationCreate(BaseModel):
     capacity: Optional[int] = None
 
 
+# ============== Warehouse Pydantic Models ==============
+
+class WarehouseUpdatePartial(BaseModel):
+    """部分更新仓库（PATCH）"""
+    warehouse_name: Optional[str] = None
+    address: Optional[str] = None
+    status: Optional[str] = None
+    warehouse_type: Optional[str] = None
+
+
+class WarehouseUpdateFull(BaseModel):
+    """完全替换更新仓库（PUT）"""
+    warehouse_code: str
+    warehouse_name: str
+    factory_id: str
+    warehouse_type: str
+    address: Optional[str] = None
+    status: str = "active"
+
+
+class WarehouseDeleteResponse(BaseModel):
+    """删除响应"""
+    message: str
+
+
 class InboundCreate(BaseModel):
     factory_id: str
     warehouse_id: str
@@ -58,6 +83,38 @@ class OutboundCreate(BaseModel):
     factory_id: str
     warehouse_id: str
     material_id: str
+
+# ============== Inventory Pydantic Models ==============
+
+class InventoryUpdatePartial(BaseModel):
+    """部分更新库存（PATCH）"""
+    location_id: Optional[str] = None
+    batch_code: Optional[str] = None
+    total_qty: Optional[int] = None
+    available_qty: Optional[int] = None
+    reserved_qty: Optional[int] = None
+    unit_cost: Optional[float] = None
+    status: Optional[str] = None
+
+
+class InventoryUpdateFull(BaseModel):
+    """完全替换更新库存（PUT）"""
+    location_id: str
+    batch_code: str
+    total_qty: int
+    available_qty: int
+    reserved_qty: int
+    unit_cost: float
+    status: str
+
+
+class InventoryDeleteResponse(BaseModel):
+    """删除响应"""
+    message: str
+
+
+# --- Existing models continue below ---
+class InboundCreate(BaseModel):
     quantity: float
     work_order_id: Optional[str] = None
     batch_code: Optional[str] = None
@@ -157,6 +214,84 @@ async def get_warehouse(
     }
 
 
+# ============== Warehouse RESTful Endpoints (PUT/PATCH/DELETE) ==============
+
+
+@router.put("/warehouses/{warehouse_id}")
+async def update_warehouse_full(
+    warehouse_id: str,
+    req: WarehouseUpdateFull,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """完全替换更新仓库信息（PUT）"""
+    try:
+        service = WarehouseService(db)
+        result = await service.update_warehouse_full(
+            warehouse_id=warehouse_id,
+            data=req.dict(),
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"仓库更新失败: {str(e)}")
+
+
+@router.patch("/warehouses/{warehouse_id}")
+async def update_warehouse_partial(
+    warehouse_id: str,
+    req: WarehouseUpdatePartial,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """部分更新仓库信息（PATCH /warehouses/{id}）"""
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    
+    try:
+        service = WarehouseService(db)
+        result = await service.update_warehouse_partial(
+            warehouse_id=warehouse_id,
+            updates=updates,
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"仓库更新失败: {str(e)}")
+
+
+@router.delete("/warehouses/{warehouse_id}")
+async def delete_warehouse(
+    warehouse_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除仓库（DELETE）"""
+    try:
+        service = WarehouseService(db)
+        result = await service.delete_warehouse_soft(
+            warehouse_id=warehouse_id,
+            deleted_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"仓库删除失败: {str(e)}")
+
+
 @router.post("/warehouses/{warehouse_id}/locations")
 async def create_location(
     warehouse_id: str,
@@ -250,6 +385,82 @@ async def get_inventory(
         ],
         "total": len(inventories)
     }
+
+
+# ============== Inventory RESTful Endpoints (PUT/PATCH/DELETE) ==============
+
+
+@router.put("/inventory/{inventory_id}")
+async def update_inventory_full(
+    inventory_id: str,
+    req: InventoryUpdateFull,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """完全替换更新库存记录（PUT）"""
+    try:
+        service = InventoryService(db)
+        result = await service.update_inventory_full(
+            inventory_id=inventory_id,
+            data=req.dict(),
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"库存更新失败: {str(e)}")
+
+
+@router.patch("/inventory/{inventory_id}")
+async def update_inventory_partial(
+    inventory_id: str,
+    req: InventoryUpdatePartial,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """部分更新库存记录（PATCH）"""
+    # 构建只包含已提供字段的更新字典（排除None值）
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    
+    try:
+        service = InventoryService(db)
+        result = await service.update_inventory_partial(
+            inventory_id=inventory_id,
+            updates=updates,
+            updated_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"库存更新失败: {str(e)}")
+
+
+@router.delete("/inventory/{inventory_id}")
+async def delete_inventory(
+    inventory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除库存记录（DELETE）"""
+    try:
+        service = InventoryService(db)
+        result = await service.delete_inventory_soft(
+            inventory_id=inventory_id,
+            deleted_by=current_user.username,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"库存删除失败: {str(e)}")
 
 
 @router.get("/inventory/available")

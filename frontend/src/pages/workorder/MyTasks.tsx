@@ -31,7 +31,7 @@ const STATUS_CONFIG: Record<string, { color: string; text: string; badge: 'defau
 
 const MyTasks: React.FC = () => {
   const user = getStoredUser()
-  const factoryId = user?.factory_id || ''
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || ''
   const [loading, setLoading] = useState(false)
   const [tasks, setTasks] = useState<WorkOrder[]>([])
 

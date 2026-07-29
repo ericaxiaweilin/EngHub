@@ -211,7 +211,7 @@ const WorkOrderList: React.FC = () => {
   const [splitForm] = Form.useForm()
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   // ---- 权限检查 ----
   const canRelease = hasPermission('work_order', 'release')

@@ -55,7 +55,7 @@ const ProductionReport: React.FC = () => {
   const [reportDetail, setReportDetail] = useState<ReportType | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   const MOCK_REPORTS: any[] = [
     { id: 'rpt-1', report_code: 'RPT-2026-0701', work_order_id: 'wo-1', station_id: 'st-1', product_id: 'PRD-001', quantity: 120, qualified_quantity: 118, defect_quantity: 2, operator: '张伟', shift: 'day', factory_id: 'factory-sh-01', created_at: '2026-07-20' },

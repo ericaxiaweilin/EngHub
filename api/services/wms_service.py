@@ -453,6 +453,124 @@ class WarehouseService:
         result = await self.db.execute(query)
         return result.scalars().all()
 
+    # ============== 仓库更新（PATCH） ==============
+
+    async def update_warehouse_partial(
+        self,
+        warehouse_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """部分更新仓库信息（PATCH /warehouses/{id}）"""
+        warehouse = await self.db.get(Warehouse, warehouse_id)
+        if not warehouse:
+            return {"success": False, "message": "仓库不存在"}
+
+        allowed_fields = {
+            "warehouse_name": warehouse.warehouse_name,
+            "address": warehouse.address,
+            "status": warehouse.status,
+            "warehouse_type": warehouse.warehouse_type,
+        }
+
+        for key, value in updates.items():
+            if key in allowed_fields and value is not None:
+                setattr(warehouse, key, value)
+
+        warehouse.updated_at = datetime.utcnow()
+        if updated_by:
+            warehouse.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(warehouse)
+
+        return {
+            "success": True,
+            "data": {
+                "id": warehouse.id,
+                "warehouse_code": warehouse.warehouse_code,
+                "warehouse_name": warehouse.warehouse_name,
+                "factory_id": warehouse.factory_id,
+                "warehouse_type": warehouse.warehouse_type,
+                "address": warehouse.address,
+                "status": warehouse.status,
+            }
+        }
+
+    # ============== 仓库完全更新（PUT） ==============
+
+    async def update_warehouse_full(
+        self,
+        warehouse_id: str,
+        data: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """完全替换更新仓库信息（PUT /warehouses/{id}）"""
+        warehouse = await self.db.get(Warehouse, warehouse_id)
+        if not warehouse:
+            return {"success": False, "message": "仓库不存在"}
+
+        warehouse.warehouse_code = data.get("warehouse_code", warehouse.warehouse_code)
+        warehouse.warehouse_name = data.get("warehouse_name", warehouse.warehouse_name)
+        warehouse.factory_id = data.get("factory_id", warehouse.factory_id)
+        warehouse.warehouse_type = data.get("warehouse_type", warehouse.warehouse_type)
+        warehouse.address = data.get("address", warehouse.address)
+        warehouse.status = data.get("status", warehouse.status)
+        warehouse.updated_at = datetime.utcnow()
+        if updated_by:
+            warehouse.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(warehouse)
+
+        return {
+            "success": True,
+            "data": {
+                "id": warehouse.id,
+                "warehouse_code": warehouse.warehouse_code,
+                "warehouse_name": warehouse.warehouse_name,
+                "factory_id": warehouse.factory_id,
+                "warehouse_type": warehouse.warehouse_type,
+                "address": warehouse.address,
+                "status": warehouse.status,
+            }
+        }
+
+    # ============== 仓库删除（DELETE - 软删除） ==============
+
+    async def delete_warehouse_soft(
+        self,
+        warehouse_id: str,
+        deleted_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """软删除仓库（标记为deleted，并检查是否有关联库存）"""
+        warehouse = await self.db.get(Warehouse, warehouse_id)
+        if not warehouse:
+            return {"success": False, "message": "仓库不存在"}
+
+        # 检查是否有库存关联
+        inv_stmt = select(Inventory).where(
+            Inventory.warehouse_id == warehouse.id,
+            Inventory.factory_id == warehouse.factory_id,
+        )
+        inv_result = await self.db.execute(inv_stmt)
+        inventories = inv_result.scalars().all()
+
+        if inventories:
+            return {
+                "success": False,
+                "message": f"该仓库下仍有 {len(inventories)} 条库存记录，请先清理或转移",
+            }
+
+        warehouse.status = "deleted"
+        warehouse.updated_at = datetime.utcnow()
+        if deleted_by:
+            warehouse.deleted_by = deleted_by
+
+        await self.db.commit()
+
+        return {"success": True, "message": "仓库已软删除"}
+
 
 class LocationService:
     """库位服务类"""
@@ -780,7 +898,130 @@ class InventoryService:
             "reserved_qty": quantity,
             "work_order_id": work_order_id
         }
-    
+
+    # ============== 库存更新（PUT/PATCH） ==============
+
+    async def update_inventory_partial(
+        self,
+        inventory_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """部分更新库存记录（PATCH /inventory/{id}）"""
+        inventory = await self.db.get(Inventory, inventory_id)
+        if not inventory:
+            return {"success": False, "message": "库存记录不存在"}
+
+        # 允许更新的字段
+        allowed_fields = {
+            "location_id": inventory.location_id,
+            "batch_code": inventory.batch_code,
+            "total_qty": inventory.total_qty,
+            "available_qty": inventory.available_qty,
+            "reserved_qty": inventory.reserved_qty,
+            "unit_cost": inventory.unit_cost,
+            "status": inventory.status,
+        }
+
+        for key, value in updates.items():
+            if key in allowed_fields:
+                setattr(inventory, key, value)
+
+        inventory.last_movement_at = datetime.utcnow()
+        inventory.updated_at = datetime.utcnow()
+        if updated_by:
+            inventory.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(inventory)
+
+        return {
+            "success": True,
+            "data": {
+                "id": inventory.id,
+                "material_id": inventory.material_id,
+                "material_code": inventory.material_code,
+                "warehouse_id": inventory.warehouse_id,
+                "location_id": inventory.location_id,
+                "batch_code": inventory.batch_code,
+                "total_qty": inventory.total_qty,
+                "available_qty": inventory.available_qty,
+                "reserved_qty": inventory.reserved_qty,
+                "unit_cost": float(inventory.unit_cost) if inventory.unit_cost else None,
+                "unit": inventory.unit,
+                "status": inventory.status,
+            }
+        }
+
+    async def update_inventory_full(
+        self,
+        inventory_id: str,
+        data: Dict[str, Any],
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """完全替换更新库存记录（PUT /inventory/{id}）"""
+        inventory = await self.db.get(Inventory, inventory_id)
+        if not inventory:
+            return {"success": False, "message": "库存记录不存在"}
+
+        # 完全替换所有可更新字段
+        inventory.location_id = data.get("location_id", inventory.location_id)
+        inventory.batch_code = data.get("batch_code", inventory.batch_code)
+        inventory.total_qty = data.get("total_qty", inventory.total_qty)
+        inventory.available_qty = data.get("available_qty", inventory.available_qty)
+        inventory.reserved_qty = data.get("reserved_qty", inventory.reserved_qty)
+        inventory.unit_cost = data.get("unit_cost", inventory.unit_cost)
+        inventory.unit = data.get("unit", inventory.unit)
+        inventory.status = data.get("status", inventory.status)
+        inventory.last_movement_at = datetime.utcnow()
+        inventory.updated_at = datetime.utcnow()
+        if updated_by:
+            inventory.updated_by = updated_by
+
+        await self.db.commit()
+        await self.db.refresh(inventory)
+
+        return {
+            "success": True,
+            "data": {
+                "id": inventory.id,
+                "material_id": inventory.material_id,
+                "material_code": inventory.material_code,
+                "warehouse_id": inventory.warehouse_id,
+                "location_id": inventory.location_id,
+                "batch_code": inventory.batch_code,
+                "total_qty": inventory.total_qty,
+                "available_qty": inventory.available_qty,
+                "reserved_qty": inventory.reserved_qty,
+                "unit_cost": float(inventory.unit_cost) if inventory.unit_cost else None,
+                "unit": inventory.unit,
+                "status": inventory.status,
+            }
+        }
+
+    # ============== 库存删除（DELETE - 软删除） ==============
+
+    async def delete_inventory_soft(
+        self,
+        inventory_id: str,
+        deleted_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """软删除库存记录（标记为deleted状态）"""
+        inventory = await self.db.get(Inventory, inventory_id)
+        if not inventory:
+            return {"success": False, "message": "库存记录不存在"}
+
+        # 设置状态为deleted
+        inventory.status = "deleted"
+        inventory.updated_at = datetime.utcnow()
+        if deleted_by:
+            inventory.deleted_by = deleted_by
+
+        await self.db.commit()
+        await self.db.refresh(inventory)
+
+        return {"success": True, "message": "库存已软删除"}
+
     async def _get_next_in_number(self, factory_id: str) -> int:
         """获取下一个入库单序号"""
         today = datetime.now().date()

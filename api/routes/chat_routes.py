@@ -35,7 +35,7 @@ router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 # --- 配置 (环境变量驱动，非硬编码) ---
 GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://host.docker.internal:14040").rstrip("/")
 API_KEY = os.getenv("LLM_API_KEY", "")
-MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("LLM_MODEL", "openrouter/auto")
 REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
 MAX_TOOL_ROUNDS = int(os.getenv("LLM_MAX_TOOL_ROUNDS", "5"))
 # Vision 模型（图片多模态路由）—— 带图片时自动切换到此模型

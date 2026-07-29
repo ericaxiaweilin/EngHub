@@ -36,7 +36,7 @@ const PROCESS_NAME: Record<string, string> = Object.fromEntries(PROCESS_OPTIONS.
 
 const RoutingTemplates: React.FC = () => {
   const user = getStoredUser()
-  const factoryId = user?.factory_id || ''
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || ''
   const [loading, setLoading] = useState(false)
   const [templates, setTemplates] = useState<RoutingTemplate[]>([])
   const [modalOpen, setModalOpen] = useState(false)
