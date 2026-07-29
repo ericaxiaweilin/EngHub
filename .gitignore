@@ -50,3 +50,4 @@ mes-project-deploy.tar.gz
 .agnes/
 .deploy_tmp/
 uploads/
+/upload_*.jpg
