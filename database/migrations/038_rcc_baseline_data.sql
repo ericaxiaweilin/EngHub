@@ -25,15 +25,15 @@ BEGIN
     INSERT INTO global_adjustable_params (id, param_code, param_name, category, param_type, current_value, default_value, min_value, max_value, unit, sensitivity, affects_logic_chains)
     VALUES
         (gen_random_uuid(), 'personnel_load_rate_threshold', '人力负荷率阈值', 'people', 'percentage', '85', '85', 50, 100, '%', 'high',
-         ARRAY['load_alert']::jsonb),
+         '["load_alert"]'::jsonb),
         (gen_random_uuid(), 'absence_warning_threshold', '缺勤预警线', 'people', 'percentage', '3', '3', 0, 10, '%', 'normal',
-         ARRAY['attendance_alert']::jsonb),
+         '["attendance_alert"]'::jsonb),
         (gen_random_uuid(), 'shift_ratio_day_night', '白班/夜班配比目标', 'people', 'ratio', '60/40', '60/40', NULL, NULL, NULL, 'strategic',
-         ARRAY['shift_adjust']::jsonb),
+         '["shift_adjust"]'::jsonb),
         (gen_random_uuid(), 'min_operator_per_station', '每工位最低操作员数', 'people', 'integer', '2', '2', 1, 5, '人', 'high',
-         ARRAY['staffing_alert']::jsonb),
+         '["staffing_alert"]'::jsonb),
         (gen_random_uuid(), 'skill_level_min_dispatch', '派工最低技能等级', 'people', 'level', 'L2', 'L2', NULL, NULL, NULL, 'high',
-         ARRAY['dispatch_rule']::jsonb)
+         '["dispatch_rule"]'::jsonb)
     ON CONFLICT (param_code) DO UPDATE SET
         current_value = EXCLUDED.current_value,
         target_value = EXCLUDED.default_value,
@@ -45,19 +45,19 @@ BEGIN
     INSERT INTO global_adjustable_params (id, param_code, param_name, category, param_type, current_value, default_value, min_value, max_value, unit, sensitivity, affects_logic_chains)
     VALUES
         (gen_random_uuid(), 'equipment_available_hours_default', '设备默认可用小时/天', 'equipment', 'hours', '16', '16', 8, 24, 'h', 'low',
-         ARRAY[]::jsonb),
+         '[]'::jsonb),
         (gen_random_uuid(), 'equipment_efficiency_target', '设备效率系数目标', 'equipment', 'percentage', '85', '85', 50, 100, '%', 'normal',
-         ARRAY['efficiency_alert']::jsonb),
+         '["efficiency_alert"]'::jsonb),
         (gen_random_uuid(), 'equipment_setup_time_minutes', '默认换型时间(分钟)', 'equipment', 'minutes', '30', '30', 0, 120, 'min', 'low',
-         ARRAY['scheduling_constraint']::jsonb),
+         '["scheduling_constraint"]'::jsonb),
         (gen_random_uuid(), 'oee_target_pct', 'OEE目标百分比', 'equipment', 'percentage', '80', '80', 50, 99, '%', 'normal',
-         ARRAY['oee_alert']::jsonb),
+         '["oee_alert"]'::jsonb),
         (gen_random_uuid(), 'pm_cycle_default_days', '预防性维护默认周期(天)', 'equipment', 'days', '7', '7', 1, 30, '天', 'normal',
-         ARRAY['pm_overdue_alert']::jsonb),
+         '["pm_overdue_alert"]'::jsonb),
         (gen_random_uuid(), 'pm_warning_days_before', 'PM到期前预警天数', 'equipment', 'days', '3', '3', 1, 7, '天', 'low',
-         ARRAY['pm_warning']::jsonb),
+         '["pm_warning"]'::jsonb),
         (gen_random_uuid(), 'equipment_downtime_alert_min', '设备停机超时报警阈值(分钟)', 'equipment', 'minutes', '30', '30', 10, 180, 'min', 'high',
-         ARRAY['downtime_alert']::jsonb)
+         '["downtime_alert"]'::jsonb)
     ON CONFLICT (param_code) DO UPDATE SET
         current_value = EXCLUDED.current_value,
         target_value = EXCLUDED.default_value,
@@ -69,21 +69,21 @@ BEGIN
     INSERT INTO global_adjustable_params (id, param_code, param_name, category, param_type, current_value, default_value, min_value, max_value, unit, sensitivity, affects_logic_chains)
     VALUES
         (gen_random_uuid(), 'priority_weight_urgent', '紧急优先级权重', 'work_order', 'integer', '10', '10', 1, 20, '', 'normal',
-         ARRAY['auto_schedule']::jsonb),
+         '["auto_schedule"]'::jsonb),
         (gen_random_uuid(), 'priority_weight_high', '高优先级权重', 'work_order', 'integer', '7', '7', 1, 20, '', 'normal',
-         ARRAY['auto_schedule']::jsonb),
+         '["auto_schedule"]'::jsonb),
         (gen_random_uuid(), 'priority_weight_medium', '普通优先级权重', 'work_order', 'integer', '5', '5', 1, 20, '', 'normal',
-         ARRAY['auto_schedule']::jsonb),
+         '["auto_schedule"]'::jsonb),
         (gen_random_uuid(), 'priority_weight_low', '低优先级权重', 'work_order', 'integer', '2', '2', 1, 20, '', 'low',
-         ARRAY['auto_schedule']::jsonb),
+         '["auto_schedule"]'::jsonb),
         (gen_random_uuid(), 'delivery_grace_period_hours', '交期宽限期(小时)', 'work_order', 'hours', '24', '24', 0, 72, 'h', 'normal',
-         ARRAY['delivery_risk']::jsonb),
+         '["delivery_risk"]'::jsonb),
         (gen_random_uuid(), 'max_parallel_orders_per_station', '单工位最大并行工单数', 'work_order', 'integer', '1', '1', 0, 3, '个', 'high',
-         ARRAY['scheduling_constraint']::jsonb),
+         '["scheduling_constraint"]'::jsonb),
         (gen_random_uuid(), 'order_reorder_threshold', '订单重排触发阈值', 'work_order', 'percentage', '15', '15', 0, 50, '%', 'normal',
-         ARRAY['auto_reschedule']::jsonb),
+         '["auto_reschedule"]'::jsonb),
         (gen_random_uuid(), 'material_shortage_auto_postpone_hours', '物料齐套不足自动推迟时长(小时)', 'work_order', 'hours', '48', '48', 0, 168, 'h', 'high',
-         ARRAY['auto_reschedule']::jsonb)
+         '["auto_reschedule"]'::jsonb)
     ON CONFLICT (param_code) DO UPDATE SET
         current_value = EXCLUDED.current_value,
         target_value = EXCLUDED.default_value,
@@ -95,19 +95,19 @@ BEGIN
     INSERT INTO global_adjustable_params (id, param_code, param_name, category, param_type, current_value, default_value, min_value, max_value, unit, sensitivity, affects_logic_chains)
     VALUES
         (gen_random_uuid(), 'env_temperature_min_c', '车间温度下限(°C)', 'environment', 'numeric', '18', '18', 10, 25, '°C', 'low',
-         ARRAY['env_alert']::jsonb),
+         '["env_alert"]'::jsonb),
         (gen_random_uuid(), 'env_temperature_max_c', '车间温度上限(°C)', 'environment', 'numeric', '28', '28', 20, 35, '°C', 'low',
-         ARRAY['env_alert']::jsonb),
+         '["env_alert"]'::jsonb),
         (gen_random_uuid(), 'env_humidity_min_pct', '车间湿度下限(%)', 'environment', 'numeric', '30', '30', 0, 80, '%', 'low',
-         ARRAY['env_alert']::jsonb),
+         '["env_alert"]'::jsonb),
         (gen_random_uuid(), 'env_humidity_max_pct', '车间湿度上限(%)', 'environment', 'numeric', '70', '70', 40, 90, '%', 'low',
-         ARRAY['env_alert']::jsonb),
+         '["env_alert"]'::jsonb),
         (gen_random_uuid(), 'env_dust_limit_ug_m3', '粉尘浓度限值(µg/m³)', 'environment', 'numeric', '100', '100', 0, 500, 'µg/m³', 'normal',
-         ARRAY['cleanliness_alert']::jsonb),
+         '["cleanliness_alert"]'::jsonb),
         (gen_random_uuid(), 'env_noise_limit_db', '噪声限值(dB)', 'environment', 'numeric', '85', '85', 50, 120, 'dB', 'normal',
-         ARRAY['noise_alert']::jsonb),
+         '["noise_alert"]'::jsonb),
         (gen_random_uuid(), 'env_reading_interval_minutes', '环境监测采样间隔(分钟)', 'environment', 'minutes', '5', '5', 1, 30, 'min', 'low',
-         ARRAY[]::jsonb)
+         '[]'::jsonb)
     ON CONFLICT (param_code) DO UPDATE SET
         current_value = EXCLUDED.current_value,
         target_value = EXCLUDED.default_value,
@@ -119,17 +119,17 @@ BEGIN
     INSERT INTO global_adjustable_params (id, param_code, param_name, category, param_type, current_value, default_value, min_value, max_value, unit, sensitivity, affects_logic_chains)
     VALUES
         (gen_random_uuid(), 'process_cycle_time_baseline', '标准节拍时间基准(秒)', 'process', 'seconds', '60', '60', 10, 300, 's', 'medium',
-         ARRAY['cycle_time_alert']::jsonb),
+         '["cycle_time_alert"]'::jsonb),
         (gen_random_uuid(), 'yield_rate_target_pct', '良品率目标(%)', 'process', 'percentage', '98', '98', 90, 100, '%', 'high',
-         ARRAY['yield_alert']::jsonb),
+         '["yield_alert"]'::jsonb),
         (gen_random_uuid(), 'aql_level_general', '通用AQL级别', 'process', 'string', 'General-II', 'General-II', NULL, NULL, NULL, 'medium',
-         ARRAY['inspection_standard']::jsonb),
+         '["inspection_standard"]'::jsonb),
         (gen_random_uuid(), 'defect_threshold_warn_pct', '不良率预警线(%)', 'process', 'percentage', '5', '5', 0, 20, '%', 'normal',
-         ARRAY['defect_alert']::jsonb),
+         '["defect_alert"]'::jsonb),
         (gen_random_uuid(), 'process_change_review_required', '工艺变更需审批标志', 'process', 'boolean', 'true', 'true', NULL, NULL, NULL, 'high',
-         ARRAY['process_change_approval']::jsonb),
+         '["process_change_approval"]'::jsonb),
         (gen_random_uuid(), 'standard_cycle_time_by_process', '标准节拍时间配置(JSON)', 'process', 'json', '{"smt":30,"solder":45,"assembly":60,"test":120,"packaging":40}', '{"smt":30,"solder":45,"assembly":60,"test":120,"packaging":40}', NULL, NULL, NULL, 'medium',
-         ARRAY['capacity_calc']::jsonb)
+         '["capacity_calc"]'::jsonb)
     ON CONFLICT (param_code) DO UPDATE SET
         current_value = EXCLUDED.current_value,
         target_value = EXCLUDED.default_value,
@@ -141,13 +141,13 @@ BEGIN
     INSERT INTO global_adjustable_params (id, param_code, param_name, category, param_type, current_value, default_value, min_value, max_value, unit, sensitivity, affects_logic_chains)
     VALUES
         (gen_random_uuid(), 'logic_chain_priority', '逻辑链执行优先级', 'logic', 'integer', '1', '1', 1, 10, '', 'normal',
-         ARRAY[]::jsonb),
+         '[]'::jsonb),
         (gen_random_uuid(), 'logic_chain_enable_env_sync', '自动同步环境读数到RCC', 'logic', 'boolean', 'true', 'true', NULL, NULL, NULL, 'normal',
-         ARRAY['env_auto_update']::jsonb),
+         '["env_auto_update"]'::jsonb),
         (gen_random_uuid(), 'logic_chain_enable_wo_alert', '工单异常自动通知', 'logic', 'boolean', 'true', 'true', NULL, NULL, NULL, 'normal',
-         ARRAY['wo_auto_notify']::jsonb),
+         '["wo_auto_notify"]'::jsonb),
         (gen_random_uuid(), 'logic_chain_enable_pm_auto', 'PM逾期自动触发维护工单', 'logic', 'boolean', 'true', 'true', NULL, NULL, NULL, 'high',
-         ARRAY['pm_auto_create']::jsonb)
+         '["pm_auto_create"]'::jsonb)
     ON CONFLICT (param_code) DO UPDATE SET
         current_value = EXCLUDED.current_value,
         target_value = EXCLUDED.default_value,
@@ -190,7 +190,7 @@ VALUES
      '[{"type":"notify_org_unit","target_org_unit":"rcc-root","message":"环境参数异常"}, {"type":"log_audit","reason":"环境异常事件记录"}]'::jsonb,
      5);
 
-RAISE NOTICE '✅ RCC deterministic_logic_chains 种子已写入';
+-- ✅ RCC deterministic_logic_chains 种子已写入
 
 
 -- ── 4. 补充 org_units 的产线层级（如果rcc基础org不完整）──
