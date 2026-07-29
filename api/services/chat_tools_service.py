@@ -692,7 +692,7 @@ async def _tool_get_production_summary(db: AsyncSession, args: Dict[str, Any], f
     today_good = sum(r.good_qty for r in reports)
     today_defect = sum(r.defect_qty for r in reports)
     total_out = today_good + today_defect
-    yield_rate = round(today_good / total_out * 100, 1) if total_out else 100.0
+    yield_rate = round(today_good / total_out * 100, 1) if total_out else None
 
     # 工单统计
     wo_stmt = select(WorkOrder)

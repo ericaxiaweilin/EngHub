@@ -17,7 +17,7 @@ import {
 const SpreadsheetEditor = lazy(() => import('./SpreadsheetEditor'))
 import api from '../services/api'
 import { tmsApi } from '../services/tms'
-import { getStoredUser } from '../services/auth'
+import { getStoredUser, logout } from '../services/auth'
 
 const { Text } = Typography
 const { TextArea } = Input
@@ -283,14 +283,22 @@ export default function AIAssistantWidget() {
         }))
       }
       const token = localStorage.getItem('token')
+      const factoryId = localStorage.getItem('active_factory_id')
       const resp = await fetch('/api/v1/chat/stream', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(factoryId ? { 'X-Factory-Id': factoryId } : {}),
         },
         body: JSON.stringify(payload),
       })
+      if (resp.status === 401) {
+        logout()
+        sessionStorage.setItem('session_expired', '1')
+        window.location.href = '/login'
+        return
+      }
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
 
       const reader = resp.body.getReader()
