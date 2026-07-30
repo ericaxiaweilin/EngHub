@@ -7,6 +7,7 @@ export const API_ENDPOINTS = {
   AUTH_LOGIN: `${API_BASE_URL}/api/v1/auth/login`,
   AUTH_ME: `${API_BASE_URL}/api/v1/auth/me`,
   AUTH_REFRESH: `${API_BASE_URL}/api/v1/auth/refresh`,
+  AUTH_RESET_PASSWORD: `${API_BASE_URL}/api/v1/auth/reset-password`,
 
   // MES
   WORK_ORDERS: `${API_BASE_URL}/api/v1/work-orders`,

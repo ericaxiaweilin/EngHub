@@ -42,6 +42,21 @@ class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
 
+class ResetPasswordRequest(BaseModel):
+    """忘记密码自助重置请求(内网信任环境: 凭用户名直接重置)"""
+    username: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("新密码至少 6 位")
+        if len(v) > 255:
+            raise ValueError("新密码过长")
+        return v
+
+
 class UserCreate(BaseModel):
     """用户创建请求"""
     username: str
@@ -309,6 +324,20 @@ async def change_password(
     await user_service.update_user(current_user.id, password=new_password)
     
     return {"message": "密码修改成功"}
+
+
+@router.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """忘记密码自助重置(内网信任环境, 凭用户名直接设新密码, 无需登录态)。"""
+    user_service = UserService(db)
+    user = await user_service.get_user_by_username(request.username.strip())
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在",
+        )
+    await user_service.update_user(str(user.id), password=request.new_password)
+    return {"message": "密码已重置, 请用新密码登录"}
 
 
 @router.get("/roles", response_model=List[RoleResponse])

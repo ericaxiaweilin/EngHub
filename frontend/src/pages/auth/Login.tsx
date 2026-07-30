@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
-import { Form, Input, Button, Card, Typography, message, Avatar, Checkbox, Alert, Tag } from 'antd'
+import { Form, Input, Button, Card, Typography, message, Avatar, Checkbox, Alert, Tag, Modal } from 'antd'
 import { UserOutlined, LockOutlined, AppstoreOutlined, ClockCircleOutlined } from '@ant-design/icons'
-import { login, fetchMe, loadCredentials, clearCredentials, SESSION_HOURS } from '../../services/auth'
+import { login, fetchMe, loadCredentials, clearCredentials, resetPassword, SESSION_HOURS } from '../../services/auth'
 
 const { Title, Text } = Typography
 
@@ -12,6 +12,11 @@ const Login: React.FC = () => {
   const navigate = useNavigate()
   const location = useLocation() as any
   const from = location.state?.from || '/'
+
+  // 忘记密码弹窗
+  const [resetOpen, setResetOpen] = useState(false)
+  const [resetLoading, setResetLoading] = useState(false)
+  const [resetForm] = Form.useForm()
 
   // 会话过期标记（由路由守卫/401 拦截器设置）
   const [expired] = useState(() => sessionStorage.getItem('session_expired') === '1')
@@ -57,6 +62,23 @@ const Login: React.FC = () => {
       }
     } finally {
       setLoading(false)
+    }
+  }
+
+  const onReset = async (values: { username: string; newPassword: string; confirm: string }) => {
+    setResetLoading(true)
+    try {
+      await resetPassword(values.username.trim(), values.newPassword.trim())
+      message.success('密码已重置，请用新密码登录')
+      clearCredentials()
+      form.setFieldsValue({ username: values.username.trim(), password: '' })
+      setResetOpen(false)
+      resetForm.resetFields()
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail || err?.message || '重置失败'
+      message.error(typeof detail === 'string' ? detail : '重置失败')
+    } finally {
+      setResetLoading(false)
     }
   }
 
@@ -122,6 +144,13 @@ const Login: React.FC = () => {
               登 录
             </Button>
           </Form.Item>
+          <div style={{ textAlign: 'right', marginBottom: 8 }}>
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => {
+              const uname = form.getFieldValue('username')
+              resetForm.setFieldsValue({ username: uname || '' })
+              setResetOpen(true)
+            }}>忘记密码？</Button>
+          </div>
         </Form>
 
         <div style={{ textAlign: 'center' }}>
@@ -140,6 +169,36 @@ const Login: React.FC = () => {
             默认账号 admin，如无法登录请联系管理员初始化
           </Text>
         </div>
+        <Modal
+          title="重置密码"
+          open={resetOpen}
+          onCancel={() => setResetOpen(false)}
+          onOk={() => resetForm.submit()}
+          confirmLoading={resetLoading}
+          okText="确认重置"
+          cancelText="取消"
+          destroyOnClose
+        >
+          <Alert type="info" showIcon style={{ marginBottom: 16 }}
+            message="输入用户名和新密码即可直接重置（内网自助）。" />
+          <Form form={resetForm} layout="vertical" onFinish={onReset} autoComplete="off">
+            <Form.Item name="username" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
+              <Input prefix={<UserOutlined />} placeholder="用户名" allowClear />
+            </Form.Item>
+            <Form.Item name="newPassword" label="新密码" rules={[{ required: true, message: '请输入新密码' }, { min: 6, message: '新密码至少 6 位' }]}>
+              <Input.Password prefix={<LockOutlined />} placeholder="新密码（至少 6 位）" />
+            </Form.Item>
+            <Form.Item name="confirm" label="确认新密码" dependencies={['newPassword']}
+              rules={[{ required: true, message: '请再次输入新密码' }, ({ getFieldValue }) => ({
+                validator(_, value) {
+                  if (!value || getFieldValue('newPassword') === value) return Promise.resolve()
+                  return Promise.reject(new Error('两次输入的密码不一致'))
+                },
+              })]}>
+              <Input.Password prefix={<LockOutlined />} placeholder="再次输入新密码" />
+            </Form.Item>
+          </Form>
+        </Modal>
       </Card>
     </div>
   )

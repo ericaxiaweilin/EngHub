@@ -77,6 +77,15 @@ export function clearCredentials(): void {
   localStorage.removeItem(CRED_KEY)
 }
 
+/** 忘记密码自助重置: 凭用户名直接设新密码(内网信任环境) */
+export async function resetPassword(username: string, newPassword: string): Promise<{ message: string }> {
+  const { data } = await axios.post<{ message: string }>(API_ENDPOINTS.AUTH_RESET_PASSWORD, {
+    username,
+    new_password: newPassword,
+  })
+  return data
+}
+
 /** 会话是否超过 12 小时（强制重新登录） */
 export function isSessionExpired(): boolean {
   const loginAt = localStorage.getItem(LOGIN_AT_KEY)
