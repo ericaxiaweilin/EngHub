@@ -17,10 +17,24 @@ CREATE TABLE IF NOT EXISTS work_order_pause_reasons (
     sort_order INTEGER DEFAULT 0,               -- 排序顺序
     created_by VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Add indexes for efficient querying
+
+
+-- Trigger to automatically update updated_at on row modification
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_work_order_pause_reasons_timestamp
+BEFORE UPDATE ON work_order_pause_reasons
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE INDEX IF NOT EXISTS idx_factory_code ON work_order_pause_reasons(factory_id, code);
 CREATE INDEX IF NOT EXISTS idx_code_active ON work_order_pause_reasons(code, is_active);
 CREATE INDEX IF NOT EXISTS idx_category ON work_order_pause_reasons(category);
