@@ -42,6 +42,21 @@ class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
 
+class ResetPasswordRequest(BaseModel):
+    """忘记密码自助重置请求(内网信任环境: 凭用户名直接重置)"""
+    username: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("新密码至少 6 位")
+        if len(v) > 255:
+            raise ValueError("新密码过长")
+        return v
+
+
 class UserCreate(BaseModel):
     """用户创建请求"""
     username: str
@@ -67,7 +82,7 @@ class UserResponse(BaseModel):
     data_scope: dict = {}
     menu_items: list = []
     is_active: bool
-
+    
     class Config:
         from_attributes = True
 
@@ -89,7 +104,7 @@ class RoleResponse(BaseModel):
     level: int
     permissions: list
     data_scope: dict
-
+    
     class Config:
         from_attributes = True
 
@@ -147,7 +162,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     返回 access_token 和 refresh_token
     """
     user_service = UserService(db)
-
+    
     # 验证用户
     user = await user_service.authenticate_user(form_data.username, form_data.password)
     if not user:
@@ -156,16 +171,16 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
             detail="用户名或密码错误",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
+    
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="账号已被禁用，请联系管理员"
         )
-
+    
     # 更新最后登录时间
     await user_service.update_last_login(user.id)
-
+    
     # 生成 Token（包含角色信息）
     access_token = create_access_token(
         data={
@@ -179,7 +194,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     refresh_token = create_refresh_token(
         data={"sub": user.username, "user_id": str(user.id)}
     )
-
+    
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -195,29 +210,29 @@ async def refresh_token(request: RefreshTokenRequest, db: AsyncSession = Depends
     使用 refresh_token 获取新的 access_token
     """
     payload = decode_token(request.refresh_token)
-
+    
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效的刷新令牌"
         )
-
+    
     username = payload.get("sub")
     if not username:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效的刷新令牌"
         )
-
+    
     user_service = UserService(db)
     user = await user_service.get_user_by_username(username)
-
+    
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户不存在或已停用"
         )
-
+    
     # 生成新的 Token
     access_token = create_access_token(
         data={
@@ -231,7 +246,7 @@ async def refresh_token(request: RefreshTokenRequest, db: AsyncSession = Depends
     new_refresh_token = create_refresh_token(
         data={"sub": user.username, "user_id": str(user.id)}
     )
-
+    
     return TokenResponse(
         access_token=access_token,
         refresh_token=new_refresh_token,
@@ -251,7 +266,7 @@ async def register(
     需要管理员权限
     """
     user_service = UserService(db)
-
+    
     # 检查用户名是否已存在
     existing_user = await user_service.get_user_by_username(user_data.username)
     if existing_user:
@@ -259,7 +274,7 @@ async def register(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="用户名已存在"
         )
-
+    
     # 检查邮箱是否已存在
     existing_email = await user_service.get_user_by_email(user_data.email)
     if existing_email:
@@ -267,7 +282,7 @@ async def register(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="邮箱已被注册"
         )
-
+    
     # 创建用户（自动关联角色定义）
     user = await user_service.create_user(
         username=user_data.username,
@@ -278,7 +293,7 @@ async def register(
         role=user_data.role,
         is_superuser=user_data.is_superuser,
     )
-
+    
     return _build_user_response(user)
 
 
@@ -297,18 +312,32 @@ async def change_password(
 ):
     """修改密码"""
     user_service = UserService(db)
-
+    
     # 验证旧密码
     if not user_service.authenticate_user(current_user.username, old_password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="旧密码错误"
         )
-
+    
     # 更新密码
     await user_service.update_user(current_user.id, password=new_password)
-
+    
     return {"message": "密码修改成功"}
+
+
+@router.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """忘记密码自助重置(内网信任环境, 凭用户名直接设新密码, 无需登录态)。"""
+    user_service = UserService(db)
+    user = await user_service.get_user_by_username(request.username.strip())
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在",
+        )
+    await user_service.update_user(str(user.id), password=request.new_password)
+    return {"message": "密码已重置, 请用新密码登录"}
 
 
 @router.get("/roles", response_model=List[RoleResponse])

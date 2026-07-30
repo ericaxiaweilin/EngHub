@@ -670,7 +670,7 @@ async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any], fa
 
     pname = ""
     if wo.product_id:
-        p = (await db.execute(select(Product).where(Product.id == wo.product_id))).scalar_one_or_none()
+        p = (await db.execute(select(Product).where(Product.product_code == wo.product_id))).scalar_one_or_none()
         pname = p.product_name if p else ""
 
     detail = _wo_to_dict(wo, pname)
@@ -813,7 +813,7 @@ async def _tool_create_work_order(db: AsyncSession, args: Dict[str, Any], operat
         return {"error": "计划数量必须大于0"}
 
     # 校验产品存在
-    product = (await db.execute(select(Product).where(Product.id == product_id))).scalar_one_or_none()
+    product = (await db.execute(select(Product).where(Product.product_code == product_id))).scalar_one_or_none()
     if not product:
         # 尝试按编码/名称模糊匹配
         product = (await db.execute(
@@ -890,9 +890,9 @@ async def _tool_create_production_report(db: AsyncSession, args: Dict[str, Any],
     defect_qty = int(args.get("defect_qty", 0))
     shift = args.get("shift", "day")
 
-    wo = (await db.execute(select(WorkOrder).where(WorkOrder.id == wo_id))).scalar_one_or_none()
+    wo = await _resolve_work_order(db, wo_id)
     if not wo:
-        return {"error": f"未找到工单ID {wo_id}"}
+        return {"error": f"未找到工单 {wo_id}"}
     if wo.status not in ("released", "in_progress"):
         return {"error": f"工单 {wo.work_order_code} 状态为 {wo.status}，需先下达才能报工"}
 
@@ -945,9 +945,16 @@ async def _resolve_work_order(db: AsyncSession, code_or_id: str, factory_id: Opt
     """按 ID 或工单号（支持模糊）定位工单。"""
     if not code_or_id:
         return None
-    wo = (await db.execute(select(WorkOrder).where(WorkOrder.id == code_or_id))).scalar_one_or_none()
-    if wo:
-        return wo
+    # WorkOrder.id 为 uuid, 仅当入参形似 UUID 时才按 id 查, 否则传编码会抛 invalid UUID 异常
+    try:
+        uuid.UUID(str(code_or_id))
+        _is_uuid = True
+    except (ValueError, TypeError):
+        _is_uuid = False
+    if _is_uuid:
+        wo = (await db.execute(select(WorkOrder).where(WorkOrder.id == code_or_id))).scalar_one_or_none()
+        if wo:
+            return wo
     stmt = select(WorkOrder).where(WorkOrder.work_order_code == code_or_id)
     if factory_id:
         stmt = stmt.where(WorkOrder.factory_id == factory_id)
@@ -1214,7 +1221,7 @@ async def _tool_get_work_order_form(db: AsyncSession, args: Dict[str, Any], fact
     svc = WorkOrderService(db)
     form = svc.to_dict(wo)
     if wo.product_id:
-        p = (await db.execute(select(Product).where(Product.id == wo.product_id))).scalar_one_or_none()
+        p = (await db.execute(select(Product).where(Product.product_code == wo.product_id))).scalar_one_or_none()
         if p:
             form["product_name"] = p.product_name
     form["progress"] = await svc.get_progress(wo)
