@@ -131,7 +131,7 @@ class User(Base):
     
     __tablename__ = "users"
     
-    id = Column(String(36), primary_key=True, default=generate_uuid)
+    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
     username = Column(String(50), unique=True, nullable=False, index=True)
     email = Column(String(100), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
