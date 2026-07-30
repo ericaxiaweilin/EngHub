@@ -36,7 +36,7 @@ ADD COLUMN IF NOT EXISTS preferred_for VARCHAR(200);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_suppliers_supplier_code ON suppliers(supplier_code);
 CREATE INDEX IF NOT EXISTS idx_supplier_code ON suppliers(supplier_code);
 CREATE INDEX IF NOT EXISTS idx_supplier_status ON suppliers(is_active);
-CREATE INDEX IF NOT EXISTS idx_supplier_search ON UPPER(supplier_name);
+CREATE INDEX IF NOT EXISTS idx_supplier_search ON suppliers (UPPER(supplier_name));
 
 -- Seed sample supplier data (for testing/demo purposes)
 INSERT INTO suppliers (id, supplier_code, supplier_name, contact_person, phone, email, lead_time_days, moq_min, eoq_suggested, preferred_for, is_active)

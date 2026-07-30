@@ -1,0 +1,104 @@
+# .pre-commit-config.yaml - EP881 预提交钩子配置
+# 安装: pre-commit install
+# 运行: pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      # ── 代码风格 ───────────────────────────────
+      - id: black
+        name: Format code with Black
+        entry: black --check --line-length=120
+        language: system
+        types: [python]
+        args: [--target-version, py39]
+
+      - id: flake8
+        name: Lint with Flake8
+        entry: flake8 --max-line-length=120 --extend-ignore=E501,W503
+        language: system
+        types: [python]
+
+      - id: pylint
+        name: Run Pylint
+        entry: pylint --load-plugins=pylint_fastapi --disable=all --enable=C0303,C0304,C0305,C0306,C0307,C0308,C0309,C0310,C0311,C0312,C0313,C0314,C0315,C0316,W0611,W0612 W0614 --rcfile=.pylintrc
+        language: system
+        types: [python]
+        require_serial: true
+
+      - id: isort
+        name: Sort imports with Isort
+        entry: isort --check-only --profile=black --line-length=120
+        language: system
+        types: [python]
+
+      # ── 测试相关 ───────────────────────────────
+      - id: pytest-unit
+        name: Run Unit Tests
+        entry: pytest tests/unit/ -v --tb=short
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: pytest-integration
+        name: Run Integration Tests (skip by default in pre-commit)
+        entry: pytest tests/integration/ -v --tb=short -m "integration"
+        language: system
+        pass_filenames: false
+        types: [python]
+        args: ["--integration"]
+
+      # ── 安全检查 ───────────────────────────────
+      - id: detect-secrets
+        name: Scan for secrets
+        entry: secrets scan .
+        language: system
+        types: [file]
+        args: ['--baseline-file', '.secrets.baseline']
+
+      - id: bandit
+        name: Security linter (Bandit)
+        entry: bandit -r src/ -f json
+        language: system
+        types: [python]
+        args: ['-c', 'bandit.yml']
+
+      # ── 其他检查 ───────────────────────────────
+      - id: check-added-annotation
+        name: Check for missing type annotations
+        entry: python -m mypy --no-error-summary src/ tests/ 2>&1 | grep -E "error:" || true
+        language: system
+        types: [python]
+
+      - id: dead-code
+        name: Detect dead code
+        entry: flake8 --select=F821,F841
+        language: system
+        types: [python]
+
+      # ── 文档检查 ───────────────────────────────
+      - id: markdown-lint
+        name: Lint Markdown files
+        entry: mdx lint --ignore EOD,MD001,MD002,MD007,MD013,MD024,MD025,MD026,MD029,MD033,MD034,MD036,MD037,MD040,MD041,MD044,MD046,MD047,MD048,MD049,MD050,MD051,MD052,MD053,MD054,MD055,MD056,MD057,MD058,MD059,MD060,MD061,MD062,MD063,MD064,MD065,MD066,MD067,MD068,MD069,MD070,MD071,MD072,MD073,MD074,MD075,MD076,MD077,MD078,MD079,MD080,MD081,MD082,MD083,MD084,MD085,MD086,MD087,MD088,MD089,MD090,MD091,MD092,MD093,MD094,MD095,MD096,MD097,MD098,MD099,MD100
+        language: system
+        types: [md]
+
+defaults:
+  stages: [style, test, security]
+  verbose: true
+
+hooks:
+  - id: black
+    stages: [style]
+  - id: flake8
+    stages: [style]
+  - id: pylint
+    stages: [style]
+  - id: isort
+    stages: [style]
+  - id: pytest-unit
+    stages: [test]
+  - id: detect-secrets
+    stages: [security]
+  - id: bandit
+    stages: [security]

@@ -24,9 +24,11 @@ async def test_pp_aps_integration():
     mps = MPSService()
     mrp = MRPService()
     
-    # 创建数据库会话
-    session = await db_config.session_factory()
-    aps_service = ApsService(session)
+    # 获取数据库会话工厂
+    from database.db_config import db_config
+    session_factory = db_config.session_factory  # property 返回 async_sessionmaker
+    async with session_factory() as session:
+        aps_service = ApsService(session)
     
     try:
         # ========================
@@ -113,8 +115,7 @@ async def test_pp_aps_integration():
         import traceback
         traceback.print_exc()
         return False
-    finally:
-        await session.close()
+    # 会话由 async with 自动管理，无需手动关闭
 
 
 async def main():
