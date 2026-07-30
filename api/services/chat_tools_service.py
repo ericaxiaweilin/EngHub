@@ -1540,7 +1540,7 @@ async def _tool_query_downtime(db: AsyncSession, args: Dict[str, Any], factory_i
                d.start_time, d.end_time, d.duration_minutes,
                d.downtime_category, d.reason_code, d.description
         FROM equipment_downtime d
-        LEFT JOIN equipment e ON e.id = d.equipment_id
+        LEFT JOIN equipment e ON e.id::varchar = d.equipment_id
         WHERE {where}
         ORDER BY d.start_time DESC LIMIT :lim
     """), {**params, "lim": limit})).fetchall()
@@ -1562,7 +1562,7 @@ async def _tool_query_downtime(db: AsyncSession, args: Dict[str, Any], factory_i
                count(*) as fault_count,
                COALESCE(sum(d.duration_minutes), 0) as total_min
         FROM equipment_downtime d
-        LEFT JOIN equipment e ON e.id = d.equipment_id
+        LEFT JOIN equipment e ON e.id::varchar = d.equipment_id
         WHERE d.factory_id = :fid AND d.downtime_category = 'breakdown'
           AND d.start_time >= now() - interval '30 days'
         GROUP BY e.equipment_code, e.equipment_name
@@ -1593,7 +1593,7 @@ async def _tool_query_maintenance_due(db: AsyncSession, args: Dict[str, Any], fa
                e.equipment_code, e.equipment_name, e.status as eq_status,
                (p.next_due_at - now()) as remaining
         FROM maintenance_plans p
-        LEFT JOIN equipment e ON e.id = p.equipment_id
+        LEFT JOIN equipment e ON e.id::varchar = p.equipment_id
         WHERE p.factory_id = :fid AND p.is_active = true
           AND p.next_due_at <= now() + (:days || ' days')::interval
         ORDER BY p.next_due_at ASC
