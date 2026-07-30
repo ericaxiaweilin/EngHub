@@ -173,6 +173,10 @@ while IFS=$'\t' read -r status path extra; do
     R*) path="$extra" ;;
   esac
   case "$path" in
+    *" 2."*)
+      # Skip duplicate " 2" copies (Finder artifacts); they are not real sources.
+      continue
+      ;;
     requirements*.txt)
       echo "依赖文件已变化，热部署不支持；请先构建新镜像。" >&2
       exit 1
