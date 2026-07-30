@@ -1,21 +1,17 @@
-"""MES Repository Module - Absolute Import Version
-
-Handles all data access operations for MES-related entities.
-This layer separates business logic from database operations.
-"""
+"""MES Repository Module - Absolute Import Version"""
 
 from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import datetime
 
-# Absolute imports - database.models is a module (single file), not a package
+# Absolute imports
 from database.models import WorkOrder, ProductionReport, Product
 from api.schemas.mes_schemas import WorkOrderQueryCriteria
 
 
 class MESRepository:
-    """MES data access layer. All database interactions happen through this class."""
+    """MES data access layer."""
     
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -31,7 +27,7 @@ class MESRepository:
             query = query.where(Product.product_code == criteria.product_id)
         
         offset = (criteria.page - 1) * criteria.size
-        query = query.offset(limit=criteria.size).order_by(WorkOrder.created_at.desc())
+        query = query.offset(offset=offset).limit(criteria.size).order_by(WorkOrder.created_at.desc())
         
         result = await self.db.execute(query)
         return result.scalars().all()

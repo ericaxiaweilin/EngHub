@@ -146,12 +146,17 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
+    # 密码重置相关字段（用于忘记密码功能）
+    password_reset_token = Column(String(255), index=True, nullable=True, default=None)  # 重置令牌哈希
+    password_reset_expires = Column(DateTime, nullable=True)  # 令牌过期时间
+    
     # 关系
     role_obj = relationship("Role", back_populates="users", foreign_keys=[role_id])
     user_roles = relationship("UserRole", back_populates="user_obj", foreign_keys="UserRole.user_id")
     
     __table_args__ = (
         Index("idx_user_factory_role", "factory_id", "role"),
+        Index("idx_user_password_reset_token", "password_reset_token"),
     )
 
 
