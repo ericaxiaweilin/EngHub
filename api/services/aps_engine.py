@@ -237,7 +237,7 @@ class ApsEngine:
         if schedule_id:
             task_result = await self.db.execute(text(
                 "SELECT t.*, w.work_order_code, w.product_id, w.planned_qty, w.priority, w.planned_due "
-                "FROM aps_schedule_tasks t JOIN work_orders w ON t.work_order_id = w.id "
+                "FROM aps_schedule_tasks t JOIN work_orders w ON t.work_order_id = w.id::text "
                 "WHERE t.schedule_id = :sid ORDER BY t.station_id, t.planned_start"
             ), {"sid": schedule_id})
         else:
@@ -251,7 +251,7 @@ class ApsEngine:
             schedule_id = row[0]
             task_result = await self.db.execute(text(
                 "SELECT t.*, w.work_order_code, w.product_id, w.planned_qty, w.priority, w.planned_due "
-                "FROM aps_schedule_tasks t JOIN work_orders w ON t.work_order_id = w.id "
+                "FROM aps_schedule_tasks t JOIN work_orders w ON t.work_order_id = w.id::text "
                 "WHERE t.schedule_id = :sid ORDER BY t.station_id, t.planned_start"
             ), {"sid": schedule_id})
 
@@ -290,7 +290,7 @@ class ApsEngine:
         if row:
             task_result = await self.db.execute(text(
                 "SELECT t.planned_end, w.work_order_code, w.planned_due, w.planned_qty "
-                "FROM aps_schedule_tasks t JOIN work_orders w ON t.work_order_id = w.id "
+                "FROM aps_schedule_tasks t JOIN work_orders w ON t.work_order_id = w.id::text "
                 "WHERE t.schedule_id = :sid AND w.planned_due IS NOT NULL"
             ), {"sid": row[0]})
             for r in task_result.mappings().all():

@@ -287,10 +287,11 @@ class ApsService:
             if wo.routing_template_id:
 
                 if wo.product_id not in product_routings:
+                    routing_template_id = str(wo.routing_template_id)
 
                     steps_stmt = select(RoutingTemplateStep).where(
 
-                        RoutingTemplateStep.template_id == wo.routing_template_id
+                        RoutingTemplateStep.template_id == routing_template_id
 
                     ).order_by(RoutingTemplateStep.seq)
 
@@ -458,7 +459,7 @@ class ApsService:
 
             priority = PRIORITY_MAP.get(wo.priority, SchedulingPriority.NORMAL)
 
-            release = wo.planned_start or horizon_start
+            release = max(wo.planned_start or horizon_start, horizon_start)
 
             due = wo.planned_due or horizon_end
 
@@ -544,7 +545,7 @@ class ApsService:
 
                 schedule_id=schedule_id,
 
-                work_order_id=task.order_id,
+                work_order_id=str(task.order_id),
 
                 order_code=order_code,
 

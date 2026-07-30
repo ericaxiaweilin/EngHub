@@ -322,8 +322,8 @@ class RCCResourceDecisionEngine:
                     sc.available_hours_per_day,
                     sc.efficiency_rate
                 FROM stations s
-                LEFT JOIN production_reports pr ON pr.station_id = s.id AND pr.factory_id = s.factory_id
-                LEFT JOIN station_capacity sc ON sc.station_id = s.id AND sc.factory_id = s.factory_id
+                LEFT JOIN production_reports pr ON pr.station_id = s.id::text AND pr.factory_id = s.factory_id
+                LEFT JOIN station_capacity sc ON sc.station_id = s.id::text AND sc.factory_id = s.factory_id
                 WHERE s.factory_id = :fid
                 GROUP BY s.station_code, s.station_name, sc.available_hours_per_day, sc.efficiency_rate
                 ORDER BY sc.efficiency_rate DESC NULLS LAST

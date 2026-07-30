@@ -39,7 +39,6 @@ class WOStatus:
 # State Transitions Configuration
 # ============================================================
 TRANSITIONS: Dict[str, List[str]] = {
-    """State transition rules: current_state -> list of allowed next states"""
     WOStatus.DRAFT: [WOStatus.PENDING, WOStatus.CANCELLED],
     WOStatus.PENDING: [WOStatus.RELEASED, WOStatus.CANCELLED],
     WOStatus.RELEASED: [WOStatus.IN_PROGRESS, WOStatus.ON_HOLD, WOStatus.CANCELLED],

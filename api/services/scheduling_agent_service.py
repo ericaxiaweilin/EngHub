@@ -76,7 +76,7 @@ class SchedulingAgent:
         affected = await self.db.execute(text("""
             SELECT t.id, t.work_order_id, t.planned_start, t.planned_end, w.work_order_code
             FROM aps_schedule_tasks t
-            JOIN work_orders w ON t.work_order_id = w.id
+            JOIN work_orders w ON t.work_order_id = w.id::text
             JOIN aps_schedules s ON t.schedule_id = s.id
             WHERE t.station_id = :eid AND s.factory_id = :fid AND s.status IN ('draft', 'confirmed')
               AND t.planned_end > NOW()
@@ -259,7 +259,8 @@ class SchedulingAgent:
         capacities = [dict(r) for r in cap_result.mappings().all()]
 
         total_daily_capacity = sum(
-            c.get("available_hours_per_day", 16) * c.get("efficiency_rate", 0.85)
+            float(c.get("available_hours_per_day") or 16)
+            * float(c.get("efficiency_rate") or 0.85)
             for c in capacities
         ) or 16
 
@@ -275,7 +276,7 @@ class SchedulingAgent:
         at_risk = await self.db.execute(text("""
             SELECT w.work_order_code, w.planned_due, t.planned_end
             FROM aps_schedule_tasks t
-            JOIN work_orders w ON t.work_order_id = w.id
+            JOIN work_orders w ON t.work_order_id = w.id::text
             JOIN aps_schedules s ON t.schedule_id = s.id
             WHERE s.factory_id = :fid AND s.status IN ('draft', 'confirmed')
               AND w.planned_due IS NOT NULL
@@ -312,7 +313,11 @@ class SchedulingAgent:
               AND t.planned_start > NOW()
             GROUP BY t.station_id
         """), {"fid": factory_id})
-        loads = [dict(r) for r in result.mappings().all()]
+        loads = []
+        for row in result.mappings().all():
+            load = dict(row)
+            load["total_hours"] = float(load.get("total_hours") or 0)
+            loads.append(load)
 
         if not loads:
             return {"balanced": True, "message": "无待执行排程任务"}
@@ -387,7 +392,7 @@ class SchedulingAgent:
         # 3. 交期风险是否已标记？
         late_count = await self.db.execute(text("""
             SELECT COUNT(*) FROM aps_schedule_tasks t
-            JOIN work_orders w ON t.work_order_id = w.id
+            JOIN work_orders w ON t.work_order_id = w.id::text
             WHERE t.schedule_id = :sid AND w.planned_due IS NOT NULL AND t.planned_end > w.planned_due
         """), {"sid": schedule_id})
         late = late_count.scalar() or 0

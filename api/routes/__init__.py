@@ -2,7 +2,7 @@
 API Routes
 """
 
-from .mes_routes import router as mes_router
+from .mes_routes import router as mes_router  # Original stable implementation
 from .ie_routes import router as ie_router
 from .ie_routes_extended import router as ie_advanced_router
 from .pp_routes import router as pp_router
@@ -30,7 +30,6 @@ __all__ = [
     "qms_router",
     "wms_router",
     "auth_router",
-    "employee_skill_router",
     "sim_erp_router",
     "sim_factory_router",
     "chat_router",
@@ -38,4 +37,5 @@ __all__ = [
     "code_table_router",
     "aps_router",
     "bom_router",
+    "employee_skill_router",
 ]

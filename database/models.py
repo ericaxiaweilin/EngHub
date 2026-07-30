@@ -27,6 +27,14 @@ import uuid
 Base = declarative_base()
 
 
+def _model_to_dict(self):
+    """Return persisted columns without leaking SQLAlchemy internals."""
+    return {column.name: getattr(self, column.key) for column in self.__table__.columns}
+
+
+Base.to_dict = _model_to_dict
+
+
 def generate_uuid():
     """生成 UUID"""
     return str(uuid.uuid4())
@@ -138,12 +146,17 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
+    # 密码重置相关字段（用于忘记密码功能）
+    password_reset_token = Column(String(255), index=True, nullable=True, default=None)  # 重置令牌哈希
+    password_reset_expires = Column(DateTime, nullable=True)  # 令牌过期时间
+    
     # 关系
     role_obj = relationship("Role", back_populates="users", foreign_keys=[role_id])
     user_roles = relationship("UserRole", back_populates="user_obj", foreign_keys="UserRole.user_id")
     
     __table_args__ = (
         Index("idx_user_factory_role", "factory_id", "role"),
+        Index("idx_user_password_reset_token", "password_reset_token"),
     )
 
 
@@ -152,7 +165,7 @@ class WorkOrder(Base):
     
     __tablename__ = "work_orders"
     
-    id = Column(String(36), primary_key=True, default=generate_uuid)
+    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
     work_order_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
     sales_order_id = Column(String(50), index=True)
@@ -172,9 +185,13 @@ class WorkOrder(Base):
     actual_complete = Column(DateTime)
     assigned_station_id = Column(String(50), index=True)
     current_routing_step = Column(Integer, default=0)
+    current_stage = Column(String(100), nullable=True)
+    next_station = Column(String(100), nullable=True)
+    in_progress_status = Column(String(30), nullable=True)
+    partial_completion_percentage = Column(Float, default=0)
     bom_version = Column(String(50))
     # ---- 工单体系化编码：层级字段（主工单 <-> 工序工单）----
-    parent_work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    parent_work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=True, index=True)
     wo_type = Column(String(20), nullable=False, default="master", index=True)  # master=主工单 / operation=工序工单
     process_code = Column(String(20), nullable=True, index=True)  # 行业通用工序代码（SMT/INJ/MACH...），主工单为空
     operation_seq = Column(Integer, nullable=True)  # 同一工序内道次序号（01/02...）
@@ -210,37 +227,88 @@ class WorkOrder(Base):
 
 
 
-"""
-QualityInspection Model - Original Version (to be reinserted into models.py)
-
-This is the original IQC/FAI/IPC/OQC inspection record model with simple fields:
-- inspect_type (IQC/IPQC/FQC/OQC)
-- result (PASS/FAIL/PENDING)
-- sample_qty, defect_qty, good_qty
-- related work order and routing step
-"""
-
-from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Index
-from database.models import Base, generate_uuid, datetime
-
 class QualityInspection(Base):
     """质量检验记录表"""
     __tablename__ = "quality_inspections"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50), nullable=False, index=True)
-    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
+    work_order_id = Column(String(36), nullable=False, index=True)
     routing_step_id = Column(String(36), nullable=False, index=True)
     inspect_type = Column(String(20), nullable=False)  # IQC/IPQC/FQC/OQC
+    inspection_phase = Column(String(30), nullable=True)
     inspector_id = Column(String(50), nullable=False)
     sample_qty = Column(Integer, nullable=False, default=0)
+    sampling_method = Column(String(100), nullable=True)
+    check_tool_id = Column(String(50), nullable=True)
     defect_qty = Column(Integer, nullable=False, default=0)
     result = Column(String(20), nullable=False)  # PASS/FAIL/PENDING
     defect_details = Column(JSON, nullable=True)
     remark = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    work_order = relationship("WorkOrder")
+
+class Inspection(Base):
+    """Compatibility inspection model used by the complete AQL workflow."""
+
+    __tablename__ = "inspections"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    inspection_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    inspection_type = Column(String(20), nullable=False)
+    product_id = Column(String(50), nullable=True)
+    material_id = Column(String(50), nullable=True)
+    batch_id = Column(String(50), nullable=True)
+    batch_size = Column(Integer, default=0)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
+    aql_level = Column(Float, default=1.0)
+    inspection_level = Column(String(20), default="general_ii")
+    sample_size = Column(Integer, nullable=True)
+    status = Column(String(20), default="pending", nullable=False)
+    inspected_qty = Column(Integer, default=0)
+    defective_qty = Column(Integer, default=0)
+    inspector_id = Column(String(50))
+    inspected_at = Column(DateTime)
+    aql_result = Column(JSON)
+    remarks = Column(Text)
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class Defect(Base):
+    """Compatibility defect model used by the AQL/OCAP workflow."""
+
+    __tablename__ = "defects"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    defect_code = Column(String(50), unique=True, nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    defect_type = Column(String(50), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    severity = Column(String(20), nullable=False)
+    inspection_id = Column(String(36), ForeignKey("inspections.id"), nullable=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True)
+    material_id = Column(String(50), nullable=True)
+    batch_id = Column(String(50), nullable=True)
+    station_id = Column(String(50), nullable=True)
+    description = Column(Text)
+    status = Column(String(20), default="open", nullable=False)
+    disposition = Column(String(20))
+    disposition_by = Column(String(50))
+    disposition_at = Column(DateTime)
+    disposition_qty = Column(Integer)
+    disposition_remark = Column(Text)
+    ocap_status = Column(String(20), default="pending")
+    ocap_triggered_at = Column(DateTime)
+    ocap_trigger_reason = Column(Text)
+    created_by = Column(String(50))
+    updated_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
 
 class WoStatusLog(Base):
     """工单状态操作日志（审核追溯：谁/什么角色/何时/做了什么）"""
@@ -311,6 +379,9 @@ class Plan(Base):
     priority = Column(Integer, default=50)
     priority_score = Column(Numeric(10, 2))
     status = Column(String(20), nullable=False, default='draft')
+    planning_cycle = Column(String(30), nullable=True)
+    release_status = Column(String(20), default="unreleased")
+    planner_id = Column(String(50), nullable=True)
     
     station_id = Column(String(50))
     scheduled_start_date = Column(Date)
@@ -340,10 +411,10 @@ class ProductionReport(Base):
     
     __tablename__ = "production_reports"
     
-    id = Column(String(36), primary_key=True, default=generate_uuid)
+    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
     report_code = Column(String(50), unique=True, nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
-    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
+    work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=False, index=True)
     station_id = Column(String(50), nullable=False, index=True)
     good_qty = Column(Integer, nullable=False, default=0)
     defect_qty = Column(Integer, default=0)
@@ -351,6 +422,8 @@ class ProductionReport(Base):
     report_type = Column(String(20), default="normal")
     shift = Column(String(20), default="day")
     operator_id = Column(String(50))
+    assistant_operator_ids = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    quality_check_passed = Column(Boolean, nullable=True)
     remark = Column(Text)
     # ---- 023: 岗位替代 Phase 1 扩展 ----
     operation_seq = Column(Integer, nullable=True)
@@ -386,7 +459,7 @@ class ProductionReportComment(Base):
     __tablename__ = "production_report_comments"
     
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    report_id = Column(String(36), ForeignKey("production_reports.id"), nullable=False, index=True)
+    report_id = Column(UUID(as_uuid=False), ForeignKey("production_reports.id"), nullable=False, index=True)
     comment = Column(Text, nullable=False)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -411,6 +484,9 @@ class Product(Base):
     standard_cost = Column(Float)
     selling_price = Column(Float)
     current_bom_version = Column(String(20))
+    current_routing_id = Column(String(50), nullable=True)
+    engineering_lead_time_days = Column(Float, nullable=True)
+    manufacturing_lead_time_days = Column(Float, nullable=True)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -493,6 +569,9 @@ class RoutingTemplateStep(Base):
     standard_hours = Column(Numeric(8, 2), default=0)
     is_parallel = Column(Boolean, default=False)
     is_qc_gate = Column(Boolean, default=False)
+    quality_requirement = Column(Text, nullable=True)
+    sop_document_url = Column(String(500), nullable=True)
+    tooling_requirement = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
     remark = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -526,6 +605,341 @@ class AlertIntelligenceReview(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
+class TimeStudyRecord(Base):
+    """时间研究记录"""
+    
+    __tablename__ = "time_study_records"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    station_id = Column(String(50), nullable=False, index=True)
+    operation_name = Column(String(100), nullable=False)
+    operator_id = Column(String(50))
+    observer_id = Column(String(50))
+    observation_date = Column(DateTime, nullable=False)
+    observed_cycles = Column(JSON, default=list)  # 观测周期数据 (JSON)
+    cycle_count = Column(Integer)
+    average_time = Column(Float)  # 平均时间
+    rating_factor = Column(Float)  # 评定系数
+    normal_time = Column(Float)  # 正常时间
+    allowed_time = Column(Float)  # 允许时间
+    allowance_rate = Column(Float)  # 宽放率
+    method = Column(String(50))  # 研究方法
+    status = Column(String(20))  # 状态 (pending/approved/rejected)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_factory_product_station", "factory_id", "product_id", "station_id"),
+    )
+
+
+class StandardOperationTime(Base):
+    """标准工时记录"""
+    
+    __tablename__ = "standard_operation_times"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    routing_step = Column(String(50))  # 工艺路线步骤编号
+    operation_seq = Column(Integer, nullable=True)
+    operation_name = Column(String(100), nullable=False)  # 工序名称
+    station_id = Column(String(50))  # 工位编码
+    work_center = Column(String(50))  # 加工中心
+    standard_time_min = Column(Float)  # 标准工时（分钟）
+    unit_time_type = Column(String(20))  # 时间类型（单件/批量等）
+    setup_time_min = Column(Float)  # 准备时间（分钟）
+    setup_before_start_time_min = Column(Float, nullable=True)
+    post_operation_time_min = Column(Float, nullable=True)
+    batch_size = Column(Integer)  # 批量数
+    rating_factor = Column(Float)  # 速度系数
+    allowance_rate = Column(Float)  # 宽放率
+    effective_standard_time = Column(Float)  # 有效标准工时
+    version = Column(String(20))  # 版本号
+    is_active = Column(Boolean, default=True)  # 是否生效
+    validity_start = Column(DateTime)  # 生效开始时间
+    validity_end = Column(DateTime)  # 失效结束时间
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_factory_product", "factory_id", "product_id"),
+        Index("idx_station_factory", "station_id", "factory_id"),
+    )
+
+
+class LineBalanceAnalysis(Base):
+    """产线平衡分析记录"""
+    
+    __tablename__ = "line_balance_analyses"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    line_id = Column(String(50), nullable=False, index=True)
+    analysis_date = Column(DateTime, nullable=False)
+    takt_time_min = Column(Float)
+    cycle_time_max = Column(Float)
+    cycle_time_avg = Column(Float)
+    balance_rate = Column(Float)
+    idle_time_total = Column(Float)
+    workstation_count = Column(Integer)
+    is_balanced = Column(Boolean, default=False)
+    workstation_details = Column(JSON, default=dict)
+    bottleneck_station = Column(String(50))
+    bottleneck_time = Column(Float)
+    recommendations = Column(JSON, default=list)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ProcessAnalysis(Base):
+    """工序分析记录"""
+    
+    __tablename__ = "process_analyses"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    operation_code = Column(String(50), nullable=False, index=True)
+    analysis_date = Column(DateTime, nullable=False)
+    total_process_time_min = Column(Float)
+    va_time_min = Column(Float)
+    nva_time_min = Column(Float)
+    wait_time_min = Column(Float)
+    move_time_min = Column(Float)
+    inspect_time_min = Column(Float)
+    va_ratio = Column(Float)
+    lead_time = Column(Float)
+    efficiency_score = Column(Float)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ActionStudy(Base):
+    """动作研究记录"""
+    
+    __tablename__ = "action_studies"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    operation_name = Column(String(100))
+    station_id = Column(String(50))
+    operator_id = Column(String(50))
+    study_date = Column(DateTime, nullable=False)
+    method_type = Column(String(50))
+    recorded_by = Column(String(50), nullable=True)
+    motions = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    total_time_cycles = Column(Float, nullable=True)
+    analysis_result = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    duration_min = Column(Float)
+    energy_consumption = Column(Float)
+    fatigue_level = Column(Integer)
+    improvement_suggestion = Column(Text)
+    motion_analysis_result = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    ergonomic_score = Column(Float, nullable=True)
+    recommended_improvement_suggestion = Column(Text, nullable=True)
+    is_optimized = Column(Boolean, default=False)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MethodStudy(Base):
+    """方法研究记录"""
+    
+    __tablename__ = "method_studies"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    original_operation = Column(String(255))
+    version = Column(String(20))
+    is_basement_method = Column(Boolean, default=False)
+    is_optimal_method = Column(Boolean, default=False)
+    description = Column(Text)
+    old_method_description = Column(Text, nullable=True)
+    improved_method_diagram_url = Column(String(500), nullable=True)
+    expected_time_saving_calculation_detail = Column(
+        JSON().with_variant(JSONB, "postgresql"), default=dict
+    )
+    improved_operation = Column(Text)
+    action_sequence = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    required_resources = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    setup_time_min = Column(Float, nullable=True)
+    cycle_time_min = Column(Float, nullable=True)
+    total_standard_time_min = Column(Float, nullable=True)
+    validity_start = Column(DateTime, nullable=True)
+    validity_end = Column(DateTime, nullable=True)
+    approved_by = Column(String(50), nullable=True)
+    status = Column(String(20), default="draft")
+    expected_time_saving_min = Column(Float)
+    cost_impact = Column(Float)
+    implementation_status = Column(String(50))
+    implementer_id = Column(String(50))
+    implementation_date = Column(DateTime)
+    verification_result = Column(String(100))
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkCellLayout(Base):
+    """工作单元布局"""
+    
+    __tablename__ = "work_cell_layouts"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_cell_id = Column(String(50), nullable=False, index=True)
+    product_family_id = Column(String(50))
+    layout_diagram_url = Column(String(255))
+    material_flow_path = Column(JSON, default=dict)
+    operator_movement_path = Column(JSON, default=dict)
+    takt_time_alignment = Column(String(50))
+    storage_location_type = Column(String(50), nullable=True)
+    description = Column(Text)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class KanbanSystem(Base):
+    """看板系统"""
+    
+    __tablename__ = "kanban_systems"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    kanban_id = Column(String(50), nullable=False, index=True)
+    kanban_type = Column(String(50))
+    upstream_station = Column(String(50))
+    downstream_station = Column(String(50))
+    product_id = Column(String(50))
+    part_number = Column(String(100))
+    min_stock_level = Column(Integer)
+    max_stock_level = Column(Integer)
+    max_card_count = Column(Integer, nullable=True)
+    current_card_count = Column(Integer, nullable=True)
+    safety_stock_level = Column(Integer, nullable=True)
+    card_status = Column(String(20), nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+    reorder_quantity = Column(Integer)
+    lead_time_days = Column(Integer)
+    kanban_card_image_url = Column(String(500), nullable=True)
+    trigger_rule_type = Column(String(50), nullable=True)
+    min_max_stock_levels_detail = Column(
+        JSON().with_variant(JSONB, "postgresql"), default=dict
+    )
+    holder_id = Column(String(50))
+    status = Column(String(20), default="active")
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class FiveSAudit(Base):
+    """5S 审核记录"""
+    
+    __tablename__ = "five_s_audits"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    work_center_id = Column(String(50), nullable=False, index=True)
+    audit_date = Column(DateTime, nullable=False)
+    auditor_id = Column(String(50))
+    seiri_score = Column(Integer)  # 整理评分
+    seiton_score = Column(Integer)  # 整顿评分
+    seiso_score = Column(Integer)  # 清扫评分
+    seiketsu_score = Column(Integer, nullable=True)
+    shitsuke_score = Column(Integer, nullable=True)
+    improvement_items = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    next_audit_date = Column(Date, nullable=True)
+    seiketsu_score = Column(Integer)  # 清洁评分
+    shitsuke_score = Column(Integer)  # 素养评分
+    total_score = Column(Integer)
+    improvement_items = Column(JSON, default=list)
+    next_audit_date = Column(DateTime)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ShiftSummary(Base):
+    """班次汇总记录"""
+    
+    __tablename__ = "shift_summaries"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    shift_date = Column(Date, nullable=False)
+    shift_type = Column(String(20))  # 白班/夜班/晚班等
+    station_id = Column(String(50))
+    work_order_id = Column(String(50))
+    product_id = Column(String(50))
+    total_output = Column(Integer)
+    good_qty = Column(Integer)
+    defect_qty = Column(Integer)
+    scrap_qty = Column(Integer)
+    yield_rate = Column(Float)
+    target_output = Column(Integer)
+    achievement_rate = Column(Float)
+    report_count = Column(Integer)
+    total_cycle_time = Column(Float)
+    operator_count = Column(Integer)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CodeTable(Base):
+    """代码表（字典表）"""
+    
+    __tablename__ = "code_tables"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    category = Column(String(50), nullable=False, index=True)  # 类别（如 status, type, level 等）
+    code = Column(String(50), nullable=False, index=True)  # 代码值
+    name = Column(String(100), nullable=False)  # 中文名称
+    name_en = Column(String(100))  # 英文名称
+    description = Column(Text)  # 描述
+    keywords = Column(JSON, default=dict)  # 关键词
+    extra = Column(JSON, default=dict)  # 扩展字段
+    sort_order = Column(Integer, default=0)  # 排序
+    is_active = Column(Boolean, default=True)  # 是否启用
+    is_system = Column(Boolean, default=False)  # 是否为系统内置
+    factory_id = Column(String(50), index=True)  # 所属工厂（空表示全局）
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Equipment(Base):
     """设备表"""
     
@@ -537,6 +951,11 @@ class Equipment(Base):
     factory_id = Column(String(50), nullable=False, index=True)
     station_id = Column(String(50), index=True)
     equipment_type = Column(String(50))
+    manufacturer_model = Column(String(100), nullable=True)
+    serial_number = Column(String(100), nullable=True)
+    purchase_date = Column(Date, nullable=True)
+    warranty_expiry = Column(Date, nullable=True)
+    maintenance_interval_days = Column(Integer, nullable=True)
     status = Column(String(20), default="available")
     last_maintenance_date = Column(DateTime)
     next_maintenance_date = Column(DateTime)
@@ -579,6 +998,10 @@ class Location(Base):
     warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False, index=True)
     location_type = Column(String(20), default="rack")
     zone = Column(String(50))
+    aisle = Column(String(30), nullable=True)
+    rack = Column(String(30), nullable=True)
+    level = Column(String(30), nullable=True)
+    bin_code = Column(String(30), nullable=True)
     capacity = Column(Integer)
     status = Column(String(20), default="active")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -602,6 +1025,9 @@ class Inventory(Base):
     warehouse_id = Column(String(36), ForeignKey("warehouses.id"), nullable=False, index=True)
     location_id = Column(String(36), ForeignKey("locations.id"))
     batch_code = Column(String(50), index=True)
+    expiry_date = Column(Date, nullable=True)
+    storage_location = Column(String(100), nullable=True)
+    qualified_status = Column(String(20), default="qualified")
     total_qty = Column(Integer, default=0, nullable=False)
     available_qty = Column(Integer, default=0, nullable=False)
     reserved_qty = Column(Integer, default=0)
@@ -661,6 +1087,40 @@ class OutboundOrder(Base):
     completed_at = Column(DateTime)
 
 
+class InventoryTransaction(Base):
+    """库存交易流水表（出入库记录）"""
+    
+    __tablename__ = "inventory_transactions"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    inventory_id = Column(String(36), ForeignKey("inventory.id"), nullable=False)
+    material_id = Column(String(50), nullable=False, index=True)
+    batch_code = Column(String(50))
+    transaction_type = Column(String(20), nullable=False)  # INBOUND/OUTBOUND/ADJUSTMENT/PRODUCTION_OUT/WIP_TRANSFER etc.
+    quantity = Column(Integer, nullable=False)
+    before_qty = Column(Integer)
+    after_qty = Column(Integer)
+    reference_type = Column(String(30))  # e.g., work_order, inbound_order, production_order
+    reference_id = Column(String(36))  # reference to related entity
+    reference_doc_no = Column(String(100), nullable=True)
+    reason_code = Column(String(50), nullable=True)
+    operator = Column(String(50))
+    remark = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    # Relationship to WorkOrder (if transaction is linked to a production order)
+    work_order_id = Column(String(50), index=True)
+    
+    __table_args__ = (
+        Index("idx_inv_txn_factory", "factory_id"),
+        Index("idx_inv_txn_mat", "material_id"),
+        Index("idx_inv_txn_batch", "batch_code"),
+        Index("idx_inv_txn_date", "created_at"),
+        Index("idx_inv_txn_work_order", work_order_id, transaction_type),  # 针对成本核算JOIN的复合索引
+    )
+
+
 # ==================== 员工技能模型 ====================
 
 class Skill(Base):
@@ -688,6 +1148,9 @@ class EmployeeSkill(Base):
     certified_date = Column(DateTime)
     expiry_date = Column(DateTime)
     score = Column(Numeric(5, 2))
+    training_record_link = Column(String(500), nullable=True)
+    competency_assessment_score = Column(Numeric(5, 2), nullable=True)
+    skill_level_date = Column(Date, nullable=True)
     remarks = Column(Text)
     evaluated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -714,6 +1177,7 @@ class TrainingRecord(Base):
     hours = Column(Numeric(5, 2))
     result = Column(String(20))
     certificate_no = Column(String(50))
+    notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     
     user = relationship("User", backref="training_records")
@@ -918,6 +1382,10 @@ class DefectRecord(Base):
     station_id = Column(String(50), nullable=True, index=True)
     equipment_id = Column(String(36), ForeignKey("equipment.id"), nullable=True, index=True)
     defect_type = Column(String(50), nullable=False)      # appearance/dimension/function/performance/material/process/other
+    defect_classification = Column(String(50), nullable=True)
+    failure_mode = Column(String(100), nullable=True)
+    rpn_value = Column(Integer, nullable=True)
+    corrective_action_link = Column(String(500), nullable=True)
     severity = Column(String(20), nullable=False, default="minor")  # critical/major/minor/observation
     quantity = Column(Integer, nullable=False, default=0)
     disposition = Column(String(20), nullable=True)        # rework/repair/scrap/concession/return
@@ -1131,6 +1599,9 @@ class CAPACase(Base):
     
     # 状态流转
     status = Column(String(20), default="open")  # "open", "in_progress", "verified", "closed"
+    effectiveness_check_date = Column(DateTime, nullable=True)
+    verification_result = Column(Text, nullable=True)
+    preventive_scope = Column(Text, nullable=True)
     
     # 执行记录
     action_logs = Column(JSONB, default=list)  # [{"status": "...", "at": "...", "by": "...", "notes": "..."}]
@@ -1204,12 +1675,15 @@ class ApsSchedule(Base):
     __tablename__ = "aps_schedules"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
+    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50))
     status = Column(String(20))
     schedule_code = Column(String(50))
     mode = Column(String(20), default="hybrid")
     optimize_for = Column(String(20), default="delivery")
+    priority_level = Column(String(20), nullable=True)
+    constraint_type = Column(String(50), nullable=True)
+    feasibility_status = Column(String(20), nullable=True)
     horizon_start = Column(DateTime)
     horizon_end = Column(DateTime)
     on_time_rate = Column(Float)
@@ -1228,11 +1702,14 @@ class ApsScheduleTask(Base):
     __tablename__ = "aps_schedule_tasks"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    schedule_id = Column(UUID(as_uuid=True))
+    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    schedule_id = Column(UUID(as_uuid=False))
     station_id = Column(String(50))
     planned_start = Column(DateTime)
     planned_end = Column(DateTime)
+    actual_start = Column(DateTime, nullable=True)
+    actual_end = Column(DateTime, nullable=True)
+    deviation_reason = Column(Text, nullable=True)
     status = Column(String(20))
     setup_minutes = Column(Float, default=0)
     material_ready = Column(Boolean, default=True)
@@ -1330,6 +1807,370 @@ class EngHubBomItem(Base):
     )
 
 
+class QmsInspectionItem(Base):
+    """QMS检验项记录"""
+    
+    __tablename__ = "qms_inspection_items"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    inspection_id = Column(String(50), nullable=False, index=True)  # 检验单ID
+    item_name = Column(String(100))  # 检验项目名称
+    item_code = Column(String(50))  # 检验项目编码
+    spec_lower = Column(Float)  # 规格下限
+    spec_upper = Column(Float)  # 规格上限
+    target_value = Column(Float)  # 目标值
+    measured_value = Column(Float)  # 实测值
+    result = Column(String(20))  # 检验结果（合格/不合格等）
+    measurement_method = Column(String(100))  # 测量方法
+    remark = Column(Text)  # 备注
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class QualityGoal(Base):
+    """质量目标"""
+    
+    __tablename__ = "quality_goals"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50))
+    metric_type = Column(String(50))  # 不良率、一次合格率等
+    target_value = Column(Float)
+    actual_value = Column(Float)
+    period = Column(String(20))  # 日/周/月
+    status = Column(String(20), default="active")  # active/archived
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class QualityGoalReview(Base):
+    """质量目标评审记录"""
+    
+    __tablename__ = "quality_goal_reviews"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    goal_id = Column(String(36), nullable=False)
+    review_date = Column(DateTime, nullable=False)
+    reviewer = Column(String(50))
+    comments = Column(Text)
+    approved = Column(Boolean, default=False)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class QmsSpcPoint(Base):
+    """SPC控制图数据点"""
+    
+    __tablename__ = "qms_spc_points"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    characteristic_code = Column(String(50), nullable=False, index=True)  # 特征码
+    characteristic_name = Column(String(100))  # 特征名称
+    control_chart_type = Column(String(30), nullable=True)
+    calculation_method = Column(String(50), nullable=True)
+    subgroup_count = Column(Integer, nullable=True)
+    work_order_id = Column(String(50))  # 关联工单
+    station_id = Column(String(50))  # 工位
+    measured_value = Column(Float)  # 测量值
+    sample_group = Column(Integer)  # 样本组号
+    ucl = Column(Float)  # 上控制限
+    lcl = Column(Float)  # 下控制限
+    cl = Column(Float)  # 中心线
+    is_out_of_control = Column(Boolean, default=False)  # 是否失控
+    measured_at = Column(DateTime, nullable=False)  # 测量时间
+    measured_by = Column(String(50))  # 测量人
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ProcessCapability(Base):
+    """工序能力分析"""
+    
+    __tablename__ = "process_capability"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50), nullable=False, index=True)
+    station_id = Column(String(50), nullable=False, index=True)
+    operation_name = Column(String(100))  # 工序名称
+    characteristic = Column(String(100))  # 特性名称
+    specification_min = Column(Float)  # 规格下限
+    specification_max = Column(Float)  # 规格上限
+    mean_value = Column(Float)  # 均值
+    standard_deviation = Column(Float)  # 标准差
+    cp = Column(Float)  # 工序能力指数
+    cpk = Column(Float)  # 工序能力潜力指数
+    sampling_size = Column(Integer)  # 抽样数量
+    sample_date = Column(DateTime, nullable=False)
+    status = Column(String(20), default="analyzed")  # analyzed/pending
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InventoryCountItem(Base):
+    """库存盘点明细记录"""
+    
+    __tablename__ = "inventory_count_items"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    count_id = Column(String(50), nullable=False)  # 盘点单ID
+    inventory_id = Column(String(36))  # 关联库存物料ID（Inventory.id）
+    material_id = Column(String(50))  # 物料ID
+    batch_code = Column(String(50))  # 批次号
+    system_qty = Column(Integer)  # 系统数量
+    counted_qty = Column(Integer)  # 实际盘点数量
+    diff_qty = Column(Integer)  # 差异数量（counted - system）
+    adjusted = Column(Boolean, default=False)  # 是否已调整
+    remark = Column(String(255))  # 备注
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ProductionAlert(Base):
+    """生产告警记录"""
+    
+    __tablename__ = "production_alerts"
+    
+    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    alert_type = Column(String(50))  # 告警类型（缺料/设备故障/质量异常等）
+    severity = Column(String(20))  # 严重程度（critical/high/medium/low）
+    title = Column(String(255))  # 标题
+    message = Column(Text)  # 详细信息
+    source_type = Column(String(50))  # 来源类型（equipment/work_order/quality等）
+    source_id = Column(String(36))  # 来源ID
+    metric_value = Column(Float)  # 指标值
+    threshold_value = Column(Float)  # 阈值
+    is_read = Column(Boolean, default=False)  # 是否已读
+    is_resolved = Column(Boolean, default=False)  # 是否已解决
+    resolved_by = Column(String(50))  # 解决人
+    resolved_at = Column(DateTime)  # 解决时间
+    triggered_at = Column(DateTime, nullable=False)  # 触发时间
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class EquipmentDowntime(Base):
+    """设备停机记录"""
+    
+    __tablename__ = "equipment_downtime"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    equipment_id = Column(String(50))  # 设备ID
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    start_time = Column(DateTime, nullable=False)  # 开始时间
+    end_time = Column(DateTime)  # 结束时间
+    duration_minutes = Column(Float)  # 停机分钟数
+    downtime_category = Column(String(50))  # 停机类别（故障/维护/缺料等）
+    reason_code = Column(String(50))  # 原因代码
+    description = Column(Text)  # 描述
+    reported_by = Column(String(50))  # 报告人
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MaintenanceOrder(Base):
+    """维修工单"""
+    
+    __tablename__ = "maintenance_orders"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    order_code = Column(String(50), unique=True, nullable=False)  # 工单编号
+    equipment_id = Column(String(50), nullable=False)  # 设备ID
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    order_type = Column(String(50))  # 工单类型（预防性/ corrective/紧急）
+    priority = Column(String(20), default="normal")  # 优先级
+    status = Column(String(20), default="pending")  # 状态（pending/in progress/completed/canceled）
+    scheduled_start = Column(DateTime)  # 计划开始时间
+    scheduled_end = Column(DateTime)  # 计划结束时间
+    actual_start = Column(DateTime)  # 实际开始时间
+    actual_end = Column(DateTime)  # 实际结束时间
+    description = Column(Text)  # 描述
+    assigned_to = Column(String(50))  # 负责人
+    parts_used = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    labor_hours = Column(Float, nullable=True)
+    cost_analysis = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    failure_root_cause_code = Column(String(50), nullable=True)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MaintenancePlan(Base):
+    """维修计划"""
+    
+    __tablename__ = "maintenance_plans"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    plan_code = Column(String(50), unique=True, nullable=False)  # 计划编号
+    equipment_id = Column(String(50), nullable=False)  # 设备ID
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    plan_type = Column(String(50))  # 计划类型（daily/weekly/monthly/yearly）
+    frequency = Column(String(50))  # 频率
+    next_run_date = Column(Date)  # 下次运行日期
+    last_run_date = Column(Date)  # 上次运行日期
+    description = Column(Text)  # 描述
+    is_active = Column(Boolean, default=True)  # 是否启用
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Notification(Base):
+    """通知记录"""
+    
+    __tablename__ = "notifications"
+    
+    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    title = Column(String(255), nullable=False)  # 标题
+    content = Column(Text)  # 内容
+    severity = Column(String(20))  # 严重程度
+    category = Column(String(50))  # 类别
+    recipient = Column(String(50))  # 接收人
+    is_read = Column(Boolean, default=False)  # 是否已读
+    source_type = Column(String(50), nullable=True)
+    source_id = Column(String(100), nullable=True)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class HourlyOutputSnapshot(Base):
+    """小时产出快照"""
+    
+    __tablename__ = "hourly_output_snapshots"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    snapshot_date = Column(Date, nullable=False)  # 日期
+    snapshot_hour = Column(Integer, nullable=False)  # 小时
+    station_id = Column(String(50), nullable=False, index=True)  # 工位
+    output_qty = Column(Integer)  # 总产出
+    good_qty = Column(Integer)  # 良品数
+    defect_qty = Column(Integer)  # 不良品数
+    target_qty = Column(Integer)  # 目标产量
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InventoryCount(Base):
+    """库存盘点记录"""
+    
+    __tablename__ = "inventory_counts"
+    """库存盘点记录"""
+    
+    __tablename__ = "inventory_counts"
+    """库存盘点记录"""
+    
+    __tablename__ = "inventory_counts"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    count_code = Column(String(50), nullable=False, unique=True)  # 盘点单号
+    factory_id = Column(String(50), nullable=False, index=True)  # 工厂
+    warehouse_id = Column(String(50))  # 仓库
+    count_type = Column(String(20))  # 盘点类型（日常/月度/年度等）
+    status = Column(String(20), default="planned")  # 计划/执行中/已完成/待审核
+    planned_date = Column(Date)  # 计划盘点日期
+    counted_by = Column(String(50))  # 盘点人
+    approved_by = Column(String(50))  # 审核人
+    total_items = Column(Integer)  # 总物品数
+    diff_items = Column(Integer)  # 差异物品数
+    total_diff_qty = Column(Integer)  # 差异总数量
+    remark = Column(Text)  # 备注
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SpcConfig(Base):
+    """SPC配置"""
+    """SPC配置"""
+    
+    __tablename__ = "spc_configs"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    product_id = Column(String(50))
+    station_id = Column(String(50))
+    characteristic_code = Column(String(50), nullable=False, index=True)
+    sample_size = Column(Integer, default=5)  # 子组大小
+    sample_interval = Column(Integer, nullable=False)  # 采样间隔（分钟）
+    control_rule = Column(String(50), default="westgard")  # 判异规则
+    is_active = Column(Boolean, default=True)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Qms8dReport(Base):
+    
+    __tablename__ = "qms_8d_reports"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    report_code = Column(String(50), unique=True, nullable=False)
+    factory_id = Column(String(50), nullable=False, index=True)
+    defect_record_id = Column(String(36))  # 关联缺陷记录ID
+    title = Column(String(255), nullable=False)  # 标题
+    severity = Column(String(20))  # 严重程度
+    status = Column(String(20), default="open")  # 状态
+    d1_team = Column(Text)  # D1团队描述
+    d2_problem_description = Column(Text)  # D2问题描述
+    d3_containment_action = Column(Text)  # D3遏制措施
+    d4_root_cause = Column(Text)  # D4根本原因
+    d5_corrective_action = Column(Text)  # D5纠正措施
+    d6_implementation = Column(Text)  # D6实施情况
+    d7_preventive_action = Column(Text)  # D7预防措施
+    d8_congratulations = Column(Text)  # D8表彰/总结经验
+    opened_by = Column(String(50))
+    closed_by = Column(String(50))
+    due_date = Column(DateTime)
+    
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class EngHubBomSyncLog(Base):
     """BOM 同步日志"""
     __tablename__ = "enghub_bom_sync_log"
@@ -1342,4 +2183,3 @@ class EngHubBomSyncLog(Base):
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     error_message = Column(Text)
-

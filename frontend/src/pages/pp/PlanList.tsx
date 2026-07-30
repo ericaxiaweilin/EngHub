@@ -61,9 +61,9 @@ const PlanList: React.FC = () => {
     try {
       const res = await listPlans(factory)
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_PLANS)
+      setData(items)
     } catch {
-      setData(MOCK_PLANS)
+      setData([])
     } finally {
       setLoading(false)
     }

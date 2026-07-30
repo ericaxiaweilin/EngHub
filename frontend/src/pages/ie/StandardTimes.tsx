@@ -17,26 +17,18 @@ interface StandardTime {
   factory_id: string
   product_id: string
   routing_step: string
+  operation_seq?: number
   operation_name: string
   station_id?: string
   standard_time_min: number
+  setup_before_start_time_min?: number
+  post_operation_time_min?: number
   effective_standard_time: number
   version: string
   is_active: boolean
   validity_start: string
   created_at: string
 }
-
-const MOCK_DATA: StandardTime[] = [
-  { id: 'mock-1', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP10', operation_name: '精车外圆', station_id: 'ST-01', standard_time_min: 2.35, effective_standard_time: 2.12, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
-  { id: 'mock-2', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP20', operation_name: '铣平面', station_id: 'ST-02', standard_time_min: 3.80, effective_standard_time: 3.42, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
-  { id: 'mock-3', factory_id: 'factory-sh-01', product_id: 'PRD-002', routing_step: 'OP10', operation_name: '钻孔', station_id: 'ST-03', standard_time_min: 1.55, effective_standard_time: 1.40, version: 'v2', is_active: true, validity_start: '2026-02-01', created_at: '2026-02-01' },
-  { id: 'mock-4', factory_id: 'factory-sh-01', product_id: 'PRD-002', routing_step: 'OP30', operation_name: '磨削精加工', station_id: 'ST-04', standard_time_min: 4.20, effective_standard_time: 3.78, version: 'v1', is_active: true, validity_start: '2026-01-15', created_at: '2026-01-15' },
-  { id: 'mock-5', factory_id: 'factory-sh-01', product_id: 'PRD-003', routing_step: 'OP10', operation_name: '组装前检验', station_id: 'ST-05', standard_time_min: 0.85, effective_standard_time: 0.77, version: 'v1', is_active: false, validity_start: '2025-12-01', created_at: '2025-12-01' },
-  { id: 'mock-6', factory_id: 'factory-sh-01', product_id: 'PRD-003', routing_step: 'OP20', operation_name: '总装', station_id: 'ST-06', standard_time_min: 5.60, effective_standard_time: 5.04, version: 'v1', is_active: true, validity_start: '2026-03-01', created_at: '2026-03-01' },
-  { id: 'mock-7', factory_id: 'factory-sh-01', product_id: 'PRD-001', routing_step: 'OP30', operation_name: '动平衡检测', station_id: 'ST-07', standard_time_min: 1.20, effective_standard_time: 1.08, version: 'v1', is_active: true, validity_start: '2026-01-01', created_at: '2026-01-01' },
-  { id: 'mock-8', factory_id: 'factory-sh-01', product_id: 'PRD-004', routing_step: 'OP10', operation_name: '下料', station_id: 'ST-01', standard_time_min: 0.45, effective_standard_time: 0.41, version: 'v1', is_active: true, validity_start: '2026-04-01', created_at: '2026-04-01' },
-]
 
 const StandardTimes: React.FC = () => {
   const [factory, setFactory] = useState('factory-sh-01')
@@ -54,7 +46,7 @@ const StandardTimes: React.FC = () => {
         params: { factory_id: factory, limit: 500 },
       })
       const items = res.items || res || []
-      setData(items.length > 0 ? items : MOCK_DATA)
+      setData(items)
     } catch {
       setData([])
     } finally {
@@ -120,6 +112,7 @@ const StandardTimes: React.FC = () => {
   const columns: ColumnsType<StandardTime> = [
     { title: '产品ID', dataIndex: 'product_id', key: 'product_id', width: 110, ellipsis: true },
     { title: '工序', dataIndex: 'routing_step', key: 'routing_step', width: 80 },
+    { title: '序号', dataIndex: 'operation_seq', key: 'operation_seq', width: 65, render: v => v ?? '-' },
     { title: '作业名称', dataIndex: 'operation_name', key: 'operation_name', width: 160, ellipsis: true },
     { title: '工位', dataIndex: 'station_id', key: 'station_id', width: 90, render: v => v || '-' },
     {
@@ -131,6 +124,8 @@ const StandardTimes: React.FC = () => {
       title: '有效工时', dataIndex: 'effective_standard_time', key: 'effective_standard_time', width: 100,
       render: v => (v || 0).toFixed(2),
     },
+    { title: '准备(min)', dataIndex: 'setup_before_start_time_min', key: 'setup_before_start_time_min', width: 90, render: v => v ?? '-' },
+    { title: '收尾(min)', dataIndex: 'post_operation_time_min', key: 'post_operation_time_min', width: 90, render: v => v ?? '-' },
     { title: '版本', dataIndex: 'version', key: 'version', width: 60, render: v => <Tag>{v || 'v1'}</Tag> },
     {
       title: '状态', dataIndex: 'is_active', key: 'is_active', width: 70,
@@ -221,18 +216,35 @@ const StandardTimes: React.FC = () => {
             <Input placeholder="如 精车外圆" />
           </Form.Item>
           <Row gutter={16}>
-            <Col span={8}>
+            <Col span={6}>
+              <Form.Item name="operation_seq" label="工序序号">
+                <InputNumber min={1} step={1} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
               <Form.Item name="station_id" label="工位ID">
                 <Input placeholder="可选" />
               </Form.Item>
             </Col>
-            <Col span={8}>
+            <Col span={6}>
               <Form.Item name="standard_time_min" label="标准时间(min)" rules={[{ required: true, message: '必填' }]}>
                 <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
               </Form.Item>
             </Col>
-            <Col span={8}>
+            <Col span={6}>
               <Form.Item name="effective_standard_time" label="有效工时(min)">
+                <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="setup_before_start_time_min" label="开工准备时间(min)">
+                <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="post_operation_time_min" label="作业后收尾时间(min)">
                 <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
               </Form.Item>
             </Col>

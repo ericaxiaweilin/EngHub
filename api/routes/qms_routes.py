@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database.db_config import get_db
 from core.auth.security import get_current_user
 from database.models import User, QualityInspection, DefectRecord, Qms8dReport
-from api.services.qms_service import QmsService
+from api.services.qms_service import QMSService as QmsService
 
 router = APIRouter(prefix="/api/v1", tags=["qms"])
 
@@ -34,6 +34,9 @@ async def list_inspections(
 ):
     """获取检验单列表"""
     query = select(QualityInspection).where(QualityInspection.factory_id == factory_id)
+    
+    # NOTE: 软删除过滤 - 待数据库迁移后生效 (需给 QualityInspection 添加 is_deleted BOOLEAN DEFAULT false 列)
+    # query = query.where(QualityInspection.is_deleted == False)
 
     if inspection_type:
         query = query.where(QualityInspection.inspect_type == inspection_type.upper())
@@ -130,6 +133,9 @@ async def list_defects(
 ):
     """获取不良品列表"""
     query = select(DefectRecord).where(DefectRecord.factory_id == factory_id)
+    
+    # NOTE: 软删除过滤 - 待数据库迁移后生效 (需给 DefectRecord 添加 is_deleted BOOLEAN DEFAULT false 列)
+    # query = query.where(DefectRecord.is_deleted == False)
 
     if defect_type:
         query = query.where(DefectRecord.defect_type == defect_type)
@@ -264,6 +270,51 @@ async def update_defect_ocap(
     return _serialize_defect(r)
 
 
+# ============== DELETE Endpoints (Soft Delete) ==============
+
+
+@router.delete("/defects/{defect_id}")
+async def delete_defect(
+    defect_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除缺陷记录（标记为已删除，逻辑过滤查询）"""
+    from api.services.qms_service import QMSService
+    
+    try:
+        qms = QMSService(db)
+        result = await qms.soft_delete_defect(defect_id, current_user.username if current_user else "system")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"缺陷删除失败: {str(e)}")
+
+
+@router.delete("/inspections/{inspection_id}")
+async def delete_inspection(
+    inspection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除检验记录（标记为已删除，逻辑过滤查询）"""
+    from api.services.qms_service import QMSService
+    
+    try:
+        qms = QMSService(db)
+        result = await qms.soft_delete_inspection(inspection_id, current_user.username if current_user else "system")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return {"message": result["message"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"检验删除失败: {str(e)}")
+
+
 def _serialize_defect(r: DefectRecord) -> dict:
     """序列化缺陷记录，字段对齐前端 Defect 接口 + 完整品质追溯"""
     return {
@@ -331,7 +382,11 @@ class InspectionCreate(BaseModel):
     factory_id: str
     work_order_id: str
     inspect_type: str  # IQC/IPQC/FQC/OQC
+    routing_step_id: str = "general"
+    inspection_phase: Optional[str] = None
     sample_qty: int = 5
+    sampling_method: Optional[str] = None
+    check_tool_id: Optional[str] = None
     items: List[InspectionItemCreate] = []
     remark: Optional[str] = None
 
@@ -355,6 +410,9 @@ class SpcPointCreate(BaseModel):
     work_order_id: Optional[str] = None
     station_id: Optional[str] = None
     sample_group: Optional[int] = None
+    control_chart_type: str = "xbar"
+    calculation_method: str = "three_sigma"
+    subgroup_count: Optional[int] = None
 
 
 class EightDCreate(BaseModel):
@@ -380,9 +438,13 @@ async def create_inspection(
     result = await svc.create_inspection(
         factory_id=req.factory_id,
         work_order_id=req.work_order_id,
+        routing_step_id=req.routing_step_id,
         inspect_type=req.inspect_type,
+        inspection_phase=req.inspection_phase,
         inspector_id=current_user.username,
         sample_qty=req.sample_qty,
+        sampling_method=req.sampling_method,
+        check_tool_id=req.check_tool_id,
         items=[i.dict() for i in req.items],
         remark=req.remark,
     )
@@ -437,6 +499,9 @@ async def record_spc_point(
         work_order_id=req.work_order_id,
         station_id=req.station_id,
         sample_group=req.sample_group,
+        control_chart_type=req.control_chart_type,
+        calculation_method=req.calculation_method,
+        subgroup_count=req.subgroup_count,
         measured_by=current_user.username,
     )
 

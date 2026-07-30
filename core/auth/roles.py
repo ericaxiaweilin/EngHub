@@ -718,8 +718,8 @@ def get_menu_items_for_user(user) -> list:
 
     # ━━━ 7. 协同 ━━━
     collab_children = []
-    if "andon" in modules_with_access or is_admin:
-        collab_children.append({"key": "/andon", "label": "安灯小工单"})
+    # 安灯小工单：所有用户可见（协同基础功能）
+    collab_children.append({"key": "/andon", "label": "安灯小工单"})
     collab_children.append({"key": "/quick-request", "label": "快速工单"})
     if "tms" in modules_with_access:
         collab_children.append({"key": "/tms/approval", "label": "审批中心"})

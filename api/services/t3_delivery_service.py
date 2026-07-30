@@ -124,7 +124,7 @@ class T3DeliveryService:
                    sum(wo.defect_qty) as defects,
                    sum(CASE WHEN wo.status = 'in_progress' THEN 1 ELSE 0 END) as active_wo
             FROM work_orders wo
-            JOIN stations st ON wo.assigned_station_id = st.id
+            JOIN stations st ON wo.assigned_station_id = st.id::text
             WHERE wo.factory_id = :fid AND wo.status IN ('released', 'in_progress')
             GROUP BY st.station_code, st.station_name
             ORDER BY active_wo DESC
@@ -152,7 +152,7 @@ class T3DeliveryService:
                 sum(wo.completed_qty) as done,
                 sum(wo.defect_qty) as defects
             FROM work_orders wo
-            JOIN stations st ON wo.assigned_station_id = st.id
+            JOIN stations st ON wo.assigned_station_id = st.id::text
             WHERE wo.factory_id = :fid AND wo.status IN ('released', 'in_progress')
             GROUP BY department
             ORDER BY wo_count DESC
@@ -219,7 +219,7 @@ class T3DeliveryService:
             SELECT wo.work_order_code, wo.product_id, wo.planned_qty, wo.completed_qty,
                    wo.status, wo.planned_due, st.station_name
             FROM work_orders wo
-            LEFT JOIN stations st ON wo.assigned_station_id = st.id
+            LEFT JOIN stations st ON wo.assigned_station_id = st.id::text
             WHERE wo.factory_id = :fid
               AND wo.status IN ('released', 'in_progress')
               AND wo.planned_due < NOW()

@@ -66,6 +66,13 @@ class ProductionReportCreate(BaseModel):
     report_type: str = "normal"
     shift: str = "day"
     operator_id: Optional[str] = None
+    assistant_operator_ids: List[str] = []
+    operation_seq: Optional[int] = None
+    operation_name: Optional[str] = None
+    machine_id: Optional[str] = None
+    actual_start_time: Optional[datetime] = None
+    actual_end_time: Optional[datetime] = None
+    quality_check_passed: Optional[bool] = None
     remark: Optional[str] = None
 
 
@@ -844,6 +851,13 @@ async def list_production_reports(
                 "report_type": r.report_type,
                 "shift": r.shift,
                 "operator_id": r.operator_id,
+                "assistant_operator_ids": r.assistant_operator_ids or [],
+                "operation_seq": r.operation_seq,
+                "operation_name": r.operation_name,
+                "machine_id": r.machine_id,
+                "actual_start_time": r.start_time.isoformat() if r.start_time else None,
+                "actual_end_time": r.end_time.isoformat() if r.end_time else None,
+                "quality_check_passed": r.quality_check_passed,
                 "remark": r.remark,
                 "is_modified": r.is_modified,
                 "modified_at": r.modified_at.isoformat() if r.modified_at else None,
@@ -876,6 +890,13 @@ async def create_production_report(
             report_type=report.report_type,
             shift=report.shift,
             operator_id=report.operator_id,
+            assistant_operator_ids=report.assistant_operator_ids,
+            operation_seq=report.operation_seq,
+            operation_name=report.operation_name,
+            machine_id=report.machine_id,
+            start_time=report.actual_start_time,
+            end_time=report.actual_end_time,
+            quality_check_passed=report.quality_check_passed,
             remark=report.remark,
             created_by=current_user.username,
         )

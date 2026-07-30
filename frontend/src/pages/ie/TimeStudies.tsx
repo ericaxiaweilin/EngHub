@@ -57,9 +57,9 @@ const TimeStudies: React.FC = () => {
         params: { factory_id: factory, limit: 500 },
       })
       const items = res.items || res || []
-      setData(items.length > 0 ? items : MOCK_DATA)
+      setData(items)
     } catch {
-      setData(MOCK_DATA)
+      setData([])
     } finally {
       setLoading(false)
     }

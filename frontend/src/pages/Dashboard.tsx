@@ -57,7 +57,8 @@ const Dashboard: React.FC = () => {
   const [equipDetail, setEquipDetail] = useState<Equipment | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'F01'
+  // 优先用顶部选择器选中的厂区（与其他页面一致），回退到用户所属厂区
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   const fetchData = useCallback(async () => {
     setLoading(true)

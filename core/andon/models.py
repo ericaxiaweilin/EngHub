@@ -89,8 +89,8 @@ class AndonEscalationLog(Base):
 
     __tablename__ = "andon_escalation_logs"
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    ticket_id = Column(String(36), ForeignKey("andon_tickets.id"), nullable=False, index=True)
+    id = Column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
+    ticket_id = Column(UUID(as_uuid=False), ForeignKey("andon_tickets.id"), nullable=False, index=True)
     event_type = Column(String(30), nullable=False, index=True)     # reminder/escalated/resolved_closed
     from_role = Column(String(50), nullable=True)                   # 当前处理人
     to_role = Column(String(50), nullable=True)                     # 升级对象

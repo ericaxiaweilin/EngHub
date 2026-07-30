@@ -37,7 +37,7 @@ const InventoryList: React.FC = () => {
   const [detail, setDetail] = useState<InventoryItem | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   const MOCK_INVENTORY: any[] = [
     { id: 'inv-1', material_code: 'MAT-1001', material_name: '轴承 6205', quantity: 2400, unit: '个', warehouse_id: 'WH-01', location: 'A-01-01', safety_stock: 500, max_stock: 5000, status: 'normal', factory_id: 'factory-sh-01', updated_at: '2026-07-20' },
@@ -55,11 +55,11 @@ const InventoryList: React.FC = () => {
       if (statusFilter) params.status = statusFilter
       const res = await getInventory(params)
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_INVENTORY)
-      setTotal(res.total || items.length || MOCK_INVENTORY.length)
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      setData(MOCK_INVENTORY)
-      setTotal(MOCK_INVENTORY.length)
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

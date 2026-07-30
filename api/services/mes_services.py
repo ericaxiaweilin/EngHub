@@ -5,7 +5,7 @@ MES Service Layer - Production Report, Station, Routing, Equipment Services
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, delete
+from sqlalchemy import case, select, update, delete
 from sqlalchemy.orm import selectinload
 
 from database.models import (
@@ -40,6 +40,13 @@ class ProductionReportService:
         report_type: str = "normal",
         shift: str = "day",
         operator_id: Optional[str] = None,
+        assistant_operator_ids: Optional[List[str]] = None,
+        operation_seq: Optional[int] = None,
+        operation_name: Optional[str] = None,
+        machine_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        quality_check_passed: Optional[bool] = None,
         remark: Optional[str] = None,
         created_by: Optional[str] = None,
     ) -> ProductionReport:
@@ -60,6 +67,13 @@ class ProductionReportService:
             report_type=report_type,
             shift=shift,
             operator_id=operator_id,
+            assistant_operator_ids=assistant_operator_ids or [],
+            operation_seq=operation_seq,
+            operation_name=operation_name,
+            machine_id=machine_id,
+            start_time=start_time,
+            end_time=end_time,
+            quality_check_passed=quality_check_passed,
             remark=remark,
             created_by=created_by,
         )
@@ -107,6 +121,19 @@ class ProductionReportService:
                     completed_qty=completed_qty,
                     good_qty=good_qty,
                     defect_qty=defect_qty,
+                    partial_completion_percentage=(
+                        func.least(
+                            100.0,
+                            completed_qty * 100.0 / func.nullif(WorkOrder.planned_qty, 0),
+                        )
+                    ),
+                    in_progress_status=(
+                        case(
+                            (completed_qty >= WorkOrder.planned_qty, "completed"),
+                            (completed_qty > 0, "in_progress"),
+                            else_="not_started",
+                        )
+                    ),
                 )
             )
             await self.db.commit()

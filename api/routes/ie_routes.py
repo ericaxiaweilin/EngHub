@@ -31,12 +31,15 @@ class StandardTimeCreate(BaseModel):
     factory_id: str
     product_id: str
     routing_step: str
+    operation_seq: Optional[int] = None
     operation_name: str
     station_id: Optional[str] = None
     work_center: Optional[str] = None
     standard_time_min: float = 0.0
     unit_time_type: str = "per_piece"  # per_piece / per_batch / setup
     setup_time_min: float = 0.0
+    setup_before_start_time_min: float = 0.0
+    post_operation_time_min: float = 0.0
     batch_size: int = 1
     rating_factor: float = 1.0
     allowance_rate: float = 0.15
@@ -47,8 +50,11 @@ class StandardTimeCreate(BaseModel):
 
 class StandardTimeUpdate(BaseModel):
     """更新标准工时请求体"""
+    operation_seq: Optional[int] = None
     standard_time_min: Optional[float] = None
     setup_time_min: Optional[float] = None
+    setup_before_start_time_min: Optional[float] = None
+    post_operation_time_min: Optional[float] = None
     batch_size: Optional[int] = None
     rating_factor: Optional[float] = None
     allowance_rate: Optional[float] = None
@@ -62,12 +68,15 @@ class StandardTimeResponse(BaseModel):
     factory_id: str
     product_id: str
     routing_step: str
+    operation_seq: Optional[int]
     operation_name: str
     station_id: Optional[str]
     work_center: Optional[str]
     standard_time_min: float
     unit_time_type: str
     setup_time_min: float
+    setup_before_start_time_min: Optional[float]
+    post_operation_time_min: Optional[float]
     batch_size: int
     rating_factor: float
     allowance_rate: float
@@ -205,12 +214,15 @@ async def create_standard_time(
             factory_id=st.factory_id,
             product_id=st.product_id,
             routing_step=st.routing_step,
+            operation_seq=st.operation_seq,
             operation_name=st.operation_name,
             station_id=st.station_id,
             work_center=st.work_center,
             standard_time_min=st.standard_time_min,
             unit_time_type=st.unit_time_type,
             setup_time_min=st.setup_time_min,
+            setup_before_start_time_min=st.setup_before_start_time_min,
+            post_operation_time_min=st.post_operation_time_min,
             batch_size=st.batch_size,
             rating_factor=st.rating_factor,
             allowance_rate=st.allowance_rate,

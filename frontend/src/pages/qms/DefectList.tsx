@@ -96,7 +96,7 @@ const DefectList: React.FC = () => {
   const [detail, setDetail] = useState<Defect | null>(null)
 
   const user = getStoredUser()
-  const factoryId = user?.factory_id || 'factory-sh-01'
+  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
 
   const MOCK_DEFECTS: any[] = [
     { id: 'df-1', defect_code: 'DEF-2026-001', defect_type: '外观', defect_name: '划伤', severity: 'minor', status: 'open', quantity: 3, work_order_id: 'wo-1', station_id: 'ST-01', product_id: 'PRD-001', factory_id: 'factory-sh-01', created_at: '2026-07-10' },
@@ -113,11 +113,11 @@ const DefectList: React.FC = () => {
       if (severityFilter) params.severity = severityFilter
       const res = await getDefects(params)
       const items = res.items || []
-      setData(items.length > 0 ? items : MOCK_DEFECTS)
-      setTotal(res.total || items.length || MOCK_DEFECTS.length)
+      setData(items)
+      setTotal(res.total ?? items.length)
     } catch (err: any) {
-      setData(MOCK_DEFECTS)
-      setTotal(MOCK_DEFECTS.length)
+      setData([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }

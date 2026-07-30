@@ -51,8 +51,8 @@ const LeanMetrics: React.FC = () => {
     try {
       const res = await api.get(API_ENDPOINTS.IE_LEAN_METRICS, { params: { factory_id: factory, limit: 200 } })
       const items = res.items || res || []
-      setData(items.length > 0 ? items : MOCK_DATA)
-    } catch { setData(MOCK_DATA) } finally { setLoading(false) }
+      setData(items)
+    } catch { setData([]) } finally { setLoading(false) }
   }
 
   useEffect(() => { fetchData() }, [factory])

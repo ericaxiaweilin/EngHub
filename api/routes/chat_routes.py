@@ -10,16 +10,19 @@ AI Assistant chat routes（支持 Tool Calling）。
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,29 +30,20 @@ from database.db_config import get_db
 from database.models import FileRecord, User
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
 )
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 
-# --- 配置 (环境变量驱动，非硬编码) ---
+# --- 模型底座接入配置 ---
 GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://host.docker.internal:14040").rstrip("/")
 API_KEY = os.getenv("LLM_API_KEY", "")
-MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
 MAX_TOOL_ROUNDS = int(os.getenv("LLM_MAX_TOOL_ROUNDS", "5"))
-# Vision 模型（图片多模态路由）—— 带图片时自动切换到此模型
-VISION_URL = os.getenv("LLM_VISION_URL", "http://host.docker.internal:8019").rstrip("/")
-VISION_MODEL = os.getenv("LLM_VISION_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
-# OCR 专用模型（文字提取）—— 用户意图为识别/提取文字时走此模型（经网关路由到 DashScope）
-OCR_MODEL = os.getenv("LLM_OCR_MODEL", "openai/qwen-vl-ocr")
-
-# OCR 意图关键词（用户消息含这些词 + 附带图片 → 走 OCR 专用模型）
-_OCR_KEYWORDS = frozenset([
-    "ocr", "识别", "提取文字", "读取文字", "识别文字", "文字识别",
-    "扫描", "识别内容", "读取内容", "提取内容", "看图识字",
-    "识别图纸", "读取图纸", "识别报告", "识别文件",
-])
+MODEL_STACK_CONTROL_PLANE_URL = os.getenv("MODEL_STACK_CONTROL_PLANE_URL", "").rstrip("/")
+MODEL_STACK_CHAT_TASK_ID = os.getenv("MODEL_STACK_CHAT_TASK_ID", "").strip()
+MODEL_STACK_VISION_TASK_ID = os.getenv("MODEL_STACK_VISION_TASK_ID", "").strip()
+MODEL_STACK_ROUTE_TIMEOUT = float(os.getenv("MODEL_STACK_ROUTE_TIMEOUT", "5"))
 
 SYSTEM_PROMPT = (
     "你是 EngHub MES 制造执行系统的智能助手，可以直接操作系统完成用户的请求。"
@@ -70,11 +64,23 @@ SYSTEM_PROMPT = (
     "你能直接读到真实数据库，必须立即调用工具取数并以表格/清单形式呈现给用户。\n"
     "【预警情报中枢】你不仅是查询助手，更是预警情报审查员。当系统产生被动预警（安灯工单/质量缺陷/设备故障/工单超时）时，"
     "你会自动进行初步审查（严重度/根因/建议/分派）。用户可随时问你“有什么预警”“预警简报”获取当前态势，"
-    "也可以说“巡检”让你主动扫描异常。审查结果包含严重度判定、根因假设、处置建议和推荐分派对象。\n"
+    "也可以说“巡检”让你主动扫描异常。只有工具返回了对应证据时，才能给出根因、处置建议和分派对象。\n"
     "【流程知识库】系统内置了完整的流程知识：工单全生命周期（8阶段：创建→下达→派工→执行→报工→质检→完工→入库）、"
     "6大职位标准作业流程(操作员/品检员/设备工程师/PMC计划员/生产主管/仓管员)、各环节RACI责任矩阵。"
     "用户问流程/职责/该找谁类问题时，调用 query_process_knowledge 工具获取标准答案。\n"
+    "【回答边界】工具结果未提供的信息不得猜测，不得擅自补充故障、缺料、同步异常等可能原因。"
+    "最终回答只输出面向用户的结论，禁止输出 <think>、推理过程、内部分析或工具选择过程。\n"
     "请用简洁专业的中文回答制造与车间管理相关问题。"
+)
+
+TOOL_RESULT_GROUNDING = (
+    "以下 JSON 是本次回答唯一可用的业务事实。只陈述 JSON 明确提供的数据，"
+    "不得补充可能原因、假设、示例编号、风险结论或系统未执行的动作。"
+    "数值为 0 或列表为空时，只说明当前返回无记录，不推测原因。"
+)
+FINAL_GROUNDING_PROMPT = (
+    "最终答复必须逐项对应前面的工具 JSON。禁止添加 JSON 中不存在的状态、"
+    "原因、风险、预警、示例、建议或已执行动作；不要用常识补全缺失字段。"
 )
 
 
@@ -91,18 +97,17 @@ class Attachment(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
-    model: Optional[str] = None
     temperature: float = 0.3
     enable_tools: bool = True  # 是否启用工具调用
-    attachments: List[Attachment] = []  # 本轮用户消息附带的附件
+    attachments: List[Attachment] = Field(default_factory=list)  # 本轮用户消息附带的附件
 
 
 class ToolAction(BaseModel):
     """一次工具执行记录，供前端展示'AI 已执行的操作'。"""
     tool: str
     label: str
-    arguments: Dict[str, Any] = {}
-    result: Dict[str, Any] = {}
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    result: Dict[str, Any] = Field(default_factory=dict)
     is_write: bool = False
     is_sim: bool = False
     success: bool = True
@@ -112,28 +117,37 @@ class ChatResponse(BaseModel):
     reply: str
     model: str
     degraded: bool = False
-    actions: List[ToolAction] = []
+    actions: List[ToolAction] = Field(default_factory=list)
 
 
 @router.get("/health")
 async def chat_health():
-    """返回 AI 网关配置与连通性状态。"""
-    configured = bool(GATEWAY_URL)
+    """返回模型底座任务路由与网关连通性状态。"""
+    configured = bool(
+        GATEWAY_URL
+        and MODEL_STACK_CONTROL_PLANE_URL
+        and MODEL_STACK_CHAT_TASK_ID
+    )
     reachable = False
-    detail = "gateway url not configured"
+    detail = "model-stack configuration incomplete"
     if configured:
         try:
+            route = await _resolve_model_route(MODEL_STACK_CHAT_TASK_ID)
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{GATEWAY_URL}/health")
-                reachable = resp.status_code < 500
-                detail = f"status={resp.status_code}"
+                gateway_resp = await client.get(f"{GATEWAY_URL}/health")
+            reachable = gateway_resp.status_code < 500
+            detail = (
+                f"control-plane=ready, gateway={gateway_resp.status_code}, "
+                f"route={route['task_id']}"
+            )
         except Exception as exc:  # noqa: BLE001
             detail = f"unreachable: {type(exc).__name__}"
     return {
         "configured": configured,
         "reachable": reachable,
-        "model": MODEL,
+        "model": MODEL_STACK_CHAT_TASK_ID,
         "gateway": GATEWAY_URL,
+        "control_plane": MODEL_STACK_CONTROL_PLANE_URL,
         "detail": detail,
     }
 
@@ -157,31 +171,166 @@ async def chat_tools():
     }
 
 
-def _detect_ocr_intent(text: str) -> bool:
-    """检测用户消息是否表达 OCR/文字提取意图。"""
-    t = text.lower()
-    return any(kw in t for kw in _OCR_KEYWORDS)
+async def _resolve_model_route(
+    task_id: str,
+    *,
+    prompt_tokens: int = 1000,
+    max_completion_tokens: int = 1024,
+) -> Dict[str, Any]:
+    """向模型底座申请任务路由；业务侧不维护模型候选或回退链。"""
+    if not MODEL_STACK_CONTROL_PLANE_URL or not task_id:
+        raise RuntimeError("model-stack task routing is not configured")
+
+    url = (
+        f"{MODEL_STACK_CONTROL_PLANE_URL}/api/model-management/"
+        f"business-tasks/{quote(task_id, safe='')}/route-request"
+    )
+    params = {
+        "prompt_tokens": max(0, int(prompt_tokens)),
+        "max_completion_tokens": max(0, int(max_completion_tokens)),
+        "require_deployed": "true",
+    }
+    async with httpx.AsyncClient(timeout=MODEL_STACK_ROUTE_TIMEOUT) as client:
+        resp, manifest_resp = await asyncio.gather(
+            client.get(url, params=params),
+            client.get(
+                f"{MODEL_STACK_CONTROL_PLANE_URL}/api/model-management/providers/deployed"
+            ),
+        )
+    resp.raise_for_status()
+    manifest_resp.raise_for_status()
+
+    envelope = resp.json()
+    route = envelope.get("route_request") if isinstance(envelope, dict) else None
+    providers = route.get("providers") if isinstance(route, dict) else None
+    provider = str(providers[0] if providers else "").strip()
+    if not provider:
+        raise RuntimeError(f"model-stack returned no deployed route for {task_id}")
+
+    manifest = manifest_resp.json()
+    provider_rows = manifest.get("providers") if isinstance(manifest, dict) else None
+    provider_row = next(
+        (
+            row for row in (provider_rows or [])
+            if isinstance(row, dict)
+            and str(row.get("provider") or row.get("key") or "").strip() == provider
+        ),
+        None,
+    )
+    gateway_model = str(
+        (provider_row or {}).get("target_model")
+        or (provider_row or {}).get("model")
+        or ""
+    ).strip()
+    if not gateway_model:
+        raise RuntimeError(f"model-stack returned no execution target for {provider}")
+
+    runtime_policy = route.get("runtime_policy") or {}
+    timeout_ms = (
+        route.get("request_timeout_ms")
+        or runtime_policy.get("request_timeout_ms")
+        or int(REQUEST_TIMEOUT * 1000)
+    )
+    completion_limit = (
+        route.get("max_completion_tokens")
+        or runtime_policy.get("max_completion_tokens")
+        or max_completion_tokens
+    )
+    return {
+        "task_id": str(route.get("dispatch_scenario") or task_id),
+        "provider": provider,
+        "gateway_model": gateway_model,
+        "request_timeout": max(1.0, float(timeout_ms) / 1000),
+        "max_completion_tokens": max(1, int(completion_limit)),
+    }
 
 
 async def _call_llm(
     payload: Dict[str, Any],
-    use_vision: bool = False,
-    base_url_override: Optional[str] = None,
+    *,
+    request_timeout: Optional[float] = None,
 ) -> httpx.Response:
-    """调用 LLM。
-
-    路由优先级：base_url_override > use_vision(VISION_URL) > GATEWAY_URL
-    """
-    base_url = base_url_override or (VISION_URL if use_vision else GATEWAY_URL)
-    headers = {"Content-Type": "application/json"}
+    """通过模型底座网关调用控制面下发的 provider。"""
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=request_timeout or REQUEST_TIMEOUT) as client:
         return await client.post(
-            f"{base_url}/v1/chat/completions",
+            f"{GATEWAY_URL}/v1/chat/completions",
             json=payload,
             headers=headers,
         )
+
+
+def _clean_model_reply(content: str) -> str:
+    """清除模型协议中误混入 content 的推理区块，不改变最终答案语义."""
+    reply = (content or "").strip()
+    return re.sub(
+        r"<think>.*?</think>",
+        "",
+        reply,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+
+
+def _grounded_tool_result(result: Dict[str, Any]) -> str:
+    return (
+        f"{TOOL_RESULT_GROUNDING}\n"
+        f"{json.dumps(result, ensure_ascii=False, default=str)}"
+    )
+
+
+async def _verify_grounded_reply(
+    reply: str,
+    actions: List[ToolAction],
+    route: Dict[str, Any],
+) -> str:
+    """让模型按工具事实审校草稿；业务侧不参与语义改写。"""
+    if not actions:
+        return reply
+    facts = [
+        {"tool": action.tool, "result": action.result}
+        for action in actions
+    ]
+    verification_payload = {
+        "model": route["gateway_model"],
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是事实审校器。仅保留能从工具 JSON 逐项验证的陈述，"
+                    "删除所有原因猜测、风险推断、预警、建议、示例和未执行动作。"
+                    "保持中文自然表达，只输出修订后的最终答复。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"工具事实：\n{json.dumps(facts, ensure_ascii=False, default=str)}"
+                    f"\n\n待审校草稿：\n{reply}"
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": route["max_completion_tokens"],
+    }
+    resp = await _call_llm(
+        verification_payload,
+        request_timeout=route["request_timeout"],
+    )
+    if resp.status_code >= 400:
+        return reply
+    data = resp.json()
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    return _clean_model_reply(content) or reply
 
 
 async def _load_attachment_records(
@@ -390,81 +539,6 @@ def _attachment_text_note(records: List[FileRecord]) -> str:
     return "\n".join(lines)
 
 
-def _strip_images_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """vision 降级：把多模态 content 剩除图片块，仅保留文本（避免网关因不支持图片而 400）。"""
-    stripped: List[Dict[str, Any]] = []
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            msg = {**msg, "content": "\n".join(t for t in text_parts if t)}
-        stripped.append(msg)
-    return stripped
-
-
-async def _run_deterministic(
-    intent: Dict[str, Any],
-    user_question: str,
-    model: str,
-    operator: str,
-    db: AsyncSession,
-    actions: List[ToolAction],
-    factory_id: Optional[str] = None,
-    attachment_records: Optional[List[FileRecord]] = None,
-) -> ChatResponse:
-    """确定性业务底座（参考 luaguage capability 执行思路）。
-
-    后端根据意图直接执行工具取真实数据（不依赖模型决策），再让 LLM 仅负责把数据组织成自然语言。
-    工具一定被调用、数据一定真实，从根本上杜绝“建议查看看板”这类推诿性模糊回答。"""
-    tool_name = intent["tool"]
-    tool_args = intent.get("args") or {}
-    result = await execute_tool(db, tool_name, tool_args, operator=operator, factory_id=factory_id)
-    is_error = "error" in result
-    actions.append(ToolAction(
-        tool=tool_name,
-        label=TOOL_LABELS.get(tool_name, tool_name),
-        arguments=tool_args,
-        result=result,
-        is_write=tool_name in WRITE_TOOLS,
-        is_sim=tool_name in SIM_TOOLS,
-        success=not is_error,
-    ))
-    data_str = json.dumps(result, ensure_ascii=False, default=str)
-    if is_error:
-        return ChatResponse(
-            reply=f"⚠️ 查询失败：{result.get('error')}",
-            model=model, degraded=False, actions=actions,
-        )
-    # 附件摘要：确定性路径以数据为主，附件仅以文字告知模型（不走 vision）
-    att_note = _attachment_text_note(attachment_records or [])
-    format_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": (
-            f"用户问题：{user_question}{att_note}\n\n"
-            f"系统已通过工具 `{tool_name}` 从真实数据库取到如下数据（JSON）：\n{data_str}\n\n"
-            "请严格基于以上真实数据，用简洁专业的中文、以 Markdown 表格或清单形式直接回答用户，并给出简要分析。"
-            "数据已齐全，禁止说‘建议查看看板/日报中心’之类的推诿话术，直接呈现数据。"
-        )},
-    ]
-    try:
-        fmt_resp = await _call_llm({
-            "model": model,
-            "messages": format_messages,
-            "temperature": 0.3,
-        })
-        if fmt_resp.status_code < 400:
-            reply = (fmt_resp.json().get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-            if reply:
-                return ChatResponse(reply=reply, model=model, degraded=False, actions=actions)
-    except Exception:  # noqa: BLE001
-        pass
-    # 格式化失败兜底：直接返回结构化真实数据
-    return ChatResponse(
-        reply=f"已从数据库取到真实数据：\n```json\n{data_str}\n```",
-        model=model, degraded=False, actions=actions,
-    )
-
-
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -473,7 +547,6 @@ async def chat(
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
     """转发对话到 litellm 网关，支持 tool calling 循环执行 MES 操作。"""
-    model = request.model or MODEL
     operator = current_user.username or current_user.id
     factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
 
@@ -486,15 +559,17 @@ async def chat(
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
-
-    # ---- 确定性业务底座：命中查询意图 → 后端直接执行工具取真实数据，LLM 仅负责组织语言 ----
-    intent = resolve_intent(last_user) if request.enable_tools else None
-    if intent:
-        return await _run_deterministic(
-            intent, last_user, model, operator, db, actions, factory_id, att_records,
+    task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
+    prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
+    try:
+        route = await _resolve_model_route(task_id, prompt_tokens=prompt_tokens)
+    except Exception as exc:  # noqa: BLE001
+        return ChatResponse(
+            reply=_degraded_message(f"模型底座路由失败 ({type(exc).__name__})"),
+            model=task_id, degraded=True, actions=actions,
         )
 
-    # ---- 非确定性意图：走 auto tool-calling 循环（写操作 / 多步 / 通用问答）----
+    # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     history = [m.model_dump() for m in request.messages]
     # 将附件注入「最后一条用户消息」：图片 → 多模态 content；非图片 → 文字摘要追加
@@ -514,66 +589,27 @@ async def chat(
     messages += history
 
     payload: Dict[str, Any] = {
-        "model": model,
+        "model": route["gateway_model"],
         "messages": messages,
         "temperature": request.temperature,
+        "max_tokens": route["max_completion_tokens"],
     }
-    # 图片多模态：自动路由到 VL 模型（VL 模型不支持 tool calling，纯视觉问答）
-    use_vision = bool(image_records)
-    use_ocr = use_vision and _detect_ocr_intent(last_user)
-    if use_ocr:
-        # OCR 专用模型（经网关路由，文字提取更精准）
-        payload["model"] = OCR_MODEL
-    elif use_vision:
-        payload["model"] = VISION_MODEL
-    elif request.enable_tools:
+    # 图片内容由视觉任务模型理解；业务侧不再用 OCR 关键词选择具体模型。
+    if not image_records and request.enable_tools:
         payload["tools"] = TOOL_DEFINITIONS
         payload["tool_choice"] = "auto"
 
-    # 多模态降级标记：VL/OCR 模型不可用时，剔除图片以纯文本重试
-    vision_dropped = False
-
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            try:
-                # OCR 走网关（base_url_override=None 即 GATEWAY_URL），VL 走本地 VISION_URL
-                resp = await _call_llm(
-                    payload,
-                    use_vision=(use_vision and not use_ocr and not vision_dropped),
-                )
-            except Exception:
-                # VL 模型连接失败（未启动/网络不可达）→ 降级到主模型纯文本
-                if use_vision and not vision_dropped:
-                    vision_dropped = True
-                    payload["model"] = model
-                    payload["messages"] = _strip_images_from_messages(payload["messages"])
-                    resp = await _call_llm(payload)
-                else:
-                    raise
-
-            # 网关不支持 tools 时（部分模型/网关返回 400），降级为纯问答重试一次
-            if resp.status_code >= 400 and request.enable_tools and payload.get("tools"):
-                payload.pop("tools", None)
-                payload.pop("tool_choice", None)
-                resp = await _call_llm(payload)
-
-            # VL 模型不可用（连接失败/400）→ 剔除图片转纯文本走主模型
-            if resp.status_code >= 400 and image_records and not vision_dropped:
-                vision_dropped = True
-                payload["model"] = model
-                payload["messages"] = _strip_images_from_messages(payload["messages"])
-                note = _attachment_text_note(image_records)
-                if note:
-                    payload["messages"].append({
-                        "role": "user",
-                        "content": f"（当前模型暂不支持图片识别，图片已存入系统文件库。{note}\n请基于附件信息与文字内容回答。）",
-                    })
-                resp = await _call_llm(payload)
+            resp = await _call_llm(
+                payload,
+                request_timeout=route["request_timeout"],
+            )
 
             if resp.status_code >= 400:
                 return ChatResponse(
                     reply=_degraded_message(f"网关返回 {resp.status_code}"),
-                    model=model, degraded=True, actions=actions,
+                    model=route["task_id"], degraded=True, actions=actions,
                 )
 
             data = resp.json()
@@ -583,13 +619,19 @@ async def chat(
 
             # 无工具调用 → 最终回复
             if not tool_calls:
-                reply = (message.get("content") or "").strip()
+                reply = _clean_model_reply(message.get("content") or "")
                 if not reply:
                     return ChatResponse(
                         reply=_degraded_message("网关无有效回复"),
-                        model=model, degraded=True, actions=actions,
+                        model=route["task_id"], degraded=True, actions=actions,
                     )
-                return ChatResponse(reply=reply, model=model, degraded=False, actions=actions)
+                reply = await _verify_grounded_reply(reply, actions, route)
+                return ChatResponse(
+                    reply=reply,
+                    model=route["task_id"],
+                    degraded=False,
+                    actions=actions,
+                )
 
             # 有工具调用 → 逐个执行，把 assistant 消息和 tool 结果追加到上下文
             messages.append({
@@ -619,29 +661,33 @@ async def chat(
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                    "content": _grounded_tool_result(result),
                 })
 
             # 继续下一轮，让模型基于工具结果生成回复
+            messages.append({"role": "system", "content": FINAL_GROUNDING_PROMPT})
             payload["messages"] = messages
+            # 能力已由模型完成语义选择；后续只让模型基于工具结果生成答复，
+            # 不再重复发送完整工具清单，避免无意义的 token 消耗和二次工具调用。
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
 
         # 超过最大轮次
         return ChatResponse(
             reply="操作轮次过多，已停止。请简化您的请求后重试。",
-            model=model, degraded=True, actions=actions,
+            model=route["task_id"], degraded=True, actions=actions,
         )
     except Exception as exc:  # noqa: BLE001
         return ChatResponse(
             reply=_degraded_message(f"网关连接失败 ({type(exc).__name__})"),
-            model=model, degraded=True, actions=actions,
+            model=route["task_id"], degraded=True, actions=actions,
         )
 
 
 def _degraded_message(reason: str) -> str:
     return (
-        f"⚠️ AI 服务暂不可用（{reason}）。\n\n"
-        "请检查后端环境变量 `LLM_GATEWAY_URL` / `LLM_API_KEY` / `LLM_MODEL` "
-        "是否指向可用的 litellm 网关。配置完成后即可正常对话与执行操作。"
+        f"AI 服务暂不可用（{reason}）。\n\n"
+        "模型任务未能由模型底座正常下发，请检查控制面与模型网关状态。"
     )
 
 
@@ -871,39 +917,70 @@ def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
-async def _stream_llm_tokens(payload: Dict[str, Any]):
-    """以 stream 模式调用网关，逐块 yield SSE delta 帧。
-
-    返回时通过 generator 的 return value 无法传递信息，
-    因此用包装类记录是否产生了有效内容。"""
-    payload = {**payload, "stream": True}
-    headers = {"Content-Type": "application/json"}
+async def _stream_llm_deltas(
+    payload: Dict[str, Any],
+    *,
+    request_timeout: float,
+):
+    """调用网关 SSE，逐块返回 OpenAI delta。"""
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    stream_payload = {
+        **payload,
+        "stream": True,
+        "cache": {"no-cache": True},
+    }
+    async with httpx.AsyncClient(timeout=request_timeout) as client:
         async with client.stream(
             "POST",
             f"{GATEWAY_URL}/v1/chat/completions",
-            json=payload,
+            json=stream_payload,
             headers=headers,
         ) as resp:
             if resp.status_code >= 400:
-                await resp.aread()
-                raise RuntimeError(f"gateway {resp.status_code}")
+                body = await resp.aread()
+                raise RuntimeError(
+                    f"gateway {resp.status_code}: {body[:300].decode(errors='replace')}"
+                )
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
                     break
                 try:
                     chunk = json.loads(data_str)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    text = delta.get("content") or ""
-                    if text:
-                        yield _sse("delta", {"content": text})
+                    yield chunk.get("choices", [{}])[0].get("delta", {}) or {}
                 except (json.JSONDecodeError, IndexError, KeyError):
                     continue
+
+
+def _merge_stream_tool_calls(
+    accumulated: Dict[int, Dict[str, Any]],
+    deltas: List[Dict[str, Any]],
+) -> None:
+    """合并 OpenAI 流式 tool_calls 的分片。"""
+    for item in deltas:
+        index = int(item.get("index", 0))
+        target = accumulated.setdefault(index, {
+            "id": "",
+            "type": "function",
+            "function": {"name": "", "arguments": ""},
+        })
+        if item.get("id"):
+            target["id"] = item["id"]
+        if item.get("type"):
+            target["type"] = item["type"]
+        function_delta = item.get("function") or {}
+        if function_delta.get("name"):
+            target["function"]["name"] += function_delta["name"]
+        if function_delta.get("arguments"):
+            target["function"]["arguments"] += function_delta["arguments"]
 
 
 @router.post("/stream")
@@ -914,7 +991,6 @@ async def chat_stream(
     current_user: User = Depends(get_current_user),
 ):
     """SSE 流式对话：工具执行实时推送 action 事件，最终回复逐 token 流式输出。"""
-    model = request.model or MODEL
     operator = current_user.username or current_user.id
     factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
 
@@ -929,6 +1005,18 @@ async def chat_stream(
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
+        task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
+        prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
+        try:
+            route = await _resolve_model_route(task_id, prompt_tokens=prompt_tokens)
+        except Exception as exc:  # noqa: BLE001
+            yield _sse("delta", {
+                "content": _degraded_message(
+                    f"模型底座路由失败 ({type(exc).__name__})"
+                ),
+            })
+            yield _sse("done", {"model": task_id, "degraded": True})
+            return
 
         # ---- Excel/CSV 附件 → 推送结构化表格事件（前端渲染可交互表格 + Univer 电子表格） ----
         for rec in att_records:
@@ -937,58 +1025,7 @@ async def chat_stream(
                 if tbl:
                     yield _sse("table", tbl)
 
-        # ---- 确定性业务底座：命中意图 → 执行工具 → 流式格式化 ----
-        intent = resolve_intent(last_user) if request.enable_tools else None
-        if intent:
-            tool_name = intent["tool"]
-            tool_args = intent.get("args") or {}
-            result = await execute_tool(db, tool_name, tool_args, operator=operator, factory_id=factory_id)
-            is_error = "error" in result
-            action = ToolAction(
-                tool=tool_name,
-                label=TOOL_LABELS.get(tool_name, tool_name),
-                arguments=tool_args,
-                result=result,
-                is_write=tool_name in WRITE_TOOLS,
-                is_sim=tool_name in SIM_TOOLS,
-                success=not is_error,
-            )
-            yield _sse("action", action.model_dump())
-
-            if is_error:
-                yield _sse("delta", {"content": f"⚠️ 查询失败：{result.get('error')}"})
-                yield _sse("done", {"model": model, "degraded": False})
-                return
-
-            # 推送结构化表格数据（前端渲染可交互表格 + Univer 电子表格）
-            table_data = _extract_table_data(tool_name, result)
-            if table_data:
-                yield _sse("table", table_data)
-
-            data_str = json.dumps(result, ensure_ascii=False, default=str)
-            att_note = _attachment_text_note(att_records)
-            format_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": (
-                    f"用户问题：{last_user}{att_note}\n\n"
-                    f"系统已通过工具 `{tool_name}` 从真实数据库取到如下数据（JSON）：\n{data_str}\n\n"
-                    "请严格基于以上真实数据，用简洁专业的中文、以 Markdown 表格或清单形式直接回答用户，并给出简要分析。"
-                    "数据已齐全，禁止说'建议查看看板/日报中心'之类的推诿话术，直接呈现数据。"
-                )},
-            ]
-            got_content = False
-            try:
-                async for frame in _stream_llm_tokens({"model": model, "messages": format_messages, "temperature": 0.3}):
-                    got_content = True
-                    yield frame
-            except Exception:  # noqa: BLE001
-                pass
-            if not got_content:
-                yield _sse("delta", {"content": f"已从数据库取到真实数据：\n```json\n{data_str}\n```"})
-            yield _sse("done", {"model": model, "degraded": False})
-            return
-
-        # ---- 非确定性路径：tool-calling 循环（非流式执行工具），最终轮流式输出 ----
+        # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
         messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         history = [m.model_dump() for m in request.messages]
         non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
@@ -1006,82 +1043,50 @@ async def chat_stream(
         messages += history
 
         payload: Dict[str, Any] = {
-            "model": model,
+            "model": route["gateway_model"],
             "messages": messages,
             "temperature": request.temperature,
+            "max_tokens": route["max_completion_tokens"],
         }
-        # 图片多模态路由：OCR 意图 → OCR 模型（经网关）；普通图片 → 本地 VL
-        use_vision_s = bool(image_records)
-        use_ocr_s = use_vision_s and _detect_ocr_intent(last_user)
-        if use_ocr_s:
-            payload["model"] = OCR_MODEL
-        elif use_vision_s:
-            payload["model"] = VISION_MODEL
-        elif request.enable_tools:
+        # 图片内容由视觉任务模型做语义理解，不在业务侧做关键词分流。
+        if not image_records and request.enable_tools:
             payload["tools"] = TOOL_DEFINITIONS
             payload["tool_choice"] = "auto"
 
-        vision_dropped = False
         try:
             for _ in range(MAX_TOOL_ROUNDS):
-                resp = await _call_llm(
+                streamed_content: List[str] = []
+                streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
+                async for delta in _stream_llm_deltas(
                     payload,
-                    use_vision=(use_vision_s and not use_ocr_s and not vision_dropped),
-                )
+                    request_timeout=route["request_timeout"],
+                ):
+                    text = delta.get("content") or ""
+                    if text:
+                        streamed_content.append(text)
+                        yield _sse("delta", {"content": text})
+                    _merge_stream_tool_calls(
+                        streamed_tool_calls,
+                        delta.get("tool_calls") or [],
+                    )
 
-                # 网关不支持 tools → 降级纯问答
-                if resp.status_code >= 400 and request.enable_tools and payload.get("tools"):
-                    payload.pop("tools", None)
-                    payload.pop("tool_choice", None)
-                    resp = await _call_llm(payload)
-
-                # vision 降级
-                if resp.status_code >= 400 and image_records and not vision_dropped:
-                    vision_dropped = True
-                    payload["messages"] = _strip_images_from_messages(payload["messages"])
-                    note = _attachment_text_note(image_records)
-                    if note:
-                        payload["messages"].append({
-                            "role": "user",
-                            "content": f"（当前模型暂不支持图片识别，图片已存入系统文件库。{note}\n请基于附件信息与文字内容回答。）",
-                        })
-                    resp = await _call_llm(payload)
-
-                if resp.status_code >= 400:
-                    yield _sse("delta", {"content": _degraded_message(f"网关返回 {resp.status_code}")})
-                    yield _sse("done", {"model": model, "degraded": True})
-                    return
-
-                data = resp.json()
-                choice = data.get("choices", [{}])[0]
-                msg = choice.get("message", {}) or {}
-                tool_calls = msg.get("tool_calls") or []
-
-                # 无工具调用 → 最终回复：用流式重新请求，逐 token 推送
+                tool_calls = [
+                    streamed_tool_calls[index]
+                    for index in sorted(streamed_tool_calls)
+                    if streamed_tool_calls[index]["function"]["name"]
+                ]
                 if not tool_calls:
-                    got_content = False
-                    try:
-                        async for frame in _stream_llm_tokens(payload):
-                            got_content = True
-                            yield frame
-                    except Exception:  # noqa: BLE001
-                        pass
-                    if not got_content:
-                        # 流式失败，用已获得的非流式内容兜底
-                        reply = (msg.get("content") or "").strip()
-                        if reply:
-                            yield _sse("delta", {"content": reply})
-                        else:
-                            yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
-                            yield _sse("done", {"model": model, "degraded": True})
-                            return
-                    yield _sse("done", {"model": model, "degraded": False})
+                    if not streamed_content:
+                        yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
+                        yield _sse("done", {"model": route["task_id"], "degraded": True})
+                        return
+                    yield _sse("done", {"model": route["task_id"], "degraded": False})
                     return
 
-                # 有工具调用 → 执行并推送 action 事件
+                # 模型通过流协议下发工具调用，后端执行并实时推送 action。
                 messages.append({
                     "role": "assistant",
-                    "content": msg.get("content") or "",
+                    "content": "".join(streamed_content),
                     "tool_calls": tool_calls,
                 })
                 for tc in tool_calls:
@@ -1104,18 +1109,48 @@ async def chat_stream(
                     )
                     actions.append(action)
                     yield _sse("action", action.model_dump())
+                    table_data = _extract_table_data(tool_name, result)
+                    if table_data:
+                        yield _sse("table", table_data)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
-                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                        "content": _grounded_tool_result(result),
                     })
-                payload["messages"] = messages
+
+                # 最终回答直接流式生成。语义选择仍由首轮模型完成，业务层只提供工具事实。
+                facts = [
+                    {"tool": action.tool, "result": action.result}
+                    for action in actions
+                ]
+                payload = {
+                    "model": route["gateway_model"],
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                f"{FINAL_GROUNDING_PROMPT}"
+                                "请根据用户问题和工具事实生成简洁、自然的中文答复，"
+                                "只输出最终答复。"
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"用户问题：{last_user}\n"
+                                f"工具事实：{json.dumps(facts, ensure_ascii=False, default=str)}"
+                            ),
+                        },
+                    ],
+                    "temperature": 0,
+                    "max_tokens": route["max_completion_tokens"],
+                }
 
             yield _sse("delta", {"content": "操作轮次过多，已停止。请简化您的请求后重试。"})
-            yield _sse("done", {"model": model, "degraded": True})
+            yield _sse("done", {"model": route["task_id"], "degraded": True})
         except Exception as exc:  # noqa: BLE001
             yield _sse("delta", {"content": _degraded_message(f"网关连接失败 ({type(exc).__name__})")})
-            yield _sse("done", {"model": model, "degraded": True})
+            yield _sse("done", {"model": route["task_id"], "degraded": True})
 
     return StreamingResponse(
         generate(),

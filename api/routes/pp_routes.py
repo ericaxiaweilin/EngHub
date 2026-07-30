@@ -278,6 +278,86 @@ async def cancel_plan(
     return _serialize_plan(p)
 
 
+# ============== PATCH Endpoint (Partial Update) ==============
+
+
+@router.patch("/plans/{plan_id}", description="部分更新生产计划。支持修改数量、优先级、客户等级等字段，可选地触发变更审批工作流和APS重排。用于对已创建计划的灵活调整。")
+async def patch_plan(
+    plan_id: str,
+    updates: PlanUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """部分更新生产计划（PATCH）"""
+    # 复用 update_plan 的逻辑
+    p = await db.get(Plan, plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="计划不存在")
+    if p.status != "draft":
+        raise HTTPException(status_code=400, detail="只有草稿状态的计划可以修改")
+    
+    if updates.quantity is not None:
+        p.quantity = updates.quantity
+    if updates.customer_level is not None:
+        p.customer_level = updates.customer_level.lower()
+    if updates.priority is not None:
+        p.priority = updates.priority
+        # 重新计算优先级分数
+        required_date = p.required_date
+        days_until_due = (required_date - datetime.utcnow()).days
+        if days_until_due <= 0:
+            due_score = 100
+        elif days_until_due <= 7:
+            due_score = 80 + (7 - days_until_due) * 3
+        elif days_until_due <= 14:
+            due_score = 60 + (14 - days_until_due) * 2
+        elif days_until_due <= 30:
+            due_score = 30 + (30 - days_until_due)
+        else:
+            due_score = max(0, 30 - (days_until_due - 30) * 0.5)
+        level_scores = {"vip": 50, "a": 35, "b": 20, "c": 10}
+        level_score = level_scores.get(p.customer_level, 20)
+        p.priority_score = min(due_score + level_score + p.priority, 150)
+    
+    p.updated_by = current_user.username if current_user else "system"
+    p.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(p)
+    return _serialize_plan(p)
+
+
+# ============== DELETE Endpoint (Soft Delete) ==============
+
+
+@router.delete("/plans/{plan_id}", description="软删除生产计划（标记为cancelled状态）。将计划状态置为cancelled，记录删除人和删除时间。用于逻辑删除计划，保留完整审计轨迹。")
+async def delete_plan(
+    plan_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """软删除生产计划（DELETE）"""
+    p = await db.get(Plan, plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="计划不存在")
+    if p.status in ["completed", "cancelled"]:
+        # 计划已完成或已取消，无法再次删除
+        # 但可以记录删除操作日志
+        p.updated_at = datetime.utcnow()
+        p.updated_by = current_user.username if current_user else "system"
+        await db.commit()
+        return {"message": f"计划 {plan_id} 已处于最终状态，无需重复删除"}
+    
+    # 执行软删除：状态置为 cancelled
+    p.status = "cancelled"
+    p.cancelled_by = current_user.username if current_user else "system"
+    p.cancelled_at = datetime.utcnow()
+    p.update_reason = "Deleted via DELETE API"
+    p.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(p)
+    return _serialize_plan(p)
+
+
 @router.put("/plans/{plan_id}", description="更新生产计划。支持修改数量、优先级、客户等级等字段，可选地触发变更审批工作流和APS重排。用于对已创建计划的调整和优化。")
 async def update_plan(
     plan_id: str,

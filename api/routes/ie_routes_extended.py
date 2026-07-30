@@ -40,6 +40,8 @@ class ActionStudyCreate(BaseModel):
     motions: List[Dict] = []  # [{"motion": "reach", "time_units": 2}]
     total_time_cycles: float = 0.0
     analysis_result: Dict[str, Any] = {}
+    ergonomic_score: Optional[float] = None
+    recommended_improvement_suggestion: Optional[str] = None
 
 
 class ActionStudyResponse(BaseModel):
@@ -67,6 +69,9 @@ class MethodStudyCreate(BaseModel):
     is_basement_method: bool = False
     is_optimal_method: bool = False
     description: str = ""
+    old_method_description: Optional[str] = None
+    improved_method_diagram_url: Optional[str] = None
+    expected_time_saving_calculation_detail: Dict[str, Any] = {}
     action_sequence: List[Dict] = []
     required_resources: List[Dict] = []
     setup_time_min: float = 0.0
@@ -141,6 +146,9 @@ class KanbanCreate(BaseModel):
     current_card_count: int = 0
     safety_stock_level: int = 2
     card_status: str = "available"
+    kanban_card_image_url: Optional[str] = None
+    trigger_rule_type: Optional[str] = None
+    min_max_stock_levels_detail: Dict[str, Any] = {}
 
 
 class KanbanResponse(BaseModel):
@@ -220,6 +228,9 @@ async def create_action_study(
         motions=as_data.motions,
         total_time_cycles=as_data.total_time_cycles,
         analysis_result=as_data.analysis_result,
+        motion_analysis_result=as_data.analysis_result,
+        ergonomic_score=as_data.ergonomic_score,
+        recommended_improvement_suggestion=as_data.recommended_improvement_suggestion,
         created_by=current_user.username
     )
     
@@ -227,7 +238,7 @@ async def create_action_study(
     await db.commit()
     await db.refresh(action_study)
     
-    return ActionStudyResponse.from_pydict(action_study.to_dict())
+    return action_study.to_dict()
 
 
 @router.get("/action-studies", response_model=List[Dict[str, Any]])
@@ -275,6 +286,9 @@ async def create_method_study(
         is_basement_method=ms_data.is_basement_method,
         is_optimal_method=ms_data.is_optimal_method,
         description=ms_data.description,
+        old_method_description=ms_data.old_method_description,
+        improved_method_diagram_url=ms_data.improved_method_diagram_url,
+        expected_time_saving_calculation_detail=ms_data.expected_time_saving_calculation_detail,
         action_sequence=ms_data.action_sequence,
         required_resources=ms_data.required_resources,
         setup_time_min=ms_data.setup_time_min,
@@ -291,7 +305,7 @@ async def create_method_study(
     await db.commit()
     await db.refresh(method_study)
     
-    return MethodStudyResponse.from_pydict(method_study.to_dict())
+    return method_study.to_dict()
 
 
 @router.put("/method-studies/{ms_id}/approve")
@@ -344,7 +358,7 @@ async def create_work_cell_layout(
     await db.commit()
     await db.refresh(layout)
     
-    return WorkCellLayoutResponse.from_pydict(layout.to_dict())
+    return layout.to_dict()
 
 
 @router.get("/work-cells/{work_cell_id}", response_model=WorkCellLayoutResponse)
@@ -359,11 +373,11 @@ async def get_work_cell_layout(
     if factory_id:
         query = query.where(WorkCellLayout.factory_id == factory_id)
     
-    result = await query
+    result = await db.execute(query)
     layout = result.scalar_one_or_none()
     if not layout:
         raise HTTPException(status_code=404, detail="Work cell layout not found")
-    return WorkCellLayoutResponse.from_pydict(layout.to_dict())
+    return layout.to_dict()
 
 
 # ============================================================
@@ -389,6 +403,9 @@ async def create_kanban(
         current_card_count=kanban_data.current_card_count,
         safety_stock_level=kanban_data.safety_stock_level,
         card_status=kanban_data.card_status,
+        kanban_card_image_url=kanban_data.kanban_card_image_url,
+        trigger_rule_type=kanban_data.trigger_rule_type,
+        min_max_stock_levels_detail=kanban_data.min_max_stock_levels_detail,
         created_by=current_user.username
     )
     
@@ -396,7 +413,7 @@ async def create_kanban(
     await db.commit()
     await db.refresh(kanban)
     
-    return KanbanResponse.from_pydict(kanban.to_dict())
+    return kanban.to_dict()
 
 
 @router.put("/kanbans/{kanban_id}/update-card-count")
@@ -419,7 +436,7 @@ async def update_kanban_card_count(
     await db.commit()
     await db.refresh(kanban)
     
-    return KanbanResponse.from_pydict(kanban.to_dict())
+    return kanban.to_dict()
 
 
 # ============================================================
