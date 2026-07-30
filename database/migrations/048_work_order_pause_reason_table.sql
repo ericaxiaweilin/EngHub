@@ -32,10 +32,12 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+DROP TRIGGER IF EXISTS update_work_order_pause_reasons_timestamp ON work_order_pause_reasons;
 CREATE TRIGGER update_work_order_pause_reasons_timestamp
 BEFORE UPDATE ON work_order_pause_reasons
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE INDEX IF NOT EXISTS idx_factory_code ON work_order_pause_reasons(factory_id, code);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_work_order_pause_reasons_factory_code ON work_order_pause_reasons(factory_id, code);
 CREATE INDEX IF NOT EXISTS idx_code_active ON work_order_pause_reasons(code, is_active);
 CREATE INDEX IF NOT EXISTS idx_category ON work_order_pause_reasons(category);
 

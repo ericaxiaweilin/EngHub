@@ -19,16 +19,19 @@ CREATE TABLE IF NOT EXISTS supplier_materials (
     description VARCHAR(200),                             -- Optional remarks/comments
     created_by VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Foreign key constraint (PostgreSQL syntax)
+-- Foreign key constraint (PostgreSQL syntax, idempotent for replay)
+ALTER TABLE supplier_materials
+DROP CONSTRAINT IF EXISTS fk_supplier_material_supplier;
 ALTER TABLE supplier_materials 
 ADD CONSTRAINT fk_supplier_material_supplier 
 FOREIGN KEY (supplier_id) REFERENCES suppliers(id) 
 ON DELETE CASCADE;
 
 -- Create indexes for efficient queries
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_supplier_material ON supplier_materials(supplier_id, material_code);
 CREATE INDEX IF NOT EXISTS idx_supplier_material ON supplier_materials(supplier_id, material_code);
 CREATE INDEX IF NOT EXISTS idx_material_active ON supplier_materials(material_code, is_active);
 CREATE INDEX IF NOT EXISTS idx_is_primary ON supplier_materials(is_primary);

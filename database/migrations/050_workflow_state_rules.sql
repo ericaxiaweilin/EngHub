@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS workflow_state_rules (
     sort_order INTEGER DEFAULT 0,                 -- Sort order for UI display
     created_by VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Create indexes for efficient querying

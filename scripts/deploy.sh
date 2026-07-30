@@ -153,8 +153,20 @@ for file in main.py requirements.txt frontend/package.json frontend/package-lock
   fi
 done
 
-# Hot-patch only files changed since the last successful deployment. The
-# production image contains compatibility files that are not yet in this repo.
+# First make sure the running container has the full tracked source snapshot.
+# The manifest loop below still applies migrations and removes deleted files.
+for dir in api core database integrations scripts; do
+  if [[ -d "$RELEASE_DIR/source/$dir" ]]; then
+    docker exec -u 0 "$CONTAINER" mkdir -p "/app/$dir"
+    docker cp "$RELEASE_DIR/source/$dir/." "$CONTAINER:/app/$dir/"
+    docker exec -u 0 "$CONTAINER" chown -R appuser:appgroup "/app/$dir"
+  fi
+done
+if [[ -f "$RELEASE_DIR/source/main.py" ]]; then
+  docker cp "$RELEASE_DIR/source/main.py" "$CONTAINER:/app/main.py"
+  docker exec -u 0 "$CONTAINER" chown appuser:appgroup /app/main.py
+fi
+
 while IFS=$'\t' read -r status path extra; do
   [[ -z "$status" || -z "$path" ]] && continue
   case "$status" in

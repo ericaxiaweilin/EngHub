@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS workflow_action_gates (
     sort_order INTEGER DEFAULT 0,
     created_by VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_factory_action ON workflow_action_gates(factory_id, action);

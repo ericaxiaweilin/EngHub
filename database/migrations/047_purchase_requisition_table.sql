@@ -26,10 +26,33 @@ CREATE TABLE IF NOT EXISTS purchase_requisitions (
     lead_time_days INTEGER,                    -- Supplier lead time in days
     created_by VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+ALTER TABLE purchase_requisitions
+ADD COLUMN IF NOT EXISTS purchase_code VARCHAR(50),
+ADD COLUMN IF NOT EXISTS material_id VARCHAR(50),
+ADD COLUMN IF NOT EXISTS required_qty INTEGER,
+ADD COLUMN IF NOT EXISTS suggested_qty INTEGER,
+ADD COLUMN IF NOT EXISTS shortage_qty INTEGER,
+ADD COLUMN IF NOT EXISTS suggested_date TIMESTAMP,
+ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'NORMAL',
+ADD COLUMN IF NOT EXISTS mrp_plan_id VARCHAR(36),
+ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(15, 2),
+ADD COLUMN IF NOT EXISTS supplier_id VARCHAR(50),
+ADD COLUMN IF NOT EXISTS lead_time_days INTEGER,
+ADD COLUMN IF NOT EXISTS created_by VARCHAR(50),
+ADD COLUMN IF NOT EXISTS pr_code VARCHAR(50),
+ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'mrp',
+ADD COLUMN IF NOT EXISTS source_id VARCHAR(50),
+ADD COLUMN IF NOT EXISTS qty NUMERIC,
+ADD COLUMN IF NOT EXISTS unit VARCHAR(20) DEFAULT 'PCS',
+ADD COLUMN IF NOT EXISTS required_date DATE,
+ADD COLUMN IF NOT EXISTS auto_approved BOOLEAN DEFAULT FALSE,
+ADD COLUMN IF NOT EXISTS approved_by VARCHAR(50);
+
 -- Add indexes for efficient querying and reporting
+CREATE UNIQUE INDEX IF NOT EXISTS uq_purchase_requisitions_purchase_code ON purchase_requisitions(purchase_code);
 CREATE INDEX IF NOT EXISTS idx_pr_factory_material ON purchase_requisitions(factory_id, material_id);
 CREATE INDEX IF NOT EXISTS idx_pr_status ON purchase_requisitions(status);
 CREATE INDEX IF NOT EXISTS idx_pr_suggested_date ON purchase_requisitions(suggested_date);
@@ -40,14 +63,17 @@ CREATE INDEX IF NOT EXISTS idx_pr_factory_status ON purchase_requisitions(factor
 -- ALTER TABLE purchase_requisitions ADD CONSTRAINT pr_mrp_plan FOREIGN KEY (mrp_plan_id) REFERENCES mrp_plans(id);
 
 -- Seed sample data (for testing/demo purposes)
-INSERT INTO purchase_requisitions (id, purchase_code, factory_id, material_id, material_code, material_name, 
-                                  required_qty, suggested_qty, shortage_qty, suggested_date, priority, status,
-                                  mrp_plan_id, estimated_cost, supplier_id, lead_time_days, created_by)
+INSERT INTO purchase_requisitions (
+    id, pr_code, purchase_code, factory_id, source, source_id, material_id,
+    material_code, material_name, qty, unit, required_date, required_qty,
+    suggested_qty, shortage_qty, suggested_date, priority, status, auto_approved,
+    mrp_plan_id, estimated_cost, supplier_id, lead_time_days, created_by
+)
 VALUES 
-(gen_random_uuid(), 'PR-20260728-001', 'FAC_MECH_001', 'MAT-RES-10K', 'RES-10K-0603', '贴片电阻10K',
-  5000, 5000, 3000, NOW() + INTERVAL '7 days', 'HIGH', 'PENDING', 'MRP-PLAN-20260728-01', 50.00, 'SUP-001', 7, 'system'),
-(gen_random_uuid(), 'PR-20260728-002', 'FAC_MECH_001', 'MAT-CAP-100NF', 'CAP-100NF-0603', '贴片电容100NF',
-  3000, 3000, 2000, NOW() + INTERVAL '7 days', 'MEDIUM', 'PENDING', 'MRP-PLAN-20260728-01', 60.00, 'SUP-002', 10, 'system')
+(gen_random_uuid(), 'PR-20260728-001', 'PR-20260728-001', 'FAC_MECH_001', 'mrp', 'MRP-PLAN-20260728-01', 'MAT-RES-10K', 'RES-10K-0603', '贴片电阻10K',
+  5000, 'PCS', CURRENT_DATE + 7, 5000, 5000, 3000, NOW() + INTERVAL '7 days', 'HIGH', 'PENDING', FALSE, 'MRP-PLAN-20260728-01', 50.00, 'SUP-001', 7, 'system'),
+(gen_random_uuid(), 'PR-20260728-002', 'PR-20260728-002', 'FAC_MECH_001', 'mrp', 'MRP-PLAN-20260728-01', 'MAT-CAP-100NF', 'CAP-100NF-0603', '贴片电容100NF',
+  3000, 'PCS', CURRENT_DATE + 7, 3000, 3000, 2000, NOW() + INTERVAL '7 days', 'MEDIUM', 'PENDING', FALSE, 'MRP-PLAN-20260728-01', 60.00, 'SUP-002', 10, 'system')
 ON CONFLICT DO NOTHING;
 
 -- =============================================================================

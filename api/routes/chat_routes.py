@@ -32,6 +32,9 @@ from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
     TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
 )
+from api.services.quick_command_service import (
+    build_agent_system_prompt, record_agent_dispatch,
+)
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 
@@ -100,6 +103,7 @@ class ChatRequest(BaseModel):
     temperature: float = 0.3
     enable_tools: bool = True  # 是否启用工具调用
     attachments: List[Attachment] = Field(default_factory=list)  # 本轮用户消息附带的附件
+    agent_key: Optional[str] = None  # 指定调度的智能体（空=自动，由模型自行选择工具）
 
 
 class ToolAction(BaseModel):
@@ -571,6 +575,12 @@ async def chat(
 
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
+    if request.agent_key:
+        agent_prompt = build_agent_system_prompt(request.agent_key)
+        if agent_prompt:
+            messages.append({"role": "system", "content": agent_prompt})
+            await record_agent_dispatch(db, factory_id, request.agent_key, last_user)
     history = [m.model_dump() for m in request.messages]
     # 将附件注入「最后一条用户消息」：图片 → 多模态 content；非图片 → 文字摘要追加
     non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
@@ -1027,6 +1037,12 @@ async def chat_stream(
 
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
         messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
+        if request.agent_key:
+            agent_prompt = build_agent_system_prompt(request.agent_key)
+            if agent_prompt:
+                messages.append({"role": "system", "content": agent_prompt})
+                await record_agent_dispatch(db, factory_id, request.agent_key, last_user)
         history = [m.model_dump() for m in request.messages]
         non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
         injected = False

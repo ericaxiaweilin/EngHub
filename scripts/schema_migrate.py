@@ -38,6 +38,8 @@ async def migrate() -> None:
             "SELECT migration_name, checksum FROM enghub_schema_migrations"
         ))).all())
         for path in sorted(MIGRATIONS.glob("*.sql")):
+            if path.name.endswith(" 2.sql"):
+                continue
             try:
                 version = int(path.name.split("_", 1)[0])
             except ValueError:

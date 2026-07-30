@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS workflow_state_rules (
     sort_order INTEGER DEFAULT 0,            -- Sort order for UI display
     created_by VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Create primary indexes for efficient querying
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS workflow_action_gates (
     sort_order INTEGER DEFAULT 0,            -- Sort order
     created_by VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Create indexes for action-based lookups
@@ -59,8 +59,10 @@ CREATE TABLE IF NOT EXISTS workflow_rule_versions (
 );
 
 -- Create indexes for version queries
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_workflow_rule_versions_factory_version
+    ON workflow_rule_versions(factory_id, version_number);
 CREATE INDEX IF NOT EXISTS idx_factory_version ON workflow_rule_versions(factory_id, version_number);
-CREATE INDEX IF_NOT EXISTS idx_factory_active ON workflow_rule_versions(factory_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_factory_active ON workflow_rule_versions(factory_id, is_active);
 
 -- Seed default state transition rules matching the current hardcoded TRANSITIONS
 -- These represent the initial state machine configuration before any customization
@@ -119,7 +121,7 @@ VALUES
     (gen_random_uuid(), 'ALL', 'resume', 'team_leader', 'Team leaders can resume work orders', 12),
     
     (gen_random_uuid(), 'ALL', 'cancel', 'operator', 'Operators can cancel draft/pending work orders', 13),
-    (gen_random_uuid(), 'ALL', 'cancel', 'team_leader', 'Team leaders can cancel work orders', 14),
+    (gen_random_uuid(), 'ALL', 'cancel', 'team_leader', 'Team leaders can cancel work orders', 14)
 ON CONFLICT (factory_id, action, required_role) DO NOTHING;
 
 -- Create an initial version record (version 1)

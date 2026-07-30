@@ -21,13 +21,22 @@ CREATE TABLE IF NOT EXISTS suppliers (
     eoq_suggested NUMERIC(15, 2),                -- 建议经济批量
     preferred_for VARCHAR(200),                  -- 擅长供应的材料类别
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+ALTER TABLE suppliers
+ADD COLUMN IF NOT EXISTS address TEXT,
+ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE,
+ADD COLUMN IF NOT EXISTS lead_time_days INTEGER DEFAULT 7,
+ADD COLUMN IF NOT EXISTS moq_min INTEGER DEFAULT 1,
+ADD COLUMN IF NOT EXISTS eoq_suggested NUMERIC(15, 2),
+ADD COLUMN IF NOT EXISTS preferred_for VARCHAR(200);
+
 -- Add indexes for efficient querying and reporting
+CREATE UNIQUE INDEX IF NOT EXISTS uq_suppliers_supplier_code ON suppliers(supplier_code);
 CREATE INDEX IF NOT EXISTS idx_supplier_code ON suppliers(supplier_code);
 CREATE INDEX IF NOT EXISTS idx_supplier_status ON suppliers(is_active);
-CREATE INDEX IF NOT EXISTS idx_supplier_search ON UPPER(supplier_name);
+CREATE INDEX IF NOT EXISTS idx_supplier_search ON suppliers (UPPER(supplier_name));
 
 -- Seed sample supplier data (for testing/demo purposes)
 INSERT INTO suppliers (id, supplier_code, supplier_name, contact_person, phone, email, lead_time_days, moq_min, eoq_suggested, preferred_for, is_active)

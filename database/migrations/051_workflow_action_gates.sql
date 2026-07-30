@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS workflow_action_gates (
     sort_order INTEGER DEFAULT 0,                 -- UI排序顺序
     created_by VARCHAR(50),                       -- 创建者
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT ON UPDATE NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Add indexes for efficient querying
