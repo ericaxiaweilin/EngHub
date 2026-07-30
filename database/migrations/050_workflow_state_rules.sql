@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS workflow_state_rules (
 -- Create indexes for efficient querying
 CREATE INDEX IF NOT EXISTS idx_factory_state ON workflow_state_rules(factory_id, current_state);
 CREATE INDEX IF NOT EXISTS idx_allowed_next ON workflow_state_rules(factory_id, allowed_next_state);
-CREATE UNIQUE INDEX IF EXISTS uniq_factory_curr_next 
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_factory_curr_next 
     ON workflow_state_rules(factory_id, current_state, allowed_next_state);
 
 -- Seed default state transition rules matching the original TRANSITIONS dictionary
@@ -52,7 +52,7 @@ INSERT INTO workflow_state_rules (id, factory_id, current_state, allowed_next_st
     (gen_random_uuid(), 'ALL', 'on_hold', 'cancelled', 'On hold cancellation', 13, TRUE),
     
     -- Pending_inbound can only go to completed
-    (gen_random_uuid(), 'ALL', 'pending_inbound', 'completed', 'Pending inbound to completed', 14, TRUE),
+    (gen_random_uuid(), 'ALL', 'pending_inbound', 'completed', 'Pending inbound to completed', 14, TRUE)
     
     -- Terminal states have no outgoing transitions (empty arrays in original TRANSITIONS)
     -- completed, closed, and cancelled have no allowed_next_states by default

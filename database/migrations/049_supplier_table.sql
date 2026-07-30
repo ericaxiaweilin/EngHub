@@ -39,11 +39,11 @@ CREATE INDEX IF NOT EXISTS idx_supplier_status ON suppliers(is_active);
 CREATE INDEX IF NOT EXISTS idx_supplier_search ON suppliers (UPPER(supplier_name));
 
 -- Seed sample supplier data (for testing/demo purposes)
-INSERT INTO suppliers (id, supplier_code, supplier_name, contact_person, phone, email, lead_time_days, moq_min, eoq_suggested, preferred_for, is_active)
+INSERT INTO suppliers (id, factory_id, supplier_code, supplier_name, contact_person, phone, email, lead_time_days, moq_min, eoq_suggested, preferred_for, is_active)
 VALUES 
-    (gen_random_uuid(), 'SUP-RES-001', 'Resistor Components Inc.', 'John Smith', '+1-555-0101', 'john@resistors.com', 7, 1000, 5000.0, '贴片电阻、电容等被动元件', TRUE),
-    (gen_random_uuid(), 'SUP-CAP-001', 'Capacitor Tech Corp.', 'Emily Chen', '+1-555-0102', 'emily@captech.com', 10, 500, 3000.0, '各类电容器', TRUE),
-    (gen_random_uuid(), 'SUP-CHIPS-001', 'Microchip Solutions', 'Mike Johnson', '+1-555-0103', 'mike@microchips.com', 14, 100, 2000.0, 'IC芯片、微控制器', TRUE)
+    (gen_random_uuid(), 'F01', 'SUP-RES-001', 'Resistor Components Inc.', 'John Smith', '+1-555-0101', 'john@resistors.com', 7, 1000, 5000.0, '贴片电阻、电容等被动元件', TRUE),
+    (gen_random_uuid(), 'F01', 'SUP-CAP-001', 'Capacitor Tech Corp.', 'Emily Chen', '+1-555-0102', 'emily@captech.com', 10, 500, 3000.0, '各类电容器', TRUE),
+    (gen_random_uuid(), 'F01', 'SUP-CHIPS-001', 'Microchip Solutions', 'Mike Johnson', '+1-555-0103', 'mike@microchips.com', 14, 100, 2000.0, 'IC芯片、微控制器', TRUE)
 ON CONFLICT DO NOTHING;
 
 -- =============================================================================

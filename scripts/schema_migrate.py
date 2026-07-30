@@ -52,6 +52,7 @@ async def migrate() -> None:
                 if applied[path.name] != checksum:
                     raise RuntimeError(f"applied migration checksum changed: {path.name}")
                 continue
+            print(f"applying migration: {path.name}", flush=True)
             raw = await connection.get_raw_connection()
             await raw.driver_connection.execute(sql)
             await connection.execute(

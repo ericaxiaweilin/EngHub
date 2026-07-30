@@ -92,7 +92,7 @@ VALUES
     (gen_random_uuid(), 'ALL', 'on_hold', 'cancelled', 'On hold cancellation', 13),
     
     -- Pending_inbound can only go to completed
-    (gen_random_uuid(), 'ALL', 'pending_inbound', 'completed', 'Pending inbound to completed', 14),
+    (gen_random_uuid(), 'ALL', 'pending_inbound', 'completed', 'Pending inbound to completed', 14)
     
     -- Completed has no outgoing transitions (terminal state)
     -- Closed has no outgoing transitions (terminal state)
