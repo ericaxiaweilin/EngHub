@@ -13,7 +13,7 @@ import {
   PaperClipOutlined, FileOutlined, DownloadOutlined, TableOutlined,
   CopyOutlined, ShareAltOutlined, CommentOutlined, InboxOutlined,
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
-  PlusOutlined, DeleteOutlined, EditOutlined, SettingOutlined,
+  PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
 } from '@ant-design/icons'
 
 // Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
@@ -535,7 +535,7 @@ export default function AIAssistantWidget() {
         command_text: text,
         agent_key: newCmdAgent !== 'auto' ? newCmdAgent : undefined,
       })
-      message.success(res.agent_name ? `已添加，自动归类到「${res.agent_name}」` : '已添加（通用命令，由模型自动调度）')
+      message.success(res.agent_name ? `已添加，自动归类到「${res.agent_name}」` : '已添加（通用命令，交由智能体自动处理）')
       setNewCmdText('')
       setNewCmdAgent('auto')
       fetchQuickCommands()
@@ -580,6 +580,14 @@ export default function AIAssistantWidget() {
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '删除失败')
     }
+  }
+
+  // 在弹窗内直接点击快捷命令：以其归类智能体身份发送，并关闭弹窗
+  const sendQuickCommand = (cmd: QuickCommand) => {
+    if (loading) return
+    setCmdModalOpen(false)
+    setEditingCmdId(null)
+    sendMessage(cmd.command_text, cmd.agent_key || undefined)
   }
 
   const copyChatMessage = async (chatMessage: ChatMsg) => {
@@ -1211,7 +1219,7 @@ export default function AIAssistantWidget() {
                           onChange={setSelectedAgent}
                           style={{ width: 170, flexShrink: 0 }}
                           options={[
-                            { value: 'auto', label: '自动调度（模型选择）' },
+                            { value: 'auto', label: '智能体（模型自选）' },
                             ...agents.map(a => ({ value: a.key, label: a.name })),
                           ]}
                         />
@@ -1222,19 +1230,8 @@ export default function AIAssistantWidget() {
                         )}
                       </div>
                     )}
-                    {/* 快捷指令（后端快速命令，带智能体归类标识） */}
+                    {/* 快捷指令区：仅保留工作流触发 + 快捷命令入口，快捷命令本体收进弹窗 */}
                     <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                      {quickCommands.map(cmd => (
-                        <Tooltip key={cmd.id} title={cmd.agent_name ? `由「${cmd.agent_name}」处理` : '自动调度'}>
-                          <Tag
-                            color={cmd.agent_key ? 'geekblue' : 'processing'}
-                            style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px', margin: 0 }}
-                            onClick={() => !loading && sendMessage(cmd.command_text, cmd.agent_key || undefined)}
-                          >
-                            {cmd.command_text}{cmd.agent_name ? ` · ${cmd.agent_name.replace('智能体', '')}` : ''}
-                          </Tag>
-                        </Tooltip>
-                      ))}
                       {/* 可用工作流（橙色区分，点击即触发确定性流程） */}
                       {workflows.map(wf => (
                         <Tag
@@ -1246,18 +1243,19 @@ export default function AIAssistantWidget() {
                           <ThunderboltOutlined /> {wf.label}
                         </Tag>
                       ))}
-                      {/* 快速命令管理入口（CRUD） */}
+                      {/* 快捷命令入口：点击打开弹窗，在弹窗内直接发送给智能体 */}
                       <Tag
-                        icon={<SettingOutlined />}
-                        style={{ cursor: 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px', margin: 0, borderStyle: 'dashed' }}
+                        icon={<UnorderedListOutlined />}
+                        color="processing"
+                        style={{ cursor: 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px', margin: 0 }}
                         onClick={() => setCmdModalOpen(true)}
                       >
-                        管理
+                        快捷命令
                       </Tag>
                     </div>
-                    {/* 快速命令管理弹窗：新增后立即自动归类到对应智能体 */}
+                    {/* 快捷命令弹窗：点击命令即直接发送；新增后立即自动归类到对应智能体 */}
                     <Modal
-                      title="快速命令管理"
+                      title="快捷命令"
                       open={cmdModalOpen}
                       onCancel={() => { setCmdModalOpen(false); setEditingCmdId(null) }}
                       footer={null}
@@ -1315,17 +1313,22 @@ export default function AIAssistantWidget() {
                               </Space.Compact>
                             ) : (
                               <Space size={6}>
-                                <Text style={{ fontSize: 13 }}>{cmd.command_text}</Text>
+                                <Tooltip title={cmd.agent_name ? `点击发送，由「${cmd.agent_name}」处理` : '点击发送给智能体'}>
+                                  <Text
+                                    style={{ fontSize: 13, cursor: loading ? 'not-allowed' : 'pointer', color: '#1677ff' }}
+                                    onClick={() => sendQuickCommand(cmd)}
+                                  >{cmd.command_text}</Text>
+                                </Tooltip>
                                 {cmd.agent_name
                                   ? <Tag color="geekblue" style={{ fontSize: 10 }}>{cmd.agent_name}</Tag>
-                                  : <Tag style={{ fontSize: 10 }}>自动调度</Tag>}
+                                  : <Tag style={{ fontSize: 10 }}>智能体</Tag>}
                               </Space>
                             )}
                           </List.Item>
                         )}
                       />
                       <Text type="secondary" style={{ fontSize: 11 }}>
-                        新增命令后系统会立即自动归类到对应智能体；点击命令即以该智能体身份执行。
+                        点击命令即可直接发送给对应智能体；新增命令后系统会自动归类到对应智能体。
                       </Text>
                     </Modal>
                     {/* 输入区 */}
