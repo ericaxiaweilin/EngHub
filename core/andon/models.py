@@ -51,7 +51,7 @@ class AndonTicket(Base):
     location_id = Column(String(50), nullable=True)                 # 工位/区域ID
     location_name = Column(String(100), nullable=True)              # 位置名称（冗余）
     equipment_id = Column(String(36), nullable=True, index=True)    # 关联设备
-    work_order_id = Column(String(36), nullable=True, index=True)   # 关联生产工单
+    work_order_id = Column(UUID(as_uuid=False), nullable=True, index=True)   # 关联生产工单
 
     # 状态机
     status = Column(String(30), default="open", index=True)         # open/assigned/picking/upgrading/in_progress/resolved/closed/cancelled

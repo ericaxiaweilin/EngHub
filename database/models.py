@@ -315,7 +315,7 @@ class WoStatusLog(Base):
     __tablename__ = "wo_status_logs"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
+    work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=False, index=True)
     action = Column(String(30), nullable=False)          # create/release/start/pause/resume/pending_inbound/complete/close/cancel/split
     from_status = Column(String(20), nullable=True)
     to_status = Column(String(20), nullable=False)
@@ -1467,7 +1467,7 @@ class ReconciliationLog(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     reconcile_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
-    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
+    work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=True, index=True)
     planned_qty = Column(Integer, nullable=False, default=0)
     good_qty = Column(Integer, nullable=False, default=0)
     defect_qty = Column(Integer, nullable=False, default=0)
