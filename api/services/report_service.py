@@ -63,6 +63,7 @@ class ReportService:
         remark: Optional[str] = None,
         shift: Optional[str] = None,
         report_date: Optional[datetime] = None,
+        assistant_operator_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """快速报工 - 3秒完成"""
         shift = shift or _detect_shift()
@@ -87,6 +88,7 @@ class ReportService:
             report_type="quick",
             shift=shift,
             operator_id=operator_id,
+            assistant_operator_ids=assistant_operator_ids or [],
             operation_seq=operation_seq,
             operation_name=operation_name,
             machine_id=machine_id,
@@ -141,6 +143,7 @@ class ReportService:
         operator_id: Optional[str] = None,
         shift: Optional[str] = None,
         report_date: Optional[datetime] = None,
+        assistant_operator_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """批量报工 - 一次报多个工序/工单"""
         shift = shift or _detect_shift()
@@ -164,6 +167,7 @@ class ReportService:
                 remark=item.get("remark"),
                 shift=shift,
                 report_date=item.get("report_date") or report_date,
+                assistant_operator_ids=item.get("assistant_operator_ids") or assistant_operator_ids,
             )
             results.append(result)
             total_good += item.get("good_qty", 0)

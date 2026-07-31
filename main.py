@@ -58,6 +58,7 @@ from api.routes.agent_routes import router as agent_router
 from api.routes.quick_command_routes import router as quick_command_router
 from api.routes.task_center_routes import router as task_center_router
 from api.routes.crew_routes import router as crew_router
+from api.routes.work_team_routes import router as work_team_router
 from core.org_panel.api_adapter import router as org_panel_router
 
 app = FastAPI(
@@ -99,6 +100,7 @@ app.include_router(wms_phase3_router)  # 岗位替代 Phase 3: 仓管操作/库�
 app.include_router(qms_phase4_router)  # 岗位替代 Phase 4: 检验终端/SPC/不良分析
 app.include_router(equipment_phase5_router)  # 岗位替代 Phase 5: 维保终端/OEE/故障预测
 app.include_router(hr_router)  # HR 人力档案 + 工厂切换
+app.include_router(work_team_router)  # 报工小组 CRUD（操作人便捷选择/批量报工）
 app.include_router(notification_router)  # 站内通知（报告/异常/系统）
 app.include_router(role_elimination_router)  # 岗位替代（调度员/采购员/工艺员）
 app.include_router(workflow_analytics_router)  # 工作流交叉分析（深层数据）

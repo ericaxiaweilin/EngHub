@@ -887,6 +887,24 @@ class FiveSAudit(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class WorkTeam(Base):
+    """报工小组：若干工号打包为一个整体，便于小组长批量报工"""
+
+    __tablename__ = "work_teams"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    team_code = Column(String(50), nullable=False, index=True)
+    team_name = Column(String(100), nullable=False)
+    leader_id = Column(String(50))  # 组长工号（报工时作为 operator_id）
+    member_ids = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 组员工号列表
+    description = Column(Text)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class ShiftSummary(Base):
     """班次汇总记录"""
     

@@ -334,6 +334,7 @@ export const createProductionReport = (data: {
   report_type?: string;
   shift?: string;
   operator_id?: string;
+  assistant_operator_ids?: string[];
   remark?: string;
   report_date?: string;
 }) => api.post(API_ENDPOINTS.PRODUCTION_REPORTS, data);
@@ -348,10 +349,12 @@ export const batchProductionReport = (data: {
     scrap_qty?: number;
     remark?: string;
     report_date?: string;
+    assistant_operator_ids?: string[];
   }[];
   operator_id?: string;
   shift?: string;
   report_date?: string;
+  assistant_operator_ids?: string[];
 }) => api.post('/api/v1/reports/batch', data);
 
 export const modifyProductionReport = (id: string, data: Record<string, any>) =>
@@ -359,6 +362,55 @@ export const modifyProductionReport = (id: string, data: Record<string, any>) =>
 
 export const addReportComment = (id: string, comment: string) =>
   api.post(`${API_ENDPOINTS.PRODUCTION_REPORTS}/${id}/comments`, { comment });
+
+// ============== Work Teams（报工小组） ==============
+
+export interface WorkTeam {
+  id: string;
+  factory_id: string;
+  team_code: string;
+  team_name: string;
+  leader_id?: string;
+  member_ids: string[];
+  description?: string;
+  is_active: boolean;
+  created_by?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export const getWorkTeams = (params: { factory_id: string; include_inactive?: boolean; keyword?: string }) =>
+  api.get<any, { items: WorkTeam[]; total: number }>('/api/v1/work-teams', { params });
+
+export const createWorkTeam = (data: {
+  factory_id: string;
+  team_name: string;
+  team_code?: string;
+  leader_id?: string;
+  member_ids?: string[];
+  description?: string;
+}) => api.post<any, WorkTeam>('/api/v1/work-teams', data);
+
+export const updateWorkTeam = (id: string, data: Partial<Omit<WorkTeam, 'id' | 'factory_id'>>) =>
+  api.put<any, WorkTeam>(`/api/v1/work-teams/${id}`, data);
+
+export const deleteWorkTeam = (id: string, hard = false) =>
+  api.delete(`/api/v1/work-teams/${id}`, { params: { hard } });
+
+// 报工操作人选择用的员工简表（按登录用户当前工厂过滤）
+export interface HrEmployeeLite {
+  id: string;
+  employee_code: string;
+  name: string;
+  department?: string;
+  station?: string;
+  position?: string;
+}
+
+export const getHrEmployees = (params?: { keyword?: string; page_size?: number }) =>
+  api.get<any, { items: HrEmployeeLite[]; total: number }>('/api/v1/hr/employees', {
+    params: { page_size: 200, ...params },
+  });
 
 // ============== Stations ==============
 

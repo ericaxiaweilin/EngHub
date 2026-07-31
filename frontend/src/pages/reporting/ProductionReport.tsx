@@ -1,14 +1,15 @@
-import React, { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback, useMemo } from 'react'
 import {
   Form, Input, InputNumber, Select, Button, Card, Radio, Space, message,
-  Table, Tag, Row, Col, Modal, Statistic, DatePicker,
+  Table, Tag, Row, Col, Modal, Statistic, DatePicker, Popconfirm,
 } from 'antd'
-import { ReloadOutlined, PlusOutlined, DeleteOutlined, AppstoreAddOutlined } from '@ant-design/icons'
+import { ReloadOutlined, PlusOutlined, DeleteOutlined, AppstoreAddOutlined, TeamOutlined, EditOutlined } from '@ant-design/icons'
 import dayjs, { Dayjs } from 'dayjs'
 import {
   getProductionReports, createProductionReport, batchProductionReport, modifyProductionReport,
   addReportComment, getWorkOrders, getStations, getProducts,
-  ProductionReport as ReportType, WorkOrder, Station, Product,
+  getWorkTeams, createWorkTeam, updateWorkTeam, deleteWorkTeam, getHrEmployees,
+  ProductionReport as ReportType, WorkOrder, Station, Product, WorkTeam, HrEmployeeLite,
 } from '../../services/mes'
 import { getStoredUser } from '../../services/auth'
 import { useNavigate } from 'react-router-dom'
@@ -63,7 +64,17 @@ const ProductionReport: React.FC = () => {
   const [batchDate, setBatchDate] = useState<Dayjs | null>(null)
   const [batchShift, setBatchShift] = useState<string>('day')
   const [batchOperator, setBatchOperator] = useState<string>('')
+  const [batchTeamId, setBatchTeamId] = useState<string | undefined>(undefined)
   const [batchSubmitting, setBatchSubmitting] = useState(false)
+  // 操作人便捷选择：员工花名册 + 报工小组
+  const [employees, setEmployees] = useState<HrEmployeeLite[]>([])
+  const [teams, setTeams] = useState<WorkTeam[]>([])
+  const [formTeamId, setFormTeamId] = useState<string | undefined>(undefined)
+  // 小组管理弹窗
+  const [teamMgrOpen, setTeamMgrOpen] = useState(false)
+  const [editingTeam, setEditingTeam] = useState<WorkTeam | null>(null)
+  const [teamSaving, setTeamSaving] = useState(false)
+  const [teamForm] = Form.useForm()
 
   const navigate = useNavigate()
   // 追溯交互状态：统计下钻抽屉 / 报工原始记录详情
@@ -95,21 +106,54 @@ const ProductionReport: React.FC = () => {
   }, [factoryId, page])
 
   const fetchOptions = useCallback(async () => {
-    const [woRes, stRes, pdRes] = await Promise.allSettled([
+    const [woRes, stRes, pdRes, empRes, teamRes] = await Promise.allSettled([
       getWorkOrders({ factory_id: factoryId, status: 'in_progress', page_size: 50 }),
       getStations({ factory_id: factoryId, page_size: 50 }),
       getProducts(),
+      getHrEmployees(),
+      getWorkTeams({ factory_id: factoryId }),
     ])
     setWorkOrders(woRes.status === 'fulfilled' ? (woRes.value.items || []) : [])
     setStations(stRes.status === 'fulfilled' ? (stRes.value.items || []) : [])
     setProducts(pdRes.status === 'fulfilled' ? (pdRes.value.items || []) : [])
+    setEmployees(empRes.status === 'fulfilled' ? (empRes.value.items || []) : [])
+    setTeams(teamRes.status === 'fulfilled' ? (teamRes.value.items || []) : [])
+  }, [factoryId])
+
+  const refreshTeams = useCallback(async () => {
+    try {
+      const res = await getWorkTeams({ factory_id: factoryId })
+      setTeams(res.items || [])
+    } catch { /* ignore */ }
   }, [factoryId])
 
   useEffect(() => { fetchReports() }, [fetchReports])
   useEffect(() => { fetchOptions() }, [fetchOptions])
 
+  // ===== 操作人选项：登录用户置顶 + 组织花名册 =====
+  const operatorOptions = useMemo(() => {
+    const opts: { value: string; label: string }[] = []
+    if (user?.username) opts.push({ value: user.username, label: `👤 我自己（${user.username}）` })
+    employees.forEach(e => {
+      if (e.employee_code && e.employee_code !== user?.username) {
+        opts.push({ value: e.employee_code, label: `${e.employee_code} - ${e.name}${e.position ? `（${e.position}）` : ''}` })
+      }
+    })
+    return opts
+  }, [employees, user?.username])
+
+  const empLabel = useCallback((code: string) => {
+    const e = employees.find(x => x.employee_code === code)
+    return e ? `${code} ${e.name}` : code
+  }, [employees])
+
+  // 选中小组 → 操作人=组长，组员作为协作人员一起记入报工
+  const teamAssistants = (team: WorkTeam | undefined, operator?: string) =>
+    team ? (team.member_ids || []).filter(m => m && m !== operator) : undefined
+
   const handleSubmit = async (values: any) => {
     try {
+      const team = teams.find(t => t.id === formTeamId)
       await createProductionReport({
         factory_id: factoryId,
         work_order_id: values.work_order_id,
@@ -119,12 +163,14 @@ const ProductionReport: React.FC = () => {
         report_type: values.report_type || 'normal',
         shift: values.shift || 'day',
         operator_id: values.operator_id || undefined,
+        assistant_operator_ids: teamAssistants(team, values.operator_id),
         remark: values.remark || undefined,
         // 可选报工日期：不选则后端取当前时间；选了取当天中午（避免时区换算跨天）
         report_date: values.report_date ? values.report_date.hour(12).minute(0).second(0).toISOString() : undefined,
       })
       message.success('报工提交成功')
       form.resetFields()
+      setFormTeamId(undefined)
       fetchReports()
     } catch (err: any) {
       message.error(err?.response?.data?.detail || '报工提交失败')
@@ -138,6 +184,7 @@ const ProductionReport: React.FC = () => {
     if (valid.length < batchRows.length) { message.warning(`有 ${batchRows.length - valid.length} 行不完整，已自动忽略`) }
     setBatchSubmitting(true)
     try {
+      const team = teams.find(t => t.id === batchTeamId)
       const res: any = await batchProductionReport({
         factory_id: factoryId,
         items: valid.map(r => ({
@@ -148,6 +195,7 @@ const ProductionReport: React.FC = () => {
           remark: r.remark || undefined,
         })),
         operator_id: batchOperator || undefined,
+        assistant_operator_ids: teamAssistants(team, batchOperator),
         shift: batchShift,
         report_date: batchDate ? batchDate.hour(12).minute(0).second(0).toISOString() : undefined,
       })
@@ -155,6 +203,7 @@ const ProductionReport: React.FC = () => {
       setBatchOpen(false)
       setBatchRows([{ key: 1, good_qty: 0, defect_qty: 0 }])
       setBatchDate(null)
+      setBatchTeamId(undefined)
       fetchReports()
     } catch (err: any) {
       message.error(err?.response?.data?.detail || '批量报工失败')
@@ -165,6 +214,48 @@ const ProductionReport: React.FC = () => {
 
   const updateBatchRow = (key: number, patch: Partial<BatchRow>) =>
     setBatchRows(rows => rows.map(r => (r.key === key ? { ...r, ...patch } : r)))
+
+  // ===== 小组 CRUD =====
+  const openTeamEdit = (t: WorkTeam | null) => {
+    setEditingTeam(t)
+    teamForm.setFieldsValue(t
+      ? { team_name: t.team_name, team_code: t.team_code, leader_id: t.leader_id, member_ids: t.member_ids || [], description: t.description }
+      : { team_name: '', team_code: '', leader_id: undefined, member_ids: [], description: '' })
+  }
+
+  const handleTeamSave = async () => {
+    let values: any
+    try { values = await teamForm.validateFields() } catch { return }
+    setTeamSaving(true)
+    try {
+      if (editingTeam) {
+        await updateWorkTeam(editingTeam.id, { ...values, team_code: values.team_code || undefined })
+        message.success('小组已更新')
+      } else {
+        await createWorkTeam({ factory_id: factoryId, ...values, team_code: values.team_code || undefined })
+        message.success('小组已创建')
+      }
+      setEditingTeam(null)
+      teamForm.resetFields()
+      refreshTeams()
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || '保存失败')
+    } finally {
+      setTeamSaving(false)
+    }
+  }
+
+  const handleTeamDelete = async (id: string) => {
+    try {
+      await deleteWorkTeam(id)
+      message.success('小组已删除')
+      if (formTeamId === id) setFormTeamId(undefined)
+      if (batchTeamId === id) setBatchTeamId(undefined)
+      refreshTeams()
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || '删除失败')
+    }
+  }
 
   const handleModify = async (values: any) => {
     if (!modifyModal) return
@@ -216,7 +307,11 @@ const ProductionReport: React.FC = () => {
       ),
     },
     { label: '工位', key: 'station_id', render: (v: string) => stationLabel(v) },
-    { label: '操作人', key: 'operator_id', render: (v: string) => v || '-' },
+    { label: '操作人', key: 'operator_id', render: (v: string) => v ? empLabel(v) : '-' },
+    {
+      label: '协作人员', key: 'assistant_operator_ids',
+      render: (v: string[]) => (v && v.length) ? v.map(m => <Tag key={m}>{empLabel(m)}</Tag>) : '-',
+    },
     { label: '良品数', key: 'good_qty', render: (v: number) => <span style={{ color: '#52c41a', fontWeight: 600 }}>{v}</span> },
     { label: '不良数', key: 'defect_qty', render: (v: number) => <span style={{ color: '#faad14', fontWeight: 600 }}>{v}</span> },
     { label: '报废数', key: 'scrap_qty', render: (v: number) => <span style={{ color: '#f5222d' }}>{v}</span> },
@@ -286,7 +381,7 @@ const ProductionReport: React.FC = () => {
       ),
     },
     { title: '工位', dataIndex: 'station_id', key: 'station', width: 130, render: (v: string) => stationLabel(v) },
-    { title: '操作人', dataIndex: 'operator_id', key: 'operator', width: 90, render: (v: string) => v || '-' },
+    { title: '操作人', dataIndex: 'operator_id', key: 'operator', width: 110, render: (v: string) => v ? empLabel(v) : '-' },
     { title: '良品', dataIndex: 'good_qty', key: 'good', width: 70, render: (v: number) => <span style={{ color: '#52c41a', fontWeight: 500 }}>{v}</span> },
     { title: '不良', dataIndex: 'defect_qty', key: 'defect', width: 70, render: (v: number) => <span style={{ color: v > 0 ? '#faad14' : undefined, fontWeight: 500 }}>{v}</span> },
     { title: '报废', dataIndex: 'scrap_qty', key: 'scrap', width: 70, render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : undefined }}>{v}</span> },
@@ -340,7 +435,7 @@ const ProductionReport: React.FC = () => {
       <Row gutter={16}>
         <Col span={8}>
           <Card title="新建报工" size="small">
-            <Form form={form} layout="vertical" onFinish={handleSubmit} initialValues={{ report_type: 'normal', shift: 'day', good_qty: 0, defect_qty: 0 }}>
+            <Form form={form} layout="vertical" onFinish={handleSubmit} initialValues={{ report_type: 'normal', shift: 'day', good_qty: 0, defect_qty: 0, operator_id: user?.username }}>
               <Form.Item label="报工类型" name="report_type">
                 <Radio.Group>
                   <Radio.Button value="normal">正常</Radio.Button>
@@ -371,8 +466,28 @@ const ProductionReport: React.FC = () => {
               <Form.Item label="报工日期" name="report_date" tooltip="不选则默认为当前时间；选择历史日期可补录报工">
                 <DatePicker style={{ width: '100%' }} placeholder="默认今天（可选历史日期补录）" disabledDate={(d) => d && d.isAfter(dayjs(), 'day')} />
               </Form.Item>
-              <Form.Item label="操作人" name="operator_id">
-                <Input placeholder="操作员工号" />
+              <Form.Item label="报工小组" tooltip="选择小组后：操作人自动填组长，组员作为协作人员一并记入报工">
+                <Select
+                  placeholder="可选：按小组报工" allowClear showSearch optionFilterProp="children"
+                  value={formTeamId}
+                  onChange={(val) => {
+                    setFormTeamId(val)
+                    const t = teams.find(x => x.id === val)
+                    if (t) form.setFieldsValue({ operator_id: t.leader_id || user?.username })
+                  }}
+                >
+                  {teams.map(t => (
+                    <Option key={t.id} value={t.id}>{t.team_code} {t.team_name}（{(t.member_ids || []).length}人）</Option>
+                  ))}
+                </Select>
+              </Form.Item>
+              {formTeamId && (
+                <div style={{ marginTop: -16, marginBottom: 12 }}>
+                  {(teams.find(x => x.id === formTeamId)?.member_ids || []).map(m => <Tag key={m} color="blue">{empLabel(m)}</Tag>)}
+                </div>
+              )}
+              <Form.Item label="操作人" name="operator_id" tooltip="默认登录用户，可从组织花名册选择">
+                <Select placeholder="选择操作员（默认我自己）" allowClear showSearch optionFilterProp="label" options={operatorOptions} />
               </Form.Item>
               <Space size="large">
                 <Form.Item label="良品数" name="good_qty" rules={[{ required: true }]}>
@@ -398,6 +513,7 @@ const ProductionReport: React.FC = () => {
             size="small"
             extra={
               <Space>
+                <Button size="small" icon={<TeamOutlined />} onClick={() => { openTeamEdit(null); setTeamMgrOpen(true) }}>小组管理</Button>
                 <Button size="small" type="primary" ghost icon={<AppstoreAddOutlined />} onClick={() => setBatchOpen(true)}>批量报工</Button>
                 <Button size="small" icon={<ReloadOutlined />} onClick={fetchReports}>刷新</Button>
               </Space>
@@ -439,8 +555,30 @@ const ProductionReport: React.FC = () => {
             <Radio.Button value="night">夜班</Radio.Button>
           </Radio.Group>
           <span>操作人：</span>
-          <Input style={{ width: 140 }} placeholder="操作员工号（可选）" value={batchOperator} onChange={(e) => setBatchOperator(e.target.value)} />
+          <Select
+            style={{ width: 200 }} placeholder="默认我自己（登录用户）" allowClear showSearch optionFilterProp="label"
+            value={batchOperator || undefined} onChange={(v) => setBatchOperator(v || '')} options={operatorOptions}
+          />
+          <span>小组：</span>
+          <Select
+            style={{ width: 200 }} placeholder="可选：按小组报工" allowClear showSearch optionFilterProp="children"
+            value={batchTeamId}
+            onChange={(val) => {
+              setBatchTeamId(val)
+              const t = teams.find(x => x.id === val)
+              if (t?.leader_id) setBatchOperator(t.leader_id)
+            }}
+          >
+            {teams.map(t => (
+              <Option key={t.id} value={t.id}>{t.team_code} {t.team_name}（{(t.member_ids || []).length}人）</Option>
+            ))}
+          </Select>
         </Space>
+        {batchTeamId && (
+          <div style={{ marginBottom: 12 }}>
+            协作组员：{(teams.find(x => x.id === batchTeamId)?.member_ids || []).map(m => <Tag key={m} color="blue">{empLabel(m)}</Tag>)}
+          </div>
+        )}
         <Table<BatchRow>
           size="small"
           dataSource={batchRows}
@@ -503,6 +641,74 @@ const ProductionReport: React.FC = () => {
             >添加一行</Button>
           )}
         />
+      </Modal>
+
+      {/* 小组管理 */}
+      <Modal
+        title="报工小组管理"
+        open={teamMgrOpen}
+        onCancel={() => { setTeamMgrOpen(false); setEditingTeam(null); teamForm.resetFields() }}
+        footer={null}
+        width={860}
+      >
+        <Table<WorkTeam>
+          size="small" rowKey="id" dataSource={teams} pagination={false} style={{ marginBottom: 16 }}
+          locale={{ emptyText: '暂无小组，在下方创建第一个小组' }}
+          columns={[
+            { title: '编码', dataIndex: 'team_code', width: 110 },
+            { title: '名称', dataIndex: 'team_name', width: 140 },
+            { title: '组长', dataIndex: 'leader_id', width: 140, render: (v: string) => v ? empLabel(v) : '-' },
+            {
+              title: '组员', dataIndex: 'member_ids',
+              render: (v: string[]) => (v && v.length) ? v.map(m => <Tag key={m}>{empLabel(m)}</Tag>) : '-',
+            },
+            {
+              title: '操作', key: 'act', width: 130,
+              render: (_, t) => (
+                <Space size={4}>
+                  <Button type="link" size="small" icon={<EditOutlined />} onClick={() => openTeamEdit(t)}>编辑</Button>
+                  <Popconfirm title="确定删除该小组？" onConfirm={() => handleTeamDelete(t.id)}>
+                    <Button type="link" danger size="small" icon={<DeleteOutlined />} />
+                  </Popconfirm>
+                </Space>
+              ),
+            },
+          ]}
+        />
+        <Card
+          size="small"
+          title={editingTeam ? `编辑小组：${editingTeam.team_name}` : '新建小组'}
+          extra={editingTeam && <Button size="small" onClick={() => openTeamEdit(null)}>取消编辑</Button>}
+        >
+          <Form form={teamForm} layout="vertical">
+            <Row gutter={12}>
+              <Col span={8}>
+                <Form.Item label="小组名称" name="team_name" rules={[{ required: true, message: '请输入小组名称' }]}>
+                  <Input placeholder="如：一班装配组" />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item label="小组编码" name="team_code" tooltip="不填自动生成">
+                  <Input placeholder="自动生成" />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item label="组长" name="leader_id" tooltip="报工时默认作为操作人">
+                  <Select placeholder="选择组长" allowClear showSearch optionFilterProp="label" options={operatorOptions} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Form.Item label="组员（可多选）" name="member_ids">
+              <Select mode="multiple" placeholder="选择组员工号" showSearch optionFilterProp="label" options={operatorOptions} />
+            </Form.Item>
+            <Form.Item label="说明" name="description">
+              <Input placeholder="可选" />
+            </Form.Item>
+            <Button type="primary" loading={teamSaving} onClick={handleTeamSave} block>
+              {editingTeam ? '保存修改' : '创建小组'}
+            </Button>
+          </Form>
+        </Card>
       </Modal>
 
       {/* 修改报工 */}
