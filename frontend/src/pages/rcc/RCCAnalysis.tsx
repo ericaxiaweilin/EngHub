@@ -2,15 +2,18 @@
  * RCC 瓶颈分析 + 参数控制台
  * 产能瓶颈识别 + 可调参数管理 + 逻辑链配置
  */
-import { useState, useEffect, useMemo } from 'react'
-import { Row, Col, Tag, Space, Table, Progress, Empty, Switch, Tooltip, Button, message, InputNumber, Modal } from 'antd'
+import { useState, useEffect, useMemo, lazy, Suspense } from 'react'
+import { Row, Col, Tag, Space, Table, Progress, Empty, Switch, Tooltip, Button, message, InputNumber, Modal, Popconfirm, Spin } from 'antd'
 import {
   FundOutlined, WarningOutlined, SettingOutlined, BranchesOutlined,
   ThunderboltOutlined, CheckCircleOutlined, ToolOutlined, TeamOutlined,
-  ExperimentOutlined, ControlOutlined, HistoryOutlined, ApiOutlined
+  ExperimentOutlined, ControlOutlined, HistoryOutlined, ApiOutlined,
+  PlusOutlined, EditOutlined, DeleteOutlined,
 } from '@ant-design/icons'
 import axios from 'axios'
 import { useRcc, COLORS } from './RCCCommandCenter'
+
+const LogicChainEditor = lazy(() => import('./LogicChainEditor'))
 
 const API_BASE = '/api/v1/rcc'
 
@@ -116,6 +119,23 @@ export default function RCCAnalysis() {
   const [logicChains, setLogicChains] = useState<any[]>([])
   const [loadingParams, setLoadingParams] = useState(false)
   const [activeSection, setActiveSection] = useState<'bottleneck' | 'params' | 'chains'>('bottleneck')
+  const [editorChain, setEditorChain] = useState<any | null>(null)  // 编辑中的链
+  const [editorOpen, setEditorOpen] = useState(false)
+
+  const loadChains = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/logic-chains`)
+      setLogicChains(res.data?.items || [])
+    } catch (e) { /* ignore */ }
+  }
+
+  const handleDeleteChain = async (id: string) => {
+    try {
+      await axios.delete(`${API_BASE}/logic-chains/${id}`)
+      message.success('逻辑链已删除')
+      loadChains()
+    } catch (e: any) { message.error(e?.response?.data?.detail || '删除失败') }
+  }
 
   // 加载参数和逻辑链
   useEffect(() => {
@@ -274,9 +294,15 @@ export default function RCCAnalysis() {
       {/* 逻辑链 */}
       {activeSection === 'chains' && (
         <div style={{ background: COLORS.bgCard, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 20 }}>
-          <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14, marginBottom: 16 }}>
-            <BranchesOutlined style={{ color: COLORS.accentPurple, marginRight: 8 }} />
-            确定性逻辑链 ({logicChains.length})
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14 }}>
+              <BranchesOutlined style={{ color: COLORS.accentPurple, marginRight: 8 }} />
+              确定性逻辑链 ({logicChains.length})
+            </div>
+            <Button type="primary" size="small" icon={<PlusOutlined />}
+              onClick={() => { setEditorChain(null); setEditorOpen(true) }}>
+              可视化编排
+            </Button>
           </div>
           {logicChains.length > 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -292,15 +318,23 @@ export default function RCCAnalysis() {
                       </div>
                       <div style={{ color: COLORS.textMuted, fontSize: 11, marginTop: 2 }}>
                         触发: {chain.trigger_event} · 顺序: {chain.execution_order}
+                        {Array.isArray(chain.action_sequence) && ` · 动作 ${chain.action_sequence.length}`}
                       </div>
                     </div>
-                    <Tag style={{
-                      border: 'none', fontSize: 10,
-                      background: chain.enabled ? 'rgba(52,211,153,0.1)' : 'rgba(100,116,139,0.1)',
-                      color: chain.enabled ? COLORS.success : COLORS.textMuted
-                    }}>
-                      {chain.enabled ? '已启用' : '已停用'}
-                    </Tag>
+                    <Space size={8}>
+                      <Tag style={{
+                        border: 'none', fontSize: 10,
+                        background: chain.enabled ? 'rgba(52,211,153,0.1)' : 'rgba(100,116,139,0.1)',
+                        color: chain.enabled ? COLORS.success : COLORS.textMuted
+                      }}>
+                        {chain.enabled ? '已启用' : '已停用'}
+                      </Tag>
+                      <Button type="link" size="small" icon={<EditOutlined />} style={{ color: COLORS.accentBlue }}
+                        onClick={() => { setEditorChain(chain); setEditorOpen(true) }} />
+                      <Popconfirm title="删除该逻辑链？" onConfirm={() => handleDeleteChain(chain.id)}>
+                        <Button type="link" size="small" danger icon={<DeleteOutlined />} />
+                      </Popconfirm>
+                    </Space>
                   </div>
                   {chain.conditions && (
                     <div style={{ marginTop: 8, padding: '6px 10px', borderRadius: 6, background: COLORS.bgHover }}>
@@ -316,6 +350,16 @@ export default function RCCAnalysis() {
             <Empty description={<span style={{ color: COLORS.textMuted }}>暂无逻辑链配置</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />
           )}
         </div>
+      )}
+
+      {editorOpen && (
+        <Suspense fallback={<div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.4)', zIndex: 1100 }}><Spin size="large" /></div>}>
+          <LogicChainEditor
+            chain={editorChain}
+            onClose={() => setEditorOpen(false)}
+            onSaved={() => { setEditorOpen(false); loadChains() }}
+          />
+        </Suspense>
       )}
     </div>
   )

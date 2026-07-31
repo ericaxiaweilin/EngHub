@@ -303,7 +303,7 @@ async def list_logic_chains(
     db: AsyncSession = Depends(get_db),
 ):
     """查询确定性逻辑链配置"""
-    from database.models import DeterministicLogicChain
+    from core.rcc.models import DeterministicLogicChain
     from sqlalchemy import select as sa_select
 
     query = sa_select(DeterministicLogicChain)
@@ -322,6 +322,71 @@ async def list_logic_chains(
             "created_at": c.created_at.isoformat() if c.created_at else None,
         } for c in chains
     ], "total": len(chains)}
+
+
+@router.post("/logic-chains", status_code=201, summary="创建逻辑链")
+async def create_logic_chain(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """创建确定性逻辑链（可视化编排器保存）"""
+    from core.rcc.models import DeterministicLogicChain
+
+    for f in ("chain_code", "chain_name", "trigger_event"):
+        if not payload.get(f):
+            raise HTTPException(status_code=400, detail=f"缺少必填字段：{f}")
+    chain = DeterministicLogicChain(
+        chain_code=payload["chain_code"],
+        chain_name=payload["chain_name"],
+        trigger_event=payload["trigger_event"],
+        conditions=payload.get("conditions") or [],
+        action_sequence=payload.get("action_sequence") or [],
+        org_unit_id=payload.get("org_unit_id"),
+        enabled=bool(payload.get("enabled", True)),
+        execution_order=int(payload.get("execution_order", 0)),
+    )
+    db.add(chain)
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"保存失败（chain_code 可能重复）：{exc}")
+    return {"id": chain.id, "chain_code": chain.chain_code}
+
+
+@router.put("/logic-chains/{chain_id}", summary="更新逻辑链")
+async def update_logic_chain(chain_id: str, payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """更新确定性逻辑链配置"""
+    from core.rcc.models import DeterministicLogicChain
+    from sqlalchemy import select as sa_select
+
+    chain = (await db.execute(
+        sa_select(DeterministicLogicChain).where(DeterministicLogicChain.id == chain_id)
+    )).scalar_one_or_none()
+    if not chain:
+        raise HTTPException(status_code=404, detail="逻辑链不存在")
+    for f in ("chain_name", "trigger_event", "conditions", "action_sequence", "org_unit_id"):
+        if f in payload:
+            setattr(chain, f, payload[f])
+    if "enabled" in payload:
+        chain.enabled = bool(payload["enabled"])
+    if "execution_order" in payload:
+        chain.execution_order = int(payload["execution_order"])
+    await db.commit()
+    return {"id": chain.id, "chain_code": chain.chain_code, "updated": True}
+
+
+@router.delete("/logic-chains/{chain_id}", summary="删除逻辑链")
+async def delete_logic_chain(chain_id: str, db: AsyncSession = Depends(get_db)):
+    """删除确定性逻辑链"""
+    from core.rcc.models import DeterministicLogicChain
+    from sqlalchemy import select as sa_select
+
+    chain = (await db.execute(
+        sa_select(DeterministicLogicChain).where(DeterministicLogicChain.id == chain_id)
+    )).scalar_one_or_none()
+    if not chain:
+        raise HTTPException(status_code=404, detail="逻辑链不存在")
+    await db.delete(chain)
+    await db.commit()
+    return {"deleted": True}
 
 
 __all__ = ["router"]
