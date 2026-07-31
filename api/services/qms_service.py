@@ -176,7 +176,15 @@ class QMSService:
             ).scalars()
         )
         points.reverse()
-        return {"count": len(points), "points": [self._spc_dict(point) for point in points]}
+        ooc_count = sum(1 for p in points if p.is_out_of_control)
+        char_name = points[0].characteristic_name if points and hasattr(points[0], 'characteristic_name') else characteristic_code
+        return {
+            "count": len(points),
+            "characteristic_code": characteristic_code,
+            "characteristic_name": char_name,
+            "ooc_count": ooc_count,
+            "points": [self._spc_dict(point) for point in points],
+        }
 
     @staticmethod
     def _spc_dict(point: QmsSpcPoint) -> Dict[str, Any]:
@@ -187,6 +195,7 @@ class QMSService:
             "calculation_method": point.calculation_method,
             "subgroup_count": point.subgroup_count,
             "measured_value": point.measured_value,
+            "value": point.measured_value,
             "sample_group": point.sample_group,
             "ucl": point.ucl,
             "lcl": point.lcl,
@@ -446,4 +455,123 @@ class QMSService:
         await db.commit()
         return {"success": True, "message": f"检验 {inspection_id} 已软删除 (实际需配合数据库迁移)"}
 
-    # Kanban 接口待后续实现...
+    async def get_quality_dashboard(self, factory_id: str) -> Dict[str, Any]:
+        """质量看板聚合数据"""
+        db = await self._get_db()
+        from sqlalchemy import select, func, case
+        from database.models import QualityInspection, DefectRecord
+
+        # 检验统计
+        insp_res = await db.execute(
+            select(
+                func.count(QualityInspection.id),
+                func.sum(case((func.upper(QualityInspection.result) == 'PASS', 1), else_=0)),
+            ).where(QualityInspection.factory_id == factory_id)
+        )
+        row = insp_res.one()
+        total_inspections = row[0] or 0
+        passed = row[1] or 0
+        pass_rate = round(passed / max(total_inspections, 1) * 100, 1)
+
+        # 不良品统计
+        defect_res = await db.execute(
+            select(
+                func.count(DefectRecord.id),
+                func.sum(DefectRecord.quantity),
+            ).where(DefectRecord.factory_id == factory_id)
+        )
+        drow = defect_res.one()
+        total_defects = drow[0] or 0
+        total_defect_qty = drow[1] or 0
+
+        # 按严重等级分布
+        sev_res = await db.execute(
+            select(DefectRecord.severity, func.count(DefectRecord.id))
+            .where(DefectRecord.factory_id == factory_id)
+            .group_by(DefectRecord.severity)
+        )
+        severity_dist = {r[0]: r[1] for r in sev_res.all()}
+
+        # 按缺陷类型分布
+        type_res = await db.execute(
+            select(DefectRecord.defect_type, func.count(DefectRecord.id))
+            .where(DefectRecord.factory_id == factory_id)
+            .group_by(DefectRecord.defect_type)
+        )
+        type_dist = {r[0]: r[1] for r in type_res.all()}
+
+        # 最近不良品
+        recent_res = await db.execute(
+            select(DefectRecord)
+            .where(DefectRecord.factory_id == factory_id)
+            .order_by(DefectRecord.created_at.desc())
+            .limit(10)
+        )
+        recent_defects = [
+            {
+                "id": d.id,
+                "record_code": d.record_code,
+                "defect_type": d.defect_type,
+                "severity": d.severity,
+                "quantity": d.quantity,
+                "disposition": d.disposition,
+                "station_id": d.station_id,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+            }
+            for d in recent_res.scalars().all()
+        ]
+
+        # SPC 异常点
+        spc_ooc = 0
+        try:
+            from database.models import QmsSpcPoint
+            spc_res = await db.execute(
+                select(func.count(QmsSpcPoint.id))
+                .where(QmsSpcPoint.factory_id == factory_id)
+                .where(QmsSpcPoint.is_out_of_control == True)
+            )
+            spc_ooc = spc_res.scalar() or 0
+        except Exception:
+            pass
+
+        # 8D 报告统计
+        eight_d_in_progress = 0
+        eight_d_open = 0
+        try:
+            from database.models import Qms8dReport
+            d8_res = await db.execute(
+                select(Qms8dReport.status, func.count(Qms8dReport.id))
+                .where(Qms8dReport.factory_id == factory_id)
+                .group_by(Qms8dReport.status)
+            )
+            for status, cnt in d8_res.all():
+                if status in ('in_progress', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7'):
+                    eight_d_in_progress += cnt
+                elif status in ('open', 'new'):
+                    eight_d_open += cnt
+        except Exception:
+            pass
+
+        # top_defects: [{type, qty}] 按数量降序
+        top_defects = [
+            {"type": dtype, "qty": int(cnt)}
+            for dtype, cnt in sorted(type_dist.items(), key=lambda x: x[1], reverse=True)
+        ]
+
+        return {
+            "factory_id": factory_id,
+            "inspection": {
+                "pass_rate": pass_rate,
+                "total": total_inspections,
+                "passed": int(passed),
+            },
+            "spc_ooc_count": spc_ooc,
+            "eight_d": {
+                "in_progress": eight_d_in_progress,
+                "open": eight_d_open,
+            },
+            "top_defects": top_defects,
+            "severity_distribution": severity_dist,
+            "defect_type_distribution": type_dist,
+            "recent_defects": recent_defects,
+        }

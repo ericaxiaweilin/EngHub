@@ -53,13 +53,29 @@ services:
     ports:
       - "18888:8000"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
     networks:
       - default
       - model-stack
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      # 代码持久化挂载：容器重建不丢代码
+      - ${CODE_DIR:-..}/api:/app/api
+      - ${CODE_DIR:-..}/core:/app/core
+      - ${CODE_DIR:-..}/database:/app/database
+      - ${CODE_DIR:-..}/integrations:/app/integrations
+      - ${CODE_DIR:-..}/main.py:/app/main.py
+      - ${CODE_DIR:-..}/frontend_dist:/app/frontend_dist
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
     # 内存限制 2GB (Python应用需要更多内存)
     deploy:

@@ -14,7 +14,11 @@ import {
   CopyOutlined, ShareAltOutlined, CommentOutlined, InboxOutlined,
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
   PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
+  CarryOutOutlined,
 } from '@ant-design/icons'
+
+// 任务中心（嵌入 chatbot 浮窗第三个 tab）
+import TaskCenter from '../pages/collab/TaskCenter'
 
 // Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
 const SpreadsheetEditor = lazy(() => import('./SpreadsheetEditor'))
@@ -928,6 +932,7 @@ export default function AIAssistantWidget() {
                   </Badge>
                 ),
               },
+              { key: 'tasks', label: <span><CarryOutOutlined /> 任务中心</span> },
             ]}
           />
 
@@ -1610,6 +1615,11 @@ export default function AIAssistantWidget() {
                       </>
                     )}
                   </div>
+            )}
+            {tab === 'tasks' && (
+              <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+                <TaskCenter />
+              </div>
             )}
           </div>
 

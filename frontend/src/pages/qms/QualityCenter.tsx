@@ -8,14 +8,66 @@ import {
   DashboardOutlined, PlusOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
+import { getStoredUser } from '../../services/auth'
+import { Line } from '@ant-design/charts'
 
-const FACTORY = 'F001'
+const getFactory = () => localStorage.getItem('active_factory_id') || getStoredUser()?.factory_id || 'FAC_ELEC_DEMO_2026'
 
-// ============== SPC 控制图 ==============
+// ============== SPC 控制图组件 (@ant-design/charts) ==============
+const SpcControlChart: React.FC<{ points: any[] }> = ({ points }) => {
+  if (!points?.length) return <Empty />
+
+  const ucl = points[0]?.ucl ?? 1
+  const cl = points[0]?.cl ?? 0
+  const lcl = points[0]?.lcl ?? 0
+
+  const chartData = points.map((p: any, i: number) => ({
+    index: i + 1,
+    value: p.value ?? p.measured_value ?? 0,
+    type: p.is_out_of_control ? '异常点' : '受控点',
+  }))
+
+  const config: any = {
+    data: chartData,
+    xField: 'index',
+    yField: 'value',
+    colorField: 'type',
+    scale: { color: { range: ['#1890ff', '#f5222d'] } },
+    axis: {
+      x: { title: '样本组', labelAutoRotate: false },
+      y: { title: '测量值' },
+    },
+    style: { lineWidth: 2 },
+    point: {
+      shapeField: 'point',
+      sizeField: 3,
+      style: (datum: any) => ({
+        fill: datum.type === '异常点' ? '#f5222d' : '#1890ff',
+        stroke: '#fff',
+        lineWidth: 1,
+      }),
+    },
+    annotations: [
+      { type: 'lineY', yField: ucl, style: { stroke: '#f5222d', lineWidth: 1.5, lineDash: [6, 3] }, label: { text: `UCL=${ucl.toFixed(2)}`, position: 'right', style: { fill: '#f5222d', fontSize: 10 } } },
+      { type: 'lineY', yField: cl, style: { stroke: '#52c41a', lineWidth: 1.5, lineDash: [4, 2] }, label: { text: `CL=${cl.toFixed(2)}`, position: 'right', style: { fill: '#52c41a', fontSize: 10 } } },
+      { type: 'lineY', yField: lcl, style: { stroke: '#f5222d', lineWidth: 1.5, lineDash: [6, 3] }, label: { text: `LCL=${lcl.toFixed(2)}`, position: 'right', style: { fill: '#f5222d', fontSize: 10 } } },
+    ],
+    tooltip: {
+      title: (d: any) => `样本 #${d.index}`,
+      items: [{ channel: 'y', name: '测量值' }],
+    },
+    height: 280,
+  }
+
+  return <Line {...config} />
+}
+
+// ============== SPC 控制面板 ==============
 const SpcPanel: React.FC = () => {
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(false)
   const [charCode, setCharCode] = useState('')
+  const [configs, setConfigs] = useState<any[]>([])
   const [addModal, setAddModal] = useState(false)
   const [form] = Form.useForm()
 
@@ -23,15 +75,29 @@ const SpcPanel: React.FC = () => {
     if (!code) return
     setLoading(true)
     try {
-      const res: any = await api.get('/api/v1/qms/spc', { params: { factory_id: FACTORY, characteristic_code: code } })
+      const res: any = await api.get('/api/v1/qms/spc', { params: { factory_id: getFactory(), characteristic_code: code } })
       setData(res)
     } catch { setData(null) } finally { setLoading(false) }
   }, [])
 
+  // 自动加载可用特性列表并查询第一个
+  useEffect(() => {
+    (async () => {
+      try {
+        const list: any = await api.get('/api/v1/qms/spc/configs', { params: { factory_id: getFactory() } })
+        setConfigs(list || [])
+        if (list?.length > 0) {
+          setCharCode(list[0].code)
+          loadChart(list[0].code)
+        }
+      } catch { /* */ }
+    })()
+  }, [loadChart])
+
   const handleAdd = async () => {
     const vals = await form.validateFields()
     try {
-      const res: any = await api.post('/api/v1/qms/spc', { ...vals, factory_id: FACTORY })
+      const res: any = await api.post('/api/v1/qms/spc', { ...vals, factory_id: getFactory() })
       message.success(res.is_out_of_control ? '⚠️ 数据点超出控制限！' : '数据点已记录')
       setAddModal(false)
       form.resetFields()
@@ -42,8 +108,13 @@ const SpcPanel: React.FC = () => {
   return (
     <div>
       <Space style={{ marginBottom: 12 }}>
-        <Input placeholder="质量特性编码" value={charCode} onChange={e => setCharCode(e.target.value)}
-          onPressEnter={() => loadChart(charCode)} style={{ width: 200 }} />
+        {configs.length > 0 ? (
+          <Select value={charCode} onChange={(v) => { setCharCode(v); loadChart(v) }} style={{ width: 220 }}
+            options={configs.map((c: any) => ({ value: c.code, label: `${c.code} (${c.name})` }))} />
+        ) : (
+          <Input placeholder="质量特性编码" value={charCode} onChange={e => setCharCode(e.target.value)}
+            onPressEnter={() => loadChart(charCode)} style={{ width: 200 }} />
+        )}
         <Button onClick={() => loadChart(charCode)}>查询</Button>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => setAddModal(true)}>记录数据</Button>
       </Space>
@@ -54,26 +125,7 @@ const SpcPanel: React.FC = () => {
         ) : (
           <Card size="small" title={`${data.characteristic_name || data.characteristic_code} 控制图`}
             extra={<Tag color={data.ooc_count > 0 ? 'error' : 'success'}>{data.ooc_count} 个异常点</Tag>}>
-            {/* 简易控制图：用表格展示 */}
-            <div style={{ display: 'flex', gap: 4, alignItems: 'flex-end', height: 120, padding: '0 8px' }}>
-              {data.points.map((p: any, i: number) => {
-                const range = (p.ucl || 1) - (p.lcl || 0) || 1
-                const h = Math.max(4, ((p.value - (p.lcl || 0)) / range) * 100)
-                return (
-                  <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                    <div style={{
-                      width: '80%', height: h, borderRadius: 2,
-                      backgroundColor: p.is_out_of_control ? '#f5222d' : '#1890ff',
-                    }} title={`${p.value} @ ${p.measured_at?.slice(5, 16)}`} />
-                  </div>
-                )
-              })}
-            </div>
-            <Row gutter={16} style={{ marginTop: 8 }}>
-              <Col span={8}><Statistic title="UCL" value={data.points[data.points.length - 1]?.ucl} precision={3} /></Col>
-              <Col span={8}><Statistic title="CL" value={data.points[data.points.length - 1]?.cl} precision={3} /></Col>
-              <Col span={8}><Statistic title="LCL" value={data.points[data.points.length - 1]?.lcl} precision={3} /></Col>
-            </Row>
+            <SpcControlChart points={data.points} />
           </Card>
         )}
       </Spin>
@@ -105,7 +157,7 @@ const EightDPanel: React.FC = () => {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const res: any = await api.get('/api/v1/qms/8d', { params: { factory_id: FACTORY } })
+      const res: any = await api.get('/api/v1/qms/8d', { params: { factory_id: getFactory() } })
       setReports(res.items || [])
     } catch { /* */ } finally { setLoading(false) }
   }, [])
@@ -114,7 +166,7 @@ const EightDPanel: React.FC = () => {
   const handleCreate = async () => {
     const vals = await form.validateFields()
     try {
-      await api.post('/api/v1/qms/8d', { ...vals, factory_id: FACTORY })
+      await api.post('/api/v1/qms/8d', { ...vals, factory_id: getFactory() })
       message.success('8D 报告已创建')
       setCreateModal(false); form.resetFields(); load()
     } catch (e: any) { message.error(e?.response?.data?.detail || '失败') }
@@ -173,7 +225,7 @@ const DashboardPanel: React.FC = () => {
     (async () => {
       setLoading(true)
       try {
-        const res: any = await api.get('/api/v1/qms/dashboard', { params: { factory_id: FACTORY } })
+        const res: any = await api.get('/api/v1/qms/dashboard', { params: { factory_id: getFactory() } })
         setData(res)
       } catch { /* */ } finally { setLoading(false) }
     })()
