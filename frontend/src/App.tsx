@@ -229,6 +229,8 @@ const App: React.FC = () => {
             <Route path="ie/work-cells" element={<PermissionGate path="/ie/work-cells"><WorkCells /></PermissionGate>} />
             <Route path="ie/kanbans" element={<PermissionGate path="/ie/kanbans"><Kanbans /></PermissionGate>} />
             <Route path="ie/5s-audits" element={<PermissionGate path="/ie/5s-audits"><FiveSAudits /></PermissionGate>} />
+            {/* 未知路由兜底，避免白屏 */}
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
       </BrowserRouter>
