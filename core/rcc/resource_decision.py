@@ -675,9 +675,8 @@ class RCCResourceDecisionEngine:
         """读取全局可调参数值"""
         try:
             q = await self.db.execute(sql_text(
-                "SELECT current_value FROM global_adjustable_params WHERE param_code = :code",
-                {"code": param_code}
-            ))
+                "SELECT current_value FROM global_adjustable_params WHERE param_code = :code"
+            ), {"code": param_code})
             return q.scalar()
         except Exception:
             return None

@@ -75,7 +75,6 @@ class RCCTaskService:
             comment=comment,
         )
         self.db.add(record)
-        await task.approval_records.append(record) if hasattr(task, 'approval_records') else None
         
         await self.db.commit()
         await self.db.refresh(task)
@@ -100,7 +99,6 @@ class RCCTaskService:
             comment=reason,
         )
         self.db.add(record)
-        await task.approval_records.append(record) if hasattr(task, 'approval_records') else None
         
         await self.db.commit()
         await self.db.refresh(task)
@@ -295,7 +293,7 @@ class LogicChainEngine:
         chains = (await self.db.execute(query)).scalars().all()
         
         for chain in chains:
-            if self._matches_trigger(chain, event):
+            if await self._matches_trigger(chain, event):
                 conditions_met = await self._check_conditions(chain, event)
                 if conditions_met:
                     result = await self._execute_actions(chain, event)
@@ -309,7 +307,7 @@ class LogicChainEngine:
     
     async def _check_conditions(self, chain: Any, event: Dict[str, Any]) -> bool:
         """检查条件表达式是否满足"""
-        from core.logic_chain.conditions import ConditionEvaluator
+        from core.rcc.conditions import ConditionEvaluator
         
         evaluator = ConditionEvaluator(self.db)
         return await evaluator.evaluate_conditions(chain.conditions, event)
@@ -376,8 +374,8 @@ class LogicChainEngine:
         param = (await self.db.execute(query)).scalar_one_or_none()
         
         if param:
-            param.current_value = str(new_value)
             param.previous_value = param.current_value
+            param.current_value = str(new_value)
             await self.db.commit()
             return {"type": "update_param", "param_id": param.id, "status": "updated"}
         
