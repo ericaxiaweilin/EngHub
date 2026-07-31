@@ -14,6 +14,7 @@ import RCCOverview from './RCCOverview'
 import RCCResourceBoard from './RCCResourceBoard'
 import RCCDecisionHub from './RCCDecisionHub'
 import RCCAnalysis from './RCCAnalysis'
+import RCCOrgBubbles from './RCCOrgBubbles'
 
 const API_BASE = '/api/v1/rcc'
 const { Sider, Content, Header } = Layout
@@ -98,6 +99,7 @@ export default function RCCCommandCenter() {
 
   const menuItems = [
     { key: 'overview', icon: <DashboardOutlined />, label: '指挥总览' },
+    { key: 'org-bubbles', icon: <TeamOutlined />, label: '任务智慧中心' },
     { key: 'resources', icon: <RadarChartOutlined />, label: '资源调度' },
     { key: 'decisions', icon: <ThunderboltOutlined />, label: '决策中心' },
     { key: 'analysis', icon: <FundOutlined />, label: '瓶颈分析' },
@@ -183,6 +185,7 @@ export default function RCCCommandCenter() {
           <Content style={{ padding: 24, overflow: 'auto' }}>
             <Spin spinning={loading && !lastSync}>
               {activeView === 'overview' && <RCCOverview />}
+              {activeView === 'org-bubbles' && <RCCOrgBubbles />}
               {activeView === 'resources' && <RCCResourceBoard />}
               {activeView === 'decisions' && <RCCDecisionHub />}
               {activeView === 'analysis' && <RCCAnalysis />}

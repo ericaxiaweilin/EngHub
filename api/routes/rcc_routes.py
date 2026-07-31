@@ -389,6 +389,91 @@ async def delete_logic_chain(chain_id: str, db: AsyncSession = Depends(get_db)):
     return {"deleted": True}
 
 
+# ==================== 组织泡泡图（任务智慧中心） ====================
+
+@router.get("/org-bubbles", summary="组织泡泡图数据 - 任务智慧中心")
+async def org_bubbles(factory_id: str = Query("F01")):
+    """聚合 org_panel 节点 + 逻辑链，生成力导向泡泡图数据
+    
+    每个节点 = 一个组织泡泡（大小=负荷，颜色=健康度）
+    每条链 = 泡泡间连线（信号传导关系）
+    """
+    from core.org_panel.presets import build_electronics_factory
+    from core.org_panel.signals import SignalType
+
+    # 获取引擎单例（复用 org_panel 的实例）
+    from core.org_panel.api_adapter import get_engine
+    engine = get_engine()
+
+    nodes = []
+    for nid, node in engine.nodes.items():
+        # 计算健康度：有无 violations + 关键信号判断
+        health = "normal"  # normal / warning / danger
+        if node.violations:
+            health = "danger"
+        else:
+            # 检查关键输出信号是否越界
+            outputs = node.output_signals
+            escalation = outputs.get(SignalType.ESCALATION_LEVEL, 0)
+            if escalation >= 2:
+                health = "danger"
+            elif escalation >= 1:
+                health = "warning"
+            # 设备可用率低 → warning
+            avail = outputs.get(SignalType.AVAILABILITY, 1.0)
+            if avail < 0.85:
+                health = "warning" if health == "normal" else health
+
+        # 负荷 = 输出信号数量 + 参数数量 的综合（归一化到 0-1）
+        load_score = min(1.0, (len(node.output_signals) * 0.08 + len(node.parameters) * 0.05 + len(node.violations) * 0.2))
+
+        nodes.append({
+            "id": nid,
+            "name": node.name,
+            "level": node.level,
+            "scope": node.scope,
+            "health": health,
+            "load": round(load_score, 3),
+            "violations": node.violations,
+            "key_outputs": {
+                k.label: round(v, 4)
+                for k, v in list(node.output_signals.items())[:6]
+            },
+            "param_count": len(node.parameters),
+            "capability_count": len(node.capabilities),
+        })
+
+    edges = []
+    for chain in engine.chains:
+        for link in chain.links:
+            source_node = engine.nodes.get(link.source_node_id)
+            current_value = None
+            if source_node and link.source_signal in source_node.output_signals:
+                current_value = round(source_node.output_signals[link.source_signal], 4)
+            edges.append({
+                "source": link.source_node_id,
+                "target": link.target_node_id,
+                "signal": link.source_signal.label,
+                "target_signal": link.target_signal.label,
+                "label": link.label or f"{link.source_signal.label}→{link.target_signal.label}",
+                "chain_name": chain.name,
+                "value": current_value,
+                "latency_h": link.latency_hours,
+            })
+
+    return {
+        "success": True,
+        "factory_id": factory_id,
+        "nodes": nodes,
+        "edges": edges,
+        "meta": {
+            "total_nodes": len(nodes),
+            "total_edges": len(edges),
+            "chains": [c.name for c in engine.chains],
+        },
+    }
+
+
 __all__ = ["router"]
 
 

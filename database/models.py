@@ -1688,6 +1688,27 @@ class QualityCost(Base):
 
 # ==================== APS 排程模型 ====================
 
+class APSRequest(Base):
+    """APS 重排请求队列（#11 PS事件解耦：报工生产者入队→消费者异步执行排程）"""
+    __tablename__ = "aps_schedule_requests"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    mode = Column(String(20), default="hybrid")
+    horizon_days = Column(Integer, default=7)
+    optimize_for = Column(String(20), default="delivery")
+    source_type = Column(String(30))  # report_created / report_modified / manual
+    source_id = Column(String(36))  # 触发源ID（如报工ID）
+    status = Column(String(20), default="pending", index=True)  # pending/in_progress/completed/failed
+    retry_count = Column(Integer, default=0)
+    max_retries = Column(Integer, default=3)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime)
+
+
 class ApsSchedule(Base):
     """排程计划"""
     __tablename__ = "aps_schedules"

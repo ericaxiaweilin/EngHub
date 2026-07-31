@@ -5,7 +5,7 @@
  */
 import React, { useState, useEffect, useCallback } from 'react'
 import {
-  Card, Row, Col, Tag, Table, Space, Button, Select, Typography,
+  Badge, Card, Row, Col, Tag, Table, Space, Button, Select, Typography,
   Empty, message, Tabs, Descriptions, Timeline, Alert, Spin,
 } from 'antd'
 import {
@@ -64,21 +64,32 @@ const CollaborationNetwork: React.FC = () => {
     setSimLoading(false)
   }
 
-  const roles = network?.roles || []
-  const events = network?.events || []
+  // 后端返回 roles/events 是 object（key→value），需转为数组供 Table 使用
+  const roles = React.useMemo(() => {
+    const r = network?.roles
+    if (!r) return []
+    if (Array.isArray(r)) return r
+    return Object.entries(r).map(([key, val]: [string, any]) => ({ key, ...val }))
+  }, [network])
+
+  const events = React.useMemo(() => {
+    const e = network?.events
+    if (!e) return []
+    if (Array.isArray(e)) return e
+    return Object.entries(e).map(([key, val]: [string, any]) => ({ key, ...val }))
+  }, [network])
 
   const roleColumns = [
     { title: '岗位', dataIndex: 'key', key: 'key', render: (v: string) => <Tag color="blue">{v}</Tag> },
     { title: '名称', dataIndex: 'name', key: 'name' },
-    { title: '职责', dataIndex: 'responsibilities', key: 'resp', render: (v: string[]) => v?.join('、') || '-' },
-    { title: '协同连接', dataIndex: 'connections', key: 'conn', render: (v: number) => <Badge count={v} showZero color="#1890ff" /> },
+    { title: '部门', dataIndex: 'department', key: 'dept', render: (v: string) => v || '-' },
   ]
 
   const eventColumns = [
     { title: '事件', dataIndex: 'key', key: 'key', render: (v: string) => <Tag color="orange">{v}</Tag> },
-    { title: '描述', dataIndex: 'description', key: 'desc' },
-    { title: '触发岗位', dataIndex: 'trigger_role', key: 'trigger' },
-    { title: '通知对象', dataIndex: 'notify_roles', key: 'notify', render: (v: string[]) => v?.map((r: string) => <Tag key={r}>{r}</Tag>) },
+    { title: '名称', dataIndex: 'name', key: 'name' },
+    { title: '触发', dataIndex: 'trigger', key: 'trigger', ellipsis: true },
+    { title: '通知对象', dataIndex: 'notify', key: 'notify', render: (v: string[]) => Array.isArray(v) ? v.map((r: string) => <Tag key={r}>{r}</Tag>) : '-' },
   ]
 
   return (

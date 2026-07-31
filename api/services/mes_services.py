@@ -17,10 +17,13 @@ from database.models import (
     WorkOrder,
     Product,
     BomItem,
-    Inventory
+    Inventory,
+    APSRequest
 )
-from api.services.aps_service import ApsService  # #11 APS动态排程反馈 - 报工后触发重排程
 import asyncio
+import logging
+
+_logger = logging.getLogger(__name__)
 
 
 class ProductionReportService:
@@ -96,8 +99,13 @@ class ProductionReportService:
         await self._backflush_materials(self.db, work_order_id, good_qty, created_by)
         
         # #11 PS事件解耦（增强版）- 将APS重算请求写入数据库队列，由消费者服务异步处理
+        # 入队失败不应阻断报工主流程（报工已commit）
         if factory_id and work_order_id:
-            await self._enqueue_aps_replan(work_order_id, factory_id, report.id, 'report_created', created_by or 'system')
+            try:
+                await self._enqueue_aps_replan(work_order_id, factory_id, report.id, 'report_created', created_by or 'system')
+            except Exception as e:
+                _logger.warning("APS入队失败(报工创建), 不阻断主流程: %s", e)
+                await self.db.rollback()
         
         return report
     
@@ -352,9 +360,16 @@ class ProductionReportService:
         # 重新计算工单数量
         await self._update_work_order_qty(report.work_order_id)
         
-        # #11 APS动态排程反馈 - 报工修改后触发APS重新计算
+        # #11 PS事件解耦 - 报工修改后触发APS重新计算（入队失败不阻断报工）
         if report.factory_id and report.work_order_id:
-            await self._notify_aps_on_report_update(report.work_order_id, report.factory_id)
+            try:
+                await self._enqueue_aps_replan(
+                    report.work_order_id, report.factory_id, report.id,
+                    'report_modified', report.modified_by or 'system'
+                )
+            except Exception as e:
+                _logger.warning("APS入队失败(报工修改), 不阻断主流程: %s", e)
+                await self.db.rollback()
         
         return report
 
