@@ -335,7 +335,24 @@ export const createProductionReport = (data: {
   shift?: string;
   operator_id?: string;
   remark?: string;
+  report_date?: string;
 }) => api.post(API_ENDPOINTS.PRODUCTION_REPORTS, data);
+
+export const batchProductionReport = (data: {
+  factory_id: string;
+  items: {
+    work_order_id: string;
+    station_id: string;
+    good_qty?: number;
+    defect_qty?: number;
+    scrap_qty?: number;
+    remark?: string;
+    report_date?: string;
+  }[];
+  operator_id?: string;
+  shift?: string;
+  report_date?: string;
+}) => api.post('/api/v1/reports/batch', data);
 
 export const modifyProductionReport = (id: string, data: Record<string, any>) =>
   api.patch(`${API_ENDPOINTS.PRODUCTION_REPORTS}/${id}`, data);

@@ -17,6 +17,8 @@ import {
   WorkshopConfig, getFactoryScenario, getFactoryScenarios, runFactorySimulation,
 } from '../../services/factorySim'
 import FlowTopology from './FlowTopology'
+import type { ColumnsType } from 'antd/es/table'
+import DrillDownDrawer from '../../components/trace/DrillDownDrawer'
 
 const { Text } = Typography
 
@@ -54,45 +56,256 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
 
 /* ==================== KPI 指标条 ==================== */
 
+interface KpiDrill {
+  title: string
+  headline: React.ReactNode
+  formula?: string
+  columns: ColumnsType<any>
+  records: any[]
+}
+
 export const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => {
   const k = result.kpis
-  const items: { title: string; value: string; suffix?: string; color: string; tip?: string }[] = [
-    { title: '平均负荷率', value: pct(k.avg_load_rate), color: k.avg_load_rate > 0.9 ? '#fa8c16' : '#1890ff' },
-    { title: '峰值负荷率', value: pct(k.peak_load_rate, 0), color: k.peak_load_rate > 1 ? '#f5222d' : '#52c41a' },
-    { title: '订单准时率', value: pct(k.on_time_rate, 0), color: k.on_time_rate >= 0.8 ? '#52c41a' : '#f5222d' },
-    { title: '延期订单', value: `${k.delayed_orders}`, suffix: `/ ${result.order_count}`, color: k.delayed_orders > 0 ? '#f5222d' : '#52c41a' },
-    { title: '瓶颈工段', value: `${k.bottleneck_sections}`, color: k.bottleneck_sections > 0 ? '#f5222d' : '#52c41a' },
+  // 卡片下钻：每个 KPI 都能点开看“这个数怎么算出来的”，
+  // 明细来自同一份 result 数组（后端聚合也基于这些明细），微观=宏观天然一致
+  const [drill, setDrill] = useState<KpiDrill | null>(null)
+
+  const secCols: ColumnsType<any> = [
+    { title: '工段', dataIndex: 'name', key: 'name' },
+    { title: '车间', dataIndex: 'workshop_name', key: 'ws', width: 110 },
+    { title: '负荷工时', dataIndex: 'total_load_hours', key: 'lh', width: 90, render: (v: number) => `${v}h` },
+    { title: '产能工时', dataIndex: 'total_capacity_hours', key: 'ch', width: 90, render: (v: number) => `${v}h` },
+    { title: '平均负荷', dataIndex: 'avg_load_rate', key: 'ar', width: 90, render: (v: number) => pct(v) },
+    { title: '峰值负荷', dataIndex: 'peak_load_rate', key: 'pr', width: 120, render: (v: number, r: any) => `${pct(v, 0)}（第${(r.peak_day ?? 0) + 1}天）` },
+  ]
+  const orderCols: ColumnsType<any> = [
+    { title: '订单', dataIndex: 'order_code', key: 'code', render: (v: string, r: any) => v || r.order_id },
+    { title: '产品', dataIndex: 'product_name', key: 'p' },
+    { title: '数量', dataIndex: 'quantity', key: 'q', width: 80 },
+    { title: '交期', dataIndex: 'due_day', key: 'due', width: 80, render: (v: number) => `第${v + 1}天` },
+    { title: '完工', dataIndex: 'completion_day', key: 'cd', width: 80, render: (v: number) => `第${v + 1}天` },
+    { title: '延期', dataIndex: 'delay_days', key: 'dd', width: 70, render: (v: number) => (v > 0 ? <span style={{ color: '#f5222d' }}>{v}天</span> : '-') },
+    { title: '准时', dataIndex: 'on_time', key: 'ot', width: 60, render: (v: boolean) => (v ? <Tag color="green">是</Tag> : <Tag color="red">否</Tag>) },
+  ]
+  const blockCols: ColumnsType<any> = [
+    { title: '#', dataIndex: 'rank', key: 'rank', width: 40 },
+    { title: '工段', dataIndex: 'section_name', key: 'sn' },
+    { title: '类型', dataIndex: 'blocking_type', key: 'bt', width: 90, render: (v: string) => <Tag color={(BLOCKING_TYPE_COLOR as Record<string, string>)[v]}>{(BLOCKING_TYPE_LABEL as Record<string, string>)[v] || v}</Tag> },
+    { title: '峰值负荷', dataIndex: 'peak_load_rate', key: 'pl', width: 90, render: (v: number) => pct(v, 0) },
+    { title: '过载天数', dataIndex: 'overload_days', key: 'od', width: 80 },
+    { title: '积压峰值', dataIndex: 'wip_peak', key: 'wp', width: 90, render: (v: number) => `${v} 件` },
+    { title: '说明', dataIndex: 'detail', key: 'dt' },
+  ]
+
+  const sortedByAvg = [...result.sections].sort((a, b) => b.avg_load_rate - a.avg_load_rate)
+  const delayed = result.orders.filter((o) => !o.on_time)
+  const onTimeCnt = result.orders.length - delayed.length
+  const peakSec = sortedByAvg.reduce((m, s) => (s.peak_load_rate > m.peak_load_rate ? s : m), sortedByAvg[0] || ({} as any))
+  const otSecs = result.sections.filter((s) => s.overtime_used_hours > 0).sort((a, b) => b.overtime_used_hours - a.overtime_used_hours)
+  const wipPeakPt = result.wip_curve.reduce((m, p) => (p.wip_qty > (m?.wip_qty ?? -1) ? p : m), result.wip_curve[0])
+  const sectionWip = result.sections.map((s) => ({
+    name: s.name, workshop_name: s.workshop_name,
+    wip_peak: Math.max(0, ...s.series.map((c) => c.wip_qty || 0)),
+  })).sort((a, b) => b.wip_peak - a.wip_peak)
+
+  const drills: Record<string, () => KpiDrill> = {
+    avg_load: () => ({
+      title: '平均负荷率 · 追溯', headline: pct(k.avg_load_rate),
+      formula: `${pct(k.avg_load_rate)} = 总负荷 ${k.total_work_hours.toFixed(0)}h ÷ 总产能 ${k.total_capacity_hours.toFixed(0)}h（${result.sections.length} 个工段汇总）`,
+      columns: secCols, records: sortedByAvg,
+    }),
+    peak_load: () => ({
+      title: '峰值负荷率 · 追溯', headline: pct(k.peak_load_rate, 0),
+      formula: `${pct(k.peak_load_rate, 0)} = 各工段峰值负荷的最大值，出现在「${peakSec?.name || '-'}」第${(peakSec?.peak_day ?? 0) + 1}天`,
+      columns: secCols, records: [...result.sections].sort((a, b) => b.peak_load_rate - a.peak_load_rate),
+    }),
+    on_time: () => ({
+      title: '订单准时率 · 追溯', headline: pct(k.on_time_rate, 0),
+      formula: `${pct(k.on_time_rate, 0)} = 准时订单 ${onTimeCnt} ÷ 总订单 ${result.orders.length}`,
+      columns: orderCols, records: [...result.orders].sort((a, b) => Number(a.on_time) - Number(b.on_time)),
+    }),
+    delayed: () => ({
+      title: '延期订单 · 追溯', headline: `${k.delayed_orders} 单`,
+      formula: `${k.delayed_orders} = 完工晚于交期的订单数（共 ${result.orders.length} 单）`,
+      columns: orderCols, records: [...delayed].sort((a, b) => b.delay_days - a.delay_days),
+    }),
+    bottleneck: () => ({
+      title: '瓶颈工段 · 追溯', headline: `${k.bottleneck_sections} 个`,
+      formula: `${k.bottleneck_sections} = 峰值负荷率超过 100% 的工段数`,
+      columns: secCols, records: result.sections.filter((s) => s.is_bottleneck).sort((a, b) => b.peak_load_rate - a.peak_load_rate),
+    }),
+    imbalance: () => ({
+      title: '负荷不均衡指数 · 追溯', headline: k.imbalance_index.toFixed(2),
+      formula: sortedByAvg.length > 1
+        ? `${k.imbalance_index.toFixed(2)} = 最高「${sortedByAvg[0].name}」${pct(sortedByAvg[0].avg_load_rate)} - 最低「${sortedByAvg[sortedByAvg.length - 1].name}」${pct(sortedByAvg[sortedByAvg.length - 1].avg_load_rate)}`
+        : '工段数不足，无法计算极差',
+      columns: secCols, records: sortedByAvg,
+    }),
+    overtime: () => ({
+      title: '加班工时 · 追溯', headline: `${k.overtime_hours.toFixed(0)} h`,
+      formula: otSecs.length > 0
+        ? `${k.overtime_hours.toFixed(0)}h = ${otSecs.map((s) => `${s.name} ${s.overtime_used_hours.toFixed(0)}h`).join(' + ')}（负荷超出产能部分）`
+        : '无工段产生加班',
+      columns: [
+        { title: '工段', dataIndex: 'name', key: 'name' },
+        { title: '车间', dataIndex: 'workshop_name', key: 'ws', width: 110 },
+        { title: '加班工时', dataIndex: 'overtime_used_hours', key: 'ot', width: 100, render: (v: number) => <span style={{ color: '#722ed1', fontWeight: 600 }}>{v.toFixed(1)}h</span> },
+        { title: '负荷工时', dataIndex: 'total_load_hours', key: 'lh', width: 90, render: (v: number) => `${v}h` },
+        { title: '产能工时', dataIndex: 'total_capacity_hours', key: 'ch', width: 90, render: (v: number) => `${v}h` },
+      ],
+      records: otSecs,
+    }),
+    wip_peak: () => ({
+      title: 'WIP 峰值 · 追溯', headline: `${k.wip_peak} 件`,
+      formula: `${k.wip_peak} 件 = 各日在制数量的最大值，出现在第${(wipPeakPt?.day ?? 0) + 1}天`,
+      columns: [
+        { title: '天', dataIndex: 'day', key: 'd', width: 70, render: (v: number) => `第${v + 1}天` },
+        { title: '在制数量', dataIndex: 'wip_qty', key: 'w', render: (v: number) => `${v} 件` },
+        { title: '活跃订单', dataIndex: 'active_orders', key: 'a', width: 100 },
+      ],
+      records: result.wip_curve,
+    }),
+    output: () => ({
+      title: '成品产出 · 追溯', headline: `${k.total_output.toLocaleString()} 件`,
+      formula: `${k.total_output.toLocaleString()} = 各日产出累加（良品 ${k.good_output.toLocaleString()} + 报废 ${k.scrap_output.toLocaleString()}）`,
+      columns: [
+        { title: '天', dataIndex: 'day', key: 'd', width: 70, render: (v: number) => `第${v + 1}天` },
+        { title: '产出', dataIndex: 'output_qty', key: 'o', width: 90 },
+        { title: '良品', dataIndex: 'good_qty', key: 'g', width: 90, render: (v: number) => <span style={{ color: '#52c41a' }}>{v}</span> },
+        { title: '报废', dataIndex: 'scrap_qty', key: 's', width: 90, render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : undefined }}>{v}</span> },
+        { title: '累计良品', dataIndex: 'cumulative', key: 'c', width: 100 },
+      ],
+      records: result.daily_output.filter((d) => d.output_qty > 0),
+    }),
+    yield_rate: () => ({
+      title: '综合良品率 · 追溯', headline: pct(k.avg_yield_rate),
+      formula: `${pct(k.avg_yield_rate)} = 良品 ${k.good_output.toLocaleString()} ÷ 总产出 ${(k.good_output + k.scrap_output).toLocaleString()}（按工段明细汇总）`,
+      columns: [
+        { title: '工段', dataIndex: 'name', key: 'n' },
+        { title: '计划量', dataIndex: 'planned_qty', key: 'p', width: 90 },
+        { title: '良品', dataIndex: 'good_qty', key: 'g', width: 90, render: (v: number) => <span style={{ color: '#52c41a' }}>{v}</span> },
+        { title: '报废', dataIndex: 'scrap_qty', key: 's', width: 90, render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : undefined }}>{v}</span> },
+        { title: '良品率', dataIndex: 'yield_rate', key: 'y', width: 90, render: (v: number) => pct(v) },
+      ],
+      records: [...result.section_outputs].sort((a, b) => a.yield_rate - b.yield_rate),
+    }),
+    headcount: () => ({
+      title: '在岗人数 · 追溯', headline: `${k.headcount} 人`,
+      formula: result.workforce.length <= 12
+        ? `${k.headcount} = ${result.workforce.map((w) => `${w.name} ${w.headcount}`).join(' + ')}`
+        : `${k.headcount} = ${result.workforce.length} 个工段在岗人数之和`,
+      columns: [
+        { title: '工段', dataIndex: 'name', key: 'n' },
+        { title: '在岗人数', dataIndex: 'headcount', key: 'h', width: 90 },
+        { title: '单班人数', dataIndex: 'per_shift', key: 'ps', width: 90 },
+        { title: '平均技能', dataIndex: 'avg_skill', key: 'sk', width: 90, render: (v: number) => v?.toFixed(1) },
+        { title: '出勤率', dataIndex: 'avg_attendance', key: 'at', width: 90, render: (v: number) => pct(v ?? 0) },
+      ],
+      records: [...result.workforce].sort((a, b) => b.headcount - a.headcount),
+    }),
+    po: () => ({
+      title: 'PO 完工/延期 · 追溯', headline: `${k.po_completed} / ${k.po_delayed}`,
+      formula: `准时完工 ${k.po_completed} 个，延期 ${k.po_delayed} 个（共 ${result.production_orders.length} 个 PO）`,
+      columns: [
+        { title: 'PO', dataIndex: 'po_id', key: 'po', width: 170 },
+        { title: '产品', dataIndex: 'product_name', key: 'p' },
+        { title: '数量', dataIndex: 'quantity', key: 'q', width: 80 },
+        { title: '状态', dataIndex: 'status', key: 'st', width: 90, render: (v: string) => <Tag color={v === 'done' ? 'green' : v === 'in_progress' ? 'blue' : 'default'}>{v}</Tag> },
+        { title: '准时', dataIndex: 'on_time', key: 'ot', width: 60, render: (v: boolean) => (v ? <Tag color="green">是</Tag> : <Tag color="red">否</Tag>) },
+        { title: '良品', dataIndex: 'good_qty', key: 'g', width: 80 },
+        { title: '当前工段', dataIndex: 'current_section', key: 'cs', width: 110 },
+      ],
+      records: [...result.production_orders].sort((a, b) => Number(a.on_time) - Number(b.on_time)),
+    }),
+    blocking: () => ({
+      title: '卡点工段 · 追溯', headline: `${k.blocking_point_count} 个`,
+      formula: `${k.blocking_point_count} = 出现过载/积压的卡点工段数（物流停滞处）`,
+      columns: blockCols, records: result.blocking_points,
+    }),
+    max_wip: () => ({
+      title: '峰值积压 · 追溯', headline: `${k.max_section_wip.toLocaleString()} 件`,
+      formula: `${k.max_section_wip.toLocaleString()} 件 = 单工段单日在制积压的最大值`,
+      columns: result.blocking_points.length > 0 ? blockCols : [
+        { title: '工段', dataIndex: 'name', key: 'n' },
+        { title: '车间', dataIndex: 'workshop_name', key: 'ws', width: 120 },
+        { title: '积压峰值', dataIndex: 'wip_peak', key: 'wp', width: 110, render: (v: number) => `${v} 件` },
+      ],
+      records: result.blocking_points.length > 0
+        ? [...result.blocking_points].sort((a, b) => b.wip_peak - a.wip_peak)
+        : sectionWip,
+    }),
+    outbound: () => ({
+      title: '出库总量 · 追溯', headline: `${k.total_outbound.toLocaleString()} 件`,
+      formula: `${k.total_outbound.toLocaleString()} 件 = 各出库单数量之和（${result.outbound_orders.length} 单，待出库 ${k.pending_outbound} 单）`,
+      columns: [
+        { title: '出库单', dataIndex: 'outbound_id', key: 'ob', width: 160 },
+        { title: '产品', dataIndex: 'product_name', key: 'p' },
+        { title: '数量', dataIndex: 'quantity', key: 'q', width: 80 },
+        { title: '出库日', dataIndex: 'outbound_day', key: 'd', width: 80, render: (v: number) => `第${v + 1}天` },
+        { title: '仓库', dataIndex: 'warehouse', key: 'w', width: 100 },
+        { title: '状态', dataIndex: 'status', key: 'st', width: 90, render: (v: string) => (v === 'shipped' ? <Tag color="green">已出库</Tag> : <Tag color="orange">待出库</Tag>) },
+      ],
+      records: [...result.outbound_orders].sort((a, b) => a.outbound_day - b.outbound_day),
+    }),
+  }
+
+  const items: { title: string; value: string; suffix?: string; color: string; tip?: string; drill: string }[] = [
+    { title: '平均负荷率', value: pct(k.avg_load_rate), color: k.avg_load_rate > 0.9 ? '#fa8c16' : '#1890ff', drill: 'avg_load' },
+    { title: '峰值负荷率', value: pct(k.peak_load_rate, 0), color: k.peak_load_rate > 1 ? '#f5222d' : '#52c41a', drill: 'peak_load' },
+    { title: '订单准时率', value: pct(k.on_time_rate, 0), color: k.on_time_rate >= 0.8 ? '#52c41a' : '#f5222d', drill: 'on_time' },
+    { title: '延期订单', value: `${k.delayed_orders}`, suffix: `/ ${result.order_count}`, color: k.delayed_orders > 0 ? '#f5222d' : '#52c41a', drill: 'delayed' },
+    { title: '瓶颈工段', value: `${k.bottleneck_sections}`, color: k.bottleneck_sections > 0 ? '#f5222d' : '#52c41a', drill: 'bottleneck' },
     {
       title: '负荷不均衡指数', value: k.imbalance_index.toFixed(2),
       color: k.imbalance_index > 0.4 ? '#fa8c16' : '#52c41a',
       tip: '各工段平均负荷率的极差。越大说明订单结构对不同部门的负荷拉动分化越明显',
+      drill: 'imbalance',
     },
-    { title: '加班工时', value: k.overtime_hours.toFixed(0), suffix: 'h', color: '#722ed1' },
-    { title: 'WIP 峰值', value: `${k.wip_peak}`, suffix: '件', color: '#13c2c2' },
-    { title: '成品产出', value: `${k.total_output.toLocaleString()}`, suffix: '件', color: '#52c41a', tip: '计划期成品产出总量（末道工序完工）' },
-    { title: '综合良品率', value: pct(k.avg_yield_rate), color: k.avg_yield_rate >= 0.97 ? '#52c41a' : '#fa8c16', tip: `良品 ${k.good_output.toLocaleString()} / 报废 ${k.scrap_output.toLocaleString()}` },
-    { title: '在岗人数', value: `${k.headcount}`, suffix: '人', color: '#2f54eb', tip: '全厂在岗总人数（单班人数×班次）' },
-    { title: 'PO 完工/延期', value: `${k.po_completed}/${k.po_delayed}`, color: k.po_delayed > 0 ? '#f5222d' : '#52c41a', tip: '准时完工 PO 数 / 延期 PO 数' },
-    { title: '卡点工段', value: `${k.blocking_point_count}`, color: k.blocking_point_count > 0 ? '#f5222d' : '#52c41a', tip: '出现过载的卡点工段数（物流停滞处）' },
-    { title: '峰值积压', value: `${k.max_section_wip.toLocaleString()}`, suffix: '件', color: '#fa8c16', tip: '单工段单日在制积压峰值（物料堆在哪）' },
-    { title: '出库总量', value: `${k.total_outbound.toLocaleString()}`, suffix: '件', color: '#52c41a', tip: `计划期成品出库总量；待出库 ${k.pending_outbound} 单` },
+    { title: '加班工时', value: k.overtime_hours.toFixed(0), suffix: 'h', color: '#722ed1', drill: 'overtime' },
+    { title: 'WIP 峰值', value: `${k.wip_peak}`, suffix: '件', color: '#13c2c2', drill: 'wip_peak' },
+    { title: '成品产出', value: `${k.total_output.toLocaleString()}`, suffix: '件', color: '#52c41a', tip: '计划期成品产出总量（末道工序完工）', drill: 'output' },
+    { title: '综合良品率', value: pct(k.avg_yield_rate), color: k.avg_yield_rate >= 0.97 ? '#52c41a' : '#fa8c16', tip: `良品 ${k.good_output.toLocaleString()} / 报废 ${k.scrap_output.toLocaleString()}`, drill: 'yield_rate' },
+    { title: '在岗人数', value: `${k.headcount}`, suffix: '人', color: '#2f54eb', tip: '全厂在岗总人数（单班人数×班次）', drill: 'headcount' },
+    { title: 'PO 完工/延期', value: `${k.po_completed}/${k.po_delayed}`, color: k.po_delayed > 0 ? '#f5222d' : '#52c41a', tip: '准时完工 PO 数 / 延期 PO 数', drill: 'po' },
+    { title: '卡点工段', value: `${k.blocking_point_count}`, color: k.blocking_point_count > 0 ? '#f5222d' : '#52c41a', tip: '出现过载的卡点工段数（物流停滞处）', drill: 'blocking' },
+    { title: '峰值积压', value: `${k.max_section_wip.toLocaleString()}`, suffix: '件', color: '#fa8c16', tip: '单工段单日在制积压峰值（物料堆在哪）', drill: 'max_wip' },
+    { title: '出库总量', value: `${k.total_outbound.toLocaleString()}`, suffix: '件', color: '#52c41a', tip: `计划期成品出库总量；待出库 ${k.pending_outbound} 单`, drill: 'outbound' },
   ]
   return (
-    <Row gutter={[12, 12]}>
-      {items.map((it) => (
-        <Col span={6} xl={3} key={it.title}>
-          <Card size="small" styles={{ body: { padding: '10px 14px' } }}>
-            <Tooltip title={it.tip}>
-              <div style={{ fontSize: 11, color: '#8c8c8c' }}>{it.title}</div>
-              <div style={{ fontSize: 20, fontWeight: 700, color: it.color, lineHeight: 1.3 }}>
-                {it.value}
-                {it.suffix && <span style={{ fontSize: 12, fontWeight: 400, marginLeft: 2 }}>{it.suffix}</span>}
-              </div>
-            </Tooltip>
-          </Card>
-        </Col>
-      ))}
-    </Row>
+    <>
+      <Row gutter={[12, 12]}>
+        {items.map((it) => (
+          <Col span={6} xl={3} key={it.title}>
+            <Card
+              size="small"
+              hoverable
+              onClick={() => setDrill(drills[it.drill]())}
+              styles={{ body: { padding: '10px 14px' } }}
+            >
+              <Tooltip title={it.tip ? `${it.tip}（点击追溯明细）` : '点击追溯明细'}>
+                <div style={{ fontSize: 11, color: '#8c8c8c' }}>{it.title}</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: it.color, lineHeight: 1.3 }}>
+                  {it.value}
+                  {it.suffix && <span style={{ fontSize: 12, fontWeight: 400, marginLeft: 2 }}>{it.suffix}</span>}
+                </div>
+              </Tooltip>
+            </Card>
+          </Col>
+        ))}
+      </Row>
+      {drill && (
+        <DrillDownDrawer
+          open
+          onClose={() => setDrill(null)}
+          title={drill.title}
+          headline={drill.headline}
+          formula={drill.formula}
+          columns={drill.columns}
+          records={drill.records}
+          width={860}
+        />
+      )}
+    </>
   )
 }
 

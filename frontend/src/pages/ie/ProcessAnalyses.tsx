@@ -40,7 +40,7 @@ const MOCK_DATA: ProcessAnalysis[] = [
 ]
 
 const ProcessAnalyses: React.FC = () => {
-  const [factory, setFactory] = useState('factory-sh-01')
+  const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
   const [data, setData] = useState<ProcessAnalysis[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -121,7 +121,7 @@ const ProcessAnalyses: React.FC = () => {
       <Card title="工序价值分析" extra={
         <Space>
           <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
-            <Select.Option value="factory-sh-01">上海工厂</Select.Option>
+            <Select.Option value="F01">F01</Select.Option>
             <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
             <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
           </Select>

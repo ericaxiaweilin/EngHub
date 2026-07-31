@@ -2,7 +2,7 @@
 MES Service Layer - Production Report, Station, Routing, Equipment Services
 生产报工、工位、工艺路线、设备管理服务
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import case, select, update, delete
@@ -49,6 +49,7 @@ class ProductionReportService:
         quality_check_passed: Optional[bool] = None,
         remark: Optional[str] = None,
         created_by: Optional[str] = None,
+        report_date: Optional[datetime] = None,
     ) -> ProductionReport:
         """创建生产报工"""
         import uuid
@@ -77,6 +78,11 @@ class ProductionReportService:
             remark=remark,
             created_by=created_by,
         )
+        # 可选报工日期：支持补录历史报工（created_at 作为报工时间参与看板聚合）
+        if report_date is not None:
+            if report_date.tzinfo is not None:
+                report_date = report_date.astimezone(timezone.utc).replace(tzinfo=None)
+            report.created_at = report_date
         
         self.db.add(report)
         await self.db.commit()

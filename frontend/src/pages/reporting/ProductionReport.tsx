@@ -1,12 +1,12 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import {
   Form, Input, InputNumber, Select, Button, Card, Radio, Space, message,
-  Table, Tag, Row, Col, Modal, Statistic,
+  Table, Tag, Row, Col, Modal, Statistic, DatePicker,
 } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
-import dayjs from 'dayjs'
+import { ReloadOutlined, PlusOutlined, DeleteOutlined, AppstoreAddOutlined } from '@ant-design/icons'
+import dayjs, { Dayjs } from 'dayjs'
 import {
-  getProductionReports, createProductionReport, modifyProductionReport,
+  getProductionReports, createProductionReport, batchProductionReport, modifyProductionReport,
   addReportComment, getWorkOrders, getStations, getProducts,
   ProductionReport as ReportType, WorkOrder, Station, Product,
 } from '../../services/mes'
@@ -35,6 +35,15 @@ interface DrillConfig {
   onRowClick?: (r: any) => void
 }
 
+interface BatchRow {
+  key: number
+  work_order_id?: string
+  station_id?: string
+  good_qty: number
+  defect_qty: number
+  remark?: string
+}
+
 const ProductionReport: React.FC = () => {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
@@ -48,6 +57,13 @@ const ProductionReport: React.FC = () => {
   const [commentModal, setCommentModal] = useState<ReportType | null>(null)
   const [commentText, setCommentText] = useState('')
   const [modifyForm] = Form.useForm()
+  // 批量报工弹窗状态
+  const [batchOpen, setBatchOpen] = useState(false)
+  const [batchRows, setBatchRows] = useState<BatchRow[]>([{ key: 1, good_qty: 0, defect_qty: 0 }])
+  const [batchDate, setBatchDate] = useState<Dayjs | null>(null)
+  const [batchShift, setBatchShift] = useState<string>('day')
+  const [batchOperator, setBatchOperator] = useState<string>('')
+  const [batchSubmitting, setBatchSubmitting] = useState(false)
 
   const navigate = useNavigate()
   // 追溯交互状态：统计下钻抽屉 / 报工原始记录详情
@@ -104,6 +120,8 @@ const ProductionReport: React.FC = () => {
         shift: values.shift || 'day',
         operator_id: values.operator_id || undefined,
         remark: values.remark || undefined,
+        // 可选报工日期：不选则后端取当前时间；选了取当天中午（避免时区换算跨天）
+        report_date: values.report_date ? values.report_date.hour(12).minute(0).second(0).toISOString() : undefined,
       })
       message.success('报工提交成功')
       form.resetFields()
@@ -112,6 +130,41 @@ const ProductionReport: React.FC = () => {
       message.error(err?.response?.data?.detail || '报工提交失败')
     }
   }
+
+  // ===== 批量报工 =====
+  const handleBatchSubmit = async () => {
+    const valid = batchRows.filter(r => r.work_order_id && r.station_id && (r.good_qty > 0 || r.defect_qty > 0))
+    if (valid.length === 0) { message.warning('请至少填写一行完整的报工（工单+工位+数量）'); return }
+    if (valid.length < batchRows.length) { message.warning(`有 ${batchRows.length - valid.length} 行不完整，已自动忽略`) }
+    setBatchSubmitting(true)
+    try {
+      const res: any = await batchProductionReport({
+        factory_id: factoryId,
+        items: valid.map(r => ({
+          work_order_id: r.work_order_id!,
+          station_id: r.station_id!,
+          good_qty: r.good_qty || 0,
+          defect_qty: r.defect_qty || 0,
+          remark: r.remark || undefined,
+        })),
+        operator_id: batchOperator || undefined,
+        shift: batchShift,
+        report_date: batchDate ? batchDate.hour(12).minute(0).second(0).toISOString() : undefined,
+      })
+      message.success(`批量报工成功：${res?.count ?? valid.length} 条，良品 ${res?.total_good ?? '-'} 件`)
+      setBatchOpen(false)
+      setBatchRows([{ key: 1, good_qty: 0, defect_qty: 0 }])
+      setBatchDate(null)
+      fetchReports()
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || '批量报工失败')
+    } finally {
+      setBatchSubmitting(false)
+    }
+  }
+
+  const updateBatchRow = (key: number, patch: Partial<BatchRow>) =>
+    setBatchRows(rows => rows.map(r => (r.key === key ? { ...r, ...patch } : r)))
 
   const handleModify = async (values: any) => {
     if (!modifyModal) return
@@ -315,6 +368,9 @@ const ProductionReport: React.FC = () => {
                   <Radio.Button value="night">夜班</Radio.Button>
                 </Radio.Group>
               </Form.Item>
+              <Form.Item label="报工日期" name="report_date" tooltip="不选则默认为当前时间；选择历史日期可补录报工">
+                <DatePicker style={{ width: '100%' }} placeholder="默认今天（可选历史日期补录）" disabledDate={(d) => d && d.isAfter(dayjs(), 'day')} />
+              </Form.Item>
               <Form.Item label="操作人" name="operator_id">
                 <Input placeholder="操作员工号" />
               </Form.Item>
@@ -340,7 +396,12 @@ const ProductionReport: React.FC = () => {
           <Card
             title="报工记录"
             size="small"
-            extra={<Button size="small" icon={<ReloadOutlined />} onClick={fetchReports}>刷新</Button>}
+            extra={
+              <Space>
+                <Button size="small" type="primary" ghost icon={<AppstoreAddOutlined />} onClick={() => setBatchOpen(true)}>批量报工</Button>
+                <Button size="small" icon={<ReloadOutlined />} onClick={fetchReports}>刷新</Button>
+              </Space>
+            }
           >
             <Table
               columns={columns}
@@ -357,6 +418,92 @@ const ProductionReport: React.FC = () => {
           </Card>
         </Col>
       </Row>
+
+      {/* 批量报工 */}
+      <Modal
+        title="批量报工"
+        open={batchOpen}
+        onCancel={() => setBatchOpen(false)}
+        onOk={handleBatchSubmit}
+        okText={`提交 ${batchRows.filter(r => r.work_order_id && r.station_id && (r.good_qty > 0 || r.defect_qty > 0)).length} 条报工`}
+        confirmLoading={batchSubmitting}
+        width={960}
+      >
+        <Space style={{ marginBottom: 12 }} wrap>
+          <span>报工日期：</span>
+          <DatePicker value={batchDate} onChange={setBatchDate} placeholder="默认今天（可选历史日期补录）" disabledDate={(d) => d && d.isAfter(dayjs(), 'day')} />
+          <span>班次：</span>
+          <Radio.Group value={batchShift} onChange={(e) => setBatchShift(e.target.value)}>
+            <Radio.Button value="day">白班</Radio.Button>
+            <Radio.Button value="middle">中班</Radio.Button>
+            <Radio.Button value="night">夜班</Radio.Button>
+          </Radio.Group>
+          <span>操作人：</span>
+          <Input style={{ width: 140 }} placeholder="操作员工号（可选）" value={batchOperator} onChange={(e) => setBatchOperator(e.target.value)} />
+        </Space>
+        <Table<BatchRow>
+          size="small"
+          dataSource={batchRows}
+          pagination={false}
+          rowKey="key"
+          columns={[
+            {
+              title: '工单', dataIndex: 'work_order_id', width: 240,
+              render: (v, row) => (
+                <Select
+                  style={{ width: '100%' }} placeholder="选择在制工单" showSearch optionFilterProp="children"
+                  value={v} onChange={(val) => updateBatchRow(row.key, { work_order_id: val })}
+                >
+                  {workOrders.map(wo => (
+                    <Option key={wo.id} value={wo.id}>{wo.work_order_code} ({productLabel(wo.product_id)})</Option>
+                  ))}
+                </Select>
+              ),
+            },
+            {
+              title: '工位', dataIndex: 'station_id', width: 200,
+              render: (v, row) => (
+                <Select
+                  style={{ width: '100%' }} placeholder="选择工位" showSearch optionFilterProp="children"
+                  value={v} onChange={(val) => updateBatchRow(row.key, { station_id: val })}
+                >
+                  {stations.map(st => (
+                    <Option key={st.id} value={st.station_code}>{st.station_code} - {st.station_name}</Option>
+                  ))}
+                </Select>
+              ),
+            },
+            {
+              title: '良品数', dataIndex: 'good_qty', width: 100,
+              render: (v, row) => <InputNumber min={0} value={v} onChange={(val) => updateBatchRow(row.key, { good_qty: val || 0 })} style={{ width: '100%' }} />,
+            },
+            {
+              title: '不良数', dataIndex: 'defect_qty', width: 100,
+              render: (v, row) => <InputNumber min={0} value={v} onChange={(val) => updateBatchRow(row.key, { defect_qty: val || 0 })} style={{ width: '100%' }} />,
+            },
+            {
+              title: '备注', dataIndex: 'remark',
+              render: (v, row) => <Input value={v} placeholder="可选" onChange={(e) => updateBatchRow(row.key, { remark: e.target.value })} />,
+            },
+            {
+              title: '', key: 'del', width: 40,
+              render: (_, row) => (
+                <Button
+                  type="text" danger size="small" icon={<DeleteOutlined />}
+                  disabled={batchRows.length <= 1}
+                  onClick={() => setBatchRows(rows => rows.filter(r => r.key !== row.key))}
+                />
+              ),
+            },
+          ]}
+          footer={() => (
+            <Button
+              type="dashed" block icon={<PlusOutlined />}
+              onClick={() => setBatchRows(rows => [...rows, { key: Math.max(...rows.map(r => r.key)) + 1, good_qty: 0, defect_qty: 0 }])}
+            >添加一行</Button>
+          )}
+        />
+      </Modal>
 
       {/* 修改报工 */}
       <Modal title={`修改报工: ${modifyModal?.report_code || ''}`} open={!!modifyModal} onCancel={() => setModifyModal(null)} footer={null}>
