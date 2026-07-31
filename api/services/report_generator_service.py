@@ -402,7 +402,8 @@ class ReportGeneratorService:
         # 2. 产出比昨日下降
         if report_date:
             try:
-                yesterday = (date.fromisoformat(report_date) - timedelta(days=1)).isoformat()
+                # 保持 date 类型与 func.date() 比较，避免 "operator does not exist: date = character varying"
+                yesterday = date.fromisoformat(report_date) - timedelta(days=1)
                 yd_stmt = select(
                     func.coalesce(func.sum(ProductionReport.good_qty + ProductionReport.defect_qty + ProductionReport.scrap_qty), 0)
                 ).where(and_(
