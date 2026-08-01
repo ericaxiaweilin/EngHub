@@ -10,6 +10,9 @@
     "lint": "eslint . --ext ts,tsx"
   },
   "dependencies": {
+    "@ant-design/charts": "^2.6.7",
+    "@antv/x6": "^3.1.7",
+    "@antv/x6-react-shape": "^3.0.1",
     "@univerjs/preset-sheets-core": "^0.25.1",
     "@univerjs/presets": "^0.25.1",
     "antd": "^5.12.0",
