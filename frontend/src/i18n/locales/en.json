@@ -26,7 +26,6 @@
     "/tms/approval": "Approval Center",
     "/tms/distribution": "Distribution Board",
     "/tms/agent": "Agent Console",
-    "/andon": "Andon Quick Request",
     "/work-order-templates": "Work Order Templates",
     "/data-consistency": "Data Consistency",
     "/quick-request": "Quick Request"

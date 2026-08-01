@@ -131,6 +131,29 @@ interface IMMsg {
   callMeta?: { call_type: string; station: string; priority: string; task_code?: string }
 }
 
+interface IMGroup {
+  id: string
+  factory_id: string
+  name: string
+  description?: string
+  group_type?: string
+  org_node_id?: string
+  owner_id?: string
+  avatar_color?: string
+  message_count?: number
+  last_message_at?: string
+}
+
+interface IMGroupMsg {
+  id: string
+  group_id: string
+  sender_id: string
+  sender_name: string
+  msg_type: string
+  content: string
+  created_at?: string
+}
+
 interface InfoItem {
   id: string
   source: 'im' | 'system' | 'ai'
@@ -203,13 +226,21 @@ export default function AIAssistantWidget() {
   // IM 未读
   const [unread, setUnread] = useState<Record<string, number>>({ c2: 1, c3: 2 })
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null)
+  const [selectedGroup, setSelectedGroup] = useState<IMGroup | null>(null)
   const [infoOpen, setInfoOpen] = useState(false)
   const [infoItems, setInfoItems] = useState<InfoItem[]>([])
   const [infoLoading, setInfoLoading] = useState(false)
+  const [groups, setGroups] = useState<IMGroup[]>([])
+  const [groupsLoading, setGroupsLoading] = useState(false)
+  const [groupModalOpen, setGroupModalOpen] = useState(false)
+  const [groupForm] = Form.useForm()
   // IM 聊天
   const [imMessages, setImMessages] = useState<Record<string, IMMsg[]>>({})
   const [imInput, setImInput] = useState('')
   const [imSending, setImSending] = useState(false)
+  const [groupMessages, setGroupMessages] = useState<Record<string, IMGroupMsg[]>>({})
+  const [groupInput, setGroupInput] = useState('')
+  const [groupSending, setGroupSending] = useState(false)
   const imListRef = useRef<HTMLDivElement>(null)
   // 工单呼叫弹窗
   const [callModalOpen, setCallModalOpen] = useState(false)
@@ -220,6 +251,7 @@ export default function AIAssistantWidget() {
   const [sheetTable, setSheetTable] = useState<TableData | null>(null)
 
   const user = getStoredUser()
+  const activeFactoryId = () => localStorage.getItem('active_factory_id') || user?.factory_id || 'FAC_ELEC_DEMO_2026'
   const infoStorageKey = `enghub-info:${user?.username || 'anonymous'}:${localStorage.getItem('active_factory_id') || 'default'}`
 
   const addInfoItem = useCallback((item: InfoItem) => {
@@ -258,6 +290,30 @@ export default function AIAssistantWidget() {
     }
   }, [])
 
+  const fetchGroups = useCallback(async () => {
+    const factoryId = activeFactoryId()
+    setGroupsLoading(true)
+    try {
+      const res: any = await api.get('/api/v1/collaboration/im/groups', {
+        params: { factory_id: factoryId },
+      })
+      setGroups(res.groups || [])
+    } catch {
+      setGroups([])
+    } finally {
+      setGroupsLoading(false)
+    }
+  }, [user?.factory_id])
+
+  const fetchGroupMessages = useCallback(async (groupId: string) => {
+    try {
+      const res: any = await api.get(`/api/v1/collaboration/im/groups/${groupId}/messages`)
+      setGroupMessages(prev => ({ ...prev, [groupId]: res.messages || [] }))
+    } catch {
+      setGroupMessages(prev => ({ ...prev, [groupId]: prev[groupId] || [] }))
+    }
+  }, [])
+
   useEffect(() => {
     try {
       const stored = JSON.parse(localStorage.getItem(infoStorageKey) || '[]')
@@ -274,6 +330,10 @@ export default function AIAssistantWidget() {
     const localItems = infoItems.filter(item => !item.backendId)
     localStorage.setItem(infoStorageKey, JSON.stringify(localItems))
   }, [infoItems, infoStorageKey])
+
+  useEffect(() => {
+    if (open || tab === 'im') fetchGroups()
+  }, [open, tab, fetchGroups])
 
   // 自动滚动到底部
   useEffect(() => {
@@ -614,7 +674,7 @@ export default function AIAssistantWidget() {
     }
   }
 
-  const shareChatMessage = () => {
+  const shareChatMessage = async () => {
     if (!shareMessage) return
     const content = shareMessage.content.trim()
     if (!content) return
@@ -629,6 +689,31 @@ export default function AIAssistantWidget() {
         sender: user?.full_name || user?.username || '我',
       })
       message.success('已分享到内网信息')
+    } else if (shareTarget.startsWith('group:')) {
+      const groupId = shareTarget.replace('group:', '')
+      const group = groups.find(item => item.id === groupId)
+      if (!group) return
+      try {
+        const res: any = await api.post(`/api/v1/collaboration/im/groups/${groupId}/messages`, {
+          content: `[AI 助手分享]\n${content}`,
+        })
+        setGroupMessages(prev => ({
+          ...prev,
+          [groupId]: [...(prev[groupId] || []), {
+            id: res.id || createId('group-share'),
+            group_id: groupId,
+            sender_id: user?.username || 'me',
+            sender_name: user?.full_name || user?.username || '我',
+            msg_type: 'text',
+            content: `[AI 助手分享]\n${content}`,
+            created_at: new Date().toISOString(),
+          }],
+        }))
+        message.success(`已分享到${group.name}`)
+      } catch {
+        message.error('分享到群失败')
+        return
+      }
     } else {
       const contact = FACTORY_CONTACTS.find(item => item.id === shareTarget)
       if (!contact) return
@@ -705,7 +790,11 @@ export default function AIAssistantWidget() {
   // ---------- IM 自动滚动 ----------
   useEffect(() => {
     if (imListRef.current) imListRef.current.scrollTop = imListRef.current.scrollHeight
-  }, [imMessages, selectedContact])
+  }, [imMessages, selectedContact, groupMessages, selectedGroup])
+
+  useEffect(() => {
+    if (selectedGroup) fetchGroupMessages(selectedGroup.id)
+  }, [selectedGroup, fetchGroupMessages])
 
   // ---------- IM 发送消息 ----------
   const sendImMessage = () => {
@@ -742,6 +831,67 @@ export default function AIAssistantWidget() {
       })
       setImSending(false)
     }, 900)
+  }
+
+  const sendGroupMessage = async () => {
+    const text = groupInput.trim()
+    if (!text || !selectedGroup || groupSending) return
+    const groupId = selectedGroup.id
+    setGroupInput('')
+    setGroupSending(true)
+    try {
+      const res: any = await api.post(`/api/v1/collaboration/im/groups/${groupId}/messages`, {
+        content: text,
+      })
+      setGroupMessages(prev => ({
+        ...prev,
+        [groupId]: [...(prev[groupId] || []), {
+          id: res.id || createId('group-msg'),
+          group_id: groupId,
+          sender_id: user?.username || 'me',
+          sender_name: user?.full_name || user?.username || '我',
+          msg_type: 'text',
+          content: text,
+          created_at: new Date().toISOString(),
+        }],
+      }))
+      fetchGroups()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '群消息发送失败')
+    } finally {
+      setGroupSending(false)
+    }
+  }
+
+  const createGroup = async () => {
+    try {
+      const values = await groupForm.validateFields()
+      const res: any = await api.post('/api/v1/collaboration/im/groups', {
+        factory_id: activeFactoryId(),
+        name: values.name,
+        description: values.description,
+        group_type: values.group_type || 'custom',
+      })
+      message.success('群已创建')
+      setGroupModalOpen(false)
+      groupForm.resetFields()
+      await fetchGroups()
+      if (res?.id) {
+        setSelectedContact(null)
+        setInfoOpen(false)
+        setSelectedGroup({
+          id: res.id,
+          factory_id: res.factory_id || activeFactoryId(),
+          name: res.name || values.name,
+          description: values.description,
+          group_type: values.group_type || 'custom',
+          avatar_color: '#1677ff',
+        })
+      }
+    } catch (e: any) {
+      if (e?.errorFields) return
+      message.error(e?.response?.data?.detail || '创建群失败')
+    }
   }
 
   const markInfoRead = async (item: InfoItem) => {
@@ -1476,6 +1626,80 @@ export default function AIAssistantWidget() {
                           )}
                         </div>
                       </div>
+                    ) : selectedGroup ? (
+                      /* 群聊天 */
+                      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                        <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                          <Button type="text" size="small" onClick={() => setSelectedGroup(null)}>←</Button>
+                          <Avatar size={32} style={{ background: selectedGroup.avatar_color || '#1677ff' }} icon={<TeamOutlined />} />
+                          <div style={{ flex: 1, lineHeight: 1.3, minWidth: 0 }}>
+                            <div>
+                              <Text strong>{selectedGroup.name}</Text>
+                              <Tag color="blue" style={{ marginLeft: 6, fontSize: 10 }}>{selectedGroup.group_type || 'group'}</Tag>
+                            </div>
+                            <Text type="secondary" style={{ fontSize: 11 }} ellipsis>{selectedGroup.description || '群协同消息'}</Text>
+                          </div>
+                          <Tooltip title="刷新消息">
+                            <Button type="text" size="small" icon={<ReloadOutlined />} onClick={() => fetchGroupMessages(selectedGroup.id)} />
+                          </Tooltip>
+                        </div>
+                        <div ref={imListRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '10px 12px', background: '#fafafa' }}>
+                          {(groupMessages[selectedGroup.id] || []).length === 0 && (
+                            <div style={{ textAlign: 'center', color: '#999', fontSize: 12, marginTop: 24 }}>
+                              暂无群消息
+                            </div>
+                          )}
+                          {(groupMessages[selectedGroup.id] || []).map(m => {
+                            const mine = m.sender_id === user?.username
+                            const systemMsg = m.sender_id === 'system' || m.msg_type === 'system'
+                            return (
+                              <div key={m.id} style={{ marginBottom: 10, display: 'flex', justifyContent: mine ? 'flex-end' : 'flex-start' }}>
+                                {!mine && (
+                                  <Avatar size={26} style={{ background: systemMsg ? '#13c2c2' : selectedGroup.avatar_color || '#1677ff', marginRight: 6, flexShrink: 0 }} icon={systemMsg ? <InboxOutlined /> : <TeamOutlined />} />
+                                )}
+                                <div style={{
+                                  maxWidth: '76%',
+                                  padding: '7px 10px',
+                                  borderRadius: 10,
+                                  background: mine ? '#1677ff' : systemMsg ? '#fff7e6' : '#fff',
+                                  color: mine ? '#fff' : '#333',
+                                  fontSize: 12,
+                                  lineHeight: 1.5,
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                  border: mine ? 'none' : systemMsg ? '1px solid #ffd591' : '1px solid #eee',
+                                }}>
+                                  {!mine && <div style={{ fontSize: 10, color: systemMsg ? '#fa8c16' : '#999', marginBottom: 2 }}>{m.sender_name || m.sender_id}</div>}
+                                  {m.content}
+                                  <div style={{ fontSize: 10, color: mine ? 'rgba(255,255,255,0.7)' : '#999', marginTop: 3, textAlign: 'right' }}>
+                                    {m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : now()}
+                                  </div>
+                                </div>
+                              </div>
+                            )
+                          })}
+                          {groupSending && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <Avatar size={26} style={{ background: selectedGroup.avatar_color || '#1677ff' }} icon={<TeamOutlined />} />
+                              <Spin size="small" />
+                            </div>
+                          )}
+                        </div>
+                        <div style={{ padding: '6px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                          <Text type="secondary" style={{ fontSize: 11 }}>群协同（Chatbot 任务、异常、RCC 决策可同步到群）</Text>
+                        </div>
+                        <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
+                          <Space.Compact style={{ width: '100%' }}>
+                            <Input
+                              value={groupInput}
+                              onChange={e => setGroupInput(e.target.value)}
+                              onPressEnter={sendGroupMessage}
+                              placeholder={`发到 ${selectedGroup.name}...`}
+                            />
+                            <Button type="primary" icon={<SendOutlined />} loading={groupSending} onClick={sendGroupMessage} />
+                          </Space.Compact>
+                        </div>
+                      </div>
                     ) : selectedContact ? (
                       /* 联系人聊天 */
                       <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -1579,6 +1803,45 @@ export default function AIAssistantWidget() {
                           />
                           {infoUnread > 0 && <Badge count={infoUnread} />}
                         </List.Item>
+                        <div style={{ padding: '8px 16px 4px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <Text type="secondary" style={{ fontSize: 12 }}>群组</Text>
+                          <Button type="text" size="small" icon={<PlusOutlined />} onClick={() => setGroupModalOpen(true)}>建群</Button>
+                        </div>
+                        <Spin spinning={groupsLoading}>
+                          <List
+                            dataSource={groups}
+                            locale={{ emptyText: '暂无群组' }}
+                            renderItem={(g) => (
+                              <List.Item
+                                style={{ padding: '8px 16px', cursor: 'pointer' }}
+                                onClick={() => {
+                                  setSelectedGroup(g)
+                                  setSelectedContact(null)
+                                  setInfoOpen(false)
+                                }}
+                              >
+                                <List.Item.Meta
+                                  avatar={<Avatar style={{ background: g.avatar_color || '#1677ff' }} icon={<TeamOutlined />} />}
+                                  title={
+                                    <span>
+                                      {g.name}
+                                      <Tag color="geekblue" style={{ marginLeft: 6, fontSize: 10 }}>{g.group_type || 'group'}</Tag>
+                                    </span>
+                                  }
+                                  description={
+                                    <span style={{ fontSize: 12 }}>
+                                      {g.description || '群协同'}
+                                      {(g.message_count || 0) > 0 && <Tag color="blue" style={{ marginLeft: 6, fontSize: 10 }}>{g.message_count} 消息</Tag>}
+                                    </span>
+                                  }
+                                />
+                              </List.Item>
+                            )}
+                          />
+                        </Spin>
+                        <div style={{ padding: '8px 16px 4px' }}>
+                          <Text type="secondary" style={{ fontSize: 12 }}>联系人</Text>
+                        </div>
                         <List
                           dataSource={FACTORY_CONTACTS}
                           renderItem={(c) => (
@@ -1709,6 +1972,10 @@ export default function AIAssistantWidget() {
           style={{ width: '100%', marginTop: 6 }}
           options={[
             { value: 'info', label: '内网信息' },
+            ...groups.map(group => ({
+              value: `group:${group.id}`,
+              label: `${group.name} · 群`,
+            })),
             ...FACTORY_CONTACTS.map(contact => ({
               value: contact.id,
               label: `${contact.name} · ${contact.role}`,
@@ -1722,6 +1989,37 @@ export default function AIAssistantWidget() {
         }}>
           {shareMessage?.content}
         </div>
+      </Modal>
+
+      <Modal
+        title={<Space><TeamOutlined /><span>创建群</span></Space>}
+        open={groupModalOpen}
+        onCancel={() => setGroupModalOpen(false)}
+        onOk={createGroup}
+        okText="创建"
+        cancelText="取消"
+        width={420}
+        destroyOnClose
+      >
+        <Form form={groupForm} layout="vertical">
+          <Form.Item name="name" label="群名称" rules={[{ required: true, message: '请输入群名称' }]}>
+            <Input placeholder="如：模具试产攻关群" />
+          </Form.Item>
+          <Form.Item name="group_type" label="群类型" initialValue="custom">
+            <Select
+              options={[
+                { value: 'custom', label: '自定义' },
+                { value: 'rcc', label: 'RCC指挥' },
+                { value: 'exception', label: '异常处理' },
+                { value: 'quality', label: '质量联动' },
+                { value: 'ie', label: 'IE改善' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item name="description" label="说明">
+            <Input.TextArea rows={3} placeholder="说明这个群负责的流程、异常或项目" />
+          </Form.Item>
+        </Form>
       </Modal>
 
       {/* 工单呼叫弹窗（模板直达，无需跳转页面） */}

@@ -26,7 +26,6 @@
     "/tms/approval": "審批中心",
     "/tms/distribution": "分發看板",
     "/tms/agent": "Agent控制台",
-    "/andon": "安燈小工單",
     "/work-order-templates": "程序工單模板",
     "/data-consistency": "數據一致性",
     "/quick-request": "快速工單"

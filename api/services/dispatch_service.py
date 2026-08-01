@@ -356,31 +356,80 @@ async def auto_dispatch_station(
             "recommended_orders": pending,
         }
 
-    # L2/L3: 自动派发
-    # 查找空闲工位（无在制工单的工位）
+    # L2/L3: 自动派发。派发字段有外键约束，必须写入真实 stations.id。
     if station_id:
-        free_stations = [station_id]
+        station_result = await db.execute(sql_text("""
+            SELECT id, station_code AS work_center
+            FROM stations
+            WHERE factory_id = :fid
+              AND (id = :sid OR station_code = :sid)
+            ORDER BY station_code NULLS LAST, id
+            LIMIT 1
+        """), {"fid": factory_id, "sid": station_id})
+        station_row = station_result.mappings().first()
+        free_stations = [dict(station_row)] if station_row else []
     else:
-        # 查找所有有 released 工单等待分配的工位
+        # 查找所有有 released 工单等待分配的真实工位；无法映射的业务码跳过，避免 FK 失败。
         result = await db.execute(sql_text("""
-            SELECT DISTINCT work_center
-            FROM work_orders
-            WHERE factory_id = :fid AND status = 'released' AND wo_type = 'operation'
-              AND assigned_station_id IS NULL
+            WITH pending_centers AS (
+                SELECT DISTINCT work_center
+                FROM work_orders
+                WHERE factory_id = :fid
+                  AND status = 'released'
+                  AND wo_type = 'operation'
+                  AND assigned_station_id IS NULL
+                  AND work_center IS NOT NULL
+            )
+            SELECT DISTINCT ON (pc.work_center)
+                   s.id,
+                   pc.work_center AS work_center
+            FROM pending_centers pc
+            JOIN stations s ON s.factory_id = :fid
+             AND (
+                s.id = pc.work_center
+                OR s.station_code = pc.work_center
+                OR (pc.work_center = 'ASSY' AND (
+                    s.station_code ILIKE '%ASSY%'
+                    OR s.station_code ILIKE 'ST-ZL-%'
+                    OR s.station_name ILIKE '%组装%'
+                    OR s.station_name ILIKE '%组立%'
+                    OR s.station_name ILIKE '%总装%'
+                ))
+                OR (pc.work_center = 'EDM' AND (
+                    s.station_code ILIKE '%EDM%'
+                    OR s.station_name ILIKE '%EDM%'
+                ))
+                OR (pc.work_center = 'WCUT' AND (
+                    s.station_code ILIKE '%WCUT%'
+                    OR s.station_code ILIKE 'ST-XC-%'
+                    OR s.station_name ILIKE '%线材%'
+                    OR s.station_name ILIKE '%线切%'
+                ))
+             )
+            ORDER BY pc.work_center,
+                     CASE
+                        WHEN s.id = pc.work_center OR s.station_code = pc.work_center THEN 0
+                        ELSE 1
+                     END,
+                     s.station_code NULLS LAST,
+                     s.id
         """), {"fid": factory_id})
-        free_stations = [r[0] for r in result.fetchall() if r[0]]
+        free_stations = [dict(r) for r in result.mappings().all()]
 
     dispatched = []
     for station in free_stations:
+        station_pk = station["id"]
+        work_center = station.get("work_center")
         # 找该工位等待中优先级最高的工单
         wo_result = await db.execute(sql_text("""
             SELECT id, work_order_code, priority, planned_due, work_center
             FROM work_orders
             WHERE factory_id = :fid AND status = 'released' AND wo_type = 'operation'
-              AND (work_center = :wc OR assigned_station_id IS NULL)
+              AND assigned_station_id IS NULL
+              AND work_center = :wc
             ORDER BY priority DESC, planned_due ASC, created_at ASC
             LIMIT 1
-        """), {"fid": factory_id, "wc": station})
+        """), {"fid": factory_id, "wc": work_center})
         wo = wo_result.mappings().first()
 
         if wo:
@@ -390,7 +439,7 @@ async def auto_dispatch_station(
                 SET assigned_station_id = :sid, status = 'in_progress',
                     actual_start = NOW(), updated_at = NOW()
                 WHERE id = :id
-            """), {"sid": station, "id": wo["id"]})
+            """), {"sid": station_pk, "id": wo["id"]})
 
             log = WoStatusLog(
                 id=str(uuid.uuid4()),
@@ -399,11 +448,11 @@ async def auto_dispatch_station(
                 from_status="released",
                 to_status="in_progress",
                 operator="system",
-                comment=f"事件驱动自派发到工位 {station}",
+                comment=f"事件驱动自派发到工位 {station_pk}",
                 created_at=datetime.utcnow(),
             )
             db.add(log)
-            dispatched.append({"wo_code": wo["work_order_code"], "station": station})
+            dispatched.append({"wo_code": wo["work_order_code"], "station": station_pk})
 
     if dispatched:
         await db.flush()

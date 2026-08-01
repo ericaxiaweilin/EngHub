@@ -87,6 +87,7 @@ REQUIRED_TABLES=(
     routing_template_steps
     time_study_records line_balance_analyses process_analyses
     action_studies method_studies work_cell_layouts kanban_systems five_s_audits
+    item_traceability
     org_units rcc_organizations rcc_tasks rcc_approval_records
     deterministic_logic_chains global_adjustable_params
     chat_quick_commands
@@ -183,8 +184,11 @@ check_min_rows method_studies 1 "IE方法研究"
 check_min_rows work_cell_layouts 1 "IE工作单元"
 check_min_rows kanban_systems 1 "IE看板"
 check_min_rows five_s_audits 1 "IE 5S审核"
+check_min_rows item_traceability 1 "一物一码追溯"
 check_min_rows rcc_tasks 2 "RCC调度任务"
 check_min_rows rcc_organizations 1 "RCC组织"
+check_min_rows im_groups 1 "Chatbot群组"
+check_min_rows im_messages 1 "Chatbot群消息"
 
 if [ -f "$(dirname "$0")/data_guard.py" ]; then
     if PG_CONTAINER="$PG_CONTAINER" PG_USER="$PG_USER" PG_DB="$PG_DB" DATA_GUARD_FACTORIES="$DATA_GUARD_FACTORIES" \
@@ -217,7 +221,7 @@ for fid in "${FACTORY_LIST[@]}"; do
         fail "工厂 $fid 员工不足 (${FAC_EMP})"
     fi
 
-    for tbl in warehouses plans pp_plans standard_operation_times time_study_records line_balance_analyses process_analyses action_studies method_studies work_cell_layouts kanban_systems five_s_audits; do
+    for tbl in warehouses plans pp_plans standard_operation_times time_study_records line_balance_analyses process_analyses action_studies method_studies work_cell_layouts kanban_systems five_s_audits item_traceability im_groups; do
         CNT=$(psql_cmd "SELECT count(*) FROM $tbl WHERE factory_id='$fid';")
         if [ "$CNT" -ge 1 ]; then
             pass "工厂 $fid 模块数据 $tbl (${CNT})"
@@ -274,6 +278,9 @@ if [ -n "$TOKEN" ]; then
     check_api "rcc/org-bubbles?factory_id=${FACTORY_ID}" "RCC气泡图"
     check_api "org-panel/nodes" "组织节点"
     check_api "collaboration/network?factory_id=${FACTORY_ID}" "协同网络"
+    check_api "collaboration/im/groups?factory_id=${FACTORY_ID}" "Chatbot群组"
+    check_api "traceability/drill-through?factory_id=${FACTORY_ID}&domain=work_orders&limit=1" "工单穿透追溯"
+    check_api "traceability/drill-through?factory_id=${FACTORY_ID}&domain=ie&limit=1" "IE穿透追溯"
     check_api "ie/standard-times?factory_id=${FACTORY_ID}&limit=1" "IE标准工时"
     check_api "ie/time-studies?factory_id=${FACTORY_ID}&limit=1" "IE时间研究"
     check_api "ie/line-balance-analyses?factory_id=${FACTORY_ID}&limit=1" "IE线平衡"
@@ -321,10 +328,39 @@ PY
     fi
 }
 
+check_bundle_absent() {
+    local needle=$1 desc=$2
+    local index="$FRONTEND_DIST/index.html"
+    if [ ! -f "$index" ]; then
+        fail "前端 index.html 不存在: $index"
+        return
+    fi
+    local bundle
+    bundle=$(python3 - "$index" <<'PY' 2>/dev/null
+import re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'src="/assets/([^"]+\.js)"', html)
+print(m.group(1) if m else "")
+PY
+)
+    if [ -z "$bundle" ] || [ ! -f "$FRONTEND_DIST/assets/$bundle" ]; then
+        fail "前端主 bundle 不存在: ${bundle:-missing}"
+        return
+    fi
+    if grep -q "$needle" "$FRONTEND_DIST/assets/$bundle"; then
+        fail "$desc 仍存在（bundle: $bundle）"
+    else
+        pass "$desc"
+    fi
+}
+
 check_bundle_text "任务中心" "Chatbot 任务中心入口"
 check_bundle_text "任务智慧中心" "RCC 气泡图入口"
 check_bundle_text "RCC 决策中心" "RCC 指挥调度决策中心"
 check_bundle_text "IE 精益生产" "IE 模块入口"
+check_bundle_text "穿透式追溯" "穿透式追溯入口"
+check_bundle_text "创建群" "Chatbot 群功能入口"
+check_bundle_absent "安灯小工单" "安灯小工单独立入口已移除"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 汇总

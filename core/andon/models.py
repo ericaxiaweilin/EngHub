@@ -8,7 +8,7 @@ v2.5 - Andon 2.0 Smart Work Order Models
 """
 
 from sqlalchemy import Column, String, Integer, DateTime, Boolean, Float, ForeignKey, Text, JSON, Index
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 import uuid
 from datetime import datetime
@@ -39,6 +39,7 @@ class AndonTicket(Base):
 
     __tablename__ = "andon_tickets"
 
+    # 生产库历史数据包含业务型 ID（如 andon-elec-02），这里按真实 schema 使用 varchar。
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     ticket_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
@@ -51,7 +52,7 @@ class AndonTicket(Base):
     location_id = Column(String(50), nullable=True)                 # 工位/区域ID
     location_name = Column(String(100), nullable=True)              # 位置名称（冗余）
     equipment_id = Column(String(36), nullable=True, index=True)    # 关联设备
-    work_order_id = Column(UUID(as_uuid=False), nullable=True, index=True)   # 关联生产工单
+    work_order_id = Column(String(36), nullable=True, index=True)   # 关联生产工单
 
     # 状态机
     status = Column(String(30), default="open", index=True)         # open/assigned/picking/upgrading/in_progress/resolved/closed/cancelled
@@ -89,8 +90,9 @@ class AndonEscalationLog(Base):
 
     __tablename__ = "andon_escalation_logs"
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
-    ticket_id = Column(UUID(as_uuid=False), ForeignKey("andon_tickets.id"), nullable=False, index=True)
+    # NOTE: 生产库该主键实际为 varchar；对齐为 String(36) 以匹配真实 schema。
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    ticket_id = Column(String(36), ForeignKey("andon_tickets.id"), nullable=False, index=True)
     event_type = Column(String(30), nullable=False, index=True)     # reminder/escalated/resolved_closed
     from_role = Column(String(50), nullable=True)                   # 当前处理人
     to_role = Column(String(50), nullable=True)                     # 升级对象

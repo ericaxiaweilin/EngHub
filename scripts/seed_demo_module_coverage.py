@@ -72,10 +72,31 @@ def product_expr(factory_id: str, offset: int = 0) -> Expr:
     )
 
 
+def product_id_expr(factory_id: str, offset: int = 0) -> Expr:
+    return Expr(
+        "(SELECT id FROM products "
+        f"WHERE factory_id={q(factory_id)} ORDER BY product_code LIMIT 1 OFFSET {offset})"
+    )
+
+
 def station_expr(factory_id: str, offset: int = 0) -> Expr:
     return Expr(
         "(SELECT station_code FROM stations "
         f"WHERE factory_id={q(factory_id)} ORDER BY station_code LIMIT 1 OFFSET {offset})"
+    )
+
+
+def work_order_id_expr(factory_id: str, offset: int = 0) -> Expr:
+    return Expr(
+        "(SELECT id FROM work_orders "
+        f"WHERE factory_id={q(factory_id)} ORDER BY created_at DESC NULLS LAST, id LIMIT 1 OFFSET {offset})"
+    )
+
+
+def equipment_id_expr(factory_id: str, offset: int = 0) -> Expr:
+    return Expr(
+        "(SELECT id FROM equipment "
+        f"WHERE factory_id={q(factory_id)} ORDER BY equipment_code NULLS LAST, id LIMIT 1 OFFSET {offset})"
     )
 
 
@@ -267,6 +288,58 @@ def base_schema_sql() -> list[str]:
         "ALTER TABLE global_adjustable_params ADD COLUMN IF NOT EXISTS changed_by VARCHAR(50);",
         "ALTER TABLE global_adjustable_params ADD COLUMN IF NOT EXISTS change_reason TEXT;",
         "ALTER TABLE global_adjustable_params ADD COLUMN IF NOT EXISTS previous_value VARCHAR;",
+        """
+        CREATE TABLE IF NOT EXISTS im_groups (
+            id VARCHAR(36) PRIMARY KEY,
+            factory_id VARCHAR(50),
+            name VARCHAR(100) NOT NULL,
+            description VARCHAR(500),
+            group_type VARCHAR(30) DEFAULT 'ops',
+            org_node_id VARCHAR(50),
+            owner_id VARCHAR(50),
+            avatar_color VARCHAR(20) DEFAULT '#1677ff',
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS im_messages (
+            id VARCHAR(36) PRIMARY KEY,
+            group_id VARCHAR(36),
+            sender_id VARCHAR(50),
+            sender_name VARCHAR(100),
+            msg_type VARCHAR(20) DEFAULT 'text',
+            content TEXT NOT NULL,
+            command_type VARCHAR(50),
+            command_payload JSONB DEFAULT '{}'::jsonb,
+            reply_to_id VARCHAR(36),
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS item_traceability (
+            id VARCHAR(36) PRIMARY KEY,
+            item_code VARCHAR(50) UNIQUE NOT NULL,
+            item_type VARCHAR(20) DEFAULT 'finished',
+            factory_id VARCHAR(50) NOT NULL,
+            work_order_id VARCHAR(36),
+            product_id VARCHAR(36),
+            material_batch_id VARCHAR(50),
+            material_supplier_id VARCHAR(50),
+            station_id VARCHAR(50),
+            equipment_id VARCHAR(36),
+            operator_id VARCHAR(50),
+            quality_check_result VARCHAR(20),
+            serial_number VARCHAR(50),
+            next_item_code VARCHAR(50),
+            inspection_record_id VARCHAR(36),
+            metadata JSONB DEFAULT '{}'::jsonb,
+            created_by VARCHAR(50),
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+        """,
     ]
 
 
@@ -718,6 +791,86 @@ def ie_sql(factory_id: str, label: str) -> list[str]:
     return sql
 
 
+def im_group_sql(factory_id: str) -> list[str]:
+    short = "ELEC" if factory_id == "FAC_ELEC_DEMO_2026" else "MECH"
+    suffix = factory_id[-4:].replace("_", "")
+    groups = [
+        ("rcc-command", "RCC指挥调度群", "厂长/RCC/计划/生产/设备/质量联动，承接指挥中心决策和异常升级。", "rcc", "#1677ff"),
+        ("prod-exception", "生产异常处理群", "报工异常、设备停机、物料短缺、安灯呼叫统一在 Chatbot 内闭环。", "exception", "#fa8c16"),
+        ("quality-linkage", "质量联动群", "IQC/IPQC/OQC/SPC/8D 质量问题拉通生产、IE 和仓储。", "quality", "#722ed1"),
+    ]
+    sql: list[str] = []
+    for idx, (code, name, desc, group_type, color) in enumerate(groups, start=1):
+        gid = f"im-{suffix}-{code}"
+        sql.append(upsert("im_groups", {
+            "id": gid,
+            "factory_id": factory_id,
+            "name": f"{short}-{name}",
+            "description": desc,
+            "group_type": group_type,
+            "org_node_id": code,
+            "owner_id": "chatbot",
+            "avatar_color": color,
+            "is_active": True,
+            "created_at": Expr(f"NOW() - INTERVAL '{idx} hours'"),
+            "updated_at": Expr("NOW()"),
+        }))
+        sql.append(upsert("im_messages", {
+            "id": f"{gid}-welcome",
+            "group_id": gid,
+            "sender_id": "system",
+            "sender_name": "系统",
+            "msg_type": "system",
+            "content": f"{short}-{name}已建立，Chatbot 可把任务、预警和RCC决策同步到本群。",
+            "command_type": "group_bootstrap",
+            "command_payload": sql_json({"factory_id": factory_id, "group_type": group_type}),
+            "reply_to_id": None,
+            "created_at": Expr(f"NOW() - INTERVAL '{idx} hours'"),
+        }))
+    return sql
+
+
+def traceability_sql(factory_id: str) -> list[str]:
+    short = "ELEC" if factory_id == "FAC_ELEC_DEMO_2026" else "MECH"
+    rows = [
+        ("fg", "finished", "FG", "pass", 2),
+        ("semi", "semi_finished", "SF", "pass", 1),
+        ("raw", "raw_material", "RM", "pass", 0),
+    ]
+    item_codes = {
+        key: f"TRACE-{short}-{code}-001"
+        for key, _item_type, code, _quality, _offset in rows
+    }
+    sql: list[str] = []
+    for key, item_type, code, quality, offset in rows:
+        sql.append(upsert("item_traceability", {
+            "id": stable_id("item-trace", factory_id, key),
+            "item_code": item_codes[key],
+            "item_type": item_type,
+            "factory_id": factory_id,
+            "work_order_id": work_order_id_expr(factory_id, offset),
+            "product_id": product_id_expr(factory_id, offset % 2),
+            "material_batch_id": f"BATCH-{short}-202608-{offset + 1:02d}",
+            "material_supplier_id": f"SUP-{short}-A",
+            "station_id": station_expr(factory_id, offset),
+            "equipment_id": equipment_id_expr(factory_id, offset),
+            "operator_id": f"OP-{short}-{300 + offset}",
+            "quality_check_result": quality,
+            "serial_number": f"SN-{short}-20260801-{offset + 1:04d}",
+            "next_item_code": item_codes["semi"] if key == "raw" else item_codes["fg"] if key == "semi" else None,
+            "inspection_record_id": None,
+            "metadata": sql_json({
+                "trace_stage": key,
+                "source": "demo_module_coverage_seed",
+                "links": ["work_order", "product", "station", "equipment", "quality"],
+            }),
+            "created_by": "seed_guard",
+            "created_at": Expr(f"NOW() - INTERVAL '{6 - offset} hours'"),
+            "updated_at": Expr("NOW()"),
+        }, conflict="item_code"))
+    return sql
+
+
 def build_sql(factories: list[str]) -> str:
     labels = {"FAC_ELEC_DEMO_2026": "电子厂", "FAC_MECH_001": "机械厂"}
     statements = ["BEGIN;", *base_schema_sql()]
@@ -729,6 +882,8 @@ def build_sql(factories: list[str]) -> str:
         statements.extend(warehouse_plan_sql(factory_id, label))
         statements.extend(routing_sql(factory_id))
         statements.extend(ie_sql(factory_id, label))
+        statements.extend(im_group_sql(factory_id))
+        statements.extend(traceability_sql(factory_id))
     statements.append("COMMIT;")
     return "\n".join(statements)
 

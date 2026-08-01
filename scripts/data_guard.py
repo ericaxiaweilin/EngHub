@@ -75,12 +75,24 @@ TABLES: dict[str, dict[str, Any]] = {
     "work_cell_layouts": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "kanban_systems": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "five_s_audits": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "item_traceability": {"min": 1, "factory_min": 1, "max_drop_pct": 0.0},
     "org_units": {"min": 1, "max_drop_pct": 0.0},
     "rcc_organizations": {"min": 1, "max_drop_pct": 0.0},
     "rcc_tasks": {"min": 2, "max_drop_pct": 0.0},
     "rcc_approval_records": {"min": 1, "max_drop_pct": 0.0},
     "deterministic_logic_chains": {"min": 1, "max_drop_pct": 0.0},
     "global_adjustable_params": {"min": 1, "max_drop_pct": 0.0},
+    "im_groups": {"min": 1, "factory_min": 1, "max_drop_pct": 0.0},
+    "im_messages": {
+        "min": 1,
+        "factory_min": 1,
+        "factory_count_sql": (
+            "SELECT count(*) FROM im_messages m "
+            "JOIN im_groups g ON g.id=m.group_id "
+            "WHERE g.factory_id={factory_id};"
+        ),
+        "max_drop_pct": 0.0,
+    },
 }
 
 

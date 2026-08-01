@@ -14,8 +14,8 @@ ALTER TABLE roles ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'::jsonb
 ALTER TABLE roles ADD COLUMN IF NOT EXISTS data_scope JSONB DEFAULT '{"type":"own"}'::jsonb;
 ALTER TABLE roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 UPDATE roles
-SET role_code = COALESCE(role_code, lower(regexp_replace(name, '[^a-zA-Z0-9]+', '_', 'g'))),
-    role_name = COALESCE(role_name, name)
+SET role_code = COALESCE(role_code, lower(regexp_replace(COALESCE(role_name, id), '[^a-zA-Z0-9]+', '_', 'g'))),
+    role_name = COALESCE(role_name, role_code, id)
 WHERE role_code IS NULL OR role_name IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_roles_role_code ON roles(role_code);
 
@@ -171,4 +171,3 @@ ALTER TABLE automation_config ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE automation_config ADD COLUMN IF NOT EXISTS auto_rules JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE automation_config ADD COLUMN IF NOT EXISTS updated_by VARCHAR(100);
 ALTER TABLE automation_config ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
-

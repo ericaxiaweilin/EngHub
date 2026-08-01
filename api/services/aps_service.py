@@ -489,7 +489,7 @@ class ApsService:
 
         schedule_id = str(uuid.uuid4())
 
-        schedule_code = f"APS-{factory_id[:6]}-{now.strftime('%Y%m%d%H%M')}"
+        schedule_code = f"APS-{factory_id[:6]}-{now.strftime('%Y%m%d%H%M%S')}-{str(uuid.uuid4())[:4].upper()}"
 
         aps_schedule = ApsSchedule(
 
@@ -840,6 +840,10 @@ class ApsService:
                 "start": t.planned_start.isoformat(),
 
                 "end": t.planned_end.isoformat(),
+
+                "planned_start": t.planned_start.isoformat(),
+
+                "planned_end": t.planned_end.isoformat(),
 
                 "setup_seconds": t.setup_seconds,
 

@@ -8,9 +8,6 @@ import asyncio
 import logging
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent / ".env", override=True)  # 必须在所有路由 import 之前加载
-
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -63,6 +60,7 @@ from api.routes.task_center_routes import router as task_center_router
 from api.routes.crew_routes import router as crew_router
 from api.routes.work_team_routes import router as work_team_router
 from api.routes.virtual_factory_routes import router as virtual_factory_router
+from api.routes.traceability_routes import router as traceability_router
 from core.org_panel.api_adapter import router as org_panel_router
 
 app = FastAPI(
@@ -116,6 +114,7 @@ app.include_router(quick_command_router)  # Chatbot 快速命令 CRUD + 智能�
 app.include_router(task_center_router)  # 任务中心（待办跟进 + 定期扫描）
 app.include_router(crew_router)  # CrewAI推理层+个人知识层
 app.include_router(virtual_factory_router)  # 虚拟工厂脉搏（订单/拆单/报工/预警）
+app.include_router(traceability_router)  # 统一穿透式追溯（看板聚合数 → 来源记录）
 app.include_router(rcc_router)
 app.include_router(rcc_data_router)
 app.include_router(rcc_decision_router)
@@ -182,6 +181,7 @@ async def _periodic_scheduler():
                             res = await rpt_svc.auto_generate_and_notify(fid)
                             _logger.info(f"[scheduler] 日报生成: {fid}, 异常 {res.get('anomalies', []).__len__()} 条")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[scheduler] 日报生成失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 日报任务异常: {e}")
@@ -202,6 +202,7 @@ async def _periodic_scheduler():
                             if res.get("schedule_id"):
                                 _logger.info(f"[scheduler] 自动排产: {fid}, {res.get('total_tasks', 0)} 任务")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[scheduler] 自动排产失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 排产任务异常: {e}")
@@ -222,6 +223,7 @@ async def _periodic_scheduler():
                             if res.get("tasks_created"):
                                 _logger.info(f"[scheduler] 设备PM: {fid}, 生成 {res['tasks_created']} 个保养任务")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[scheduler] 设备PM失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 设备PM任务异常: {e}")
@@ -241,6 +243,7 @@ async def _periodic_scheduler():
                             if res.get("dispatched_count"):
                                 _logger.info(f"[scheduler] 自派发: {fid}, {res['dispatched_count']} 单")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[scheduler] 自派发失败 {fid}: {ex}")
                     await db.commit()
         except Exception as e:
@@ -262,6 +265,7 @@ async def _periodic_scheduler():
                             if res.get("escalated_count"):
                                 _logger.info(f"[scheduler] 异常升级: {fid}, {res['escalated_count']} 条")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[scheduler] 异常升级失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 异常升级任务异常: {e}")
@@ -282,6 +286,7 @@ async def _periodic_scheduler():
                             if stalled.get("stalled_count"):
                                 _logger.info(f"[scheduler] 智能体卡住: {fid}, {stalled['stalled_count']}个任务")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[scheduler] 卡住检测失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 智能体监督任务异常: {e}")
@@ -302,6 +307,7 @@ async def _periodic_scheduler():
                             if result.get("total_items"):
                                 _logger.info(f"[warehouse] {fid}: {result['total_items']}项物料需补货")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[warehouse] 补货检查失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 仓储智能体任务异常: {e}")
@@ -324,6 +330,7 @@ async def _periodic_scheduler():
                             if created or advanced:
                                 _logger.info(f"[virtual-factory] {fid}: 新单{created}, 推进{advanced}柜")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[virtual-factory] 脉搏失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 虚拟工厂任务异常: {e}")
@@ -344,6 +351,7 @@ async def _periodic_scheduler():
                             if not balance.get("balanced", True):
                                 _logger.info(f"[scheduling] {fid}: 产能不平衡 ({balance.get('imbalance_ratio', 0):.0%})")
                         except Exception as ex:
+                            await db.rollback()
                             _logger.warning(f"[scheduling] 产能检查失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 排产智能体任务异常: {e}")
@@ -385,4 +393,3 @@ if FRONTEND_DIST.is_dir():
             str(FRONTEND_DIST / "index.html"),
             headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
         )
-

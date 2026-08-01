@@ -267,8 +267,23 @@ class ExceptionEngine:
 
             if minutes > threshold:
                 # 升级：创建新通知给更高级别
+                existing_escalation = await self.db.execute(text("""
+                    SELECT 1
+                    FROM notifications
+                    WHERE factory_id = :fid
+                      AND source_type = 'escalation'
+                      AND source_id = :orig_id
+                      AND is_read = FALSE
+                    LIMIT 1
+                """), {"fid": factory_id, "orig_id": item["id"]})
+                if existing_escalation.scalar():
+                    continue
+
                 new_recipient = "manager" if item["recipient"] == "supervisor" else "supervisor"
                 esc_id = _gen_id()
+                title = f"升级：{item['title']}（{int(minutes)}分钟未处理）"
+                if len(title) > 190:
+                    title = f"{title[:187]}..."
                 await self.db.execute(text("""
                     INSERT INTO notifications
                     (id, factory_id, recipient, category, title, content, severity,
@@ -279,7 +294,7 @@ class ExceptionEngine:
                     "id": esc_id,
                     "fid": factory_id,
                     "rcpt": new_recipient,
-                    "title": f"⬆️ 升级：{item['title']}（{int(minutes)}分钟未处理）",
+                    "title": title,
                     "content": f"原异常超时未处理，自动升级。\n原通知: {item['title']}\n"
                                f"已等待 {int(minutes)} 分钟（阈值 {threshold} 分钟）\n"
                                f"原处理人: {item['recipient']}",

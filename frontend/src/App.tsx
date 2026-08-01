@@ -46,7 +46,6 @@ import ModuleSelector from './pages/ModuleSelector'
 // v2.5 Modules
 import WarRoom from './pages/war-room/WarRoom'
 import AgentSupervisor from './pages/war-room/AgentSupervisor'
-import AndonDashboard from './pages/andon/AndonDashboard'
 import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
 import RCCCommandCenter from './pages/rcc/RCCCommandCenter'
 // BOM 管理模块
@@ -275,7 +274,7 @@ const App: React.FC = () => {
             <Route path="automation-level" element={<AutomationLevel />} />
             <Route path="workflow-analytics" element={<WorkflowAnalytics />} />
             {/* v2.5 Smart Collaboration */}
-            <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
+            <Route path="andon" element={<Navigate to="/task-center" replace />} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
             <Route path="rcc" element={<PermissionGate path="/rcc"><RCCCommandCenter /></PermissionGate>} />
             <Route path="expert" element={<PermissionGate path="/ai"><ExpertSystemChat /></PermissionGate>} />
