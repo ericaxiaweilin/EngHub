@@ -14,6 +14,7 @@ PG_DB="${PG_DB:-enghub}"
 BACKEND_CONTAINER="${BACKEND_CONTAINER:-docker-backend-1}"
 BACKEND_PORT="${BACKEND_PORT:-18888}"
 FACTORY_ID="${FACTORY_ID:-FAC_ELEC_DEMO_2026}"
+FRONTEND_DIST="${FRONTEND_DIST:-$(cd "$(dirname "$0")/.." && pwd)/frontend_dist}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -83,6 +84,7 @@ REQUIRED_TABLES=(
     aps_schedules aps_schedule_tasks
     routing_templates
     chat_quick_commands
+    followup_tasks followup_task_logs
     im_groups im_messages
     tms_tasks suppliers
     maintenance_orders
@@ -137,7 +139,7 @@ check_column defect_records factory_id
 # 4. 种子数据最低量检查
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
-echo "▶ [4/5] 种子数据检查"
+echo "▶ [4/6] 种子数据检查"
 
 check_min_rows() {
     local tbl=$1 min=$2 desc=$3
@@ -166,6 +168,7 @@ check_min_rows roles 1 "角色"
 check_min_rows code_tables 5 "码表"
 check_min_rows work_order_templates 3 "工单模板"
 check_min_rows routing_templates 1 "工艺模板"
+check_min_rows chat_quick_commands 5 "Chatbot 快速命令"
 
 if [ -f "$(dirname "$0")/data_guard.py" ]; then
     if PG_CONTAINER="$PG_CONTAINER" PG_USER="$PG_USER" PG_DB="$PG_DB" DATA_GUARD_FACTORIES="$FACTORY_ID" \
@@ -198,7 +201,7 @@ fi
 # 5. API 端点可达性
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
-echo "▶ [5/5] API 端点检查"
+echo "▶ [5/6] API 端点检查"
 
 # 登录获取 token
 LOGIN_RESP=$(curl -s -X POST "http://localhost:${BACKEND_PORT}/api/v1/auth/login" \
@@ -234,7 +237,45 @@ if [ -n "$TOKEN" ]; then
     check_api "org-panel/org-nodes?factory_id=${FACTORY_ID}" "组织节点"
     check_api "collaboration/network?factory_id=${FACTORY_ID}" "协同网络"
     check_api "ie/standard-times?factory_id=${FACTORY_ID}&limit=1" "IE标准工时"
+    check_api "chat/agents" "Chatbot智能体列表"
+    check_api "chat/quick-commands" "Chatbot快速命令"
+    check_api "task-center/inbox" "Chatbot任务中心收件箱"
+    check_api "task-center/tasks" "Chatbot任务中心任务列表"
 fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 6. 前端模块存在性检查
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo ""
+echo "▶ [6/6] 前端模块存在性"
+
+check_bundle_text() {
+    local needle=$1 desc=$2
+    local index="$FRONTEND_DIST/index.html"
+    if [ ! -f "$index" ]; then
+        fail "前端 index.html 不存在: $index"
+        return
+    fi
+    local bundle
+    bundle=$(python3 - "$index" <<'PY' 2>/dev/null
+import re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'src="/assets/([^"]+\.js)"', html)
+print(m.group(1) if m else "")
+PY
+)
+    if [ -z "$bundle" ] || [ ! -f "$FRONTEND_DIST/assets/$bundle" ]; then
+        fail "前端主 bundle 不存在: ${bundle:-missing}"
+        return
+    fi
+    if grep -q "$needle" "$FRONTEND_DIST/assets/$bundle"; then
+        pass "$desc"
+    else
+        fail "$desc 缺失（bundle: $bundle）"
+    fi
+}
+
+check_bundle_text "任务中心" "Chatbot 任务中心入口"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 汇总

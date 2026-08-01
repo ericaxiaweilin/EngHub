@@ -3,7 +3,7 @@
  * 可拖拽移动、最小化/最大化，参考 luaguage ChatbotWidget 交互模式
  */
 import React, { useState, useRef, useEffect, useCallback, lazy, Suspense } from 'react'
-import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message, Table, Select, Empty } from 'antd'
+import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message, Table, Select, Empty, Popconfirm } from 'antd'
 import {
   RobotOutlined, TeamOutlined, SendOutlined, MinusOutlined,
   ExpandOutlined, CompressOutlined, CloseOutlined,
@@ -13,7 +13,12 @@ import {
   PaperClipOutlined, FileOutlined, DownloadOutlined, TableOutlined,
   CopyOutlined, ShareAltOutlined, CommentOutlined, InboxOutlined,
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
+  PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
+  CarryOutOutlined,
 } from '@ant-design/icons'
+
+// 任务中心（嵌入 chatbot 浮窗第三个 tab）
+import TaskCenter from '../pages/collab/TaskCenter'
 
 // Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
 const SpreadsheetEditor = lazy(() => import('./SpreadsheetEditor'))
@@ -89,8 +94,8 @@ interface ChatMsg {
   tables?: TableData[]
 }
 
-// ---------- 快捷指令 ----------
-const QUICK_COMMANDS = [
+// ---------- 快捷指令（后端不可用时的本地兜底） ----------
+const FALLBACK_QUICK_COMMANDS = [
   '今天生产情况怎么样？',
   '查询在制工单',
   '查询库存水平',
@@ -99,6 +104,22 @@ const QUICK_COMMANDS = [
   '跑一次高温加班合规仿真',
   '最近的仿真审计记录',
 ]
+
+// ---------- 智能体调度 ----------
+interface ChatAgent {
+  key: string
+  name: string
+  description: string
+}
+
+// ---------- 快速命令（后端 CRUD，新增后自动归类智能体） ----------
+interface QuickCommand {
+  id: string
+  command_text: string
+  agent_key?: string | null
+  agent_name?: string | null
+  is_preset: boolean
+}
 
 // ---------- IM 聊天消息 ----------
 interface IMMsg {
@@ -167,6 +188,18 @@ export default function AIAssistantWidget() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 可用工作流清单（从 /chat/tools 拉取，供快捷指令区展示）
   const [workflows, setWorkflows] = useState<{ name: string; label: string; needs_params: boolean }[]>([])
+  // 智能体调度：可选 agent 列表 + 当前选中（auto = 由模型自动调度）
+  const [agents, setAgents] = useState<ChatAgent[]>([])
+  const [selectedAgent, setSelectedAgent] = useState<string>('auto')
+  // 快速命令（后端 CRUD）
+  const [quickCommands, setQuickCommands] = useState<QuickCommand[]>([])
+  const [cmdModalOpen, setCmdModalOpen] = useState(false)
+  const [newCmdText, setNewCmdText] = useState('')
+  const [newCmdAgent, setNewCmdAgent] = useState<string>('auto')
+  const [cmdSaving, setCmdSaving] = useState(false)
+  const [editingCmdId, setEditingCmdId] = useState<string | null>(null)
+  const [editCmdText, setEditCmdText] = useState('')
+  const [editCmdAgent, setEditCmdAgent] = useState<string>('auto')
   // IM 未读
   const [unread, setUnread] = useState<Record<string, number>>({ c2: 1, c3: 2 })
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null)
@@ -254,6 +287,23 @@ export default function AIAssistantWidget() {
       .catch(() => { /* 网关/后端未就绪时不展示工作流快捷指令 */ })
   }, [])
 
+  // 拉取可调度智能体 + 快速命令
+  const fetchQuickCommands = useCallback(async () => {
+    try {
+      const res: any = await api.get('/api/v1/chat/quick-commands')
+      setQuickCommands(res.commands || [])
+    } catch {
+      // 后端不可用时降级为本地预设命令
+      setQuickCommands(FALLBACK_QUICK_COMMANDS.map((c, i) => ({ id: `local-${i}`, command_text: c, is_preset: true })))
+    }
+  }, [])
+  useEffect(() => {
+    api.get('/api/v1/chat/agents')
+      .then((res: any) => setAgents(res.agents || []))
+      .catch(() => { /* 智能体列表不可用时隐藏选择器 */ })
+    fetchQuickCommands()
+  }, [fetchQuickCommands])
+
   // ---------- 拖拽逻辑 ----------
   const onHeaderMouseDown = useCallback((e: React.MouseEvent) => {
     if (maximized) return
@@ -337,7 +387,8 @@ export default function AIAssistantWidget() {
   }, [])
 
   // ---------- 发送消息（SSE 流式输出） ----------
-  const sendMessage = async (preset?: string) => {
+  // agentKeyOverride：快速命令自带的归类智能体，优先于顶部选择器
+  const sendMessage = async (preset?: string, agentKeyOverride?: string) => {
     const text = (preset ?? input).trim()
     if (loading) return
     if (!text && pendingAttachments.length === 0) return
@@ -372,6 +423,9 @@ export default function AIAssistantWidget() {
           kind: a.is_image ? 'image' : 'file',
         }))
       }
+      // 智能体调度：快速命令归类 > 选择器指定；auto 不传，由模型自动调度
+      const dispatchAgent = agentKeyOverride || (selectedAgent !== 'auto' ? selectedAgent : undefined)
+      if (dispatchAgent) payload.agent_key = dispatchAgent
       const token = localStorage.getItem('token')
       const factoryId = localStorage.getItem('active_factory_id')
       const resp = await fetch('/api/v1/chat/stream', {
@@ -473,6 +527,71 @@ export default function AIAssistantWidget() {
     } finally {
       setLoading(false)
     }
+  }
+
+  // ---------- 快速命令 CRUD ----------
+  const addQuickCommand = async () => {
+    const text = newCmdText.trim()
+    if (!text) return
+    setCmdSaving(true)
+    try {
+      const res: any = await api.post('/api/v1/chat/quick-commands', {
+        command_text: text,
+        agent_key: newCmdAgent !== 'auto' ? newCmdAgent : undefined,
+      })
+      message.success(res.agent_name ? `已添加，自动归类到「${res.agent_name}」` : '已添加（通用命令，交由智能体自动处理）')
+      setNewCmdText('')
+      setNewCmdAgent('auto')
+      fetchQuickCommands()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '添加失败')
+    } finally {
+      setCmdSaving(false)
+    }
+  }
+
+  const startEditCommand = (cmd: QuickCommand) => {
+    setEditingCmdId(cmd.id)
+    setEditCmdText(cmd.command_text)
+    setEditCmdAgent(cmd.agent_key || 'auto')
+  }
+
+  const saveQuickCommand = async () => {
+    if (!editingCmdId) return
+    const text = editCmdText.trim()
+    if (!text) return
+    setCmdSaving(true)
+    try {
+      const res: any = await api.put(`/api/v1/chat/quick-commands/${editingCmdId}`, {
+        command_text: text,
+        agent_key: editCmdAgent !== 'auto' ? editCmdAgent : undefined,
+      })
+      message.success(res.agent_name ? `已更新，归类到「${res.agent_name}」` : '已更新')
+      setEditingCmdId(null)
+      fetchQuickCommands()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '更新失败')
+    } finally {
+      setCmdSaving(false)
+    }
+  }
+
+  const removeQuickCommand = async (id: string) => {
+    try {
+      await api.delete(`/api/v1/chat/quick-commands/${id}`)
+      message.success('已删除')
+      fetchQuickCommands()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '删除失败')
+    }
+  }
+
+  // 在弹窗内直接点击快捷命令：以其归类智能体身份发送，并关闭弹窗
+  const sendQuickCommand = (cmd: QuickCommand) => {
+    if (loading) return
+    setCmdModalOpen(false)
+    setEditingCmdId(null)
+    sendMessage(cmd.command_text, cmd.agent_key || undefined)
   }
 
   const copyChatMessage = async (chatMessage: ChatMsg) => {
@@ -813,6 +932,7 @@ export default function AIAssistantWidget() {
                   </Badge>
                 ),
               },
+              { key: 'tasks', label: <span><CarryOutOutlined /> 任务中心</span> },
             ]}
           />
 
@@ -1094,30 +1214,128 @@ export default function AIAssistantWidget() {
                         </div>
                       )}
                     </div>
-                    {/* 快捷指令 */}
+                    {/* 智能体调度选择器 */}
+                    {agents.length > 0 && (
+                      <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                        <RobotOutlined style={{ color: '#1677ff', fontSize: 12, flexShrink: 0 }} />
+                        <Select
+                          size="small"
+                          value={selectedAgent}
+                          onChange={setSelectedAgent}
+                          style={{ width: 170, flexShrink: 0 }}
+                          options={[
+                            { value: 'auto', label: '智能体（模型自选）' },
+                            ...agents.map(a => ({ value: a.key, label: a.name })),
+                          ]}
+                        />
+                        {selectedAgent !== 'auto' && (
+                          <Text type="secondary" style={{ fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {agents.find(a => a.key === selectedAgent)?.description}
+                          </Text>
+                        )}
+                      </div>
+                    )}
+                    {/* 快捷指令区：仅保留工作流触发 + 快捷命令入口，快捷命令本体收进弹窗 */}
                     <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                      {QUICK_COMMANDS.map(cmd => (
-                        <Tag
-                          key={cmd}
-                          color="processing"
-                          style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px' }}
-                          onClick={() => !loading && sendMessage(cmd)}
-                        >
-                          {cmd}
-                        </Tag>
-                      ))}
                       {/* 可用工作流（橙色区分，点击即触发确定性流程） */}
                       {workflows.map(wf => (
                         <Tag
                           key={wf.name}
                           color="orange"
-                          style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px' }}
+                          style={{ cursor: loading ? 'not-allowed' : 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px', margin: 0 }}
                           onClick={() => !loading && sendMessage(wf.label)}
                         >
                           <ThunderboltOutlined /> {wf.label}
                         </Tag>
                       ))}
+                      {/* 快捷命令入口：点击打开弹窗，在弹窗内直接发送给智能体 */}
+                      <Tag
+                        icon={<UnorderedListOutlined />}
+                        color="processing"
+                        style={{ cursor: 'pointer', fontSize: 11, borderRadius: 12, padding: '1px 8px', margin: 0 }}
+                        onClick={() => setCmdModalOpen(true)}
+                      >
+                        快捷命令
+                      </Tag>
                     </div>
+                    {/* 快捷命令弹窗：点击命令即直接发送；新增后立即自动归类到对应智能体 */}
+                    <Modal
+                      title="快捷命令"
+                      open={cmdModalOpen}
+                      onCancel={() => { setCmdModalOpen(false); setEditingCmdId(null) }}
+                      footer={null}
+                      width={560}
+                    >
+                      <Space.Compact style={{ width: '100%', marginBottom: 12 }}>
+                        <Input
+                          placeholder="输入新命令语句，如：检查本周交期风险"
+                          value={newCmdText}
+                          onChange={e => setNewCmdText(e.target.value)}
+                          onPressEnter={addQuickCommand}
+                        />
+                        <Select
+                          value={newCmdAgent}
+                          onChange={setNewCmdAgent}
+                          style={{ width: 150 }}
+                          options={[
+                            { value: 'auto', label: '自动归类' },
+                            ...agents.map(a => ({ value: a.key, label: a.name })),
+                          ]}
+                        />
+                        <Button type="primary" icon={<PlusOutlined />} loading={cmdSaving} onClick={addQuickCommand}>添加</Button>
+                      </Space.Compact>
+                      <List
+                        size="small"
+                        dataSource={quickCommands}
+                        style={{ maxHeight: 320, overflowY: 'auto' }}
+                        renderItem={cmd => (
+                          <List.Item
+                            actions={cmd.is_preset ? [
+                              <Tag key="preset" style={{ fontSize: 10 }}>预置</Tag>,
+                            ] : editingCmdId === cmd.id ? [
+                              <Button key="save" type="link" size="small" loading={cmdSaving} onClick={saveQuickCommand}>保存</Button>,
+                              <Button key="cancel" type="link" size="small" onClick={() => setEditingCmdId(null)}>取消</Button>,
+                            ] : [
+                              <Button key="edit" type="text" size="small" icon={<EditOutlined />} aria-label="编辑命令" onClick={() => startEditCommand(cmd)} />,
+                              <Popconfirm key="del" title="删除该命令？" onConfirm={() => removeQuickCommand(cmd.id)}>
+                                <Button type="text" size="small" danger icon={<DeleteOutlined />} aria-label="删除命令" />
+                              </Popconfirm>,
+                            ]}
+                          >
+                            {editingCmdId === cmd.id ? (
+                              <Space.Compact style={{ width: '100%' }}>
+                                <Input size="small" value={editCmdText} onChange={e => setEditCmdText(e.target.value)} onPressEnter={saveQuickCommand} />
+                                <Select
+                                  size="small"
+                                  value={editCmdAgent}
+                                  onChange={setEditCmdAgent}
+                                  style={{ width: 140 }}
+                                  options={[
+                                    { value: 'auto', label: '自动归类' },
+                                    ...agents.map(a => ({ value: a.key, label: a.name })),
+                                  ]}
+                                />
+                              </Space.Compact>
+                            ) : (
+                              <Space size={6}>
+                                <Tooltip title={cmd.agent_name ? `点击发送，由「${cmd.agent_name}」处理` : '点击发送给智能体'}>
+                                  <Text
+                                    style={{ fontSize: 13, cursor: loading ? 'not-allowed' : 'pointer', color: '#1677ff' }}
+                                    onClick={() => sendQuickCommand(cmd)}
+                                  >{cmd.command_text}</Text>
+                                </Tooltip>
+                                {cmd.agent_name
+                                  ? <Tag color="geekblue" style={{ fontSize: 10 }}>{cmd.agent_name}</Tag>
+                                  : <Tag style={{ fontSize: 10 }}>智能体</Tag>}
+                              </Space>
+                            )}
+                          </List.Item>
+                        )}
+                      />
+                      <Text type="secondary" style={{ fontSize: 11 }}>
+                        点击命令即可直接发送给对应智能体；新增命令后系统会自动归类到对应智能体。
+                      </Text>
+                    </Modal>
                     {/* 输入区 */}
                     <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
                       {replyingTo && (
@@ -1397,6 +1615,11 @@ export default function AIAssistantWidget() {
                       </>
                     )}
                   </div>
+            )}
+            {tab === 'tasks' && (
+              <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+                <TaskCenter />
+              </div>
             )}
           </div>
 

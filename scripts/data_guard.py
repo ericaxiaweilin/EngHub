@@ -33,6 +33,9 @@ DEFAULT_FACTORIES = [
 TABLES: dict[str, dict[str, Any]] = {
     "users": {"min": 1, "max_drop_pct": 0.0},
     "factories": {"min": 1, "max_drop_pct": 0.0},
+    "chat_quick_commands": {"min": 5, "max_drop_pct": 0.0},
+    "followup_tasks": {"min": 0, "factory_min": 0, "max_drop_pct": 0.0},
+    "followup_task_logs": {"min": 0, "factory_min": 0, "max_drop_pct": 0.0},
     "products": {"min": 1, "max_drop_pct": 0.05},
     "work_orders": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "sales_orders": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
