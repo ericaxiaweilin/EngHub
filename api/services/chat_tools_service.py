@@ -607,7 +607,63 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_followup_task",
+            "description": "把暂时无法一次完成的任务挂入任务中心持续跟进（等物料/等审批/等设备恢复/等供应商等场景）。系统会按设定频率定期用工具核实进展，完成/受阻时推送通知。当用户交代的事情当前无法闭环、或用户说'跟进一下''盯着''挂起来''到时候提醒我'时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "任务标题（一句话，如'跟进 WO-20260730-001 缺料到货'）"},
+                    "description": {"type": "string", "description": "任务详情/用户原始指令，可选"},
+                    "block_reason": {"type": "string", "description": "当前无法完成的原因（如'等供应商交货'），可选"},
+                    "follow_interval_minutes": {"type": "integer", "description": "跟进频率（分钟），默认120（2小时），最小15", "default": 120},
+                    "agent_key": {"type": "string", "description": "负责跟进的智能体 key（dispatch_agent/procurement_agent/quality_agent/delivery_agent/escalation_agent/equipment_agent/scheduling_agent/warehouse_agent），不传则自动归类"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
 ]
+
+TOOL_DEFINITIONS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "get_virtual_factory_status",
+            "description": "查询虚拟工厂脉搏状态：当前虚拟销售订单、主工单、进度、报工数量。用于回答'虚拟工厂现在怎样/数据脉搏/订单节奏'类问题。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_virtual_factory_pulse",
+            "description": "主动推进一次虚拟工厂脉搏：按月产能和订单周期创建销售订单、拆主/工序工单、按日节奏报工并生成节奏预警。不是秒完订单。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "monthly_capacity_containers": {
+                        "type": "integer",
+                        "description": "月出货产能（柜/月），默认300",
+                        "default": 300,
+                    },
+                    "order_lead_days": {
+                        "type": "integer",
+                        "description": "订单周期天数，默认90天",
+                        "default": 90,
+                    },
+                    "target_active_orders": {
+                        "type": "integer",
+                        "description": "希望维持的虚拟在制主订单数，默认6",
+                        "default": 6,
+                    },
+                },
+            },
+        },
+    },
+])
 
 
 # ==================== 工具执行器 ====================
@@ -1795,6 +1851,35 @@ async def _tool_query_environment(db: AsyncSession, args: Dict[str, Any], factor
     }
 
 
+async def _tool_get_virtual_factory_status(
+    db: AsyncSession,
+    args: Dict[str, Any],
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    from api.services.virtual_factory_service import DEFAULT_FACTORY_ID, VirtualFactoryService
+
+    fid = factory_id or DEFAULT_FACTORY_ID
+    return await VirtualFactoryService(db).status(fid)
+
+
+async def _tool_run_virtual_factory_pulse(
+    db: AsyncSession,
+    args: Dict[str, Any],
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    from api.services.virtual_factory_service import DEFAULT_FACTORY_ID, PulseConfig, VirtualFactoryService
+
+    fid = factory_id or DEFAULT_FACTORY_ID
+    cfg = PulseConfig(
+        factory_id=fid,
+        monthly_capacity_containers=int(args.get("monthly_capacity_containers") or 300),
+        order_lead_days=int(args.get("order_lead_days") or 90),
+        target_active_orders=int(args.get("target_active_orders") or 6),
+        operator="virtual_factory",
+    )
+    return await VirtualFactoryService(db).pulse(cfg)
+
+
 # 执行器注册表
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
@@ -1832,6 +1917,8 @@ _TOOL_EXECUTORS = {
     "query_stagnant": _tool_query_stagnant,
     "query_spc_anomalies": _tool_query_spc_anomalies,
     "query_environment": _tool_query_environment,
+    "get_virtual_factory_status": _tool_get_virtual_factory_status,
+    "run_virtual_factory_pulse": _tool_run_virtual_factory_pulse,
 }
 
 
@@ -1882,6 +1969,25 @@ async def _tool_query_collaboration(db: AsyncSession, args: Dict[str, Any], fact
 
 _TOOL_EXECUTORS["query_collaboration"] = _tool_query_collaboration
 
+
+async def _tool_create_followup_task(db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """挂账跟进任务：写入任务中心，由后台扫描器按频率定期跟进。"""
+    from api.services import followup_task_service as followup_svc
+    return await followup_svc.create_task(
+        db, factory_id or "FAC_MECH_001",
+        created_by=operator,
+        title=str(args.get("title") or ""),
+        description=str(args.get("description") or ""),
+        agent_key=args.get("agent_key") or None,
+        follow_interval_minutes=int(args.get("follow_interval_minutes") or 120),
+        block_reason=str(args.get("block_reason") or ""),
+        source="chatbot",
+        conversation_hint=str(args.get("description") or args.get("title") or "")[:500],
+    )
+
+
+_TOOL_EXECUTORS["create_followup_task"] = _tool_create_followup_task
+
 # 写操作工具（需要记录操作人）
 WRITE_TOOLS = {
     "create_work_order", "release_work_order", "create_production_report",
@@ -1890,10 +1996,14 @@ WRITE_TOOLS = {
     "run_workflow",
     "export_report_file",
     "acknowledge_alert", "run_alert_patrol",
+    "create_followup_task",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
-SIM_TOOLS = {"run_compliance_simulation", "query_simulation_audits"}
+SIM_TOOLS = {
+    "run_compliance_simulation", "query_simulation_audits",
+    "get_virtual_factory_status", "run_virtual_factory_pulse",
+}
 
 # 工具的中文标签（供前端展示）
 TOOL_LABELS = {
@@ -1932,6 +2042,9 @@ TOOL_LABELS = {
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",
     "query_environment": "车间环境",
+    "get_virtual_factory_status": "虚拟工厂状态",
+    "run_virtual_factory_pulse": "虚拟工厂脉搏",
+    "create_followup_task": "挂账跟进任务",
 }
 
 
@@ -1941,6 +2054,21 @@ TOOL_LABELS = {
 # “建议你进入看板/日报中心查看”这类推诿性模糊回答。
 # 仅对单步查询类工具做强制路由；写操作/多步操作仍交由模型 auto 编排。
 INTENT_RULES: List[Dict[str, Any]] = [
+    {
+        "tool": "run_virtual_factory_pulse",
+        "keywords": [
+            "虚拟工厂脉搏", "跑一下虚拟工厂", "推进虚拟工厂", "生成虚拟订单",
+            "主动下订单", "自动下订单", "虚拟下单", "虚拟拆单", "维持数据丰富度",
+            "按真实节奏", "300柜", "三个月订单", "3个月订单",
+        ],
+    },
+    {
+        "tool": "get_virtual_factory_status",
+        "keywords": [
+            "虚拟工厂", "数据脉搏", "订单节奏", "虚拟订单状态", "虚拟报工",
+            "虚拟工单", "现在虚拟工厂怎样", "虚拟工厂状态",
+        ],
+    },
     {
         "tool": "get_production_summary",
         "keywords": [
@@ -2217,6 +2345,9 @@ async def execute_tool(
     if not executor:
         return {"error": f"未知工具：{tool_name}"}
     try:
+        if tool_name == "create_followup_task":
+            # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
+            return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name in WRITE_TOOLS:
             return await executor(db, arguments, operator)
         return await executor(db, arguments, factory_id)

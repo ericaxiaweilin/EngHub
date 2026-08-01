@@ -14,6 +14,7 @@ import RCCOverview from './RCCOverview'
 import RCCResourceBoard from './RCCResourceBoard'
 import RCCDecisionHub from './RCCDecisionHub'
 import RCCAnalysis from './RCCAnalysis'
+import RCCOrgBubbles from './RCCOrgBubbles'
 
 const API_BASE = '/api/v1/rcc'
 const { Sider, Content, Header } = Layout
@@ -29,7 +30,7 @@ export interface RccContextType {
 }
 
 export const RccContext = createContext<RccContextType>({
-  baseline: {}, decisions: {}, factoryId: 'F01',
+  baseline: {}, decisions: {}, factoryId: 'FAC_ELEC_DEMO_2026',
   loading: false, lastSync: null, refresh: () => {}
 })
 
@@ -57,13 +58,13 @@ export { COLORS }
 // ==================== 主组件 ====================
 export default function RCCCommandCenter() {
   const [activeView, setActiveView] = useState('overview')
-  const [factoryId, setFactoryId] = useState('F01')
+  const [factoryId, setFactoryId] = useState(() => localStorage.getItem('active_factory_id') || 'FAC_ELEC_DEMO_2026')
   const [baseline, setBaseline] = useState<any>({})
   const [decisions, setDecisions] = useState<any>({})
   const [loading, setLoading] = useState(false)
   const [lastSync, setLastSync] = useState<string | null>(null)
   const [autoRefresh, setAutoRefresh] = useState(false)
-  const [factories, setFactories] = useState<string[]>(['F01'])
+  const [factories, setFactories] = useState<string[]>([factoryId, 'FAC_ELEC_DEMO_2026', 'FAC_MECH_001'])
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -88,6 +89,11 @@ export default function RCCCommandCenter() {
     }
   }, [factoryId])
 
+  const handleFactoryChange = (nextFactoryId: string) => {
+    setFactoryId(nextFactoryId)
+    localStorage.setItem('active_factory_id', nextFactoryId)
+  }
+
   useEffect(() => { fetchData() }, [fetchData])
 
   useEffect(() => {
@@ -98,6 +104,7 @@ export default function RCCCommandCenter() {
 
   const menuItems = [
     { key: 'overview', icon: <DashboardOutlined />, label: '指挥总览' },
+    { key: 'org-bubbles', icon: <TeamOutlined />, label: '任务智慧中心' },
     { key: 'resources', icon: <RadarChartOutlined />, label: '资源调度' },
     { key: 'decisions', icon: <ThunderboltOutlined />, label: '决策中心' },
     { key: 'analysis', icon: <FundOutlined />, label: '瓶颈分析' },
@@ -159,10 +166,10 @@ export default function RCCCommandCenter() {
             <Space size={12}>
               <Select
                 value={factoryId}
-                onChange={setFactoryId}
+                onChange={handleFactoryChange}
                 style={{ width: 160 }}
                 popupClassName="rcc-dark-dropdown"
-                options={factories.map(f => ({ value: f, label: `工厂 ${f}` }))}
+                options={Array.from(new Set(factories.filter(Boolean))).map(f => ({ value: f, label: `工厂 ${f}` }))}
               />
               <Tooltip title={autoRefresh ? '停止自动刷新' : '开启30s自动刷新'}>
                 <Button
@@ -183,6 +190,7 @@ export default function RCCCommandCenter() {
           <Content style={{ padding: 24, overflow: 'auto' }}>
             <Spin spinning={loading && !lastSync}>
               {activeView === 'overview' && <RCCOverview />}
+              {activeView === 'org-bubbles' && <RCCOrgBubbles factoryId={factoryId} />}
               {activeView === 'resources' && <RCCResourceBoard />}
               {activeView === 'decisions' && <RCCDecisionHub />}
               {activeView === 'analysis' && <RCCAnalysis />}

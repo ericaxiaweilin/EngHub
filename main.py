@@ -8,6 +8,9 @@ import asyncio
 import logging
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)  # 必须在所有路由 import 之前加载
+
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -55,7 +58,11 @@ from api.routes.automation_level_routes import router as automation_level_router
 from api.routes.collaboration_routes import router as collaboration_router
 from api.routes.agent_supervisor_routes import router as agent_supervisor_router
 from api.routes.agent_routes import router as agent_router
+from api.routes.quick_command_routes import router as quick_command_router
+from api.routes.task_center_routes import router as task_center_router
 from api.routes.crew_routes import router as crew_router
+from api.routes.work_team_routes import router as work_team_router
+from api.routes.virtual_factory_routes import router as virtual_factory_router
 from core.org_panel.api_adapter import router as org_panel_router
 
 app = FastAPI(
@@ -97,6 +104,7 @@ app.include_router(wms_phase3_router)  # 岗位替代 Phase 3: 仓管操作/库�
 app.include_router(qms_phase4_router)  # 岗位替代 Phase 4: 检验终端/SPC/不良分析
 app.include_router(equipment_phase5_router)  # 岗位替代 Phase 5: 维保终端/OEE/故障预测
 app.include_router(hr_router)  # HR 人力档案 + 工厂切换
+app.include_router(work_team_router)  # 报工小组 CRUD（操作人便捷选择/批量报工）
 app.include_router(notification_router)  # 站内通知（报告/异常/系统）
 app.include_router(role_elimination_router)  # 岗位替代（调度员/采购员/工艺员）
 app.include_router(workflow_analytics_router)  # 工作流交叉分析（深层数据）
@@ -104,7 +112,10 @@ app.include_router(automation_level_router)  # 自动化等级配置（L0-L3可�
 app.include_router(collaboration_router)  # 岗位协同网络（事件+边界）
 app.include_router(agent_supervisor_router)  # 智能体监督（长任务+卡住+预测+闭环）
 app.include_router(agent_router)  # 排产+仓储智能体
+app.include_router(quick_command_router)  # Chatbot 快速命令 CRUD + 智能体调度列表
+app.include_router(task_center_router)  # 任务中心（待办跟进 + 定期扫描）
 app.include_router(crew_router)  # CrewAI推理层+个人知识层
+app.include_router(virtual_factory_router)  # 虚拟工厂脉搏（订单/拆单/报工/预警）
 app.include_router(rcc_router)
 app.include_router(rcc_data_router)
 app.include_router(rcc_decision_router)
@@ -295,6 +306,28 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 仓储智能体任务异常: {e}")
 
+        # 虚拟工厂脉搏 —— 每 60 分钟按真实节奏接单/拆单/报工/预警
+        try:
+            import time as _t_vf
+            if not hasattr(_periodic_scheduler, "_last_virtual_factory"):
+                _periodic_scheduler._last_virtual_factory = 0
+            if _t_vf.time() - _periodic_scheduler._last_virtual_factory > 3600:  # 60min
+                _periodic_scheduler._last_virtual_factory = _t_vf.time()
+                from api.services.virtual_factory_service import PulseConfig, VirtualFactoryService
+                async with db_config.session_factory() as db:
+                    svc = VirtualFactoryService(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            result = await svc.pulse(PulseConfig(factory_id=fid))
+                            created = len(result.get("created_orders", []))
+                            advanced = result.get("advanced", {}).get("containers_reported", 0)
+                            if created or advanced:
+                                _logger.info(f"[virtual-factory] {fid}: 新单{created}, 推进{advanced}柜")
+                        except Exception as ex:
+                            _logger.warning(f"[virtual-factory] 脉搏失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 虚拟工厂任务异常: {e}")
+
         # 排产智能体：产能平衡检查 —— 每 30 分钟
         try:
             import time as _t9
@@ -326,6 +359,10 @@ async def _start_scheduler():
     # 幂等技能种子：确保 skills + hr_employee_skills 数据存在（防 DB 重建后丢失）
     from scripts.seed_skills_startup import run_skill_seed
     asyncio.create_task(run_skill_seed())
+
+    # 任务中心定期扫描：到期待办任务自动跟进（FOLLOWUP_SCANNER_ENABLED=0 可关）
+    from api.services.followup_task_service import followup_scanner_loop
+    asyncio.create_task(followup_scanner_loop())
 
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------

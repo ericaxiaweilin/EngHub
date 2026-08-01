@@ -30,7 +30,10 @@ from database.db_config import get_db
 from database.models import FileRecord, User
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
+)
+from api.services.quick_command_service import (
+    build_agent_system_prompt, record_agent_dispatch,
 )
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
@@ -68,6 +71,10 @@ SYSTEM_PROMPT = (
     "【流程知识库】系统内置了完整的流程知识：工单全生命周期（8阶段：创建→下达→派工→执行→报工→质检→完工→入库）、"
     "6大职位标准作业流程(操作员/品检员/设备工程师/PMC计划员/生产主管/仓管员)、各环节RACI责任矩阵。"
     "用户问流程/职责/该找谁类问题时，调用 query_process_knowledge 工具获取标准答案。\n"
+    "【任务中心】工业场景很多任务无法一次完成（等物料/等审批/等设备恢复/等供应商）。"
+    "当用户交代的事情当前无法闭环、或用户说'跟进一下''盯着这个''挂起来''到时候提醒我'时，"
+    "调用 create_followup_task 把任务挂入任务中心，系统会按频率（默认2小时，用户可指定）定期自动跟进并推送通知；"
+    "挂账成功后告知用户可在「任务中心」页面查看进度。不要把能立即完成的查询/操作挂账。\n"
     "【回答边界】工具结果未提供的信息不得猜测，不得擅自补充故障、缺料、同步异常等可能原因。"
     "最终回答只输出面向用户的结论，禁止输出 <think>、推理过程、内部分析或工具选择过程。\n"
     "请用简洁专业的中文回答制造与车间管理相关问题。"
@@ -100,6 +107,7 @@ class ChatRequest(BaseModel):
     temperature: float = 0.3
     enable_tools: bool = True  # 是否启用工具调用
     attachments: List[Attachment] = Field(default_factory=list)  # 本轮用户消息附带的附件
+    agent_key: Optional[str] = None  # 指定调度的智能体（空=自动，由模型自行选择工具）
 
 
 class ToolAction(BaseModel):
@@ -142,12 +150,25 @@ async def chat_health():
             )
         except Exception as exc:  # noqa: BLE001
             detail = f"unreachable: {type(exc).__name__}"
+    else:
+        # 降级模式：检查网关是否可达
+        fallback_model = os.getenv("LLM_MODEL", "").strip()
+        if GATEWAY_URL and fallback_model:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    gateway_resp = await client.get(f"{GATEWAY_URL}/health")
+                reachable = gateway_resp.status_code < 500
+                detail = f"fallback mode: model={fallback_model}, gateway={gateway_resp.status_code}"
+            except Exception as exc:  # noqa: BLE001
+                detail = f"fallback mode: gateway unreachable ({type(exc).__name__})"
+        else:
+            detail = "no model configured (set LLM_MODEL or model-stack)"
     return {
         "configured": configured,
         "reachable": reachable,
-        "model": MODEL_STACK_CHAT_TASK_ID,
+        "model": MODEL_STACK_CHAT_TASK_ID or os.getenv("LLM_MODEL", ""),
         "gateway": GATEWAY_URL,
-        "control_plane": MODEL_STACK_CONTROL_PLANE_URL,
+        "control_plane": MODEL_STACK_CONTROL_PLANE_URL or "(fallback: direct)",
         "detail": detail,
     }
 
@@ -177,9 +198,22 @@ async def _resolve_model_route(
     prompt_tokens: int = 1000,
     max_completion_tokens: int = 1024,
 ) -> Dict[str, Any]:
-    """向模型底座申请任务路由；业务侧不维护模型候选或回退链。"""
+    """向模型底座申请任务路由；业务侧不维护模型候选或回退链。
+
+    当 model-stack 控制面未配置时，降级为直接使用 LLM_GATEWAY_URL + LLM_MODEL。
+    """
     if not MODEL_STACK_CONTROL_PLANE_URL or not task_id:
-        raise RuntimeError("model-stack task routing is not configured")
+        # 降级：直接用网关 + 环境变量模型
+        fallback_model = os.getenv("LLM_MODEL", "deepseek-v4-pro").strip()
+        if not fallback_model:
+            raise RuntimeError("model-stack task routing is not configured and LLM_MODEL is empty")
+        return {
+            "task_id": task_id or fallback_model,
+            "provider": "direct",
+            "gateway_model": fallback_model,
+            "request_timeout": REQUEST_TIMEOUT,
+            "max_completion_tokens": max_completion_tokens,
+        }
 
     url = (
         f"{MODEL_STACK_CONTROL_PLANE_URL}/api/model-management/"
@@ -282,6 +316,33 @@ def _grounded_tool_result(result: Dict[str, Any]) -> str:
         f"{TOOL_RESULT_GROUNDING}\n"
         f"{json.dumps(result, ensure_ascii=False, default=str)}"
     )
+
+
+def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
+    """Deterministic fallback reply for clear business intents."""
+    label = TOOL_LABELS.get(tool_name, tool_name)
+    if "error" in result:
+        return f"{label}执行失败：{result['error']}"
+    if tool_name == "run_virtual_factory_pulse":
+        rhythm = result.get("rhythm", {})
+        advanced = result.get("advanced", {})
+        return (
+            "虚拟工厂脉搏已推进。\n"
+            f"- 月产能：{rhythm.get('monthly_capacity_containers', 300)} 柜/月，"
+            f"日节奏：{rhythm.get('daily_capacity_containers', 10)} 柜/日\n"
+            f"- 新建订单：{len(result.get('created_orders', []))} 个\n"
+            f"- 本次报工：{advanced.get('containers_reported', 0)} 柜，"
+            f"{advanced.get('reports_created', 0)} 条报工\n"
+            f"- 节奏预警：{len(result.get('alerts', []))} 条"
+        )
+    if tool_name == "get_virtual_factory_status":
+        return (
+            "虚拟工厂当前状态：\n"
+            f"- 虚拟销售订单：{result.get('virtual_sales_orders', 0)} 个\n"
+            f"- 在制虚拟主工单：{result.get('active_virtual_orders', 0)} 个\n"
+            f"- 虚拟报工记录：{result.get('virtual_report_count', 0)} 条"
+        )
+    return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
 
 
 async def _verify_grounded_reply(
@@ -559,6 +620,29 @@ async def chat(
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
+
+    if request.enable_tools and not image_records:
+        direct = resolve_intent(last_user)
+        if direct:
+            tool_name = direct["tool"]
+            arguments = direct.get("args") or {}
+            result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+            actions.append(ToolAction(
+                tool=tool_name,
+                label=TOOL_LABELS.get(tool_name, tool_name),
+                arguments=arguments,
+                result=result,
+                is_write=tool_name in WRITE_TOOLS,
+                is_sim=tool_name in SIM_TOOLS,
+                success="error" not in result,
+            ))
+            return ChatResponse(
+                reply=_direct_tool_reply(tool_name, result),
+                model="deterministic-tool-router",
+                degraded=False,
+                actions=actions,
+            )
+
     task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
     prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
     try:
@@ -571,6 +655,12 @@ async def chat(
 
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
+    if request.agent_key:
+        agent_prompt = build_agent_system_prompt(request.agent_key)
+        if agent_prompt:
+            messages.append({"role": "system", "content": agent_prompt})
+            await record_agent_dispatch(db, factory_id, request.agent_key, last_user)
     history = [m.model_dump() for m in request.messages]
     # 将附件注入「最后一条用户消息」：图片 → 多模态 content；非图片 → 文字摘要追加
     non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
@@ -1005,6 +1095,30 @@ async def chat_stream(
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
+
+        if request.enable_tools and not image_records:
+            direct = resolve_intent(last_user)
+            if direct:
+                tool_name = direct["tool"]
+                arguments = direct.get("args") or {}
+                result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+                action = ToolAction(
+                    tool=tool_name,
+                    label=TOOL_LABELS.get(tool_name, tool_name),
+                    arguments=arguments,
+                    result=result,
+                    is_write=tool_name in WRITE_TOOLS,
+                    is_sim=tool_name in SIM_TOOLS,
+                    success="error" not in result,
+                )
+                yield _sse("action", action.model_dump())
+                table_data = _extract_table_data(tool_name, result)
+                if table_data:
+                    yield _sse("table", table_data)
+                yield _sse("delta", {"content": _direct_tool_reply(tool_name, result)})
+                yield _sse("done", {"model": "deterministic-tool-router", "degraded": False})
+                return
+
         task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
         prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
         try:
@@ -1027,6 +1141,12 @@ async def chat_stream(
 
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
         messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
+        if request.agent_key:
+            agent_prompt = build_agent_system_prompt(request.agent_key)
+            if agent_prompt:
+                messages.append({"role": "system", "content": agent_prompt})
+                await record_agent_dispatch(db, factory_id, request.agent_key, last_user)
         history = [m.model_dump() for m in request.messages]
         non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
         injected = False
