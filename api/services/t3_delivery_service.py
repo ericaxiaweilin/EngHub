@@ -154,7 +154,7 @@ class T3DeliveryService:
             FROM work_orders wo
             JOIN stations st ON wo.assigned_station_id = st.id::text
             WHERE wo.factory_id = :fid AND wo.status IN ('released', 'in_progress')
-            GROUP BY department
+            GROUP BY 1
             ORDER BY wo_count DESC
         """, {"fid": factory_id})
 

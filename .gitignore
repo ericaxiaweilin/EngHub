@@ -7,6 +7,13 @@ __pycache__/
 # OS files
 .DS_Store
 **/.DS_Store
+# macOS 云同步/拷贝产生的重复副本（"xxx 2.py" / "xxx 3.md"）与 AppleDouble 文件
+* 2
+* 2.*
+* 3
+* 3.*
+._*
+**/._*
 
 # Logs and temp files
 *.log
@@ -52,3 +59,7 @@ mes-project-deploy.tar.gz
 uploads/
 /upload_*.jpg
 /scripts/seed_f01_reports.py
+
+# Remote deployment artifacts (runtime state and backups stay outside source control)
+/backups/
+/enghub.runtime.env

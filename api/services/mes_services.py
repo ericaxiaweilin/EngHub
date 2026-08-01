@@ -2,7 +2,7 @@
 MES Service Layer - Production Report, Station, Routing, Equipment Services
 生产报工、工位、工艺路线、设备管理服务
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import case, select, update, delete
@@ -17,10 +17,13 @@ from database.models import (
     WorkOrder,
     Product,
     BomItem,
-    Inventory
+    Inventory,
+    APSRequest
 )
-from api.services.aps_service import ApsService  # #11 APS动态排程反馈 - 报工后触发重排程
 import asyncio
+import logging
+
+_logger = logging.getLogger(__name__)
 
 
 class ProductionReportService:
@@ -49,6 +52,7 @@ class ProductionReportService:
         quality_check_passed: Optional[bool] = None,
         remark: Optional[str] = None,
         created_by: Optional[str] = None,
+        report_date: Optional[datetime] = None,
     ) -> ProductionReport:
         """创建生产报工"""
         import uuid
@@ -77,6 +81,11 @@ class ProductionReportService:
             remark=remark,
             created_by=created_by,
         )
+        # 可选报工日期：支持补录历史报工（created_at 作为报工时间参与看板聚合）
+        if report_date is not None:
+            if report_date.tzinfo is not None:
+                report_date = report_date.astimezone(timezone.utc).replace(tzinfo=None)
+            report.created_at = report_date
         
         self.db.add(report)
         await self.db.commit()
@@ -90,8 +99,13 @@ class ProductionReportService:
         await self._backflush_materials(self.db, work_order_id, good_qty, created_by)
         
         # #11 PS事件解耦（增强版）- 将APS重算请求写入数据库队列，由消费者服务异步处理
+        # 入队失败不应阻断报工主流程（报工已commit）
         if factory_id and work_order_id:
-            await self._enqueue_aps_replan(work_order_id, factory_id, report.id, 'report_created', created_by or 'system')
+            try:
+                await self._enqueue_aps_replan(work_order_id, factory_id, report.id, 'report_created', created_by or 'system')
+            except Exception as e:
+                _logger.warning("APS入队失败(报工创建), 不阻断主流程: %s", e)
+                await self.db.rollback()
         
         return report
     
@@ -346,9 +360,16 @@ class ProductionReportService:
         # 重新计算工单数量
         await self._update_work_order_qty(report.work_order_id)
         
-        # #11 APS动态排程反馈 - 报工修改后触发APS重新计算
+        # #11 PS事件解耦 - 报工修改后触发APS重新计算（入队失败不阻断报工）
         if report.factory_id and report.work_order_id:
-            await self._notify_aps_on_report_update(report.work_order_id, report.factory_id)
+            try:
+                await self._enqueue_aps_replan(
+                    report.work_order_id, report.factory_id, report.id,
+                    'report_modified', report.modified_by or 'system'
+                )
+            except Exception as e:
+                _logger.warning("APS入队失败(报工修改), 不阻断主流程: %s", e)
+                await self.db.rollback()
         
         return report
 

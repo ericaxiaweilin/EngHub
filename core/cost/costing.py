@@ -374,7 +374,7 @@ class CostingService:
         # query = select(InventoryBOM).where(InventoryBOM.product_id == product_id)
         
         # 方案B：从 Product 的材料关联查询
-        query = select(Product).where(Product.product_code == product_id)
+        query = select(Product).where(Product.id == product_id)
         result = await db.execute(query)
         product = result.scalar_one_or_none()
         

@@ -731,7 +731,7 @@ async def calculate_mrp(
         raise HTTPException(status_code=404, detail="计划不存在")
     
     # 产品名称
-    prod_res = await db.execute(select(Product).where(Product.product_code == p.product_id))
+    prod_res = await db.execute(select(Product).where(Product.id == p.product_id))
     product = prod_res.scalar()
     product_name = product.product_name if product else p.product_id
     

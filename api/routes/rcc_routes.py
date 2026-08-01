@@ -6,7 +6,10 @@ v2.6 - RCC API Routes
 """
 
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database.db_config import get_db
 
 router = APIRouter(prefix="/api/v1/rcc", tags=["rcc - 资源控制中心"])
 
@@ -19,12 +22,11 @@ async def list_rcc_tasks(
     org_unit_id: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
 ):
     """查询RCC调度任务列表"""
     from core.rcc.services import RCCTaskService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = RCCTaskService(db)
     try:
         tasks = await service.list_tasks(status=status, org_unit_id=org_unit_id, page=page, page_size=page_size)
@@ -43,12 +45,10 @@ async def list_rcc_tasks(
 
 
 @router.post("/tasks/create", status_code=201, summary="创建RCC调度任务")
-async def create_rcc_task(payload: Dict[str, Any]):
+async def create_rcc_task(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
     """创建RCC调度任务"""
     from core.rcc.services import RCCTaskService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = RCCTaskService(db)
     try:
         task = await service.create_task(
@@ -70,12 +70,10 @@ async def create_rcc_task(payload: Dict[str, Any]):
 
 
 @router.post("/tasks/{task_id}/approve", summary="审批通过RCC任务")
-async def approve_rcc_task(task_id: str, comment: str = ""):
+async def approve_rcc_task(task_id: str, comment: str = "", db: AsyncSession = Depends(get_db)):
     """审批通过RCC任务"""
     from core.rcc.services import RCCTaskService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = RCCTaskService(db)
     try:
         task = await service.approve_task(task_id, approver_id="current_user", comment=comment)
@@ -87,12 +85,10 @@ async def approve_rcc_task(task_id: str, comment: str = ""):
 
 
 @router.post("/tasks/{task_id}/reject", summary="拒绝RCC任务")
-async def reject_rcc_task(task_id: str, reason: str):
+async def reject_rcc_task(task_id: str, reason: str, db: AsyncSession = Depends(get_db)):
     """拒绝RCC任务"""
     from core.rcc.services import RCCTaskService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = RCCTaskService(db)
     try:
         task = await service.reject_task(task_id, approver_id="current_user", reason=reason)
@@ -110,12 +106,11 @@ async def list_adjustable_params(
     org_unit_id: Optional[str] = None,
     category: Optional[str] = None,
     sensitivity: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
 ):
     """查询可调参数"""
     from core.rcc.services import ParamAdjustmentService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = ParamAdjustmentService(db)
     try:
         params = await service.list_params(org_unit_id=org_unit_id, category=category, sensitivity=sensitivity)
@@ -136,12 +131,10 @@ async def list_adjustable_params(
 
 
 @router.put("/params/{param_id}", summary="调整参数")
-async def adjust_parameter(param_id: str, payload: Dict[str, Any]):
+async def adjust_parameter(param_id: str, payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
     """调整参数（根据敏感度决定是否需要RCC审批）"""
     from core.rcc.services import ParamAdjustmentService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = ParamAdjustmentService(db)
     try:
         result = await service.adjust_parameter(
@@ -159,12 +152,10 @@ async def adjust_parameter(param_id: str, payload: Dict[str, Any]):
 
 
 @router.get("/params/{param_id}/impact", summary="参数影响分析")
-async def analyze_param_impact(param_id: str, new_value: str = Query(...)):
+async def analyze_param_impact(param_id: str, new_value: str = Query(...), db: AsyncSession = Depends(get_db)):
     """分析参数变更影响"""
     from core.rcc.services import ParamAdjustmentService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = ParamAdjustmentService(db)
     try:
         impact = await service.analyze_impact(param_id, new_value)
@@ -181,19 +172,19 @@ async def list_param_audit(
     changed_by: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
 ):
     """查询参数变更审计记录"""
     from database.models import ParameterChangeAudit
     from sqlalchemy import select as sa_select
-    
-    db = next(get_db())
+
     query = sa_select(ParameterChangeAudit)
     if param_id:
         query = query.where(ParameterChangeAudit.param_id == param_id)
     if changed_by:
         query = query.where(ParameterChangeAudit.changed_by == changed_by)
     query = query.order_by(ParameterChangeAudit.changed_at.desc()).offset((page-1)*page_size).limit(page_size)
-    
+
     records = list((await db.execute(query)).scalars().all())
     return {"items": [
         {
@@ -208,12 +199,10 @@ async def list_param_audit(
 # ==================== Chatbot 工单 ====================
 
 @router.post("/chatbot/tickets/create", status_code=201, summary="创建Chatbot工单")
-async def create_chatbot_ticket(payload: Dict[str, Any]):
+async def create_chatbot_ticket(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
     """创建Chatbot工单"""
     from core.rcc.services import ChatbotTicketService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = ChatbotTicketService(db)
     try:
         ticket = await service.create_ticket(
@@ -236,12 +225,10 @@ async def create_chatbot_ticket(payload: Dict[str, Any]):
 
 
 @router.post("/chatbot/tickets/{ticket_id}/route", summary="路由Chatbot工单")
-async def route_chatbot_ticket(ticket_id: str, target_org_unit: str, target_position: str):
+async def route_chatbot_ticket(ticket_id: str, target_org_unit: str, target_position: str, db: AsyncSession = Depends(get_db)):
     """路由工单到指定组织和职位"""
     from core.rcc.services import ChatbotTicketService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = ChatbotTicketService(db)
     try:
         ticket = await service.route_ticket(ticket_id, target_org_unit, target_position)
@@ -253,12 +240,10 @@ async def route_chatbot_ticket(ticket_id: str, target_org_unit: str, target_posi
 
 
 @router.post("/chatbot/tickets/{ticket_id}/resolve", summary="解决Chatbot工单")
-async def resolve_chatbot_ticket(ticket_id: str, resolution: str, resolved_by: str):
+async def resolve_chatbot_ticket(ticket_id: str, resolution: str, resolved_by: str, db: AsyncSession = Depends(get_db)):
     """解决工单"""
     from core.rcc.services import ChatbotTicketService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = ChatbotTicketService(db)
     try:
         ticket = await service.resolve_ticket(ticket_id, resolution, resolved_by)
@@ -275,12 +260,11 @@ async def list_chatbot_tickets(
     status: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
 ):
     """查询工单列表"""
     from core.rcc.services import ChatbotTicketService
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     service = ChatbotTicketService(db)
     try:
         tickets = await service.list_tickets(requester_id=requester_id, status=status, page=page, page_size=page_size)
@@ -300,12 +284,10 @@ async def list_chatbot_tickets(
 # ==================== 确定性逻辑链 ====================
 
 @router.post("/logic-chains/evaluate", summary="评估并执行逻辑链")
-async def evaluate_logic_chain(event: Dict[str, Any], context_org_unit: str = Query(...)):
+async def evaluate_logic_chain(event: Dict[str, Any], context_org_unit: str = Query(...), db: AsyncSession = Depends(get_db)):
     """全局逻辑链评估：根据事件触发所有匹配的逻辑链并执行动作"""
     from core.rcc.services import LogicChainEngine
-    from database.db_config import get_db
-    
-    db = next(get_db())
+
     engine = LogicChainEngine(db)
     try:
         results = await engine.evaluate(event=event, context_org_unit=context_org_unit)
@@ -318,18 +300,18 @@ async def evaluate_logic_chain(event: Dict[str, Any], context_org_unit: str = Qu
 async def list_logic_chains(
     org_unit_id: Optional[str] = None,
     trigger_event: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
 ):
     """查询确定性逻辑链配置"""
-    from database.models import DeterministicLogicChain
+    from core.rcc.models import DeterministicLogicChain
     from sqlalchemy import select as sa_select
-    
-    db = next(get_db())
+
     query = sa_select(DeterministicLogicChain)
     if org_unit_id:
         query = query.where(DeterministicLogicChain.org_unit_id == org_unit_id)
     if trigger_event:
         query = query.where(DeterministicLogicChain.trigger_event == trigger_event)
-    
+
     chains = list((await db.execute(query)).scalars().all())
     return {"items": [
         {
@@ -340,6 +322,156 @@ async def list_logic_chains(
             "created_at": c.created_at.isoformat() if c.created_at else None,
         } for c in chains
     ], "total": len(chains)}
+
+
+@router.post("/logic-chains", status_code=201, summary="创建逻辑链")
+async def create_logic_chain(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """创建确定性逻辑链（可视化编排器保存）"""
+    from core.rcc.models import DeterministicLogicChain
+
+    for f in ("chain_code", "chain_name", "trigger_event"):
+        if not payload.get(f):
+            raise HTTPException(status_code=400, detail=f"缺少必填字段：{f}")
+    chain = DeterministicLogicChain(
+        chain_code=payload["chain_code"],
+        chain_name=payload["chain_name"],
+        trigger_event=payload["trigger_event"],
+        conditions=payload.get("conditions") or [],
+        action_sequence=payload.get("action_sequence") or [],
+        org_unit_id=payload.get("org_unit_id"),
+        enabled=bool(payload.get("enabled", True)),
+        execution_order=int(payload.get("execution_order", 0)),
+    )
+    db.add(chain)
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"保存失败（chain_code 可能重复）：{exc}")
+    return {"id": chain.id, "chain_code": chain.chain_code}
+
+
+@router.put("/logic-chains/{chain_id}", summary="更新逻辑链")
+async def update_logic_chain(chain_id: str, payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """更新确定性逻辑链配置"""
+    from core.rcc.models import DeterministicLogicChain
+    from sqlalchemy import select as sa_select
+
+    chain = (await db.execute(
+        sa_select(DeterministicLogicChain).where(DeterministicLogicChain.id == chain_id)
+    )).scalar_one_or_none()
+    if not chain:
+        raise HTTPException(status_code=404, detail="逻辑链不存在")
+    for f in ("chain_name", "trigger_event", "conditions", "action_sequence", "org_unit_id"):
+        if f in payload:
+            setattr(chain, f, payload[f])
+    if "enabled" in payload:
+        chain.enabled = bool(payload["enabled"])
+    if "execution_order" in payload:
+        chain.execution_order = int(payload["execution_order"])
+    await db.commit()
+    return {"id": chain.id, "chain_code": chain.chain_code, "updated": True}
+
+
+@router.delete("/logic-chains/{chain_id}", summary="删除逻辑链")
+async def delete_logic_chain(chain_id: str, db: AsyncSession = Depends(get_db)):
+    """删除确定性逻辑链"""
+    from core.rcc.models import DeterministicLogicChain
+    from sqlalchemy import select as sa_select
+
+    chain = (await db.execute(
+        sa_select(DeterministicLogicChain).where(DeterministicLogicChain.id == chain_id)
+    )).scalar_one_or_none()
+    if not chain:
+        raise HTTPException(status_code=404, detail="逻辑链不存在")
+    await db.delete(chain)
+    await db.commit()
+    return {"deleted": True}
+
+
+# ==================== 组织泡泡图（任务智慧中心） ====================
+
+@router.get("/org-bubbles", summary="组织泡泡图数据 - 任务智慧中心")
+async def org_bubbles(factory_id: str = Query("F01")):
+    """聚合 org_panel 节点 + 逻辑链，生成力导向泡泡图数据
+
+    每个节点 = 一个组织泡泡（大小=负荷，颜色=健康度）
+    每条链 = 泡泡间连线（信号传导关系）
+    """
+    from core.org_panel.presets import build_electronics_factory
+    from core.org_panel.signals import SignalType
+
+    # 获取引擎单例（复用 org_panel 的实例）
+    from core.org_panel.api_adapter import get_engine
+    engine = get_engine()
+
+    nodes = []
+    for nid, node in engine.nodes.items():
+        # 计算健康度：有无 violations + 关键信号判断
+        health = "normal"  # normal / warning / danger
+        if node.violations:
+            health = "danger"
+        else:
+            # 检查关键输出信号是否越界
+            outputs = node.output_signals
+            escalation = outputs.get(SignalType.ESCALATION_LEVEL, 0)
+            if escalation >= 2:
+                health = "danger"
+            elif escalation >= 1:
+                health = "warning"
+            # 设备可用率低 → warning
+            avail = outputs.get(SignalType.AVAILABILITY, 1.0)
+            if avail < 0.85:
+                health = "warning" if health == "normal" else health
+
+        # 负荷 = 输出信号数量 + 参数数量 的综合（归一化到 0-1）
+        load_score = min(1.0, (len(node.output_signals) * 0.08 + len(node.parameters) * 0.05 + len(node.violations) * 0.2))
+
+        nodes.append({
+            "id": nid,
+            "name": node.name,
+            "level": node.level,
+            "scope": node.scope,
+            "health": health,
+            "load": round(load_score, 3),
+            "violations": node.violations,
+            "key_outputs": {
+                k.label: round(v, 4)
+                for k, v in list(node.output_signals.items())[:6]
+            },
+            "param_count": len(node.parameters),
+            "capability_count": len(node.capabilities),
+        })
+
+    edges = []
+    for chain in engine.chains:
+        for link in chain.links:
+            source_node = engine.nodes.get(link.source_node_id)
+            current_value = None
+            if source_node and link.source_signal in source_node.output_signals:
+                current_value = round(source_node.output_signals[link.source_signal], 4)
+            edges.append({
+                "source": link.source_node_id,
+                "target": link.target_node_id,
+                "signal": link.source_signal.label,
+                "target_signal": link.target_signal.label,
+                "label": link.label or f"{link.source_signal.label}→{link.target_signal.label}",
+                "chain_name": chain.name,
+                "value": current_value,
+                "latency_h": link.latency_hours,
+            })
+
+    return {
+        "success": True,
+        "factory_id": factory_id,
+        "nodes": nodes,
+        "edges": edges,
+        "meta": {
+            "total_nodes": len(nodes),
+            "total_edges": len(edges),
+            "chains": [c.name for c in engine.chains],
+        },
+    }
 
 
 __all__ = ["router"]

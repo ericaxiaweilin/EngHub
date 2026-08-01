@@ -32,6 +32,7 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+DROP TRIGGER IF EXISTS update_work_order_pause_reasons_timestamp ON work_order_pause_reasons;
 CREATE TRIGGER update_work_order_pause_reasons_timestamp
 BEFORE UPDATE ON work_order_pause_reasons
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

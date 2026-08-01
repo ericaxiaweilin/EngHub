@@ -8,8 +8,11 @@ v2.5 - Work Order Template Engine
 import uuid
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database.db_config import get_db
 
 router = APIRouter(prefix="/api/v1/work-order-templates", tags=["work-order-templates"])
 
@@ -138,15 +141,12 @@ async def preview_template(template_code: str):
 
 
 @router.post("/create", status_code=201, summary="基于模板创建程序工单")
-async def create_work_order_from_template(payload: TemplateCreateRequest):
+async def create_work_order_from_template(payload: TemplateCreateRequest, db: AsyncSession = Depends(get_db)):
     """
     基于预设模板创建正式程序工单，继承上下文信息。
     模板包括：NCR(品质异常)、MAINT(设备维修)、ECR(工艺变更)、FAI(首件检验)、SCRAP(报废申请)
     """
     from database.models import WorkOrder
-    from database.db_config import get_db
-
-    db = next(get_db())
 
     # 校验模板存在
     if payload.template_code not in WORK_ORDER_TEMPLATES:

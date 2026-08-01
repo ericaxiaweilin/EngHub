@@ -131,7 +131,7 @@ class User(Base):
     
     __tablename__ = "users"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     username = Column(String(50), unique=True, nullable=False, index=True)
     email = Column(String(100), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
@@ -165,7 +165,7 @@ class WorkOrder(Base):
     
     __tablename__ = "work_orders"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     work_order_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
     sales_order_id = Column(String(50), index=True)
@@ -191,7 +191,7 @@ class WorkOrder(Base):
     partial_completion_percentage = Column(Float, default=0)
     bom_version = Column(String(50))
     # ---- 工单体系化编码：层级字段（主工单 <-> 工序工单）----
-    parent_work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=True, index=True)
+    parent_work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
     wo_type = Column(String(20), nullable=False, default="master", index=True)  # master=主工单 / operation=工序工单
     process_code = Column(String(20), nullable=True, index=True)  # 行业通用工序代码（SMT/INJ/MACH...），主工单为空
     operation_seq = Column(Integer, nullable=True)  # 同一工序内道次序号（01/02...）
@@ -315,7 +315,7 @@ class WoStatusLog(Base):
     __tablename__ = "wo_status_logs"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
     action = Column(String(30), nullable=False)          # create/release/start/pause/resume/pending_inbound/complete/close/cancel/split
     from_status = Column(String(20), nullable=True)
     to_status = Column(String(20), nullable=False)
@@ -411,10 +411,10 @@ class ProductionReport(Base):
     
     __tablename__ = "production_reports"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     report_code = Column(String(50), unique=True, nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
-    work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
     station_id = Column(String(50), nullable=False, index=True)
     good_qty = Column(Integer, nullable=False, default=0)
     defect_qty = Column(Integer, default=0)
@@ -459,7 +459,7 @@ class ProductionReportComment(Base):
     __tablename__ = "production_report_comments"
     
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    report_id = Column(UUID(as_uuid=False), ForeignKey("production_reports.id"), nullable=False, index=True)
+    report_id = Column(String(36), ForeignKey("production_reports.id"), nullable=False, index=True)
     comment = Column(Text, nullable=False)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -884,6 +884,24 @@ class FiveSAudit(Base):
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_by = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkTeam(Base):
+    """报工小组：若干工号打包为一个整体，便于小组长批量报工"""
+
+    __tablename__ = "work_teams"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    team_code = Column(String(50), nullable=False, index=True)
+    team_name = Column(String(100), nullable=False)
+    leader_id = Column(String(50))  # 组长工号（报工时作为 operator_id）
+    member_ids = Column(JSON().with_variant(JSONB, "postgresql"), default=list)  # 组员工号列表
+    description = Column(Text)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -1467,7 +1485,7 @@ class ReconciliationLog(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     reconcile_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
-    work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=True, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
     planned_qty = Column(Integer, nullable=False, default=0)
     good_qty = Column(Integer, nullable=False, default=0)
     defect_qty = Column(Integer, nullable=False, default=0)
@@ -1670,12 +1688,33 @@ class QualityCost(Base):
 
 # ==================== APS 排程模型 ====================
 
+class APSRequest(Base):
+    """APS 重排请求队列（#11 PS事件解耦：报工生产者入队→消费者异步执行排程）"""
+    __tablename__ = "aps_schedule_requests"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    mode = Column(String(20), default="hybrid")
+    horizon_days = Column(Integer, default=7)
+    optimize_for = Column(String(20), default="delivery")
+    source_type = Column(String(30))  # report_created / report_modified / manual
+    source_id = Column(String(36))  # 触发源ID（如报工ID）
+    status = Column(String(20), default="pending", index=True)  # pending/in_progress/completed/failed
+    retry_count = Column(Integer, default=0)
+    max_retries = Column(Integer, default=3)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime)
+
+
 class ApsSchedule(Base):
     """排程计划"""
     __tablename__ = "aps_schedules"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50))
     status = Column(String(20))
     schedule_code = Column(String(50))
@@ -1702,8 +1741,8 @@ class ApsScheduleTask(Base):
     __tablename__ = "aps_schedule_tasks"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
-    schedule_id = Column(UUID(as_uuid=False))
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    schedule_id = Column(String(36))
     station_id = Column(String(50))
     planned_start = Column(DateTime)
     planned_end = Column(DateTime)
@@ -1951,7 +1990,7 @@ class ProductionAlert(Base):
     
     __tablename__ = "production_alerts"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50), nullable=False, index=True)  # 工厂
     alert_type = Column(String(50))  # 告警类型（缺料/设备故障/质量异常等）
     severity = Column(String(20))  # 严重程度（critical/high/medium/low）
@@ -2050,7 +2089,7 @@ class Notification(Base):
     
     __tablename__ = "notifications"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50), nullable=False, index=True)  # 工厂
     title = Column(String(255), nullable=False)  # 标题
     content = Column(Text)  # 内容

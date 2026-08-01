@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS supplier_materials (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Foreign key constraint (PostgreSQL syntax)
+-- Foreign key constraint (PostgreSQL syntax, idempotent for replay)
+ALTER TABLE supplier_materials
+DROP CONSTRAINT IF EXISTS fk_supplier_material_supplier;
 ALTER TABLE supplier_materials 
 ADD CONSTRAINT fk_supplier_material_supplier 
 FOREIGN KEY (supplier_id) REFERENCES suppliers(id) 

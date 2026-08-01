@@ -579,14 +579,16 @@ class ProcessAnalysisService:
     async def get_process_flow_analysis(
         self,
         factory_id: str,
-        product_id: str,
+        product_id: Optional[str] = None,
         limit: int = 100
     ) -> List[Dict[str, Any]]:
-        """获取产品的全流程价值分析"""
+        """获取产品的全流程价值分析（product_id 为空时返回工厂全部分析）"""
         query = select(ProcessAnalysis).where(
-            ProcessAnalysis.factory_id == factory_id,
-            ProcessAnalysis.product_id == product_id
-        ).order_by(ProcessAnalysis.analysis_date.desc()).limit(limit)
+            ProcessAnalysis.factory_id == factory_id
+        )
+        if product_id:
+            query = query.where(ProcessAnalysis.product_id == product_id)
+        query = query.order_by(ProcessAnalysis.analysis_date.desc()).limit(limit)
         
         result = (await self.db.execute(query)).scalars().all()
         return [r.to_dict() for r in result]
@@ -594,7 +596,7 @@ class ProcessAnalysisService:
     async def calculate_leaning_metrics(
         self,
         factory_id: str,
-        product_id: str
+        product_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """计算精益生产关键指标"""
         analyses = await self.get_process_flow_analysis(factory_id, product_id)
@@ -614,7 +616,7 @@ class ProcessAnalysisService:
             "average_lead_time": round(total_lead_time / len(analyses), 2),
             "average_va_ratio": round(avg_va_ratio * 100, 2),
             "analysis_count": len(analyses),
-            "improvement_potential": round((1 - avg_va_ratio) * 100, 2) if avg_ratio < 1 else 0,
+            "improvement_potential": round((1 - avg_va_ratio) * 100, 2) if avg_va_ratio < 1 else 0,
         }
 
 class PerformanceRatingService:

@@ -8,10 +8,10 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_HOST="${DEPLOY_HOST:-eric@100.96.188.77}"
 REMOTE_DIR="${REMOTE_DIR:-/home/eric/enghub}"
-CONTAINER="${CONTAINER:-enghub}"
-DB_CONTAINER="${DB_CONTAINER:-engflow-postgres}"
-DB_USER="${DB_USER:-postgres}"
-DB_NAME="${DB_NAME:-bom_intelligence}"
+CONTAINER="${CONTAINER:-docker-backend-1}"
+DB_CONTAINER="${DB_CONTAINER:-docker-postgres-1}"
+DB_USER="${DB_USER:-enghub}"
+DB_NAME="${DB_NAME:-enghub}"
 DEPLOY_BASE_SHA="${DEPLOY_BASE_SHA:-}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18888/health}"
 PUBLIC_URL="${PUBLIC_URL:-http://${DEPLOY_HOST#*@}:18888}"
@@ -153,19 +153,10 @@ for file in main.py requirements.txt frontend/package.json frontend/package-lock
   fi
 done
 
-# First make sure the running container has the full tracked source snapshot.
-# The manifest loop below still applies migrations and removes deleted files.
-for dir in api core database integrations scripts; do
-  if [[ -d "$RELEASE_DIR/source/$dir" ]]; then
-    docker exec -u 0 "$CONTAINER" mkdir -p "/app/$dir"
-    docker cp "$RELEASE_DIR/source/$dir/." "$CONTAINER:/app/$dir/"
-    docker exec -u 0 "$CONTAINER" chown -R appuser:appgroup "/app/$dir"
-  fi
-done
-if [[ -f "$RELEASE_DIR/source/main.py" ]]; then
-  docker cp "$RELEASE_DIR/source/main.py" "$CONTAINER:/app/main.py"
-  docker exec -u 0 "$CONTAINER" chown appuser:appgroup /app/main.py
-fi
+# Volume 挂载模式：代码目录直接从宿主机映射进容器，无需 docker cp
+# 只需确保权限正确（容器以 appuser 运行）
+chmod -R 755 "$REMOTE_DIR/api" "$REMOTE_DIR/core" "$REMOTE_DIR/database" "$REMOTE_DIR/integrations" 2>/dev/null || true
+chmod 644 "$REMOTE_DIR/main.py" 2>/dev/null || true
 
 while IFS=$'\t' read -r status path extra; do
   [[ -z "$status" || -z "$path" ]] && continue
@@ -173,6 +164,10 @@ while IFS=$'\t' read -r status path extra; do
     R*) path="$extra" ;;
   esac
   case "$path" in
+    *" 2."*)
+      # Skip duplicate " 2" copies (Finder artifacts); they are not real sources.
+      continue
+      ;;
     requirements*.txt)
       echo "依赖文件已变化，热部署不支持；请先构建新镜像。" >&2
       exit 1
@@ -186,20 +181,20 @@ while IFS=$'\t' read -r status path extra; do
       continue
       ;;
     api/*|core/*|database/*.py|integrations/*|main.py)
+      # Volume 挂载模式下文件已同步到宿主机，无需 docker cp
+      # 仅处理删除操作（从宿主机移除）
       if [[ "$status" == D* ]]; then
-        docker exec -u 0 "$CONTAINER" rm -f "/app/$path"
-      else
-        docker exec -u 0 "$CONTAINER" mkdir -p "/app/$(dirname "$path")"
-        docker cp "$RELEASE_DIR/source/$path" "$CONTAINER:/app/$path"
-        docker exec -u 0 "$CONTAINER" chown appuser:appgroup "/app/$path"
+        rm -f "$REMOTE_DIR/$path"
       fi
       ;;
   esac
 done < "$MANIFEST"
 
-docker exec -u 0 "$CONTAINER" rm -rf /app/frontend_dist
-docker cp "$RELEASE_DIR/frontend_dist" "$CONTAINER:/app/frontend_dist"
-docker exec -u 0 "$CONTAINER" chown -R appuser:appgroup /app/frontend_dist
+# 前端产物直接写入 volume 挂载目录
+rm -rf "$REMOTE_DIR/frontend_dist"
+mkdir -p "$REMOTE_DIR/frontend_dist"
+cp -r "$RELEASE_DIR/frontend_dist/." "$REMOTE_DIR/frontend_dist/"
+chmod -R 755 "$REMOTE_DIR/frontend_dist"
 
 docker restart "$CONTAINER" >/dev/null
 
@@ -226,3 +221,11 @@ REMOTE
 
 ok "部署完成: ${SHORT_SHA}"
 printf '生产地址: %s\n' "$PUBLIC_URL"
+
+# ━━━ 部署后验证（表/列/数据/API 缺失则失败）━━━
+info "运行部署验证 checklist"
+if ssh "$DEPLOY_HOST" "bash '$REMOTE_DIR/scripts/deploy_verify.sh'"; then
+  ok "部署验证通过 ✓"
+else
+  fail "部署验证失败！请检查上方输出并修复。"
+fi

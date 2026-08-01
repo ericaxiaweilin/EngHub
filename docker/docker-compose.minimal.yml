@@ -60,6 +60,20 @@ services:
       - model-stack
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      # 代码目录挂载：容器重建不丢代码
+      - /home/eric/enghub/api:/app/api
+      - /home/eric/enghub/core:/app/core
+      - /home/eric/enghub/database:/app/database
+      - /home/eric/enghub/integrations:/app/integrations
+      - /home/eric/enghub/main.py:/app/main.py
+      - /home/eric/enghub/frontend_dist:/app/frontend_dist
+    healthcheck:
+      test: ['CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8000/health")']
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
     # 内存限制 2GB (Python应用需要更多内存)
     deploy:

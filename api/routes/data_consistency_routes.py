@@ -6,18 +6,20 @@ v2.5 - Data Consistency API Routes
 """
 
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database.db_config import get_db
 
 router = APIRouter(prefix="/api/v1/data-consistency", tags=["data-consistency"])
 
 
 @router.get("/reconciliation/work-orders/{work_order_id}", summary="对账单个工单")
-async def reconcile_work_order(work_order_id: str):
+async def reconcile_work_order(work_order_id: str, db: AsyncSession = Depends(get_db)):
     """触发单个工单的自动对账"""
     from api.services.data_consistency_service import DataConsistencyService
-    from database.db_config import get_db
 
-    db = next(get_db())
     service = DataConsistencyService(db)
     try:
         result = await service.reconcile_work_order(work_order_id)
@@ -27,12 +29,10 @@ async def reconcile_work_order(work_order_id: str):
 
 
 @router.post("/reconciliation/batch", summary="批量对账")
-async def batch_reconcile(factory_id: str = Query(...)):
+async def batch_reconcile(factory_id: str = Query(...), db: AsyncSession = Depends(get_db)):
     """对所有进行中的工单执行批量对账"""
     from api.services.data_consistency_service import DataConsistencyService
-    from database.db_config import get_db
 
-    db = next(get_db())
     service = DataConsistencyService(db)
     try:
         results = await service.batch_reconcile_all(factory_id)
@@ -48,12 +48,10 @@ async def batch_reconcile(factory_id: str = Query(...)):
 
 
 @router.get("/replenishment/pending", summary="待处理补货任务")
-async def list_pending_replenishments(factory_id: str = Query(...)):
+async def list_pending_replenishments(factory_id: str = Query(...), db: AsyncSession = Depends(get_db)):
     """查看线边仓拉动式补货任务列表"""
     from api.services.data_consistency_service import DataConsistencyService
-    from database.db_config import get_db
 
-    db = next(get_db())
     service = DataConsistencyService(db)
     tasks = await service.list_pending_replenishments(factory_id)
     return {"items": [
@@ -67,12 +65,10 @@ async def list_pending_replenishments(factory_id: str = Query(...)):
 
 
 @router.post("/replenishment/check", summary="检查并创建补货任务")
-async def check_and_create_replenishment_tasks():
+async def check_and_create_replenishment_tasks(db: AsyncSession = Depends(get_db)):
     """扫描所有阈值，自动创建低于水位线的补货任务"""
     from api.services.data_consistency_service import DataConsistencyService
-    from database.db_config import get_db
 
-    db = next(get_db())
     service = DataConsistencyService(db)
     try:
         tasks = await service.check_and_create_replenishment_tasks()
@@ -89,11 +85,11 @@ async def trace_by_batch(
     work_order_id: Optional[str] = None,
     batch_code: Optional[str] = None,
     item_code: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
 ):
     """一物一码正反向追溯链（简化版）"""
     from database.models import ItemTraceability
 
-    db = next(get_db())
     stmt = select(ItemTraceability).where(ItemTraceability.factory_id == factory_id)
 
     if work_order_id:

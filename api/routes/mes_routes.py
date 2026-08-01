@@ -74,6 +74,7 @@ class ProductionReportCreate(BaseModel):
     actual_end_time: Optional[datetime] = None
     quality_check_passed: Optional[bool] = None
     remark: Optional[str] = None
+    report_date: Optional[datetime] = None  # 可选报工日期（补录历史报工）
 
 
 class ProductionReportComment(BaseModel):
@@ -899,6 +900,7 @@ async def create_production_report(
             quality_check_passed=report.quality_check_passed,
             remark=report.remark,
             created_by=current_user.username,
+            report_date=report.report_date,
         )
         return {
             "id": production_report.id,

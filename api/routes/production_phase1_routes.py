@@ -3,6 +3,7 @@
 """
 from fastapi import APIRouter, Depends, Query, HTTPException
 from typing import Optional, List
+from datetime import datetime
 from pydantic import BaseModel
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +34,8 @@ class QuickReportRequest(BaseModel):
     cycle_time_sec: Optional[float] = None
     remark: Optional[str] = None
     shift: Optional[str] = None
+    report_date: Optional[datetime] = None  # 可选报工日期（补录）
+    assistant_operator_ids: Optional[List[str]] = None  # 协作人员工号（小组报工）
 
 
 class BatchReportItem(BaseModel):
@@ -47,6 +50,8 @@ class BatchReportItem(BaseModel):
     machine_id: Optional[str] = None
     cycle_time_sec: Optional[float] = None
     remark: Optional[str] = None
+    report_date: Optional[datetime] = None
+    assistant_operator_ids: Optional[List[str]] = None
 
 
 class BatchReportRequest(BaseModel):
@@ -54,6 +59,8 @@ class BatchReportRequest(BaseModel):
     items: List[BatchReportItem]
     operator_id: Optional[str] = None
     shift: Optional[str] = None
+    report_date: Optional[datetime] = None  # 批量统一报工日期（可被行内 report_date 覆盖）
+    assistant_operator_ids: Optional[List[str]] = None  # 批量统一协作人员（可被行内覆盖）
 
 
 # ==================== 报工终端 ====================
@@ -109,6 +116,8 @@ async def quick_report(
         cycle_time_sec=req.cycle_time_sec,
         remark=req.remark,
         shift=req.shift,
+        report_date=req.report_date,
+        assistant_operator_ids=req.assistant_operator_ids,
     )
     return result
 
@@ -127,6 +136,8 @@ async def batch_report(
         items=items,
         operator_id=req.operator_id or current_user.username,
         shift=req.shift,
+        report_date=req.report_date,
+        assistant_operator_ids=req.assistant_operator_ids,
     )
     return result
 

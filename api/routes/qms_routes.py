@@ -470,6 +470,27 @@ async def submit_inspection(
     return result
 
 
+@router.get("/qms/spc/configs")
+async def list_spc_configs(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出可用的 SPC 质量特性"""
+    from sqlalchemy import select, distinct
+    from database.models import QmsSpcPoint
+    res = await db.execute(
+        select(
+            QmsSpcPoint.characteristic_code,
+            QmsSpcPoint.characteristic_name,
+        )
+        .where(QmsSpcPoint.factory_id == factory_id)
+        .group_by(QmsSpcPoint.characteristic_code, QmsSpcPoint.characteristic_name)
+        .order_by(QmsSpcPoint.characteristic_code)
+    )
+    return [{"code": r[0], "name": r[1] or r[0]} for r in res.all()]
+
+
 @router.get("/qms/spc")
 async def get_spc_chart(
     factory_id: str,
