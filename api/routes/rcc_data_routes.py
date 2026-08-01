@@ -9,6 +9,8 @@ RCC = Resource Control Center — 全局统筹人/物/工单计算
 """
 
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from database.db_config import get_db
 from typing import Optional, Dict, Any
 
 router = APIRouter(prefix="/api/v1/rcc", tags=["rcc"])
@@ -25,6 +27,7 @@ async def _rollback_safely(db) -> None:
 async def get_rcc_data(
     factory_id: Optional[str] = Query(None, description="工厂ID"),
     mode: str = Query("single", description="single|global"),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     综合数据层接口：从上游业务模块直接汇总人/设备/工单/环境/工艺真实基线、
@@ -34,10 +37,6 @@ async def get_rcc_data(
     - mode=global → 聚合所有工厂数据，适合 RCC 全局视角
     - factory_id=None + mode=single（默认）→ 尝试从上下文获取默认工厂
     """
-    from database.db_config import get_db
-    
-    db_generator = get_db()
-    db = await db_generator.__anext__()
     try:
         # 1. 全量计算引擎
         from core.rcc.calculator import RCCResourceCalculator
@@ -148,19 +147,15 @@ async def get_rcc_data(
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    finally:
-        if hasattr(db_generator, 'aclose'):
-            await db_generator.aclose()
 
 
 @router.get("/baseline", summary="RCC全量基线概览")
-async def get_full_baseline(factory_id: str = Query(..., description="工厂ID")):
+async def get_full_baseline(
+    factory_id: str = Query(..., description="工厂ID"),
+    db: AsyncSession = Depends(get_db),
+):
     """全量RCC基线，汇总人/设备/工单/环境/工艺五维数据"""
     from core.rcc.calculator import RCCResourceCalculator
-    from database.db_config import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession
-    
-    db: AsyncSession = await get_db().__anext__()
     try:
         calc = RCCResourceCalculator(db)
         result = await calc.full_baseline_sync(factory_id)
@@ -170,13 +165,9 @@ async def get_full_baseline(factory_id: str = Query(..., description="工厂ID")
 
 
 @router.get("/baseline/people", summary="人力基线明细")
-async def get_people_baseline(factory_id: str = Query(...)):
+async def get_people_baseline(factory_id: str = Query(...), db: AsyncSession = Depends(get_db)):
     """人力资源基线：编制、在岗率、技能分布、负荷预警"""
     from core.rcc.calculator import RCCResourceCalculator
-    from database.db_config import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession
-    
-    db: AsyncSession = await get_db().__anext__()
     try:
         calc = RCCResourceCalculator(db)
         result = await calc.people_baseline(factory_id)
@@ -186,13 +177,9 @@ async def get_people_baseline(factory_id: str = Query(...)):
 
 
 @router.get("/baseline/equipment", summary="设备基线明细")
-async def get_equipment_baseline(factory_id: str = Query(...)):
+async def get_equipment_baseline(factory_id: str = Query(...), db: AsyncSession = Depends(get_db)):
     """设备产能基线：状态、OEE目标、PM逾期、利用率"""
     from core.rcc.calculator import RCCResourceCalculator
-    from database.db_config import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession
-    
-    db: AsyncSession = await get_db().__anext__()
     try:
         calc = RCCResourceCalculator(db)
         result = await calc.equipment_baseline(factory_id)
@@ -202,13 +189,9 @@ async def get_equipment_baseline(factory_id: str = Query(...)):
 
 
 @router.get("/baseline/work_orders", summary="工单统筹基线")
-async def get_work_order_baseline(factory_id: str = Query(...)):
+async def get_work_order_baseline(factory_id: str = Query(...), db: AsyncSession = Depends(get_db)):
     """工单统筹：状态分布、急单比例、交期风险、齐套率、APS状态"""
     from core.rcc.calculator import RCCResourceCalculator
-    from database.db_config import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession
-    
-    db: AsyncSession = await get_db().__anext__()
     try:
         calc = RCCResourceCalculator(db)
         result = await calc.work_order_baseline(factory_id)
@@ -218,13 +201,9 @@ async def get_work_order_baseline(factory_id: str = Query(...)):
 
 
 @router.get("/baseline/process", summary="工艺基线明细")
-async def get_process_baseline(factory_id: str = Query(...)):
+async def get_process_baseline(factory_id: str = Query(...), db: AsyncSession = Depends(get_db)):
     """工艺基线：节拍时间、良品率基线、AQL级别、质量目标对标"""
     from core.rcc.calculator import RCCResourceCalculator
-    from database.db_config import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession
-    
-    db: AsyncSession = await get_db().__anext__()
     try:
         calc = RCCResourceCalculator(db)
         result = await calc.process_baseline(factory_id)
@@ -234,7 +213,10 @@ async def get_process_baseline(factory_id: str = Query(...)):
 
 
 @router.post("/calculate", summary="触发RCC统筹计算")
-async def trigger_calculation(payload: Dict[str, Any] = Body(default={})):
+async def trigger_calculation(
+    payload: Dict[str, Any] = Body(default={}),
+    db: AsyncSession = Depends(get_db),
+):
     """
     触发全量RCC统筹计算。
     payload可选：
@@ -247,43 +229,40 @@ async def trigger_calculation(payload: Dict[str, Any] = Body(default={})):
     factory_id = payload.get("factory_id", "FAC_MECH_001")
 
     from core.rcc.calculator import RCCResourceCalculator
-    from database.db_config import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
     from database.models import Notification
     import uuid
-    
-    engine = create_async_engine("postgresql+asyncpg://enghub:enghub123@localhost:5432/enghub")
-    async with engine.begin() as conn:
-        calc = RCCResourceCalculator(conn)
-        try:
-            result = await calc.full_baseline_sync(factory_id)
-            
-            # 写入Notification作为计算完成通知
-            modules_str = ", ".join(payload.get('modules', ['全部']))
-            n = Notification(
-                id=str(uuid.uuid4()),
-                factory_id=factory_id,
-                recipient=None,
-                category="system",
-                title="RCC统筹基线已更新",
-                content=f"工厂{factory_id}的RCC基线已重新计算，涉及模块: {modules_str}",
-                severity="info",
-                source_type="rcc_baseline",
-                is_read=False,
-                created_at=__import__('datetime').datetime.utcnow(),
-            )
-            conn.add(n)
-            await conn.commit()
-            
-            return {"success": True, "data": result}
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-    
-    await engine.dispose()
+
+    calc = RCCResourceCalculator(db)
+    try:
+        result = await calc.full_baseline_sync(factory_id)
+
+        # 写入Notification作为计算完成通知
+        modules_str = ", ".join(payload.get('modules', ['全部']))
+        n = Notification(
+            id=str(uuid.uuid4()),
+            factory_id=factory_id,
+            recipient=None,
+            category="system",
+            title="RCC统筹基线已更新",
+            content=f"工厂{factory_id}的RCC基线已重新计算，涉及模块: {modules_str}",
+            severity="info",
+            source_type="rcc_baseline",
+            is_read=False,
+            created_at=__import__('datetime').datetime.utcnow(),
+        )
+        db.add(n)
+        await db.commit()
+
+        return {"success": True, "data": result}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/sync-baseline", summary="同步DB数据到RCC基线")
-async def sync_baseline(payload: Dict[str, Any] = Body(default={})):
+async def sync_baseline(
+    payload: Dict[str, Any] = Body(default={}),
+    db: AsyncSession = Depends(get_db),
+):
     """
     强制同步：将当前所有真实DB数据重新汇总到RCC基线。
     适用于批量数据变更后刷新基线。
@@ -291,16 +270,9 @@ async def sync_baseline(payload: Dict[str, Any] = Body(default={})):
     factory_id = payload.get("factory_id", "FAC_MECH_001")
 
     from core.rcc.calculator import RCCResourceCalculator
-    from database.db_config import get_db
-    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-    
-    engine = create_async_engine("postgresql+asyncpg://enghub:enghub123@localhost:5432/enghub")
-    async with engine.begin() as conn:
-        calc = RCCResourceCalculator(conn)
-        try:
-            result = await calc.full_baseline_sync(factory_id)
-            return {"success": True, "data": result}
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-    
-    await engine.dispose()
+    calc = RCCResourceCalculator(db)
+    try:
+        result = await calc.full_baseline_sync(factory_id)
+        return {"success": True, "data": result}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
