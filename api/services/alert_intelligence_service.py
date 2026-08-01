@@ -18,12 +18,10 @@
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-import httpx
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,12 +30,6 @@ from database.models import (
     Equipment, WorkOrder,
 )
 from core.andon.models import AndonTicket
-
-# LLM 配置（复用 chat_routes 的环境变量）
-GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://host.docker.internal:14040").rstrip("/")
-API_KEY = os.getenv("LLM_API_KEY", "")
-MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "30"))
 
 # 预警来源标签
 SOURCE_LABELS = {
@@ -146,19 +138,22 @@ async def _call_llm_for_review(context: str, source: str) -> Dict[str, Any]:
     prompt = REVIEW_PROMPT_TEMPLATE.format(source_label=source_label, context=context)
 
     try:
-        headers = {"Content-Type": "application/json"}
-        if API_KEY:
-            headers["Authorization"] = f"Bearer {API_KEY}"
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.post(
-                f"{GATEWAY_URL}/v1/chat/completions",
-                json={
-                    "model": MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2,
-                },
-                headers=headers,
-            )
+        from api.routes.chat_routes import (
+            MODEL_STACK_CHAT_TASK_ID, _call_llm, _resolve_model_route,
+        )
+        route = await _resolve_model_route(
+            MODEL_STACK_CHAT_TASK_ID, prompt_tokens=max(1, len(prompt) // 4),
+            max_completion_tokens=800,
+        )
+        resp = await _call_llm(
+            {
+                "model": route["gateway_model"],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": route["max_completion_tokens"],
+            },
+            request_timeout=route["request_timeout"],
+        )
         if resp.status_code < 400:
             content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
             # 尝试解析 JSON

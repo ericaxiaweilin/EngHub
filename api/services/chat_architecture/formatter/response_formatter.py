@@ -12,11 +12,11 @@ from datetime import datetime
 class ResponseFormatter:
     """Format chatbot responses according to standardized templates."""
     
-    def format_success(self, reply_text: str, model: str = "deepseek-v4-pro", degraded: bool = False) -> Dict[str, Any]:
+    def format_success(self, reply_text: str, model: Optional[str] = None, degraded: bool = False) -> Dict[str, Any]:
         """Format a successful chat response."""
         response = {
             "reply": reply_text,
-            "model": model,
+            "model": model or "dynamic-route",
             "degraded": degraded,
             "timestamp": datetime.now().isoformat(),
         }

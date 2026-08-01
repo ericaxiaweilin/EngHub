@@ -3,7 +3,7 @@
  * 可拖拽移动、最小化/最大化，参考 luaguage ChatbotWidget 交互模式
  */
 import React, { useState, useRef, useEffect, useCallback, lazy, Suspense } from 'react'
-import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Modal, Form, Radio, message, Table, Select, Empty, Popconfirm } from 'antd'
+import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Popover, Modal, Form, Radio, message, Table, Select, Empty, Popconfirm } from 'antd'
 import {
   RobotOutlined, TeamOutlined, SendOutlined, MinusOutlined,
   ExpandOutlined, CompressOutlined, CloseOutlined,
@@ -14,7 +14,7 @@ import {
   CopyOutlined, ShareAltOutlined, CommentOutlined, InboxOutlined,
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
   PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
-  CarryOutOutlined,
+  CarryOutOutlined, InfoCircleOutlined,
 } from '@ant-design/icons'
 
 // 任务中心（嵌入 chatbot 浮窗第三个 tab）
@@ -110,6 +110,10 @@ interface ChatAgent {
   key: string
   name: string
   description: string
+  capabilities?: string[]
+  inputs?: string[]
+  outputs?: string[]
+  boundaries?: string[]
 }
 
 // ---------- 快速命令（后端 CRUD，新增后自动归类智能体） ----------
@@ -1379,9 +1383,29 @@ export default function AIAssistantWidget() {
                           ]}
                         />
                         {selectedAgent !== 'auto' && (
-                          <Text type="secondary" style={{ fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {agents.find(a => a.key === selectedAgent)?.description}
-                          </Text>
+                          <>
+                            <Text type="secondary" style={{ fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {agents.find(a => a.key === selectedAgent)?.description}
+                            </Text>
+                            <Popover
+                              placement="topLeft"
+                              title={`${agents.find(a => a.key === selectedAgent)?.name || '智能体'}职责说明`}
+                              content={(() => {
+                                const agent = agents.find(a => a.key === selectedAgent)
+                                if (!agent) return null
+                                return (
+                                  <div style={{ width: 300, fontSize: 12 }}>
+                                    <div style={{ marginBottom: 6 }}><Text strong>能做什么：</Text>{(agent.capabilities || []).join('、') || agent.description}</div>
+                                    <div style={{ marginBottom: 6 }}><Text strong>输入：</Text>{(agent.inputs || []).join('、') || '按当前会话上下文'}</div>
+                                    <div style={{ marginBottom: 6 }}><Text strong>输出：</Text>{(agent.outputs || []).join('、') || '结构化处理结果'}</div>
+                                    <div><Text strong>边界：</Text>{(agent.boundaries || []).join('；') || '超出职责时升级人工'}</div>
+                                  </div>
+                                )
+                              })()}
+                            >
+                              <Button type="text" size="small" icon={<InfoCircleOutlined />} aria-label="查看智能体职责" />
+                            </Popover>
+                          </>
                         )}
                       </div>
                     )}

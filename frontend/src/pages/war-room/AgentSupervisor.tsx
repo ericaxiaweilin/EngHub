@@ -23,6 +23,10 @@ interface AgentStatus {
   key: string
   name: string
   description: string
+  capabilities: string[]
+  inputs: string[]
+  outputs: string[]
+  boundaries: string[]
   sensing: string
   last_action: any
   running_tasks: number
@@ -156,6 +160,12 @@ const AgentSupervisor: React.FC = () => {
                     extra={<Tag color={sensingMap[agent.sensing]?.color}>{sensingMap[agent.sensing]?.text || agent.sensing}</Tag>}
                   >
                     <Text type="secondary" style={{ fontSize: 12 }}>{agent.description}</Text>
+                    <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.7 }}>
+                      <div><Text strong>能做什么：</Text>{(agent.capabilities || []).join('、')}</div>
+                      <div><Text strong>输入：</Text>{(agent.inputs || []).join('、')}</div>
+                      <div><Text strong>输出：</Text>{(agent.outputs || []).join('、')}</div>
+                      <div><Text strong>边界：</Text>{(agent.boundaries || []).join('；')}</div>
+                    </div>
                     <div style={{ marginTop: 8 }}>
                       <Space size="large">
                         <Statistic title="运行中" value={agent.running_tasks} valueStyle={{ fontSize: 16 }} />

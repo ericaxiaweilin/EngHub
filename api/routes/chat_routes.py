@@ -141,11 +141,14 @@ async def chat_health():
     if configured:
         try:
             route = await _resolve_model_route(MODEL_STACK_CHAT_TASK_ID)
+            gateway_headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
             async with httpx.AsyncClient(timeout=5.0) as client:
-                gateway_resp = await client.get(f"{GATEWAY_URL}/health")
-            reachable = gateway_resp.status_code < 500
+                gateway_resp = await client.get(
+                    f"{GATEWAY_URL}/v1/models", headers=gateway_headers,
+                )
+            reachable = gateway_resp.status_code < 400
             detail = (
-                f"control-plane=ready, gateway={gateway_resp.status_code}, "
+                f"control-plane=ready, gateway_models={gateway_resp.status_code}, "
                 f"route={route['task_id']}"
             )
         except Exception as exc:  # noqa: BLE001

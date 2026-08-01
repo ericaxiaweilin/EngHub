@@ -47,6 +47,10 @@ async def list_chat_agents(
                 "key": k,
                 "name": v["name"],
                 "description": v["description"],
+                "capabilities": v["capabilities"],
+                "inputs": v["inputs"],
+                "outputs": v["outputs"],
+                "boundaries": v["boundaries"],
                 "trigger": v["trigger"],
             }
             for k, v in AGENTS.items()

@@ -11,8 +11,14 @@ set -uo pipefail
 PG_CONTAINER="${PG_CONTAINER:-docker-postgres-1}"
 PG_USER="${PG_USER:-enghub}"
 PG_DB="${PG_DB:-enghub}"
-BACKEND_CONTAINER="${BACKEND_CONTAINER:-docker-backend-1}"
+BACKEND_CONTAINER="${BACKEND_CONTAINER:-enghub-backend-1}"
 BACKEND_PORT="${BACKEND_PORT:-18888}"
+MODEL_GATEWAY_CONTAINER="${MODEL_GATEWAY_CONTAINER:-model-stack-gateway}"
+MODEL_CONTROL_PLANE_CONTAINER="${MODEL_CONTROL_PLANE_CONTAINER:-model-stack-control-plane}"
+MODEL_GATEWAY_URL="${MODEL_GATEWAY_URL:-http://127.0.0.1:14040}"
+MODEL_CONTROL_PLANE_URL="${MODEL_CONTROL_PLANE_URL:-http://127.0.0.1:14041}"
+MODEL_CHAT_TASK_ID="${MODEL_CHAT_TASK_ID:-data_coin.advisor.chat}"
+MODEL_VISION_TASK_ID="${MODEL_VISION_TASK_ID:-luaguage.vision.content_analysis}"
 FACTORY_ID="${FACTORY_ID:-FAC_ELEC_DEMO_2026}"
 DATA_GUARD_FACTORIES="${DATA_GUARD_FACTORIES:-FAC_ELEC_DEMO_2026,FAC_MECH_001}"
 FRONTEND_DIST="${FRONTEND_DIST:-$(cd "$(dirname "$0")/.." && pwd)/frontend_dist}"
@@ -65,6 +71,65 @@ if [ "$PG_STATUS" = "running" ]; then
 else
     fail "数据库容器状态: $PG_STATUS"
 fi
+
+MODEL_GATEWAY_STATUS=$(docker inspect --format='{{.State.Status}}' "$MODEL_GATEWAY_CONTAINER" 2>/dev/null || echo "missing")
+if [ "$MODEL_GATEWAY_STATUS" = "running" ]; then
+    pass "模型网关容器 $MODEL_GATEWAY_CONTAINER 运行中"
+else
+    fail "模型网关容器 $MODEL_GATEWAY_CONTAINER 状态: $MODEL_GATEWAY_STATUS"
+fi
+
+MODEL_CONTROL_STATUS=$(docker inspect --format='{{.State.Status}}' "$MODEL_CONTROL_PLANE_CONTAINER" 2>/dev/null || echo "missing")
+if [ "$MODEL_CONTROL_STATUS" = "running" ]; then
+    pass "模型控制面容器 $MODEL_CONTROL_PLANE_CONTAINER 运行中"
+else
+    fail "模型控制面容器 $MODEL_CONTROL_PLANE_CONTAINER 状态: $MODEL_CONTROL_STATUS"
+fi
+
+MODEL_CONTROL_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$MODEL_CONTROL_PLANE_URL/health" 2>/dev/null || echo "000")
+if [ "$MODEL_CONTROL_CODE" = "200" ]; then
+    pass "模型控制面健康 ($MODEL_CONTROL_CODE)"
+else
+    fail "模型控制面不可达 ($MODEL_CONTROL_CODE)"
+fi
+
+MODEL_GATEWAY_KEY="${LLM_API_KEY:-}"
+if [ -z "$MODEL_GATEWAY_KEY" ]; then
+    MODEL_GATEWAY_KEY=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$BACKEND_CONTAINER" 2>/dev/null | awk -F= '$1=="LLM_API_KEY" {print substr($0, index($0, "=")+1); exit}')
+fi
+MODEL_GATEWAY_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
+    -H "Authorization: Bearer $MODEL_GATEWAY_KEY" "$MODEL_GATEWAY_URL/v1/models" 2>/dev/null || true)
+if [ "$MODEL_GATEWAY_CODE" = "200" ]; then
+    pass "模型网关模型清单可用且鉴权通过 ($MODEL_GATEWAY_CODE)"
+else
+    fail "模型网关模型清单不可用或鉴权失败 (${MODEL_GATEWAY_CODE:-000})"
+fi
+
+check_model_route() {
+    local task_id=$1 desc=$2
+    local route_json provider manifest_json target_model
+    route_json=$(curl -fsS --max-time 8 --get \
+        "$MODEL_CONTROL_PLANE_URL/api/model-management/business-tasks/${task_id}/route-request" \
+        --data-urlencode "prompt_tokens=64" \
+        --data-urlencode "max_completion_tokens=32" \
+        --data-urlencode "require_deployed=true" 2>/dev/null || true)
+    provider=$(printf '%s' "$route_json" | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('route_request',{}); print((r.get('providers') or [''])[0])" 2>/dev/null || true)
+    if [ -z "$provider" ]; then
+        fail "$desc 动态路由失败"
+        return
+    fi
+    manifest_json=$(curl -fsS --max-time 8 \
+        "$MODEL_CONTROL_PLANE_URL/api/model-management/providers/deployed" 2>/dev/null || true)
+    target_model=$(printf '%s' "$manifest_json" | python3 -c "import json,sys; d=json.load(sys.stdin); p=sys.argv[1]; rows=d.get('providers') or []; row=next((x for x in rows if isinstance(x,dict) and str(x.get('provider') or x.get('key') or '').strip()==p),{}); print(str(row.get('target_model') or row.get('model') or '').strip())" "$provider" 2>/dev/null || true)
+    if [ -n "$target_model" ]; then
+        pass "$desc 动态路由成功 ($provider -> $target_model)"
+    else
+        fail "$desc 路由 provider 未在已部署清单中 ($provider)"
+    fi
+}
+
+check_model_route "$MODEL_CHAT_TASK_ID" "模型 Chat 任务"
+check_model_route "$MODEL_VISION_TASK_ID" "模型 Vision 任务"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2. 必需表存在性检查
@@ -282,6 +347,29 @@ if [ -n "$TOKEN" ]; then
     pass "登录成功 (eric)"
 else
     fail "登录失败! 响应: ${LOGIN_RESP:0:100}"
+fi
+
+if [ -n "$TOKEN" ]; then
+    CHAT_HEALTH=$(curl -sS -H "Authorization: Bearer $TOKEN" \
+        "http://localhost:${BACKEND_PORT}/api/v1/chat/health" 2>/dev/null || echo "{}")
+    CHAT_HEALTH_OK=$(printf '%s' "$CHAT_HEALTH" | python3 -c "import json,sys; d=json.load(sys.stdin); print('1' if d.get('configured') and d.get('reachable') else '0')" 2>/dev/null || echo "0")
+    if [ "$CHAT_HEALTH_OK" = "1" ]; then
+        pass "Chatbot 模型路由健康"
+    else
+        fail "Chatbot 模型路由未就绪: ${CHAT_HEALTH:0:240}"
+    fi
+
+    MODEL_CHAT_PROBE=$(curl -sS -X POST "http://localhost:${BACKEND_PORT}/api/v1/chat" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "X-Factory-Id: ${FACTORY_ID}" \
+        -d '{"messages":[{"role":"user","content":"请只回复：模型链路探针正常"}],"enable_tools":false}' 2>/dev/null || echo "{}")
+    MODEL_CHAT_PROBE_OK=$(printf '%s' "$MODEL_CHAT_PROBE" | python3 -c "import json,sys; d=json.load(sys.stdin); print('1' if not d.get('degraded') and str(d.get('reply') or '').strip() else '0')" 2>/dev/null || echo "0")
+    if [ "$MODEL_CHAT_PROBE_OK" = "1" ]; then
+        pass "模型底座真实生成探针"
+    else
+        fail "模型底座真实生成失败: ${MODEL_CHAT_PROBE:0:240}"
+    fi
 fi
 
 check_api() {

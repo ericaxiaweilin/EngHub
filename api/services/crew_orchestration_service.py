@@ -17,22 +17,15 @@ Crew定义：
 不依赖crewai库，用相同模式自建（轻量+可控+可审计）。
 后续如需替换为crewai库，接口不变。
 """
-import os
 import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 _logger = logging.getLogger("crew_orchestration")
-
-LLM_GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://localhost:4000")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-placeholder")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
 
 # ═══════════════════════════════════════════════════════════
 # Crew 定义（组织层决策场景）
@@ -383,28 +376,32 @@ class CrewOrchestration:
         return "\n".join(parts)
 
     async def _call_llm(self, prompt: str) -> str:
-        """调用LLM网关"""
+        """通过公共模型底座按业务任务动态路由。"""
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    f"{LLM_GATEWAY_URL}/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-                    json={
-                        "model": LLM_MODEL,
-                        "messages": [
-                            {"role": "system", "content": "你是制造企业的智能决策系统。基于数据给出客观、结构化的分析和建议。"},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": 0.3,
-                        "max_tokens": 2000,
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data["choices"][0]["message"]["content"]
-                else:
-                    _logger.warning(f"[crew] LLM调用失败: {resp.status_code} {resp.text[:200]}")
-                    return json.dumps({"error": "LLM不可用", "fallback": "请人工决策"})
+            from api.routes.chat_routes import (
+                MODEL_STACK_CHAT_TASK_ID, _call_llm, _resolve_model_route,
+            )
+            route = await _resolve_model_route(
+                MODEL_STACK_CHAT_TASK_ID, prompt_tokens=max(1, len(prompt) // 4),
+                max_completion_tokens=2000,
+            )
+            resp = await _call_llm(
+                {
+                    "model": route["gateway_model"],
+                    "messages": [
+                        {"role": "system", "content": "你是制造企业的智能决策系统。基于数据给出客观、结构化的分析和建议。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": route["max_completion_tokens"],
+                },
+                request_timeout=route["request_timeout"],
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            _logger.warning(f"[crew] LLM调用失败: {resp.status_code} {resp.text[:200]}")
+            return json.dumps({"error": "LLM不可用", "fallback": "请人工决策"})
         except Exception as e:
             _logger.warning(f"[crew] LLM调用异常: {e}")
             return json.dumps({"error": str(e), "fallback": "请人工决策"})

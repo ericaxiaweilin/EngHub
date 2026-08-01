@@ -274,30 +274,31 @@ class PersonalKnowledgeService:
 请用{emp_name}的视角和经验回答，简洁实用。"""
 
         try:
-            llm_url = os.getenv("LLM_GATEWAY_URL", "http://localhost:4000")
-            llm_key = os.getenv("LLM_API_KEY", "sk-placeholder")
-            llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    f"{llm_url}/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {llm_key}"},
-                    json={
-                        "model": llm_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.5,
-                        "max_tokens": 500,
-                    },
-                )
-                if resp.status_code == 200:
-                    answer = resp.json()["choices"][0]["message"]["content"]
-                    return {
-                        "employee": emp_name,
-                        "position": emp_pos,
-                        "answer": answer,
-                        "confidence": min(80, len(context_items) * 10),
-                        "knowledge_used": len(context_items),
-                    }
+            from api.routes.chat_routes import (
+                MODEL_STACK_CHAT_TASK_ID, _call_llm, _resolve_model_route,
+            )
+            route = await _resolve_model_route(
+                MODEL_STACK_CHAT_TASK_ID, prompt_tokens=max(1, len(prompt) // 4),
+                max_completion_tokens=500,
+            )
+            resp = await _call_llm(
+                {
+                    "model": route["gateway_model"],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.5,
+                    "max_tokens": route["max_completion_tokens"],
+                },
+                request_timeout=route["request_timeout"],
+            )
+            if resp.status_code == 200:
+                answer = resp.json()["choices"][0]["message"]["content"]
+                return {
+                    "employee": emp_name,
+                    "position": emp_pos,
+                    "answer": answer,
+                    "confidence": min(80, len(context_items) * 10),
+                    "knowledge_used": len(context_items),
+                }
         except Exception as e:
             _logger.warning(f"[personal] LLM调用失败: {e}")
 

@@ -127,6 +127,8 @@ def build_agent_system_prompt(agent_key: str) -> Optional[str]:
     return (
         f"【智能体调度】用户已指定由「{agent['name']}」处理本次会话。"
         f"该智能体职责：{agent['description']}（触发场景：{agent['trigger']}）。"
+        f"输入范围：{'、'.join(agent['inputs'])}；输出范围：{'、'.join(agent['outputs'])}。"
+        f"职责边界：{'；'.join(agent['boundaries'])}。"
         f"请以该智能体的身份和专业视角回答，优先执行其职责范围内的查询与操作"
         + (f"（优先工具：{hints}）" if hints else "")
         + f"。执行完成后遵循其闭环验证要求：{agent['verify']}。"
