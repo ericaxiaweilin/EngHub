@@ -974,6 +974,7 @@ class Equipment(Base):
     purchase_date = Column(Date, nullable=True)
     warranty_expiry = Column(Date, nullable=True)
     maintenance_interval_days = Column(Integer, nullable=True)
+    responsible_engineer_id = Column(String(36), nullable=True, index=True)
     status = Column(String(20), default="available")
     last_maintenance_date = Column(DateTime)
     next_maintenance_date = Column(DateTime)
@@ -2044,18 +2045,25 @@ class MaintenanceOrder(Base):
     equipment_id = Column(String(50), nullable=False)  # 设备ID
     factory_id = Column(String(50), nullable=False, index=True)  # 工厂
     order_type = Column(String(50))  # 工单类型（预防性/ corrective/紧急）
+    # Legacy service contract kept alongside the newer order_type contract.
+    maintenance_type = Column(String(20), nullable=True)
     priority = Column(String(20), default="normal")  # 优先级
     status = Column(String(20), default="pending")  # 状态（pending/in progress/completed/canceled）
     scheduled_start = Column(DateTime)  # 计划开始时间
     scheduled_end = Column(DateTime)  # 计划结束时间
     actual_start = Column(DateTime)  # 实际开始时间
     actual_end = Column(DateTime)  # 实际结束时间
+    planned_date = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
     description = Column(Text)  # 描述
     assigned_to = Column(String(50))  # 负责人
     parts_used = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
     labor_hours = Column(Float, nullable=True)
     cost_analysis = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
     failure_root_cause_code = Column(String(50), nullable=True)
+    result_summary = Column(Text, nullable=True)
+    downtime_minutes = Column(Float, default=0)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_by = Column(String(50))
@@ -2072,9 +2080,15 @@ class MaintenancePlan(Base):
     equipment_id = Column(String(50), nullable=False)  # 设备ID
     factory_id = Column(String(50), nullable=False, index=True)  # 工厂
     plan_type = Column(String(50))  # 计划类型（daily/weekly/monthly/yearly）
+    # Legacy service contract kept alongside the newer date-only fields.
+    plan_name = Column(String(100), nullable=True)
+    frequency_days = Column(Integer, nullable=True)
     frequency = Column(String(50))  # 频率
     next_run_date = Column(Date)  # 下次运行日期
     last_run_date = Column(Date)  # 上次运行日期
+    last_executed_at = Column(DateTime, nullable=True)
+    next_due_at = Column(DateTime, nullable=True)
+    checklist = Column(Text, nullable=True)
     description = Column(Text)  # 描述
     is_active = Column(Boolean, default=True)  # 是否启用
     

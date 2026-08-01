@@ -11,6 +11,7 @@ import dayjs from 'dayjs'
 import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 import { API_ENDPOINTS } from '../../config/api'
+import { getActiveFactoryId } from '../../utils/factory'
 
 interface StandardTime {
   id: string
@@ -31,7 +32,7 @@ interface StandardTime {
 }
 
 const StandardTimes: React.FC = () => {
-  const [factory, setFactory] = useState('factory-sh-01')
+  const [factory, setFactory] = useState(getActiveFactoryId())
   const [data, setData] = useState<StandardTime[]>([])
   const [loading, setLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
@@ -170,7 +171,6 @@ const StandardTimes: React.FC = () => {
         extra={
           <Space>
             <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
-              <Select.Option value="factory-sh-01">上海工厂</Select.Option>
               <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
               <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
             </Select>

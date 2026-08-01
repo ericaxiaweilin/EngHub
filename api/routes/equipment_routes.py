@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
@@ -76,10 +76,26 @@ async def list_equipment(
         query = query.where(Equipment.status == status)
     if station_id:
         query = query.where(Equipment.station_id == station_id)
-    query = query.order_by(Equipment.equipment_code)
+    # Broken/maintenance assets must be actionable first in the operator view.
+    priority = case(
+        (Equipment.status.in_(["broken", "fault", "failure"]), 0),
+        (Equipment.status == "maintenance", 1),
+        (Equipment.status.in_(["idle", "offline"]), 2),
+        else_=3,
+    )
+    query = query.order_by(priority, Equipment.equipment_code)
 
     result = await db.execute(query)
     items = result.scalars().all()
+    owner_ids = [e.responsible_engineer_id for e in items if e.responsible_engineer_id]
+    owner_map = {}
+    if owner_ids:
+        owner_params = {f"owner_{idx}": owner_id for idx, owner_id in enumerate(owner_ids)}
+        owner_placeholders = ", ".join(f":owner_{idx}" for idx in range(len(owner_ids)))
+        owner_rows = (await db.execute(text(
+            f"SELECT id, employee_code, name FROM hr_employees WHERE id IN ({owner_placeholders})"
+        ), owner_params)).fetchall()
+        owner_map = {r[0]: {"employee_code": r[1], "name": r[2]} for r in owner_rows}
 
     return {
         "items": [
@@ -88,6 +104,9 @@ async def list_equipment(
                 "equipment_name": e.equipment_name, "factory_id": e.factory_id,
                 "station_id": e.station_id, "equipment_type": e.equipment_type,
                 "status": e.status,
+                "responsible_engineer_id": e.responsible_engineer_id,
+                "responsible_engineer_code": owner_map.get(e.responsible_engineer_id, {}).get("employee_code"),
+                "responsible_engineer_name": owner_map.get(e.responsible_engineer_id, {}).get("name"),
                 "last_maintenance_date": e.last_maintenance_date.isoformat() if e.last_maintenance_date else None,
                 "next_maintenance_date": e.next_maintenance_date.isoformat() if e.next_maintenance_date else None,
             }

@@ -18,7 +18,6 @@ from api.services.mes_services import (
     ProductionReportService,
     StationService,
     RoutingService,
-    EquipmentService,
 )
 from api.services.dispatch_service import dispatch_operations, advance_flow
 from core.auth.security import get_current_user
@@ -1043,31 +1042,6 @@ async def get_routing(
         "created_by": routing.created_by,
         "created_at": routing.created_at.isoformat() if routing.created_at else None,
         "updated_at": routing.updated_at.isoformat() if routing.updated_at else None,
-    }
-
-
-# --- Equipment Endpoints ---
-
-@router.get("/equipment")
-async def list_equipment(
-    factory_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """获取设备列表"""
-    service = EquipmentService(db)
-    equipment_list = await service.list_equipment(factory_id=factory_id)
-    return {
-        "items": [
-            {
-                "id": str(e.id), "equipment_code": e.equipment_code,
-                "equipment_name": e.equipment_name, "factory_id": e.factory_id,
-                "equipment_type": e.equipment_type, "status": e.status,
-                "created_at": e.created_at.isoformat() if e.created_at else None,
-            }
-            for e in equipment_list
-        ],
-        "total": len(equipment_list),
     }
 
 

@@ -9,6 +9,7 @@ import dayjs from 'dayjs'
 import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 import { API_ENDPOINTS } from '../../config/api'
+import { getActiveFactoryId } from '../../utils/factory'
 
 interface LeanMetric {
   id: string
@@ -42,16 +43,27 @@ const MOCK_DATA: LeanMetric[] = [
 ]
 
 const LeanMetrics: React.FC = () => {
-  const [factory, setFactory] = useState('factory-sh-01')
+  const [factory, setFactory] = useState(getActiveFactoryId())
   const [data, setData] = useState<LeanMetric[]>([])
   const [loading, setLoading] = useState(false)
 
   const fetchData = async () => {
     setLoading(true)
     try {
-      const res = await api.get(API_ENDPOINTS.IE_LEAN_METRICS, { params: { factory_id: factory, limit: 200 } })
-      const items = res.items || res || []
-      setData(items)
+      const res: any = await api.get(API_ENDPOINTS.IE_LEAN_METRICS, { params: { factory_id: factory } })
+      // 后端返回基于工序价值分析聚合的指标 dict，映射为指标行展示
+      if (!res || res.error || res.analysis_count === undefined) { setData([]); return }
+      const today = dayjs().format('YYYY-MM-DD')
+      const vaPct = Math.round((res.overall_va_ratio || 0) * 10000) / 100
+      const rows: LeanMetric[] = [
+        { id: 'lm-va-ratio', factory_id: factory, metric_name: '增值时间占比(VA Ratio)', metric_category: 'efficiency', value: vaPct, target_value: 30, unit: '%', period: '实时', status: vaPct >= 30 ? 'on_track' : vaPct >= 24 ? 'at_risk' : 'behind', recorded_at: today },
+        { id: 'lm-va-time', factory_id: factory, metric_name: '总增值时间', metric_category: 'efficiency', value: res.total_value_added_time || 0, target_value: res.total_value_added_time || 0, unit: 'min', period: '实时', status: 'on_track', recorded_at: today },
+        { id: 'lm-nva-time', factory_id: factory, metric_name: '总非增值时间', metric_category: 'cost', value: res.total_non_value_added_time || 0, target_value: res.total_value_added_time || 0, unit: 'min', period: '实时', status: (res.total_non_value_added_time || 0) <= (res.total_value_added_time || 0) ? 'on_track' : 'behind', recorded_at: today },
+        { id: 'lm-lead-time', factory_id: factory, metric_name: '平均交付周期(Lead Time)', metric_category: 'delivery', value: res.average_lead_time || 0, target_value: res.average_lead_time || 0, unit: 'min', period: '实时', status: 'on_track', recorded_at: today },
+        { id: 'lm-improve', factory_id: factory, metric_name: '改善空间(Improvement Potential)', metric_category: 'efficiency', value: res.improvement_potential || 0, target_value: 50, unit: '%', period: '实时', status: (res.improvement_potential || 0) <= 50 ? 'on_track' : 'at_risk', recorded_at: today },
+        { id: 'lm-count', factory_id: factory, metric_name: '工序价值分析样本数', metric_category: 'quality', value: res.analysis_count || 0, target_value: 1, unit: '条', period: '实时', status: (res.analysis_count || 0) >= 1 ? 'on_track' : 'behind', recorded_at: today },
+      ]
+      setData(rows)
     } catch { setData([]) } finally { setLoading(false) }
   }
 
@@ -102,7 +114,6 @@ const LeanMetrics: React.FC = () => {
 
       <Card title="精益指标看板" extra={
         <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
-          <Select.Option value="factory-sh-01">上海工厂</Select.Option>
           <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
           <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
         </Select>

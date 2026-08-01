@@ -79,6 +79,7 @@ REQUIRED_TABLES=(
     inventory warehouses locations
     andon_tickets notifications
     production_reports bom_items
+    attendance
     departments roles permissions role_permissions user_roles
     code_tables work_order_templates
     quality_inspections defect_records
@@ -95,6 +96,7 @@ REQUIRED_TABLES=(
     im_groups im_messages
     tms_tasks suppliers
     maintenance_orders
+    maintenance_plans equipment_downtime
     shift_summaries
 )
 
@@ -135,6 +137,7 @@ check_column hr_employees station
 check_column hr_employees department
 check_column equipment status
 check_column equipment factory_id
+check_column equipment responsible_engineer_id
 check_column skills skill_code
 check_column skills skill_name
 check_column code_tables factory_id
@@ -163,6 +166,10 @@ check_min_rows factories 1 "工厂"
 check_min_rows products 1 "产品"
 check_min_rows work_orders 1 "工单"
 check_min_rows equipment 1 "设备"
+check_min_rows attendance 1 "出勤流水"
+check_min_rows maintenance_orders 1 "维修工单"
+check_min_rows maintenance_plans 1 "维修计划"
+check_min_rows equipment_downtime 1 "设备停机流水"
 check_min_rows hr_employees 10 "员工档案"
 check_min_rows skills 5 "技能定义"
 check_min_rows hr_employee_skills 10 "员工技能关联"
@@ -221,7 +228,7 @@ for fid in "${FACTORY_LIST[@]}"; do
         fail "工厂 $fid 员工不足 (${FAC_EMP})"
     fi
 
-    for tbl in warehouses plans pp_plans standard_operation_times time_study_records line_balance_analyses process_analyses action_studies method_studies work_cell_layouts kanban_systems five_s_audits item_traceability im_groups; do
+    for tbl in warehouses plans pp_plans standard_operation_times time_study_records line_balance_analyses process_analyses action_studies method_studies work_cell_layouts kanban_systems five_s_audits item_traceability im_groups attendance maintenance_orders maintenance_plans equipment_downtime; do
         CNT=$(psql_cmd "SELECT count(*) FROM $tbl WHERE factory_id='$fid';")
         if [ "$CNT" -ge 1 ]; then
             pass "工厂 $fid 模块数据 $tbl (${CNT})"
@@ -235,6 +242,28 @@ for fid in "${FACTORY_LIST[@]}"; do
         pass "工厂 $fid 工艺模板步骤 (${RT_STEP_CNT})"
     else
         fail "工厂 $fid 工艺模板步骤为空"
+    fi
+
+    FAC_EQUIPMENT=$(psql_cmd "SELECT count(*) FROM equipment WHERE factory_id='$fid';")
+    FAC_UNASSIGNED=$(psql_cmd "SELECT count(*) FROM equipment WHERE factory_id='$fid' AND (responsible_engineer_id IS NULL OR trim(responsible_engineer_id)='');")
+    if [ "$FAC_UNASSIGNED" -eq 0 ] && [ "$FAC_EQUIPMENT" -ge 1 ]; then
+        pass "工厂 $fid 设备责任人完整 (${FAC_EQUIPMENT}台)"
+    else
+        fail "工厂 $fid 设备责任人缺失 (${FAC_UNASSIGNED}/${FAC_EQUIPMENT})"
+    fi
+
+    FAC_ENGINEERS=$(psql_cmd "SELECT count(*) FROM hr_employees WHERE factory_id='$fid' AND position='设备工程师';")
+    if [ "$FAC_ENGINEERS" -ge 1 ]; then
+        pass "工厂 $fid 有设备工程师 (${FAC_ENGINEERS})"
+    else
+        fail "工厂 $fid 没有设备工程师档案"
+    fi
+
+    FAC_TODAY_ATTENDANCE=$(psql_cmd "SELECT count(*) FROM attendance WHERE factory_id='$fid' AND date=CURRENT_DATE::text;")
+    if [ "$FAC_TODAY_ATTENDANCE" -ge 1 ]; then
+        pass "工厂 $fid 今日出勤流水 (${FAC_TODAY_ATTENDANCE})"
+    else
+        fail "工厂 $fid 今日出勤流水为空"
     fi
 done
 
