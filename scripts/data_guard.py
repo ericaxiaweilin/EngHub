@@ -39,6 +39,7 @@ TABLES: dict[str, dict[str, Any]] = {
     "products": {"min": 1, "max_drop_pct": 0.05},
     "work_orders": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "sales_orders": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "plans": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "pp_plans": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "production_reports": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "quality_inspections": {"min": 1, "factory_min": 1, "max_drop_pct": 0.0},
@@ -46,15 +47,40 @@ TABLES: dict[str, dict[str, Any]] = {
     "qms_spc_points": {"min": 1, "factory_min": 1, "max_drop_pct": 0.0},
     "qms_8d_reports": {"min": 1, "factory_min": 1, "max_drop_pct": 0.0},
     "inventory": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "warehouses": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "equipment": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "stations": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "hr_employees": {"min": 5, "factory_min": 1, "max_drop_pct": 0.05},
     "skills": {"min": 5, "max_drop_pct": 0.05},
     "work_order_templates": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
-    "routing_templates": {"min": 1, "factory_min": 0, "max_drop_pct": 0.05},
+    "routing_templates": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "routing_template_steps": {
+        "min": 1,
+        "factory_min": 1,
+        "factory_count_sql": (
+            "SELECT count(*) FROM routing_template_steps s "
+            "JOIN routing_templates rt ON rt.id=s.template_id "
+            "WHERE rt.factory_id={factory_id};"
+        ),
+        "max_drop_pct": 0.05,
+    },
     "aps_schedules": {"min": 1, "factory_min": 1, "max_drop_pct": 0.10},
     "aps_schedule_tasks": {"min": 1, "max_drop_pct": 0.10},
     "standard_operation_times": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "time_study_records": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "line_balance_analyses": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "process_analyses": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "action_studies": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "method_studies": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "work_cell_layouts": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "kanban_systems": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "five_s_audits": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "org_units": {"min": 1, "max_drop_pct": 0.0},
+    "rcc_organizations": {"min": 1, "max_drop_pct": 0.0},
+    "rcc_tasks": {"min": 2, "max_drop_pct": 0.0},
+    "rcc_approval_records": {"min": 1, "max_drop_pct": 0.0},
+    "deterministic_logic_chains": {"min": 1, "max_drop_pct": 0.0},
+    "global_adjustable_params": {"min": 1, "max_drop_pct": 0.0},
 }
 
 
@@ -120,6 +146,15 @@ def count_rows(table: str, factory_id: str | None = None) -> int:
     return int(raw or 0)
 
 
+def count_factory_rows(table: str, cfg: dict[str, Any], factory_id: str) -> int:
+    custom_sql = cfg.get("factory_count_sql")
+    if custom_sql:
+        sql = str(custom_sql).format(factory_id=_sql_string(factory_id))
+        raw = psql_scalar(sql)
+        return int(raw or 0)
+    return count_rows(table, factory_id)
+
+
 def take_snapshot(factories: list[str]) -> dict[str, Any]:
     snapshot: dict[str, Any] = {
         "version": 1,
@@ -139,10 +174,10 @@ def take_snapshot(factories: list[str]) -> dict[str, Any]:
         total = count_rows(table)
         snapshot["tables"][table] = {"exists": True, "count": total, "min": cfg.get("min", 0)}
 
-        if cfg.get("factory_min") is not None and has_column(table, "factory_id"):
+        if cfg.get("factory_min") is not None and (has_column(table, "factory_id") or cfg.get("factory_count_sql")):
             snapshot["factory_tables"][table] = {}
             for factory_id in factories:
-                snapshot["factory_tables"][table][factory_id] = count_rows(table, factory_id)
+                snapshot["factory_tables"][table][factory_id] = count_factory_rows(table, cfg, factory_id)
 
     return snapshot
 

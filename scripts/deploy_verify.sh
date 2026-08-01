@@ -14,6 +14,7 @@ PG_DB="${PG_DB:-enghub}"
 BACKEND_CONTAINER="${BACKEND_CONTAINER:-docker-backend-1}"
 BACKEND_PORT="${BACKEND_PORT:-18888}"
 FACTORY_ID="${FACTORY_ID:-FAC_ELEC_DEMO_2026}"
+DATA_GUARD_FACTORIES="${DATA_GUARD_FACTORIES:-FAC_ELEC_DEMO_2026,FAC_MECH_001}"
 FRONTEND_DIST="${FRONTEND_DIST:-$(cd "$(dirname "$0")/.." && pwd)/frontend_dist}"
 
 RED='\033[0;31m'
@@ -42,7 +43,7 @@ echo "════════════════════════�
 # 1. 容器健康检查
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
-echo "▶ [1/5] 容器状态"
+echo "▶ [1/6] 容器状态"
 
 STATUS=$(docker inspect --format='{{.State.Status}}' "$BACKEND_CONTAINER" 2>/dev/null || echo "missing")
 if [ "$STATUS" = "running" ]; then
@@ -69,7 +70,7 @@ fi
 # 2. 必需表存在性检查
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
-echo "▶ [2/5] 必需表检查"
+echo "▶ [2/6] 必需表检查"
 
 REQUIRED_TABLES=(
     users factories products work_orders equipment
@@ -83,6 +84,11 @@ REQUIRED_TABLES=(
     quality_inspections defect_records
     aps_schedules aps_schedule_tasks
     routing_templates
+    routing_template_steps
+    time_study_records line_balance_analyses process_analyses
+    action_studies method_studies work_cell_layouts kanban_systems five_s_audits
+    org_units rcc_organizations rcc_tasks rcc_approval_records
+    deterministic_logic_chains global_adjustable_params
     chat_quick_commands
     followup_tasks followup_task_logs
     im_groups im_messages
@@ -106,7 +112,7 @@ done
 # 3. 关键列检查（历史高频缺失）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
-echo "▶ [3/5] 关键列检查"
+echo "▶ [3/6] 关键列检查"
 
 check_column() {
     local tbl=$1 col=$2
@@ -168,10 +174,20 @@ check_min_rows roles 1 "角色"
 check_min_rows code_tables 5 "码表"
 check_min_rows work_order_templates 3 "工单模板"
 check_min_rows routing_templates 1 "工艺模板"
+check_min_rows routing_template_steps 1 "工艺模板步骤"
 check_min_rows chat_quick_commands 5 "Chatbot 快速命令"
+check_min_rows time_study_records 1 "IE时间研究"
+check_min_rows line_balance_analyses 1 "IE线平衡"
+check_min_rows action_studies 1 "IE动作研究"
+check_min_rows method_studies 1 "IE方法研究"
+check_min_rows work_cell_layouts 1 "IE工作单元"
+check_min_rows kanban_systems 1 "IE看板"
+check_min_rows five_s_audits 1 "IE 5S审核"
+check_min_rows rcc_tasks 2 "RCC调度任务"
+check_min_rows rcc_organizations 1 "RCC组织"
 
 if [ -f "$(dirname "$0")/data_guard.py" ]; then
-    if PG_CONTAINER="$PG_CONTAINER" PG_USER="$PG_USER" PG_DB="$PG_DB" DATA_GUARD_FACTORIES="$FACTORY_ID" \
+    if PG_CONTAINER="$PG_CONTAINER" PG_USER="$PG_USER" PG_DB="$PG_DB" DATA_GUARD_FACTORIES="$DATA_GUARD_FACTORIES" \
         python3 "$(dirname "$0")/data_guard.py" verify >/tmp/enghub_data_guard_verify.log 2>&1; then
         pass "数据水位守卫"
     else
@@ -183,19 +199,40 @@ else
 fi
 
 # 工厂级数据
-FAC_WO=$(psql_cmd "SELECT count(*) FROM work_orders WHERE factory_id='$FACTORY_ID';")
-if [ "$FAC_WO" -ge 1 ]; then
-    pass "工厂 $FACTORY_ID 有工单 (${FAC_WO})"
-else
-    warn "工厂 $FACTORY_ID 无工单"
-fi
+IFS=',' read -ra FACTORY_LIST <<< "$DATA_GUARD_FACTORIES"
+for fid in "${FACTORY_LIST[@]}"; do
+    fid="$(echo "$fid" | xargs)"
+    [ -z "$fid" ] && continue
+    FAC_WO=$(psql_cmd "SELECT count(*) FROM work_orders WHERE factory_id='$fid';")
+    if [ "$FAC_WO" -ge 1 ]; then
+        pass "工厂 $fid 有工单 (${FAC_WO})"
+    else
+        fail "工厂 $fid 无工单"
+    fi
 
-FAC_EMP=$(psql_cmd "SELECT count(*) FROM hr_employees WHERE factory_id='$FACTORY_ID';")
-if [ "$FAC_EMP" -ge 5 ]; then
-    pass "工厂 $FACTORY_ID 有员工 (${FAC_EMP})"
-else
-    warn "工厂 $FACTORY_ID 员工不足 (${FAC_EMP})"
-fi
+    FAC_EMP=$(psql_cmd "SELECT count(*) FROM hr_employees WHERE factory_id='$fid';")
+    if [ "$FAC_EMP" -ge 5 ]; then
+        pass "工厂 $fid 有员工 (${FAC_EMP})"
+    else
+        fail "工厂 $fid 员工不足 (${FAC_EMP})"
+    fi
+
+    for tbl in warehouses plans pp_plans standard_operation_times time_study_records line_balance_analyses process_analyses action_studies method_studies work_cell_layouts kanban_systems five_s_audits; do
+        CNT=$(psql_cmd "SELECT count(*) FROM $tbl WHERE factory_id='$fid';")
+        if [ "$CNT" -ge 1 ]; then
+            pass "工厂 $fid 模块数据 $tbl (${CNT})"
+        else
+            fail "工厂 $fid 模块数据 $tbl 为空"
+        fi
+    done
+
+    RT_STEP_CNT=$(psql_cmd "SELECT count(*) FROM routing_template_steps s JOIN routing_templates rt ON rt.id=s.template_id WHERE rt.factory_id='$fid';")
+    if [ "$RT_STEP_CNT" -ge 1 ]; then
+        pass "工厂 $fid 工艺模板步骤 (${RT_STEP_CNT})"
+    else
+        fail "工厂 $fid 工艺模板步骤为空"
+    fi
+done
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 5. API 端点可达性
@@ -233,10 +270,19 @@ if [ -n "$TOKEN" ]; then
     check_api "aps/schedules?factory_id=${FACTORY_ID}" "APS排程"
     check_api "qms/inspections?factory_id=${FACTORY_ID}" "质量检验"
     check_api "andon/tickets?factory_id=${FACTORY_ID}" "安灯工单"
-    check_api "rcc/overview?factory_id=${FACTORY_ID}" "RCC总览"
-    check_api "org-panel/org-nodes?factory_id=${FACTORY_ID}" "组织节点"
+    check_api "rcc/data?factory_id=${FACTORY_ID}&mode=single" "RCC总览"
+    check_api "rcc/org-bubbles?factory_id=${FACTORY_ID}" "RCC气泡图"
+    check_api "org-panel/nodes" "组织节点"
     check_api "collaboration/network?factory_id=${FACTORY_ID}" "协同网络"
     check_api "ie/standard-times?factory_id=${FACTORY_ID}&limit=1" "IE标准工时"
+    check_api "ie/time-studies?factory_id=${FACTORY_ID}&limit=1" "IE时间研究"
+    check_api "ie/line-balance-analyses?factory_id=${FACTORY_ID}&limit=1" "IE线平衡"
+    check_api "ie/process-analyses?factory_id=${FACTORY_ID}&limit=1" "IE工艺分析"
+    check_api "ie-advanced/action-studies?factory_id=${FACTORY_ID}&limit=1" "IE动作研究"
+    check_api "ie-advanced/method-studies?factory_id=${FACTORY_ID}&limit=1" "IE方法研究"
+    check_api "ie-advanced/work-cells?factory_id=${FACTORY_ID}&limit=1" "IE工作单元"
+    check_api "ie-advanced/kanbans?factory_id=${FACTORY_ID}&limit=1" "IE看板"
+    check_api "ie-advanced/5s-audits?factory_id=${FACTORY_ID}&limit=1" "IE 5S审核"
     check_api "chat/agents" "Chatbot智能体列表"
     check_api "chat/quick-commands" "Chatbot快速命令"
     check_api "task-center/inbox" "Chatbot任务中心收件箱"
@@ -276,6 +322,9 @@ PY
 }
 
 check_bundle_text "任务中心" "Chatbot 任务中心入口"
+check_bundle_text "任务智慧中心" "RCC 气泡图入口"
+check_bundle_text "RCC 决策中心" "RCC 指挥调度决策中心"
+check_bundle_text "IE 精益生产" "IE 模块入口"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 汇总

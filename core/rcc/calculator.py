@@ -31,15 +31,23 @@ class RCCResourceCalculator:
         except (ValueError, TypeError):
             return default
 
+    async def _rollback_after_error(self) -> None:
+        """Clear failed DB transactions so later RCC sections can still render."""
+        try:
+            await self.db.rollback()
+        except Exception:
+            pass
+
     async def _get_param_value(self, param_code: str) -> Optional[str]:
         """读取全局可调参数值"""
         try:
-            q = await self.db.execute(sql_text(
-                "SELECT current_value FROM global_adjustable_params WHERE param_code = :code",
-                {"code": param_code}
-            ))
+            q = await self.db.execute(
+                sql_text("SELECT current_value FROM global_adjustable_params WHERE param_code = :code"),
+                {"code": param_code},
+            )
             return q.scalar()
         except Exception:
+            await self._rollback_after_error()
             return None
 
     # ──────────────────────────────────────────────────────────
@@ -163,6 +171,7 @@ class RCCResourceCalculator:
                     })
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -239,6 +248,7 @@ class RCCResourceCalculator:
             result["actual_today_production"] = actual_output
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -352,6 +362,7 @@ class RCCResourceCalculator:
             )
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -458,6 +469,7 @@ class RCCResourceCalculator:
             result["alert"] = len(warnings) > 0
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -534,6 +546,7 @@ class RCCResourceCalculator:
             result["top_defects_30d"] = [dict(r) for r in defect_rows.mappings().all()]
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -558,6 +571,7 @@ class RCCResourceCalculator:
             environment = await self.environment_baseline(factory_id)
             process = await self.process_baseline(factory_id)
         except Exception as e:
+            await self._rollback_after_error()
             return {
                 "factory_id": factory_id,
                 "synced_at": datetime.now(timezone.utc).isoformat(),

@@ -29,8 +29,23 @@ const MOCK_DATA: WorkCell[] = [
   { id: 'wc-4', factory_id: 'factory-sh-01', cell_name: '检测包装单元', cell_type: 'inspection', capacity_per_hour: 50, num_operators: 2, num_machines: 1, product_family: '成品', status: 'maintenance', created_at: '2026-06-15' },
 ]
 
+function normalizeWorkCell(row: any): WorkCell {
+  const flowLength = Array.isArray(row.material_flow_path) ? row.material_flow_path.length : 0
+  const movementLength = Array.isArray(row.operator_movement_path) ? row.operator_movement_path.length : 0
+  return {
+    ...row,
+    cell_name: row.cell_name || row.work_cell_id,
+    cell_type: row.cell_type || row.storage_location_type || 'cell',
+    capacity_per_hour: Number(row.capacity_per_hour ?? Math.max(12, flowLength * 12)),
+    num_operators: Number(row.num_operators ?? Math.max(2, movementLength)),
+    num_machines: Number(row.num_machines ?? Math.max(1, flowLength - 2)),
+    product_family: row.product_family || row.product_family_id || '-',
+    status: row.status || 'active',
+  }
+}
+
 const WorkCells: React.FC = () => {
-  const [factory, setFactory] = useState('factory-sh-01')
+  const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
   const [data, setData] = useState<WorkCell[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -42,7 +57,7 @@ const WorkCells: React.FC = () => {
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_WORK_CELLS, { params: { factory_id: factory, limit: 200 } })
       const items = res.items || res || []
-      setData(items)
+      setData(items.map(normalizeWorkCell))
     } catch { setData([]) } finally { setLoading(false) }
   }
 
@@ -104,7 +119,7 @@ const WorkCells: React.FC = () => {
       <Card title="工作单元布局" extra={
         <Space>
           <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
-            <Select.Option value="factory-sh-01">上海工厂</Select.Option><Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option><Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
+            <Select.Option value="F01">F01</Select.Option><Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option><Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
           </Select>
           <Button type="primary" icon={<PlusOutlined />} size="small" onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true) }}>新增</Button>
         </Space>

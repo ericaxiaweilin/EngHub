@@ -256,6 +256,12 @@ ok "部署完成: $SHORT_SHA"
 
 # ━━━ 部署后验证 ━━━
 info "━━━ 阶段 6/6：部署后验证 ━━━"
+info "补齐两家演示工厂模块数据"
+ssh "$DEPLOY_HOST" \
+  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' python3 '$REMOTE_DIR/scripts/seed_demo_module_coverage.py'" \
+  || fail "演示工厂模块补数失败，触发自动回滚！"
+ok "演示工厂模块数据已补齐"
+
 if ! ssh "$DEPLOY_HOST" \
   "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' DATA_GUARD_FACTORIES='$DATA_GUARD_FACTORIES' python3 '$REMOTE_DIR/scripts/data_guard.py' verify --baseline '$DATA_GUARD_BASELINE' --output '$REMOTE_DIR/backups/$BACKUP_TAG/data_guard_after.json'"; then
   fail "数据水位守卫失败，触发自动回滚！"

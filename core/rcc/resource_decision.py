@@ -25,6 +25,13 @@ class RCCResourceDecisionEngine:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def _rollback_after_error(self) -> None:
+        """Clear failed DB transactions so later RCC decisions can still render."""
+        try:
+            await self.db.rollback()
+        except Exception:
+            pass
+
     # ──────────────────────────────────────────────────────────
     # Worker Assignment — 人力分配决策
     # ──────────────────────────────────────────────────────────
@@ -121,6 +128,7 @@ class RCCResourceDecisionEngine:
                         })
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -192,6 +200,7 @@ class RCCResourceDecisionEngine:
                 })
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -280,6 +289,7 @@ class RCCResourceDecisionEngine:
                 })
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -385,6 +395,7 @@ class RCCResourceDecisionEngine:
                     pass
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -489,6 +500,7 @@ class RCCResourceDecisionEngine:
             result["suggested_actions"] = [w["action"] for w in warnings]
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -590,6 +602,7 @@ class RCCResourceDecisionEngine:
                     pass
 
         except Exception as e:
+            await self._rollback_after_error()
             result["error"] = str(e)
 
         return result
@@ -615,6 +628,7 @@ class RCCResourceDecisionEngine:
             environment_response = await self.recommend_environment_response(factory_id)
             process_response = await self.recommend_process_response(factory_id)
         except Exception as e:
+            await self._rollback_after_error()
             return {
                 "factory_id": factory_id,
                 "decision_time": datetime.now(timezone.utc).isoformat(),
@@ -675,9 +689,9 @@ class RCCResourceDecisionEngine:
         """读取全局可调参数值"""
         try:
             q = await self.db.execute(sql_text(
-                "SELECT current_value FROM global_adjustable_params WHERE param_code = :code",
-                {"code": param_code}
-            ))
+                "SELECT current_value FROM global_adjustable_params WHERE param_code = :code"
+            ), {"code": param_code})
             return q.scalar()
         except Exception:
+            await self._rollback_after_error()
             return None

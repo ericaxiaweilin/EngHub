@@ -14,6 +14,13 @@ from typing import Optional, Dict, Any
 router = APIRouter(prefix="/api/v1/rcc", tags=["rcc"])
 
 
+async def _rollback_safely(db) -> None:
+    try:
+        await db.rollback()
+    except Exception:
+        pass
+
+
 @router.get("/data", summary="综合数据层接口")
 async def get_rcc_data(
     factory_id: Optional[str] = Query(None, description="工厂ID"),
@@ -60,6 +67,7 @@ async def get_rcc_data(
             
             for fid in all_factories:
                 fb = await calc.full_baseline_sync(fid)
+                await _rollback_safely(db)
                 fbl = fb.get("baseline", {})
                 
                 p = fbl.get("people", {})
@@ -109,7 +117,9 @@ async def get_rcc_data(
                 }
             
             baseline = await calc.full_baseline_sync(effective_factory_id)
+            await _rollback_safely(db)
             decisions = await engine.full_resource_decision(effective_factory_id)
+            await _rollback_safely(db)
         
         # 4. 可调参数 + 逻辑链汇总
         params_result = await db.execute(sql_text(

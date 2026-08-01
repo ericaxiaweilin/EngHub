@@ -5,9 +5,10 @@ v2.6 - RCC (Resource Control Center) Models
 资源控制中心 — 三位一体调度系统核心
 """
 
-from sqlalchemy import Column, String, Text, Boolean, Float, DateTime, JSON, ForeignKey, Index
+from sqlalchemy import Column, String, Text, Boolean, Float, Integer, DateTime, JSON, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime, timezone
+import uuid
 
 from database.models import Base
 
@@ -224,4 +225,3 @@ class LogicChainExecutionLog(Base):
     actions_executed = Column(JSON, default=list)
     action_results = Column(JSON, default=list)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-

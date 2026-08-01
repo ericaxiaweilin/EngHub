@@ -29,7 +29,22 @@
     "/andon": "安灯小工单",
     "/work-order-templates": "程序工单模板",
     "/data-consistency": "数据一致性",
-    "/quick-request": "快速工单"
+    "/quick-request": "快速工单",
+    "g-collab": "协同",
+    "/rcc": "RCC指挥中心",
+    "/task-center": "任务中心",
+    "/agent-supervisor": "智能体监督",
+    "g-ie": "IE 精益生产",
+    "/ie/standard-times": "标准工时",
+    "/ie/time-studies": "时间研究",
+    "/ie/line-balance": "线平衡分析",
+    "/ie/process-analyses": "工艺分析",
+    "/ie/lean-metrics": "精益指标",
+    "/ie/action-studies": "动作研究",
+    "/ie/method-studies": "方法研究",
+    "/ie/work-cells": "工作单元",
+    "/ie/kanbans": "看板",
+    "/ie/5s-audits": "5S审核"
   },
   "layout": {
     "settings": "系统设置",

@@ -10,6 +10,7 @@ import {
   AlertOutlined, SettingOutlined, RadarChartOutlined
 } from '@ant-design/icons'
 import axios from 'axios'
+import { useSearchParams } from 'react-router-dom'
 import RCCOverview from './RCCOverview'
 import RCCResourceBoard from './RCCResourceBoard'
 import RCCDecisionHub from './RCCDecisionHub'
@@ -57,7 +58,9 @@ export { COLORS }
 
 // ==================== 主组件 ====================
 export default function RCCCommandCenter() {
-  const [activeView, setActiveView] = useState('overview')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const initialView = searchParams.get('view') || 'overview'
+  const [activeView, setActiveView] = useState(['overview', 'org-bubbles', 'resources', 'decisions', 'analysis'].includes(initialView) ? initialView : 'overview')
   const [factoryId, setFactoryId] = useState(() => localStorage.getItem('active_factory_id') || 'FAC_ELEC_DEMO_2026')
   const [baseline, setBaseline] = useState<any>({})
   const [decisions, setDecisions] = useState<any>({})
@@ -132,7 +135,10 @@ export default function RCCCommandCenter() {
           <Menu
             mode="inline"
             selectedKeys={[activeView]}
-            onClick={({ key }) => setActiveView(key)}
+            onClick={({ key }) => {
+              setActiveView(key)
+              setSearchParams({ view: key })
+            }}
             items={menuItems}
             style={{ background: 'transparent', border: 'none', padding: '12px 8px' }}
           />

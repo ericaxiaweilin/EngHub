@@ -719,6 +719,7 @@ def get_menu_items_for_user(user) -> list:
     # ━━━ 7. 协同 ━━━
     collab_children = []
     # 安灯小工单：所有用户可见（协同基础功能）
+    collab_children.append({"key": "/rcc", "label": "RCC指挥中心"})
     collab_children.append({"key": "/andon", "label": "安灯小工单"})
     collab_children.append({"key": "/quick-request", "label": "快速工单"})
     if "tms" in modules_with_access:
@@ -758,6 +759,38 @@ def get_menu_items_for_user(user) -> list:
             {"key": "/workflow-analytics", "label": "工作流分析"},
         ]
         items.append({"key": "/settings", "label": "系统", "children": sys_children})
+
+    # ━━━ 11. IE 精益生产 ━━━
+    if is_admin or any(
+        m in modules_with_access
+        for m in [
+            "ie_standard_time",
+            "ie_time_study",
+            "ie_line_balance",
+            "ie_process_analysis",
+            "ie_action_study",
+            "ie_method_study",
+            "ie_work_cell",
+            "ie_kanban",
+            "ie_5s_audit",
+        ]
+    ):
+        items.append({
+            "key": "g-ie",
+            "label": "IE 精益生产",
+            "children": [
+                {"key": "/ie/standard-times", "label": "标准工时"},
+                {"key": "/ie/time-studies", "label": "时间研究"},
+                {"key": "/ie/line-balance", "label": "线平衡分析"},
+                {"key": "/ie/process-analyses", "label": "工艺分析"},
+                {"key": "/ie/lean-metrics", "label": "精益指标"},
+                {"key": "/ie/action-studies", "label": "动作研究"},
+                {"key": "/ie/method-studies", "label": "方法研究"},
+                {"key": "/ie/work-cells", "label": "工作单元"},
+                {"key": "/ie/kanbans", "label": "看板"},
+                {"key": "/ie/5s-audits", "label": "5S审核"},
+            ],
+        })
 
     return items
 

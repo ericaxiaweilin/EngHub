@@ -31,8 +31,25 @@ const MOCK_DATA: LineBalance[] = [
   { id: 'lb-5', factory_id: 'factory-sh-01', line_id: 'LINE-04', product_id: 'PRD-005', takt_time: 120.0, cycle_time: 98.0, balance_efficiency: 0.65, num_stations: 10, total_workload: 980.0, status: 'completed', created_at: '2026-06-20' },
 ]
 
+function normalizeLineBalance(row: any): LineBalance {
+  const rawRate = Number(row.balance_efficiency ?? row.balance_rate ?? 0)
+  const balanceEfficiency = rawRate > 1 ? rawRate / 100 : rawRate
+  const cycleTime = Number(row.cycle_time ?? row.cycle_time_avg ?? row.cycle_time_max ?? 0)
+  const stationCount = Number(row.num_stations ?? row.workstation_count ?? 0)
+  return {
+    ...row,
+    takt_time: Number(row.takt_time ?? row.takt_time_min ?? 0),
+    cycle_time: cycleTime,
+    balance_efficiency: balanceEfficiency,
+    num_stations: stationCount,
+    total_workload: Number(row.total_workload ?? (cycleTime * stationCount)),
+    status: row.status || (row.is_balanced ? 'completed' : 'running'),
+    created_at: row.created_at || row.analysis_date,
+  }
+}
+
 const LineBalanceAnalyses: React.FC = () => {
-  const [factory, setFactory] = useState('factory-sh-01')
+  const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
   const [data, setData] = useState<LineBalance[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -43,7 +60,7 @@ const LineBalanceAnalyses: React.FC = () => {
     try {
       const res = await api.get(API_ENDPOINTS.IE_LINE_BALANCE_ANALYSES, { params: { factory_id: factory, limit: 200 } })
       const items = res.items || res || []
-      setData(items)
+      setData(items.map(normalizeLineBalance))
     } catch { setData([]) } finally { setLoading(false) }
   }
 
@@ -120,7 +137,7 @@ const LineBalanceAnalyses: React.FC = () => {
       <Card title="产线平衡分析" extra={
         <Space>
           <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
-            <Select.Option value="factory-sh-01">上海工厂</Select.Option>
+            <Select.Option value="F01">F01</Select.Option>
             <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
             <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
           </Select>
