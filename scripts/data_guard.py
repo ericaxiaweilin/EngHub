@@ -49,9 +49,14 @@ TABLES: dict[str, dict[str, Any]] = {
     "inventory": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "warehouses": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "equipment": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "attendance": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "maintenance_orders": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "maintenance_plans": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
+    "equipment_downtime": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "stations": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "hr_employees": {"min": 5, "factory_min": 1, "max_drop_pct": 0.05},
     "skills": {"min": 5, "max_drop_pct": 0.05},
+    "hr_employee_skills": {"min": 10, "max_drop_pct": 0.05},
     "work_order_templates": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "routing_templates": {"min": 1, "factory_min": 1, "max_drop_pct": 0.05},
     "routing_template_steps": {
@@ -92,6 +97,33 @@ TABLES: dict[str, dict[str, Any]] = {
             "WHERE g.factory_id={factory_id};"
         ),
         "max_drop_pct": 0.0,
+    },
+}
+
+# Row counts alone do not protect the relationships that make a module usable.
+# These checks catch a populated equipment table with no owner and stale HR data.
+FACTORY_HEALTH_CHECKS: dict[str, dict[str, Any]] = {
+    "attendance_today": {
+        "sql": (
+            "SELECT count(*) FROM attendance "
+            "WHERE factory_id={factory_id} AND date=CURRENT_DATE::text;"
+        ),
+        "min": 1,
+    },
+    "equipment_unassigned": {
+        "sql": (
+            "SELECT count(*) FROM equipment "
+            "WHERE factory_id={factory_id} "
+            "AND (responsible_engineer_id IS NULL OR trim(responsible_engineer_id)='');"
+        ),
+        "max": 0,
+    },
+    "equipment_engineers": {
+        "sql": (
+            "SELECT count(*) FROM hr_employees "
+            "WHERE factory_id={factory_id} AND position='设备工程师';"
+        ),
+        "min": 1,
     },
 }
 
@@ -176,6 +208,7 @@ def take_snapshot(factories: list[str]) -> dict[str, Any]:
         "factories": factories,
         "tables": {},
         "factory_tables": {},
+        "factory_checks": {},
     }
 
     for table, cfg in TABLES.items():
@@ -190,6 +223,12 @@ def take_snapshot(factories: list[str]) -> dict[str, Any]:
             snapshot["factory_tables"][table] = {}
             for factory_id in factories:
                 snapshot["factory_tables"][table][factory_id] = count_factory_rows(table, cfg, factory_id)
+
+    for factory_id in factories:
+        snapshot["factory_checks"][factory_id] = {}
+        for name, cfg in FACTORY_HEALTH_CHECKS.items():
+            sql = str(cfg["sql"]).format(factory_id=_sql_string(factory_id))
+            snapshot["factory_checks"][factory_id][name] = int(psql_scalar(sql) or 0)
 
     return snapshot
 
@@ -261,6 +300,19 @@ def verify_snapshot(
                             f"{table}/{factory_id}: dropped from {before_factory} to {factory_count} "
                             f"(allowed drop {max_drop_pct:.0%})"
                         )
+
+    for factory_id in factories:
+        checks = current.get("factory_checks", {}).get(factory_id, {})
+        for name, cfg in FACTORY_HEALTH_CHECKS.items():
+            value = int(checks.get(name) or 0)
+            if "min" in cfg and value < int(cfg["min"]):
+                failures.append(
+                    f"{name}/{factory_id}: {value}, minimum {int(cfg['min'])}"
+                )
+            if "max" in cfg and value > int(cfg["max"]):
+                failures.append(
+                    f"{name}/{factory_id}: {value}, maximum {int(cfg['max'])}"
+                )
 
     return failures, warnings
 

@@ -154,12 +154,16 @@ function getActiveModule(pathname: string): string | null {
 // ---------- 工厂切换器（仅开发账户可见） ----------
 const FactorySwitcher: React.FC = () => {
   const [factories, setFactories] = useState<{ id: string; name: string; short_name: string }[]>([])
-  const [current, setCurrent] = useState(localStorage.getItem('active_factory_id') || '')
+  const storedFactory = localStorage.getItem('active_factory_id') || ''
+  const [current, setCurrent] = useState(storedFactory === 'factory-sh-01' || storedFactory === 'F01' ? '' : storedFactory)
 
   useEffect(() => {
     api.get('/api/v1/hr/factories')
       .then((res: any) => {
         setFactories(res.items || [])
+        if (storedFactory === 'factory-sh-01' || storedFactory === 'F01') {
+          localStorage.removeItem('active_factory_id')
+        }
         if (!current && res.items?.length > 0) {
           setCurrent(res.items[0].id)
           localStorage.setItem('active_factory_id', res.items[0].id)

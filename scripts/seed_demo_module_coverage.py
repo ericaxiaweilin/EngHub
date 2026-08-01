@@ -8,6 +8,8 @@ Docker container and only upserts deterministic demo rows for:
 - PP plans
 - routing template steps
 - IE basic and advanced modules
+- HR attendance/leave/rest and equipment engineer ownership
+- TPM maintenance plans/orders/downtime and recent OEE production pulse
 """
 from __future__ import annotations
 
@@ -791,6 +793,205 @@ def ie_sql(factory_id: str, label: str) -> list[str]:
     return sql
 
 
+def hr_equipment_tpm_sql(factory_id: str) -> list[str]:
+    """Seed the operational records that make HR/TPM/RCC mutually traceable."""
+    short = "ELEC" if factory_id == "FAC_ELEC_DEMO_2026" else "MEC"
+    label = "电子厂" if short == "ELEC" else "机械厂"
+    engineer_specs = [
+        ("01", "设备工程师", "白班", "L5", ["OEE", "TPM", "PLC"]),
+        ("02", "设备工程师", "夜班", "L4", ["TPM", "EQ-MNT", "安全"]),
+    ]
+    sql: list[str] = []
+
+    for code, position, shift, level, tags in engineer_specs:
+        employee_id = stable_id("equipment-engineer", factory_id, code)
+        employee_code = f"{short}-EQ-{code}"
+        sql.append(upsert("hr_employees", {
+            "id": employee_id,
+            "factory_id": factory_id,
+            "employee_code": employee_code,
+            "name": ("陈设备" if short == "ELEC" else "李设备") + code,
+            "gender": "男" if code == "01" else "女",
+            "department": "设备工程部",
+            "station": "设备维护",
+            "position": position,
+            "shift": shift,
+            "hire_date": Expr("CURRENT_DATE - INTERVAL '420 days'"),
+            "status": "active",
+            "skill_level": level,
+            "phone": f"1390000{short[-1]}{code}",
+            "expertise_tags": sql_json(tags),
+            "remarks": f"{label} TPM/OEE责任人，负责设备状态、停机和维护闭环。",
+            "height_cm": 172.0 if code == "01" else 165.0,
+            "weight_kg": 68.0 if code == "01" else 55.0,
+            "updated_at": Expr("NOW()"),
+        }))
+        for skill_code, skill_level in [("EQ-MNT", level), ("PLC", "L4" if code == "01" else "L3")]:
+            sql.append(upsert("hr_employee_skills", {
+                "id": stable_id("equipment-engineer-skill", factory_id, code, skill_code),
+                "hr_employee_id": employee_id,
+                "skill_id": Expr(f"(SELECT id FROM skills WHERE code={q(skill_code)} LIMIT 1)"),
+                "level": skill_level,
+                "certified_date": Expr("CURRENT_DATE - INTERVAL '180 days'"),
+                "expiry_date": Expr("CURRENT_DATE + INTERVAL '185 days'"),
+                "updated_at": Expr("NOW()"),
+            }))
+
+    # Repair the legacy demo factory key and connect operators to the current HR roster.
+    sql.extend([
+        "UPDATE operators SET factory_id='FAC_MECH_001', employee_id='MEC-' || LPAD(SUBSTRING(employee_id FROM 'EMP-M([0-9]+)-DEMO_2026'), 4, '0') WHERE factory_id='FAC_MECH_DEMO_2026';",
+        "UPDATE operators SET employee_id='ELEC-' || LPAD(SUBSTRING(employee_id FROM 'EMP-E([0-9]+)-DEMO_2026'), 4, '0') WHERE factory_id='FAC_ELEC_DEMO_2026' AND employee_id LIKE 'EMP-E%-DEMO_2026';",
+        "DELETE FROM attendance WHERE factory_id IN ('FAC_ELEC_DEMO_2026','FAC_MECH_DEMO_2026','FAC_MECH_001');",
+        """
+        WITH ranked AS (
+            SELECT o.id, o.factory_id, ROW_NUMBER() OVER (PARTITION BY o.factory_id ORDER BY o.employee_id) AS rn
+            FROM operators o
+            WHERE o.factory_id IN ('FAC_ELEC_DEMO_2026', 'FAC_MECH_001')
+        )
+        INSERT INTO attendance (id, factory_id, operator_id, date, check_in, check_out, shift, status, created_at)
+        SELECT md5(factory_id || id || CURRENT_DATE::text), factory_id, id, CURRENT_DATE::text,
+               CASE WHEN rn % 5 IN (0, 1) THEN NULL
+                    WHEN rn % 5 = 2 THEN CURRENT_DATE + TIME '08:20'
+                    ELSE CURRENT_DATE + TIME '07:50' END,
+               CASE WHEN rn % 5 IN (0, 1) THEN NULL ELSE CURRENT_DATE + TIME '19:00' END,
+               CASE WHEN rn % 2 = 0 THEN '夜班' ELSE '白班' END,
+               CASE rn % 5 WHEN 0 THEN 'rest' WHEN 1 THEN 'leave' WHEN 2 THEN 'late' ELSE 'present' END,
+               NOW()
+        FROM ranked;
+        """,
+    ])
+
+    # Bind every asset to one of the two engineers and make actionable statuses visible first.
+    sql.append("""
+    WITH owners AS (
+        SELECT id, factory_id, ROW_NUMBER() OVER (PARTITION BY factory_id ORDER BY employee_code) AS rn
+        FROM hr_employees
+        WHERE department='设备工程部' AND position='设备工程师'
+    ), ranked_equipment AS (
+        SELECT id, factory_id, ROW_NUMBER() OVER (PARTITION BY factory_id ORDER BY equipment_code) AS rn
+        FROM equipment
+    )
+    UPDATE equipment e
+       SET responsible_engineer_id = o.id,
+           updated_at = NOW()
+      FROM ranked_equipment re
+      JOIN owners o ON o.factory_id = re.factory_id AND o.rn = ((re.rn - 1) % 2) + 1
+     WHERE e.id = re.id;
+    """)
+    sql.append("""
+    WITH ranked AS (
+        SELECT id, ROW_NUMBER() OVER (PARTITION BY factory_id ORDER BY equipment_code) AS rn
+        FROM equipment
+        WHERE factory_id IN ('FAC_ELEC_DEMO_2026', 'FAC_MECH_001')
+    )
+    UPDATE equipment e SET status = CASE WHEN r.rn = 1 THEN 'broken' WHEN r.rn = 2 THEN 'maintenance' ELSE e.status END,
+                           updated_at = NOW()
+      FROM ranked r WHERE e.id = r.id;
+    """)
+
+    maintenance = [
+        ("01", 0, "emergency", "high", "open", "主轴振动异常，已触发故障预警。", 2, 90),
+        ("02", 1, "corrective", "medium", "in_progress", "冷却系统压力偏低，正在更换滤芯。", 1, 55),
+        ("03", 2, "preventive", "low", "completed", "按周期完成润滑与精度点检。", -4, 35),
+    ]
+    for code, eq_offset, mtype, priority, status, description, day_offset, downtime in maintenance:
+        order_id = stable_id("maintenance-order", factory_id, code)
+        engineer_id = stable_id("equipment-engineer", factory_id, "01" if code != "02" else "02")
+        start_expr = Expr(f"NOW() - INTERVAL '{abs(day_offset)} days'") if day_offset < 0 else Expr("NOW() + INTERVAL '2 hours'")
+        end_expr = Expr(f"NOW() - INTERVAL '{abs(day_offset)} days' + INTERVAL '2 hours'") if status == "completed" else None
+        sql.append(upsert("maintenance_orders", {
+            "id": order_id,
+            "order_code": f"MO-{short}-{code}-202608",
+            "factory_id": factory_id,
+            "equipment_id": equipment_id_expr(factory_id, eq_offset),
+            "maintenance_type": mtype,
+            "order_type": mtype,
+            "priority": priority,
+            "status": status,
+            "description": description,
+            "planned_date": start_expr,
+            "scheduled_start": start_expr,
+            "scheduled_end": end_expr or Expr("NOW() + INTERVAL '4 hours'"),
+            "started_at": start_expr if status in ("in_progress", "completed") else None,
+            "actual_start": start_expr if status in ("in_progress", "completed") else None,
+            "completed_at": end_expr,
+            "actual_end": end_expr,
+            "assigned_to": engineer_id,
+            "result_summary": "已恢复设备稳定运行" if status == "completed" else None,
+            "downtime_minutes": downtime,
+            "created_by": "seed_guard",
+            "created_at": Expr("NOW() - INTERVAL '2 days'"),
+            "updated_at": Expr("NOW()"),
+        }))
+
+    for code, eq_offset, freq, due_offset in [("01", 0, 7, -1), ("02", 1, 14, 3), ("03", 2, 30, 18)]:
+        sql.append(upsert("maintenance_plans", {
+            "id": stable_id("maintenance-plan", factory_id, code),
+            "plan_code": f"PM-{short}-{code}-202608",
+            "factory_id": factory_id,
+            "equipment_id": equipment_id_expr(factory_id, eq_offset),
+            "plan_type": "preventive",
+            "plan_name": f"{label}设备{code}点检保养",
+            "frequency": f"每{freq}天",
+            "frequency_days": freq,
+            "next_run_date": Expr(f"CURRENT_DATE + INTERVAL '{due_offset} days'"),
+            "next_due_at": Expr(f"NOW() + INTERVAL '{due_offset} days'"),
+            "last_run_date": Expr(f"CURRENT_DATE - INTERVAL '{freq} days'"),
+            "last_executed_at": Expr(f"NOW() - INTERVAL '{freq} days'"),
+            "checklist": "润滑、点检、精度、急停、安全防护",
+            "description": "TPM周期保养计划，逾期进入RCC预警。",
+            "is_active": True,
+            "created_by": "seed_guard",
+            "created_at": Expr("NOW() - INTERVAL '10 days'"),
+            "updated_at": Expr("NOW()"),
+        }))
+
+    for code, eq_offset, category, duration, day_offset in [
+        ("01", 0, "breakdown", 90, 1), ("02", 1, "maintenance", 55, 2), ("03", 2, "material_shortage", 25, 3)
+    ]:
+        sql.append(upsert("equipment_downtime", {
+            "id": stable_id("equipment-downtime", factory_id, code),
+            "equipment_id": equipment_id_expr(factory_id, eq_offset),
+            "factory_id": factory_id,
+            "start_time": Expr(f"NOW() - INTERVAL '{day_offset} days'"),
+            "end_time": Expr(f"NOW() - INTERVAL '{day_offset} days' + INTERVAL '{duration} minutes'"),
+            "duration_minutes": duration,
+            "downtime_category": category,
+            "reason_code": "主轴振动" if category == "breakdown" else "TPM-PLAN" if category == "maintenance" else "MAT-HOLD",
+            "description": "设备故障/维护/待料记录，供OEE和RCC联动。",
+            "reported_by": stable_id("equipment-engineer", factory_id, "01"),
+            "created_by": "seed_guard",
+            "created_at": Expr(f"NOW() - INTERVAL '{day_offset} days'")
+        }))
+
+    # Recent reports make the OEE calculation reflect a real operating pulse.
+    for idx in range(1, 7):
+        sql.append(upsert("production_reports", {
+            "id": stable_id("oee-production-report", factory_id, str(idx)),
+            "report_code": f"PR-OEE-{short}-{idx:02d}-202608",
+            "factory_id": factory_id,
+            "work_order_id": work_order_id_expr(factory_id, idx % 3),
+            "station_id": station_expr(factory_id, idx % 3),
+            "good_qty": 2400 - idx * 25,
+            "defect_qty": 8 + idx % 3,
+            "scrap_qty": 4,
+            "report_type": "normal",
+            "shift": "day" if idx % 2 else "night",
+            "operator_id": f"{short}-OP-{idx:03d}",
+            "operation_seq": idx,
+            "operation_name": "设备产出报工",
+            "machine_id": equipment_id_expr(factory_id, idx % 3),
+            "start_time": Expr(f"NOW() - INTERVAL '{idx} hours'"),
+            "end_time": Expr(f"NOW() - INTERVAL '{idx} hours' + INTERVAL '50 minutes'"),
+            "cycle_time_sec": 7.5 + idx * 0.2,
+            "quality_check_passed": True,
+            "created_by": "virtual_factory_agent",
+            "created_at": Expr(f"NOW() - INTERVAL '{idx} hours'"),
+            "updated_at": Expr("NOW()"),
+        }))
+    return sql
+
+
 def im_group_sql(factory_id: str) -> list[str]:
     short = "ELEC" if factory_id == "FAC_ELEC_DEMO_2026" else "MECH"
     suffix = factory_id[-4:].replace("_", "")
@@ -882,6 +1083,7 @@ def build_sql(factories: list[str]) -> str:
         statements.extend(warehouse_plan_sql(factory_id, label))
         statements.extend(routing_sql(factory_id))
         statements.extend(ie_sql(factory_id, label))
+        statements.extend(hr_equipment_tpm_sql(factory_id))
         statements.extend(im_group_sql(factory_id))
         statements.extend(traceability_sql(factory_id))
     statements.append("COMMIT;")

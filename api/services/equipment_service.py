@@ -116,6 +116,8 @@ class EquipmentTpmService:
             ProductionReport.factory_id == factory_id,
             ProductionReport.created_at >= start,
         )
+        if equipment_id:
+            pr_stmt = pr_stmt.where(ProductionReport.machine_id == equipment_id)
         pr_result = await self.db.execute(pr_stmt)
         row = pr_result.fetchone()
         total_produced = row[0] if row else 0
@@ -167,6 +169,7 @@ class EquipmentTpmService:
             order_code=order_code,
             factory_id=factory_id,
             equipment_id=equipment_id,
+            order_type=maintenance_type,
             maintenance_type=maintenance_type,
             priority=priority,
             status="open",
@@ -235,6 +238,9 @@ class EquipmentTpmService:
             id=str(uuid.uuid4()),
             factory_id=factory_id,
             equipment_id=equipment_id,
+            plan_code=f"PM-{factory_id[:4]}-{str(uuid.uuid4())[:8].upper()}",
+            plan_type="preventive",
+            frequency=f"每{frequency_days}天",
             plan_name=plan_name,
             frequency_days=frequency_days,
             next_due_at=now + timedelta(days=frequency_days),

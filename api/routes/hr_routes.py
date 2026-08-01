@@ -250,6 +250,85 @@ async def hr_stats(
     }
 
 
+@router.get("/attendance/summary")
+async def attendance_summary(
+    date_value: Optional[str] = Query(None, alias="date"),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Today's operational attendance pulse for HR and RCC."""
+    fid = _get_active_factory(current_user, request)
+    target_date = date_value or "CURRENT_DATE"
+    date_expr = "CURRENT_DATE::text" if target_date == "CURRENT_DATE" else ":attendance_date"
+    params: Dict[str, Any] = {"fid": fid}
+    if target_date != "CURRENT_DATE":
+        params["attendance_date"] = target_date
+    row = (await db.execute(text(f"""
+        SELECT COUNT(*)::int AS total,
+               COUNT(*) FILTER (WHERE status = 'present')::int AS present,
+               COUNT(*) FILTER (WHERE status = 'late')::int AS late,
+               COUNT(*) FILTER (WHERE status = 'leave')::int AS on_leave,
+               COUNT(*) FILTER (WHERE status = 'rest')::int AS rest
+        FROM attendance
+        WHERE factory_id = :fid AND date = {date_expr}
+    """), params)).mappings().first()
+    summary = dict(row or {"total": 0, "present": 0, "late": 0, "on_leave": 0, "rest": 0})
+    total = summary.get("total", 0) or 0
+    summary["attended"] = summary.get("present", 0) + summary.get("late", 0)
+    summary["attendance_rate_pct"] = round(summary["attended"] / total * 100, 1) if total else 0
+    summary["factory_id"] = fid
+    summary["date"] = date_value or "today"
+    return summary
+
+
+@router.get("/attendance")
+async def list_attendance(
+    date_value: Optional[str] = Query(None, alias="date"),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Attendance records joined back to HR employee profiles."""
+    fid = _get_active_factory(current_user, request)
+    conditions = ["a.factory_id = :fid"]
+    params: Dict[str, Any] = {"fid": fid, "limit": limit}
+    if date_value:
+        conditions.append("a.date = :attendance_date")
+        params["attendance_date"] = date_value
+    else:
+        conditions.append("a.date = CURRENT_DATE::text")
+    if status:
+        conditions.append("a.status = :attendance_status")
+        params["attendance_status"] = status
+    rows = (await db.execute(text(f"""
+        SELECT a.id, a.operator_id, COALESCE(e.employee_code, o.employee_id) AS employee_code,
+               COALESCE(e.name, o.name) AS name, a.date, a.shift, a.status,
+               a.check_in, a.check_out
+        FROM attendance a
+        LEFT JOIN operators o ON o.id = a.operator_id
+        LEFT JOIN hr_employees e ON e.factory_id = a.factory_id AND e.employee_code = o.employee_id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY CASE a.status WHEN 'late' THEN 0 WHEN 'leave' THEN 1 WHEN 'rest' THEN 2 ELSE 3 END,
+                 a.operator_id
+        LIMIT :limit
+    """), params)).fetchall()
+    return {
+        "factory_id": fid,
+        "items": [
+            {
+                "id": r[0], "operator_id": r[1], "employee_code": r[2], "name": r[3],
+                "date": r[4], "shift": r[5], "status": r[6],
+                "check_in": r[7].isoformat() if r[7] else None,
+                "check_out": r[8].isoformat() if r[8] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.post("/employees")
 async def create_employee(
     body: EmployeeCreate,

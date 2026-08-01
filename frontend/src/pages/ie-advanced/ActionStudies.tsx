@@ -8,6 +8,7 @@ import dayjs from 'dayjs'
 import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 import { API_ENDPOINTS } from '../../config/api'
+import { getActiveFactoryId } from '../../utils/factory'
 
 interface ActionStudy {
   id: string
@@ -55,7 +56,7 @@ function normalizeActionStudy(row: any): ActionStudy {
 }
 
 const ActionStudies: React.FC = () => {
-  const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
+  const [factory, setFactory] = useState(getActiveFactoryId())
   const [data, setData] = useState<ActionStudy[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -138,7 +139,7 @@ const ActionStudies: React.FC = () => {
       <Card title="动作研究" extra={
         <Space>
           <Select value={factory} onChange={setFactory} style={{ width: 120 }} size="small">
-            <Select.Option value="F01">F01</Select.Option><Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option><Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
+            <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option><Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
           </Select>
           <Button type="primary" icon={<PlusOutlined />} size="small" onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true) }}>新增</Button>
         </Space>

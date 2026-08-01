@@ -8,6 +8,7 @@ import dayjs from 'dayjs'
 import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 import { API_ENDPOINTS } from '../../config/api'
+import { getActiveFactoryId } from '../../utils/factory'
 
 interface LineBalance {
   id: string
@@ -49,7 +50,7 @@ function normalizeLineBalance(row: any): LineBalance {
 }
 
 const LineBalanceAnalyses: React.FC = () => {
-  const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
+  const [factory, setFactory] = useState(getActiveFactoryId())
   const [data, setData] = useState<LineBalance[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -137,7 +138,6 @@ const LineBalanceAnalyses: React.FC = () => {
       <Card title="产线平衡分析" extra={
         <Space>
           <Select value={factory} onChange={setFactory} style={{ width: 140 }} size="small">
-            <Select.Option value="F01">F01</Select.Option>
             <Select.Option value="FAC_ELEC_DEMO_2026">电子工厂</Select.Option>
             <Select.Option value="FAC_MECH_001">机械工厂</Select.Option>
           </Select>

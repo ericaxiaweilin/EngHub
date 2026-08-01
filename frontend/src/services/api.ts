@@ -19,7 +19,8 @@ api.interceptors.request.use(
       config.headers.Authorization = `Bearer ${token}`;
     }
     // 全局工厂切换（开发账户切换后存入 localStorage）
-    const factoryId = localStorage.getItem('active_factory_id');
+    const storedFactoryId = localStorage.getItem('active_factory_id');
+    const factoryId = storedFactoryId === 'factory-sh-01' || storedFactoryId === 'F01' ? '' : storedFactoryId;
     if (factoryId) {
       config.headers['X-Factory-Id'] = factoryId;
     }

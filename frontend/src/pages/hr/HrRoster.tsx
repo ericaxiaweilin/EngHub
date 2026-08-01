@@ -44,6 +44,29 @@ interface HrStats {
   genders: { gender: string; count: number }[]
 }
 
+interface AttendanceSummary {
+  factory_id: string
+  date: string
+  total: number
+  present: number
+  late: number
+  on_leave: number
+  rest: number
+  attended: number
+  attendance_rate_pct: number
+}
+
+interface AttendanceRecord {
+  id: string
+  employee_code?: string
+  name?: string
+  date: string
+  shift: string
+  status: string
+  check_in?: string | null
+  check_out?: string | null
+}
+
 interface SkillItem { id: number; code: string; name: string }
 interface SkillGroup { category: string; skills: SkillItem[] }
 interface EmpSkill {
@@ -74,6 +97,13 @@ const STATUS_MAP: Record<string, { color: string; text: string }> = {
   active: { color: 'green', text: '在职' },
   leave: { color: 'orange', text: '休假' },
   resigned: { color: 'red', text: '离职' },
+}
+
+const ATTENDANCE_MAP: Record<string, { color: string; text: string }> = {
+  present: { color: 'green', text: '出勤' },
+  late: { color: 'gold', text: '迟到' },
+  leave: { color: 'orange', text: '请假' },
+  rest: { color: 'default', text: '休息' },
 }
 
 const SKILL_COLORS: Record<string, string> = { L1: 'default', L2: 'blue', L3: 'cyan', L4: 'purple', L5: 'gold' }
@@ -119,11 +149,25 @@ export default function HrRoster() {
   const [dispatchMinLevel, setDispatchMinLevel] = useState<string>('L2')
   const [candidates, setCandidates] = useState<Candidate[]>([])
   const [candidatesLoading, setCandidatesLoading] = useState(false)
+  const [attendanceSummary, setAttendanceSummary] = useState<AttendanceSummary | null>(null)
+  const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([])
+  const [attendanceLoading, setAttendanceLoading] = useState(false)
 
   // 加载统计 + 技能库
   useEffect(() => {
     api.get('/api/v1/hr/stats').then((res: any) => setStats(res)).catch(() => {})
     api.get('/api/v1/hr/skill-library').then((res: any) => setSkillLibrary(res || [])).catch(() => {})
+    setAttendanceLoading(true)
+    Promise.all([
+      api.get('/api/v1/hr/attendance/summary'),
+      api.get('/api/v1/hr/attendance', { params: { limit: 100 } }),
+    ]).then(([summary, records]: any[]) => {
+      setAttendanceSummary(summary)
+      setAttendanceRecords(records.items || [])
+    }).catch(() => {
+      setAttendanceSummary(null)
+      setAttendanceRecords([])
+    }).finally(() => setAttendanceLoading(false))
   }, [])
 
   // 加载花名册
@@ -339,6 +383,40 @@ export default function HrRoster() {
               ) : (
                 <Empty description={candidatesLoading ? '查询中...' : '请选择条件后点击查询'} />
               )}
+            </Card>
+          ),
+        },
+        {
+          key: 'attendance',
+          label: '出勤 / 请假 / 休息',
+          children: (
+            <Card size="small" title="今日出勤状态" loading={attendanceLoading}>
+              {attendanceSummary && (
+                <Row gutter={12} style={{ marginBottom: 16 }}>
+                  <Col span={4}><Statistic title="出勤率" value={attendanceSummary.attendance_rate_pct} suffix="%" valueStyle={{ color: '#52c41a' }} /></Col>
+                  <Col span={4}><Statistic title="出勤" value={attendanceSummary.present} /></Col>
+                  <Col span={4}><Statistic title="迟到" value={attendanceSummary.late} valueStyle={{ color: '#faad14' }} /></Col>
+                  <Col span={4}><Statistic title="请假" value={attendanceSummary.on_leave} valueStyle={{ color: '#fa8c16' }} /></Col>
+                  <Col span={4}><Statistic title="休息" value={attendanceSummary.rest} /></Col>
+                  <Col span={4}><Statistic title="记录数" value={attendanceSummary.total} /></Col>
+                </Row>
+              )}
+              <Table
+                dataSource={attendanceRecords}
+                rowKey="id"
+                size="small"
+                pagination={{ pageSize: 20, showTotal: t => `共 ${t} 条` }}
+                columns={[
+                  { title: '工号', dataIndex: 'employee_code', width: 120 },
+                  { title: '姓名', dataIndex: 'name', width: 90 },
+                  { title: '日期', dataIndex: 'date', width: 110 },
+                  { title: '班次', dataIndex: 'shift', width: 90 },
+                  { title: '状态', dataIndex: 'status', width: 90, render: (v: string) => <Tag color={ATTENDANCE_MAP[v]?.color}>{ATTENDANCE_MAP[v]?.text || v}</Tag> },
+                  { title: '签到', dataIndex: 'check_in', width: 170, render: (v: string | null) => v ? v.replace('T', ' ').slice(0, 16) : '-' },
+                  { title: '签退', dataIndex: 'check_out', width: 170, render: (v: string | null) => v ? v.replace('T', ' ').slice(0, 16) : '-' },
+                ]}
+                scroll={{ x: 850 }}
+              />
             </Card>
           ),
         },

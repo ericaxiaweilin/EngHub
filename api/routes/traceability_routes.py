@@ -24,19 +24,21 @@ router = APIRouter(prefix="/api/v1/traceability", tags=["Traceability"])
 TRACE_DOMAINS: Dict[str, Dict[str, Any]] = {
     "people": {
         "title": "人力数据追溯",
-        "lineage": ["hr_employees 在册/在岗", "hr_employee_skills 技能矩阵", "RCC 人力基线"],
+        "lineage": ["hr_employees 员工档案", "attendance 出勤/请假/休息", "hr_employee_skills 技能矩阵", "RCC 人力基线"],
         "sources": [
             {"table": "hr_employees", "label": "员工档案", "route": "/hr-roster", "columns": ["id", "employee_code", "name", "full_name", "department", "station", "shift", "skill_level", "status", "updated_at", "created_at"]},
             {"table": "hr_employee_skills", "label": "员工技能", "route": "/skill-matrix", "columns": ["id", "employee_id", "skill_id", "level", "certified", "updated_at", "created_at"]},
+            {"table": "attendance", "label": "出勤/请假/休息", "route": "/hr-roster", "columns": ["id", "operator_id", "date", "shift", "status", "check_in", "check_out", "created_at"]},
         ],
     },
     "equipment": {
         "title": "设备数据追溯",
-        "lineage": ["equipment 状态/OEE", "maintenance_orders 维修闭环", "production_reports 设备产出", "RCC 设备基线"],
+        "lineage": ["equipment 状态/OEE/责任人", "maintenance_orders 维修闭环", "equipment_downtime 停机/故障", "production_reports 设备产出", "RCC 设备基线"],
         "sources": [
-            {"table": "equipment", "label": "设备台账", "route": "/equipment-center", "columns": ["id", "equipment_code", "equipment_name", "equipment_type", "station_id", "status", "updated_at", "created_at"]},
+            {"table": "equipment", "label": "设备台账", "route": "/equipment-center", "columns": ["id", "equipment_code", "equipment_name", "equipment_type", "station_id", "status", "responsible_engineer_id", "updated_at", "created_at"]},
             {"table": "maintenance_orders", "label": "维修工单", "route": "/equipment/maintenance", "columns": ["id", "order_code", "equipment_id", "priority", "status", "scheduled_start", "actual_start", "actual_end", "updated_at", "created_at"]},
-            {"table": "production_reports", "label": "设备/工位产出", "route": "/production-report", "columns": ["id", "report_code", "work_order_id", "station_id", "equipment_id", "good_qty", "defect_qty", "created_at"]},
+            {"table": "production_reports", "label": "设备/工位产出", "route": "/production-report", "columns": ["id", "report_code", "work_order_id", "station_id", "machine_id", "good_qty", "defect_qty", "created_at"]},
+            {"table": "equipment_downtime", "label": "设备停机/故障", "route": "/equipment-center", "columns": ["id", "equipment_id", "start_time", "end_time", "duration_minutes", "downtime_category", "reason_code", "description", "created_at"]},
         ],
     },
     "work_orders": {

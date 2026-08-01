@@ -109,7 +109,22 @@ class RCCResourceCalculator:
             
             total = result["headcount"].get("total", 0) or 0
             active = result["headcount"].get("active", 0) or 0
-            result["attendance_rate_pct"] = round(active / total * 100) if total > 0 else 0
+            # Prefer the operational attendance ledger when today's sample exists.
+            attendance_rows = await self.db.execute(sql_text("""
+                SELECT COUNT(*)::int AS total,
+                       COUNT(*) FILTER (WHERE status IN ('present','late'))::int AS attended,
+                       COUNT(*) FILTER (WHERE status = 'leave')::int AS on_leave,
+                       COUNT(*) FILTER (WHERE status = 'rest')::int AS rest,
+                       COUNT(*) FILTER (WHERE status = 'late')::int AS late
+                FROM attendance
+                WHERE factory_id = :fid AND date = CURRENT_DATE::text
+            """), {"fid": factory_id})
+            attendance = attendance_rows.mappings().first()
+            if attendance and attendance["total"]:
+                result["attendance_rate_pct"] = round(attendance["attended"] / attendance["total"] * 100, 1)
+                result["attendance"] = dict(attendance)
+            else:
+                result["attendance_rate_pct"] = round(active / total * 100, 1) if total > 0 else 0
 
             # 各工位明细
             station_rows = await self.db.execute(sql_text("""
@@ -246,6 +261,68 @@ class RCCResourceCalculator:
             """), {"fid": factory_id})
             actual_output = {r.station_id: r.today_good_qty for r in prod_rows.mappings().all()}
             result["actual_today_production"] = actual_output
+
+            # 7-day OEE baseline for RCC. Keep downtime and production in
+            # separate aggregates so two one-to-many joins cannot multiply data.
+            equipment_count = (await self.db.execute(sql_text(
+                "SELECT COUNT(*)::int FROM equipment WHERE factory_id = :fid"
+            ), {"fid": factory_id})).scalar() or 0
+            downtime_row = await self.db.execute(sql_text("""
+                SELECT COALESCE(SUM(duration_minutes), 0)::float AS downtime_minutes
+                FROM equipment_downtime
+                WHERE factory_id = :fid AND start_time >= NOW() - INTERVAL '7 days'
+            """), {"fid": factory_id})
+            production_row = await self.db.execute(sql_text("""
+                SELECT COALESCE(SUM(good_qty + defect_qty + scrap_qty), 0)::float AS produced,
+                       COALESCE(SUM(defect_qty + scrap_qty), 0)::float AS defects
+                FROM production_reports
+                WHERE factory_id = :fid AND created_at >= NOW() - INTERVAL '7 days'
+            """), {"fid": factory_id})
+            downtime = float((downtime_row.mappings().first() or {}).get("downtime_minutes", 0) or 0)
+            production = production_row.mappings().first() or {}
+            produced = float(production.get("produced", 0) or 0)
+            defects = float(production.get("defects", 0) or 0)
+            # RCC's factory KPI uses the same 12-hour daily production window
+            # as the TPM service; equipment count is shown separately.
+            planned = 7 * 12 * 60
+            running = max(planned - downtime, 1)
+            availability = max(0.0, (planned - downtime) / planned) if planned else 0.0
+            performance = min(1.0, produced * 0.2 / running)
+            quality = (produced - defects) / produced if produced else 1.0
+            result["oee_actual_pct"] = round(availability * performance * quality * 100, 1)
+            result["oee_detail"] = {
+                "availability": round(availability * 100, 1),
+                "performance": round(performance * 100, 1),
+                "quality": round(quality * 100, 1),
+                "downtime_minutes": round(downtime, 1),
+                "produced": int(produced),
+                "defects": int(defects),
+            }
+
+            pm_rows = await self.db.execute(sql_text("""
+                SELECT p.plan_code, p.equipment_id, p.plan_name, p.next_due_at,
+                       e.equipment_code, e.equipment_name
+                FROM maintenance_plans p
+                LEFT JOIN equipment e ON e.id = p.equipment_id
+                WHERE p.factory_id = :fid AND p.is_active = TRUE
+                ORDER BY p.next_due_at ASC NULLS LAST
+            """), {"fid": factory_id})
+            pm_items = [dict(row) for row in pm_rows.mappings().all()]
+            result["pm_overdue"] = [item for item in pm_items if item.get("next_due_at") and item["next_due_at"] < datetime.utcnow()]
+            result["pm_overdue_count"] = len(result["pm_overdue"])
+
+            owner_rows = await self.db.execute(sql_text("""
+                SELECT e.equipment_code, e.equipment_name, e.status,
+                       e.responsible_engineer_id, h.employee_code, h.name AS engineer_name
+                FROM equipment e
+                LEFT JOIN hr_employees h ON h.id = e.responsible_engineer_id
+                WHERE e.factory_id = :fid
+                ORDER BY CASE WHEN e.status IN ('broken','fault','failure') THEN 0
+                              WHEN e.status='maintenance' THEN 1
+                              WHEN e.status IN ('idle','offline') THEN 2 ELSE 3 END,
+                         e.equipment_code
+            """), {"fid": factory_id})
+            result["equipment_details"] = [dict(row) for row in owner_rows.mappings().all()]
 
         except Exception as e:
             await self._rollback_after_error()
@@ -593,7 +670,11 @@ class RCCResourceCalculator:
                     "total": equipment.get("total_equipment"),
                     "statuses": equipment.get("status_distribution", {}),
                     "oee_target_pct": equipment.get("oee_target_pct"),
+                    "oee_actual_pct": equipment.get("oee_actual_pct", 0),
+                    "oee_detail": equipment.get("oee_detail", {}),
                     "pm_overdue_count": equipment.get("pm_overdue_count"),
+                    "pm_overdue": equipment.get("pm_overdue", []),
+                    "equipment_details": equipment.get("equipment_details", []),
                 },
                 "work_orders": {
                     "status": work_orders.get("status_distribution", {}),
