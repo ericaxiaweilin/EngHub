@@ -85,10 +85,10 @@ const MODULES: ModuleDef[] = [
   {
     key: 'collab',
     title: 'RCC',
-    desc: '安灯呼叫 · 作战室 · 任务分发 · 审批',
+    desc: '指挥调度 · 气泡图 · 资源决策 · 任务分发',
     icon: <DashboardOutlined style={{ fontSize: 36 }} />,
     color: '#2f54eb',
-    path: '/andon',
+    path: '/rcc?view=org-bubbles',
   },
   {
     key: 'ie',

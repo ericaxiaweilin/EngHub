@@ -5,7 +5,7 @@
  * 点击泡泡 → 右侧 Drawer 展示详情
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Drawer, Tag, Space, Descriptions, Spin } from 'antd'
+import { Alert, Drawer, Empty, Tag, Space, Descriptions, Spin } from 'antd'
 import {
   ThunderboltOutlined, CloseCircleOutlined,
   ApiOutlined, TeamOutlined,
@@ -119,11 +119,16 @@ function simulate(nodes: BubbleNode[], edges: BubbleEdge[], w: number, h: number
 }
 
 // ==================== 主组件 ====================
-export default function RCCOrgBubbles() {
+interface RCCOrgBubblesProps {
+  factoryId?: string
+}
+
+export default function RCCOrgBubbles({ factoryId = 'FAC_ELEC_DEMO_2026' }: RCCOrgBubblesProps) {
   const [nodes, setNodes] = useState<BubbleNode[]>([])
   const [edges, setEdges] = useState<BubbleEdge[]>([])
   const [meta, setMeta] = useState<any>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<BubbleNode | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const svgRef = useRef<SVGSVGElement>(null)
@@ -136,8 +141,9 @@ export default function RCCOrgBubbles() {
 
   const fetchData = useCallback(async () => {
     setLoading(true)
+    setError(null)
     try {
-      const res = await axios.get(`${API_BASE}/org-bubbles`, { params: { factory_id: 'F01' } })
+      const res = await axios.get(`${API_BASE}/org-bubbles`, { params: { factory_id: factoryId } })
       const data = res.data
       if (data.success) {
         const ns: BubbleNode[] = (data.nodes || []).map((n: any) => ({
@@ -149,10 +155,18 @@ export default function RCCOrgBubbles() {
         setEdges(data.edges || [])
         setMeta(data.meta)
         alphaRef.current = 1
+      } else {
+        setNodes([])
+        setEdges([])
+        setError('RCC气泡数据返回为空')
       }
-    } catch { /* ignore */ }
+    } catch (e: any) {
+      setNodes([])
+      setEdges([])
+      setError(e?.response?.data?.detail || e?.message || 'RCC气泡数据加载失败')
+    }
     setLoading(false)
-  }, [])
+  }, [factoryId])
 
   useEffect(() => { fetchData() }, [fetchData])
 
@@ -202,10 +216,23 @@ export default function RCCOrgBubbles() {
 
       {/* 泡泡图画布 */}
       <Spin spinning={loading}>
+        {error && (
+          <Alert
+            type="warning"
+            showIcon
+            message={error}
+            style={{ marginBottom: 12, background: COLORS.bgCard, borderColor: COLORS.border, color: COLORS.text }}
+          />
+        )}
         <div style={{
           background: COLORS.bg, borderRadius: 16, border: `1px solid ${COLORS.border}`,
           overflow: 'hidden', position: 'relative',
         }}>
+          {nodesRef.current.length === 0 && !loading ? (
+            <div style={{ height: 320, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Empty description={<span style={{ color: COLORS.textDim }}>当前工厂暂无RCC气泡节点</span>} />
+            </div>
+          ) : (
           <svg ref={svgRef} width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
             {/* 背景网格 */}
             <defs>
@@ -287,6 +314,7 @@ export default function RCCOrgBubbles() {
               )
             })}
           </svg>
+          )}
         </div>
       </Spin>
 

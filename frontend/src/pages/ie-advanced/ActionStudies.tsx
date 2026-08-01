@@ -35,6 +35,25 @@ const MOCK_DATA: ActionStudy[] = [
   { id: 'as-5', factory_id: 'factory-sh-01', operation_name: '检验外观', station_id: 'ST-05', motion_type: 'inspect', motion_distance_cm: 20, time_seconds: 5.0, difficulty_level: 'medium', improvement_note: '引入AOI自动检测', created_at: '2026-06-20' },
 ]
 
+function normalizeActionStudy(row: any): ActionStudy {
+  const firstMotion = Array.isArray(row.motions) ? row.motions[0] : null
+  const ergonomic = Number(row.ergonomic_score ?? 80)
+  return {
+    ...row,
+    motion_type: row.motion_type || firstMotion?.motion || row.method_type || 'inspect',
+    motion_distance_cm: Number(row.motion_distance_cm ?? firstMotion?.distance_cm ?? 0),
+    time_seconds: Number(row.time_seconds ?? row.total_time_cycles ?? (Number(row.duration_min || 0) * 60)),
+    difficulty_level: row.difficulty_level || (ergonomic < 65 ? 'high' : ergonomic < 82 ? 'medium' : 'low'),
+    improvement_note:
+      row.improvement_note ||
+      row.recommended_improvement_suggestion ||
+      row.improvement_suggestion ||
+      row.analysis_result?.method_improvement ||
+      '-',
+    created_at: row.created_at || row.study_date,
+  }
+}
+
 const ActionStudies: React.FC = () => {
   const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
   const [data, setData] = useState<ActionStudy[]>([])
@@ -48,7 +67,7 @@ const ActionStudies: React.FC = () => {
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_ACTION_STUDIES, { params: { factory_id: factory, limit: 200 } })
       const items = res.items || res || []
-      setData(items)
+      setData(items.map(normalizeActionStudy))
     } catch { setData([]) } finally { setLoading(false) }
   }
 

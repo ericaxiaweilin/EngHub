@@ -59,3 +59,8 @@ mes-project-deploy.tar.gz
 uploads/
 /upload_*.jpg
 /scripts/seed_f01_reports.py
+
+# Remote deployment artifacts (runtime state and backups stay outside source control)
+/backups/
+/enghub.runtime.env
+/tmp/

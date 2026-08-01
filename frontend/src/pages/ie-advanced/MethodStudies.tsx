@@ -28,6 +28,21 @@ const MOCK_DATA: MethodStudy[] = [
   { id: 'ms-4', factory_id: 'factory-sh-01', operation_name: '物料搬运', current_method: '人工推车', proposed_method: 'AGV自动导引车', time_saving_pct: 50.0, status: 'proposed', analyst: 'IE-王工', created_at: '2026-06-15' },
 ]
 
+function normalizeMethodStudy(row: any): MethodStudy {
+  const savingDetail = row.expected_time_saving_calculation_detail || {}
+  const savingMin = Number(row.expected_time_saving_min ?? savingDetail.saving_min ?? 0)
+  const standardMin = Number(row.total_standard_time_min ?? 0)
+  const savingPct = Number(row.time_saving_pct ?? savingDetail.saving_pct ?? (standardMin > 0 ? (savingMin / standardMin) * 100 : 0))
+  return {
+    ...row,
+    operation_name: row.operation_name || row.original_operation,
+    current_method: row.current_method || row.old_method_description || row.description || '-',
+    proposed_method: row.proposed_method || row.improved_operation || savingDetail.proposed_method || row.description || '-',
+    time_saving_pct: savingPct,
+    analyst: row.analyst || row.created_by || row.approved_by || '-',
+  }
+}
+
 const MethodStudies: React.FC = () => {
   const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
   const [data, setData] = useState<MethodStudy[]>([])
@@ -41,7 +56,7 @@ const MethodStudies: React.FC = () => {
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_METHOD_STUDIES, { params: { factory_id: factory, limit: 200 } })
       const items = res.items || res || []
-      setData(items)
+      setData(items.map(normalizeMethodStudy))
     } catch { setData([]) } finally { setLoading(false) }
   }
 

@@ -7,9 +7,10 @@ import {
   LineChartOutlined, AimOutlined, WarningOutlined, PlusOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
+import { getStoredUser } from '../../services/auth'
 
 const { Title, Text } = Typography
-const FACTORY = 'F001'
+const getFactory = () => localStorage.getItem('active_factory_id') || getStoredUser()?.factory_id || 'FAC_ELEC_DEMO_2026'
 
 const SpcDashboard: React.FC = () => {
   const [characteristics, setCharacteristics] = useState<any[]>([])
@@ -20,9 +21,10 @@ const SpcDashboard: React.FC = () => {
 
   const loadCharacteristics = async () => {
     try {
-      const res: any = await api.get('/api/v1/qms/spc/characteristics', { params: { factory_id: FACTORY } })
-      setCharacteristics(res?.items || [])
-      if (res?.items?.length && !selected) setSelected(res.items[0].characteristic_code)
+      const res: any = await api.get('/api/v1/qms/spc/configs', { params: { factory_id: getFactory() } })
+      const items = Array.isArray(res) ? res : (res?.items || [])
+      setCharacteristics(items)
+      if (items.length && !selected) setSelected(items[0].code || items[0].characteristic_code)
     } catch { /* ignore */ }
   }
 
@@ -30,7 +32,7 @@ const SpcDashboard: React.FC = () => {
     if (!code) return
     setLoading(true)
     try {
-      const res: any = await api.get('/api/v1/qms/spc/chart', { params: { factory_id: FACTORY, characteristic_code: code } })
+      const res: any = await api.get('/api/v1/qms/spc', { params: { factory_id: getFactory(), characteristic_code: code } })
       setChartData(res)
     } catch { setChartData(null) } finally { setLoading(false) }
   }
@@ -41,8 +43,10 @@ const SpcDashboard: React.FC = () => {
   const handleMeasure = async () => {
     if (measureValue === null || !selected) return
     try {
-      const res: any = await api.post('/api/v1/qms/spc/measure', {
-        factory_id: FACTORY, characteristic_code: selected, measured_value: measureValue,
+      const selectedMeta = characteristics.find(c => (c.code || c.characteristic_code) === selected)
+      const res: any = await api.post('/api/v1/qms/spc', {
+        factory_id: getFactory(), characteristic_code: selected, measured_value: measureValue,
+        characteristic_name: selectedMeta?.name || selectedMeta?.characteristic_name,
       })
       if (res.is_out_of_control) {
         message.warning('⚠️ 超出控制限！过程失控')
@@ -76,7 +80,10 @@ const SpcDashboard: React.FC = () => {
               onChange={setSelected}
               placeholder="选择质量特性"
               style={{ width: 220 }}
-              options={characteristics.map(c => ({ value: c.characteristic_code, label: `${c.characteristic_code} ${c.characteristic_name || ''}` }))}
+              options={characteristics.map(c => ({
+                value: c.code || c.characteristic_code,
+                label: `${c.code || c.characteristic_code} ${c.name || c.characteristic_name || ''}`,
+              }))}
             />
             <InputNumber
               value={measureValue}
@@ -96,10 +103,10 @@ const SpcDashboard: React.FC = () => {
         <Col span={6}>
           <Card size="small">
             <Statistic title="Cpk 过程能力" value={cpk ?? '—'} valueStyle={{ color: cpkColor }} prefix={<AimOutlined />} />
-            <Text type="secondary" style={{ fontSize: 12 }}>{cpk >= 1.33 ? '能力充足' : cpk >= 1.0 ? '能力一般' : '能力不足'}</Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>{cpk == null ? '等待更多数据' : cpk >= 1.33 ? '能力充足' : cpk >= 1.0 ? '能力一般' : '能力不足'}</Text>
           </Card>
         </Col>
-        <Col span={6}><Card size="small"><Statistic title="数据点" value={chartData?.total_points || 0} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="数据点" value={chartData?.total_points || chartData?.count || 0} /></Card></Col>
         <Col span={6}><Card size="small"><Statistic title="失控点" value={chartData?.ooc_count || 0} valueStyle={{ color: (chartData?.ooc_count || 0) > 0 ? '#f5222d' : '#52c41a' }} prefix={<WarningOutlined />} /></Card></Col>
         <Col span={6}>
           <Card size="small">
@@ -126,15 +133,16 @@ const SpcDashboard: React.FC = () => {
               {/* 数据点 */}
               <div style={{ display: 'flex', alignItems: 'center', height: '100%', gap: 2 }}>
                 {points.slice(-30).map((p: any, i: number) => {
-                  const range = (chartData?.ucl || 1) - (chartData?.lcl || 0)
-                  const pct = range > 0 ? Math.max(5, Math.min(95, ((chartData?.ucl || 1) - p.measured_value) / range * 100)) : 50
+                  const value = p.measured_value ?? p.value ?? 0
+                  const range = ((chartData?.ucl ?? p.ucl) || 1) - ((chartData?.lcl ?? p.lcl) || 0)
+                  const pct = range > 0 ? Math.max(5, Math.min(95, (((chartData?.ucl ?? p.ucl) || 1) - value) / range * 100)) : 50
                   return (
                     <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'flex-start', paddingTop: `${pct}%` }}>
                       <div style={{
                         width: 8, height: 8, borderRadius: '50%',
                         backgroundColor: p.is_out_of_control ? '#f5222d' : '#1890ff',
                         boxShadow: p.is_out_of_control ? '0 0 6px #f5222d' : 'none',
-                      }} title={`${p.measured_value}`} />
+                      }} title={`${value}`} />
                     </div>
                   )
                 })}
@@ -149,7 +157,7 @@ const SpcDashboard: React.FC = () => {
               pagination={false}
               columns={[
                 { title: '时间', dataIndex: 'measured_at', width: 150, render: (v) => v?.slice(5, 16).replace('T', ' ') },
-                { title: '测量值', dataIndex: 'measured_value', width: 100, render: (v, r: any) => <Text style={{ color: r.is_out_of_control ? '#f5222d' : undefined, fontWeight: r.is_out_of_control ? 'bold' : undefined }}>{v}</Text> },
+                { title: '测量值', dataIndex: 'measured_value', width: 100, render: (v, r: any) => <Text style={{ color: r.is_out_of_control ? '#f5222d' : undefined, fontWeight: r.is_out_of_control ? 'bold' : undefined }}>{v ?? r.value}</Text> },
                 { title: '状态', dataIndex: 'is_out_of_control', width: 80, render: (v) => v ? <Tag color="red">失控</Tag> : <Tag color="green">受控</Tag> },
                 { title: '工位', dataIndex: 'station_id', width: 80 },
               ]}

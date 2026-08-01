@@ -293,7 +293,7 @@ async def patrol(
                 AlertIntelligenceReview.status == "pending",
             )
         )
-        if existing.scalar_one_or_none():
+        if existing.scalars().first():
             continue
 
         is_overdue = wo.planned_due < now if wo.planned_due else False
@@ -328,7 +328,7 @@ async def patrol(
                 AlertIntelligenceReview.status == "pending",
             )
         )
-        if existing.scalar_one_or_none():
+        if existing.scalars().first():
             continue
 
         minutes_open = (now - ticket.created_at).total_seconds() / 60
@@ -365,7 +365,7 @@ async def patrol(
                     AlertIntelligenceReview.status == "pending",
                 )
             )
-            if existing.scalar_one_or_none():
+            if existing.scalars().first():
                 continue
             context = (
                 f"设备故障停机预警：\n"
@@ -403,7 +403,7 @@ async def patrol(
                     AlertIntelligenceReview.status == "pending",
                 )
             )
-            if existing.scalar_one_or_none():
+            if existing.scalars().first():
                 continue
             context = (
                 f"缺料预警（低于安全库存）：\n"
@@ -437,7 +437,7 @@ async def patrol(
                     AlertIntelligenceReview.status == "pending",
                 )
             )
-            if existing.scalar_one_or_none():
+            if existing.scalars().first():
                 continue
             context = (
                 f"SPC过程失控预警：\n"
@@ -483,7 +483,7 @@ async def patrol(
                     AlertIntelligenceReview.status == "pending",
                 )
             )
-            if not existing.scalar_one_or_none():
+            if not existing.scalars().first():
                 context = f"车间环境异常预警：\n" + "\n".join(f"- {a}" for a in env_alerts)
                 await review_alert(db, factory_id, "environment", ref_id, "环境异常", context)
                 alerts_found += 1

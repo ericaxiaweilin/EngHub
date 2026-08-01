@@ -30,7 +30,7 @@ from database.db_config import get_db
 from database.models import FileRecord, User
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
 )
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
@@ -290,6 +290,33 @@ def _grounded_tool_result(result: Dict[str, Any]) -> str:
         f"{TOOL_RESULT_GROUNDING}\n"
         f"{json.dumps(result, ensure_ascii=False, default=str)}"
     )
+
+
+def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
+    """Deterministic fallback reply for clear business intents."""
+    label = TOOL_LABELS.get(tool_name, tool_name)
+    if "error" in result:
+        return f"{label}执行失败：{result['error']}"
+    if tool_name == "run_virtual_factory_pulse":
+        rhythm = result.get("rhythm", {})
+        advanced = result.get("advanced", {})
+        return (
+            "虚拟工厂脉搏已推进。\n"
+            f"- 月产能：{rhythm.get('monthly_capacity_containers', 300)} 柜/月，"
+            f"日节奏：{rhythm.get('daily_capacity_containers', 10)} 柜/日\n"
+            f"- 新建订单：{len(result.get('created_orders', []))} 个\n"
+            f"- 本次报工：{advanced.get('containers_reported', 0)} 柜，"
+            f"{advanced.get('reports_created', 0)} 条报工\n"
+            f"- 节奏预警：{len(result.get('alerts', []))} 条"
+        )
+    if tool_name == "get_virtual_factory_status":
+        return (
+            "虚拟工厂当前状态：\n"
+            f"- 虚拟销售订单：{result.get('virtual_sales_orders', 0)} 个\n"
+            f"- 在制虚拟主工单：{result.get('active_virtual_orders', 0)} 个\n"
+            f"- 虚拟报工记录：{result.get('virtual_report_count', 0)} 条"
+        )
+    return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
 
 
 async def _verify_grounded_reply(
@@ -567,6 +594,29 @@ async def chat(
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
+
+    if request.enable_tools and not image_records:
+        direct = resolve_intent(last_user)
+        if direct:
+            tool_name = direct["tool"]
+            arguments = direct.get("args") or {}
+            result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+            actions.append(ToolAction(
+                tool=tool_name,
+                label=TOOL_LABELS.get(tool_name, tool_name),
+                arguments=arguments,
+                result=result,
+                is_write=tool_name in WRITE_TOOLS,
+                is_sim=tool_name in SIM_TOOLS,
+                success="error" not in result,
+            ))
+            return ChatResponse(
+                reply=_direct_tool_reply(tool_name, result),
+                model="deterministic-tool-router",
+                degraded=False,
+                actions=actions,
+            )
+
     task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
     prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
     try:
@@ -1019,6 +1069,30 @@ async def chat_stream(
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
+
+        if request.enable_tools and not image_records:
+            direct = resolve_intent(last_user)
+            if direct:
+                tool_name = direct["tool"]
+                arguments = direct.get("args") or {}
+                result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+                action = ToolAction(
+                    tool=tool_name,
+                    label=TOOL_LABELS.get(tool_name, tool_name),
+                    arguments=arguments,
+                    result=result,
+                    is_write=tool_name in WRITE_TOOLS,
+                    is_sim=tool_name in SIM_TOOLS,
+                    success="error" not in result,
+                )
+                yield _sse("action", action.model_dump())
+                table_data = _extract_table_data(tool_name, result)
+                if table_data:
+                    yield _sse("table", table_data)
+                yield _sse("delta", {"content": _direct_tool_reply(tool_name, result)})
+                yield _sse("done", {"model": "deterministic-tool-router", "degraded": False})
+                return
+
         task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
         prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
         try:

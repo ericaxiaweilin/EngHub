@@ -14,6 +14,7 @@ DB_CONTAINER="${DB_CONTAINER:-docker-postgres-1}"
 DB_USER="${DB_USER:-enghub}"
 DB_NAME="${DB_NAME:-enghub}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18888/health}"
+DATA_GUARD_FACTORIES="${DATA_GUARD_FACTORIES:-FAC_ELEC_DEMO_2026,FAC_MECH_001}"
 MAX_HEALTH_WAIT=45          # 健康检查最大等待秒数
 BACKUP_KEEP=5               # 保留最近 N 个备份
 COMMIT_MESSAGE="${1:-deploy: $(date '+%Y-%m-%d %H:%M:%S')}"
@@ -32,6 +33,7 @@ BACKUP_TAG="backup_${TIMESTAMP}"
 ROLLBACK_NEEDED=false
 DB_BACKUP_FILE=""
 CODE_SNAPSHOT_DIR=""
+DATA_GUARD_BASELINE=""
 
 rollback() {
   if [[ "$ROLLBACK_NEEDED" != true ]]; then return 0; fi
@@ -150,6 +152,15 @@ BACKUP
 ok "备份完成: $BACKUP_TAG"
 DB_BACKUP_FILE="$REMOTE_DIR/backups/$BACKUP_TAG/database.sql"
 CODE_SNAPSHOT_DIR="$REMOTE_DIR/backups/$BACKUP_TAG"
+DATA_GUARD_BASELINE="$REMOTE_DIR/backups/$BACKUP_TAG/data_guard_before.json"
+
+# ━━━ 数据水位快照（关键！）━━━
+info "记录部署前数据水位"
+scp -q "$ROOT_DIR/scripts/data_guard.py" "$DEPLOY_HOST:/tmp/enghub-data-guard.py"
+ssh "$DEPLOY_HOST" \
+  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' DATA_GUARD_FACTORIES='$DATA_GUARD_FACTORIES' python3 /tmp/enghub-data-guard.py snapshot --output '$DATA_GUARD_BASELINE'" \
+  || fail "部署前数据水位快照失败"
+ok "数据水位快照完成: $DATA_GUARD_BASELINE"
 
 # ━━━ 部署 ━━━
 info "━━━ 阶段 5/6：部署新版本 ━━━"
@@ -245,6 +256,18 @@ ok "部署完成: $SHORT_SHA"
 
 # ━━━ 部署后验证 ━━━
 info "━━━ 阶段 6/6：部署后验证 ━━━"
+info "补齐两家演示工厂模块数据"
+ssh "$DEPLOY_HOST" \
+  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' python3 '$REMOTE_DIR/scripts/seed_demo_module_coverage.py'" \
+  || fail "演示工厂模块补数失败，触发自动回滚！"
+ok "演示工厂模块数据已补齐"
+
+if ! ssh "$DEPLOY_HOST" \
+  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' DATA_GUARD_FACTORIES='$DATA_GUARD_FACTORIES' python3 '$REMOTE_DIR/scripts/data_guard.py' verify --baseline '$DATA_GUARD_BASELINE' --output '$REMOTE_DIR/backups/$BACKUP_TAG/data_guard_after.json'"; then
+  fail "数据水位守卫失败，触发自动回滚！"
+fi
+ok "数据水位守卫通过"
+
 if ssh "$DEPLOY_HOST" "bash '$REMOTE_DIR/scripts/deploy_verify.sh'"; then
   ROLLBACK_NEEDED=false  # 验证通过，取消回滚
   ok "═══ 部署成功 ✓ ($SHORT_SHA) ═══"

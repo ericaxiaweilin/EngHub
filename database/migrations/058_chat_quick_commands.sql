@@ -25,12 +25,17 @@ COMMENT ON TABLE chat_quick_commands IS 'Chatbot 快速命令（预设语句 + �
 
 -- 系统预置命令（与前端原硬编码 QUICK_COMMANDS 对齐，并补充智能体调度类命令）
 INSERT INTO chat_quick_commands (id, factory_id, command_text, agent_key, agent_name, classify_source, is_preset, sort_order)
-VALUES
-    (gen_random_uuid(), NULL, '今天生产情况怎么样？', NULL, NULL, 'manual', TRUE, 10),
-    (gen_random_uuid(), NULL, '查询在制工单', 'dispatch_agent', '派工智能体', 'manual', TRUE, 20),
-    (gen_random_uuid(), NULL, '查询库存水平', 'warehouse_agent', '仓储智能体', 'manual', TRUE, 30),
-    (gen_random_uuid(), NULL, '最近有哪些不良品？', 'quality_agent', '质量智能体', 'manual', TRUE, 40),
-    (gen_random_uuid(), NULL, '设备运行状态如何？', 'equipment_agent', '设备智能体', 'manual', TRUE, 50),
-    (gen_random_uuid(), NULL, '跑一次高温加班合规仿真', NULL, NULL, 'manual', TRUE, 60),
-    (gen_random_uuid(), NULL, '最近的仿真审计记录', NULL, NULL, 'manual', TRUE, 70)
-ON CONFLICT DO NOTHING;
+SELECT gen_random_uuid(), NULL, v.command_text, v.agent_key, v.agent_name, 'manual', TRUE, v.sort_order
+FROM (VALUES
+    ('今天生产情况怎么样？', NULL, NULL, 10),
+    ('查询在制工单', 'dispatch_agent', '派工智能体', 20),
+    ('查询库存水平', 'warehouse_agent', '仓储智能体', 30),
+    ('最近有哪些不良品？', 'quality_agent', '质量智能体', 40),
+    ('设备运行状态如何？', 'equipment_agent', '设备智能体', 50),
+    ('跑一次高温加班合规仿真', NULL, NULL, 60),
+    ('最近的仿真审计记录', NULL, NULL, 70)
+) AS v(command_text, agent_key, agent_name, sort_order)
+WHERE NOT EXISTS (
+    SELECT 1 FROM chat_quick_commands c
+    WHERE c.factory_id IS NULL AND c.command_text = v.command_text
+);

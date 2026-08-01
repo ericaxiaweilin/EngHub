@@ -165,7 +165,7 @@ class WorkOrder(Base):
     
     __tablename__ = "work_orders"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     work_order_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
     sales_order_id = Column(String(50), index=True)
@@ -191,7 +191,7 @@ class WorkOrder(Base):
     partial_completion_percentage = Column(Float, default=0)
     bom_version = Column(String(50))
     # ---- 工单体系化编码：层级字段（主工单 <-> 工序工单）----
-    parent_work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=True, index=True)
+    parent_work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=True, index=True)
     wo_type = Column(String(20), nullable=False, default="master", index=True)  # master=主工单 / operation=工序工单
     process_code = Column(String(20), nullable=True, index=True)  # 行业通用工序代码（SMT/INJ/MACH...），主工单为空
     operation_seq = Column(Integer, nullable=True)  # 同一工序内道次序号（01/02...）
@@ -411,10 +411,10 @@ class ProductionReport(Base):
     
     __tablename__ = "production_reports"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     report_code = Column(String(50), unique=True, nullable=False)
     factory_id = Column(String(50), nullable=False, index=True)
-    work_order_id = Column(UUID(as_uuid=False), ForeignKey("work_orders.id"), nullable=False, index=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id"), nullable=False, index=True)
     station_id = Column(String(50), nullable=False, index=True)
     good_qty = Column(Integer, nullable=False, default=0)
     defect_qty = Column(Integer, default=0)
@@ -459,7 +459,7 @@ class ProductionReportComment(Base):
     __tablename__ = "production_report_comments"
     
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    report_id = Column(UUID(as_uuid=False), ForeignKey("production_reports.id"), nullable=False, index=True)
+    report_id = Column(String(36), ForeignKey("production_reports.id"), nullable=False, index=True)
     comment = Column(Text, nullable=False)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -1714,7 +1714,7 @@ class ApsSchedule(Base):
     __tablename__ = "aps_schedules"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50))
     status = Column(String(20))
     schedule_code = Column(String(50))
@@ -1741,8 +1741,8 @@ class ApsScheduleTask(Base):
     __tablename__ = "aps_schedule_tasks"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
-    schedule_id = Column(UUID(as_uuid=False))
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    schedule_id = Column(String(36))
     station_id = Column(String(50))
     planned_start = Column(DateTime)
     planned_end = Column(DateTime)
@@ -1990,7 +1990,7 @@ class ProductionAlert(Base):
     
     __tablename__ = "production_alerts"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50), nullable=False, index=True)  # 工厂
     alert_type = Column(String(50))  # 告警类型（缺料/设备故障/质量异常等）
     severity = Column(String(20))  # 严重程度（critical/high/medium/low）
@@ -2089,7 +2089,7 @@ class Notification(Base):
     
     __tablename__ = "notifications"
     
-    id = Column(UUID(as_uuid=False), primary_key=True, default=generate_uuid)
+    id = Column(String(36), primary_key=True, default=generate_uuid)
     factory_id = Column(String(50), nullable=False, index=True)  # 工厂
     title = Column(String(255), nullable=False)  # 标题
     content = Column(Text)  # 内容

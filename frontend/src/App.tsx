@@ -1,6 +1,6 @@
 import React from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { ConfigProvider } from 'antd'
+import { Button, ConfigProvider, Result, Spin } from 'antd'
 import { getAntdLocale, getStoredLocale, LOCALE_CHANGE_EVENT } from './services/locale'
 import Layout from './components/Layout'
 import Dashboard from './pages/Dashboard'
@@ -46,14 +46,13 @@ import ModuleSelector from './pages/ModuleSelector'
 // v2.5 Modules
 import WarRoom from './pages/war-room/WarRoom'
 import AgentSupervisor from './pages/war-room/AgentSupervisor'
-import AndonDashboard from './pages/andon/AndonDashboard'
 import WorkOrderTemplatesPage from './pages/templates/WorkOrderTemplates'
 import RCCCommandCenter from './pages/rcc/RCCCommandCenter'
 // BOM 管理模块
 import BOMManager from './pages/bom/BOMManager'
 import BOMCompare from './pages/bom/BOMCompare'
 import MaterialSearch from './pages/bom/MaterialSearch'
-import { isAuthenticated, getStoredUser } from './services/auth'
+import { fetchMe, getStoredUser, isAuthenticated, logout } from './services/auth'
 // TMS 模块
 import ApprovalCenter from './pages/tms/ApprovalCenter'
 import TaskDistribution from './pages/tms/TaskDistribution'
@@ -107,24 +106,87 @@ const RequireAuth: React.FC<{ children: React.ReactElement }> = ({ children }) =
  * 注意：react-router v6 要求 <Route> 子元素必须是字面 <Route>，
  * 因此权限逻辑放在 element 内部而非自定义 Route 组件
  */
+const hasMenuAccess = (items: any[], menuPath: string): boolean => {
+  return items.some((item: any) => {
+    if (item.key === menuPath) return true
+    return Array.isArray(item.children) && hasMenuAccess(item.children, menuPath)
+  })
+}
+
+const CenteredRouteState: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <div style={{ minHeight: 360, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+    {children}
+  </div>
+)
+
 const PermissionGate: React.FC<{ path: string; children: React.ReactElement }> = ({ path, children }) => {
-  const user = getStoredUser()
-  if (!user) return null
+  const [user, setUser] = React.useState(() => getStoredUser())
+  const [loadingUser, setLoadingUser] = React.useState(() => !getStoredUser() && isAuthenticated())
+  const [sessionLost, setSessionLost] = React.useState(false)
+
+  React.useEffect(() => {
+    if (user || !isAuthenticated()) return
+
+    let cancelled = false
+    setLoadingUser(true)
+    fetchMe()
+      .then((fresh) => {
+        if (!cancelled) setUser(fresh)
+      })
+      .catch(() => {
+        logout()
+        if (!cancelled) setSessionLost(true)
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingUser(false)
+      })
+
+    return () => { cancelled = true }
+  }, [user])
+
+  if (!isAuthenticated() || sessionLost) {
+    return <Navigate to="/login" replace state={{ from: window.location.pathname }} />
+  }
+
+  if (loadingUser) {
+    return (
+      <CenteredRouteState>
+        <Spin tip="正在恢复会话..." />
+      </CenteredRouteState>
+    )
+  }
+
+  if (!user) {
+    return (
+      <CenteredRouteState>
+        <Result
+          status="403"
+          title="会话信息缺失"
+          subTitle="当前登录凭据不完整，请重新登录后继续。"
+          extra={<Button type="primary" onClick={() => { logout(); window.location.href = '/login' }}>重新登录</Button>}
+        />
+      </CenteredRouteState>
+    )
+  }
 
   // 管理员/超管直通，不受菜单数据新旧影响
   if (user.is_superuser || user.role === 'admin') return children
 
   const menuPath = path.startsWith('/') ? path : `/${path}`
   const menuItems = user.menu_items || []
-  const hasAccess = menuItems.some((item: any) => {
-    if (item.key === menuPath) return true
-    // 检查子菜单
-    if (item.children && item.children.some((child: any) => child.key === menuPath)) return true
-    return false
-  })
+  const hasAccess = hasMenuAccess(menuItems, menuPath)
 
   if (!hasAccess && menuPath !== '/dashboard') {
-    return <Navigate to="/" replace />
+    return (
+      <CenteredRouteState>
+        <Result
+          status="403"
+          title="无权访问"
+          subTitle={`当前账号菜单未开放 ${menuPath}，页面已被守卫拦截。`}
+          extra={<Button type="primary" onClick={() => { window.location.href = '/' }}>回到首页</Button>}
+        />
+      </CenteredRouteState>
+    )
   }
 
   return children
@@ -212,12 +274,12 @@ const App: React.FC = () => {
             <Route path="automation-level" element={<AutomationLevel />} />
             <Route path="workflow-analytics" element={<WorkflowAnalytics />} />
             {/* v2.5 Smart Collaboration */}
-            <Route path="andon" element={<PermissionGate path="/andon"><AndonDashboard /></PermissionGate>} />
+            <Route path="andon" element={<Navigate to="/task-center" replace />} />
             <Route path="work-order-templates" element={<PermissionGate path="/work-order-templates"><WorkOrderTemplatesPage /></PermissionGate>} />
             <Route path="rcc" element={<PermissionGate path="/rcc"><RCCCommandCenter /></PermissionGate>} />
             <Route path="expert" element={<PermissionGate path="/ai"><ExpertSystemChat /></PermissionGate>} />
             <Route path="war-room" element={<PermissionGate path="/simulation"><WarRoom /></PermissionGate>} />
-                        <Route path="agent-supervisor" element={<PermissionGate path="/simulation"><AgentSupervisor /></PermissionGate>} />
+            <Route path="agent-supervisor" element={<PermissionGate path="/agent-supervisor"><AgentSupervisor /></PermissionGate>} />
             {/* IE 精益生产 */}
             <Route path="ie/standard-times" element={<PermissionGate path="/ie/standard-times"><StandardTimes /></PermissionGate>} />
             <Route path="ie/time-studies" element={<PermissionGate path="/ie/time-studies"><TimeStudies /></PermissionGate>} />
@@ -230,7 +292,7 @@ const App: React.FC = () => {
             <Route path="ie/kanbans" element={<PermissionGate path="/ie/kanbans"><Kanbans /></PermissionGate>} />
             <Route path="ie/5s-audits" element={<PermissionGate path="/ie/5s-audits"><FiveSAudits /></PermissionGate>} />
             {/* 未知路由兜底，避免白屏 */}
-            <Route path="*" element={<Navigate to="/" replace />} />
+            <Route path="*" element={<Result status="404" title="页面不存在" subTitle="当前地址没有对应页面。" extra={<Button type="primary" onClick={() => { window.location.href = '/' }}>回到首页</Button>} />} />
           </Route>
         </Routes>
       </BrowserRouter>

@@ -10,6 +10,7 @@ import {
   AlertOutlined, SettingOutlined, RadarChartOutlined
 } from '@ant-design/icons'
 import axios from 'axios'
+import { useSearchParams } from 'react-router-dom'
 import RCCOverview from './RCCOverview'
 import RCCResourceBoard from './RCCResourceBoard'
 import RCCDecisionHub from './RCCDecisionHub'
@@ -30,7 +31,7 @@ export interface RccContextType {
 }
 
 export const RccContext = createContext<RccContextType>({
-  baseline: {}, decisions: {}, factoryId: 'F01',
+  baseline: {}, decisions: {}, factoryId: 'FAC_ELEC_DEMO_2026',
   loading: false, lastSync: null, refresh: () => {}
 })
 
@@ -57,14 +58,16 @@ export { COLORS }
 
 // ==================== 主组件 ====================
 export default function RCCCommandCenter() {
-  const [activeView, setActiveView] = useState('overview')
-  const [factoryId, setFactoryId] = useState('F01')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const initialView = searchParams.get('view') || 'overview'
+  const [activeView, setActiveView] = useState(['overview', 'org-bubbles', 'resources', 'decisions', 'analysis'].includes(initialView) ? initialView : 'overview')
+  const [factoryId, setFactoryId] = useState(() => localStorage.getItem('active_factory_id') || 'FAC_ELEC_DEMO_2026')
   const [baseline, setBaseline] = useState<any>({})
   const [decisions, setDecisions] = useState<any>({})
   const [loading, setLoading] = useState(false)
   const [lastSync, setLastSync] = useState<string | null>(null)
   const [autoRefresh, setAutoRefresh] = useState(false)
-  const [factories, setFactories] = useState<string[]>(['F01'])
+  const [factories, setFactories] = useState<string[]>([factoryId, 'FAC_ELEC_DEMO_2026', 'FAC_MECH_001'])
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -88,6 +91,11 @@ export default function RCCCommandCenter() {
       setLoading(false)
     }
   }, [factoryId])
+
+  const handleFactoryChange = (nextFactoryId: string) => {
+    setFactoryId(nextFactoryId)
+    localStorage.setItem('active_factory_id', nextFactoryId)
+  }
 
   useEffect(() => { fetchData() }, [fetchData])
 
@@ -127,7 +135,10 @@ export default function RCCCommandCenter() {
           <Menu
             mode="inline"
             selectedKeys={[activeView]}
-            onClick={({ key }) => setActiveView(key)}
+            onClick={({ key }) => {
+              setActiveView(key)
+              setSearchParams({ view: key })
+            }}
             items={menuItems}
             style={{ background: 'transparent', border: 'none', padding: '12px 8px' }}
           />
@@ -161,10 +172,10 @@ export default function RCCCommandCenter() {
             <Space size={12}>
               <Select
                 value={factoryId}
-                onChange={setFactoryId}
+                onChange={handleFactoryChange}
                 style={{ width: 160 }}
                 popupClassName="rcc-dark-dropdown"
-                options={factories.map(f => ({ value: f, label: `工厂 ${f}` }))}
+                options={Array.from(new Set(factories.filter(Boolean))).map(f => ({ value: f, label: `工厂 ${f}` }))}
               />
               <Tooltip title={autoRefresh ? '停止自动刷新' : '开启30s自动刷新'}>
                 <Button
@@ -185,7 +196,7 @@ export default function RCCCommandCenter() {
           <Content style={{ padding: 24, overflow: 'auto' }}>
             <Spin spinning={loading && !lastSync}>
               {activeView === 'overview' && <RCCOverview />}
-              {activeView === 'org-bubbles' && <RCCOrgBubbles />}
+              {activeView === 'org-bubbles' && <RCCOrgBubbles factoryId={factoryId} />}
               {activeView === 'resources' && <RCCResourceBoard />}
               {activeView === 'decisions' && <RCCDecisionHub />}
               {activeView === 'analysis' && <RCCAnalysis />}

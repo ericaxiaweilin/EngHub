@@ -26,7 +26,6 @@
     "/tms/approval": "Trung tâm phê duyệt",
     "/tms/distribution": "Bảng phân phối",
     "/tms/agent": "Bảng điều khiển Agent",
-    "/andon": "Andon - Yêu cầu nhanh",
     "/work-order-templates": "Mẫu lệnh sản xuất",
     "/data-consistency": "Tính nhất quán dữ liệu",
     "/quick-request": "Yêu cầu nhanh"

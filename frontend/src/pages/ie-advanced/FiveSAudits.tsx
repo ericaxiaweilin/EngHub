@@ -33,6 +33,19 @@ const MOCK_DATA: FiveSAudit[] = [
   { id: '5s-5', factory_id: 'factory-sh-01', work_center_id: 'WC-05', auditor: '赵工', audit_date: '2026-07-20', score_sort: 17, score_set_in_order: 16, score_shine: 18, score_standardize: 16, score_sustain: 17, total_score: 84, status: 'completed', created_at: '2026-07-20' },
 ]
 
+function normalizeFiveSAudit(row: any): FiveSAudit {
+  return {
+    ...row,
+    auditor: row.auditor || row.auditor_id || '-',
+    score_sort: Number(row.score_sort ?? row.seiri_score ?? 0),
+    score_set_in_order: Number(row.score_set_in_order ?? row.seiton_score ?? 0),
+    score_shine: Number(row.score_shine ?? row.seiso_score ?? 0),
+    score_standardize: Number(row.score_standardize ?? row.seiketsu_score ?? 0),
+    score_sustain: Number(row.score_sustain ?? row.shitsuke_score ?? 0),
+    status: row.status || 'completed',
+  }
+}
+
 const FiveSAudits: React.FC = () => {
   const [factory, setFactory] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
   const [data, setData] = useState<FiveSAudit[]>([])
@@ -45,7 +58,7 @@ const FiveSAudits: React.FC = () => {
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_5S_AUDITS, { params: { factory_id: factory, limit: 200 } })
       const items = res.items || res || []
-      setData(items)
+      setData(items.map(normalizeFiveSAudit))
     } catch { setData([]) } finally { setLoading(false) }
   }
 

@@ -1,6 +1,8 @@
 import axios from 'axios';
 import { message } from 'antd';
 
+const recentServerErrors = new Map<string, number>();
+
 const api = axios.create({
   timeout: 30000,
   headers: {
@@ -49,7 +51,17 @@ api.interceptors.response.use(
     const msg = Array.isArray(detail)
       ? detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ')
       : (detail || error.message || 'Request failed');
-    message.error(msg);
+    if (status && status >= 500) {
+      const key = `${error.config?.method || 'GET'} ${error.config?.url || ''}`;
+      const now = Date.now();
+      const last = recentServerErrors.get(key) || 0;
+      if (now - last > 10000) {
+        recentServerErrors.set(key, now);
+        message.error(`服务器异常，已保留当前页面数据：${msg}`);
+      }
+    } else {
+      message.error(msg);
+    }
     return Promise.reject(error);
   }
 );

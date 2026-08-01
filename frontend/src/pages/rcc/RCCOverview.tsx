@@ -2,14 +2,16 @@
  * RCC 指挥总览 — 厂长级执行仪表板
  * 五维资源健康度 + KPI大数字 + 实时告警 + 趋势指示
  */
-import { useMemo } from 'react'
-import { Row, Col, Progress, Tag, Space, Tooltip, Empty } from 'antd'
+import { useMemo, useState } from 'react'
+import { Row, Col, Progress, Tag, Space, Tooltip, Empty, Button } from 'antd'
 import {
   TeamOutlined, ToolOutlined, FileTextOutlined, EnvironmentOutlined,
   ExperimentOutlined, ArrowUpOutlined, ArrowDownOutlined, WarningOutlined,
-  CheckCircleOutlined, FireOutlined, ThunderboltOutlined, ClockCircleOutlined
+  CheckCircleOutlined, FireOutlined, ThunderboltOutlined, ClockCircleOutlined,
+  EyeOutlined
 } from '@ant-design/icons'
 import { useRcc, COLORS } from './RCCCommandCenter'
+import TraceabilityDrawer from '../../components/TraceabilityDrawer'
 
 // ==================== KPI 卡片组件 ====================
 function KpiCard({ icon, label, value, suffix, sub, trend, color, onClick }: {
@@ -50,10 +52,10 @@ function KpiCard({ icon, label, value, suffix, sub, trend, color, onClick }: {
 }
 
 // ==================== 资源健康度环形图 ====================
-function HealthRing({ label, percent, color, icon }: { label: string; percent: number; color: string; icon: React.ReactNode }) {
+function HealthRing({ label, percent, color, icon, onClick }: { label: string; percent: number; color: string; icon: React.ReactNode; onClick?: () => void }) {
   const status = percent >= 80 ? '良好' : percent >= 60 ? '注意' : '警告'
   return (
-    <div style={{ textAlign: 'center', padding: '16px 12px' }}>
+    <div onClick={onClick} style={{ textAlign: 'center', padding: '16px 12px', cursor: onClick ? 'pointer' : 'default' }}>
       <Progress
         type="circle" size={90} percent={Math.round(percent)}
         strokeColor={color} trailColor={COLORS.bg}
@@ -122,7 +124,8 @@ function OrderStatusBar({ statusMap }: { statusMap: Record<string, number> }) {
 
 // ==================== 主组件 ====================
 export default function RCCOverview() {
-  const { baseline, decisions } = useRcc()
+  const { baseline, decisions, factoryId } = useRcc()
+  const [traceTarget, setTraceTarget] = useState<{ domain: string; title: string } | null>(null)
 
   const people = baseline.people || baseline?.baseline?.people || {}
   const equipment = baseline.equipment || baseline?.baseline?.equipment || {}
@@ -166,6 +169,8 @@ export default function RCCOverview() {
     }
   }, [people, equipment, workOrders, environment, process])
 
+  const openTrace = (domain: string, title: string) => setTraceTarget({ domain, title })
+
   return (
     <div>
       {/* 告警横幅 */}
@@ -179,6 +184,7 @@ export default function RCCOverview() {
             value={metrics.activeWorkers} suffix="人"
             sub={`出勤率 ${metrics.attendanceRate}%`}
             trend={metrics.attendanceRate > 95 ? 'down' : metrics.attendanceRate < 85 ? 'up' : 'flat'}
+            onClick={() => openTrace('people', '在岗人力追溯')}
           />
         </Col>
         <Col xs={24} sm={12} lg={6}>
@@ -187,6 +193,7 @@ export default function RCCOverview() {
             value={metrics.oee} suffix="%"
             sub={`${metrics.runningEquip}/${metrics.equipTotal} 台运行中`}
             trend={metrics.oee >= 85 ? 'down' : 'up'}
+            onClick={() => openTrace('equipment', '设备OEE追溯')}
           />
         </Col>
         <Col xs={24} sm={12} lg={6}>
@@ -195,6 +202,7 @@ export default function RCCOverview() {
             value={metrics.totalOrders} suffix="个"
             sub={`急单 ${metrics.urgentCount} · 风险 ${metrics.deliveryRisk}`}
             trend={metrics.urgentCount > 3 ? 'up' : 'flat'}
+            onClick={() => openTrace('work_orders', '在制工单追溯')}
           />
         </Col>
         <Col xs={24} sm={12} lg={6}>
@@ -203,6 +211,7 @@ export default function RCCOverview() {
             value={metrics.pmOverdue} suffix="台"
             sub={metrics.pmOverdue > 0 ? '需立即安排维护' : '设备维护正常'}
             trend={metrics.pmOverdue > 0 ? 'up' : 'flat'}
+            onClick={() => openTrace('pm', 'PM逾期追溯')}
           />
         </Col>
       </Row>
@@ -212,23 +221,31 @@ export default function RCCOverview() {
         <Col xs={24} lg={14}>
           <div style={{ background: COLORS.bgCard, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 24 }}>
             <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14, marginBottom: 16 }}>
-              <ExperimentOutlined style={{ color: COLORS.accent, marginRight: 8 }} />
-              五维资源健康度
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <span><ExperimentOutlined style={{ color: COLORS.accent, marginRight: 8 }} />五维资源健康度</span>
+                <Tooltip title="追溯五维来源">
+                  <Button type="text" size="small" icon={<EyeOutlined />} onClick={() => openTrace('rcc', '五维资源健康追溯')} style={{ color: COLORS.textDim }} />
+                </Tooltip>
+              </Space>
             </div>
             <Row gutter={8}>
-              <Col span={4} offset={1}><HealthRing label="人力" percent={metrics.peopleHealth} color={COLORS.accent} icon={<TeamOutlined />} /></Col>
-              <Col span={4} offset={1}><HealthRing label="设备" percent={metrics.equipHealth} color={COLORS.accentBlue} icon={<ToolOutlined />} /></Col>
-              <Col span={4} offset={1}><HealthRing label="工单" percent={metrics.orderHealth} color={COLORS.accentPurple} icon={<FileTextOutlined />} /></Col>
-              <Col span={4} offset={1}><HealthRing label="环境" percent={metrics.envHealth} color={COLORS.warning} icon={<EnvironmentOutlined />} /></Col>
-              <Col span={4} offset={1}><HealthRing label="工艺" percent={metrics.processHealth} color={COLORS.success} icon={<ExperimentOutlined />} /></Col>
+              <Col span={4} offset={1}><HealthRing label="人力" percent={metrics.peopleHealth} color={COLORS.accent} icon={<TeamOutlined />} onClick={() => openTrace('people', '人力健康度追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="设备" percent={metrics.equipHealth} color={COLORS.accentBlue} icon={<ToolOutlined />} onClick={() => openTrace('equipment', '设备健康度追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="工单" percent={metrics.orderHealth} color={COLORS.accentPurple} icon={<FileTextOutlined />} onClick={() => openTrace('work_orders', '工单健康度追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="环境" percent={metrics.envHealth} color={COLORS.warning} icon={<EnvironmentOutlined />} onClick={() => openTrace('qms', '环境/质量预警追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="工艺" percent={metrics.processHealth} color={COLORS.success} icon={<ExperimentOutlined />} onClick={() => openTrace('process', '工艺健康度追溯')} /></Col>
             </Row>
           </div>
         </Col>
         <Col xs={24} lg={10}>
           <div style={{ background: COLORS.bgCard, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 24, height: '100%' }}>
             <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14, marginBottom: 16 }}>
-              <FileTextOutlined style={{ color: COLORS.accentPurple, marginRight: 8 }} />
-              工单状态分布
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <span><FileTextOutlined style={{ color: COLORS.accentPurple, marginRight: 8 }} />工单状态分布</span>
+                <Tooltip title="追溯工单来源">
+                  <Button type="text" size="small" icon={<EyeOutlined />} onClick={() => openTrace('work_orders', '工单状态分布追溯')} style={{ color: COLORS.textDim }} />
+                </Tooltip>
+              </Space>
             </div>
             {Object.keys(metrics.woStatus).length > 0 ? (
               <>
@@ -269,8 +286,12 @@ export default function RCCOverview() {
         <Col xs={24} lg={10}>
           <div style={{ background: COLORS.bgCard, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 24 }}>
             <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14, marginBottom: 16 }}>
-              <ToolOutlined style={{ color: COLORS.accentBlue, marginRight: 8 }} />
-              设备状态矩阵
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <span><ToolOutlined style={{ color: COLORS.accentBlue, marginRight: 8 }} />设备状态矩阵</span>
+                <Tooltip title="追溯设备来源">
+                  <Button type="text" size="small" icon={<EyeOutlined />} onClick={() => openTrace('equipment', '设备状态矩阵追溯')} style={{ color: COLORS.textDim }} />
+                </Tooltip>
+              </Space>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(80px, 1fr))', gap: 8 }}>
               {Object.entries(metrics.statusDist).map(([status, count]) => {
@@ -296,8 +317,12 @@ export default function RCCOverview() {
         <Col xs={24} lg={14}>
           <div style={{ background: COLORS.bgCard, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 24 }}>
             <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14, marginBottom: 16 }}>
-              <ThunderboltOutlined style={{ color: COLORS.warning, marginRight: 8 }} />
-              AI 决策摘要
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <span><ThunderboltOutlined style={{ color: COLORS.warning, marginRight: 8 }} />AI 决策摘要</span>
+                <Tooltip title="追溯RCC决策链">
+                  <Button type="text" size="small" icon={<EyeOutlined />} onClick={() => openTrace('rcc', 'AI决策摘要追溯')} style={{ color: COLORS.textDim }} />
+                </Tooltip>
+              </Space>
             </div>
             {decisions && Object.keys(decisions).length > 0 ? (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
@@ -323,6 +348,13 @@ export default function RCCOverview() {
           </div>
         </Col>
       </Row>
+      <TraceabilityDrawer
+        open={!!traceTarget}
+        factoryId={factoryId}
+        domain={traceTarget?.domain || null}
+        title={traceTarget?.title}
+        onClose={() => setTraceTarget(null)}
+      />
     </div>
   )
 }
