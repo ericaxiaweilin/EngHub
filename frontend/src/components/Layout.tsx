@@ -36,6 +36,7 @@ import {
   DragOutlined,
   RiseOutlined,
   BranchesOutlined,
+  CarryOutOutlined,
 } from '@ant-design/icons'
 import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
@@ -43,6 +44,7 @@ import api from '../services/api'
 import RoleSwitcher from './RoleSwitcher'
 import AIAssistantWidget from './AIAssistantWidget'
 import GlobalSearch from './GlobalSearch'
+import AppErrorBoundary from './AppErrorBoundary'
 
 const { Header, Sider, Content } = AntLayout
 
@@ -80,6 +82,7 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/quick-request': <EditOutlined />,
   '/andon': <AlertOutlined />,
   '/my-tasks': <CheckSquareOutlined />,
+  '/task-center': <CarryOutOutlined />,
   '/alert-intelligence': <AlertOutlined />,
   '/settings': <SettingOutlined />,
   '/ie/standard-times': <LineChartOutlined />,
@@ -130,6 +133,7 @@ const ROUTE_MODULE_MAP: [string, string][] = [
   ['/equipment-center', 'g-equipment'], ['/equipment/', 'g-equipment'],
   ['/orders', 'g-aps'], ['/plans', 'g-aps'], ['/scheduling', 'g-aps'],
   ['/andon', 'g-collab'], ['/tms/', 'g-collab'], ['/quick-request', 'g-collab'], ['/my-tasks', 'g-collab'],
+  ['/task-center', 'g-collab'],
   ['/war-room', 'g-collab'], ['/work-order-templates', 'g-collab'], ['/rcc', 'g-collab'],
   ['/agent-supervisor', 'g-collab'],
   ['/simulation', '/simulation'], ['/sim-erp', '/simulation'],
@@ -328,7 +332,9 @@ const Layout: React.FC = () => {
         )}
         <Content style={{ padding: 24, background: '#f0f2f5' }}>
           <div style={{ background: 'transparent' }}>
-            <Outlet />
+            <AppErrorBoundary resetKey={location.pathname}>
+              <Outlet />
+            </AppErrorBoundary>
           </div>
         </Content>
       </AntLayout>

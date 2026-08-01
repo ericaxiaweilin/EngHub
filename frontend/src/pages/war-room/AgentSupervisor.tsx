@@ -7,7 +7,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
   Card, Row, Col, Tag, Table, Statistic, Space, Button, Badge,
-  Timeline, Alert, Typography, Tooltip, Progress, Tabs, message,
+  Timeline, Alert, Typography, Tooltip, Progress, Tabs,
 } from 'antd'
 import {
   RobotOutlined, ReloadOutlined, CheckCircleOutlined,
@@ -52,21 +52,35 @@ const AgentSupervisor: React.FC = () => {
   const [predictions, setPredictions] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [predictLoading, setPredictLoading] = useState(false)
+  const [dashboardError, setDashboardError] = useState('')
+  const [predictionError, setPredictionError] = useState('')
+
+  const getErrorMessage = (error: any, fallback: string) => {
+    const detail = error?.response?.data?.detail
+    if (Array.isArray(detail)) return detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ')
+    return detail || error?.message || fallback
+  }
 
   const loadDashboard = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await api.get('/api/v1/agent-supervisor/dashboard', { params: { factory_id: FACTORY } })
+      const res: any = await api.get('/api/v1/agent-supervisor/dashboard', { params: { factory_id: FACTORY } })
       setDashboard(res)
-    } catch { /* ignore */ } finally { setLoading(false) }
+      setDashboardError('')
+    } catch (error: any) {
+      setDashboardError(getErrorMessage(error, '智能体监督数据加载失败'))
+    } finally { setLoading(false) }
   }, [])
 
   const loadPredictions = useCallback(async () => {
     setPredictLoading(true)
     try {
-      const res = await api.get('/api/v1/agent-supervisor/predict', { params: { factory_id: FACTORY } })
-      setPredictions(res.data?.predictions || [])
-    } catch { /* ignore */ } finally { setPredictLoading(false) }
+      const res: any = await api.get('/api/v1/agent-supervisor/predict', { params: { factory_id: FACTORY } })
+      setPredictions(Array.isArray(res?.predictions) ? res.predictions : [])
+      setPredictionError('')
+    } catch (error: any) {
+      setPredictionError(getErrorMessage(error, '预测预警加载失败'))
+    } finally { setPredictLoading(false) }
   }, [])
 
   useEffect(() => { loadDashboard(); loadPredictions() }, [loadDashboard, loadPredictions])
@@ -91,6 +105,16 @@ const AgentSupervisor: React.FC = () => {
 
   return (
     <div style={{ padding: 16 }}>
+      {(dashboardError || predictionError) && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="智能体监督数据未完全加载"
+          description={[dashboardError, predictionError].filter(Boolean).join('；')}
+        />
+      )}
+
       {/* 顶部健康度 */}
       <Row gutter={16} style={{ marginBottom: 16 }}>
         <Col span={6}>
