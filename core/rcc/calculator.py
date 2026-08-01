@@ -120,7 +120,8 @@ class RCCResourceCalculator:
                 WHERE factory_id = :fid AND date = CURRENT_DATE::text
             """), {"fid": factory_id})
             attendance = attendance_rows.mappings().first()
-            if attendance and attendance["total"]:
+            # Only use attendance ledger if it covers >=50% of active workforce
+            if attendance and attendance["total"] and attendance["total"] >= active * 0.5:
                 result["attendance_rate_pct"] = round(attendance["attended"] / attendance["total"] * 100, 1)
                 result["attendance"] = dict(attendance)
             else:

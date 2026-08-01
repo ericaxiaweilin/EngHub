@@ -295,6 +295,45 @@ def _grounded_tool_result(result: Dict[str, Any]) -> str:
     )
 
 
+def _format_orchestration_reply(orch_result) -> str:
+    """将并行编排结果格式化为用户可读的回复"""
+    parts = [f"🤖 多智能体协作完成：{orch_result.intent_name}"]
+    parts.append(f"参与智能体：{len(orch_result.sub_tasks)} 个 | 耗时：{orch_result.total_duration_ms:.0f}ms")
+    parts.append("")
+
+    # 各Agent状态
+    for t in orch_result.sub_tasks:
+        icon = "✅" if t.status == "success" else "❌" if t.status == "error" else "⏳"
+        parts.append(f"{icon} {t.agent_name} ({t.duration_ms:.0f}ms)")
+
+    # 综合结论
+    syn = orch_result.synthesis
+    if syn and isinstance(syn, dict):
+        parts.append("")
+        if syn.get("summary"):
+            parts.append(f"📋 综合判断：{syn['summary']}")
+        if syn.get("findings"):
+            parts.append("\n🔍 关键发现：")
+            for f in syn["findings"][:5]:
+                parts.append(f"  • {f}")
+        if syn.get("risks"):
+            parts.append("\n⚠️ 风险点：")
+            for r in syn["risks"][:3]:
+                parts.append(f"  • {r}")
+        if syn.get("actions"):
+            parts.append("\n🎯 建议行动：")
+            for i, a in enumerate(syn["actions"][:5], 1):
+                parts.append(f"  {i}. {a}")
+        if syn.get("need_human"):
+            parts.append("\n👤 需人工决策：")
+            for h in syn["need_human"]:
+                parts.append(f"  • {h}")
+        if syn.get("degraded"):
+            parts.append("\n⚠️ LLM不可用，以上为各智能体原始数据")
+
+    return "\n".join(parts)
+
+
 def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
     """Deterministic fallback reply for clear business intents."""
     label = TOOL_LABELS.get(tool_name, tool_name)
@@ -631,6 +670,61 @@ async def chat(
                 degraded=False,
                 actions=actions,
             )
+
+    # ---- 多智能体并行编排：识别复合意图 → 多Agent并行执行 ----
+    if request.enable_tools and not image_records and not request.agent_key:
+        try:
+            from api.services.parallel_orchestrator import ParallelOrchestrator
+            orchestrator = ParallelOrchestrator(db)
+            parallel_intent = orchestrator.resolve_intent(last_user)
+            if parallel_intent == "__commander__":
+                # 工厂指挥官模式
+                from api.services.factory_commander import FactoryCommander
+                commander = FactoryCommander(db)
+                report = await commander.run_cycle(factory_id, auto_execute=True)
+                reply = report.to_chatbot_reply()
+                actions.append(ToolAction(
+                    tool="factory_commander:cycle",
+                    label="工厂指挥官: 自主决策",
+                    arguments={"factory_id": factory_id},
+                    result=report.to_dict(),
+                    is_write=True,
+                    is_sim=False,
+                    success=True,
+                ))
+                return ChatResponse(
+                    reply=reply,
+                    model="factory-commander",
+                    degraded=False,
+                    actions=actions,
+                )
+            elif parallel_intent:
+                orch_result = await orchestrator.execute(
+                    intent=parallel_intent,
+                    factory_id=factory_id,
+                    context={"user_message": last_user, "operator": operator},
+                    user_message=last_user,
+                )
+                # 构建回复
+                reply = _format_orchestration_reply(orch_result)
+                actions.append(ToolAction(
+                    tool=f"parallel_orchestrator:{parallel_intent}",
+                    label=f"多智能体协作: {orch_result.intent_name}",
+                    arguments={"intent": parallel_intent},
+                    result=orch_result.to_dict(),
+                    is_write=False,
+                    is_sim=False,
+                    success=orch_result.status in ("completed", "partial"),
+                ))
+                return ChatResponse(
+                    reply=reply,
+                    model="parallel-orchestrator",
+                    degraded=False,
+                    actions=actions,
+                )
+        except Exception as _orch_err:
+            import logging as _lg
+            _lg.getLogger("chat").debug(f"parallel orchestrator skip: {_orch_err}")
 
     task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
     prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)

@@ -1679,6 +1679,15 @@ async def _tool_query_hr_roster(db: AsyncSession, args: Dict[str, Any], factory_
     total = (await db.execute(sa_text(f"SELECT count(*) FROM hr_employees WHERE {where}"), params)).scalar()
     active = (await db.execute(sa_text(f"SELECT count(*) FROM hr_employees WHERE {where} AND status='active'"), params)).scalar()
 
+    # 出勤率：优先用 attendance 表（覆盖率>=50%时），否则用 active/total
+    attendance_rate = round(active / total * 100, 1) if total else 0
+    att_row = (await db.execute(sa_text(
+        "SELECT count(*)::int AS t, count(*) FILTER (WHERE status IN ('present','late'))::int AS p "
+        "FROM attendance WHERE factory_id = :fid AND date = CURRENT_DATE::text"
+    ), {"fid": fid})).first()
+    if att_row and att_row[0] and att_row[0] >= (active or 0) * 0.5:
+        attendance_rate = round(att_row[1] / att_row[0] * 100, 1)
+
     # 按部门+工序统计
     dept_rows = (await db.execute(sa_text(f"""
         SELECT department, station, count(*) as cnt, count(*) FILTER (WHERE status='active') as act
@@ -1709,6 +1718,7 @@ async def _tool_query_hr_roster(db: AsyncSession, args: Dict[str, Any], factory_
         "factory_id": fid,
         "total": total,
         "active": active,
+        "attendance_rate_pct": attendance_rate,
         "distribution": distribution,
         "employees": employees,
     }

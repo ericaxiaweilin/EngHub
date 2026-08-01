@@ -17,6 +17,7 @@ Crew定义：
 不依赖crewai库，用相同模式自建（轻量+可控+可审计）。
 后续如需替换为crewai库，接口不变。
 """
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -176,10 +177,16 @@ class CrewOrchestration:
 
         _logger.info(f"[crew] 启动 {crew['name']}: {context}")
 
-        # 1. 各Agent获取数据
+        # 1. 各Agent并行获取数据（asyncio.gather）
+        gather_tasks = [
+            self._gather_agent_data(agent_def["data_source"], factory_id, context)
+            for agent_def in crew["agents"]
+        ]
+        gather_results = await asyncio.gather(*gather_tasks, return_exceptions=True)
         agent_inputs = []
-        for agent_def in crew["agents"]:
-            data = await self._gather_agent_data(agent_def["data_source"], factory_id, context)
+        for agent_def, data in zip(crew["agents"], gather_results):
+            if isinstance(data, Exception):
+                data = {"error": str(data)}
             agent_inputs.append({
                 "role": agent_def["role"],
                 "goal": agent_def["goal"],
