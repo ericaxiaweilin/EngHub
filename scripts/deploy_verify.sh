@@ -323,6 +323,18 @@ if [ -n "$TOKEN" ]; then
     check_api "chat/quick-commands" "Chatbot快速命令"
     check_api "task-center/inbox" "Chatbot任务中心收件箱"
     check_api "task-center/tasks" "Chatbot任务中心任务列表"
+
+    ORDER_STATUS_RESP=$(curl -s -X POST "http://localhost:${BACKEND_PORT}/api/v1/chat" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "X-Factory-Id: ${FACTORY_ID}" \
+        -d '{"messages":[{"role":"user","content":"这6个订单全部下发生产工单了吗"}],"enable_tools":true}' 2>/dev/null)
+    ORDER_STATUS_TOOL=$(printf '%s' "$ORDER_STATUS_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('actions') or [{}])[0].get('tool',''))" 2>/dev/null || echo "")
+    if [ "$ORDER_STATUS_TOOL" = "query_order_work_order_status" ]; then
+        pass "Chatbot 订单→工单核对触发"
+    else
+        fail "Chatbot 订单→工单核对误触发为 ${ORDER_STATUS_TOOL:-unknown}"
+    fi
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
