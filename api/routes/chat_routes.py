@@ -150,25 +150,12 @@ async def chat_health():
             )
         except Exception as exc:  # noqa: BLE001
             detail = f"unreachable: {type(exc).__name__}"
-    else:
-        # 降级模式：检查网关是否可达
-        fallback_model = os.getenv("LLM_MODEL", "").strip()
-        if GATEWAY_URL and fallback_model:
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    gateway_resp = await client.get(f"{GATEWAY_URL}/health")
-                reachable = gateway_resp.status_code < 500
-                detail = f"fallback mode: model={fallback_model}, gateway={gateway_resp.status_code}"
-            except Exception as exc:  # noqa: BLE001
-                detail = f"fallback mode: gateway unreachable ({type(exc).__name__})"
-        else:
-            detail = "no model configured (set LLM_MODEL or model-stack)"
     return {
         "configured": configured,
         "reachable": reachable,
-        "model": MODEL_STACK_CHAT_TASK_ID or os.getenv("LLM_MODEL", ""),
+        "model": MODEL_STACK_CHAT_TASK_ID,
         "gateway": GATEWAY_URL,
-        "control_plane": MODEL_STACK_CONTROL_PLANE_URL or "(fallback: direct)",
+        "control_plane": MODEL_STACK_CONTROL_PLANE_URL,
         "detail": detail,
     }
 
@@ -198,22 +185,9 @@ async def _resolve_model_route(
     prompt_tokens: int = 1000,
     max_completion_tokens: int = 1024,
 ) -> Dict[str, Any]:
-    """向模型底座申请任务路由；业务侧不维护模型候选或回退链。
-
-    当 model-stack 控制面未配置时，降级为直接使用 LLM_GATEWAY_URL + LLM_MODEL。
-    """
+    """向模型底座申请任务路由；业务侧不维护模型候选或回退链。"""
     if not MODEL_STACK_CONTROL_PLANE_URL or not task_id:
-        # 降级：直接用网关 + 环境变量模型
-        fallback_model = os.getenv("LLM_MODEL", "deepseek-v4-pro").strip()
-        if not fallback_model:
-            raise RuntimeError("model-stack task routing is not configured and LLM_MODEL is empty")
-        return {
-            "task_id": task_id or fallback_model,
-            "provider": "direct",
-            "gateway_model": fallback_model,
-            "request_timeout": REQUEST_TIMEOUT,
-            "max_completion_tokens": max_completion_tokens,
-        }
+        raise RuntimeError("model-stack task routing is not configured")
 
     url = (
         f"{MODEL_STACK_CONTROL_PLANE_URL}/api/model-management/"
@@ -334,6 +308,18 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 本次报工：{advanced.get('containers_reported', 0)} 柜，"
             f"{advanced.get('reports_created', 0)} 条报工\n"
             f"- 节奏预警：{len(result.get('alerts', []))} 条"
+        )
+    if tool_name == "query_order_work_order_status":
+        orders = result.get("orders", [])
+        return (
+            "订单到生产工单核对完成：\n"
+            f"- 销售订单：{result.get('count', 0)} 个，已有生产工单：{result.get('orders_with_work_orders', 0)} 个"
+            f"（覆盖率 {result.get('work_order_coverage_pct', 0)}%）\n"
+            f"- 生产工单：{result.get('total_work_orders', 0)} 张，其中工序工单 {result.get('total_operation_work_orders', 0)} 张\n"
+            f"- 工序工单已下达：{result.get('released_operation_work_orders', 0)}/{result.get('total_operation_work_orders', 0)}"
+            f"（{result.get('operation_release_coverage_pct', 0)}%）\n"
+            f"- 所有工序全部下达的订单：{result.get('orders_fully_released', 0)}/{len(orders)}\n"
+            "结论：订单是否已经生成生产工单，与工序工单是否全部 released 是两件事；请按上面两个口径判断。"
         )
     if tool_name == "get_virtual_factory_status":
         return (
@@ -795,6 +781,17 @@ _TABLE_COLUMNS: Dict[str, List[Dict[str, str]]] = {
         {"key": "priority", "label": "优先级"},
         {"key": "planned_due", "label": "交期"},
     ],
+    "query_order_work_order_status": [
+        {"key": "sales_order_code", "label": "销售订单"},
+        {"key": "sales_order_status", "label": "订单状态"},
+        {"key": "actual_work_order_count", "label": "生产工单数"},
+        {"key": "master_work_order_code", "label": "主工单"},
+        {"key": "master_status", "label": "主工单状态"},
+        {"key": "operation_work_order_count", "label": "工序工单数"},
+        {"key": "released_operation_count", "label": "已下达工序"},
+        {"key": "pending_operation_count", "label": "待下达工序"},
+        {"key": "all_operation_work_orders_released", "label": "工序是否全下达"},
+    ],
     "query_inventory": [
         {"key": "material_code", "label": "物料编码"},
         {"key": "material_id", "label": "物料ID"},
@@ -827,6 +824,7 @@ _TABLE_COLUMNS: Dict[str, List[Dict[str, str]]] = {
 # 工具结果中存放列表数据的字段名
 _TABLE_LIST_KEY: Dict[str, str] = {
     "query_work_orders": "work_orders",
+    "query_order_work_order_status": "orders",
     "query_inventory": "inventory",
     "query_defects": "defects",
     "query_equipment": "equipment",

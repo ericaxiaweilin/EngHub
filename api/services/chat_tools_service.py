@@ -20,7 +20,7 @@ from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 
 from database.models import (
     WorkOrder, ProductionReport, Station, Equipment, Product,
@@ -63,6 +63,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                         "description": "工单状态过滤，不传则返回全部",
                     },
                     "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_order_work_order_status",
+            "description": "核对销售订单是否已拆分并下发生产工单。明确区分：订单是否已经生成主工单/工序工单，以及工序工单是否全部为released，不能用普通工单列表代替。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_code": {"type": "string", "description": "销售订单号，可选，如 SO-VF-260801-CEC6"},
+                    "virtual_only": {"type": "boolean", "description": "只核对虚拟工厂订单，可选"},
+                    "created_today": {"type": "boolean", "description": "只核对今天创建的订单，可选"},
+                    "limit": {"type": "integer", "description": "订单条数，默认20", "default": 20},
                 },
             },
         },
@@ -687,12 +703,15 @@ def _wo_to_dict(wo: WorkOrder, product_name: str = "") -> Dict[str, Any]:
 
 
 async def _tool_query_work_orders(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    limit = min(int(args.get("limit", 10)), 50)
-    stmt = select(WorkOrder).order_by(WorkOrder.created_at.desc()).limit(limit)
+    limit = max(1, min(int(args.get("limit", 10)), 50))
+    filters = []
     if factory_id:
-        stmt = stmt.where(WorkOrder.factory_id == factory_id)
+        filters.append(WorkOrder.factory_id == factory_id)
     if args.get("status"):
-        stmt = stmt.where(WorkOrder.status == args["status"])
+        filters.append(WorkOrder.status == args["status"])
+    total_result = await db.execute(select(func.count(WorkOrder.id)).where(*filters))
+    total = int(total_result.scalar_one() or 0)
+    stmt = select(WorkOrder).where(*filters).order_by(WorkOrder.created_at.desc()).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
 
     product_ids = list({wo.product_id for wo in rows if wo.product_id})
@@ -706,7 +725,127 @@ async def _tool_query_work_orders(db: AsyncSession, args: Dict[str, Any], factor
         pname_map = {row.product_code: row.product_name for row in pres.all()}
 
     items = [_wo_to_dict(wo, pname_map.get(wo.product_id, "")) for wo in rows]
-    return {"count": len(items), "work_orders": items}
+    return {
+        "count": total,
+        "total": total,
+        "returned_count": len(items),
+        "has_more": total > len(items),
+        "work_orders": items,
+    }
+
+
+async def _tool_query_order_work_order_status(
+    db: AsyncSession,
+    args: Dict[str, Any],
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """核对销售订单到生产工单的完整覆盖与下达状态。"""
+    limit = max(1, min(int(args.get("limit", 20)), 50))
+    where = ["so.factory_id = :factory_id"]
+    params: Dict[str, Any] = {"factory_id": factory_id or "FAC_MECH_001", "limit": limit}
+
+    order_code = str(args.get("order_code") or "").strip()
+    if order_code:
+        where.append("so.order_code ILIKE :order_pattern")
+        params["order_pattern"] = f"%{order_code}%"
+    if args.get("virtual_only"):
+        where.append("so.remark LIKE :virtual_marker")
+        params["virtual_marker"] = "%[virtual_factory]%"
+    if args.get("created_today"):
+        where.append("so.created_at >= CURRENT_DATE")
+
+    where_sql = " AND ".join(where)
+    total_result = await db.execute(
+        text(f"SELECT count(*) FROM sales_orders so WHERE {where_sql}"),
+        params,
+    )
+    total = int(total_result.scalar_one() or 0)
+
+    rows_result = await db.execute(text(f"""
+        SELECT
+            so.id AS sales_order_id,
+            so.order_code AS sales_order_code,
+            so.status AS sales_order_status,
+            so.quantity,
+            so.delivery_date,
+            so.decomposed,
+            so.work_order_ids,
+            so.created_at,
+            COUNT(wo.id) AS actual_work_order_count,
+            COUNT(wo.id) FILTER (WHERE wo.wo_type = 'master') AS master_count,
+            MAX(wo.work_order_code) FILTER (WHERE wo.wo_type = 'master') AS master_work_order_code,
+            MAX(wo.status) FILTER (WHERE wo.wo_type = 'master') AS master_status,
+            COUNT(wo.id) FILTER (WHERE wo.wo_type = 'operation') AS operation_work_order_count,
+            COUNT(wo.id) FILTER (WHERE wo.wo_type = 'operation' AND wo.status = 'released') AS released_operation_count,
+            COUNT(wo.id) FILTER (WHERE wo.wo_type = 'operation' AND wo.status = 'pending') AS pending_operation_count,
+            COUNT(wo.id) FILTER (WHERE wo.wo_type = 'operation' AND wo.status = 'in_progress') AS in_progress_operation_count,
+            COUNT(wo.id) FILTER (WHERE wo.wo_type = 'operation' AND wo.status = 'completed') AS completed_operation_count
+        FROM sales_orders so
+        LEFT JOIN work_orders wo ON wo.sales_order_id IN (so.id, so.order_code)
+        WHERE {where_sql}
+        GROUP BY so.id, so.order_code, so.status, so.quantity, so.delivery_date,
+                 so.decomposed, so.work_order_ids, so.created_at
+        ORDER BY so.created_at DESC
+        LIMIT :limit
+    """), params)
+    rows = rows_result.mappings().all()
+
+    orders: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            linked_ids = json.loads(row.get("work_order_ids") or "[]")
+            linked_count = len(linked_ids) if isinstance(linked_ids, list) else 0
+        except (TypeError, ValueError, json.JSONDecodeError):
+            linked_count = 0
+
+        actual_count = int(row.get("actual_work_order_count") or 0)
+        master_count = int(row.get("master_count") or 0)
+        operation_count = int(row.get("operation_work_order_count") or 0)
+        released_count = int(row.get("released_operation_count") or 0)
+        decomposed_complete = bool(
+            row.get("decomposed") and linked_count > 0 and actual_count > 0 and master_count > 0
+        )
+        all_operations_released = operation_count > 0 and released_count == operation_count
+        orders.append({
+            "sales_order_id": row.get("sales_order_id"),
+            "sales_order_code": row.get("sales_order_code"),
+            "sales_order_status": row.get("sales_order_status"),
+            "quantity": row.get("quantity"),
+            "delivery_date": row.get("delivery_date").isoformat() if row.get("delivery_date") else None,
+            "decomposed": bool(row.get("decomposed")),
+            "linked_work_order_count": linked_count,
+            "actual_work_order_count": actual_count,
+            "master_work_order_code": row.get("master_work_order_code"),
+            "master_status": row.get("master_status"),
+            "operation_work_order_count": operation_count,
+            "released_operation_count": released_count,
+            "pending_operation_count": int(row.get("pending_operation_count") or 0),
+            "in_progress_operation_count": int(row.get("in_progress_operation_count") or 0),
+            "completed_operation_count": int(row.get("completed_operation_count") or 0),
+            "work_order_coverage_complete": decomposed_complete,
+            "all_operation_work_orders_released": all_operations_released,
+        })
+
+    total_work_orders = sum(item["actual_work_order_count"] for item in orders)
+    total_operation_work_orders = sum(item["operation_work_order_count"] for item in orders)
+    released_operation_work_orders = sum(item["released_operation_count"] for item in orders)
+    orders_with_work_orders = sum(1 for item in orders if item["work_order_coverage_complete"])
+    orders_fully_released = sum(1 for item in orders if item["all_operation_work_orders_released"])
+    return {
+        "scope": "sales_orders_to_work_orders",
+        "total": total,
+        "count": len(orders),
+        "returned_count": len(orders),
+        "has_more": total > len(orders),
+        "orders_with_work_orders": orders_with_work_orders,
+        "orders_fully_released": orders_fully_released,
+        "work_order_coverage_pct": round(orders_with_work_orders / total * 100, 1) if total else 0.0,
+        "operation_release_coverage_pct": round(released_operation_work_orders / total_operation_work_orders * 100, 1) if total_operation_work_orders else 0.0,
+        "total_work_orders": total_work_orders,
+        "total_operation_work_orders": total_operation_work_orders,
+        "released_operation_work_orders": released_operation_work_orders,
+        "orders": orders,
+    }
 
 
 async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1883,6 +2022,7 @@ async def _tool_run_virtual_factory_pulse(
 # 执行器注册表
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
+    "query_order_work_order_status": _tool_query_order_work_order_status,
     "get_work_order_detail": _tool_get_work_order_detail,
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
@@ -2008,6 +2148,7 @@ SIM_TOOLS = {
 # 工具的中文标签（供前端展示）
 TOOL_LABELS = {
     "query_work_orders": "查询工单",
+    "query_order_work_order_status": "订单-工单下发核对",
     "get_work_order_detail": "工单详情",
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
@@ -2075,6 +2216,14 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "生产情况", "生产统计", "今日生产", "今天生产", "生产汇总", "生产概览",
             "产量", "稼动率", "生产数据", "生产怎么样", "生产怎样", "今天生产怎么",
             "良品率", "报工情况", "生产概况",
+        ],
+    },
+    {
+        "tool": "query_order_work_order_status",
+        "keywords": [
+            "订单全部下发", "全部下发生产工单", "下发生产工单了吗", "是否下发生产工单",
+            "订单有没有工单", "订单是否有工单", "订单拆单情况", "订单到工单",
+            "订单工单关系", "订单对应工单", "订单下发情况",
         ],
     },
     {
@@ -2268,7 +2417,17 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
     if not tool:
         return None
     args: Dict[str, Any] = {}
-    if tool == "query_work_orders":
+    if tool == "query_order_work_order_status":
+        match = re.search(r"\bSO-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)
+        if match:
+            args["order_code"] = match.group(0)
+        if "虚拟" in message:
+            args["virtual_only"] = True
+        if any(k in message for k in ["今天", "这6个订单", "这六个订单", "这几个订单"]):
+            args["created_today"] = True
+        if any(k in message for k in ["6个订单", "六个订单"]):
+            args["limit"] = 6
+    elif tool == "query_work_orders":
         if any(k in message for k in ["在制", "生产中", "进行中", "在做", "在产"]):
             args["status"] = "in_progress"
         elif any(k in message for k in ["待下达", "未下达"]):
