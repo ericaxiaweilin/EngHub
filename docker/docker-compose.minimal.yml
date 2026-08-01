@@ -31,6 +31,7 @@ services:
           memory: 256M
 
   backend:
+    container_name: enghub-backend-1
     build:
       context: ..
       dockerfile: docker/Dockerfile.backend
@@ -42,34 +43,35 @@ services:
       - TEST_MODE=true
       # AI 助手 -> litellm 网关 (通过 model-stack 内网直连)
       # 密钥通过 docker/.env 提供 (见 .env.example)，不提交到仓库
-      - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-gateway:4000}
+      - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-stack-gateway:4000}
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - LLM_MODEL=${LLM_MODEL:-openai/qwen-plus}
-      # VL 视觉模型（图片多模态自动路由）
-      - LLM_VISION_URL=${LLM_VISION_URL:-http://host.docker.internal:8019}
-      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
-      # OCR 专用模型（文字提取，经网关路由）
-      - LLM_OCR_MODEL=${LLM_OCR_MODEL:-openai/qwen-vl-ocr}
+      # 模型名称由公共模型底座按业务任务动态路由，业务容器只持有任务 ID。
+      - MODEL_STACK_CONTROL_PLANE_URL=${MODEL_STACK_CONTROL_PLANE_URL:-http://model-stack-control-plane:8080}
+      - MODEL_STACK_CHAT_TASK_ID=${MODEL_STACK_CHAT_TASK_ID:-data_coin.advisor.chat}
+      - MODEL_STACK_VISION_TASK_ID=${MODEL_STACK_VISION_TASK_ID:-luaguage.vision.content_analysis}
+      - MODEL_STACK_ROUTE_TIMEOUT=${MODEL_STACK_ROUTE_TIMEOUT:-5}
     ports:
       - "18888:8000"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
     networks:
       - default
       - model-stack
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # 代码目录挂载：容器重建不丢代码
-      - /home/eric/enghub/api:/app/api
-      - /home/eric/enghub/core:/app/core
-      - /home/eric/enghub/database:/app/database
-      - /home/eric/enghub/integrations:/app/integrations
-      - /home/eric/enghub/main.py:/app/main.py
-      - /home/eric/enghub/frontend_dist:/app/frontend_dist
+      # 代码持久化挂载：容器重建不丢代码
+      - ${CODE_DIR:-..}/api:/app/api
+      - ${CODE_DIR:-..}/core:/app/core
+      - ${CODE_DIR:-..}/database:/app/database
+      - ${CODE_DIR:-..}/integrations:/app/integrations
+      - ${CODE_DIR:-..}/main.py:/app/main.py
+      - ${CODE_DIR:-..}/frontend_dist:/app/frontend_dist
     healthcheck:
-      test: ['CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8000/health")']
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
       timeout: 5s
       retries: 3

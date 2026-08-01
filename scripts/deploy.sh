@@ -8,7 +8,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_HOST="${DEPLOY_HOST:-eric@100.96.188.77}"
 REMOTE_DIR="${REMOTE_DIR:-/home/eric/enghub}"
-CONTAINER="${CONTAINER:-docker-backend-1}"
+CONTAINER="${CONTAINER:-enghub-backend-1}"
 DB_CONTAINER="${DB_CONTAINER:-docker-postgres-1}"
 DB_USER="${DB_USER:-enghub}"
 DB_NAME="${DB_NAME:-enghub}"
