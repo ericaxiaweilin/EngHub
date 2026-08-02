@@ -452,13 +452,13 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_ocap_tasks",
-            "description": "查询用户待处理的 OCAP（纠正预防措施）任务。显示所有 ocap_status 为 triggered/in_progress 的缺陷，供 chatbot 向用户汇报。",
-            "properties": {
-                "factory_id": {"type": "string", "description": "工厂ID，可选，默认当前用户工厂"},
-                "operator": {"type": "string", "description": "操作用户ID，必填"},
-                "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+            "description": "查询待处理的 OCAP（纠正预防措施）任务。显示所有 ocap_status 为 triggered/in_progress 的缺陷，供 chatbot 向用户汇报。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "返回条数，默认20", "default": 20},
+                },
             },
-            "required": ["operator"],
         },
     },
     {
@@ -1432,49 +1432,42 @@ async def _tool_run_alert_patrol(db: AsyncSession, args: Dict[str, Any], operato
 
 
 async def _tool_query_ocap_tasks(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """查询用户待处理的 OCAP 任务 - 集成到 chatbot
-    
-    返回当前用户（operator参数）在指定工厂下，状态为 triggered/in_progress 的缺陷列表。
-    
-    Args:
-        factory_id: 工厂ID（可选）
-        operator: 操作用户ID（必选）
-        
-    Returns:
-        {count: int, tasks: List[{defect_code, defect_type, severity, ocap_status, trigger_reason}]}
+    """查询待处理的 OCAP 任务 - 集成到 chatbot
+
+    返回指定工厂下 ocap_status 为 triggered/in_progress 的缺陷列表。
+    factory_id 由 execute_tool 透传（多工厂隔离），无需调用方再传 operator。
     """
     from database.models import DefectRecord
-    
-    current_factory = factory_id or "FAC_ELEC_DEMO_2026"  # 默认工厂，实际应从 auth context 获取
-    operator_id = args.get("operator")
-    
-    if not operator_id:
-        return {"error": "缺少 operator 参数"}
-    
-    # 查询用户的 OCAP 待办：ocap_status 为 triggered 或 in_progress
-    stmt = select(DefectRecord).where(
-        DefectRecord.factory_id == current_factory,
-        DefectRecord.ocap_status.in_(['triggered', 'in_progress']),
+
+    limit = min(int(args.get("limit", 20)), 50)
+    stmt = (
+        select(DefectRecord)
+        .where(DefectRecord.ocap_status.in_(["triggered", "in_progress"]))
+        .order_by(DefectRecord.created_at.desc())
+        .limit(limit)
     )
-    
-    result = await db.execute(stmt)
-    defects = result.scalars().all()
-    
-    tasks = []
-    for d in defects:
-        tasks.append({
-            "defect_code": d.defect_code or d.id,
+    if factory_id:
+        stmt = stmt.where(DefectRecord.factory_id == factory_id)
+
+    defects = (await db.execute(stmt)).scalars().all()
+
+    tasks = [
+        {
+            "record_code": d.record_code,
             "defect_type": d.defect_type or "",
             "severity": d.severity or "",
+            "quantity": d.quantity,
+            "disposition": d.disposition or "未处置",
             "ocap_status": d.ocap_status or "pending",
-            "trigger_reason": d.ocap_trigger_reason or "未说明",
-            "created_at": d.created_at.isoformat() if d.created_at else "",
-        })
-    
-    return {
-        "count": len(tasks),
-        "tasks": tasks,
-    }
+            "root_cause_category": d.root_cause_category,
+            "trigger_reason": getattr(d, "ocap_trigger_reason", None) or d.root_cause or "未说明",
+            "description": (d.description or "")[:80],
+            "created_at": d.created_at.strftime("%Y-%m-%d %H:%M") if d.created_at else None,
+        }
+        for d in defects
+    ]
+
+    return {"count": len(tasks), "tasks": tasks}
 
 
 async def _tool_query_hr_roster(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:

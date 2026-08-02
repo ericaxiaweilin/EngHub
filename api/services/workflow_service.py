@@ -62,13 +62,19 @@ WORKFLOW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "quality_alert_triage": {
         "label": "质量异常分诊",
-        "description": "质量异常快速分诊：先查严重(critical)不良品，再查在制工单，评估影响范围并给处置建议。",
+        "description": (
+            "质量异常完整分诊（不走 fastpath）："
+            "严重不良品 → OCAP 待办 → 在制工单 → 待处理预警，"
+            "由模型基于四步工具结果综合评估影响范围并给出处置建议。"
+        ),
         "trigger_keywords": [
-            "质量分诊", "异常分诊", "质量警报", "质量异常分诊", "分诊",
+            "质量分诊", "异常分诊", "质量警报", "质量异常分诊",
         ],
         "steps": [
-            {"tool": "query_defects", "args": {"severity": "critical"}},
-            {"tool": "query_work_orders", "args": {"status": "in_progress"}},
+            {"tool": "query_defects", "args": {"severity": "critical", "limit": 20}},
+            {"tool": "query_ocap_tasks", "args": {}},
+            {"tool": "query_work_orders", "args": {"status": "in_progress", "limit": 20}},
+            {"tool": "get_pending_alerts", "args": {}},
         ],
     },
     "full_compliance_check": {
