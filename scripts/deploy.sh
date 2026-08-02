@@ -368,6 +368,22 @@ printf '\n'
 printf '%s\n' "$COMMIT_SHA" > "$REMOTE_DIR/.last_deployed_commit"
 REMOTE
 
+# 容器重启后到模型网关的连接需要时间，不等会把竞态误判成部署失败
+info "等待模型底座就绪"
+ssh "$DEPLOY_HOST" bash -s -- "$HEALTH_URL" <<'WARMUP' || warn "模型底座未就绪，部署验证可能失败"
+set -Eeuo pipefail
+CHAT_HEALTH_URL="${1%/health}/api/v1/chat/health"
+for _ in $(seq 1 60); do
+  if curl -fsS --max-time 5 "$CHAT_HEALTH_URL" 2>/dev/null | grep -q '"reachable":true'; then
+    echo "模型底座已就绪"
+    exit 0
+  fi
+  sleep 2
+done
+echo "模型底座 120s 内仍不可达" >&2
+exit 1
+WARMUP
+
 # ━━━ 部署后验证（表/列/数据/API/前端模块缺失则回滚）━━━
 info "运行部署验证 checklist"
 ssh "$DEPLOY_HOST" "test -f '$REMOTE_DIR/scripts/deploy_verify.sh'" \
