@@ -175,10 +175,11 @@ def _workflow_needs_user_params(wf: Dict[str, Any]) -> bool:
 # ==================== 工作流匹配 / 清单 ====================
 
 def match_workflow(message: str) -> Optional[str]:
-    """确定性工作流触发：命中触发词返回工作流名，否则 None。
+    """工作流名匹配（仅供清单/测试；chatbot 不得用此做 fastpath）。
 
-    仅对「无需用户参数」的工作流做确定性路由（如生产复盘/质量分诊/合规检查）；
-    需要参数的写链路工作流（如一键建单下达）交给模型 auto 循环提取参数后调用。"""
+    Chat 路由禁止 keyword → run_workflow 捷径；工作流须由模型调用 run_workflow。
+    本函数保留给单元测试与清单辅助，勿在 chat_routes 重新接入。
+    """
     if not message:
         return None
     for name, wf in WORKFLOW_DEFINITIONS.items():

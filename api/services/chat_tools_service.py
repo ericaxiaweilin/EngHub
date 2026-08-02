@@ -1967,198 +1967,24 @@ TOOL_LABELS = {
 }
 
 
-# ==================== 确定性意图路由（业务底座） ====================
-# 参考 luaguage chatbot 的 capability catalog / business rule 思路：
-# 不依赖模型自由决策，命中业务关键词即强制调用对应工具，从根本上杜绝
-# “建议你进入看板/日报中心查看”这类推诿性模糊回答。
-# 仅对单步查询类工具做强制路由；写操作/多步操作仍交由模型 auto 编排。
-INTENT_RULES: List[Dict[str, Any]] = [
-    {
-        "tool": "get_production_summary",
-        "keywords": [
-            "生产情况", "生产统计", "今日生产", "今天生产", "生产汇总", "生产概览",
-            "产量", "稼动率", "生产数据", "生产怎么样", "生产怎样", "今天生产怎么",
-            "良品率", "报工情况", "生产概况",
-        ],
-    },
-    {
-        "tool": "query_work_orders",
-        "keywords": [
-            "在制工单", "工单列表", "查工单", "查询工单", "工单状态", "工单进度",
-            "有哪些工单", "工单情况", "工单汇总", "待下达工单", "生产工单",
-        ],
-    },
-    {
-        "tool": "query_inventory",
-        "keywords": [
-            "库存", "物料水平", "库存水平", "查库存", "库存量", "物料库存",
-            "库存情况", "库存怎么样", "库存怎样", "原料库存",
-        ],
-    },
-    {
-        "tool": "query_defects",
-        "keywords": [
-            "不良品", "缺陷", "不良", "质量问题", "不良率", "缺陷类型",
-            "不良情况", "不良汇总", "质量异常",
-        ],
-    },
-    {
-        "tool": "query_equipment",
-        "keywords": [
-            "设备状态", "设备运行", "设备情况", "查设备", "设备故障", "机器状态",
-            "设备怎么样", "设备怎样", "设备汇总", "设备稼动",
-        ],
-    },
-    {
-        # 仅对「查仿真记录」做确定性路由；「跑一次仿真」类参数需模型提取，交给 auto 循环
-        "tool": "query_simulation_audits",
-        "keywords": [
-            "仿真记录", "仿真审计", "审计记录", "仿真历史", "查仿真", "最近仿真",
-        ],
-    },
-    {
-        "tool": "get_inspection_form",
-        "keywords": [
-            "检验单", "检验记录", "检验表单", "质检记录", "质检单", "质量检验单",
-        ],
-    },
-    {
-        "tool": "export_report_file",
-        "keywords": [
-            "导出报告", "导出报表", "生成报告", "生成报表", "报告导出", "导出生产报告",
-            "导出成文件", "导出文件", "导出成", "导出为文件", "生成文件", "导出成csv",
-        ],
-    },
-    {
-        # 工单表单需工单号：resolve_intent 尝试轻量提取，提不到则交 auto 让模型提取
-        "tool": "get_work_order_form",
-        "keywords": [
-            "工单表单", "工单完整表单", "完整工单表单", "工单全量信息",
-        ],
-    },
-    # ==================== 5M1E 预警数据意图路由（具体优先于通用预警） ====================
-    {
-        "tool": "query_downtime",
-        "keywords": [
-            "停机", "停机记录", "故障记录", "MTBF", "设备利用率", "设备故障率",
-            "停机时间", "故障次数", "设备停机", "停机原因",
-        ],
-    },
-    {
-        "tool": "query_maintenance_due",
-        "keywords": [
-            "保养到期", "维保", "预防性维护", "保养计划", "维护到期",
-            "设备保养", "逾期保养", "PM到期", "维护计划",
-        ],
-    },
-    {
-        "tool": "query_shortage_alerts",
-        "keywords": [
-            "缺料", "补货", "低于安全库存", "缺料预警", "物料不足",
-            "库存不足", "低于最低水位", "补货预警", "缺料清单",
-        ],
-    },
-    {
-        "tool": "query_stagnant",
-        "keywords": [
-            "呆滞", "滞料", "呆滞物料", "长期不动", "库存积压",
-            "无流动", "呆滞料", "滞库", "积压物料",
-        ],
-    },
-    {
-        "tool": "query_spc_anomalies",
-        "keywords": [
-            "SPC", "失控", "越限", "过程能力", "控制图", "超出控制限",
-            "SPC异常", "质量失控", "UCL", "LCL", "过程异常",
-        ],
-    },
-    {
-        "tool": "query_environment",
-        "keywords": [
-            "环境", "温度", "湿度", "车间环境", "天气", "风速",
-            "降温", "静电", "ESD", "环境温度", "车间温度",
-        ],
-    },
-    {
-        "tool": "query_routing",
-        "keywords": [
-            "工艺路线", "工序", "加工步骤", "工艺流程", "产品工艺",
-            "工艺查询", "路线查询", "工序查询",
-        ],
-    },
-    {
-        "tool": "query_skill_matrix",
-        "keywords": [
-            "技能矩阵", "技能等级", "技能分布", "员工技能", "技能断层",
-            "谁会", "技能情况", "多能工", "技能覆盖",
-        ],
-    },
-    # ==================== 通用预警/巡检（放在 5M1E 具体规则之后） ====================
-    {
-        "tool": "get_pending_alerts",
-        "keywords": [
-            "预警", "告警", "警报", "异常汇报", "待处理预警", "当前异常",
-            "有什么预警", "预警情况", "告警情况", "预警汇总",
-        ],
-    },
-    {
-        "tool": "run_alert_patrol",
-        "keywords": [
-            "巡检", "扫描异常", "主动巡检", "预警巡检", "扫描预警",
-        ],
-    },
-    {
-        "tool": "query_hr_roster",
-        "keywords": [
-            "人力", "花名册", "人员分布", "多少人", "人力档案", "员工",
-            "人事", "部门人数", "工序人数", "人力统计", "人员配置",
-            "编制", "人力配置", "车间人数",
-        ],
-    },
-    {
-        "tool": "query_process_knowledge",
-        "keywords": [
-            # 工单流
-            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
-            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
-            # 职位流
-            "品检员做什么", "操作员职责", "PMC流程", "主管职责", "仓管员职责",
-            "设备工程师职责", "日常工作流", "SOP", "标准作业", "岗位职责",
-            "职位流程", "工作流程是什么", "每天做什么",
-            # 责任归属
-            "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
-        ],
-    },
-]
+# ==================== 意图路由（已全面禁用 fastpath） ====================
+# 历史：INTENT_RULES 曾对「今天生产情况 / 查询在制工单 / 最近有哪些不良品」等
+# 全部快捷命令做 keyword → 强制 execute_tool，绕过模型（即 fastpath）。
+# 现已清空：快捷命令、工作流标签、自由输入一律由模型 tool_choice=auto 选择工具。
+# 禁止在 chat_routes 重新接入 resolve_intent / detect_intent_tool。
+INTENT_RULES: List[Dict[str, Any]] = []
 
 
 def detect_intent_tool(message: str) -> Optional[str]:
-    """确定性意图识别：命中业务关键词则返回应强制调用的工具名，否则返回 None（交给模型 auto 决策）。"""
-    if not message:
-        return None
-    for rule in INTENT_RULES:
-        if any(kw in message for kw in rule["keywords"]):
-            return rule["tool"]
+    """已废弃：始终返回 None。快捷命令不得走关键词强制工具路由。"""
     return None
-
-
-# 工单码轻量提取正则：形如 WO-SPK-DEMO_2026 / ELEC-S20260723-001（大写字母数字开头 + 连字符段）
-_WO_CODE_RE = re.compile(r"\b[A-Z][A-Z0-9]+-[A-Za-z0-9_-]+")
-
-
-def _extract_wo_code(message: str) -> Optional[str]:
-    """从消息中轻量提取工单码候选（用于确定性路由的工单表单/导出）。提不到返回 None。"""
-    if not message:
-        return None
-    m = _WO_CODE_RE.search(message)
-    return m.group(0) if m else None
 
 
 def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
     """已废弃的确定性意图 fastpath（始终返回 None）。
 
-    Chatbot 必须由模型选择 tool_calls，禁止关键词直接执行工具。
-    保留函数签名供旧测试/导入兼容；请勿在 chat 路由重新启用。
+    覆盖范围：全部快捷命令、工作流触发词、自由问答。
+    Chatbot 必须由模型选择 tool_calls；请勿在 chat 路由重新启用。
     """
     return None
 
