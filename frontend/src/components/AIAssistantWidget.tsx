@@ -14,7 +14,7 @@ import {
   CopyOutlined, ShareAltOutlined, CommentOutlined, InboxOutlined,
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
   PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
-  CarryOutOutlined, InfoCircleOutlined,
+  CarryOutOutlined, InfoCircleOutlined, CrownOutlined,
 } from '@ant-design/icons'
 
 // 任务中心（嵌入 chatbot 浮窗第三个 tab）
@@ -256,6 +256,97 @@ export default function AIAssistantWidget() {
 
   const user = getStoredUser()
   const activeFactoryId = () => localStorage.getItem('active_factory_id') || user?.factory_id || 'FAC_ELEC_DEMO_2026'
+  const [commanderOn, setCommanderOn] = useState(false)
+  const [commanderBusy, setCommanderBusy] = useState(false)
+
+  const refreshCommanderStatus = useCallback(async () => {
+    try {
+      const res: any = await api.get('/api/v1/commander/my-status')
+      setCommanderOn(!!res?.enabled)
+    } catch { /* ignore */ }
+  }, [])
+
+  useEffect(() => { refreshCommanderStatus() }, [refreshCommanderStatus])
+
+  const toggleCommander = useCallback(async () => {
+    setCommanderBusy(true)
+    try {
+      const res: any = await api.post('/api/v1/commander/toggle', {
+        enabled: !commanderOn,
+        factory_id: activeFactoryId(),
+      })
+      setCommanderOn(!!res?.enabled)
+      message.success(res?.message || (res?.enabled ? '指挥官已开启' : '指挥官已关闭'))
+      if (res?.enabled) {
+        const sensingId = `cmd-sensing-${Date.now()}`
+        setMessages((prev) => [...prev, {
+          id: sensingId,
+          role: 'assistant',
+          content: '🎖️ 工厂指挥官已开启！\n\n📡 正在执行首轮态势感知…\n• 读取您的任务表与在制工单\n• 扫描产能负荷与工位利用率\n• 检查设备状态、物料库存、交期与质量态势',
+          time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+        }])
+        try {
+          const cycle: any = await api.post('/api/v1/commander/cycle', {
+            factory_id: activeFactoryId(),
+            auto_execute: true,
+          })
+          const st = cycle?.state || {}
+          const orders = st.orders || {}
+          const capacity = st.capacity || {}
+          const equipment = st.equipment || {}
+          const material = st.material || {}
+          const delivery = st.delivery || {}
+          const quality = st.quality || {}
+          const modeMap: Record<string, string> = {
+            surplus: '🟢 订单充足（挑单/延交低优）',
+            normal: '🔵 产销平衡（维持节奏）',
+            deficit: '🟡 订单欠缺（主动接单补产）',
+          }
+          const lines = [
+            '✅ 首轮态势感知完成，已接管您的工作范围：',
+            '',
+            '📋 任务表读取',
+            `   在制工单 ${orders.active ?? '-'} 单（待排 ${orders.pending ?? '-'} / 执行中 ${orders.in_progress ?? '-'}），逾期 ${orders.overdue ?? 0} 单，7天内到期 ${orders.due_7d ?? 0} 单`,
+            '🏭 产能负荷',
+            `   工位利用 ${capacity.utilization ?? '-'}（繁忙 ${capacity.stations ?? '-'}），负荷率 ${orders.load_ratio != null ? Math.round(orders.load_ratio * 100) + '%' : '-'}`,
+            '🔧 设备状态',
+            `   运行 ${equipment.running ?? '-'} / 维修 ${equipment.maintenance ?? '-'} / 故障 ${equipment.broken ?? '-'}（共 ${equipment.total ?? '-'} 台）`,
+            '📦 物料 & 🚚 交期 & ✅ 质量',
+            `   缺料 ${material.low_stock ?? 0} 项｜交期达成 ${delivery.on_time_rate ?? '-'}｜不良率 ${quality.defect_rate ?? '-'}`,
+            '',
+            `🎯 订单模式判定：${modeMap[cycle?.order_mode] || cycle?.order_mode}`,
+          ]
+          const decisions = cycle?.decisions || []
+          if (decisions.length) {
+            lines.push('', `📌 本轮自主决策（${decisions.length} 项）：`)
+            decisions.forEach((d: any, i: number) => {
+              lines.push(`   ${d.executed ? '✅' : '📋'} ${i + 1}. [${d.priority}] ${d.reason}`)
+              if (d.result?.message) lines.push(`      → ${d.result.message}`)
+            })
+          }
+          const alerts = cycle?.alerts || []
+          if (alerts.length) {
+            lines.push('', '⚠️ 预警：')
+            alerts.forEach((a: string) => lines.push(`   • ${a}`))
+          }
+          const nextActions = cycle?.next_actions || []
+          if (nextActions.length) {
+            lines.push('', '🔜 下一步：')
+            nextActions.forEach((a: string) => lines.push(`   • ${a}`))
+          }
+          lines.push('', `⏱️ 感知+决策耗时 ${Math.round(cycle?.duration_ms ?? 0)}ms｜后续将定期自动巡检，重大决策会先请示您。`)
+          setMessages((prev) => prev.map((m) => m.id === sensingId ? { ...m, content: lines.join('\n') } : m))
+        } catch {
+          setMessages((prev) => prev.map((m) => m.id === sensingId ? { ...m, content: '🎖️ 指挥官已开启，但首轮感知循环调用失败，稍后会自动重试。' } : m))
+        }
+      }
+    } catch {
+      message.error('指挥官开关操作失败')
+    } finally {
+      setCommanderBusy(false)
+    }
+  }, [commanderOn])
+
   const infoStorageKey = `enghub-info:${user?.username || 'anonymous'}:${localStorage.getItem('active_factory_id') || 'default'}`
 
   const addInfoItem = useCallback((item: InfoItem) => {
@@ -1057,7 +1148,26 @@ export default function AIAssistantWidget() {
               <RobotOutlined />
               <Text strong style={{ color: '#fff' }}>EngHub 智能助手</Text>
             </Space>
-            <Space size={4}>
+            <Space size={6}>
+              <Tooltip title={commanderOn ? '指挥官已开启：AI正在主动接管您的工作（点击关闭）' : '开启工厂指挥官：AI主动接管生产调度（点击开启）'}>
+                <Button
+                  size="small"
+                  loading={commanderBusy}
+                  onClick={toggleCommander}
+                  style={{
+                    borderRadius: 14,
+                    fontWeight: 700,
+                    fontSize: 11,
+                    border: commanderOn ? 'none' : '1px solid rgba(255,255,255,0.6)',
+                    background: commanderOn ? 'linear-gradient(135deg, #52c41a, #73d13d)' : 'transparent',
+                    color: '#fff',
+                    boxShadow: commanderOn ? '0 0 8px rgba(82,196,26,0.6)' : 'none',
+                  }}
+                >
+                  <CrownOutlined style={{ marginRight: 3 }} />
+                  {commanderOn ? '指挥官·接管中' : '指挥官'}
+                </Button>
+              </Tooltip>
               <Button type="text" size="small" icon={<MinusOutlined />} style={{ color: '#fff' }}
                 onClick={() => setOpen(false)} />
               <Button type="text" size="small"

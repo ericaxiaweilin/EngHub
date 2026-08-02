@@ -57,6 +57,7 @@ from api.routes.agent_supervisor_routes import router as agent_supervisor_router
 from api.routes.agent_routes import router as agent_router
 from api.routes.quick_command_routes import router as quick_command_router
 from api.routes.task_center_routes import router as task_center_router
+from api.routes.commander_routes import router as commander_router
 from api.routes.crew_routes import router as crew_router
 from api.routes.work_team_routes import router as work_team_router
 from api.routes.virtual_factory_routes import router as virtual_factory_router
@@ -112,6 +113,7 @@ app.include_router(agent_supervisor_router)  # 智能体监督（长任务+卡�
 app.include_router(agent_router)  # 排产+仓储智能体
 app.include_router(quick_command_router)  # Chatbot 快速命令 CRUD + 智能体调度列表
 app.include_router(task_center_router)  # 任务中心（待办跟进 + 定期扫描）
+app.include_router(commander_router)  # 工厂指挥官（chatbot 主动接管）
 app.include_router(crew_router)  # CrewAI推理层+个人知识层
 app.include_router(virtual_factory_router)  # 虚拟工厂脉搏（订单/拆单/报工/预警）
 app.include_router(traceability_router)  # 统一穿透式追溯（看板聚合数 → 来源记录）
