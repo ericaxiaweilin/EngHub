@@ -169,8 +169,21 @@ class WmsService:
         if count_order and count_order.status == "draft":
             count_order.status = "counting"
 
+        # 全部明细录入完成后进入待审批
+        if count_order:
+            pending = (
+                await self.db.execute(
+                    select(func.count()).select_from(InventoryCountItem).where(
+                        InventoryCountItem.count_id == count_id,
+                        InventoryCountItem.counted_qty.is_(None),
+                    )
+                )
+            ).scalar() or 0
+            if pending == 0 and count_order.status == "counting":
+                count_order.status = "pending_approval"
+
         await self.db.commit()
-        return {"success": True, "diff_qty": item.diff_qty}
+        return {"success": True, "diff_qty": item.diff_qty, "count_status": count_order.status if count_order else None}
 
     async def approve_count(
         self,

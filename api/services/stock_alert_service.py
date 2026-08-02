@@ -130,6 +130,58 @@ class StockAlertService:
                                 "days": inactive_days,
                             })
 
+            # 4. 慢销预警（介于呆滞与正常之间）
+            slow_days = config.get("slow_moving_days", 60)
+            if slow_days > 0 and stock["total_qty"] > 0 and dead_days > slow_days:
+                last_move = stock["last_movement"]
+                if last_move:
+                    inactive_days = (now - last_move).days
+                    if slow_days <= inactive_days < dead_days:
+                        alert_id = await self._create_alert(
+                            factory_id, "slow_moving", mid,
+                            stock["material_code"], stock["material_name"],
+                            current_qty=stock["total_qty"], days_inactive=inactive_days,
+                            severity="warning",
+                        )
+                        if alert_id:
+                            alerts_created += 1
+                            alert_details.append({
+                                "type": "slow_moving",
+                                "material": stock["material_code"],
+                                "days": inactive_days,
+                            })
+
+        # 5. 即将过期预警（按批次 expiry_date）
+        warn_days = 30
+        expiring_rows = await self.db.execute(text("""
+            SELECT i.material_id, i.material_code, i.material_name, i.batch_code,
+                   i.total_qty, i.expiry_date,
+                   COALESCE(c.expiry_warn_days, :default_warn) AS warn_days
+            FROM inventory i
+            LEFT JOIN safety_stock_config c
+              ON c.factory_id = i.factory_id AND c.material_id = i.material_id
+            WHERE i.factory_id = :fid AND i.total_qty > 0 AND i.expiry_date IS NOT NULL
+              AND i.expiry_date <= CURRENT_DATE + COALESCE(c.expiry_warn_days, :default_warn) * INTERVAL '1 day'
+        """), {"fid": factory_id, "default_warn": warn_days})
+        for row in expiring_rows.mappings().all():
+            days_left = (row["expiry_date"] - now.date()).days if row["expiry_date"] else 0
+            severity = "critical" if days_left <= 7 else "warning"
+            alert_id = await self._create_alert(
+                factory_id, "expiring", row["material_id"],
+                row["material_code"], row["material_name"] or row["material_code"],
+                current_qty=int(row["total_qty"] or 0),
+                days_inactive=max(0, -days_left) if days_left < 0 else days_left,
+                severity=severity,
+            )
+            if alert_id:
+                alerts_created += 1
+                alert_details.append({
+                    "type": "expiring",
+                    "material": row["material_code"],
+                    "batch": row["batch_code"],
+                    "days_left": days_left,
+                })
+
         await self.db.commit()
 
         return {
