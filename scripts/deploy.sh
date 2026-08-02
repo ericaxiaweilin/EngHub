@@ -141,10 +141,15 @@ tar -xzf "$SOURCE_ARCHIVE" -C "$RELEASE_DIR/source"
 tar -xzf "$FRONTEND_ARCHIVE" -C "$RELEASE_DIR/frontend_dist"
 
 # Keep the server checkout useful for inspection without touching its .git or secrets.
+# bind mount 目录可能曾被容器 root 改属主；先纠正再 rsync，并避免保留远端无权设置的 owner/group。
+docker exec -u 0 "$CONTAINER" bash -lc \
+  "chown -R $(id -u):$(id -g) /app/api /app/core /app/database /app/integrations /app/main.py 2>/dev/null || true" \
+  >/dev/null 2>&1 || true
 for dir in api core database integrations scripts frontend/src; do
   if [[ -d "$RELEASE_DIR/source/$dir" ]]; then
     mkdir -p "$REMOTE_DIR/$dir"
-    rsync -a --delete "$RELEASE_DIR/source/$dir/" "$REMOTE_DIR/$dir/"
+    rsync -rltD --delete --no-owner --no-group \
+      "$RELEASE_DIR/source/$dir/" "$REMOTE_DIR/$dir/"
   fi
 done
 for file in main.py requirements.txt frontend/package.json frontend/package-lock.json; do
