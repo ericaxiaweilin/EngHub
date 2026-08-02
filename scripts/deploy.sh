@@ -182,8 +182,8 @@ done < "$MANIFEST"
 docker cp "$FRONTEND_ARCHIVE" "$CONTAINER:/tmp/enghub-frontend-deploy.tgz"
 docker exec -u 0 "$CONTAINER" bash -lc "
   set -e
-  rm -rf /app/frontend_dist/*
   mkdir -p /app/frontend_dist
+  find /app/frontend_dist -mindepth 1 -delete
   tar -xzf /tmp/enghub-frontend-deploy.tgz -C /app/frontend_dist
   rm -f /tmp/enghub-frontend-deploy.tgz
   chown -R appuser:appgroup /app/frontend_dist || true
