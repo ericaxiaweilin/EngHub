@@ -241,6 +241,10 @@ done
 git -C "$REMOTE_DIR" rev-parse HEAD > "$BACKUP_DIR/git_head" 2>/dev/null || true
 git -C "$REMOTE_DIR" branch --show-current > "$BACKUP_DIR/git_branch" 2>/dev/null || true
 
+PG_CONTAINER="$DB_CONTAINER" PG_USER="$DB_USER" PG_DB="$DB_NAME" \
+  python3 "$REMOTE_DIR/scripts/data_guard.py" snapshot \
+  --output "$BACKUP_DIR/data_guard_before.json" >/dev/null 2>&1 || true
+
 if [[ "$DB_BACKUP" == "1" ]]; then
   docker exec "$DB_CONTAINER" pg_dump -U "$DB_USER" -d "$DB_NAME" > "$BACKUP_DIR/database.sql"
 fi
@@ -367,6 +371,23 @@ curl -fsS "${HEALTH_URL%/health}/" | grep -o 'index-[A-Za-z0-9_-]*\.js' | head -
 printf '\n'
 printf '%s\n' "$COMMIT_SHA" > "$REMOTE_DIR/.last_deployed_commit"
 REMOTE
+
+# ━━━ 数据闸门：演示工厂补数 + 水位守卫（与 deploy_safe.sh 一致）━━━
+info "补齐演示工厂模块数据"
+ssh "$DEPLOY_HOST" \
+  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' \
+   python3 '$REMOTE_DIR/scripts/seed_demo_module_coverage.py'" >/dev/null \
+  || fail "演示工厂模块补数失败！"
+ok "演示工厂模块数据已补齐"
+
+info "校验数据水位"
+ssh "$DEPLOY_HOST" \
+  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' \
+   python3 '$REMOTE_DIR/scripts/data_guard.py' verify \
+   --baseline '$REMOTE_DIR/backups/$BACKUP_TAG/data_guard_before.json' \
+   --output '$REMOTE_DIR/backups/$BACKUP_TAG/data_guard_after.json'" \
+  || fail "数据水位守卫失败！"
+ok "数据水位守卫通过"
 
 # 容器重启后到模型网关的连接需要时间，不等会把竞态误判成部署失败
 info "等待模型底座就绪"
