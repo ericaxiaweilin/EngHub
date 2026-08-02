@@ -20,26 +20,11 @@ class IntentResolver:
     }
     
     def resolve(self, message_text: str) -> Optional[str]:
-        """Parse text and return the most likely intent name.
-        
-        Args:
-            message_text: User's input message content
-            
-        Returns:
-            Intent name (e.g., "query_inventory") if recognized, else None
+        """Anti-fastpath：不再做关键词意图捷径，始终返回 None。
+
+        Chatbot 意图由模型 tool_calls 决定，禁止 keyword → 直接执行。
         """
-        if not message_text or not isinstance(message_text, str):
-            return None
-        
-        text_lower = message_text.lower()
-        
-        # Check each intent's keywords against the message
-        for intent, keywords in self._INTENT_KEYWORDS.items():
-            for kw in keywords:
-                if kw.lower() in text_lower:
-                    return intent
-        
-        return None  # No intent matched — falls back to free-form conversation
+        return None
     
     def extract_parameters(self, intent: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """Extract relevant parameters from context for a given intent.

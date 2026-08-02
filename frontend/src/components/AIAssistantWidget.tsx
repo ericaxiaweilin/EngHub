@@ -276,7 +276,7 @@ export default function AIAssistantWidget() {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight
   }, [messages, loading])
 
-  // 拉取可用工作流（仅展示无需参数的确定性流程，点击即触发）
+  // 拉取可用工作流（无需参数的流程标签；点击后作为用户消息发给模型，由模型 tool calling 执行）
   useEffect(() => {
     api.get('/api/v1/chat/tools')
       .then((res: any) => setWorkflows((res.workflows || []).filter((w: any) => !w.needs_params)))
@@ -484,7 +484,9 @@ export default function AIAssistantWidget() {
           try {
             const data = JSON.parse(dataStr)
             if (eventType === 'delta') {
-              accContent += data.content || ''
+              // replace=true：整段替换（工具轮清空误推文本 / 清洗 think 区块）
+              if (data.replace) accContent = data.content || ''
+              else accContent += data.content || ''
               applyUpdate()
             } else if (eventType === 'action') {
               accActions = [...accActions, data]
@@ -1232,7 +1234,7 @@ export default function AIAssistantWidget() {
                     )}
                     {/* 快捷指令区：仅保留工作流触发 + 快捷命令入口，快捷命令本体收进弹窗 */}
                     <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                      {/* 可用工作流（橙色区分，点击即触发确定性流程） */}
+                      {/* 可用工作流标签：点击后发送文案，由模型 tool calling 执行（禁止前端/后端 fastpath） */}
                       {workflows.map(wf => (
                         <Tag
                           key={wf.name}

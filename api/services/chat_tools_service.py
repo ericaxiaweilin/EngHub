@@ -14,7 +14,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import re
 import uuid
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
@@ -452,13 +451,13 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_ocap_tasks",
-            "description": "查询用户待处理的 OCAP（纠正预防措施）任务。显示所有 ocap_status 为 triggered/in_progress 的缺陷，供 chatbot 向用户汇报。",
-            "properties": {
-                "factory_id": {"type": "string", "description": "工厂ID，可选，默认当前用户工厂"},
-                "operator": {"type": "string", "description": "操作用户ID，必填"},
-                "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+            "description": "查询待处理的 OCAP（纠正预防措施）任务。显示所有 ocap_status 为 triggered/in_progress 的缺陷，供 chatbot 向用户汇报。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "返回条数，默认20", "default": 20},
+                },
             },
-            "required": ["operator"],
         },
     },
     {
@@ -1432,49 +1431,42 @@ async def _tool_run_alert_patrol(db: AsyncSession, args: Dict[str, Any], operato
 
 
 async def _tool_query_ocap_tasks(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """查询用户待处理的 OCAP 任务 - 集成到 chatbot
-    
-    返回当前用户（operator参数）在指定工厂下，状态为 triggered/in_progress 的缺陷列表。
-    
-    Args:
-        factory_id: 工厂ID（可选）
-        operator: 操作用户ID（必选）
-        
-    Returns:
-        {count: int, tasks: List[{defect_code, defect_type, severity, ocap_status, trigger_reason}]}
+    """查询待处理的 OCAP 任务 - 集成到 chatbot
+
+    返回指定工厂下 ocap_status 为 triggered/in_progress 的缺陷列表。
+    factory_id 由 execute_tool 透传（多工厂隔离），无需调用方再传 operator。
     """
     from database.models import DefectRecord
-    
-    current_factory = factory_id or "FAC_ELEC_DEMO_2026"  # 默认工厂，实际应从 auth context 获取
-    operator_id = args.get("operator")
-    
-    if not operator_id:
-        return {"error": "缺少 operator 参数"}
-    
-    # 查询用户的 OCAP 待办：ocap_status 为 triggered 或 in_progress
-    stmt = select(DefectRecord).where(
-        DefectRecord.factory_id == current_factory,
-        DefectRecord.ocap_status.in_(['triggered', 'in_progress']),
+
+    limit = min(int(args.get("limit", 20)), 50)
+    stmt = (
+        select(DefectRecord)
+        .where(DefectRecord.ocap_status.in_(["triggered", "in_progress"]))
+        .order_by(DefectRecord.created_at.desc())
+        .limit(limit)
     )
-    
-    result = await db.execute(stmt)
-    defects = result.scalars().all()
-    
-    tasks = []
-    for d in defects:
-        tasks.append({
-            "defect_code": d.defect_code or d.id,
+    if factory_id:
+        stmt = stmt.where(DefectRecord.factory_id == factory_id)
+
+    defects = (await db.execute(stmt)).scalars().all()
+
+    tasks = [
+        {
+            "record_code": d.record_code,
             "defect_type": d.defect_type or "",
             "severity": d.severity or "",
+            "quantity": d.quantity,
+            "disposition": d.disposition or "未处置",
             "ocap_status": d.ocap_status or "pending",
-            "trigger_reason": d.ocap_trigger_reason or "未说明",
-            "created_at": d.created_at.isoformat() if d.created_at else "",
-        })
-    
-    return {
-        "count": len(tasks),
-        "tasks": tasks,
-    }
+            "root_cause_category": d.root_cause_category,
+            "trigger_reason": getattr(d, "ocap_trigger_reason", None) or d.root_cause or "未说明",
+            "description": (d.description or "")[:80],
+            "created_at": d.created_at.strftime("%Y-%m-%d %H:%M") if d.created_at else None,
+        }
+        for d in defects
+    ]
+
+    return {"count": len(tasks), "tasks": tasks}
 
 
 async def _tool_query_hr_roster(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1974,271 +1966,26 @@ TOOL_LABELS = {
 }
 
 
-# ==================== 确定性意图路由（业务底座） ====================
-# 参考 luaguage chatbot 的 capability catalog / business rule 思路：
-# 不依赖模型自由决策，命中业务关键词即强制调用对应工具，从根本上杜绝
-# “建议你进入看板/日报中心查看”这类推诿性模糊回答。
-# 仅对单步查询类工具做强制路由；写操作/多步操作仍交由模型 auto 编排。
-INTENT_RULES: List[Dict[str, Any]] = [
-    {
-        "tool": "get_production_summary",
-        "keywords": [
-            "生产情况", "生产统计", "今日生产", "今天生产", "生产汇总", "生产概览",
-            "产量", "稼动率", "生产数据", "生产怎么样", "生产怎样", "今天生产怎么",
-            "良品率", "报工情况", "生产概况",
-        ],
-    },
-    {
-        "tool": "query_work_orders",
-        "keywords": [
-            "在制工单", "工单列表", "查工单", "查询工单", "工单状态", "工单进度",
-            "有哪些工单", "工单情况", "工单汇总", "待下达工单", "生产工单",
-        ],
-    },
-    {
-        "tool": "query_inventory",
-        "keywords": [
-            "库存", "物料水平", "库存水平", "查库存", "库存量", "物料库存",
-            "库存情况", "库存怎么样", "库存怎样", "原料库存",
-        ],
-    },
-    {
-        "tool": "query_defects",
-        "keywords": [
-            "不良品", "缺陷", "不良", "质量问题", "不良率", "缺陷类型",
-            "不良情况", "不良汇总", "质量异常",
-        ],
-    },
-    {
-        "tool": "query_equipment",
-        "keywords": [
-            "设备状态", "设备运行", "设备情况", "查设备", "设备故障", "机器状态",
-            "设备怎么样", "设备怎样", "设备汇总", "设备稼动",
-        ],
-    },
-    {
-        # 仅对「查仿真记录」做确定性路由；「跑一次仿真」类参数需模型提取，交给 auto 循环
-        "tool": "query_simulation_audits",
-        "keywords": [
-            "仿真记录", "仿真审计", "审计记录", "仿真历史", "查仿真", "最近仿真",
-        ],
-    },
-    {
-        "tool": "get_inspection_form",
-        "keywords": [
-            "检验单", "检验记录", "检验表单", "质检记录", "质检单", "质量检验单",
-        ],
-    },
-    {
-        "tool": "export_report_file",
-        "keywords": [
-            "导出报告", "导出报表", "生成报告", "生成报表", "报告导出", "导出生产报告",
-            "导出成文件", "导出文件", "导出成", "导出为文件", "生成文件", "导出成csv",
-        ],
-    },
-    {
-        # 工单表单需工单号：resolve_intent 尝试轻量提取，提不到则交 auto 让模型提取
-        "tool": "get_work_order_form",
-        "keywords": [
-            "工单表单", "工单完整表单", "完整工单表单", "工单全量信息",
-        ],
-    },
-    # ==================== 5M1E 预警数据意图路由（具体优先于通用预警） ====================
-    {
-        "tool": "query_downtime",
-        "keywords": [
-            "停机", "停机记录", "故障记录", "MTBF", "设备利用率", "设备故障率",
-            "停机时间", "故障次数", "设备停机", "停机原因",
-        ],
-    },
-    {
-        "tool": "query_maintenance_due",
-        "keywords": [
-            "保养到期", "维保", "预防性维护", "保养计划", "维护到期",
-            "设备保养", "逾期保养", "PM到期", "维护计划",
-        ],
-    },
-    {
-        "tool": "query_shortage_alerts",
-        "keywords": [
-            "缺料", "补货", "低于安全库存", "缺料预警", "物料不足",
-            "库存不足", "低于最低水位", "补货预警", "缺料清单",
-        ],
-    },
-    {
-        "tool": "query_stagnant",
-        "keywords": [
-            "呆滞", "滞料", "呆滞物料", "长期不动", "库存积压",
-            "无流动", "呆滞料", "滞库", "积压物料",
-        ],
-    },
-    {
-        "tool": "query_spc_anomalies",
-        "keywords": [
-            "SPC", "失控", "越限", "过程能力", "控制图", "超出控制限",
-            "SPC异常", "质量失控", "UCL", "LCL", "过程异常",
-        ],
-    },
-    {
-        "tool": "query_environment",
-        "keywords": [
-            "环境", "温度", "湿度", "车间环境", "天气", "风速",
-            "降温", "静电", "ESD", "环境温度", "车间温度",
-        ],
-    },
-    {
-        "tool": "query_routing",
-        "keywords": [
-            "工艺路线", "工序", "加工步骤", "工艺流程", "产品工艺",
-            "工艺查询", "路线查询", "工序查询",
-        ],
-    },
-    {
-        "tool": "query_skill_matrix",
-        "keywords": [
-            "技能矩阵", "技能等级", "技能分布", "员工技能", "技能断层",
-            "谁会", "技能情况", "多能工", "技能覆盖",
-        ],
-    },
-    # ==================== 通用预警/巡检（放在 5M1E 具体规则之后） ====================
-    {
-        "tool": "get_pending_alerts",
-        "keywords": [
-            "预警", "告警", "警报", "异常汇报", "待处理预警", "当前异常",
-            "有什么预警", "预警情况", "告警情况", "预警汇总",
-        ],
-    },
-    {
-        "tool": "run_alert_patrol",
-        "keywords": [
-            "巡检", "扫描异常", "主动巡检", "预警巡检", "扫描预警",
-        ],
-    },
-    {
-        "tool": "query_hr_roster",
-        "keywords": [
-            "人力", "花名册", "人员分布", "多少人", "人力档案", "员工",
-            "人事", "部门人数", "工序人数", "人力统计", "人员配置",
-            "编制", "人力配置", "车间人数",
-        ],
-    },
-    {
-        "tool": "query_process_knowledge",
-        "keywords": [
-            # 工单流
-            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
-            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
-            # 职位流
-            "品检员做什么", "操作员职责", "PMC流程", "主管职责", "仓管员职责",
-            "设备工程师职责", "日常工作流", "SOP", "标准作业", "岗位职责",
-            "职位流程", "工作流程是什么", "每天做什么",
-            # 责任归属
-            "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
-        ],
-    },
-]
+# ==================== 意图路由（已全面禁用 fastpath） ====================
+# 历史：INTENT_RULES 曾对「今天生产情况 / 查询在制工单 / 最近有哪些不良品」等
+# 全部快捷命令做 keyword → 强制 execute_tool，绕过模型（即 fastpath）。
+# 现已清空：快捷命令、工作流标签、自由输入一律由模型 tool_choice=auto 选择工具。
+# 禁止在 chat_routes 重新接入 resolve_intent / detect_intent_tool。
+INTENT_RULES: List[Dict[str, Any]] = []
 
 
 def detect_intent_tool(message: str) -> Optional[str]:
-    """确定性意图识别：命中业务关键词则返回应强制调用的工具名，否则返回 None（交给模型 auto 决策）。"""
-    if not message:
-        return None
-    for rule in INTENT_RULES:
-        if any(kw in message for kw in rule["keywords"]):
-            return rule["tool"]
+    """已废弃：始终返回 None。快捷命令不得走关键词强制工具路由。"""
     return None
 
 
-# 工单码轻量提取正则：形如 WO-SPK-DEMO_2026 / ELEC-S20260723-001（大写字母数字开头 + 连字符段）
-_WO_CODE_RE = re.compile(r"\b[A-Z][A-Z0-9]+-[A-Za-z0-9_-]+")
-
-
-def _extract_wo_code(message: str) -> Optional[str]:
-    """从消息中轻量提取工单码候选（用于确定性路由的工单表单/导出）。提不到返回 None。"""
-    if not message:
-        return None
-    m = _WO_CODE_RE.search(message)
-    return m.group(0) if m else None
-
-
 def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
-    """确定性意图解析：命中业务关键词返回 {"tool", "args"}，否则 None。
+    """已废弃的确定性意图 fastpath（始终返回 None）。
 
-    后端可据此直接执行工具取真实数据（不依赖模型决策），args 通过轻量关键词规则提取。
-    写操作/多步操作不走此路径，仍由模型 auto 编排。
-
-    优先级：工作流触发词（复合任务）> 单步查询工具。"""
-    # 优先匹配工作流（复合任务，如「帮我复盘今天生产」→ daily_production_review）
-    # 懒加载避免与 workflow_service 的顶层循环导入；match_workflow 仅返回无需参数的工作流
-    from api.services.workflow_service import match_workflow  # 懒加载，避免循环导入
-    wf_name = match_workflow(message)
-    if wf_name:
-        return {"tool": "run_workflow", "args": {"workflow_name": wf_name, "params": {}}}
-
-    tool = detect_intent_tool(message)
-    if not tool:
-        return None
-    args: Dict[str, Any] = {}
-    if tool == "query_work_orders":
-        if any(k in message for k in ["在制", "生产中", "进行中", "在做", "在产"]):
-            args["status"] = "in_progress"
-        elif any(k in message for k in ["待下达", "未下达"]):
-            args["status"] = "pending"
-        elif "已下达" in message:
-            args["status"] = "released"
-        elif any(k in message for k in ["已完成", "完工"]):
-            args["status"] = "completed"
-    elif tool == "get_work_order_form":
-        # 工单表单需工单号：轻量提取形如 WO-xxx / ELEC-S20260723-001 的工单码；提不到则交 auto 让模型提取
-        wo_code = _extract_wo_code(message)
-        if not wo_code:
-            return None
-        args["work_order_code"] = wo_code
-    elif tool == "get_inspection_form":
-        # 检验单：可选按工单过滤（提到工单号则带上）
-        wo_code = _extract_wo_code(message)
-        if wo_code:
-            args["work_order_code"] = wo_code
-    elif tool == "export_report_file":
-        # 默认导出生产汇总；消息含工单号且提及工单 → 导出工单表单
-        wo_code = _extract_wo_code(message)
-        if wo_code and "工单" in message:
-            args["report_type"] = "work_order"
-            args["work_order_code"] = wo_code
-        else:
-            args["report_type"] = "production_summary"
-        args["format"] = "csv" if any(k in message for k in ["csv", "CSV", "表格"]) else "json"
-    elif tool == "query_process_knowledge":
-        # 轻量提取 topic 与 keyword：
-        # 1) 责任归属类："该找谁/谁负责/卡在/超时找谁" → who_handles + 阶段关键词
-        if any(k in message for k in ["该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行"]):
-            args["topic"] = "who_handles"
-            for stage_kw in ["创建", "下达", "审批", "派工", "执行", "报工", "质检", "完工", "入库", "关闭"]:
-                if stage_kw in message:
-                    args["keyword"] = stage_kw
-                    break
-        # 2) 职位流类：消息含职位关键词 → position_sop
-        elif any(k in message for k in [
-            "品检", "操作员", "PMC", "计划员", "主管", "仓管", "设备工程",
-            "机修", "质检员", "IPQC", "生管", "岗位职责", "SOP", "标准作业",
-            "日常工作流", "每天做什么", "职位流程", "工作职责",
-        ]):
-            args["topic"] = "position_sop"
-            for pos_kw in ["品检", "操作员", "PMC", "计划员", "主管", "仓管", "设备工程", "机修", "质检", "IPQC", "生管"]:
-                if pos_kw in message:
-                    args["keyword"] = pos_kw
-                    break
-        # 3) 工单流类
-        elif any(k in message for k in [
-            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
-            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
-        ]):
-            args["topic"] = "work_order_flow"
-            for stage_kw in ["创建", "下达", "审批", "派工", "执行", "报工", "质检", "完工", "入库", "关闭"]:
-                if stage_kw in message:
-                    args["keyword"] = stage_kw
-                    break
-    return {"tool": tool, "args": args}
+    覆盖范围：全部快捷命令、工作流触发词、自由问答。
+    Chatbot 必须由模型选择 tool_calls；请勿在 chat 路由重新启用。
+    """
+    return None
 
 
 async def execute_tool(

@@ -199,15 +199,70 @@ async def test_business_capability_is_selected_by_model(monkeypatch):
     assert calls[0]["messages"][-1]["content"] == "请理解我的业务需求"
     assert calls[0]["tool_choice"] == "auto"
     assert calls[0]["tools"] == chat_routes.TOOL_DEFINITIONS
+    # anti-fastpath：首轮工具后仍保留 tools，允许多轮连续调用
     assert calls[1]["messages"][-2]["role"] == "tool"
     assert calls[1]["messages"][-1] == {
         "role": "system",
-        "content": chat_routes.FINAL_GROUNDING_PROMPT,
+        "content": chat_routes.CONTINUE_TOOL_PROMPT,
     }
-    assert "tools" not in calls[1]
-    assert "tool_choice" not in calls[1]
+    assert calls[1]["tools"] == chat_routes.TOOL_DEFINITIONS
+    assert calls[1]["tool_choice"] == "auto"
     assert calls[2]["temperature"] == 0
     assert "事实审校器" in calls[2]["messages"][0]["content"]
     assert result.reply == "当前有 1 条在制工单。"
     assert result.model == chat_routes.MODEL_STACK_CHAT_TASK_ID
     assert result.actions[0].tool == "query_work_orders"
+
+
+@pytest.mark.asyncio
+async def test_stream_yields_incremental_deltas_not_one_blob(monkeypatch):
+    """最终答复必须逐 token 推送，不能整包一次性 delta。"""
+
+    async def fake_resolve_model_route(task_id, **_kwargs):
+        return {
+            "task_id": task_id,
+            "provider": "p",
+            "gateway_model": "m",
+            "request_timeout": 30.0,
+            "max_completion_tokens": 256,
+        }
+
+    async def fake_stream_llm_deltas(payload, **_kwargs):
+        for piece in ["最近", "有", "3", "条不良品。"]:
+            yield {"content": piece}
+
+    monkeypatch.setattr(chat_routes, "_resolve_model_route", fake_resolve_model_route)
+    monkeypatch.setattr(chat_routes, "_stream_llm_deltas", fake_stream_llm_deltas)
+
+    response = await chat_routes.chat_stream(
+        chat_routes.ChatRequest(messages=[
+            chat_routes.ChatMessage(role="user", content="最近有哪些不良品？"),
+        ]),
+        http_request=SimpleNamespace(headers={"x-factory-id": "F01"}),
+        db=MagicMock(),
+        current_user=SimpleNamespace(
+            username="tester",
+            id="user-1",
+            active_factory_id="F01",
+            factory_id="F01",
+        ),
+    )
+
+    frames = []
+    async for chunk in response.body_iterator:
+        frames.append(chunk if isinstance(chunk, str) else chunk.decode())
+
+    payload = "".join(frames)
+    delta_contents = []
+    for frame in payload.split("\n\n"):
+        if "event: delta" not in frame:
+            continue
+        for line in frame.split("\n"):
+            if line.startswith("data: "):
+                import json
+                data = json.loads(line[6:])
+                if not data.get("replace"):
+                    delta_contents.append(data.get("content") or "")
+
+    assert delta_contents == ["最近", "有", "3", "条不良品。"]
+    assert "event: done" in payload

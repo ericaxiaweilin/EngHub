@@ -8,10 +8,11 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_HOST="${DEPLOY_HOST:-eric@100.96.188.77}"
 REMOTE_DIR="${REMOTE_DIR:-/home/eric/enghub}"
-CONTAINER="${CONTAINER:-enghub}"
-DB_CONTAINER="${DB_CONTAINER:-engflow-postgres}"
-DB_USER="${DB_USER:-postgres}"
-DB_NAME="${DB_NAME:-bom_intelligence}"
+# 生产 compose 容器名（bind mount 自 REMOTE_DIR）
+CONTAINER="${CONTAINER:-enghub-backend-1}"
+DB_CONTAINER="${DB_CONTAINER:-docker-postgres-1}"
+DB_USER="${DB_USER:-enghub}"
+DB_NAME="${DB_NAME:-enghub}"
 DEPLOY_BASE_SHA="${DEPLOY_BASE_SHA:-}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18888/health}"
 PUBLIC_URL="${PUBLIC_URL:-http://${DEPLOY_HOST#*@}:18888}"
@@ -140,10 +141,15 @@ tar -xzf "$SOURCE_ARCHIVE" -C "$RELEASE_DIR/source"
 tar -xzf "$FRONTEND_ARCHIVE" -C "$RELEASE_DIR/frontend_dist"
 
 # Keep the server checkout useful for inspection without touching its .git or secrets.
+# bind mount 目录可能曾被容器 root 改属主；先纠正再 rsync，并避免保留远端无权设置的 owner/group。
+docker exec -u 0 "$CONTAINER" bash -lc \
+  "chown -R $(id -u):$(id -g) /app/api /app/core /app/database /app/integrations /app/main.py 2>/dev/null || true" \
+  >/dev/null 2>&1 || true
 for dir in api core database integrations scripts frontend/src; do
   if [[ -d "$RELEASE_DIR/source/$dir" ]]; then
     mkdir -p "$REMOTE_DIR/$dir"
-    rsync -a --delete "$RELEASE_DIR/source/$dir/" "$REMOTE_DIR/$dir/"
+    rsync -rltD --delete --no-owner --no-group \
+      "$RELEASE_DIR/source/$dir/" "$REMOTE_DIR/$dir/"
   fi
 done
 for file in main.py requirements.txt frontend/package.json frontend/package-lock.json; do
@@ -153,20 +159,8 @@ for file in main.py requirements.txt frontend/package.json frontend/package-lock
   fi
 done
 
-# First make sure the running container has the full tracked source snapshot.
-# The manifest loop below still applies migrations and removes deleted files.
-for dir in api core database integrations scripts; do
-  if [[ -d "$RELEASE_DIR/source/$dir" ]]; then
-    docker exec -u 0 "$CONTAINER" mkdir -p "/app/$dir"
-    docker cp "$RELEASE_DIR/source/$dir/." "$CONTAINER:/app/$dir/"
-    docker exec -u 0 "$CONTAINER" chown -R appuser:appgroup "/app/$dir"
-  fi
-done
-if [[ -f "$RELEASE_DIR/source/main.py" ]]; then
-  docker cp "$RELEASE_DIR/source/main.py" "$CONTAINER:/app/main.py"
-  docker exec -u 0 "$CONTAINER" chown appuser:appgroup /app/main.py
-fi
-
+# 生产容器对 api/core/database/integrations/main.py/frontend_dist 使用 bind mount。
+# 因此只更新宿主机 REMOTE_DIR，再 restart；禁止 docker cp 覆盖挂载点（会 device busy）。
 while IFS=$'\t' read -r status path extra; do
   [[ -z "$status" || -z "$path" ]] && continue
   case "$status" in
@@ -186,24 +180,19 @@ while IFS=$'\t' read -r status path extra; do
       docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 \
         -U "$DB_USER" -d "$DB_NAME" < "$RELEASE_DIR/source/$path"
       ;;
-    database/schema_contract.json)
-      continue
-      ;;
-    api/*|core/*|database/*.py|integrations/*|main.py)
-      if [[ "$status" == D* ]]; then
-        docker exec -u 0 "$CONTAINER" rm -f "/app/$path"
-      else
-        docker exec -u 0 "$CONTAINER" mkdir -p "/app/$(dirname "$path")"
-        docker cp "$RELEASE_DIR/source/$path" "$CONTAINER:/app/$path"
-        docker exec -u 0 "$CONTAINER" chown appuser:appgroup "/app/$path"
-      fi
-      ;;
   esac
 done < "$MANIFEST"
 
-docker exec -u 0 "$CONTAINER" rm -rf /app/frontend_dist
-docker cp "$RELEASE_DIR/frontend_dist" "$CONTAINER:/app/frontend_dist"
-docker exec -u 0 "$CONTAINER" chown -R appuser:appgroup /app/frontend_dist
+# 前端产物：经容器 root 写入 bind mount，避免宿主机权限不足
+docker cp "$FRONTEND_ARCHIVE" "$CONTAINER:/tmp/enghub-frontend-deploy.tgz"
+docker exec -u 0 "$CONTAINER" bash -lc "
+  set -e
+  mkdir -p /app/frontend_dist
+  find /app/frontend_dist -mindepth 1 -delete
+  tar -xzf /tmp/enghub-frontend-deploy.tgz -C /app/frontend_dist
+  rm -f /tmp/enghub-frontend-deploy.tgz
+  chown -R appuser:appgroup /app/frontend_dist || true
+"
 
 docker restart "$CONTAINER" >/dev/null
 
