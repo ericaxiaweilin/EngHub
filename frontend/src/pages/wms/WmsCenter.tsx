@@ -4,9 +4,10 @@ import {
   Input, Select, message, Empty, Spin, Timeline,
 } from 'antd'
 import {
-  AuditOutlined, SearchOutlined, PlusOutlined, WarningOutlined,
+  AuditOutlined, SearchOutlined, PlusOutlined, WarningOutlined, BoxPlotOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
+import VolumeManagement from './VolumeManagement'
 
 const FACTORY = 'F001'
 
@@ -179,6 +180,7 @@ const WmsCenter: React.FC = () => {
       { key: 'count', label: <span><AuditOutlined /> 盘点管理</span>, children: <CountPanel /> },
       { key: 'trace', label: <span><SearchOutlined /> 物料追溯</span>, children: <TracePanel /> },
       { key: 'alerts', label: <span><WarningOutlined /> 库存预警</span>, children: <AlertPanel /> },
+      { key: 'volume', label: <span><BoxPlotOutlined /> 体积管理</span>, children: <VolumeManagement /> },
     ]} />
   )
 }
