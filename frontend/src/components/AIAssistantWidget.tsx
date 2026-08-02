@@ -484,7 +484,9 @@ export default function AIAssistantWidget() {
           try {
             const data = JSON.parse(dataStr)
             if (eventType === 'delta') {
-              accContent += data.content || ''
+              // replace=true：整段替换（工具轮清空误推文本 / 清洗 think 区块）
+              if (data.replace) accContent = data.content || ''
+              else accContent += data.content || ''
               applyUpdate()
             } else if (eventType === 'action') {
               accActions = [...accActions, data]

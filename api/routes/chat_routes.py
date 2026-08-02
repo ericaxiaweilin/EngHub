@@ -1090,20 +1090,26 @@ async def chat_stream(
 
         try:
             for _ in range(MAX_TOOL_ROUNDS):
-                # 先缓冲本轮内容：有 tool_calls 时不向用户推送中间文本（anti-fastpath 多轮）
+                # 逐 token 流式推送；一旦出现 tool_calls 则停止推文本（工具轮不污染最终答复）
                 streamed_content: List[str] = []
                 streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
+                saw_tool_calls = False
                 async for delta in _stream_llm_deltas(
                     payload,
                     request_timeout=route["request_timeout"],
                 ):
+                    tool_deltas = delta.get("tool_calls") or []
+                    if tool_deltas:
+                        if not saw_tool_calls and streamed_content:
+                            # 若已误推过正文，清空前端累积，避免工具轮残留
+                            yield _sse("delta", {"content": "", "replace": True})
+                        saw_tool_calls = True
+                        _merge_stream_tool_calls(streamed_tool_calls, tool_deltas)
                     text = delta.get("content") or ""
                     if text:
                         streamed_content.append(text)
-                    _merge_stream_tool_calls(
-                        streamed_tool_calls,
-                        delta.get("tool_calls") or [],
-                    )
+                        if not saw_tool_calls:
+                            yield _sse("delta", {"content": text})
 
                 tool_calls = [
                     streamed_tool_calls[index]
@@ -1111,13 +1117,17 @@ async def chat_stream(
                     if streamed_tool_calls[index]["function"]["name"]
                 ]
                 if not tool_calls:
-                    # 最终答复：无工具调用，再把缓冲内容推给前端
+                    # 最终答复已在上方逐 token 推送
                     final_text = _clean_model_reply("".join(streamed_content))
                     if not final_text:
                         yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
                         yield _sse("done", {"model": route["task_id"], "degraded": True})
                         return
-                    yield _sse("delta", {"content": final_text})
+                    cleaned = final_text
+                    raw = "".join(streamed_content)
+                    if cleaned != raw:
+                        # 去掉误混入的 <think> 等协议噪音时，整段替换一次
+                        yield _sse("delta", {"content": cleaned, "replace": True})
                     yield _sse("done", {"model": route["task_id"], "degraded": False})
                     return
 

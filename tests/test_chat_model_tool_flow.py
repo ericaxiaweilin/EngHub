@@ -212,3 +212,57 @@ async def test_business_capability_is_selected_by_model(monkeypatch):
     assert result.reply == "当前有 1 条在制工单。"
     assert result.model == chat_routes.MODEL_STACK_CHAT_TASK_ID
     assert result.actions[0].tool == "query_work_orders"
+
+
+@pytest.mark.asyncio
+async def test_stream_yields_incremental_deltas_not_one_blob(monkeypatch):
+    """最终答复必须逐 token 推送，不能整包一次性 delta。"""
+
+    async def fake_resolve_model_route(task_id, **_kwargs):
+        return {
+            "task_id": task_id,
+            "provider": "p",
+            "gateway_model": "m",
+            "request_timeout": 30.0,
+            "max_completion_tokens": 256,
+        }
+
+    async def fake_stream_llm_deltas(payload, **_kwargs):
+        for piece in ["最近", "有", "3", "条不良品。"]:
+            yield {"content": piece}
+
+    monkeypatch.setattr(chat_routes, "_resolve_model_route", fake_resolve_model_route)
+    monkeypatch.setattr(chat_routes, "_stream_llm_deltas", fake_stream_llm_deltas)
+
+    response = await chat_routes.chat_stream(
+        chat_routes.ChatRequest(messages=[
+            chat_routes.ChatMessage(role="user", content="最近有哪些不良品？"),
+        ]),
+        http_request=SimpleNamespace(headers={"x-factory-id": "F01"}),
+        db=MagicMock(),
+        current_user=SimpleNamespace(
+            username="tester",
+            id="user-1",
+            active_factory_id="F01",
+            factory_id="F01",
+        ),
+    )
+
+    frames = []
+    async for chunk in response.body_iterator:
+        frames.append(chunk if isinstance(chunk, str) else chunk.decode())
+
+    payload = "".join(frames)
+    delta_contents = []
+    for frame in payload.split("\n\n"):
+        if "event: delta" not in frame:
+            continue
+        for line in frame.split("\n"):
+            if line.startswith("data: "):
+                import json
+                data = json.loads(line[6:])
+                if not data.get("replace"):
+                    delta_contents.append(data.get("content") or "")
+
+    assert delta_contents == ["最近", "有", "3", "条不良品。"]
+    assert "event: done" in payload
