@@ -2189,11 +2189,11 @@ TOOL_LABELS = {
 }
 
 
-# ==================== 确定性意图路由（业务底座） ====================
-# 参考 luaguage chatbot 的 capability catalog / business rule 思路：
-# 不依赖模型自由决策，命中业务关键词即强制调用对应工具，从根本上杜绝
-# “建议你进入看板/日报中心查看”这类推诿性模糊回答。
-# 仅对单步查询类工具做强制路由；写操作/多步操作仍交由模型 auto 编排。
+# ==================== 关键词意图表（已停用，仅作能力目录参考） ====================
+# 该表曾用于 chatbot 的关键词 fastpath：命中即跳过模型直接执行工具，并把工具
+# JSON 原样回给用户。这会让快捷命令与工作流退化成“贴 JSON”，因此已从
+# /chat 与 /chat/stream 中摘除。所有用户消息一律交模型 tool calling 决策。
+# 请勿重新接回 chat 链路。
 INTENT_RULES: List[Dict[str, Any]] = [
     {
         "tool": "run_virtual_factory_pulse",

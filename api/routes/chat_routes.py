@@ -30,7 +30,7 @@ from database.db_config import get_db
 from database.models import FileRecord, User
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
 )
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
@@ -75,7 +75,7 @@ SYSTEM_PROMPT = (
     "当用户交代的事情当前无法闭环、或用户说'跟进一下''盯着这个''挂起来''到时候提醒我'时，"
     "调用 create_followup_task 把任务挂入任务中心，系统会按频率（默认2小时，用户可指定）定期自动跟进并推送通知；"
     "挂账成功后告知用户可在「任务中心」页面查看进度。不要把能立即完成的查询/操作挂账。\n"
-    "【回答边界】工具结果未提供的信息不得猜测，不得擅自补充故障、缺料、同步异常等可能原因。"
+    "【结果解读】工具与工作流返回的 JSON 只是你的输入素材，绝对不能原样贴给用户。""你必须把它翻译成人话：先给结论，再用表格或短清单列关键数据，最后说明下一步。""多步工作流要逐步说明每一步查到了什么，而不是复述 steps 数组。\n"    "【回答边界】工具结果未提供的信息不得猜测，不得擅自补充故障、缺料、同步异常等可能原因。"
     "最终回答只输出面向用户的结论，禁止输出 <think>、推理过程、内部分析或工具选择过程。\n"
     "请用简洁专业的中文回答制造与车间管理相关问题。"
 )
@@ -293,45 +293,6 @@ def _grounded_tool_result(result: Dict[str, Any]) -> str:
         f"{TOOL_RESULT_GROUNDING}\n"
         f"{json.dumps(result, ensure_ascii=False, default=str)}"
     )
-
-
-def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
-    """Deterministic fallback reply for clear business intents."""
-    label = TOOL_LABELS.get(tool_name, tool_name)
-    if "error" in result:
-        return f"{label}执行失败：{result['error']}"
-    if tool_name == "run_virtual_factory_pulse":
-        rhythm = result.get("rhythm", {})
-        advanced = result.get("advanced", {})
-        return (
-            "虚拟工厂脉搏已推进。\n"
-            f"- 月产能：{rhythm.get('monthly_capacity_containers', 300)} 柜/月，"
-            f"日节奏：{rhythm.get('daily_capacity_containers', 10)} 柜/日\n"
-            f"- 新建订单：{len(result.get('created_orders', []))} 个\n"
-            f"- 本次报工：{advanced.get('containers_reported', 0)} 柜，"
-            f"{advanced.get('reports_created', 0)} 条报工\n"
-            f"- 节奏预警：{len(result.get('alerts', []))} 条"
-        )
-    if tool_name == "query_order_work_order_status":
-        orders = result.get("orders", [])
-        return (
-            "订单到生产工单核对完成：\n"
-            f"- 销售订单：{result.get('count', 0)} 个，已有生产工单：{result.get('orders_with_work_orders', 0)} 个"
-            f"（覆盖率 {result.get('work_order_coverage_pct', 0)}%）\n"
-            f"- 生产工单：{result.get('total_work_orders', 0)} 张，其中工序工单 {result.get('total_operation_work_orders', 0)} 张\n"
-            f"- 工序工单已下达：{result.get('released_operation_work_orders', 0)}/{result.get('total_operation_work_orders', 0)}"
-            f"（{result.get('operation_release_coverage_pct', 0)}%）\n"
-            f"- 所有工序全部下达的订单：{result.get('orders_fully_released', 0)}/{len(orders)}\n"
-            "结论：订单是否已经生成生产工单，与工序工单是否全部 released 是两件事；请按上面两个口径判断。"
-        )
-    if tool_name == "get_virtual_factory_status":
-        return (
-            "虚拟工厂当前状态：\n"
-            f"- 虚拟销售订单：{result.get('virtual_sales_orders', 0)} 个\n"
-            f"- 在制虚拟主工单：{result.get('active_virtual_orders', 0)} 个\n"
-            f"- 虚拟报工记录：{result.get('virtual_report_count', 0)} 条"
-        )
-    return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
 
 
 async def _verify_grounded_reply(
@@ -610,28 +571,6 @@ async def chat(
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
 
-    if request.enable_tools and not image_records:
-        direct = resolve_intent(last_user)
-        if direct:
-            tool_name = direct["tool"]
-            arguments = direct.get("args") or {}
-            result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
-            actions.append(ToolAction(
-                tool=tool_name,
-                label=TOOL_LABELS.get(tool_name, tool_name),
-                arguments=arguments,
-                result=result,
-                is_write=tool_name in WRITE_TOOLS,
-                is_sim=tool_name in SIM_TOOLS,
-                success="error" not in result,
-            ))
-            return ChatResponse(
-                reply=_direct_tool_reply(tool_name, result),
-                model="deterministic-tool-router",
-                degraded=False,
-                actions=actions,
-            )
-
     task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
     prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
     try:
@@ -679,7 +618,7 @@ async def chat(
         payload["tool_choice"] = "auto"
 
     try:
-        for _ in range(MAX_TOOL_ROUNDS):
+        for round_index in range(MAX_TOOL_ROUNDS):
             resp = await _call_llm(
                 payload,
                 request_timeout=route["request_timeout"],
@@ -743,13 +682,13 @@ async def chat(
                     "content": _grounded_tool_result(result),
                 })
 
-            # 继续下一轮，让模型基于工具结果生成回复
+            # 继续下一轮：工具清单保留，模型可基于已有结果继续取数或直接作答。
             messages.append({"role": "system", "content": FINAL_GROUNDING_PROMPT})
             payload["messages"] = messages
-            # 能力已由模型完成语义选择；后续只让模型基于工具结果生成答复，
-            # 不再重复发送完整工具清单，避免无意义的 token 消耗和二次工具调用。
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
+            if round_index + 1 >= MAX_TOOL_ROUNDS - 1:
+                # 最后一轮不再给工具，强制模型收敛出面向用户的答复
+                payload.pop("tools", None)
+                payload.pop("tool_choice", None)
 
         # 超过最大轮次
         return ChatResponse(
@@ -1097,29 +1036,6 @@ async def chat_stream(
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
 
-        if request.enable_tools and not image_records:
-            direct = resolve_intent(last_user)
-            if direct:
-                tool_name = direct["tool"]
-                arguments = direct.get("args") or {}
-                result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
-                action = ToolAction(
-                    tool=tool_name,
-                    label=TOOL_LABELS.get(tool_name, tool_name),
-                    arguments=arguments,
-                    result=result,
-                    is_write=tool_name in WRITE_TOOLS,
-                    is_sim=tool_name in SIM_TOOLS,
-                    success="error" not in result,
-                )
-                yield _sse("action", action.model_dump())
-                table_data = _extract_table_data(tool_name, result)
-                if table_data:
-                    yield _sse("table", table_data)
-                yield _sse("delta", {"content": _direct_tool_reply(tool_name, result)})
-                yield _sse("done", {"model": "deterministic-tool-router", "degraded": False})
-                return
-
         task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
         prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
         try:
@@ -1175,7 +1091,7 @@ async def chat_stream(
             payload["tool_choice"] = "auto"
 
         try:
-            for _ in range(MAX_TOOL_ROUNDS):
+            for round_index in range(MAX_TOOL_ROUNDS):
                 streamed_content: List[str] = []
                 streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
                 async for delta in _stream_llm_deltas(
@@ -1239,33 +1155,20 @@ async def chat_stream(
                         "content": _grounded_tool_result(result),
                     })
 
-                # 最终回答直接流式生成。语义选择仍由首轮模型完成，业务层只提供工具事实。
-                facts = [
-                    {"tool": action.tool, "result": action.result}
-                    for action in actions
-                ]
-                payload = {
-                    "model": route["gateway_model"],
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                f"{FINAL_GROUNDING_PROMPT}"
-                                "请根据用户问题和工具事实生成简洁、自然的中文答复，"
-                                "只输出最终答复。"
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"用户问题：{last_user}\n"
-                                f"工具事实：{json.dumps(facts, ensure_ascii=False, default=str)}"
-                            ),
-                        },
-                    ],
-                    "temperature": 0,
-                    "max_tokens": route["max_completion_tokens"],
-                }
+                # 继续下一轮：工具清单保留，模型可基于已有结果继续取数或直接作答。
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"{FINAL_GROUNDING_PROMPT}"
+                        "请基于上述工具结果，用简洁自然的中文回答用户问题，"
+                        "只输出面向用户的最终答复。"
+                    ),
+                })
+                payload["messages"] = messages
+                if round_index + 1 >= MAX_TOOL_ROUNDS - 1:
+                    # 最后一轮不再给工具，强制模型收敛出面向用户的答复
+                    payload.pop("tools", None)
+                    payload.pop("tool_choice", None)
 
             yield _sse("delta", {"content": "操作轮次过多，已停止。请简化您的请求后重试。"})
             yield _sse("done", {"model": route["task_id"], "degraded": True})
