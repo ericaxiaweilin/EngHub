@@ -397,18 +397,18 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "export_report_file",
-            "description": "把生产汇总或工单表单导出为文件（JSON/CSV），写入系统文件表并返回下载链接。用于「导出报告/生成报表」类请求。",
+            "description": "把数据导出为文件（JSON/CSV），写入系统文件表并返回下载链接。用于「导出报告/生成报表/做个表格分享」类请求。支持多种报告类型。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "report_type": {
                         "type": "string",
-                        "enum": ["production_summary", "work_order"],
-                        "description": "报告类型：production_summary生产汇总（默认）/ work_order工单表单",
+                        "enum": ["production_summary", "work_order", "attendance", "employee_list"],
+                        "description": "报告类型：production_summary生产汇总 / work_order工单表单 / attendance考勤统计 / employee_list员工花名册",
                         "default": "production_summary",
                     },
                     "work_order_code": {"type": "string", "description": "工单号（report_type=work_order 时必填）"},
-                    "format": {"type": "string", "enum": ["json", "csv"], "description": "文件格式，默认json", "default": "json"},
+                    "format": {"type": "string", "enum": ["json", "csv"], "description": "文件格式，默认csv", "default": "csv"},
                 },
             },
         },
@@ -676,6 +676,20 @@ TOOL_DEFINITIONS.extend([
                         "default": 6,
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_entity",
+            "description": "全站精确搜索：按编码或名称跨模块查找实体（工位、设备、产品、工单、员工、仓库、库存、用户）。当用户提到具体编码（如 ST-ZL-01、EQ-CNC-01、WO-MECH-001）或问'xxx属于哪个部门/是什么/在哪'时，必须先调用此工具获取精确结果，禁止猜测。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键词（编码或名称片段）"},
+                },
+                "required": ["keyword"],
             },
         },
     },
@@ -1497,13 +1511,14 @@ def _to_csv(rows: Any) -> str:
 
 
 async def _tool_export_report_file(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
-    """把生产汇总/工单表单导出为文件（JSON/CSV），写入 files 表并返回下载链接。"""
+    """把数据导出为文件（JSON/CSV），写入 files 表并返回下载链接。支持多种报告类型。"""
     from api.routes.file_routes import UPLOAD_DIR  # 懒加载，复用落盘目录
+    from sqlalchemy import text as sa_text
 
     report_type = args.get("report_type") or "production_summary"
-    fmt = (args.get("format") or "json").lower()
+    fmt = (args.get("format") or "csv").lower()
     if fmt not in ("json", "csv"):
-        fmt = "json"
+        fmt = "csv"
     user = await _get_user_by_name(db, operator)
     factory_id = user.factory_id if user else None
 
@@ -1521,6 +1536,41 @@ async def _tool_export_report_file(db: AsyncSession, args: Dict[str, Any], opera
         csv_rows = data["work_order"]
         filename_base = f"work_order_{wo.work_order_code}"
         related_type, related_id = "work_order", wo.id
+
+    elif report_type == "attendance":
+        # 考勤统计：按部门/工站聚合出勤率，按缺勤率降序
+        fid_clause = "WHERE factory_id = :fid" if factory_id else ""
+        rows = (await db.execute(sa_text(f"""
+            SELECT department, station,
+                   COUNT(*)::int AS total,
+                   COUNT(*) FILTER (WHERE status='active')::int AS present,
+                   COUNT(*) - COUNT(*) FILTER (WHERE status='active')::int AS absent,
+                   ROUND((COUNT(*) - COUNT(*) FILTER (WHERE status='active')) * 100.0 / NULLIF(COUNT(*),0), 2) AS absent_rate_pct
+            FROM hr_employees
+            {fid_clause}
+            GROUP BY department, station
+            ORDER BY absent_rate_pct DESC
+        """), {"fid": factory_id} if factory_id else {})).fetchall()
+        csv_rows = [{"department": r[0], "station": r[1], "total": r[2], "present": r[3], "absent": r[4], "absent_rate_pct": float(r[5]) if r[5] else 0} for r in rows]
+        data = {"report": "attendance_deficit_rank", "date": str(date.today()), "factory_id": factory_id, "rows": csv_rows}
+        filename_base = f"attendance_deficit_rank_{date.today().strftime('%Y%m%d')}"
+        related_type, related_id = "report", "attendance"
+
+    elif report_type == "employee_list":
+        # 员工花名册
+        fid_clause = "WHERE factory_id = :fid" if factory_id else ""
+        rows = (await db.execute(sa_text(f"""
+            SELECT employee_code, name, department, station, shift, skill_level, status
+            FROM hr_employees
+            {fid_clause}
+            ORDER BY department, station, employee_code
+            LIMIT 2000
+        """), {"fid": factory_id} if factory_id else {})).fetchall()
+        csv_rows = [{"employee_code": r[0], "name": r[1], "department": r[2], "station": r[3], "shift": r[4], "skill_level": r[5], "status": r[6]} for r in rows]
+        data = {"report": "employee_list", "date": str(date.today()), "factory_id": factory_id, "rows": csv_rows}
+        filename_base = f"employee_list_{date.today().strftime('%Y%m%d')}"
+        related_type, related_id = "report", "employee_list"
+
     else:
         data = await _tool_get_production_summary(db, {}, factory_id)
         csv_rows = data
@@ -2070,6 +2120,38 @@ _TOOL_EXECUTORS = {
     "get_virtual_factory_status": _tool_get_virtual_factory_status,
     "run_virtual_factory_pulse": _tool_run_virtual_factory_pulse,
 }
+
+
+async def _tool_search_entity(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """全站实体精确搜索 — 复用 search_routes 的模块配置，跨工位/设备/产品/工单/员工/仓库/库存/用户查找。"""
+    from api.routes.search_routes import SEARCH_MODULES
+
+    keyword = (args.get("keyword") or "").strip()
+    if not keyword:
+        return {"error": "缺少搜索关键词"}
+
+    like_pattern = f"%{keyword}%"
+    results: List[Dict[str, Any]] = []
+    for mod in SEARCH_MODULES:
+        conditions = " OR ".join(f"CAST({f} AS TEXT) ILIKE :kw" for f in mod["fields"])
+        sql = f"SELECT {mod['select']} FROM {mod['from']} WHERE {conditions} LIMIT 5"
+        try:
+            rows = (await db.execute(text(sql), {"kw": like_pattern})).mappings().all()
+            for row in rows:
+                results.append({
+                    "source": mod["source"],
+                    "source_label": mod["label"],
+                    **{k: str(v) for k, v in dict(row).items() if v is not None},
+                })
+        except Exception:
+            continue
+
+    if not results:
+        return {"found": False, "message": f"未找到与 '{keyword}' 匹配的实体", "results": []}
+    return {"found": True, "count": len(results), "results": results}
+
+
+_TOOL_EXECUTORS["search_entity"] = _tool_search_entity
 
 
 async def _tool_query_process_knowledge(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:

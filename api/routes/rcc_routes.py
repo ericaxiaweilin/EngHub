@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
+from core.auth.security import get_current_user
 
 router = APIRouter(prefix="/api/v1/rcc", tags=["rcc - 资源控制中心"])
 
@@ -472,6 +473,230 @@ async def org_bubbles(factory_id: str = Query("F01")):
             "chains": [c.name for c in engine.chains],
         },
     }
+
+
+@router.get("/org-hierarchy", summary="组织层级气泡数据 - 按厂→车间→部门→工位裂变")
+async def org_hierarchy(
+    factory_id: str = Query("FAC_MECH_001"),
+    domain: str = Query("people", description="people/equipment/work_orders"),
+    db: AsyncSession = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """
+    返回组织层级树 + 每层健康度指标，供前端气泡下钻。
+    层级: factory → workshop/department → station/shift → records
+    """
+    from sqlalchemy import text as sa_text
+
+    result = {"success": True, "factory_id": factory_id, "domain": domain, "tree": None}
+
+    if domain == "people":
+        # 按 department → station → shift 聚合人力数据
+        rows = (await db.execute(sa_text("""
+            SELECT department, station, shift, skill_level, status, count(*) as cnt
+            FROM hr_employees
+            WHERE factory_id = :fid
+            GROUP BY department, station, shift, skill_level, status
+        """), {"fid": factory_id})).fetchall()
+
+        # 构建树
+        dept_map = {}  # department -> {stations: {station -> {shifts: ...}}}
+        total = 0
+        active_total = 0
+        for r in rows:
+            dept = r[0] or "未分配"
+            station = r[1] or "未分配"
+            shift = r[2] or "未分配"
+            skill = r[3] or "L1"
+            status = r[4] or "active"
+            cnt = r[5]
+            total += cnt
+            if status == "active":
+                active_total += cnt
+
+            if dept not in dept_map:
+                dept_map[dept] = {"total": 0, "active": 0, "skills": {}, "stations": {}}
+            dept_map[dept]["total"] += cnt
+            if status == "active":
+                dept_map[dept]["active"] += cnt
+            dept_map[dept]["skills"][skill] = dept_map[dept]["skills"].get(skill, 0) + cnt
+
+            if station not in dept_map[dept]["stations"]:
+                dept_map[dept]["stations"][station] = {"total": 0, "active": 0, "shifts": {}}
+            dept_map[dept]["stations"][station]["total"] += cnt
+            if status == "active":
+                dept_map[dept]["stations"][station]["active"] += cnt
+
+            shift_key = f"{shift}|{skill}|{status}"
+            dept_map[dept]["stations"][station]["shifts"][shift_key] = \
+                dept_map[dept]["stations"][station]["shifts"].get(shift_key, 0) + cnt
+
+        def _health(active, tot):
+            if tot == 0:
+                return "danger"
+            ratio = active / tot
+            if ratio >= 0.9:
+                return "normal"
+            elif ratio >= 0.7:
+                return "warning"
+            return "danger"
+
+        # 构建层级树
+        children = []
+        for dept_name, dept_data in dept_map.items():
+            station_children = []
+            for st_name, st_data in dept_data["stations"].items():
+                shift_children = []
+                for sk, cnt in st_data["shifts"].items():
+                    parts = sk.split("|")
+                    shift_children.append({
+                        "id": f"{dept_name}_{st_name}_{sk}",
+                        "name": f"{parts[0]} · {parts[1]}",
+                        "level": "shift",
+                        "count": cnt,
+                        "status": parts[2] if len(parts) > 2 else "active",
+                        "health": "normal" if (len(parts) > 2 and parts[2] == "active") else "warning",
+                    })
+                station_children.append({
+                    "id": f"{dept_name}_{st_name}",
+                    "name": st_name,
+                    "level": "station",
+                    "count": st_data["total"],
+                    "active": st_data["active"],
+                    "health": _health(st_data["active"], st_data["total"]),
+                    "children": shift_children,
+                })
+            children.append({
+                "id": dept_name,
+                "name": dept_name,
+                "level": "department",
+                "count": dept_data["total"],
+                "active": dept_data["active"],
+                "health": _health(dept_data["active"], dept_data["total"]),
+                "skills": dept_data["skills"],
+                "children": station_children,
+            })
+
+        result["tree"] = {
+            "id": factory_id,
+            "name": factory_id,
+            "level": "factory",
+            "count": total,
+            "active": active_total,
+            "health": _health(active_total, total),
+            "children": children,
+        }
+
+    elif domain == "equipment":
+        # 按 station_type 聚合设备
+        rows = (await db.execute(sa_text("""
+            SELECT station_id, status, count(*) as cnt
+            FROM equipment
+            WHERE factory_id = :fid
+            GROUP BY station_id, status
+        """), {"fid": factory_id})).fetchall()
+
+        station_map = {}
+        total = 0
+        running = 0
+        for r in rows:
+            st = r[0] or "未分配"
+            status = r[1] or "unknown"
+            cnt = r[2]
+            total += cnt
+            if status == "running":
+                running += cnt
+            if st not in station_map:
+                station_map[st] = {"total": 0, "running": 0, "statuses": {}}
+            station_map[st]["total"] += cnt
+            if status == "running":
+                station_map[st]["running"] += cnt
+            station_map[st]["statuses"][status] = station_map[st]["statuses"].get(status, 0) + cnt
+
+        def _eq_health(run, tot):
+            if tot == 0:
+                return "danger"
+            ratio = run / tot
+            if ratio >= 0.8:
+                return "normal"
+            elif ratio >= 0.5:
+                return "warning"
+            return "danger"
+
+        children = []
+        for st_name, st_data in station_map.items():
+            status_children = [{"id": f"{st_name}_{s}", "name": s, "level": "status", "count": c,
+                                "health": "normal" if s == "running" else "warning" if s == "idle" else "danger"}
+                               for s, c in st_data["statuses"].items()]
+            children.append({
+                "id": st_name, "name": st_name, "level": "station",
+                "count": st_data["total"], "active": st_data["running"],
+                "health": _eq_health(st_data["running"], st_data["total"]),
+                "children": status_children,
+            })
+
+        result["tree"] = {
+            "id": factory_id, "name": factory_id, "level": "factory",
+            "count": total, "active": running,
+            "health": _eq_health(running, total),
+            "children": children,
+        }
+
+    elif domain == "work_orders":
+        rows = (await db.execute(sa_text("""
+            SELECT assigned_station_id, status, count(*) as cnt
+            FROM work_orders
+            WHERE factory_id = :fid
+            GROUP BY assigned_station_id, status
+        """), {"fid": factory_id})).fetchall()
+
+        station_map = {}
+        total = 0
+        done = 0
+        for r in rows:
+            st = r[0] or "未分配"
+            status = r[1] or "unknown"
+            cnt = r[2]
+            total += cnt
+            if status == "completed":
+                done += cnt
+            if st not in station_map:
+                station_map[st] = {"total": 0, "done": 0, "statuses": {}}
+            station_map[st]["total"] += cnt
+            if status == "completed":
+                station_map[st]["done"] += cnt
+            station_map[st]["statuses"][status] = station_map[st]["statuses"].get(status, 0) + cnt
+
+        def _wo_health(d, t):
+            if t == 0:
+                return "danger"
+            ratio = d / t
+            if ratio >= 0.6:
+                return "normal"
+            elif ratio >= 0.3:
+                return "warning"
+            return "danger"
+
+        children = []
+        for st_name, st_data in station_map.items():
+            status_children = [{"id": f"{st_name}_{s}", "name": s, "level": "status", "count": c,
+                                "health": "normal" if s == "completed" else "warning" if s in ("in_progress", "pending") else "danger"}
+                               for s, c in st_data["statuses"].items()]
+            children.append({
+                "id": st_name, "name": st_name, "level": "station",
+                "count": st_data["total"], "active": st_data["done"],
+                "health": _wo_health(st_data["done"], st_data["total"]),
+                "children": status_children,
+            })
+
+        result["tree"] = {
+            "id": factory_id, "name": factory_id, "level": "factory",
+            "count": total, "active": done,
+            "health": _wo_health(done, total),
+            "children": children,
+        }
+
+    return result
 
 
 __all__ = ["router"]

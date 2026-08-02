@@ -253,6 +253,9 @@ export default function AIAssistantWidget() {
   const [callSubmitting, setCallSubmitting] = useState(false)
   // 电子表格弹窗（chatbot 查询结果 → Univer 在线表格）
   const [sheetTable, setSheetTable] = useState<TableData | null>(null)
+  // 工厂指挥官开关
+  const [commanderOn, setCommanderOn] = useState(false)
+  const [commanderLoading, setCommanderLoading] = useState(false)
 
   const user = getStoredUser()
   const activeFactoryId = () => localStorage.getItem('active_factory_id') || user?.factory_id || 'FAC_ELEC_DEMO_2026'
@@ -367,6 +370,41 @@ export default function AIAssistantWidget() {
       .catch(() => { /* 智能体列表不可用时隐藏选择器 */ })
     fetchQuickCommands()
   }, [fetchQuickCommands])
+
+  // ---------- 工厂指挥官状态 ----------
+  const fetchCommanderStatus = useCallback(async () => {
+    try {
+      const res: any = await api.get('/api/v1/commander/my-status')
+      setCommanderOn(!!res?.enabled)
+    } catch { /* 后端不可用时默认关闭 */ }
+  }, [])
+
+  useEffect(() => { fetchCommanderStatus() }, [fetchCommanderStatus])
+
+  const toggleCommander = useCallback(async () => {
+    setCommanderLoading(true)
+    try {
+      const res: any = await api.post('/api/v1/commander/toggle', {
+        enabled: !commanderOn,
+        factory_id: activeFactoryId(),
+      })
+      setCommanderOn(!!res?.enabled)
+      message.success(res?.message || (res?.enabled ? '指挥官已开启' : '指挥官已关闭'))
+      // 开启时在聊天中插入一条系统提示
+      if (res?.enabled) {
+        setMessages(prev => [...prev, {
+          id: createId('cmd'),
+          role: 'assistant',
+          content: '🎖️ 工厂指挥官已开启！我将主动接管您工作范围内的生产调度事务：\n• 自动感知产能负荷，切换接单/维持/挑单模式\n• 主动排产、跟催交期、协调资源\n• 重大决策会先请示您确认\n\n您可以随时点击顶部按钮关闭，恢复手动模式。',
+          time: now(),
+        }])
+      }
+    } catch {
+      message.error('指挥官开关操作失败')
+    } finally {
+      setCommanderLoading(false)
+    }
+  }, [commanderOn])
 
   // ---------- 拖拽逻辑 ----------
   const onHeaderMouseDown = useCallback((e: React.MouseEvent) => {
@@ -1057,7 +1095,27 @@ export default function AIAssistantWidget() {
               <RobotOutlined />
               <Text strong style={{ color: '#fff' }}>EngHub 智能助手</Text>
             </Space>
-            <Space size={4}>
+            <Space size={6}>
+              {/* 工厂指挥官开关 */}
+              <Tooltip title={commanderOn ? '指挥官已开启：AI正在主动接管您的工作（点击关闭）' : '开启工厂指挥官：AI主动接管生产调度（点击开启）'}>
+                <Button
+                  size="small"
+                  loading={commanderLoading}
+                  onClick={toggleCommander}
+                  style={{
+                    borderRadius: 14,
+                    fontWeight: 700,
+                    fontSize: 11,
+                    border: commanderOn ? 'none' : '1px solid rgba(255,255,255,0.6)',
+                    background: commanderOn ? 'linear-gradient(135deg, #52c41a, #73d13d)' : 'transparent',
+                    color: '#fff',
+                    boxShadow: commanderOn ? '0 0 8px rgba(82,196,26,0.6)' : 'none',
+                  }}
+                >
+                  <ThunderboltOutlined style={{ marginRight: 3 }} />
+                  {commanderOn ? '指挥官·接管中' : '指挥官'}
+                </Button>
+              </Tooltip>
               <Button type="text" size="small" icon={<MinusOutlined />} style={{ color: '#fff' }}
                 onClick={() => setOpen(false)} />
               <Button type="text" size="small"

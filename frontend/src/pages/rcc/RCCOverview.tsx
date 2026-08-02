@@ -12,6 +12,7 @@ import {
 } from '@ant-design/icons'
 import { useRcc, COLORS } from './RCCCommandCenter'
 import TraceabilityDrawer from '../../components/TraceabilityDrawer'
+import OrgBubbleDrillDown from '../../components/OrgBubbleDrillDown'
 
 // ==================== KPI 卡片组件 ====================
 function KpiCard({ icon, label, value, suffix, sub, trend, color, onClick }: {
@@ -170,6 +171,18 @@ export default function RCCOverview() {
   }, [people, equipment, workOrders, environment, process])
 
   const openTrace = (domain: string, title: string) => setTraceTarget({ domain, title })
+
+  // 气泡下钻模式：人力/设备/工单 直接进入气泡视图，替换整个仪表板
+  if (traceTarget && ['people', 'equipment', 'work_orders'].includes(traceTarget.domain)) {
+    return (
+      <OrgBubbleDrillDown
+        factoryId={factoryId}
+        domain={traceTarget.domain}
+        title={traceTarget.title}
+        onBack={() => setTraceTarget(null)}
+      />
+    )
+  }
 
   return (
     <div>
@@ -348,6 +361,7 @@ export default function RCCOverview() {
           </div>
         </Col>
       </Row>
+      {/* 其余域用表格 Drawer */}
       <TraceabilityDrawer
         open={!!traceTarget}
         factoryId={factoryId}

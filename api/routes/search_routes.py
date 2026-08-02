@@ -23,7 +23,7 @@ SEARCH_MODULES = [
         "source": "work_order", "label": "工单", "route": "/work-orders",
         "select": "wo.id, wo.work_order_code, wo.status, wo.priority, wo.planned_qty, wo.completed_qty, p.product_name",
         "from": "work_orders wo LEFT JOIN products p ON CAST(wo.product_id AS TEXT) = CAST(p.id AS TEXT)",
-        "fields": ["wo.work_order_code", "p.product_name", "wo.status"],
+        "fields": ["wo.work_order_code", "p.product_name", "wo.status", "wo.priority"],
     },
     {
         "source": "product", "label": "产品", "route": "/base-data",
@@ -35,7 +35,7 @@ SEARCH_MODULES = [
         "source": "equipment", "label": "设备", "route": "/base-data",
         "select": "id, equipment_code, equipment_name, equipment_type, spec, status",
         "from": "equipment",
-        "fields": ["equipment_code", "equipment_name", "spec"],
+        "fields": ["equipment_code", "equipment_name", "equipment_type", "spec"],
     },
     {
         "source": "inventory", "label": "库存", "route": "/inventory",
@@ -45,7 +45,7 @@ SEARCH_MODULES = [
     },
     {
         "source": "station", "label": "工位", "route": "/base-data",
-        "select": "id, station_code, station_name, station_type, capacity, status",
+        "select": "id, station_code, station_name, station_type, status",
         "from": "stations",
         "fields": ["station_code", "station_name", "station_type"],
     },
@@ -56,7 +56,13 @@ SEARCH_MODULES = [
         "fields": ["warehouse_code", "warehouse_name", "warehouse_type"],
     },
     {
-        "source": "employee", "label": "员工", "route": "/skill-matrix",
+        "source": "employee", "label": "员工", "route": "/hr-roster",
+        "select": "id, employee_code, name, department, station, skill_level, status",
+        "from": "hr_employees",
+        "fields": ["employee_code", "name", "department", "station", "skill_level"],
+    },
+    {
+        "source": "user", "label": "用户", "route": "/skill-matrix",
         "select": "id, username, full_name, email, role",
         "from": "users",
         "fields": ["username", "full_name", "email"],
