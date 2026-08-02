@@ -2155,83 +2155,12 @@ def _extract_wo_code(message: str) -> Optional[str]:
 
 
 def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
-    """确定性意图解析：命中业务关键词返回 {"tool", "args"}，否则 None。
+    """已废弃的确定性意图 fastpath（始终返回 None）。
 
-    后端可据此直接执行工具取真实数据（不依赖模型决策），args 通过轻量关键词规则提取。
-    写操作/多步操作不走此路径，仍由模型 auto 编排。
-
-    优先级：工作流触发词（复合任务）> 单步查询工具。"""
-    # 优先匹配工作流（复合任务，如「帮我复盘今天生产」→ daily_production_review）
-    # 懒加载避免与 workflow_service 的顶层循环导入；match_workflow 仅返回无需参数的工作流
-    from api.services.workflow_service import match_workflow  # 懒加载，避免循环导入
-    wf_name = match_workflow(message)
-    if wf_name:
-        return {"tool": "run_workflow", "args": {"workflow_name": wf_name, "params": {}}}
-
-    tool = detect_intent_tool(message)
-    if not tool:
-        return None
-    args: Dict[str, Any] = {}
-    if tool == "query_work_orders":
-        if any(k in message for k in ["在制", "生产中", "进行中", "在做", "在产"]):
-            args["status"] = "in_progress"
-        elif any(k in message for k in ["待下达", "未下达"]):
-            args["status"] = "pending"
-        elif "已下达" in message:
-            args["status"] = "released"
-        elif any(k in message for k in ["已完成", "完工"]):
-            args["status"] = "completed"
-    elif tool == "get_work_order_form":
-        # 工单表单需工单号：轻量提取形如 WO-xxx / ELEC-S20260723-001 的工单码；提不到则交 auto 让模型提取
-        wo_code = _extract_wo_code(message)
-        if not wo_code:
-            return None
-        args["work_order_code"] = wo_code
-    elif tool == "get_inspection_form":
-        # 检验单：可选按工单过滤（提到工单号则带上）
-        wo_code = _extract_wo_code(message)
-        if wo_code:
-            args["work_order_code"] = wo_code
-    elif tool == "export_report_file":
-        # 默认导出生产汇总；消息含工单号且提及工单 → 导出工单表单
-        wo_code = _extract_wo_code(message)
-        if wo_code and "工单" in message:
-            args["report_type"] = "work_order"
-            args["work_order_code"] = wo_code
-        else:
-            args["report_type"] = "production_summary"
-        args["format"] = "csv" if any(k in message for k in ["csv", "CSV", "表格"]) else "json"
-    elif tool == "query_process_knowledge":
-        # 轻量提取 topic 与 keyword：
-        # 1) 责任归属类："该找谁/谁负责/卡在/超时找谁" → who_handles + 阶段关键词
-        if any(k in message for k in ["该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行"]):
-            args["topic"] = "who_handles"
-            for stage_kw in ["创建", "下达", "审批", "派工", "执行", "报工", "质检", "完工", "入库", "关闭"]:
-                if stage_kw in message:
-                    args["keyword"] = stage_kw
-                    break
-        # 2) 职位流类：消息含职位关键词 → position_sop
-        elif any(k in message for k in [
-            "品检", "操作员", "PMC", "计划员", "主管", "仓管", "设备工程",
-            "机修", "质检员", "IPQC", "生管", "岗位职责", "SOP", "标准作业",
-            "日常工作流", "每天做什么", "职位流程", "工作职责",
-        ]):
-            args["topic"] = "position_sop"
-            for pos_kw in ["品检", "操作员", "PMC", "计划员", "主管", "仓管", "设备工程", "机修", "质检", "IPQC", "生管"]:
-                if pos_kw in message:
-                    args["keyword"] = pos_kw
-                    break
-        # 3) 工单流类
-        elif any(k in message for k in [
-            "工单流程", "工单生命周期", "工单流转", "下达流程", "报工流程",
-            "完工流程", "工单状态流转", "工单各阶段", "工单环节",
-        ]):
-            args["topic"] = "work_order_flow"
-            for stage_kw in ["创建", "下达", "审批", "派工", "执行", "报工", "质检", "完工", "入库", "关闭"]:
-                if stage_kw in message:
-                    args["keyword"] = stage_kw
-                    break
-    return {"tool": tool, "args": args}
+    Chatbot 必须由模型选择 tool_calls，禁止关键词直接执行工具。
+    保留函数签名供旧测试/导入兼容；请勿在 chat 路由重新启用。
+    """
+    return None
 
 
 async def execute_tool(

@@ -199,13 +199,14 @@ async def test_business_capability_is_selected_by_model(monkeypatch):
     assert calls[0]["messages"][-1]["content"] == "请理解我的业务需求"
     assert calls[0]["tool_choice"] == "auto"
     assert calls[0]["tools"] == chat_routes.TOOL_DEFINITIONS
+    # anti-fastpath：首轮工具后仍保留 tools，允许多轮连续调用
     assert calls[1]["messages"][-2]["role"] == "tool"
     assert calls[1]["messages"][-1] == {
         "role": "system",
-        "content": chat_routes.FINAL_GROUNDING_PROMPT,
+        "content": chat_routes.CONTINUE_TOOL_PROMPT,
     }
-    assert "tools" not in calls[1]
-    assert "tool_choice" not in calls[1]
+    assert calls[1]["tools"] == chat_routes.TOOL_DEFINITIONS
+    assert calls[1]["tool_choice"] == "auto"
     assert calls[2]["temperature"] == 0
     assert "事实审校器" in calls[2]["messages"][0]["content"]
     assert result.reply == "当前有 1 条在制工单。"

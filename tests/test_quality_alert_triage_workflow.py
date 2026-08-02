@@ -16,9 +16,13 @@ def test_quality_alert_triage_has_full_four_step_pipeline():
 
 
 def test_quality_alert_triage_does_not_match_bare_triage_keyword():
-    """单独「分诊」不应触发工作流 fastpath，避免误路由。"""
+    """单独「分诊」不应误匹配工作流名；chat 侧 resolve_intent 已禁用，不走关键词 fastpath。"""
+    from api.services.chat_tools_service import resolve_intent
+
     assert match_workflow("分诊") is None
     assert match_workflow("质量异常分诊") == "quality_alert_triage"
+    # chatbot 禁止用 resolve_intent 捷径直接跑工作流
+    assert resolve_intent("质量异常分诊") is None
 
 
 def test_query_ocap_tasks_schema_has_parameters_wrapper():

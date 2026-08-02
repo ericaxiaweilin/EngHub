@@ -59,9 +59,11 @@ SYSTEM_PROMPT = (
     "【工作流优先】当用户请求复合任务（如'帮我复盘今天生产'、'质量异常分诊'、'全面合规检查'、'建一个工单并下达'）时，"
     "优先调用 run_workflow 工具运行预置工作流（生产日度复盘/质量异常分诊/全面合规检查/一键建单下达），"
     "而不是逐个调用单步工具。\n"
-    "【禁止 fastpath】质量异常分诊完成后，若用户说「开始吧/开始处置/跟进」等后续动作，"
-    "必须逐工具调用（如 query_ocap_tasks、create_followup_task、get_inspection_form），"
-    "不得仅凭工作流 JSON 做文字推断，不得跳过工具直接给处置结论或声称已执行动作。\n"
+    "【禁止 fastpath】Chatbot 不得走关键词捷径或跳过工具。"
+    "若用户说「开始吧/开始处置/跟进/继续」等后续动作，必须在本轮逐工具调用"
+    "（如 query_ocap_tasks、create_followup_task、get_inspection_form、get_pending_alerts），"
+    "可多轮连续调用；不得仅凭历史工作流 JSON 做文字推断，"
+    "不得跳过工具直接给处置结论或声称已执行动作。\n"
     "【多模态附件】用户可能上传图片或文件。若收到图片，请结合图片内容回答（如识别设备/工件/缺陷/图纸/仪表盘），"
     "描述你看到的内容并给出专业判断；若用户要求“识别/OCR/提取文字”，请完整提取图片中所有文字内容（保留原始结构与格式）；"
     "若收到文件，基于文字与附件信息回答。\n"
@@ -91,6 +93,12 @@ TOOL_RESULT_GROUNDING = (
 FINAL_GROUNDING_PROMPT = (
     "最终答复必须逐项对应前面的工具 JSON。禁止添加 JSON 中不存在的状态、"
     "原因、风险、预警、示例、建议或已执行动作；不要用常识补全缺失字段。"
+)
+# 多轮工具循环提示：禁止首轮工具后强制文字收尾（anti-fastpath）
+CONTINUE_TOOL_PROMPT = (
+    "若还需更多真实数据，或用户要求开始处置/跟进/挂账，请继续调用工具；"
+    "证据充足且无需再执行写操作时，再给出最终中文答复。"
+    "禁止跳过工具、禁止声称未执行的动作。"
 )
 
 
@@ -681,13 +689,12 @@ async def chat(
                     "content": _grounded_tool_result(result),
                 })
 
-            # 继续下一轮，让模型基于工具结果生成回复
-            messages.append({"role": "system", "content": FINAL_GROUNDING_PROMPT})
+            # 多轮工具循环（anti-fastpath）：保留 tools，允许模型继续取数/写操作
+            messages.append({"role": "system", "content": CONTINUE_TOOL_PROMPT})
             payload["messages"] = messages
-            # 能力已由模型完成语义选择；后续只让模型基于工具结果生成答复，
-            # 不再重复发送完整工具清单，避免无意义的 token 消耗和二次工具调用。
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
+            if not image_records and request.enable_tools:
+                payload["tools"] = TOOL_DEFINITIONS
+                payload["tool_choice"] = "auto"
 
         # 超过最大轮次
         return ChatResponse(
@@ -1078,6 +1085,7 @@ async def chat_stream(
 
         try:
             for _ in range(MAX_TOOL_ROUNDS):
+                # 先缓冲本轮内容：有 tool_calls 时不向用户推送中间文本（anti-fastpath 多轮）
                 streamed_content: List[str] = []
                 streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
                 async for delta in _stream_llm_deltas(
@@ -1087,7 +1095,6 @@ async def chat_stream(
                     text = delta.get("content") or ""
                     if text:
                         streamed_content.append(text)
-                        yield _sse("delta", {"content": text})
                     _merge_stream_tool_calls(
                         streamed_tool_calls,
                         delta.get("tool_calls") or [],
@@ -1099,10 +1106,13 @@ async def chat_stream(
                     if streamed_tool_calls[index]["function"]["name"]
                 ]
                 if not tool_calls:
-                    if not streamed_content:
+                    # 最终答复：无工具调用，再把缓冲内容推给前端
+                    final_text = _clean_model_reply("".join(streamed_content))
+                    if not final_text:
                         yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
                         yield _sse("done", {"model": route["task_id"], "degraded": True})
                         return
+                    yield _sse("delta", {"content": final_text})
                     yield _sse("done", {"model": route["task_id"], "degraded": False})
                     return
 
@@ -1141,33 +1151,17 @@ async def chat_stream(
                         "content": _grounded_tool_result(result),
                     })
 
-                # 最终回答直接流式生成。语义选择仍由首轮模型完成，业务层只提供工具事实。
-                facts = [
-                    {"tool": action.tool, "result": action.result}
-                    for action in actions
-                ]
+                # 保留完整对话与 tools，允许下一轮继续 tool calling（禁止强制文字收尾）
+                messages.append({"role": "system", "content": CONTINUE_TOOL_PROMPT})
                 payload = {
                     "model": route["gateway_model"],
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                f"{FINAL_GROUNDING_PROMPT}"
-                                "请根据用户问题和工具事实生成简洁、自然的中文答复，"
-                                "只输出最终答复。"
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"用户问题：{last_user}\n"
-                                f"工具事实：{json.dumps(facts, ensure_ascii=False, default=str)}"
-                            ),
-                        },
-                    ],
-                    "temperature": 0,
+                    "messages": messages,
+                    "temperature": request.temperature,
                     "max_tokens": route["max_completion_tokens"],
                 }
+                if not image_records and request.enable_tools:
+                    payload["tools"] = TOOL_DEFINITIONS
+                    payload["tool_choice"] = "auto"
 
             yield _sse("delta", {"content": "操作轮次过多，已停止。请简化您的请求后重试。"})
             yield _sse("done", {"model": route["task_id"], "degraded": True})
