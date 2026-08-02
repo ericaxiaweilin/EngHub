@@ -4,10 +4,11 @@ import {
   Input, Select, message, Empty, Spin, Timeline,
 } from 'antd'
 import {
-  AuditOutlined, SearchOutlined, PlusOutlined, WarningOutlined, BoxPlotOutlined,
+  AuditOutlined, SearchOutlined, PlusOutlined, WarningOutlined, BoxPlotOutlined, ApiOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
 import VolumeManagement from './VolumeManagement'
+import WmsEnhancementHub from './WmsEnhancementHub'
 
 const FACTORY = 'F001'
 
@@ -51,6 +52,18 @@ const CountPanel: React.FC = () => {
           { title: '差异项', dataIndex: 'diff_items', width: 80, render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : undefined }}>{v}</span> },
           { title: '差异数量', dataIndex: 'total_diff_qty', width: 90 },
           { title: '创建时间', dataIndex: 'created_at', width: 110, render: (v: string) => v?.slice(0, 10) },
+          {
+            title: '操作', key: 'act', width: 90,
+            render: (_: any, r: any) => r.status === 'pending_approval' ? (
+              <Button size="small" type="link" onClick={async () => {
+                try {
+                  await api.post(`/api/v1/inventory/count/${r.id}/approve`)
+                  message.success('盘点差异已审批调整')
+                  load()
+                } catch (e: any) { message.error(e?.response?.data?.detail || '审批失败') }
+              }}>审批</Button>
+            ) : null,
+          },
         ]}
       />
       <Modal title="新建盘点单" open={createModal} onOk={handleCreate} onCancel={() => setCreateModal(false)}>
@@ -181,6 +194,7 @@ const WmsCenter: React.FC = () => {
       { key: 'trace', label: <span><SearchOutlined /> 物料追溯</span>, children: <TracePanel /> },
       { key: 'alerts', label: <span><WarningOutlined /> 库存预警</span>, children: <AlertPanel /> },
       { key: 'volume', label: <span><BoxPlotOutlined /> 体积管理</span>, children: <VolumeManagement /> },
+      { key: 'enhancement', label: <span><ApiOutlined /> 增强功能</span>, children: <WmsEnhancementHub /> },
     ]} />
   )
 }

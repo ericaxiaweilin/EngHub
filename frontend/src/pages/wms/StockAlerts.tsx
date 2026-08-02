@@ -25,6 +25,7 @@ const alertTypeConfig: Record<string, { color: string; label: string; icon: Reac
   below_safety: { color: 'red', label: '低于安全库存', icon: <WarningOutlined /> },
   above_max: { color: 'orange', label: '超过最大库存', icon: <StopOutlined /> },
   dead_stock: { color: 'purple', label: '呆滞料', icon: <StopOutlined /> },
+  slow_moving: { color: 'volcano', label: '慢销预警', icon: <WarningOutlined /> },
   expiring: { color: 'gold', label: '即将过期', icon: <WarningOutlined /> },
 }
 

@@ -45,6 +45,7 @@ from api.routes.equipment_routes import router as equipment_router
 from api.routes.production_phase1_routes import router as production_phase1_router
 from api.routes.production_phase2_routes import router as production_phase2_router
 from api.routes.wms_phase3_routes import router as wms_phase3_router
+from api.routes.wms_enhancement_routes import router as wms_enhancement_router
 from api.routes.qms_phase4_routes import router as qms_phase4_router
 from api.routes.equipment_phase5_routes import router as equipment_phase5_router
 from api.routes.hr_routes import router as hr_router
@@ -100,6 +101,7 @@ app.include_router(alert_intelligence_router)  # 预警情报审查（017 Chatbo
 app.include_router(production_phase1_router)  # 岗位替代 Phase 1: 报工终端/实时看板/报表中心
 app.include_router(production_phase2_router)  # 岗位替代 Phase 2: 订单管理/APS排程
 app.include_router(wms_phase3_router)  # 岗位替代 Phase 3: 仓管操作/库存预警/盘点
+app.include_router(wms_enhancement_router)  # WMS 全量增强
 app.include_router(qms_phase4_router)  # 岗位替代 Phase 4: 检验终端/SPC/不良分析
 app.include_router(equipment_phase5_router)  # 岗位替代 Phase 5: 维保终端/OEE/故障预测
 app.include_router(hr_router)  # HR 人力档案 + 工厂切换
