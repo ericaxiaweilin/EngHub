@@ -41,7 +41,7 @@ router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 # --- 模型底座接入配置 ---
 GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://host.docker.internal:14040").rstrip("/")
 API_KEY = os.getenv("LLM_API_KEY", "")
-REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
+REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "120"))
 MAX_TOOL_ROUNDS = int(os.getenv("LLM_MAX_TOOL_ROUNDS", "5"))
 MODEL_STACK_CONTROL_PLANE_URL = os.getenv("MODEL_STACK_CONTROL_PLANE_URL", "").rstrip("/")
 MODEL_STACK_CHAT_TASK_ID = os.getenv("MODEL_STACK_CHAT_TASK_ID", "").strip()
@@ -59,6 +59,8 @@ SYSTEM_PROMPT = (
     "仓库在库数量用 query_inventory。用户问'多少种BOM/多少种螺丝/零件种类'时必须查 BOM 工具，不要查库存。\n"
     "【料号查询】用户给出具体料号（如 1000501239）或问'XXX是什么'时，必须先调用 get_bom_material_detail(part_number=XXX)。"
     "只能陈述工具返回的 description/component_type/used_in_models 等字段，严禁编造规格、扭矩、合规认证、库存或工单。\n"
+    "【推理分析】用户明确问用途/作用/原理/「你认为」时，可结合健身器械/制造领域常识作答，"
+    "但不得编造具体库存数量、工单号、料号属性等需查库的数据。\n"
     "写操作（创建工单/下达工单/报工/完工等）执行后，请向用户确认操作结果。\n"
     "【工作流优先】当用户请求复合任务（如'帮我复盘今天生产'、'质量异常分诊'、'全面合规检查'、'建一个工单并下达'）时，"
     "优先调用 run_workflow 工具运行预置工作流（生产日度复盘/质量异常分诊/全面合规检查/一键建单下达），"
@@ -117,11 +119,23 @@ def _is_part_lookup_query(text: str) -> bool:
     return False
 
 
-def _looks_like_factual_lookup(text: str) -> bool:
-    """是否像需要查库的事实性问题（含料号或物料查询意图）。"""
+def _requires_mandatory_tool_lookup(text: str) -> bool:
+    """必须查库才能回答的问题（精确事实），不含纯推理/用途分析。"""
     if _extract_part_numbers(text):
         return True
-    return bool(re.search(r"是什么|什么意思|物料|料号|编码|part\s*number", text or "", re.I))
+    if re.search(r"多少种|多少个|有多少|查一下|查询|统计|列表|概况", text or ""):
+        return True
+    if re.search(r"料号|物料编码|part\s*number", text or "", re.I):
+        return True
+    return False
+
+
+def _is_reasoning_request(text: str) -> bool:
+    """用户要求推理/用途/原理分析，允许基于领域知识作答（不编造具体料号/库存）。"""
+    return bool(re.search(
+        r"你认为|可以推理|分析一下|用途|作用|为什么|怎么用|原理|帮忙想|解释一|知道.*吗",
+        text or "",
+    ))
 
 
 def _format_material_detail_reply(data: Dict[str, Any]) -> str:
@@ -744,7 +758,7 @@ async def chat(
                         reply=_degraded_message("网关无有效回复"),
                         model=route["task_id"], degraded=True, actions=actions,
                     )
-                if not actions and _looks_like_factual_lookup(last_user):
+                if not actions and _requires_mandatory_tool_lookup(last_user) and not _is_reasoning_request(last_user):
                     part_numbers = _extract_part_numbers(last_user)
                     if part_numbers:
                         result = await _execute_part_lookup(
@@ -1308,7 +1322,7 @@ async def chat_stream(
                         yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
                         yield _sse("done", {"model": route["task_id"], "degraded": True})
                         return
-                    if not actions and _looks_like_factual_lookup(last_user):
+                    if not actions and _requires_mandatory_tool_lookup(last_user) and not _is_reasoning_request(last_user):
                         part_numbers = _extract_part_numbers(last_user)
                         if part_numbers:
                             result = await _execute_part_lookup(

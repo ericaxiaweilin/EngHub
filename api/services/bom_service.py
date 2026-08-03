@@ -21,6 +21,9 @@ _KEYWORD_ALIASES: Dict[str, List[str]] = {
     "螺栓": ["螺栓", "螺絲", "螺丝", "bolt", "BOLT"],
     "螺母": ["螺母", "螺帽", "nut", "NUT"],
     "螺帽": ["螺帽", "螺母", "nut"],
+    "ECB": ["ECB", "ECB馬達", "ECB马达", "ecb motor"],
+    "ECB马达": ["ECB", "ECB馬達", "ECB马达", "ecb motor"],
+    "ECB馬達": ["ECB", "ECB馬達", "ECB马达", "ecb motor"],
 }
 
 
