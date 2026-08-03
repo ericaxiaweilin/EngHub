@@ -140,7 +140,7 @@ async def create_task(
             follow_interval_minutes, next_follow_at,
             item_type, assigned_to, payload, due_at)
         VALUES (:id, :fid, :cb, :title, :desc, :ak, :an, 'open', :br, :src, :hint,
-            :interval, NOW() + (:interval * INTERVAL '1 minute'),
+            :interval, NOW() + make_interval(mins => :interval_next),
             :itype, :assignee, :payload, CAST(:due AS timestamptz))
     """), {
         "id": task_id, "fid": factory_id, "cb": created_by,
@@ -148,6 +148,7 @@ async def create_task(
         "ak": agent_key, "an": _agent_name(agent_key),
         "br": (block_reason or "")[:500], "src": source,
         "hint": (conversation_hint or "")[:500], "interval": interval,
+        "interval_next": interval,
         "itype": item_type, "assignee": assigned_to,
         "payload": (payload or "")[:20000] or None, "due": due_at,
     })
@@ -205,7 +206,7 @@ async def update_task(
     # 调整频率时同步顺延下次跟进；关单时记录 closed_at
     if "follow_interval_minutes" in updates:
         set_parts.append(
-            "next_follow_at = NOW() + (:follow_interval_minutes * INTERVAL '1 minute')"
+            "next_follow_at = NOW() + make_interval(mins => :follow_interval_next)"
         )
     if updates.get("status") in {"done", "cancelled"}:
         set_parts.append("closed_at = NOW()")
@@ -213,6 +214,8 @@ async def update_task(
         set_parts.append("closed_at = NULL")
 
     params = {**updates, "id": task_id, "fid": factory_id}
+    if "follow_interval_minutes" in updates:
+        params["follow_interval_next"] = updates["follow_interval_minutes"]
     result = await db.execute(text(f"""
         UPDATE followup_tasks SET {', '.join(set_parts)}
         WHERE id = :id AND factory_id = :fid

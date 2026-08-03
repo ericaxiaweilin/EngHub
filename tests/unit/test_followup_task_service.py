@@ -37,5 +37,6 @@ async def test_create_task_interval_sql_uses_integer_interval(monkeypatch):
 
     assert "error" not in result
     assert captured_sql["params"]["interval"] == 240
-    assert "* INTERVAL '1 minute'" in captured_sql["text"]
+    assert captured_sql["params"]["interval_next"] == 240
+    assert "make_interval(mins => :interval_next)" in captured_sql["text"]
     assert "|| ' minutes'" not in captured_sql["text"]
