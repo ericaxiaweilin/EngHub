@@ -140,7 +140,7 @@ async def create_task(
             follow_interval_minutes, next_follow_at,
             item_type, assigned_to, payload, due_at)
         VALUES (:id, :fid, :cb, :title, :desc, :ak, :an, 'open', :br, :src, :hint,
-            :interval, NOW() + (:interval || ' minutes')::interval,
+            :interval, NOW() + (:interval * INTERVAL '1 minute'),
             :itype, :assignee, :payload, CAST(:due AS timestamptz))
     """), {
         "id": task_id, "fid": factory_id, "cb": created_by,
@@ -204,7 +204,9 @@ async def update_task(
     set_parts.append("updated_at = NOW()")
     # 调整频率时同步顺延下次跟进；关单时记录 closed_at
     if "follow_interval_minutes" in updates:
-        set_parts.append("next_follow_at = NOW() + (:follow_interval_minutes || ' minutes')::interval")
+        set_parts.append(
+            "next_follow_at = NOW() + (:follow_interval_minutes * INTERVAL '1 minute')"
+        )
     if updates.get("status") in {"done", "cancelled"}:
         set_parts.append("closed_at = NOW()")
     elif "status" in updates:
