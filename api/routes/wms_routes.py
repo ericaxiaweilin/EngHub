@@ -4,7 +4,7 @@ WMS API Routes
 """
 
 from fastapi import APIRouter, HTTPException, Depends
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel
 from datetime import date
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from api.services.wms_service import (
     InventoryService,
     WmsService,
 )
+from api.services.wms_volume_service import WmsVolumeService
 
 router = APIRouter(prefix="/api/v1", tags=["wms"])
 
@@ -758,6 +759,129 @@ async def fifo_check(
     """FIFO 合规检查"""
     svc = WmsService(db)
     return await svc.check_fifo(factory_id, material_id)
+
+
+# ============== WMS 体积/重量管理 ==============
+
+class VolumeTrackRequest(BaseModel):
+    factory_id: str
+    material_code: str
+    material_id: Optional[str] = None
+    material_name: Optional[str] = None
+    length_cm: Optional[float] = None
+    width_cm: Optional[float] = None
+    height_cm: Optional[float] = None
+    unit_weight_kg: Optional[float] = None
+    quantity: Optional[int] = None
+    warehouse_id: Optional[str] = None
+    batch_code: Optional[str] = None
+
+
+class VolumeUpdateRequest(BaseModel):
+    factory_id: str
+    length_cm: Optional[float] = None
+    width_cm: Optional[float] = None
+    height_cm: Optional[float] = None
+    unit_weight_kg: Optional[float] = None
+    material_name: Optional[str] = None
+
+
+class ShippingLine(BaseModel):
+    material_code: str
+    quantity: int
+    length_cm: Optional[float] = None
+    width_cm: Optional[float] = None
+    height_cm: Optional[float] = None
+    unit_weight_kg: Optional[float] = None
+
+
+class ShippingVolumeRequest(BaseModel):
+    factory_id: str
+    lines: List[ShippingLine]
+    container_type: str = "40HQ"
+
+
+@router.post("/wms/volume/track")
+async def track_volume(
+    body: VolumeTrackRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """记录物料体积/重量参数，并按库存量计算占用。"""
+    svc = WmsVolumeService(db)
+    return await svc.track_volume(
+        body.factory_id,
+        body.material_code,
+        material_id=body.material_id,
+        material_name=body.material_name,
+        length_cm=body.length_cm,
+        width_cm=body.width_cm,
+        height_cm=body.height_cm,
+        unit_weight_kg=body.unit_weight_kg,
+        quantity=body.quantity,
+        warehouse_id=body.warehouse_id,
+        batch_code=body.batch_code,
+        operator=current_user.username,
+    )
+
+
+@router.put("/wms/volume/material/{material_code}")
+async def update_volume(
+    material_code: str,
+    body: VolumeUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """更新物料体积参数。"""
+    svc = WmsVolumeService(db)
+    return await svc.update_volume(
+        body.factory_id,
+        material_code,
+        length_cm=body.length_cm,
+        width_cm=body.width_cm,
+        height_cm=body.height_cm,
+        unit_weight_kg=body.unit_weight_kg,
+        material_name=body.material_name,
+    )
+
+
+@router.get("/wms/volume/summary")
+async def volume_summary(
+    factory_id: str,
+    warehouse_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """库存体积/重量汇总。"""
+    svc = WmsVolumeService(db)
+    return await svc.get_volume_summary(factory_id, warehouse_id)
+
+
+@router.post("/wms/volume/shipping")
+async def shipping_volume(
+    body: ShippingVolumeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """计算发运体积与集装箱需求。"""
+    svc = WmsVolumeService(db)
+    return await svc.calculate_shipping_volume(
+        body.factory_id,
+        [line.model_dump() for line in body.lines],
+        container_type=body.container_type,
+    )
+
+
+@router.get("/wms/volume/space-utilization")
+async def space_utilization(
+    factory_id: str,
+    warehouse_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """仓库空间利用率分析。"""
+    svc = WmsVolumeService(db)
+    return await svc.get_space_utilization(factory_id, warehouse_id)
 
 
 __all__ = ["router"]
