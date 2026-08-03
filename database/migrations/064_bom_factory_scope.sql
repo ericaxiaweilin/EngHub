@@ -30,3 +30,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_enghub_bom_factory_source
     WHERE factory_id IS NOT NULL AND source_row_id IS NOT NULL;
 
 COMMENT ON COLUMN enghub_bom_items.factory_id IS 'EngHub 工厂 ID，EngFlow BOM 仅同步至 FAC_MECH_001';
+
+-- sync_log.id 同样需要自增序列
+CREATE SEQUENCE IF NOT EXISTS enghub_bom_sync_log_id_seq;
+SELECT setval(
+    'enghub_bom_sync_log_id_seq',
+    COALESCE((SELECT MAX(id) FROM enghub_bom_sync_log), 0) + 1,
+    false
+);
+ALTER TABLE enghub_bom_sync_log ALTER COLUMN id SET DEFAULT nextval('enghub_bom_sync_log_id_seq');
+ALTER SEQUENCE enghub_bom_sync_log_id_seq OWNED BY enghub_bom_sync_log.id;
+
+CREATE INDEX IF NOT EXISTS idx_enghub_bom_sync_log_factory ON enghub_bom_sync_log(factory_id);
