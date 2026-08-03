@@ -2230,7 +2230,7 @@ class EngHubBomSyncLog(Base):
     """BOM 同步日志"""
     __tablename__ = "enghub_bom_sync_log"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     factory_id = Column(String(50))
     source_company_id = Column(String(50))
     sync_type = Column(String(20))       # full / incremental
