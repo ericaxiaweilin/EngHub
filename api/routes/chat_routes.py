@@ -55,8 +55,10 @@ SYSTEM_PROMPT = (
     "重要：当用户要求查询数据或执行操作（如查工单、建工单、报工、查库存、查BOM、查不良品、查设备、下达工单、"
     "完工/暂停/拆分工单、查工艺路线、查技能矩阵、运行合规仿真、查仿真审计记录等）时，"
     "你必须调用对应的工具(tool)来获取真实数据或完成操作，不要凭空编造数据。"
-    "【BOM vs 库存】BOM物料清单（产品结构/零件种类）用 query_bom_summary / search_bom_materials；"
+    "【BOM vs 库存】BOM物料清单（产品结构/零件种类）用 query_bom_summary / search_bom_materials / get_bom_material_detail；"
     "仓库在库数量用 query_inventory。用户问'多少种BOM/多少种螺丝/零件种类'时必须查 BOM 工具，不要查库存。\n"
+    "【料号查询】用户给出具体料号（如 1000501239）或问'XXX是什么'时，必须先调用 get_bom_material_detail(part_number=XXX)。"
+    "只能陈述工具返回的 description/component_type/used_in_models 等字段，严禁编造规格、扭矩、合规认证、库存或工单。\n"
     "写操作（创建工单/下达工单/报工/完工等）执行后，请向用户确认操作结果。\n"
     "【工作流优先】当用户请求复合任务（如'帮我复盘今天生产'、'质量异常分诊'、'全面合规检查'、'建一个工单并下达'）时，"
     "优先调用 run_workflow 工具运行预置工作流（生产日度复盘/质量异常分诊/全面合规检查/一键建单下达），"
@@ -91,6 +93,86 @@ FINAL_GROUNDING_PROMPT = (
     "最终答复必须逐项对应前面的工具 JSON。禁止添加 JSON 中不存在的状态、"
     "原因、风险、预警、示例、建议或已执行动作；不要用常识补全缺失字段。"
 )
+
+_PART_NUMBER_RE = re.compile(r"(?<!\d)(\d{7,12})(?!\d)")
+
+
+def _extract_part_numbers(text: str) -> List[str]:
+    """从用户消息中提取疑似料号（7-12 位数字）。"""
+    return list(dict.fromkeys(_PART_NUMBER_RE.findall(text or "")))
+
+
+def _is_part_lookup_query(text: str) -> bool:
+    """是否为「查某个料号是什么」类问题（适合走确定性查库）。"""
+    part_numbers = _extract_part_numbers(text)
+    if not part_numbers:
+        return False
+    compact = re.sub(r"\s+", "", text or "")
+    if len(part_numbers) == 1 and compact in {part_numbers[0], f"{part_numbers[0]}是什么"}:
+        return True
+    if len(part_numbers) == 1 and re.search(
+        rf"{re.escape(part_numbers[0])}\s*是\s*什么", text or ""
+    ):
+        return True
+    return False
+
+
+def _looks_like_factual_lookup(text: str) -> bool:
+    """是否像需要查库的事实性问题（含料号或物料查询意图）。"""
+    if _extract_part_numbers(text):
+        return True
+    return bool(re.search(r"是什么|什么意思|物料|料号|编码|part\s*number", text or "", re.I))
+
+
+def _format_material_detail_reply(data: Dict[str, Any]) -> str:
+    """将 BOM 料号详情格式化为面向用户的确定性答复（仅含工具字段）。"""
+    pn = data.get("part_number", "")
+    if not data.get("found"):
+        return f"BOM 中未找到料号 `{pn}`。"
+    models = data.get("used_in_models") or []
+    if len(models) <= 8:
+        model_text = "、".join(models) if models else "-"
+    else:
+        model_text = "、".join(models[:8]) + f" 等共 {len(models)} 个产品型号"
+    return (
+        f"料号 **{pn}** 在 BOM 中的记录如下：\n\n"
+        f"| 字段 | 值 |\n|------|-----|\n"
+        f"| 描述 | {data.get('description') or '-'} |\n"
+        f"| 组件类型 | {data.get('component_type') or '-'} |\n"
+        f"| 一级分类 | {data.get('category_l1') or '-'} |\n"
+        f"| 二级分类 | {data.get('category_l2') or '-'} |\n"
+        f"| 材质族 | {data.get('material_family') or '-'} |\n"
+        f"| 使用产品数 | {data.get('usage_count', 0)} |\n"
+        f"| 产品型号 | {model_text} |\n"
+    )
+
+
+async def _execute_part_lookup(
+    db: AsyncSession,
+    *,
+    part_number: str,
+    operator: str,
+    factory_id: str,
+    actions: List[ToolAction],
+) -> Dict[str, Any]:
+    """执行料号精确查库并记录 action。"""
+    result = await execute_tool(
+        db,
+        "get_bom_material_detail",
+        {"part_number": part_number},
+        operator=operator,
+        factory_id=factory_id,
+    )
+    actions.append(
+        ToolAction(
+            tool="get_bom_material_detail",
+            label=TOOL_LABELS.get("get_bom_material_detail", "BOM料号详情"),
+            arguments={"part_number": part_number},
+            result=result,
+            success=not result.get("error") and result.get("found", True),
+        )
+    )
+    return result
 
 
 class ChatMessage(BaseModel):
@@ -568,6 +650,23 @@ async def chat(
     )
     actions: List[ToolAction] = []
 
+    # ---- 料号精确查询 fastpath ----
+    if _is_part_lookup_query(last_user):
+        pn = _extract_part_numbers(last_user)[0]
+        result = await _execute_part_lookup(
+            db,
+            part_number=pn,
+            operator=operator,
+            factory_id=factory_id,
+            actions=actions,
+        )
+        return ChatResponse(
+            reply=_format_material_detail_reply(result),
+            model=MODEL_STACK_CHAT_TASK_ID,
+            degraded=False,
+            actions=actions,
+        )
+
     # ---- 加载本轮附件（工厂隔离）：图片走多模态 vision，非图片以文字摘要告知 ----
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
@@ -644,6 +743,31 @@ async def chat(
                     return ChatResponse(
                         reply=_degraded_message("网关无有效回复"),
                         model=route["task_id"], degraded=True, actions=actions,
+                    )
+                if not actions and _looks_like_factual_lookup(last_user):
+                    part_numbers = _extract_part_numbers(last_user)
+                    if part_numbers:
+                        result = await _execute_part_lookup(
+                            db,
+                            part_number=part_numbers[0],
+                            operator=operator,
+                            factory_id=factory_id,
+                            actions=actions,
+                        )
+                        return ChatResponse(
+                            reply=_format_material_detail_reply(result),
+                            model=route["task_id"],
+                            degraded=False,
+                            actions=actions,
+                        )
+                    return ChatResponse(
+                        reply=(
+                            "该问题需要查询系统数据，但模型未执行查库操作。"
+                            "请重新提问或指定具体料号。"
+                        ),
+                        model=route["task_id"],
+                        degraded=True,
+                        actions=actions,
                     )
                 reply = await _verify_grounded_reply(reply, actions, route)
                 return ChatResponse(
@@ -853,6 +977,32 @@ def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict
             "rows": rows,
         }
 
+    if tool_name == "get_bom_material_detail" and result.get("found"):
+        label_map = {
+            "part_number": "料号",
+            "description": "描述",
+            "component_type": "组件类型",
+            "category_l1": "一级分类",
+            "category_l2": "二级分类",
+            "material_family": "材质族",
+            "usage_count": "使用产品数",
+            "used_in_models": "产品型号",
+        }
+        rows = [
+            {"field": label_map.get(k, k), "value": (
+                "、".join(v) if isinstance(v, list) else v
+            )}
+            for k, v in result.items()
+            if k in label_map and v is not None
+        ]
+        if not rows:
+            return None
+        return {
+            "title": f"料号 {result.get('part_number', '')}",
+            "columns": [{"key": "field", "label": "字段"}, {"key": "value", "label": "值"}],
+            "rows": rows,
+        }
+
     # 列表型查询工具
     list_key = _TABLE_LIST_KEY.get(tool_name)
     columns = _TABLE_COLUMNS.get(tool_name)
@@ -1052,6 +1202,24 @@ async def chat_stream(
     async def generate():
         actions: List[ToolAction] = []
 
+        # ---- 料号精确查询 fastpath：直接查库，避免模型编造 ----
+        if _is_part_lookup_query(last_user):
+            pn = _extract_part_numbers(last_user)[0]
+            result = await _execute_part_lookup(
+                db,
+                part_number=pn,
+                operator=operator,
+                factory_id=factory_id,
+                actions=actions,
+            )
+            yield _sse("action", actions[-1].model_dump())
+            table_data = _extract_table_data("get_bom_material_detail", result)
+            if table_data:
+                yield _sse("table", table_data)
+            yield _sse("delta", {"content": _format_material_detail_reply(result)})
+            yield _sse("done", {"model": MODEL_STACK_CHAT_TASK_ID, "degraded": False})
+            return
+
         # ---- 加载附件 ----
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
@@ -1115,6 +1283,7 @@ async def chat_stream(
             for round_index in range(MAX_TOOL_ROUNDS):
                 streamed_content: List[str] = []
                 streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
+                allow_live_stream = round_index > 0 and bool(actions)
                 async for delta in _stream_llm_deltas(
                     payload,
                     request_timeout=route["request_timeout"],
@@ -1122,7 +1291,8 @@ async def chat_stream(
                     text = delta.get("content") or ""
                     if text:
                         streamed_content.append(text)
-                        yield _sse("delta", {"content": text})
+                        if allow_live_stream:
+                            yield _sse("delta", {"content": text})
                     _merge_stream_tool_calls(
                         streamed_tool_calls,
                         delta.get("tool_calls") or [],
@@ -1138,6 +1308,32 @@ async def chat_stream(
                         yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
                         yield _sse("done", {"model": route["task_id"], "degraded": True})
                         return
+                    if not actions and _looks_like_factual_lookup(last_user):
+                        part_numbers = _extract_part_numbers(last_user)
+                        if part_numbers:
+                            result = await _execute_part_lookup(
+                                db,
+                                part_number=part_numbers[0],
+                                operator=operator,
+                                factory_id=factory_id,
+                                actions=actions,
+                            )
+                            yield _sse("action", actions[-1].model_dump())
+                            reply = _format_material_detail_reply(result)
+                            yield _sse("delta", {"content": reply})
+                            yield _sse("done", {"model": route["task_id"], "degraded": False})
+                            return
+                        yield _sse("delta", {
+                            "content": (
+                                "该问题需要查询系统数据，但模型未执行查库操作。"
+                                "请重新提问或指定具体料号，我将直接从 BOM 数据库检索。"
+                            ),
+                        })
+                        yield _sse("done", {"model": route["task_id"], "degraded": True})
+                        return
+                    if not allow_live_stream:
+                        for text in streamed_content:
+                            yield _sse("delta", {"content": text})
                     yield _sse("done", {"model": route["task_id"], "degraded": False})
                     return
 

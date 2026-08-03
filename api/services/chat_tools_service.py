@@ -148,6 +148,20 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_bom_material_detail",
+            "description": "按精确料号查询 BOM 物料详情。用户给出具体物料编码（如 1000501239）或问'XXX是什么'时必须调用此工具。返回描述、组件类型、分类、使用该料号的产品型号列表。禁止不调用此工具就描述物料属性。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "part_number": {"type": "string", "description": "精确料号/物料编码"},
+                },
+                "required": ["part_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_defects",
             "description": "查询不良品/缺陷记录。返回缺陷单号、类型、严重等级、数量、处置状态、根因分类。",
             "parameters": {
@@ -1001,6 +1015,18 @@ async def _tool_search_bom_materials(
         component_type=args.get("component_type"),
         limit=min(int(args.get("limit", 20)), 100),
     )
+
+
+async def _tool_get_bom_material_detail(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    from api.services.bom_service import BomService, MECH_FACTORY_ID
+
+    part_number = str(args.get("part_number") or "").strip()
+    if not part_number:
+        return {"error": "请提供 part_number（精确料号）"}
+    svc = BomService(db, factory_id=factory_id or MECH_FACTORY_ID)
+    return await svc.get_material_detail(part_number)
 
 
 async def _tool_query_defects(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2078,6 +2104,7 @@ _TOOL_EXECUTORS = {
     "query_inventory": _tool_query_inventory,
     "query_bom_summary": _tool_query_bom_summary,
     "search_bom_materials": _tool_search_bom_materials,
+    "get_bom_material_detail": _tool_get_bom_material_detail,
     "query_defects": _tool_query_defects,
     "query_equipment": _tool_query_equipment,
     "create_work_order": _tool_create_work_order,
@@ -2206,6 +2233,7 @@ TOOL_LABELS = {
     "query_inventory": "查询库存",
     "query_bom_summary": "BOM汇总",
     "search_bom_materials": "BOM物料搜索",
+    "get_bom_material_detail": "BOM料号详情",
     "query_defects": "查询不良品",
     "query_equipment": "查询设备",
     "create_work_order": "创建工单",
@@ -2292,6 +2320,12 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "BOM", "bom", "物料清单", "多少种bom", "多少种BOM", "产品型号",
             "BOM数量", "BOM种类", "BOM概况", "物料清单数量",
+        ],
+    },
+    {
+        "tool": "get_bom_material_detail",
+        "keywords": [
+            "是什么", "料号", "物料编码", "part number", "查物料", "物料详情",
         ],
     },
     {
