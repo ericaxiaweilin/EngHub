@@ -50,11 +50,13 @@ MODEL_STACK_ROUTE_TIMEOUT = float(os.getenv("MODEL_STACK_ROUTE_TIMEOUT", "5"))
 
 SYSTEM_PROMPT = (
     "你是 EngHub MES 制造执行系统的智能助手，可以直接操作系统完成用户的请求。"
-    "你熟悉生产工单、报工、检验、不良品、库存、生产计划(MRP)、"
+    "你熟悉生产工单、报工、检验、不良品、库存、BOM物料清单、生产计划(MRP)、"
     "工位/工艺/设备、员工技能矩阵以及合规仿真引擎(Sim-ERP)等模块。\n"
-    "重要：当用户要求查询数据或执行操作（如查工单、建工单、报工、查库存、查不良品、查设备、下达工单、"
+    "重要：当用户要求查询数据或执行操作（如查工单、建工单、报工、查库存、查BOM、查不良品、查设备、下达工单、"
     "完工/暂停/拆分工单、查工艺路线、查技能矩阵、运行合规仿真、查仿真审计记录等）时，"
     "你必须调用对应的工具(tool)来获取真实数据或完成操作，不要凭空编造数据。"
+    "【BOM vs 库存】BOM物料清单（产品结构/零件种类）用 query_bom_summary / search_bom_materials；"
+    "仓库在库数量用 query_inventory。用户问'多少种BOM/多少种螺丝/零件种类'时必须查 BOM 工具，不要查库存。\n"
     "写操作（创建工单/下达工单/报工/完工等）执行后，请向用户确认操作结果。\n"
     "【工作流优先】当用户请求复合任务（如'帮我复盘今天生产'、'质量异常分诊'、'全面合规检查'、'建一个工单并下达'）时，"
     "优先调用 run_workflow 工具运行预置工作流（生产日度复盘/质量异常分诊/全面合规检查/一键建单下达），"
@@ -744,6 +746,15 @@ _TABLE_COLUMNS: Dict[str, List[Dict[str, str]]] = {
         {"key": "reserved_qty", "label": "预留"},
         {"key": "status", "label": "状态"},
     ],
+    "search_bom_materials": [
+        {"key": "part_number", "label": "料号"},
+        {"key": "description", "label": "描述"},
+        {"key": "product_model", "label": "产品型号"},
+        {"key": "category_l1", "label": "分类"},
+        {"key": "component_type", "label": "组件类型"},
+        {"key": "quantity", "label": "用量"},
+        {"key": "unit", "label": "单位"},
+    ],
     "query_defects": [
         {"key": "record_code", "label": "记录编号"},
         {"key": "defect_type", "label": "不良类型"},
@@ -768,6 +779,7 @@ _TABLE_LIST_KEY: Dict[str, str] = {
     "query_work_orders": "work_orders",
     "query_order_work_order_status": "orders",
     "query_inventory": "inventory",
+    "search_bom_materials": "items",
     "query_defects": "defects",
     "query_equipment": "equipment",
 }
@@ -795,16 +807,25 @@ def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict
     返回 {title, columns: [{key, label}], rows: [{...}]} 或 None（不适用表格的工具）。
     """
     # 指标汇总型 → 转为 指标/数值 两列表格
-    if tool_name == "get_production_summary":
+    if tool_name in ("get_production_summary", "query_bom_summary"):
+        label_map = _SUMMARY_LABELS if tool_name == "get_production_summary" else {
+            "factory_id": "工厂",
+            "product_model_count": "产品型号(BOM)种类数",
+            "total_line_items": "BOM行数",
+            "distinct_part_count": "去重料号总数",
+            "last_synced_at": "最近同步时间",
+            "note": "说明",
+        }
         rows = [
-            {"metric": _SUMMARY_LABELS.get(k, k), "value": v}
+            {"metric": label_map.get(k, k), "value": v}
             for k, v in result.items()
-            if k != "error"
+            if k not in ("error", "available") and v is not None
         ]
         if not rows:
             return None
+        title = "生产概况汇总" if tool_name == "get_production_summary" else "BOM汇总"
         return {
-            "title": "生产概况汇总",
+            "title": title,
             "columns": [{"key": "metric", "label": "指标"}, {"key": "value", "label": "数值"}],
             "rows": rows,
         }

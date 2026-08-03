@@ -109,13 +109,39 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_inventory",
-            "description": "查询库存水平。可按物料编码过滤，返回物料、仓库、总数量、可用数量。",
+            "description": "查询仓库库存水平（WMS 在库数量）。可按物料编码过滤，返回物料、仓库、总数量、可用数量。注意：仅反映已入库库存，不含 BOM 设计态物料。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "material_keyword": {"type": "string", "description": "物料编码或名称关键词，可选"},
                     "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_bom_summary",
+            "description": "查询 BOM（物料清单）汇总统计：产品型号(BOM)种类数、BOM 行数、去重料号总数。用于回答'我们有多少种BOM/多少种产品型号/物料清单概况'。仅机械厂有 EngFlow 同步的 BOM 数据。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_bom_materials",
+            "description": "在 BOM 物料清单中搜索物料并统计种类数。按料号/描述关键词搜索，返回匹配行数及去重料号数(distinct_part_count)。用于回答'有多少种螺丝/紧固件/某类零件'。注意：查 BOM 结构用本工具，查仓库库存用 query_inventory。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键词，如 螺丝、螺絲、M8、轴承"},
+                    "category_l1": {"type": "string", "description": "一级分类过滤，可选"},
+                    "component_type": {"type": "string", "description": "组件类型过滤，如 hardware，可选"},
+                    "model_name": {"type": "string", "description": "限定某产品型号，可选"},
+                    "limit": {"type": "integer", "description": "返回样例条数，默认20", "default": 20},
+                },
+                "required": ["keyword"],
             },
         },
     },
@@ -951,6 +977,30 @@ async def _tool_query_inventory(db: AsyncSession, args: Dict[str, Any], factory_
         for inv in rows
     ]
     return {"count": len(items), "inventory": items}
+
+
+async def _tool_query_bom_summary(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    from api.services.bom_service import BomService, MECH_FACTORY_ID
+
+    svc = BomService(db, factory_id=factory_id or MECH_FACTORY_ID)
+    return await svc.get_summary()
+
+
+async def _tool_search_bom_materials(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    from api.services.bom_service import BomService, MECH_FACTORY_ID
+
+    svc = BomService(db, factory_id=factory_id or MECH_FACTORY_ID)
+    return await svc.search_materials(
+        keyword=str(args.get("keyword") or ""),
+        model_name=args.get("model_name"),
+        category_l1=args.get("category_l1"),
+        component_type=args.get("component_type"),
+        limit=min(int(args.get("limit", 20)), 100),
+    )
 
 
 async def _tool_query_defects(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2026,6 +2076,8 @@ _TOOL_EXECUTORS = {
     "get_work_order_detail": _tool_get_work_order_detail,
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
+    "query_bom_summary": _tool_query_bom_summary,
+    "search_bom_materials": _tool_search_bom_materials,
     "query_defects": _tool_query_defects,
     "query_equipment": _tool_query_equipment,
     "create_work_order": _tool_create_work_order,
@@ -2152,6 +2204,8 @@ TOOL_LABELS = {
     "get_work_order_detail": "工单详情",
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
+    "query_bom_summary": "BOM汇总",
+    "search_bom_materials": "BOM物料搜索",
     "query_defects": "查询不良品",
     "query_equipment": "查询设备",
     "create_work_order": "创建工单",
@@ -2231,6 +2285,20 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "在制工单", "工单列表", "查工单", "查询工单", "工单状态", "工单进度",
             "有哪些工单", "工单情况", "工单汇总", "待下达工单", "生产工单",
+        ],
+    },
+    {
+        "tool": "query_bom_summary",
+        "keywords": [
+            "BOM", "bom", "物料清单", "多少种bom", "多少种BOM", "产品型号",
+            "BOM数量", "BOM种类", "BOM概况", "物料清单数量",
+        ],
+    },
+    {
+        "tool": "search_bom_materials",
+        "keywords": [
+            "螺丝", "螺絲", "螺钉", "螺栓", "紧固件", "BOM物料", "零件种类",
+            "多少种螺丝", "多少种零件", "料号搜索",
         ],
     },
     {

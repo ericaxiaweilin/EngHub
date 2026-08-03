@@ -23,6 +23,7 @@ import TaskCenter from '../pages/collab/TaskCenter'
 // Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
 const SpreadsheetEditor = lazy(() => import('./SpreadsheetEditor'))
 import api from '../services/api'
+import { getActiveFactoryId } from '../utils/factory'
 import { tmsApi } from '../services/tms'
 import { getStoredUser, logout } from '../services/auth'
 
@@ -255,7 +256,7 @@ export default function AIAssistantWidget() {
   const [sheetTable, setSheetTable] = useState<TableData | null>(null)
 
   const user = getStoredUser()
-  const activeFactoryId = () => localStorage.getItem('active_factory_id') || user?.factory_id || 'FAC_ELEC_DEMO_2026'
+  const activeFactoryId = () => getActiveFactoryId(user?.factory_id || 'FAC_MECH_001')
   const [commanderOn, setCommanderOn] = useState(false)
   const [commanderBusy, setCommanderBusy] = useState(false)
 

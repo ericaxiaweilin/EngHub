@@ -14,6 +14,27 @@ logger = logging.getLogger(__name__)
 
 MECH_FACTORY_ID = "FAC_MECH_001"
 
+# 简繁/同义词扩展，便于 BOM 物料搜索（EngFlow 数据多为繁体）
+_KEYWORD_ALIASES: Dict[str, List[str]] = {
+    "螺丝": ["螺丝", "螺絲", "screw", "SCREW"],
+    "螺钉": ["螺钉", "螺絲", "螺丝", "screw"],
+    "螺栓": ["螺栓", "螺絲", "螺丝", "bolt", "BOLT"],
+    "螺母": ["螺母", "螺帽", "nut", "NUT"],
+    "螺帽": ["螺帽", "螺母", "nut"],
+}
+
+
+def _expand_search_keywords(keyword: str) -> List[str]:
+    """将用户关键词扩展为简繁/英文变体列表。"""
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    variants = {kw}
+    for base, aliases in _KEYWORD_ALIASES.items():
+        if base in kw or kw in aliases:
+            variants.update(aliases)
+    return list(variants)
+
 
 class BomService:
     """BOM 查询服务"""
@@ -50,6 +71,48 @@ class BomService:
             }
             for row in rows
         ]
+
+    async def get_summary(self) -> Dict[str, Any]:
+        """BOM 汇总统计：产品型号数、行数、去重料号数。"""
+        if self.factory_id != MECH_FACTORY_ID:
+            return {
+                "factory_id": self.factory_id,
+                "available": False,
+                "note": f"EngFlow BOM 仅对机械厂 {MECH_FACTORY_ID} 开放",
+                "product_model_count": 0,
+                "total_line_items": 0,
+                "distinct_part_count": 0,
+            }
+        base = EngHubBomItem.factory_id == MECH_FACTORY_ID
+        model_count = (
+            await self.db.execute(
+                select(func.count(distinct(EngHubBomItem.product_model))).where(
+                    base, EngHubBomItem.product_model.isnot(None)
+                )
+            )
+        ).scalar() or 0
+        line_count = (
+            await self.db.execute(select(func.count(EngHubBomItem.id)).where(base))
+        ).scalar() or 0
+        part_count = (
+            await self.db.execute(
+                select(func.count(distinct(EngHubBomItem.part_number))).where(
+                    base, EngHubBomItem.part_number.isnot(None)
+                )
+            )
+        ).scalar() or 0
+        last_sync = (
+            await self.db.execute(select(func.max(EngHubBomItem.synced_at)).where(base))
+        ).scalar()
+        return {
+            "factory_id": self.factory_id,
+            "available": True,
+            "product_model_count": model_count,
+            "total_line_items": line_count,
+            "distinct_part_count": part_count,
+            "last_synced_at": last_sync.isoformat() if last_sync else None,
+            "note": "product_model_count=产品型号(BOM)种类数；distinct_part_count=去重料号总数",
+        }
 
     async def get_bom_tree(self, model_name: str, max_level: int = 10) -> Dict[str, Any]:
         """递归展开多级 BOM 树"""
@@ -90,14 +153,17 @@ class BomService:
     ) -> Dict[str, Any]:
         """物料搜索"""
         if self.factory_id != MECH_FACTORY_ID:
-            return {"total": 0, "items": [], "limit": limit, "offset": offset}
-        conditions = [
-            EngHubBomItem.factory_id == MECH_FACTORY_ID,
-            or_(
-                EngHubBomItem.part_number.ilike(f"%{keyword}%"),
-                EngHubBomItem.description.ilike(f"%{keyword}%"),
-            ),
-        ]
+            return {"total": 0, "distinct_part_count": 0, "items": [], "limit": limit, "offset": offset}
+        keywords = _expand_search_keywords(keyword)
+        if not keywords:
+            return {"total": 0, "distinct_part_count": 0, "items": [], "limit": limit, "offset": offset}
+
+        text_conds = []
+        for kw in keywords:
+            text_conds.append(EngHubBomItem.part_number.ilike(f"%{kw}%"))
+            text_conds.append(EngHubBomItem.description.ilike(f"%{kw}%"))
+
+        conditions = [EngHubBomItem.factory_id == MECH_FACTORY_ID, or_(*text_conds)]
         if model_name:
             conditions.append(EngHubBomItem.product_model == model_name)
         if category_l1:
@@ -111,6 +177,11 @@ class BomService:
         )
         total = count_result.scalar() or 0
 
+        distinct_result = await self.db.execute(
+            select(func.count(distinct(EngHubBomItem.part_number))).where(*conditions)
+        )
+        distinct_part_count = distinct_result.scalar() or 0
+
         # 分页查询
         result = await self.db.execute(
             select(EngHubBomItem)
@@ -123,6 +194,9 @@ class BomService:
 
         return {
             "total": total,
+            "distinct_part_count": distinct_part_count,
+            "keyword": keyword,
+            "search_variants": keywords,
             "items": [self._item_to_dict(i) for i in items],
             "limit": limit,
             "offset": offset,
