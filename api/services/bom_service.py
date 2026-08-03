@@ -12,28 +12,38 @@ from database.models import EngHubBomItem
 
 logger = logging.getLogger(__name__)
 
+MECH_FACTORY_ID = "FAC_MECH_001"
+
 
 class BomService:
     """BOM 查询服务"""
 
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, factory_id: Optional[str] = None):
         self.db = db
+        self.factory_id = factory_id or MECH_FACTORY_ID
 
     async def get_models(self) -> List[Dict[str, Any]]:
         """获取所有已同步的产品型号列表（含物料数量统计）"""
+        if self.factory_id != MECH_FACTORY_ID:
+            return []
         result = await self.db.execute(
             select(
                 EngHubBomItem.product_model,
                 func.count(EngHubBomItem.id).label("item_count"),
                 func.max(EngHubBomItem.synced_at).label("last_synced"),
             )
-            .where(EngHubBomItem.product_model.isnot(None))
+            .where(
+                EngHubBomItem.product_model.isnot(None),
+                EngHubBomItem.factory_id == MECH_FACTORY_ID,
+            )
             .group_by(EngHubBomItem.product_model)
             .order_by(func.count(EngHubBomItem.id).desc())
         )
         rows = result.all()
         return [
             {
+                "id": row.product_model,
+                "name": row.product_model,
                 "model_name": row.product_model,
                 "item_count": row.item_count,
                 "last_synced": row.last_synced.isoformat() if row.last_synced else None,
@@ -43,9 +53,14 @@ class BomService:
 
     async def get_bom_tree(self, model_name: str, max_level: int = 10) -> Dict[str, Any]:
         """递归展开多级 BOM 树"""
+        if self.factory_id != MECH_FACTORY_ID:
+            return {"model_name": model_name, "tree": [], "total_items": 0}
         result = await self.db.execute(
             select(EngHubBomItem)
-            .where(EngHubBomItem.product_model == model_name)
+            .where(
+                EngHubBomItem.product_model == model_name,
+                EngHubBomItem.factory_id == MECH_FACTORY_ID,
+            )
             .order_by(EngHubBomItem.level, EngHubBomItem.part_number)
         )
         items = result.scalars().all()
@@ -74,11 +89,14 @@ class BomService:
         offset: int = 0,
     ) -> Dict[str, Any]:
         """物料搜索"""
+        if self.factory_id != MECH_FACTORY_ID:
+            return {"total": 0, "items": [], "limit": limit, "offset": offset}
         conditions = [
+            EngHubBomItem.factory_id == MECH_FACTORY_ID,
             or_(
                 EngHubBomItem.part_number.ilike(f"%{keyword}%"),
                 EngHubBomItem.description.ilike(f"%{keyword}%"),
-            )
+            ),
         ]
         if model_name:
             conditions.append(EngHubBomItem.product_model == model_name)
@@ -112,9 +130,14 @@ class BomService:
 
     async def get_material_detail(self, part_number: str) -> Dict[str, Any]:
         """物料详情（含使用该物料的所有产品）"""
+        if self.factory_id != MECH_FACTORY_ID:
+            return {"part_number": part_number, "found": False, "usages": []}
         result = await self.db.execute(
             select(EngHubBomItem)
-            .where(EngHubBomItem.part_number == part_number)
+            .where(
+                EngHubBomItem.part_number == part_number,
+                EngHubBomItem.factory_id == MECH_FACTORY_ID,
+            )
             .order_by(EngHubBomItem.product_model)
         )
         items = result.scalars().all()
@@ -154,15 +177,23 @@ class BomService:
         if not wo:
             return {"work_order_id": work_order_id, "found": False, "bom_items": []}
 
+        if wo.factory_id != MECH_FACTORY_ID:
+            return {
+                "work_order_id": work_order_id,
+                "found": False,
+                "bom_items": [],
+                "note": "EngFlow BOM 仅对机械厂开放",
+            }
+
         product_id = wo.product_id
-        # 用 product_id 匹配 BOM（可能是 model_name 或 product_sap_code）
         bom_result = await self.db.execute(
             select(EngHubBomItem)
             .where(
+                EngHubBomItem.factory_id == MECH_FACTORY_ID,
                 or_(
                     EngHubBomItem.product_model == product_id,
                     EngHubBomItem.part_number == product_id,
-                )
+                ),
             )
             .order_by(EngHubBomItem.level)
         )
@@ -193,9 +224,11 @@ class BomService:
             return {"error": "Invalid date format. Use ISO format: YYYY-MM-DD"}
 
         # 获取两个时间点存在的物料
+        factory_clause = EngHubBomItem.factory_id == MECH_FACTORY_ID
         result_a = await self.db.execute(
             select(EngHubBomItem.part_number, EngHubBomItem.quantity, EngHubBomItem.unit_price)
             .where(
+                factory_clause,
                 EngHubBomItem.product_model == model_name,
                 EngHubBomItem.synced_at <= da,
             )
@@ -205,6 +238,7 @@ class BomService:
         result_b = await self.db.execute(
             select(EngHubBomItem.part_number, EngHubBomItem.quantity, EngHubBomItem.unit_price)
             .where(
+                factory_clause,
                 EngHubBomItem.product_model == model_name,
                 EngHubBomItem.synced_at <= db_date,
             )

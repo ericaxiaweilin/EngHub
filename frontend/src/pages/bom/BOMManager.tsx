@@ -7,8 +7,9 @@ import {
   SearchOutlined, } from '@ant-design/icons';
 import BOMTree from './BOMTree';
 import api from '../../services/api';
+import { getActiveFactoryId } from '../../utils/factory';
 
-const FACTORY = 'factory-sh-01';
+const FACTORY = getActiveFactoryId();
 
 interface BOMModel {
   id: string;
@@ -74,7 +75,9 @@ const BOMManager: React.FC = () => {
   const triggerSync = async (type: string) => {
     setSyncLoading(true);
     try {
-      await api.post('/api/v1/bom/sync', { sync_type: type });
+      await api.post('/api/v1/bom/sync', null, {
+        params: { sync_type: type, factory_id: FACTORY },
+      });
       message.success(`${type === 'full' ? '全量' : '增量'}同步已触发`);
       loadModels();
       if (selectedModel) {

@@ -4,6 +4,9 @@ import {
 } from 'antd';
 import { SearchOutlined } from '@ant-design/icons';
 import api from '../../services/api';
+import { getActiveFactoryId } from '../../utils/factory';
+
+const FACTORY = getActiveFactoryId();
 
 interface MaterialItem {
   part_number: string;
@@ -31,7 +34,7 @@ const MaterialSearch: React.FC = () => {
 
   const loadModels = async () => {
     try {
-      const res = await api.get('/api/v1/bom/models');
+      const res = await api.get('/api/v1/bom/models', { params: { factory_id: FACTORY } });
       setModelOptions(res.data || []);
     } catch (error) {
       console.error('Load models failed:', error);
@@ -48,9 +51,10 @@ const MaterialSearch: React.FC = () => {
       const res = await api.get('/api/v1/bom/search', {
         params: {
           q: searchParams.q,
-          model: searchParams.model || undefined,
+          model_name: searchParams.model || undefined,
           category_l1: searchParams.category || undefined,
           component_type: searchParams.type || undefined,
+          factory_id: FACTORY,
         },
       });
       setResults(res.data?.items || res.data || []);

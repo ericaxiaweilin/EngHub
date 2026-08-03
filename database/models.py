@@ -1822,8 +1822,9 @@ class EngHubBomItem(Base):
     """EngHub 本地 BOM 缓存（从 EngFlow bom_items 同步）"""
     __tablename__ = "enghub_bom_items"
 
-    id = Column(Integer, primary_key=True, index=True)
-    source_row_id = Column(BigInteger, unique=True, index=True)  # 对应 bom_items.row_id
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    factory_id = Column(String(50), index=True)  # EngFlow BOM 仅同步至机械厂
+    source_row_id = Column(BigInteger, index=True)  # 对应 EngFlow bom_items.row_id
     product_model = Column(String(100), index=True)              # model_name
     part_number = Column(String(100), index=True)
     description = Column(Text)
@@ -1844,6 +1845,7 @@ class EngHubBomItem(Base):
 
     __table_args__ = (
         Index("idx_enghub_bom_model_part", "product_model", "part_number"),
+        Index("idx_enghub_bom_factory_model_part", "factory_id", "product_model", "part_number"),
     )
 
 
@@ -2229,6 +2231,8 @@ class EngHubBomSyncLog(Base):
     __tablename__ = "enghub_bom_sync_log"
 
     id = Column(Integer, primary_key=True, index=True)
+    factory_id = Column(String(50))
+    source_company_id = Column(String(50))
     sync_type = Column(String(20))       # full / incremental
     status = Column(String(20))          # running / success / failed
     records_synced = Column(Integer, default=0)
