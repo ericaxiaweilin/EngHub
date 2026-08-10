@@ -71,6 +71,12 @@ SYSTEM_PROMPT = (
     "【流程知识库】系统内置了完整的流程知识：工单全生命周期（8阶段：创建→下达→派工→执行→报工→质检→完工→入库）、"
     "6大职位标准作业流程(操作员/品检员/设备工程师/PMC计划员/生产主管/仓管员)、各环节RACI责任矩阵。"
     "用户问流程/职责/该找谁类问题时，调用 query_process_knowledge 工具获取标准答案。\n"
+    "【PMC工作矩阵】用户提到 PMC 矩阵、预排程沙盘、时间锤/物料锤/生产锤/出货锤/紧急锤、UHN、可加工时间或库存齐套时，"
+    "有主工单号时必须调用 query_pmc_work_matrix；没有主工单号但只问物料齐套/供应证据时调用 query_pmc_material_supply。该工具只读取真实工单/BOM/库存/工位/APS，沙盘开关只改变本次计算，不修改工单；"
+    "输出必须区分真实数据、假设、判断结论、风险和下一步交付物。UHN 未定义时不得猜测。\n"
+    "【PMC供应证据】用户问库存、在途、PO编号、供应商ETA、物料LT、180天呆滞料能否被BOM/新订单复用时，"
+    "必须调用 query_pmc_material_supply 或 query_stagnant，把 inventory、inventory_transactions、bom_items、purchase_orders 关联后回答；"
+    "没有PO表或没有BOM关联时必须明确显示数据缺失，不得把普通库存查询冒充为完整供应结论。\n"
     "【任务中心】工业场景很多任务无法一次完成（等物料/等审批/等设备恢复/等供应商）。"
     "当用户交代的事情当前无法闭环、或用户说'跟进一下''盯着这个''挂起来''到时候提醒我'时，"
     "调用 create_followup_task 把任务挂入任务中心，系统会按频率（默认2小时，用户可指定）定期自动跟进并推送通知；"
@@ -126,6 +132,7 @@ class ChatResponse(BaseModel):
     model: str
     degraded: bool = False
     actions: List[ToolAction] = Field(default_factory=list)
+    diagrams: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 @router.get("/health")
@@ -370,6 +377,75 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 在制虚拟主工单：{result.get('active_virtual_orders', 0)} 个\n"
             f"- 虚拟报工记录：{result.get('virtual_report_count', 0)} 条"
         )
+    if tool_name == "query_workflow_diagram":
+        if result.get("error"):
+            return f"流程引擎暂时无法生成图：{result['error']}\n{result.get('hint', '')}"
+        diagram = result.get("diagram") or {}
+        nodes = diagram.get("nodes") or []
+        meta = diagram.get("meta") or {}
+        is_business = diagram.get("flow_type") == "business_workflow"
+        return (
+            f"已生成「{diagram.get('title', result.get('title', '详细流程图'))}」。\n"
+            f"- 流程引擎步骤：{meta.get('step_count', meta.get('approval_node_count', len(nodes)))} 个，连线：{len(diagram.get('edges') or [])} 条\n"
+            f"- {'点击任一步可查看输入、判断标准、输出、交付物、下一步与异常回流' if is_business else '图中保留审批角色、会签/或签、审批条件和异常路径'}\n"
+            f"- {diagram.get('engine_note', '节点与连线均来自流程引擎定义。')}"
+        )
+    if tool_name == "query_pmc_work_matrix":
+        if result.get("error"):
+            return f"PMC 工作矩阵暂时无法生成：{result['error']}\n{result.get('hint', '')}"
+        judgement = result.get("judgement") or {}
+        focus = result.get("next_focus") or []
+        computed = result.get("computed") or {}
+        risks = result.get("risk_flags") or []
+        calendar = result.get("calendar") or {}
+        return (
+            f"已生成「{result.get('title', 'PMC 工作矩阵')}」。\n"
+            f"- 总体判定：{judgement.get('overall', 'needs_evidence')}\n"
+            f"- 工作日历：{calendar.get('code', '未配置')}（{calendar.get('holiday_count', 0)} 个日期，状态：{calendar.get('status', 'unknown')}）\n"
+            f"- 预计 FG Ready：{computed.get('fg_ready_at', '未知')}；预计 ETA：{computed.get('estimated_eta', '未知')}\n"
+            f"- 当前重点：{'；'.join(str(item) for item in focus)}\n"
+            f"- 风险/假设：{'；'.join(str(item) for item in risks) if risks else '暂无额外风险'}\n"
+            f"- 交付物：{'；'.join(str(item) for item in result.get('deliverables') or [])}"
+        )
+    if tool_name in {"query_pmc_material_supply", "query_stagnant"}:
+        items = result.get("items") or []
+        if not items:
+            return f"{label}查询完成：当前没有符合条件的记录（阈值 {result.get('threshold_days', 180)} 天）。"
+        lines = [
+            f"{label}查询完成：{len(items)} 种物料；呆滞阈值 {result.get('threshold_days', 180)} 天。",
+            f"采购订单数据：{result.get('purchase_order_data_status', 'unknown')}。",
+        ]
+        for item in items[:20]:
+            candidates = item.get("bom_reuse_candidates") or []
+            candidate_names = [
+                c.get("product_code") or c.get("product_name")
+                for c in candidates
+                if c.get("can_consume", True)
+            ]
+            po_codes = item.get("po_codes") or []
+            lines.append(
+                f"- {item.get('material_code')}: 可用{item.get('available_qty', item.get('qty', 0))}，"
+                f"库龄{item.get('aging_days', item.get('stagnant_days', '?'))}天，"
+                f"LT {item.get('supplier_lead_days', '?')}天，在途{item.get('in_transit_qty', 0)}，PO {','.join(map(str, po_codes)) or '无'}，"
+                f"BOM可复用: {','.join(map(str, candidate_names[:5])) or '无关联'}"
+            )
+        if len(items) > 20:
+            lines.append(f"- 其余 {len(items) - 20} 种物料已保留在结构化结果中。")
+        return "\n".join(lines)
+    if tool_name == "query_pmc_rush_impact":
+        rush = result.get("rush_order") or {}
+        impact = result.get("impact") or {}
+        lines = [
+            "PMC插单影响沙盘完成（只读）：",
+            f"- 急单：{rush.get('product_id') or '未指定产品'} × {rush.get('quantity', 0)}，预计加工 {rush.get('process_hours', 0)} 小时，产能占用 {rush.get('capacity_share', 0.5) * 100:g}%",
+            f"- 受影响订单：{impact.get('affected_order_count', 0)} 张；按当前模型每张延迟约 {impact.get('impact_hours_per_order', 0)} 小时",
+        ]
+        for item in (impact.get("delayed_orders") or [])[:20]:
+            lines.append(
+                f"- {item.get('work_order_code')}: 原交期 {item.get('original_due')} → 新预计 {item.get('new_estimated_end')}，延迟 {item.get('delay_days')} 天"
+            )
+        lines.append(result.get("note", ""))
+        return "\n".join(line for line in lines if line)
     return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
 
 
@@ -669,6 +745,7 @@ async def chat(
                 model="deterministic-tool-router",
                 degraded=False,
                 actions=actions,
+                diagrams=_collect_diagrams(actions),
             )
 
     # ---- 多智能体并行编排：识别复合意图 → 多Agent并行执行 ----
@@ -681,7 +758,7 @@ async def chat(
                 # 工厂指挥官模式
                 from api.services.factory_commander import FactoryCommander
                 commander = FactoryCommander(db)
-                report = await commander.run_cycle(factory_id, auto_execute=True)
+                report = await commander.run_cycle(factory_id, auto_execute=True, created_by=operator)
                 reply = report.to_chatbot_reply()
                 actions.append(ToolAction(
                     tool="factory_commander:cycle",
@@ -804,6 +881,7 @@ async def chat(
                     model=route["task_id"],
                     degraded=False,
                     actions=actions,
+                    diagrams=_collect_diagrams(actions),
                 )
 
             # 有工具调用 → 逐个执行，把 assistant 消息和 tool 结果追加到上下文
@@ -899,6 +977,36 @@ _TABLE_COLUMNS: Dict[str, List[Dict[str, str]]] = {
         {"key": "reserved_qty", "label": "预留"},
         {"key": "status", "label": "状态"},
     ],
+    "query_pmc_material_supply": [
+        {"key": "material_code", "label": "物料编码"},
+        {"key": "material_name", "label": "物料名称"},
+        {"key": "available_qty", "label": "可用库存"},
+        {"key": "reserved_qty", "label": "预留"},
+        {"key": "in_transit_qty", "label": "在途"},
+        {"key": "on_order_qty", "label": "未收货PO"},
+        {"key": "supplier_lead_days", "label": "供应商LT(天)"},
+        {"key": "aging_days", "label": "库龄(天)"},
+        {"key": "dead_stock", "label": "180天呆滞"},
+        {"key": "po_codes", "label": "PO编号"},
+        {"key": "bom_reuse_candidates", "label": "BOM可复用产品"},
+    ],
+    "query_stagnant": [
+        {"key": "material_code", "label": "物料编码"},
+        {"key": "qty", "label": "可用库存"},
+        {"key": "stagnant_days", "label": "呆滞天数"},
+        {"key": "supplier_lead_days", "label": "供应商LT(天)"},
+        {"key": "in_transit_qty", "label": "在途"},
+        {"key": "po_codes", "label": "PO编号"},
+        {"key": "bom_reuse_candidates", "label": "BOM可复用产品"},
+    ],
+    "query_pmc_rush_impact": [
+        {"key": "work_order_code", "label": "受影响工单"},
+        {"key": "product_id", "label": "产品"},
+        {"key": "original_due", "label": "原交期"},
+        {"key": "new_estimated_end", "label": "新预计完工"},
+        {"key": "delay_hours", "label": "延迟小时"},
+        {"key": "delay_days", "label": "延迟天数"},
+    ],
     "query_defects": [
         {"key": "record_code", "label": "记录编号"},
         {"key": "defect_type", "label": "不良类型"},
@@ -923,6 +1031,9 @@ _TABLE_LIST_KEY: Dict[str, str] = {
     "query_work_orders": "work_orders",
     "query_order_work_order_status": "orders",
     "query_inventory": "inventory",
+    "query_pmc_material_supply": "items",
+    "query_stagnant": "items",
+    "query_pmc_rush_impact": "delayed_orders",
     "query_defects": "defects",
     "query_equipment": "equipment",
 }
@@ -987,6 +1098,32 @@ def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict
             "rows": rows,
         }
 
+    if tool_name == "query_pmc_work_matrix":
+        rows = result.get("matrix_rows")
+        columns = result.get("matrix_columns")
+        if not isinstance(rows, list) or not rows or not isinstance(columns, list):
+            return None
+        return {
+            "type": "pmc_work_matrix",
+            "title": result.get("title", "PMC 工作矩阵"),
+            "columns": columns,
+            "rows": rows,
+            "work_order_code": (result.get("work_order") or {}).get("code"),
+            "pmc_options": result.get("options") or {},
+            "pmc_option_schema": result.get("option_schema") or [],
+            "pmc_result": result,
+        }
+
+    if tool_name == "query_pmc_rush_impact":
+        rows = (result.get("impact") or {}).get("delayed_orders") or []
+        if not rows:
+            return None
+        return {
+            "title": "PMC插单影响明细",
+            "columns": _TABLE_COLUMNS["query_pmc_rush_impact"],
+            "rows": rows,
+        }
+
     # 列表型查询工具
     list_key = _TABLE_LIST_KEY.get(tool_name)
     columns = _TABLE_COLUMNS.get(tool_name)
@@ -1003,6 +1140,32 @@ def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict
         "columns": columns,
         "rows": items,
     }
+
+
+def _extract_diagram_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract a deterministic flow diagram payload for the chatbot UI."""
+    if tool_name != "query_workflow_diagram":
+        return None
+    diagram = result.get("diagram")
+    if not isinstance(diagram, dict) or not diagram.get("nodes"):
+        return None
+    return diagram
+
+
+def _collect_diagrams(actions: List[ToolAction]) -> List[Dict[str, Any]]:
+    """Collect unique diagrams from executed tool actions for non-stream responses."""
+    diagrams: List[Dict[str, Any]] = []
+    seen_titles = set()
+    for action in actions:
+        diagram = _extract_diagram_data(action.tool, action.result)
+        if not diagram:
+            continue
+        key = (diagram.get("title"), diagram.get("version"))
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        diagrams.append(diagram)
+    return diagrams
 
 
 def _extract_knowledge_table(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1210,6 +1373,9 @@ async def chat_stream(
                 table_data = _extract_table_data(tool_name, result)
                 if table_data:
                     yield _sse("table", table_data)
+                diagram_data = _extract_diagram_data(tool_name, result)
+                if diagram_data:
+                    yield _sse("diagram", diagram_data)
                 yield _sse("delta", {"content": _direct_tool_reply(tool_name, result)})
                 yield _sse("done", {"model": "deterministic-tool-router", "degraded": False})
                 return
@@ -1327,6 +1493,9 @@ async def chat_stream(
                     table_data = _extract_table_data(tool_name, result)
                     if table_data:
                         yield _sse("table", table_data)
+                    diagram_data = _extract_diagram_data(tool_name, result)
+                    if diagram_data:
+                        yield _sse("diagram", diagram_data)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),

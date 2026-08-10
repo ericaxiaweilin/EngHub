@@ -23,6 +23,7 @@ import ProductionData from './pages/ProductionData'
 import PlanList from './pages/pp/PlanList'
 import SchedulingCenter from './pages/pp/SchedulingCenter'
 import OrderManagement from './pages/pp/OrderManagement'
+import PmcWorkbench from './pages/pp/PmcWorkbench'
 import QualityCenter from './pages/qms/QualityCenter'
 import QualityGoals from './pages/qms/QualityGoals'
 import InspectionTerminal from './pages/qms/InspectionTerminal'
@@ -40,6 +41,7 @@ import ReportCenter from './pages/mes/ReportCenter'
 import BaseData from './pages/basedata/BaseData'
 import SkillMatrix from './pages/hr/SkillMatrix'
 import HrRoster from './pages/hr/HrRoster'
+import PositionTrainer from './pages/position/PositionTrainer'
 import WarehouseList from './pages/wms/WarehouseList'
 import Login from './pages/auth/Login'
 import ModuleSelector from './pages/ModuleSelector'
@@ -245,6 +247,7 @@ const App: React.FC = () => {
             <Route path="stock-alerts" element={<PermissionGate path="/stock-alerts"><StockAlerts /></PermissionGate>} />
             <Route path="plans" element={<PermissionGate path="/plans"><PlanList /></PermissionGate>} />
             <Route path="scheduling" element={<PermissionGate path="/scheduling"><SchedulingCenter /></PermissionGate>} />
+            <Route path="pmc" element={<PermissionGate path="/pmc"><PmcWorkbench /></PermissionGate>} />
             <Route path="orders" element={<PermissionGate path="/orders"><OrderManagement /></PermissionGate>} />
             <Route path="base-data" element={<PermissionGate path="/base-data"><BaseData /></PermissionGate>} />
             <Route path="plant-floor" element={<PermissionGate path="/plant-floor"><PlantFloor /></PermissionGate>} />
@@ -257,6 +260,7 @@ const App: React.FC = () => {
             <Route path="equipment-center" element={<PermissionGate path="/equipment-center"><EquipmentCenter /></PermissionGate>} />
             <Route path="skill-matrix" element={<PermissionGate path="/skill-matrix"><SkillMatrix /></PermissionGate>} />
             <Route path="hr-roster" element={<PermissionGate path="/hr-roster"><HrRoster /></PermissionGate>} />
+            <Route path="position-trainer" element={<PermissionGate path="/position-trainer"><PositionTrainer /></PermissionGate>} />
             {/* 仿真引擎：车间负荷 / 人因合规 / 审计记录 统一模块 */}
             <Route path="simulation" element={<PermissionGate path="/simulation"><SimulationEngine /></PermissionGate>} />
             <Route path="sim-erp/factory" element={<Navigate to="/simulation?tab=factory" replace />} />

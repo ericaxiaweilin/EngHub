@@ -16,7 +16,7 @@ import io
 import json
 import re
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,6 +116,39 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "material_keyword": {"type": "string", "description": "物料编码或名称关键词，可选"},
                     "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_pmc_material_supply",
+            "description": "PMC供应证据查询：把库存、库存最后流动/账龄、BOM可复用产品、未收货PO、在途数量、PO编号、供应商和ETA关联起来。用于回答‘库存多少、在途多少、PO编号多少、哪些180天呆滞料还能被BOM使用、物料LT/ETA’等问题；只返回真实数据，缺少采购表时明确标记。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "material_keyword": {"type": "string", "description": "物料编码或名称关键词，可选"},
+                    "days": {"type": "integer", "description": "呆滞阈值，默认180天", "default": 180},
+                    "only_stagnant": {"type": "boolean", "description": "只返回超过阈值的呆滞料，可选", "default": False},
+                    "limit": {"type": "integer", "description": "返回条数，默认50", "default": 50},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_pmc_rush_impact",
+            "description": "PMC插单影响沙盘：根据现有待排主工单和插单数量，返回VIP/急单预计加工时间、受影响订单、原交期、新预计完工时间和延迟小时。只读不落库。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {"type": "string", "description": "急单产品编码"},
+                    "quantity": {"type": "integer", "description": "急单数量"},
+                    "due_date": {"type": "string", "description": "急单交期，ISO日期，可选"},
+                    "capacity_share": {"type": "number", "description": "急单占用产能比例，默认0.5", "default": 0.5},
+                },
+                "required": ["quantity"],
             },
         },
     },
@@ -503,6 +536,57 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_workflow_diagram",
+            "description": "从统一流程引擎生成交互式工作流图。岗位/SOP流程按 position 或 workflow_key 查询，审批实例按 flow_id/flow_code 查询；节点统一返回输入、判断标准、输出、交付物、下一步和异常分支。不得把岗位流程替换成无关的最近审批实例。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flow_id": {"type": "string", "description": "流程实例ID，可选"},
+                    "flow_code": {"type": "string", "description": "流程编码，可选，如 FLOW-20260810-ABC123"},
+                    "task_type": {"type": "string", "description": "按关联任务类型筛选，可选"},
+                    "position": {"type": "string", "description": "岗位名称或别名，如 PMC、品检员、操作员、生产主管"},
+                    "workflow_key": {"type": "string", "description": "业务工作流注册键，如 position:pmc_planner"},
+                    "current_step": {"type": "integer", "minimum": 1, "description": "希望重点查看的当前步骤，按1开始"},
+                    "engine_type": {"type": "string", "enum": ["auto", "business", "approval"], "description": "流程来源；岗位流程用business，审批实例用approval，默认auto"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_pmc_work_matrix",
+            "description": "查询指定主工单的 PMC 工作矩阵，并可用时间锤、物料锤、生产锤、出货锤、紧急锤做不落库的预排程沙盘重算。返回需求量、RDD、UHN、可加工时间、库存齐套、产能判定、ETA、风险和下一步重点；所有真实数据缺失会明确标记。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "work_order_code": {"type": "string", "description": "主工单号，如 WO-ABC-001"},
+                    "options": {
+                        "type": "object",
+                        "description": "可选沙盘开关：skip_vietnam_holidays、shift_mode、iqc_mode、substitute_material_available、yield_rate、line_occupancy、container_hours、customs_mode、enable_air_freight、accept_subcontracting。",
+                        "properties": {
+                            "skip_vietnam_holidays": {"type": "boolean"},
+                            "shift_mode": {"type": "string", "enum": ["single", "double"]},
+                            "iqc_mode": {"type": "string", "enum": ["exempt", "sampling", "full"]},
+                            "dead_stock_days": {"type": "integer", "minimum": 0, "description": "呆滞阈值，默认180天"},
+                            "material_eta_delay_days": {"type": "number", "minimum": 0, "description": "模拟物料ETA延迟天数"},
+                            "substitute_material_available": {"type": "boolean"},
+                            "yield_rate": {"type": "number", "minimum": 0.5, "maximum": 1.0},
+                            "line_occupancy": {"type": "string", "enum": ["exclusive", "shared_50"]},
+                            "container_hours": {"type": "number", "minimum": 0},
+                            "customs_mode": {"type": "string", "enum": ["none", "random"]},
+                            "enable_air_freight": {"type": "boolean"},
+                            "accept_subcontracting": {"type": "boolean"},
+                        },
+                    },
+                },
+                "required": ["work_order_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_process_knowledge",
             "description": "查询流程知识库：工单全生命周期流程（8阶段）、职位标准作业流程(SOP)、各环节责任归属(RACI)。"
                            "用于'工单流程''品检员做什么''该找谁''SOP'类请求。",
@@ -593,11 +677,11 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_stagnant",
-            "description": "查询呆滞物料：超过N天无库存流动的物料。返回物料、仓库、数量、最后流动日期、呆滞天数。用于'呆滞''滞料''长期不动'类请求。",
+            "description": "查询呆滞物料：默认超过180天无库存流动的物料，并关联BOM可复用产品、未收货PO和在途数量。用于'呆滞''滞料''库龄''长期不动'类请求。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "days": {"type": "integer", "description": "呆滞天数阈值（默认30天无流动）", "default": 30},
+                    "days": {"type": "integer", "description": "呆滞天数阈值（默认180天无流动）", "default": 180},
                 },
             },
         },
@@ -1916,35 +2000,130 @@ async def _tool_query_shortage_alerts(db: AsyncSession, args: Dict[str, Any], fa
 
 
 async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """呆滞物料：超过 N 天无库存流动"""
-    from sqlalchemy import text as sa_text
+    """呆滞物料：与 PMC 供应快照共用账龄、BOM和PO口径。"""
+    from api.services.pmc_work_matrix_service import PmcWorkMatrixService
+
     fid = factory_id or "FAC_ELEC_DEMO_2026"
-    days = int(args.get("days", 30))
+    days = int(args.get("days", 180))
+    supply = await PmcWorkMatrixService(db).query_material_supply(
+        fid,
+        material_keyword=args.get("material_keyword"),
+        days_threshold=days,
+        limit=min(int(args.get("limit", 50)), 200),
+        only_stagnant=True,
+    )
+    # Preserve the existing chatbot response keys while exposing the richer PMC evidence.
+    items = []
+    for item in supply.get("items", []):
+        items.append({
+            **item,
+            "qty": item.get("available_qty", 0),
+            "last_movement": item.get("last_movement_at"),
+            "stagnant_days": item.get("aging_days"),
+            "bom_reuse_candidates": item.get("bom_reuse_candidates", []),
+            "po_codes": item.get("po_codes", []),
+            "in_transit_qty": item.get("in_transit_qty", 0),
+        })
+    return {
+        "factory_id": fid,
+        "threshold_days": days,
+        "stagnant_count": len(items),
+        "items": items,
+        "purchase_order_data_status": supply.get("purchase_order_data_status"),
+        "note": supply.get("note"),
+    }
 
-    rows = (await db.execute(sa_text("""
-        SELECT i.material_code, i.total_qty,
-               i.updated_at, i.created_at,
-               w.warehouse_name,
-               COALESCE(EXTRACT(DAY FROM now() - i.updated_at), 0) as stagnant_days
-        FROM inventory i
-        LEFT JOIN warehouses w ON w.id = i.warehouse_id
-        WHERE i.factory_id = :fid AND i.total_qty > 0
-          AND i.updated_at < now() - (:days || ' days')::interval
-        ORDER BY stagnant_days DESC
-        LIMIT 30
-    """), {"fid": fid, "days": str(days)})).fetchall()
 
-    items = [
-        {
-            "material_code": r[0], "material_name": r[0],
-            "qty": r[1],
-            "last_movement": str(r[2])[:10] if r[2] else str(r[3])[:10],
-            "warehouse": r[4],
-            "stagnant_days": int(r[5]),
-        }
-        for r in rows
-    ]
-    return {"factory_id": fid, "threshold_days": days, "stagnant_count": len(items), "items": items}
+async def _tool_query_pmc_material_supply(
+    db: AsyncSession,
+    args: Dict[str, Any],
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """PMC material supply evidence for direct chatbot questions."""
+    from api.services.pmc_work_matrix_service import PmcWorkMatrixService
+
+    return await PmcWorkMatrixService(db).query_material_supply(
+        factory_id or "FAC_ELEC_DEMO_2026",
+        material_keyword=args.get("material_keyword"),
+        days_threshold=int(args.get("days", 180)),
+        limit=min(int(args.get("limit", 50)), 200),
+        only_stagnant=bool(args.get("only_stagnant", False)),
+    )
+
+
+async def _tool_query_pmc_rush_impact(
+    db: AsyncSession,
+    args: Dict[str, Any],
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read-only rush-order impact calculation for the PMC chatbot."""
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+    quantity = int(args.get("quantity") or 0)
+    if quantity <= 0:
+        return {"error": "缺少急单数量，无法计算插单影响"}
+    try:
+        capacity_share = float(args.get("capacity_share", 0.5))
+    except (TypeError, ValueError):
+        capacity_share = 0.5
+    capacity_share = max(0.01, min(1.0, capacity_share))
+
+    efficiency = 0.85
+    hours_per_unit = 0.5 / efficiency
+    rush_hours = quantity * hours_per_unit
+    # This uses the same conservative one-bottleneck approximation as the APS rush endpoint.
+    impact_hours = rush_hours
+
+    stmt = select(WorkOrder).where(
+        WorkOrder.factory_id == fid,
+        WorkOrder.status.in_(["released", "pending"]),
+        WorkOrder.wo_type == "master",
+    ).order_by(WorkOrder.planned_due.asc())
+    existing_result = await db.execute(stmt)
+    existing_orders = list(existing_result.scalars().all())
+
+    delayed_orders: List[Dict[str, Any]] = []
+    for work_order in existing_orders:
+        if not work_order.planned_due:
+            continue
+        original_due = work_order.planned_due
+        new_end = original_due + timedelta(hours=impact_hours)
+        delayed_orders.append({
+            "work_order_code": work_order.work_order_code,
+            "product_id": work_order.product_id,
+            "planned_qty": work_order.planned_qty,
+            "original_due": original_due.isoformat(),
+            "new_estimated_end": new_end.isoformat(),
+            "delay_hours": round(impact_hours, 1),
+            "delay_days": round(impact_hours / 24, 1),
+            "priority": work_order.priority,
+        })
+
+    rush_end = datetime.utcnow() + timedelta(hours=rush_hours)
+    due_date = None
+    if args.get("due_date"):
+        try:
+            due_date = date.fromisoformat(str(args["due_date"])[:10])
+        except ValueError:
+            due_date = None
+    return {
+        "type": "pmc_rush_impact",
+        "factory_id": fid,
+        "rush_order": {
+            "product_id": args.get("product_id"),
+            "quantity": quantity,
+            "capacity_share": capacity_share,
+            "process_hours": round(rush_hours, 1),
+            "estimated_end": rush_end.isoformat(),
+            "due_date": due_date.isoformat() if due_date else None,
+            "due_feasible": rush_end.date() <= due_date if due_date else None,
+        },
+        "impact": {
+            "affected_order_count": len(delayed_orders),
+            "impact_hours_per_order": round(impact_hours, 1),
+            "delayed_orders": delayed_orders,
+        },
+        "note": "插单影响为只读沙盘估算，未修改APS排程；正式承诺前仍需执行APS重排并确认物料齐套。",
+    }
 
 
 async def _tool_query_spc_anomalies(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2086,6 +2265,8 @@ _TOOL_EXECUTORS = {
     "get_work_order_detail": _tool_get_work_order_detail,
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
+    "query_pmc_material_supply": _tool_query_pmc_material_supply,
+    "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
     "query_defects": _tool_query_defects,
     "query_equipment": _tool_query_equipment,
     "create_work_order": _tool_create_work_order,
@@ -2109,6 +2290,8 @@ _TOOL_EXECUTORS = {
     "acknowledge_alert": _tool_acknowledge_alert,
     "run_alert_patrol": _tool_run_alert_patrol,
     "query_hr_roster": _tool_query_hr_roster,
+    "query_workflow_diagram": None,  # 流程引擎定义查询，见下方执行器
+    "query_pmc_work_matrix": None,  # PMC 工单证据矩阵，见下方执行器
     "query_process_knowledge": None,  # 占位，下方单独定义（不依赖数据库）
     # 5M1E 预警数据工具
     "query_downtime": _tool_query_downtime,
@@ -2161,6 +2344,79 @@ async def _tool_query_process_knowledge(db: AsyncSession, args: Dict[str, Any], 
 
 
 _TOOL_EXECUTORS["query_process_knowledge"] = _tool_query_process_knowledge
+
+
+async def _tool_query_workflow_diagram(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """按选择器查询业务工作流或审批实例，统一返回 diagram 契约。"""
+    from core.tms.approval_workflow import ApprovalWorkflowEngine
+    from database.models import TMSApprovalFlow, TMSTask
+
+    flow_id = str(args.get("flow_id") or "").strip()
+    flow_code = str(args.get("flow_code") or "").strip()
+    task_type = str(args.get("task_type") or "").strip()
+    position = str(args.get("position") or "").strip()
+    workflow_key = str(args.get("workflow_key") or "").strip()
+    engine_type = str(args.get("engine_type") or "auto").strip().lower()
+    try:
+        current_step = max(0, int(args.get("current_step") or 1) - 1)
+    except (TypeError, ValueError):
+        current_step = 0
+
+    if workflow_key.startswith("position:") and not position:
+        position = workflow_key.split(":", 1)[1]
+    if position or (workflow_key and engine_type != "approval"):
+        from api.services.process_knowledge_service import build_position_workflow_diagram
+        return build_position_workflow_diagram(position or workflow_key, current_step=current_step)
+
+    if not any((flow_id, flow_code, task_type)) and engine_type != "approval":
+        return {
+            "type": "workflow_diagram",
+            "source": "unified_workflow_engine",
+            "error": "缺少工作流选择器，系统不会再用最近一条无关审批实例代替",
+            "hint": "岗位流程请提供 position（如 PMC）；审批流程请提供 flow_id 或 flow_code。",
+        }
+
+    query = select(TMSApprovalFlow).order_by(TMSApprovalFlow.created_at.desc())
+    if flow_id:
+        query = query.where(TMSApprovalFlow.id == flow_id)
+    elif flow_code:
+        query = query.where(TMSApprovalFlow.flow_code == flow_code)
+    elif task_type:
+        query = query.join(TMSTask, TMSTask.id == TMSApprovalFlow.task_id).where(TMSTask.task_type == task_type)
+    query = query.limit(1)
+    flow = (await db.execute(query)).scalar_one_or_none()
+    if not flow:
+        return {
+            "type": "workflow_diagram",
+            "source": "tms_approval_engine",
+            "error": "当前流程引擎没有找到可渲染的流程实例",
+            "query": {"flow_id": flow_id or None, "flow_code": flow_code or None, "task_type": task_type or None},
+            "hint": "请提供流程ID或流程编码；如果要画销售订单评审，需先在流程引擎中配置并发起对应流程。",
+        }
+
+    status = await ApprovalWorkflowEngine(db).get_flow_status(str(flow.id))
+    if not status:
+        return {"type": "workflow_diagram", "source": "tms_approval_engine", "error": "流程状态读取失败"}
+    status["type"] = "workflow_diagram"
+    status["source"] = "tms_approval_engine"
+    status["title"] = status.get("flow_code") or "流程引擎流程图"
+    return status
+
+
+_TOOL_EXECUTORS["query_workflow_diagram"] = _tool_query_workflow_diagram
+
+
+async def _tool_query_pmc_work_matrix(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """查询 PMC 当前工单矩阵，不在 chatbot 层计算业务结果。"""
+    from api.services.pmc_work_matrix_service import PmcWorkMatrixService
+
+    code = str(args.get("work_order_code") or "").strip()
+    if not code:
+        return {"type": "pmc_work_matrix", "error": "缺少主工单号", "hint": "请提供工单号后再生成 PMC 工作矩阵。"}
+    return await PmcWorkMatrixService(db).build(factory_id or "", code, args.get("options"))
+
+
+_TOOL_EXECUTORS["query_pmc_work_matrix"] = _tool_query_pmc_work_matrix
 
 
 async def _tool_query_collaboration(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2235,6 +2491,7 @@ WRITE_TOOLS = {
 SIM_TOOLS = {
     "run_compliance_simulation", "query_simulation_audits",
     "get_virtual_factory_status", "run_virtual_factory_pulse",
+    "query_pmc_rush_impact",
 }
 
 # 工具的中文标签（供前端展示）
@@ -2244,6 +2501,8 @@ TOOL_LABELS = {
     "get_work_order_detail": "工单详情",
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
+    "query_pmc_material_supply": "PMC物料供应证据",
+    "query_pmc_rush_impact": "PMC插单影响",
     "query_defects": "查询不良品",
     "query_equipment": "查询设备",
     "create_work_order": "创建工单",
@@ -2267,6 +2526,8 @@ TOOL_LABELS = {
     "run_alert_patrol": "预警巡检",
     "query_ocap_tasks": "OCAP待办任务",
     "query_hr_roster": "人力档案",
+    "query_workflow_diagram": "流程引擎流程图",
+    "query_pmc_work_matrix": "PMC工作矩阵",
     "query_process_knowledge": "流程知识",
     # 5M1E 预警数据工具
     "query_downtime": "停机记录",
@@ -2323,6 +2584,29 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "在制工单", "工单列表", "查工单", "查询工单", "工单状态", "工单进度",
             "有哪些工单", "工单情况", "工单汇总", "待下达工单", "生产工单",
+        ],
+    },
+    {
+        # PMC 专项规则必须早于普通“库存”，否则“库存齐套率/在途库存”会被截成普通库存查询。
+        "tool": "query_pmc_rush_impact",
+        "keywords": ["插单影响", "原有订单会晚多久", "VIP急单", "占50%产能", "占用50%产能"],
+    },
+    {
+        # PMC 专项规则必须早于普通“库存”，否则“库存齐套率/在途库存”会被截成普通库存查询。
+        "tool": "query_pmc_work_matrix",
+        "keywords": [
+            "PMC工作矩阵", "PMC矩阵", "工作矩阵", "预排程沙盘", "时间锤", "物料锤",
+            "生产锤", "出货锤", "紧急锤", "重算ETA", "ETA推迟", "ETA延迟", "UHN",
+            "可加工时间", "库存齐套", "齐套率",
+        ],
+    },
+    {
+        # 供应证据规则也必须早于普通库存，覆盖“库存+在途+PO+BOM复用”复合问题。
+        "tool": "query_pmc_material_supply",
+        "keywords": [
+            "在途", "PO编号", "采购订单", "采购单", "供应商ETA", "预计到货", "库存账龄", "账龄", "库龄",
+            "提前期", "物料LT", "BOM能不能用", "BOM用掉", "BOM复用", "能不能被新订单用",
+            "呆滞料能不能", "呆滞料复用",
         ],
     },
     {
@@ -2453,6 +2737,14 @@ INTENT_RULES: List[Dict[str, Any]] = [
         ],
     },
     {
+        "tool": "query_workflow_diagram",
+        "keywords": [
+            "流程图", "画流程图", "画成流程图", "绘制流程图", "流程可视化",
+            "流程图详细", "画出流程", "流程节点图", "流程引擎",
+            "岗位工作流", "PMC工作流", "PMC的工作流", "PMC 工作流",
+        ],
+    },
+    {
         "tool": "query_process_knowledge",
         "keywords": [
             # 工单流
@@ -2548,6 +2840,95 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
         else:
             args["report_type"] = "production_summary"
         args["format"] = "csv" if any(k in message for k in ["csv", "CSV", "表格"]) else "json"
+    elif tool == "query_workflow_diagram":
+        flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
+        flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)
+        if flow_id:
+            args["flow_id"] = flow_id.group(1)
+            args["engine_type"] = "approval"
+        elif flow_code:
+            args["flow_code"] = flow_code.group(0)
+            args["engine_type"] = "approval"
+        else:
+            from api.services.process_knowledge_service import POSITION_SOPS
+            normalized_message = message.lower()
+            candidates = [
+                (key, sop, alias)
+                for key, sop in POSITION_SOPS.items()
+                for alias in [sop["title"], *sop.get("aliases", [])]
+            ]
+            candidates.sort(key=lambda item: len(str(item[2])), reverse=True)
+            matched = next((item for item in candidates if str(item[2]).lower() in normalized_message), None)
+            if matched:
+                args["position"] = matched[1]["title"]
+                args["workflow_key"] = f"position:{matched[0]}"
+                args["engine_type"] = "business"
+            step_match = re.search(r"(?:第|当前第)\s*(\d+)\s*步", message)
+            if step_match:
+                args["current_step"] = int(step_match.group(1))
+    elif tool == "query_pmc_rush_impact":
+        quantity_match = re.search(r"(\d+)\s*(?:台|件|pcs|个|数量)", message, flags=re.IGNORECASE)
+        if quantity_match:
+            args["quantity"] = int(quantity_match.group(1))
+        product_match = re.search(r"(?:产品|product(?:_id)?)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{2,})", message, flags=re.IGNORECASE)
+        if product_match:
+            args["product_id"] = product_match.group(1)
+        due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message)
+        if due_match:
+            args["due_date"] = due_match.group(1)
+        share_match = re.search(r"(?:占|占用)\s*(\d+(?:\.\d+)?)\s*%\s*(?:产能)?", message)
+        args["capacity_share"] = float(share_match.group(1)) / 100 if share_match else 0.5
+    elif tool == "query_pmc_work_matrix":
+        wo_code = _extract_wo_code(message)
+        if not wo_code:
+            # “齐套率/库存齐套” without a work order is a supply evidence query,
+            # not a matrix query that can be fabricated without an order context.
+            if any(k in message for k in ["齐套", "在途", "PO编号", "BOM"]):
+                return {"tool": "query_pmc_material_supply", "args": {}}
+            return None
+        args["work_order_code"] = wo_code
+        options: Dict[str, Any] = {}
+        if "全检" in message and "IQC" in message.upper():
+            options["iqc_mode"] = "full"
+        elif "抽检" in message and "IQC" in message.upper():
+            options["iqc_mode"] = "sampling"
+        elif "免检" in message and "IQC" in message.upper():
+            options["iqc_mode"] = "exempt"
+
+        yield_match = re.search(r"(?:良率|直通率)\s*(?:从\s*)?(\d+(?:\.\d+)?)\s*%?", message)
+        if yield_match:
+            yield_value = float(yield_match.group(1))
+            options["yield_rate"] = yield_value / 100 if yield_value > 1 else yield_value
+
+        eta_match = re.search(r"(?:ETA|到货|物料).{0,8}?(?:推迟|延迟|晚到|晚)\s*(\d+(?:\.\d+)?)\s*天", message, flags=re.IGNORECASE)
+        if eta_match:
+            options["material_eta_delay_days"] = float(eta_match.group(1))
+
+        aging_match = re.search(r"(?:呆滞|库龄|不动).{0,6}?(\d+)\s*天", message)
+        if aging_match:
+            options["dead_stock_days"] = int(aging_match.group(1))
+
+        if any(k in message for k in ["占50%产能", "占用50%产能", "共享50%", "50%的产能"]):
+            options["line_occupancy"] = "shared_50"
+        if "空运" in message:
+            options["enable_air_freight"] = True
+        if "外协" in message:
+            options["accept_subcontracting"] = True
+        if options:
+            args["options"] = options
+    elif tool == "query_pmc_material_supply":
+        days_match = re.search(r"(\d+)\s*(?:天|日)", message)
+        if days_match:
+            args["days"] = int(days_match.group(1))
+        if any(k in message for k in ["呆滞", "长期不动", "超过180天没动", "超过180日没动"]):
+            args["only_stagnant"] = True
+        material_match = re.search(r"(?:物料|料号|料\s*编码|material)\s*[:：#]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{2,})", message, flags=re.IGNORECASE)
+        if material_match:
+            args["material_keyword"] = material_match.group(1)
+    elif tool == "query_stagnant":
+        days_match = re.search(r"(\d+)\s*(?:天|日)", message)
+        args["days"] = int(days_match.group(1)) if days_match else 180
+        args["limit"] = 50
     elif tool == "query_process_knowledge":
         # 轻量提取 topic 与 keyword：
         # 1) 责任归属类："该找谁/谁负责/卡在/超时找谁" → who_handles + 阶段关键词

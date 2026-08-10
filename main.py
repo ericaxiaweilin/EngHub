@@ -20,6 +20,9 @@ from api.routes import (
     ie_advanced_router,
     mes_router,
     pp_router,
+    pmc_router,
+    trainer_router,
+    workflow_diagram_router,
     qms_router,
     sim_erp_router,
     sim_factory_router,
@@ -78,6 +81,9 @@ app.include_router(ie_router)           # Industrial Engineering Module - 精益
 app.include_router(ie_advanced_router)  # Advanced IE Module - 精益生产IE扩展模块
 app.include_router(mes_router)
 app.include_router(pp_router)
+app.include_router(pmc_router)
+app.include_router(trainer_router)  # 职位训练器：接口驱动的岗位训练包与测验
+app.include_router(workflow_diagram_router)  # 统一业务工作流图目录与渲染接口
 app.include_router(qms_router)
 app.include_router(wms_router)
 if employee_skill_router is not None:
@@ -375,6 +381,11 @@ async def _start_scheduler():
     # 任务中心定期扫描：到期待办任务自动跟进（FOLLOWUP_SCANNER_ENABLED=0 可关）
     from api.services.followup_task_service import followup_scanner_loop
     asyncio.create_task(followup_scanner_loop())
+
+    # 工厂指挥官持续盯办：为已开启指挥官的用户定期巡检，把新决策挂入任务中心
+    # （COMMANDER_WATCH_ENABLED=0 可关；COMMANDER_WATCH_INTERVAL_SECONDS 调间隔）
+    from api.services.factory_commander import commander_watch_loop
+    asyncio.create_task(commander_watch_loop())
 
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------

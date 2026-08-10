@@ -3,7 +3,7 @@
  * 可拖拽移动、最小化/最大化，参考 luaguage ChatbotWidget 交互模式
  */
 import React, { useState, useRef, useEffect, useCallback, lazy, Suspense } from 'react'
-import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Popover, Modal, Form, Radio, message, Table, Select, Empty, Popconfirm } from 'antd'
+import { Tabs, Input, Button, List, Avatar, Badge, Tag, Typography, Space, Spin, Tooltip, Popover, Modal, Form, Radio, message, Table, Select, Empty, Popconfirm, Switch, InputNumber } from 'antd'
 import {
   RobotOutlined, TeamOutlined, SendOutlined, MinusOutlined,
   ExpandOutlined, CompressOutlined, CloseOutlined,
@@ -28,6 +28,157 @@ import { getStoredUser, logout } from '../services/auth'
 
 const { Text } = Typography
 const { TextArea } = Input
+
+function EngineFlowDiagram({ diagram }: { diagram: FlowDiagram }) {
+  const processKinds = ['approval', 'task', 'decision']
+  const mainNodes = diagram.nodes.filter(node => ['start', ...processKinds, 'end'].includes(node.kind || ''))
+  const processNodes = mainNodes.filter(node => processKinds.includes(node.kind || ''))
+  const branches = diagram.edges.filter(edge => edge.type && edge.type !== 'normal')
+  const nodeLabels = new Map(diagram.nodes.map(node => [node.id, node.title || node.label || node.id]))
+  const initialNode = processNodes.find(node => node.status === 'current') || processNodes[0] || mainNodes[0]
+  const [selectedNodeId, setSelectedNodeId] = useState(initialNode?.id || '')
+  const selectedNode = diagram.nodes.find(node => node.id === selectedNodeId)
+  useEffect(() => {
+    const next = processNodes.find(node => node.status === 'current') || processNodes[0] || mainNodes[0]
+    setSelectedNodeId(next?.id || '')
+  }, [diagram.workflow_key, diagram.flow_id, diagram.flow_code])
+  const statusColor: Record<string, string> = {
+    completed: '#52c41a', current: '#1677ff', pending: '#bfbfbf', rejected: '#f5222d', inactive: '#d9d9d9',
+  }
+  const nodeColor = (node: FlowDiagramNode) => statusColor[node.status || 'pending'] || '#bfbfbf'
+  const isBusinessFlow = diagram.flow_type === 'business_workflow'
+  const currentLabel = diagram.status === 'reference'
+    ? `参考流程 · 默认聚焦第 ${(diagram.current_step ?? 0) + 1} 步`
+    : diagram.status === 'approved'
+    ? '已完成'
+    : diagram.status === 'rejected'
+      ? '已驳回'
+      : `当前第 ${(diagram.current_step ?? -1) + 1} 步`
+  const arrayValue = (value: any) => value == null || value === '' ? [] : Array.isArray(value) ? value : [value]
+  const readableItem = (item: any) => {
+    if (typeof item !== 'object' || item == null) return String(item)
+    return [item.condition || item.when, item.action || item.title, item.owner ? `责任：${item.owner}` : ''].filter(Boolean).join(' → ') || JSON.stringify(item)
+  }
+  const displayList = (value: any) => {
+    const values = arrayValue(value)
+    if (!values.length) return <Text type="secondary">流程定义未配置</Text>
+    return <ul style={{ margin: 0, paddingLeft: 18 }}>{values.map((item, index) => <li key={index}>{readableItem(item)}</li>)}</ul>
+  }
+  const detailBlock = (title: string, value: any, color = '#595959', background = '#fff') => (
+    <div style={{ border: '1px solid #e8edf3', borderRadius: 7, padding: '8px 9px', minHeight: 68, background }}>
+      <div style={{ color, fontWeight: 650, fontSize: 11, marginBottom: 5 }}>{title}</div>
+      <div style={{ color: '#465568', fontSize: 10, lineHeight: '18px', wordBreak: 'break-word' }}>{displayList(value)}</div>
+    </div>
+  )
+  const selectedBranches = selectedNode
+    ? branches.filter(edge => edge.source === selectedNode.id || edge.target === selectedNode.id)
+    : []
+  const visibleBranches = selectedBranches.length ? selectedBranches : branches
+  const nextAction = arrayValue(selectedNode?.next_focus)[0] || selectedNode?.action || selectedNode?.summary
+  const kindLabel: Record<string, string> = { approval: '审批', task: '执行', decision: '判断', exception: '异常' }
+
+  return (
+    <div style={{ marginTop: 8, background: '#fff', border: '1px solid #cfe3f6', borderRadius: 10, overflow: 'hidden', boxShadow: '0 4px 16px rgba(16,42,67,.07)' }}>
+      <div style={{ padding: '10px 12px', background: 'linear-gradient(135deg,#edf7ff,#f8fbff)', borderBottom: '1px solid #d9e8ff' }}>
+        <Space size={6} wrap>
+          <ApiOutlined style={{ color: '#1677ff' }} />
+          <Text strong style={{ fontSize: 13 }}>{diagram.title || diagram.flow_code || '流程引擎流程图'}</Text>
+          <Tag color="blue" style={{ margin: 0, fontSize: 10 }}>{diagram.meta?.step_count ?? diagram.meta?.approval_node_count ?? processNodes.length} 个{isBusinessFlow ? '业务步骤' : '审批节点'}</Tag>
+          <Tag color="geekblue" style={{ margin: 0, fontSize: 10 }}>{diagram.meta?.edge_count || 0} 条连线</Tag>
+          {diagram.status && <Tag color={diagram.status === 'approved' ? 'green' : diagram.status === 'rejected' ? 'red' : diagram.status === 'reference' ? 'cyan' : 'orange'} style={{ margin: 0, fontSize: 10 }}>{diagram.status === 'reference' ? '标准路径' : diagram.status}</Tag>}
+        </Space>
+        <div style={{ marginTop: 4, color: '#65758b', fontSize: 10 }}>流程引擎 · {diagram.flow_type || 'sequential'} · {currentLabel} · 点击步骤查看执行要求</div>
+      </div>
+
+      <div style={{ padding: '14px 12px', overflowX: 'auto', background: '#fbfdff' }}>
+        <div style={{ display: 'flex', alignItems: 'stretch', minWidth: Math.max(680, processNodes.length * 270 + 210), gap: 0 }}>
+          {mainNodes.map((node, index) => (
+            <React.Fragment key={node.id}>
+              <div
+                onClick={() => processKinds.includes(node.kind || '') && setSelectedNodeId(node.id)}
+                style={{
+                  width: processKinds.includes(node.kind || '') ? 205 : 92,
+                  flexShrink: 0,
+                  border: `1px solid ${selectedNodeId === node.id ? '#1677ff' : nodeColor(node)}`,
+                  borderRadius: processKinds.includes(node.kind || '') ? 9 : 28,
+                  background: selectedNodeId === node.id ? '#f0f7ff' : processKinds.includes(node.kind || '') ? '#fff' : '#f6ffed',
+                  padding: processKinds.includes(node.kind || '') ? '9px 10px' : '9px 8px',
+                  cursor: processKinds.includes(node.kind || '') ? 'pointer' : 'default',
+                  boxShadow: selectedNodeId === node.id ? '0 0 0 3px rgba(22,119,255,0.13)' : '0 2px 7px rgba(16,42,67,.05)',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 4, alignItems: 'center' }}>
+                  <Text strong style={{ fontSize: 11, color: processKinds.includes(node.kind || '') ? '#1f2d3d' : nodeColor(node) }}>{node.title || node.label}</Text>
+                  {processKinds.includes(node.kind || '') && <Tag color={node.kind === 'decision' ? 'gold' : node.kind === 'approval' ? 'purple' : node.status === 'current' ? 'blue' : 'default'} style={{ margin: 0, fontSize: 9, lineHeight: '15px' }}>{kindLabel[node.kind || 'task']}</Tag>}
+                </div>
+                {processKinds.includes(node.kind || '') && (
+                  <>
+                    <div style={{ marginTop: 6, fontSize: 10, color: '#59697b' }}>责任：{node.role || '未指定'}</div>
+                    {(node.summary || node.action) && <div style={{ marginTop: 5, fontSize: 10, lineHeight: '16px', color: '#59697b', height: 32, overflow: 'hidden' }}>{node.summary || node.action}</div>}
+                    <div style={{ marginTop: 7, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                      <Tag style={{ margin: 0, fontSize: 9 }}>输入 {arrayValue(node.inputs).length}</Tag>
+                      <Tag color="gold" style={{ margin: 0, fontSize: 9 }}>门槛 {arrayValue(node.judgement_criteria || node.condition).length}</Tag>
+                      <Tag color="green" style={{ margin: 0, fontSize: 9 }}>交付 {arrayValue(node.deliverables).length}</Tag>
+                    </div>
+                    {node.condition && <div style={{ marginTop: 4, color: '#d46b08', fontSize: 10, wordBreak: 'break-word' }}>条件：{JSON.stringify(node.condition)}</div>}
+                  </>
+                )}
+              </div>
+              {index < mainNodes.length - 1 && (() => {
+                const next = mainNodes[index + 1]
+                const edge = diagram.edges.find(item => item.source === node.id && item.target === next.id && (!item.type || item.type === 'normal'))
+                return <div style={{ width: 72, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#69b1ff' }}><div style={{ fontSize: 20, lineHeight: 1 }}>→</div><div style={{ marginTop: 4, color: '#7b8ba0', fontSize: 9, lineHeight: '13px', textAlign: 'center' }}>{edge?.label || '继续'}</div></div>
+              })()}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+
+      {selectedNode && !['start', 'end'].includes(selectedNode.kind || '') && (
+        <div style={{ borderTop: '1px solid #e8edf3', padding: '10px 12px', background: '#fff' }}>
+          <Space size={6} wrap>
+            <Text strong style={{ fontSize: 12 }}>当前选择 · {selectedNode.title || selectedNode.label}</Text>
+            <Tag color={selectedNode.kind === 'exception' ? 'red' : selectedNode.status === 'current' ? 'blue' : 'default'} style={{ margin: 0, fontSize: 9 }}>{kindLabel[selectedNode.kind || 'task'] || '步骤'}</Tag>
+            <Text type="secondary" style={{ fontSize: 10 }}>点击上方步骤切换</Text>
+          </Space>
+          {nextAction && <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 7, background: '#e6f4ff', border: '1px solid #91caff' }}><Text strong style={{ color: '#0958d9', fontSize: 11 }}>现在重点：</Text><Text style={{ fontSize: 11 }}>{String(nextAction)}</Text></div>}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 7, marginTop: 8 }}>
+            {detailBlock('① 输入 / 前置证据', selectedNode.inputs, '#0958d9', '#f7fbff')}
+            {detailBlock('② 判断标准 / 放行门槛', selectedNode.judgement_criteria || selectedNode.condition, '#d46b08', '#fffaf0')}
+            {detailBlock('③ 输出 / 状态变化', selectedNode.outputs, '#531dab', '#faf8ff')}
+            {detailBlock('④ 交付物 / 系统留痕', selectedNode.deliverables, '#237804', '#f6ffed')}
+            {detailBlock('⑤ 下一步重点', selectedNode.next_focus, '#1677ff', '#f0f7ff')}
+            {detailBlock('⑥ 阻塞点', selectedNode.blockers, '#cf1322', '#fff7f6')}
+          </div>
+          {(selectedNode.work_matrix || selectedNode.matrix_fields) && (
+            <div style={{ marginTop: 8, border: '1px solid #bae0ff', borderRadius: 7, padding: '8px 9px', background: '#f0f7ff' }}>
+              <Text strong style={{ fontSize: 11, color: '#1677ff' }}>工作矩阵 / 核心参数</Text>
+              <div style={{ marginTop: 4, fontSize: 10 }}>{displayList(selectedNode.work_matrix || selectedNode.matrix_fields)}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {visibleBranches.length > 0 && (
+        <div style={{ borderTop: '1px solid #e8edf3', padding: '9px 12px', background: '#fffdf8' }}>
+          <Text strong style={{ fontSize: 11 }}>{selectedBranches.length ? '当前节点的异常与回流路径' : '全部异常与回流路径'}</Text>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 5, marginTop: 5 }}>
+            {visibleBranches.map((edge, index) => (
+              <div key={edge.id || index} onClick={() => edge.target && diagram.nodes.some(node => node.id === edge.target) && setSelectedNodeId(edge.target)} style={{ padding: '6px 8px', borderRadius: 6, background: edge.type === 'exception' ? '#fff1f0' : edge.type === 'recovery' || edge.type === 'loop' ? '#fff7e6' : '#f9f0ff', border: `1px solid ${edge.type === 'exception' ? '#ffa39e' : edge.type === 'recovery' || edge.type === 'loop' ? '#ffd591' : '#d3adf7'}`, fontSize: 10, cursor: edge.target ? 'pointer' : 'default' }}>
+                <div style={{ color: '#595959' }}>{nodeLabels.get(edge.source || '') || edge.source} → {nodeLabels.get(edge.target || '') || edge.target}</div>
+                <Text code style={{ fontSize: 10 }}>{edge.label || edge.type}</Text>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ borderTop: '1px dashed #d9d9d9', padding: '7px 10px', color: '#8c8c8c', fontSize: 10 }}>
+        {diagram.engine_note || '节点和连线来自统一流程引擎定义。'}
+      </div>
+    </div>
+  )
+}
 
 // ---------- IM 联系人（内网工厂人员） ----------
 interface Contact {
@@ -75,6 +226,212 @@ interface TableData {
   title: string
   columns: { key: string; label: string }[]
   rows: Record<string, any>[]
+  type?: string
+  work_order_code?: string
+  pmc_options?: Record<string, any>
+  pmc_option_schema?: PmcOptionDefinition[]
+  pmc_result?: any
+}
+
+interface PmcOptionDefinition {
+  group: string
+  key: string
+  label: string
+  type: 'boolean' | 'select' | 'number'
+  description?: string
+  business_talk?: string
+  options?: { value: string; label: string }[]
+  min?: number
+  max?: number
+  step?: number
+  unit?: string
+}
+
+interface FlowDiagramNode {
+  id: string
+  kind?: string
+  label?: string
+  title?: string
+  status?: string
+  role?: string | null
+  summary?: string
+  action?: string
+  approval_type?: string
+  condition?: any
+  auto_approve_if?: any
+  allow_agent?: boolean
+  inputs?: any[]
+  judgement_criteria?: any[]
+  outputs?: any[]
+  deliverables?: any[]
+  next_focus?: any[]
+  blockers?: any[]
+  exception_paths?: any[]
+  work_matrix?: any
+  matrix_fields?: any[]
+  systems?: any[]
+  details?: Record<string, any>
+  history?: Record<string, any>[]
+}
+
+interface FlowDiagramEdge {
+  id?: string
+  source?: string
+  target?: string
+  label?: string
+  type?: string
+}
+
+interface FlowDiagram {
+  title?: string
+  workflow_key?: string
+  flow_id?: string
+  flow_code?: string
+  flow_type?: string
+  status?: string
+  current_step?: number
+  nodes: FlowDiagramNode[]
+  edges: FlowDiagramEdge[]
+  meta?: { node_count?: number; edge_count?: number; approval_node_count?: number; step_count?: number; interactive?: boolean }
+  legend?: { key: string; label: string; color: string }[]
+  engine_note?: string
+}
+
+const PMC_STATUS_LABEL: Record<string, string> = {
+  ready_for_mps: '可进入 MPS 草案',
+  conditional: '条件放行',
+  blocked: '阻塞',
+  needs_evidence: '需要补证据',
+}
+
+function PmcWorkbench({ table, onOpenSheet }: { table: TableData; onOpenSheet?: (table: TableData) => void }) {
+  const initialResult = table.pmc_result || {}
+  const [options, setOptions] = useState<Record<string, any>>(table.pmc_options || initialResult.options || {})
+  const [result, setResult] = useState<any>(initialResult)
+  const [expanded, setExpanded] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const schema = table.pmc_option_schema || result.option_schema || []
+
+  const setOption = (key: string, value: any) => {
+    setOptions(prev => ({ ...prev, [key]: value }))
+  }
+
+  const recalculate = async () => {
+    if (!table.work_order_code) return
+    setSaving(true)
+    try {
+      const res: any = await api.post('/api/v1/pmc/work-matrix/scenario', {
+        factory_id: localStorage.getItem('active_factory_id') || 'FAC_MECH_001',
+        work_order_code: table.work_order_code,
+        options,
+      })
+      setResult(res)
+      message.success('PMC 沙盘已按当前开关重算')
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || 'PMC 沙盘重算失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const renderControl = (definition: PmcOptionDefinition) => {
+    const value = options[definition.key]
+    if (definition.type === 'boolean') {
+      return <Switch size="small" checked={!!value} onChange={next => setOption(definition.key, next)} />
+    }
+    if (definition.type === 'select') {
+      return <Select
+        size="small"
+        value={value}
+        options={(definition.options || []).map(item => ({ value: item.value, label: item.label }))}
+        onChange={next => setOption(definition.key, next)}
+        style={{ minWidth: 130 }}
+      />
+    }
+    const isYield = definition.key === 'yield_rate'
+    const numericValue = isYield ? Math.round(Number(value || 0.97) * 100) : Number(value ?? definition.min ?? 0)
+    return <Space.Compact>
+      <InputNumber
+        size="small"
+        value={numericValue}
+        min={isYield ? Math.round((definition.min || 0.5) * 100) : definition.min}
+        max={isYield ? Math.round((definition.max || 1) * 100) : definition.max}
+        step={isYield ? 1 : definition.step}
+        onChange={next => setOption(definition.key, isYield ? Number(next || 0) / 100 : Number(next || 0))}
+        style={{ width: 100 }}
+      />
+      {definition.unit && <span style={{ padding: '2px 6px', background: '#f5f5f5', border: '1px solid #d9d9d9', fontSize: 10 }}>{isYield ? '%' : definition.unit}</span>}
+    </Space.Compact>
+  }
+
+  const currentColumns = result.matrix_columns || table.columns
+  const currentRows = result.matrix_rows || table.rows
+  const judgement = result.judgement || {}
+  const computed = result.computed || {}
+  const calendar = result.calendar || {}
+  const status = judgement.overall || 'needs_evidence'
+  const statusColor = status === 'ready_for_mps' ? 'green' : status === 'blocked' ? 'red' : status === 'conditional' ? 'orange' : 'blue'
+  const groups: string[] = Array.from(new Set<string>(schema.map((item: PmcOptionDefinition) => item.group)))
+
+  return (
+    <div style={{ background: '#fff', border: '1px solid #d9e8ff', borderRadius: 8, overflow: 'hidden', marginTop: 0 }}>
+      <div style={{ padding: '8px 10px', background: '#f0f7ff', borderBottom: '1px solid #d9e8ff', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+        <Space size={5} wrap>
+          <ThunderboltOutlined style={{ color: '#1677ff' }} />
+          <Text strong style={{ fontSize: 12 }}>{result.title || table.title}</Text>
+          <Tag color={statusColor} style={{ margin: 0, fontSize: 10 }}>{PMC_STATUS_LABEL[status] || status}</Tag>
+          {calendar.code && <Tooltip title={calendar.source || '越南法定假期日历'}><Tag color="cyan" style={{ margin: 0, fontSize: 10 }}>{calendar.code}</Tag></Tooltip>}
+        </Space>
+        <Button type="link" size="small" onClick={() => setExpanded(prev => !prev)}>{expanded ? '收起开关' : '展开开关'}</Button>
+      </div>
+
+      {expanded && <div style={{ padding: '8px 10px', background: '#fcfcfc', borderBottom: '1px solid #f0f0f0' }}>
+        <div style={{ color: '#595959', fontSize: 10, marginBottom: 7 }}>本区是预排程假设，不修改工单主数据；切换后点击“重算沙盘”。</div>
+        <div style={{ color: calendar.code ? '#1677ff' : '#cf1322', fontSize: 10, marginBottom: 7 }}>工作日历：{calendar.code || '未配置'} · {calendar.holiday_count || 0} 个日期 · 来源：{calendar.source_name || calendar.source_url || 'APS 日期级工作日历接口'}</div>
+        {groups.map(group => (
+          <div key={group} style={{ marginBottom: 7 }}>
+            <div style={{ color: '#1677ff', fontWeight: 600, fontSize: 10, marginBottom: 4 }}>{group}</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(235px, 1fr))', gap: 5 }}>
+              {schema.filter((item: PmcOptionDefinition) => item.group === group).map((definition: PmcOptionDefinition) => (
+                <div key={definition.key} style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: '5px 7px', background: '#fff' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'center' }}>
+                    <Text style={{ fontSize: 10 }}>{definition.label}</Text>
+                    {renderControl(definition)}
+                  </div>
+                  {definition.description && <div style={{ color: '#8c8c8c', fontSize: 9, lineHeight: '14px', marginTop: 3 }}>{definition.description}</div>}
+                  {definition.business_talk && <div style={{ color: '#389e0d', fontSize: 9, lineHeight: '14px', marginTop: 2 }}>话术：{definition.business_talk}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+        <Button type="primary" size="small" icon={<ReloadOutlined />} loading={saving} onClick={recalculate}>重算沙盘</Button>
+      </div>}
+
+      <div style={{ padding: '8px 10px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 5 }}>
+        {[['需求投入量', computed.required_production_qty, 'pcs'], ['需求生产工时', computed.production_hours, 'h'], ['FG Ready', computed.fg_ready_at, ''], ['预计 ETA', computed.estimated_eta, '']].map(([label, value, unit]) => (
+          <div key={String(label)} style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: '5px 7px' }}>
+            <div style={{ color: '#8c8c8c', fontSize: 9 }}>{label}</div>
+            <div style={{ fontWeight: 600, fontSize: 11, marginTop: 2 }}>{value == null || value === '' ? '-' : String(value)} {unit && <span style={{ fontWeight: 400, color: '#8c8c8c' }}>{unit}</span>}</div>
+          </div>
+        ))}
+      </div>
+
+      {!!(result.risk_flags || []).length && <div style={{ margin: '0 10px 8px', padding: '6px 8px', background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 6 }}>
+        <div style={{ color: '#d46b08', fontWeight: 600, fontSize: 10 }}>风险与假设</div>
+        {(result.risk_flags || []).map((risk: string, index: number) => <div key={index} style={{ color: '#595959', fontSize: 10, lineHeight: '16px' }}>• {risk}</div>)}
+      </div>}
+
+      <Table
+        size="small"
+        dataSource={(currentRows || []).map((row: any, index: number) => ({ ...row, _rowKey: index }))}
+        rowKey="_rowKey"
+        pagination={currentRows.length > 6 ? { pageSize: 6, size: 'small' } : false}
+        columns={(currentColumns || []).map((column: any) => ({ title: column.label, dataIndex: column.key, key: column.key, ellipsis: true, render: (value: any) => value == null ? '-' : String(value) }))}
+        title={() => <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}><Text strong style={{ fontSize: 11 }}>参数证据矩阵</Text><Button type="link" size="small" icon={<TableOutlined />} onClick={() => onOpenSheet?.({ ...table, title: result.title || table.title, columns: currentColumns, rows: currentRows })}>在电子表格中打开</Button></div>}
+      />
+    </div>
+  )
 }
 
 // ---------- 聊天消息 ----------
@@ -92,6 +449,7 @@ interface ChatMsg {
   actions?: ToolAction[]
   attachments?: MsgAttachment[]
   tables?: TableData[]
+  diagrams?: FlowDiagram[]
 }
 
 // ---------- 快捷指令（后端不可用时的本地兜底） ----------
@@ -390,14 +748,90 @@ export default function AIAssistantWidget() {
       })
       setCommanderOn(!!res?.enabled)
       message.success(res?.message || (res?.enabled ? '指挥官已开启' : '指挥官已关闭'))
-      // 开启时在聊天中插入一条系统提示
+
       if (res?.enabled) {
+        // 开启后先插入一条“正在感知”提示，然后立即执行首轮决策循环
+        const sensingId = createId('cmd-sensing')
         setMessages(prev => [...prev, {
-          id: createId('cmd'),
+          id: sensingId,
           role: 'assistant',
-          content: '🎖️ 工厂指挥官已开启！我将主动接管您工作范围内的生产调度事务：\n• 自动感知产能负荷，切换接单/维持/挑单模式\n• 主动排产、跟催交期、协调资源\n• 重大决策会先请示您确认\n\n您可以随时点击顶部按钮关闭，恢复手动模式。',
+          content: '🎖️ 工厂指挥官已开启！\n\n📡 正在执行首轮态势感知…\n• 读取您的任务表与在制工单\n• 扫描产能负荷与工位利用率\n• 检查设备状态、物料库存、交期与质量态势',
           time: now(),
         }])
+
+        try {
+          const cycle: any = await api.post('/api/v1/commander/cycle', {
+            factory_id: activeFactoryId(),
+            auto_execute: true,
+          })
+          // 将感知+决策结果格式化为活动日志
+          const st = cycle?.state || {}
+          const orders = st.orders || {}
+          const cap = st.capacity || {}
+          const equip = st.equipment || {}
+          const mat = st.material || {}
+          const del = st.delivery || {}
+          const qual = st.quality || {}
+          const modeLabel: Record<string, string> = { surplus: '🟢 订单充足（挑单/延交低优）', normal: '🔵 产销平衡（维持节奏）', deficit: '🟡 订单欠缺（主动接单补产）' }
+
+          const lines: string[] = [
+            '✅ 首轮态势感知完成，已接管您的工作范围：',
+            '',
+            '📋 任务表读取',
+            `   在制工单 ${orders.active ?? '-'} 单（待排 ${orders.pending ?? '-'} / 执行中 ${orders.in_progress ?? '-'}），逾期 ${orders.overdue ?? 0} 单，7天内到期 ${orders.due_7d ?? 0} 单`,
+            '🏭 产能负荷',
+            `   工位利用 ${cap.utilization ?? '-'}（繁忙 ${cap.stations ?? '-'}），负荷率 ${orders.load_ratio != null ? Math.round(orders.load_ratio * 100) + '%' : '-'}`,
+            '🔧 设备状态',
+            `   运行 ${equip.running ?? '-'} / 维修 ${equip.maintenance ?? '-'} / 故障 ${equip.broken ?? '-'}（共 ${equip.total ?? '-'} 台）`,
+            '📦 物料 & 🚚 交期 & ✅ 质量',
+            `   缺料 ${mat.low_stock ?? 0} 项｜交期达成 ${del.on_time_rate ?? '-'}｜不良率 ${qual.defect_rate ?? '-'}`,
+            '',
+            `🎯 订单模式判定：${modeLabel[cycle?.order_mode] || cycle?.order_mode}`,
+          ]
+
+          const decisions = cycle?.decisions || []
+          if (decisions.length) {
+            lines.push('', `📌 本轮自主决策（${decisions.length} 项）：`)
+            decisions.forEach((d: any, i: number) => {
+              lines.push(`   ${d.executed ? '✅' : '📋'} ${i + 1}. [${d.priority}] ${d.reason}`)
+              if (d.result?.message) lines.push(`      → ${d.result.message}`)
+            })
+          }
+          const plan = cycle?.plan
+          if (plan?.objective) {
+            const planItems = plan.items || []
+            lines.push('', `🗂️ 行动计划（Plan，已记录到任务中心）：${plan.objective}`)
+            planItems.forEach((it: any) => {
+              lines.push(`   ${it.plan_seq ?? '•'}. [${it.agent_name || '通用'}] ${it.title}（进度${it.progress_pct ?? 0}%）`)
+            })
+            if (plan.progress_pct != null) lines.push(`   📈 计划总进度：${plan.progress_pct}%，智能体持续跟进直到全部闭环。`)
+          }
+          const followups = cycle?.followup_tasks || []
+          if (followups.length) {
+            lines.push('', `📌 已挂入任务中心持续盯办（${followups.length} 项，智能体持续跟进直到闭环）：`)
+            followups.forEach((t: any) => {
+              const tag = t.status === 'created' ? '🆕 新挂' : `🔄 已跟${t.follow_count ?? 0}次`
+              lines.push(`   • [${t.agent_name}] ${t.title}（每${t.interval}分钟 · ${tag} · 进度${t.progress_pct ?? 0}%）`)
+            })
+            lines.push('   ↳ 扫描器将定期调度对应智能体核实进展，有进展/完成会自动推送通知。')
+          }
+          const alerts = cycle?.alerts || []
+          if (alerts.length) {
+            lines.push('', '⚠️ 预警：')
+            alerts.forEach((a: string) => lines.push(`   • ${a}`))
+          }
+          const nexts = cycle?.next_actions || []
+          if (nexts.length) {
+            lines.push('', '🔜 下一步：')
+            nexts.forEach((n: string) => lines.push(`   • ${n}`))
+          }
+          lines.push('', `⏱️ 感知+决策耗时 ${Math.round(cycle?.duration_ms ?? 0)}ms｜后续将定期自动巡检，重大决策会先请示您。`)
+
+          // 用感知结果替换“正在感知”提示
+          setMessages(prev => prev.map(m => m.id === sensingId ? { ...m, content: lines.join('\n') } : m))
+        } catch {
+          setMessages(prev => prev.map(m => m.id === sensingId ? { ...m, content: '🎖️ 指挥官已开启，但首轮感知循环调用失败，稍后会自动重试。' } : m))
+        }
       }
     } catch {
       message.error('指挥官开关操作失败')
@@ -553,6 +987,7 @@ export default function AIAssistantWidget() {
       let accContent = ''
       let accActions: ToolAction[] = []
       let accTables: TableData[] = []
+      let accDiagrams: FlowDiagram[] = []
       let degraded = false
 
       const applyUpdate = () => {
@@ -566,6 +1001,7 @@ export default function AIAssistantWidget() {
             degraded,
             actions: accActions.length > 0 ? [...accActions] : [],
             tables: accTables.length > 0 ? [...accTables] : [],
+            diagrams: accDiagrams.length > 0 ? [...accDiagrams] : [],
           }
           return updated
         })
@@ -597,6 +1033,9 @@ export default function AIAssistantWidget() {
               applyUpdate()
             } else if (eventType === 'table') {
               accTables = [...accTables, data as TableData]
+              applyUpdate()
+            } else if (eventType === 'diagram') {
+              accDiagrams = [...accDiagrams, data as FlowDiagram]
               applyUpdate()
             } else if (eventType === 'done') {
               degraded = !!data.degraded
@@ -1326,11 +1765,21 @@ export default function AIAssistantWidget() {
                                 ))}
                               </div>
                             )}
+                            {/* 流程引擎图：直接渲染引擎返回的节点、条件和异常分支 */}
+                            {m.role === 'assistant' && m.diagrams && m.diagrams.length > 0 && (
+                              <div style={{ marginTop: 8 }}>
+                                {m.diagrams.map((diagram, di) => (
+                                  <EngineFlowDiagram key={`${diagram.flow_id || diagram.flow_code || 'diagram'}-${di}`} diagram={diagram} />
+                                ))}
+                              </div>
+                            )}
                             {/* 结构化表格（chatbot 查询结果 → 可交互表格 + Univer 电子表格） */}
                             {m.role === 'assistant' && m.tables && m.tables.length > 0 && (
                               <div style={{ marginTop: 8 }}>
                                 {m.tables.map((tbl, ti) => (
-                                  <div key={ti} style={{
+                                  tbl.type === 'pmc_work_matrix' ? (
+                                    <PmcWorkbench key={ti} table={tbl} onOpenSheet={setSheetTable} />
+                                  ) : <div key={ti} style={{
                                     background: '#fff', border: '1px solid #e6f4ff',
                                     borderRadius: 8, overflow: 'hidden', marginTop: ti > 0 ? 8 : 0,
                                     boxShadow: '0 1px 4px rgba(0,0,0,0.06)',

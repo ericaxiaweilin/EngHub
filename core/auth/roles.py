@@ -710,6 +710,7 @@ def get_menu_items_for_user(user) -> list:
             "key": "g-aps",
             "label": "APS 计划排程",
             "children": [
+                {"key": "/pmc", "label": "PMC 工作台"},
                 {"key": "/orders", "label": "销售订单"},
                 {"key": "/plans", "label": "生产计划"},
                 {"key": "/scheduling", "label": "排程中心"},
@@ -740,11 +741,12 @@ def get_menu_items_for_user(user) -> list:
         items.append({"key": "/simulation", "label": "仿真引擎"})
 
     # ━━━ 9. 人员 ━━━
-    if any(m in modules_with_access for m in ["hr", "skill_matrix", "training"]) or is_admin:
+    if any(m in modules_with_access for m in ["hr", "skill_matrix", "training", "pp"]) or is_admin:
         children = []
         children.append({"key": "/hr-roster", "label": "人力档案"})
         if "skill_matrix" in modules_with_access or "hr" in modules_with_access or is_admin:
             children.append({"key": "/skill-matrix", "label": "技能矩阵"})
+        children.append({"key": "/position-trainer", "label": "职位训练器"})
         if children:
             items.append({"key": "g-hr", "label": "人员", "children": children})
 

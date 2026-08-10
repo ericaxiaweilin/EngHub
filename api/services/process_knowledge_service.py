@@ -131,12 +131,116 @@ POSITION_SOPS: Dict[str, Dict[str, Any]] = {
         "aliases": ["PMC", "计划员", "PMC计划员", "生管", "物控", "生产计划员"],
         "duties": "统筹订单评审、物料需求与产能排产，建工单并跟催进度，回复交期",
         "daily_flow": [
-            {"step": 1, "task": "订单评审", "detail": "接收客户订单，评审交期可行性(产能/物料/人力)"},
-            {"step": 2, "task": "MRP运算", "detail": "运行物料需求计划，生成采购建议与到料需求日"},
-            {"step": 3, "task": "排产计划", "detail": "按产能与优先级编排周/日生产计划"},
-            {"step": 4, "task": "建工单/下达", "detail": "将计划转为生产工单，提交主管审批后下达车间"},
-            {"step": 5, "task": "进度跟催", "detail": "监控工单进度，滞后工单跟催车间；物料延迟跟催采购"},
-            {"step": 6, "task": "交期回复", "detail": "汇总订单执行情况，回复业务/客户交期承诺"},
+            {
+                "step": 1,
+                "task": "订单评审",
+                "owner": "PMC计划员",
+                "detail": "把客户需求转换成可计算的需求量、RDD和评审边界，形成是否可进入计划的第一道闸口。",
+                "inputs": ["销售订单/预测版本", "产品型号与需求数量", "RDD/客户收货节点", "BOM与工艺路线版本", "当前库存/在途/开放PO", "APS产能与越南工作日历"],
+                "judgement_criteria": ["订单字段与版本完整", "RDD口径明确且可倒推", "BOM/工艺版本有效", "物料与产能证据可追溯", "预计ETA不晚于RDD；否则只能条件承诺或阻塞"],
+                "outputs": ["评审结论：可计划/条件放行/阻塞", "锁定需求量与RDD", "风险责任人与补证据期限"],
+                "deliverables": ["订单评审记录", "PMC工作矩阵", "MPS可行性初判", "风险/假设清单"],
+                "next_focus": ["通过：进入MRP运算", "条件放行：先跟踪缺口和责任人", "阻塞：不得直接承诺客户交期"],
+                "blockers": ["缺少RDD", "BOM或工艺版本未冻结", "VN工作日历未配置", "库存/PO/产能数据缺失"],
+                "work_matrix": ["需求量", "RDD", "UHN（若企业已定义）", "可加工时间", "库存齐套率", "含PO预计齐套率", "预计ETA"],
+                "systems": ["销售订单", "PMC工作矩阵", "APS日历", "BOM/工艺"],
+                "pass_condition": "需求、RDD、物料和产能证据齐备",
+                "exception_paths": [
+                    {"condition": "订单/RDD/版本信息缺失", "action": "退回销售/RD补齐", "owner": "销售/RD", "deliverables": ["补齐后的订单与版本确认"], "return_to": "current"},
+                    {"condition": "ETA晚于RDD或产能不足", "action": "发起交付风险评审", "owner": "PMC主管/生产主管", "deliverables": ["加班/外协/改期方案"], "return_to": "current"},
+                ],
+            },
+            {
+                "step": 2,
+                "task": "MRP运算与齐套判断",
+                "owner": "PMC物控",
+                "detail": "按有效需求、BOM、库存和供应证据计算净需求，不把未确认在途当作已齐套。",
+                "inputs": ["已评审需求", "有效BOM", "合格可用库存", "安全库存", "开放PO/在途数量与ETA", "损耗率/直通率假设"],
+                "judgement_criteria": ["净需求=需求量×单位用量+安全库存-合格可用库存-可信供应", "每项缺口都有数量、需求日和责任人", "PO/在途只有在ETA与IQC可满足时才计入条件齐套", "替代料必须完成工程与品质验证"],
+                "outputs": ["物料齐套率", "缺料清单与需求日", "采购/调拨/替代建议", "条件齐套结论"],
+                "deliverables": ["MRP运算结果", "缺料跟催表", "到料计划", "替代料验证任务"],
+                "next_focus": ["齐套：进入产能与MPS排程", "不齐套：锁定PO、ETA和升级节点"],
+                "blockers": ["BOM用量缺失", "库存状态不合格", "PO无可靠ETA", "替代料未验证"],
+                "matrix_fields": ["required_qty", "qualified_available_qty", "in_transit_qty", "on_order_qty", "shortage_qty", "supplier_lead_days"],
+                "systems": ["MRP", "库存", "采购订单", "IQC"],
+                "pass_condition": "库存齐套或可信供应覆盖全部缺口",
+                "exception_paths": [
+                    {"condition": "关键料缺口且无可靠ETA", "action": "升级采购主管并评估改期", "owner": "采购主管/PMC主管", "deliverables": ["供应恢复日期或改期建议"], "return_to": "current"},
+                    {"condition": "存在可替代料", "action": "发起替代料验证", "owner": "RD/品质/采购", "deliverables": ["替代料批准记录"], "return_to": "current"},
+                ],
+            },
+            {
+                "step": 3,
+                "task": "产能校核与MPS排程",
+                "owner": "PMC计划员",
+                "detail": "把需求工时与瓶颈工位可加工时间进行CRP校核，形成有资源约束的周/日计划。",
+                "inputs": ["齐套结论", "需求投入量", "工艺路线/标准工时", "班次与设备日历", "已占用产能", "订单优先级"],
+                "judgement_criteria": ["瓶颈工位需求工时≤可加工时间", "共享线体按实际占用比例折减", "良率、换线、保养和法定假期已纳入", "MPS完工节点支持RDD倒推"],
+                "outputs": ["MPS草案", "周计划/日计划", "瓶颈负荷与冲突订单", "预计生产完成时间"],
+                "deliverables": ["MPS版本", "产能负荷表", "排程冲突清单", "资源调整建议"],
+                "next_focus": ["无冲突：冻结本版MPS并准备建单", "有冲突：先完成优先级仲裁和资源调整"],
+                "blockers": ["标准工时/UHN口径缺失", "设备日历缺失", "线体被其他订单抢占", "需求工时超过瓶颈可用时间"],
+                "matrix_fields": ["required_production_qty", "required_hours", "available_machining_hours", "utilization_pct", "production_complete_at"],
+                "systems": ["APS/CRP", "MPS", "设备日历", "技能矩阵"],
+                "pass_condition": "瓶颈产能可行且MPS完工节点满足RDD",
+                "exception_paths": [
+                    {"condition": "瓶颈工位超载", "action": "比较加班、换线、外协与改期方案", "owner": "生产主管/PMC主管", "deliverables": ["获批的资源调整方案"], "return_to": "current"},
+                    {"condition": "插单造成计划冲突", "action": "执行优先级仲裁并重排受影响订单", "owner": "PMC主管/业务", "deliverables": ["插单影响清单与新版MPS"], "return_to": "current"},
+                ],
+            },
+            {
+                "step": 4,
+                "task": "建工单与释放闸口",
+                "owner": "PMC计划员/生产主管",
+                "detail": "将已确认MPS转换为主工单和工序工单；只有资源、版本与审批全部满足才能释放到车间。",
+                "inputs": ["已冻结MPS", "产品/BOM/工艺版本", "主工单与工序工单结构", "物料齐套结论", "产能/人员/设备确认", "审批记录"],
+                "judgement_criteria": ["工单数量与MPS一致", "主单与工序子单编码和数量闭环", "BOM/工艺版本已冻结", "物料和产能满足释放门槛", "创建人与审批/下达人职责分离"],
+                "outputs": ["主工单及工序工单", "状态：pending→released", "计划开始/完成时间", "派工前置条件"],
+                "deliverables": ["工单包", "版本快照", "释放审批记录", "未释放原因清单"],
+                "next_focus": ["已释放：通知生产主管派工", "未释放：按缺口责任人跟催，不允许状态假闭环"],
+                "blockers": ["主/子工单数量不一致", "版本未冻结", "物料或产能未达闸口", "审批缺失"],
+                "systems": ["MPS", "工单中心", "审批流", "派工看板"],
+                "pass_condition": "工单数据闭环且主管完成释放审批",
+                "exception_paths": [
+                    {"condition": "释放闸口未满足", "action": "保持pending并生成未释放原因", "owner": "PMC计划员", "deliverables": ["未释放原因与责任人清单"], "return_to": "current"},
+                    {"condition": "审批驳回", "action": "修订MPS/工单后重新提交", "owner": "PMC计划员", "deliverables": ["修订记录"], "return_to": "current"},
+                ],
+            },
+            {
+                "step": 5,
+                "task": "执行监控与异常闭环",
+                "owner": "PMC计划员",
+                "detail": "按工单、工序和物料节点监控计划达成，不只看主工单状态；偏差必须形成责任人与恢复时间。",
+                "inputs": ["已释放工单", "派工/开工状态", "工序报工", "良品/不良/报废", "物料到货与IQC", "设备停机与安灯"],
+                "judgement_criteria": ["主工单与工序状态一致", "累计投入/良品/不良数量守恒", "计划与实际偏差在阈值内", "关键异常有责任人、措施和恢复ETA", "预计完工持续满足交付节点"],
+                "outputs": ["工单进度与达成率", "延期预测", "异常行动队列", "新版预计完工/FG Ready"],
+                "deliverables": ["PMC日报", "缺料/停机/品质异常跟催表", "恢复计划", "升级记录"],
+                "next_focus": ["无偏差：持续按节奏监控", "有偏差：先保关键路径，再更新交付预测"],
+                "blockers": ["工序未下达但主单显示生产中", "漏报/晚报", "物料延迟", "设备停机", "批量不良"],
+                "systems": ["生产看板", "报工", "安灯", "质量/NCR", "采购跟催"],
+                "pass_condition": "生产完工且关键异常闭环，FG Ready时间可确认",
+                "exception_paths": [
+                    {"condition": "进度偏差超过阈值", "action": "启动恢复计划并重算ETA", "owner": "生产主管/PMC", "deliverables": ["恢复计划与新版ETA"], "return_to": "current"},
+                    {"condition": "品质或设备异常影响关键路径", "action": "升级责任部门并冻结不可靠承诺", "owner": "品质/设备/生产主管", "deliverables": ["处置结论与恢复时间"], "return_to": "current"},
+                ],
+            },
+            {
+                "step": 6,
+                "task": "交付确认与闭环",
+                "owner": "PMC计划员",
+                "detail": "基于完工、终检、入库、装柜和运输证据回复交期，并关闭计划版本与遗留事项。",
+                "inputs": ["完工与终检结果", "成品入库数量", "FG Ready时间", "装柜/报关计划", "运输方式与ETA", "未结异常"],
+                "judgement_criteria": ["完工数、良品数、入库数数量闭环", "终检与放行状态合格", "装柜/海关/运输缓冲已计入", "客户承诺日期有证据来源", "未结风险已明确披露"],
+                "outputs": ["可承诺交付日期", "出货计划", "订单执行结论", "未结事项与责任人"],
+                "deliverables": ["交期回复记录", "出货/装柜计划", "订单关闭检查表", "复盘改进项"],
+                "next_focus": ["按承诺节点持续跟踪至签收", "偏差时先通知业务并给出证据化新ETA"],
+                "blockers": ["终检未放行", "入库数与完工数不一致", "装柜/海关状态未知", "运输资源未确认"],
+                "systems": ["完工入库", "OQC", "出货计划", "订单中心"],
+                "pass_condition": "质量、数量、出货和ETA证据全部闭环",
+                "exception_paths": [
+                    {"condition": "FG Ready或运输节点晚于承诺", "action": "通知业务并审批新ETA/运输方案", "owner": "PMC主管/业务", "deliverables": ["客户沟通记录与新承诺日期"], "return_to": "current"},
+                ],
+            },
         ],
         "escalation": "产能不足→生产主管协调加班/外协 | 物料断供→采购主管+业务变更交期 | 插单冲突→PMC主管仲裁优先级",
         "related_tools": "MRP运算、工单创建/下达、生产统计、库存查询",
@@ -189,14 +293,59 @@ RACI_MATRIX: Dict[str, Dict[str, str]] = {
 
 # ==================== 统一查询入口 ====================
 
-def _match_position(keyword: str) -> Optional[Dict[str, Any]]:
-    """按关键词模糊匹配职位（别名/标题包含即命中）。"""
+def _match_position_entry(keyword: str) -> Optional[tuple[str, Dict[str, Any]]]:
+    """按关键词模糊匹配职位并返回注册键与定义。"""
     if not keyword:
         return None
-    for sop in POSITION_SOPS.values():
-        if keyword in sop["title"] or any(keyword in a for a in sop["aliases"]):
-            return sop
+    normalized = keyword.strip().lower()
+    for key, sop in POSITION_SOPS.items():
+        candidates = [key, sop["title"], *sop["aliases"]]
+        if any(normalized in str(candidate).lower() or str(candidate).lower() in normalized for candidate in candidates):
+            return key, sop
     return None
+
+
+def _match_position(keyword: str) -> Optional[Dict[str, Any]]:
+    entry = _match_position_entry(keyword)
+    return entry[1] if entry else None
+
+
+def build_position_workflow_diagram(position: str, current_step: int = 0) -> Dict[str, Any]:
+    """把职位SOP送入通用流程引擎；所有职位共用同一图契约。"""
+    from core.workflow_diagram_engine import build_business_flow_diagram
+
+    entry = _match_position_entry(position)
+    if not entry:
+        return {
+            "type": "workflow_diagram",
+            "source": "business_workflow_registry",
+            "error": f"未找到职位工作流：{position}",
+            "available_positions": [sop["title"] for sop in POSITION_SOPS.values()],
+            "hint": "请指定职位名称，例如 PMC、品检员、操作员或生产主管。",
+        }
+    key, sop = entry
+    diagram = build_business_flow_diagram(
+        workflow_key=f"position:{key}",
+        title=f"{sop['title']} 工作流",
+        role=sop["title"],
+        description=sop.get("duties", ""),
+        steps=sop.get("daily_flow", []),
+        current_step=current_step,
+        metadata={
+            "position_key": key,
+            "position_title": sop["title"],
+            "escalation": sop.get("escalation"),
+            "related_tools": sop.get("related_tools"),
+        },
+    )
+    return {
+        "type": "workflow_diagram",
+        "source": "business_workflow_registry",
+        "workflow_key": f"position:{key}",
+        "title": diagram["title"],
+        "position": sop["title"],
+        "diagram": diagram,
+    }
 
 
 def _match_stage(keyword: str) -> Optional[Dict[str, Any]]:
@@ -293,4 +442,10 @@ def query_knowledge(topic: str = "", keyword: str = "") -> Dict[str, Any]:
     }
 
 
-__all__ = ["WORK_ORDER_FLOW", "POSITION_SOPS", "RACI_MATRIX", "query_knowledge"]
+__all__ = [
+    "WORK_ORDER_FLOW",
+    "POSITION_SOPS",
+    "RACI_MATRIX",
+    "query_knowledge",
+    "build_position_workflow_diagram",
+]
