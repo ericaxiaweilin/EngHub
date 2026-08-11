@@ -131,6 +131,8 @@ ALTER TABLE aps_schedule_tasks ADD COLUMN IF NOT EXISTS sequence_in_station INTE
 ALTER TABLE stations ADD COLUMN IF NOT EXISTS capacity INTEGER;
 ALTER TABLE stations ADD COLUMN IF NOT EXISTS capacity_unit VARCHAR(20);
 ALTER TABLE stations ADD COLUMN IF NOT EXISTS equipment_count INTEGER;
+ALTER TABLE routings ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active';
+ALTER TABLE routings ADD COLUMN IF NOT EXISTS remark VARCHAR(255);
 
 -- 2026 Vietnam working calendar.  Both factories use the same legal calendar;
 -- company-specific closures remain separate records/API inputs.
@@ -240,15 +242,17 @@ WHERE NOT EXISTS (
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO routings (
-    id, routing_code, factory_id, product_id, version, steps, is_active,
+    id, routing_code, factory_id, product_id, version, status, remark, steps, is_active,
     created_by, created_at, updated_at
 )
 VALUES
-    ('rt-vf-tread-001', 'RT-TREAD-001', 'FAC_MECH_001', 'FG-TREAD-001', 'CURRENT', '[{"step_no":10,"name":"车架焊接","station":"ST-HJ-01","UHN":0.17},{"step_no":20,"name":"表面涂装","station":"ST-TZ-01","UHN":0.13},{"step_no":30,"name":"电控装配","station":"ST-JD-01","UHN":0.20},{"step_no":40,"name":"跑步机总装","station":"ST-ZL-01","UHN":0.14},{"step_no":50,"name":"成品检验","station":"ST-QC-02","UHN":0.10},{"step_no":60,"name":"包装入库","station":"ST-PK-01","UHN":0.08}]'::jsonb, TRUE, 'pmc_bootstrap', NOW(), NOW()),
-    ('rt-vf-tread-002', 'RT-TREAD-002', 'FAC_MECH_001', 'FG-TREAD-002', 'CURRENT', '[{"step_no":10,"name":"车架焊接","station":"ST-HJ-01","UHN":0.17},{"step_no":20,"name":"表面涂装","station":"ST-TZ-01","UHN":0.13},{"step_no":30,"name":"电控装配","station":"ST-JD-01","UHN":0.20},{"step_no":40,"name":"跑步机总装","station":"ST-ZL-01","UHN":0.14},{"step_no":50,"name":"成品检验","station":"ST-QC-02","UHN":0.10},{"step_no":60,"name":"包装入库","station":"ST-PK-01","UHN":0.08}]'::jsonb, TRUE, 'pmc_bootstrap', NOW(), NOW()),
-    ('rt-vf-tread-003', 'RT-TREAD-003', 'FAC_MECH_001', 'FG-TREAD-003', 'CURRENT', '[{"step_no":10,"name":"车架焊接","station":"ST-HJ-01","UHN":0.17},{"step_no":20,"name":"表面涂装","station":"ST-TZ-01","UHN":0.13},{"step_no":30,"name":"电控装配","station":"ST-JD-01","UHN":0.20},{"step_no":40,"name":"跑步机总装","station":"ST-ZL-01","UHN":0.14},{"step_no":50,"name":"成品检验","station":"ST-QC-02","UHN":0.10},{"step_no":60,"name":"包装入库","station":"ST-PK-01","UHN":0.08}]'::jsonb, TRUE, 'pmc_bootstrap', NOW(), NOW())
+    ('rt-vf-tread-001', 'RT-TREAD-001', 'FAC_MECH_001', 'FG-TREAD-001', 'CURRENT', 'active', '跑步机 PMC 训练工艺路线', '[{"step_no":10,"name":"车架焊接","station":"ST-HJ-01","UHN":0.17},{"step_no":20,"name":"表面涂装","station":"ST-TZ-01","UHN":0.13},{"step_no":30,"name":"电控装配","station":"ST-JD-01","UHN":0.20},{"step_no":40,"name":"跑步机总装","station":"ST-ZL-01","UHN":0.14},{"step_no":50,"name":"成品检验","station":"ST-QC-02","UHN":0.10},{"step_no":60,"name":"包装入库","station":"ST-PK-01","UHN":0.08}]'::jsonb, TRUE, 'pmc_bootstrap', NOW(), NOW()),
+    ('rt-vf-tread-002', 'RT-TREAD-002', 'FAC_MECH_001', 'FG-TREAD-002', 'CURRENT', 'active', '跑步机 PMC 训练工艺路线', '[{"step_no":10,"name":"车架焊接","station":"ST-HJ-01","UHN":0.17},{"step_no":20,"name":"表面涂装","station":"ST-TZ-01","UHN":0.13},{"step_no":30,"name":"电控装配","station":"ST-JD-01","UHN":0.20},{"step_no":40,"name":"跑步机总装","station":"ST-ZL-01","UHN":0.14},{"step_no":50,"name":"成品检验","station":"ST-QC-02","UHN":0.10},{"step_no":60,"name":"包装入库","station":"ST-PK-01","UHN":0.08}]'::jsonb, TRUE, 'pmc_bootstrap', NOW(), NOW()),
+    ('rt-vf-tread-003', 'RT-TREAD-003', 'FAC_MECH_001', 'FG-TREAD-003', 'CURRENT', 'active', '跑步机 PMC 训练工艺路线', '[{"step_no":10,"name":"车架焊接","station":"ST-HJ-01","UHN":0.17},{"step_no":20,"name":"表面涂装","station":"ST-TZ-01","UHN":0.13},{"step_no":30,"name":"电控装配","station":"ST-JD-01","UHN":0.20},{"step_no":40,"name":"跑步机总装","station":"ST-ZL-01","UHN":0.14},{"step_no":50,"name":"成品检验","station":"ST-QC-02","UHN":0.10},{"step_no":60,"name":"包装入库","station":"ST-PK-01","UHN":0.08}]'::jsonb, TRUE, 'pmc_bootstrap', NOW(), NOW())
 ON CONFLICT (id) DO UPDATE SET
     routing_code = EXCLUDED.routing_code,
+    status = EXCLUDED.status,
+    remark = EXCLUDED.remark,
     steps = EXCLUDED.steps,
     is_active = TRUE,
     updated_at = NOW();
