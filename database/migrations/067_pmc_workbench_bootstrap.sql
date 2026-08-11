@@ -126,6 +126,12 @@ ALTER TABLE aps_schedule_tasks ADD COLUMN IF NOT EXISTS setup_minutes DOUBLE PRE
 ALTER TABLE aps_schedule_tasks ADD COLUMN IF NOT EXISTS material_ready BOOLEAN DEFAULT TRUE;
 ALTER TABLE aps_schedule_tasks ADD COLUMN IF NOT EXISTS sequence_in_station INTEGER;
 
+-- Older production schemas retain a daily capacity summary beside the newer
+-- capacity_per_hour column.  Fill both representations for portable seeds.
+ALTER TABLE stations ADD COLUMN IF NOT EXISTS capacity INTEGER;
+ALTER TABLE stations ADD COLUMN IF NOT EXISTS capacity_unit VARCHAR(20);
+ALTER TABLE stations ADD COLUMN IF NOT EXISTS equipment_count INTEGER;
+
 -- 2026 Vietnam working calendar.  Both factories use the same legal calendar;
 -- company-specific closures remain separate records/API inputs.
 WITH calendar_days(holiday_date, holiday_name, holiday_type) AS (
@@ -208,17 +214,21 @@ ON CONFLICT (product_code) DO UPDATE SET
 
 INSERT INTO stations (
     id, station_code, station_name, factory_id, station_type, workshop_id,
-    capacity_per_hour, status, equipment_ids, created_by, created_at, updated_at
+    capacity, capacity_unit, equipment_count, capacity_per_hour, status,
+    equipment_ids, created_by, created_at, updated_at
 )
 VALUES
-    ('st-vf-hj-01', 'ST-HJ-01', '车架焊接单元', 'FAC_MECH_001', 'welding', 'WS-MECH-01', 6, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
-    ('st-vf-tz-01', 'ST-TZ-01', '表面涂装单元', 'FAC_MECH_001', 'coating', 'WS-MECH-01', 8, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
-    ('st-vf-jd-01', 'ST-JD-01', '电控装配单元', 'FAC_MECH_001', 'assembly', 'WS-MECH-02', 5, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
-    ('st-vf-zl-01', 'ST-ZL-01', '总装单元', 'FAC_MECH_001', 'assembly', 'WS-MECH-02', 7, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
-    ('st-vf-qc-02', 'ST-QC-02', '成品检验单元', 'FAC_MECH_001', 'quality', 'WS-MECH-03', 10, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
-    ('st-vf-pk-01', 'ST-PK-01', '包装入库单元', 'FAC_MECH_001', 'packing', 'WS-MECH-03', 12, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW())
+    ('st-vf-hj-01', 'ST-HJ-01', '车架焊接单元', 'FAC_MECH_001', 'welding', 'WS-MECH-01', 60, 'pcs/day', 1, 6, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
+    ('st-vf-tz-01', 'ST-TZ-01', '表面涂装单元', 'FAC_MECH_001', 'coating', 'WS-MECH-01', 80, 'pcs/day', 1, 8, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
+    ('st-vf-jd-01', 'ST-JD-01', '电控装配单元', 'FAC_MECH_001', 'assembly', 'WS-MECH-02', 50, 'pcs/day', 1, 5, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
+    ('st-vf-zl-01', 'ST-ZL-01', '总装单元', 'FAC_MECH_001', 'assembly', 'WS-MECH-02', 70, 'pcs/day', 1, 7, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
+    ('st-vf-qc-02', 'ST-QC-02', '成品检验单元', 'FAC_MECH_001', 'quality', 'WS-MECH-03', 100, 'pcs/day', 1, 10, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
+    ('st-vf-pk-01', 'ST-PK-01', '包装入库单元', 'FAC_MECH_001', 'packing', 'WS-MECH-03', 120, 'pcs/day', 1, 12, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW())
 ON CONFLICT (id) DO UPDATE SET
     station_name = EXCLUDED.station_name,
+    capacity = EXCLUDED.capacity,
+    capacity_unit = EXCLUDED.capacity_unit,
+    equipment_count = EXCLUDED.equipment_count,
     capacity_per_hour = EXCLUDED.capacity_per_hour,
     status = EXCLUDED.status,
     updated_at = NOW();
