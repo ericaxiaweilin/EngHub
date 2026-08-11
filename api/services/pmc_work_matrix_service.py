@@ -535,6 +535,10 @@ class PmcWorkMatrixService:
         limit = max(1, min(int(limit or 50), 200))
         keyword = (material_keyword or "").strip()
 
+        # Do not materialize every SKU and then execute five evidence queries
+        # per item.  A production factory can have tens of thousands of SKUs;
+        # the previous implementation applied ``limit`` only after that N+1
+        # fan-out and made the PMC supply panel unusable.
         inventory_stmt = select(Inventory.material_code).where(Inventory.factory_id == factory_id)
         if keyword:
             inventory_stmt = inventory_stmt.where(
@@ -543,14 +547,30 @@ class PmcWorkMatrixService:
                     Inventory.material_name.ilike(f"%{keyword}%"),
                 )
             )
-        material_result = await self.db.execute(inventory_stmt.distinct())
+        candidate_limit = limit
+        if only_stagnant:
+            candidate_limit = min(max(limit * 3, limit), 200)
+            cutoff = datetime.utcnow() - timedelta(days=days_threshold)
+            inventory_stmt = inventory_stmt.where(
+                Inventory.available_qty > 0,
+                Inventory.last_movement_at.is_not(None),
+                Inventory.last_movement_at <= cutoff,
+            ).order_by(Inventory.last_movement_at.asc())
+        else:
+            inventory_stmt = inventory_stmt.order_by(Inventory.material_code.asc())
+
+        material_result = await self.db.execute(inventory_stmt.distinct().limit(candidate_limit))
         material_codes = {str(code) for code in material_result.scalars().all() if code}
 
         # Include PO-only materials so the PMC can see a purchase that has not arrived yet.
         po_snapshot = await self._purchase_order_rows(factory_id)
         for row in po_snapshot["rows"]:
             code = str(row.get("material_code") or "")
-            if code and (not keyword or keyword.lower() in code.lower()):
+            if (
+                code
+                and (not keyword or keyword.lower() in code.lower())
+                and (code in material_codes or len(material_codes) < candidate_limit)
+            ):
                 material_codes.add(code)
 
         snapshots = []
@@ -576,6 +596,8 @@ class PmcWorkMatrixService:
             "count": len(snapshots),
             "stagnant_count": sum(1 for item in snapshots if item["dead_stock"]),
             "items": snapshots,
+            "candidate_count": len(material_codes),
+            "query_scope": "candidate page; refine material_keyword for a specific material",
             "purchase_order_data_status": "ready" if po_snapshot["available"] else "missing",
             "note": "available_qty 是现有可用库存；open_supply_qty 是未收货PO供应，in_transit_qty 是已出货未收货PO；supplier_lead_days 来自有效供应商报价。BOM候选只表示主数据关联，是否可用仍需确认批次质量与版本。",
         }
