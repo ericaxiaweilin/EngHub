@@ -336,9 +336,9 @@ INSERT INTO work_orders (
     created_at, updated_at
 )
 VALUES
-    ('wo-vf-tread-001-20260810', 'WO-TREAD-20260810-001', 'FAC_MECH_001', 'mps-vf-tread-001-20260810', 'FG-TREAD-001', 'rt-vf-tread-001', 24, 'pcs', 6, 5, 1, 0, 'in_progress', 'high', TIMESTAMP '2026-08-10 08:00:00', TIMESTAMP '2026-08-18 17:00:00', 'st-vf-jd-01', 30, '电控装配', 'ST-JD-01', TRUE, 'CURRENT', 'master', 'pmc_bootstrap', 'pmc_bootstrap', 'pmc_demo', '跑步机1号：保留缺料和质量复判训练场景。', NOW(), NOW()),
-    ('wo-vf-tread-002-20260810', 'WO-TREAD-20260810-002', 'FAC_MECH_001', 'mps-vf-tread-002-20260810', 'FG-TREAD-002', 'rt-vf-tread-002', 18, 'pcs', 0, 0, 0, 0, 'released', 'medium', TIMESTAMP '2026-08-11 08:00:00', TIMESTAMP '2026-08-21 17:00:00', 'st-vf-hj-01', 10, '车架焊接', 'ST-HJ-01', FALSE, 'CURRENT', 'master', 'pmc_bootstrap', 'pmc_bootstrap', 'pmc_demo', '跑步机2号：用于 PMC 交期可信性评审。', NOW(), NOW()),
-    ('wo-vf-tread-003-20260810', 'WO-TREAD-20260810-003', 'FAC_MECH_001', 'mps-vf-tread-003-20260810', 'FG-TREAD-003', 'rt-vf-tread-003', 12, 'pcs', 0, 0, 0, 0, 'released', 'medium', TIMESTAMP '2026-08-12 08:00:00', TIMESTAMP '2026-08-25 17:00:00', 'st-vf-hj-01', 10, '车架焊接', 'ST-HJ-01', FALSE, 'CURRENT', 'master', 'pmc_bootstrap', 'pmc_bootstrap', 'pmc_demo', '跑步机3号：常规生产节奏。', NOW(), NOW())
+    ('wo-vf-tread-001-20260810', 'WO-TREAD-20260810-001', 'FAC_MECH_001', 'mps-vf-tread-001-20260810', 'FG-TREAD-001', 'rt-vf-tread-001', 24, 'pcs', 6, 5, 1, 0, 'in_progress', 'high', TIMESTAMP '2026-08-10 08:00:00', TIMESTAMP '2026-08-18 17:00:00', NULL, 30, '电控装配', 'ST-JD-01', TRUE, 'CURRENT', 'master', 'pmc_bootstrap', 'pmc_bootstrap', 'pmc_demo', '跑步机1号：保留缺料和质量复判训练场景。', NOW(), NOW()),
+    ('wo-vf-tread-002-20260810', 'WO-TREAD-20260810-002', 'FAC_MECH_001', 'mps-vf-tread-002-20260810', 'FG-TREAD-002', 'rt-vf-tread-002', 18, 'pcs', 0, 0, 0, 0, 'released', 'medium', TIMESTAMP '2026-08-11 08:00:00', TIMESTAMP '2026-08-21 17:00:00', NULL, 10, '车架焊接', 'ST-HJ-01', FALSE, 'CURRENT', 'master', 'pmc_bootstrap', 'pmc_bootstrap', 'pmc_demo', '跑步机2号：用于 PMC 交期可信性评审。', NOW(), NOW()),
+    ('wo-vf-tread-003-20260810', 'WO-TREAD-20260810-003', 'FAC_MECH_001', 'mps-vf-tread-003-20260810', 'FG-TREAD-003', 'rt-vf-tread-003', 12, 'pcs', 0, 0, 0, 0, 'released', 'medium', TIMESTAMP '2026-08-12 08:00:00', TIMESTAMP '2026-08-25 17:00:00', NULL, 10, '车架焊接', 'ST-HJ-01', FALSE, 'CURRENT', 'master', 'pmc_bootstrap', 'pmc_bootstrap', 'pmc_demo', '跑步机3号：常规生产节奏。', NOW(), NOW())
 ON CONFLICT (work_order_code) DO UPDATE SET
     source_plan_id = EXCLUDED.source_plan_id,
     product_id = EXCLUDED.product_id,
