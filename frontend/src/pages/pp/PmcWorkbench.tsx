@@ -61,6 +61,14 @@ const STATUS_META: Record<string, { label: string; color: string }> = {
   warning: { label: '需关注', color: 'warning' },
 }
 
+const SCENARIO_GROUP_META: Record<string, { code: string; color: string; caption: string }> = {
+  '时间锤': { code: 'T', color: '#1677ff', caption: '日历 / 班次' },
+  '物料锤': { code: 'M', color: '#722ed1', caption: 'IQC / 供应' },
+  '生产锤': { code: 'P', color: '#13a8a8', caption: '良率 / 产能' },
+  '出货锤': { code: 'S', color: '#d46b08', caption: '装柜 / 关务' },
+  '紧急锤': { code: 'E', color: '#cf1322', caption: '加急 / 外协' },
+}
+
 const valueText = (value: unknown, unit?: string) => {
   if (value === null || value === undefined || value === '') return '-'
   return `${String(value)}${unit ? ` ${unit}` : ''}`
@@ -157,6 +165,10 @@ export default function PmcWorkbench() {
     () => Array.from(new Set(optionSchema.map((item) => item.group))),
     [optionSchema],
   )
+  const optionsByGroup = useMemo(
+    () => Object.fromEntries(optionGroups.map((group) => [group, optionSchema.filter((item) => item.group === group)])),
+    [optionGroups, optionSchema],
+  )
   const parameters = matrix?.parameters || []
   const parameterMap = useMemo(
     () => Object.fromEntries(parameters.map((item: any) => [item.key, item])),
@@ -166,7 +178,7 @@ export default function PmcWorkbench() {
   const status = STATUS_META[judgement.overall] || { label: judgement.overall || '等待评审', color: 'default' }
   const kitRate = Number(parameterMap.inventory_kit_rate?.value || 0)
 
-  const renderOption = (definition: PmcOptionDefinition) => {
+  const renderOption = (definition: PmcOptionDefinition, compact = false) => {
     const value = options[definition.key]
     if (definition.type === 'boolean') {
       return <Switch checked={Boolean(value)} onChange={(next) => setOptions((current) => ({ ...current, [definition.key]: next }))} />
@@ -175,7 +187,7 @@ export default function PmcWorkbench() {
       return (
         <Select
           value={value}
-          style={{ minWidth: 150 }}
+          style={{ width: compact ? '100%' : undefined, minWidth: compact ? undefined : 150 }}
           options={definition.options || []}
           onChange={(next) => setOptions((current) => ({ ...current, [definition.key]: next }))}
         />
@@ -185,6 +197,7 @@ export default function PmcWorkbench() {
     const numericValue = isYield ? Math.round(Number(value ?? 0.97) * 100) : Number(value ?? definition.min ?? 0)
     return (
       <InputNumber
+        style={compact ? { width: '100%' } : undefined}
         value={numericValue}
         min={isYield ? Math.round(Number(definition.min ?? 0.5) * 100) : definition.min}
         max={isYield ? Math.round(Number(definition.max ?? 1) * 100) : definition.max}
@@ -196,6 +209,23 @@ export default function PmcWorkbench() {
         }))}
       />
     )
+  }
+
+  const applyScenarioPreset = (preset: 'baseline' | 'protect_delivery' | 'cost_control') => {
+    const baseline = matrix?.options || {}
+    if (preset === 'baseline') {
+      setOptions(baseline)
+      message.info('已恢复接口返回的基准假设')
+      return
+    }
+    setOptions({
+      ...baseline,
+      ...options,
+      ...(preset === 'protect_delivery'
+        ? { shift_mode: 'double', yield_rate: 0.97, line_occupancy: 'exclusive', container_hours: 2, customs_mode: 'none' }
+        : { shift_mode: 'single', yield_rate: 0.97, line_occupancy: 'shared_50', enable_air_freight: false, accept_subcontracting: false }),
+    })
+    message.info(preset === 'protect_delivery' ? '已载入“保交付”沙盘假设，请点击重算确认影响' : '已载入“控成本”沙盘假设，请点击重算确认影响')
   }
 
   const parameterColumns = [
@@ -295,17 +325,41 @@ export default function PmcWorkbench() {
 
           {!!(matrix.risk_flags || []).length && <Alert type="warning" showIcon icon={<WarningOutlined />} message="当前风险与假设" description={<Space direction="vertical" size={2}>{matrix.risk_flags.map((item: string, index: number) => <Text key={index}>• {item}</Text>)}</Space>} style={{ marginBottom: 16 }} />}
 
-          <Card size="small" title="五类预排程开关（接口重算，不覆盖工单主数据）" extra={<Button type="primary" icon={<ReloadOutlined />} loading={recalculating} onClick={recalculate}>重算沙盘</Button>} style={{ marginBottom: 16 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 250px), 1fr))', gap: 12 }}>
-              {optionGroups.map((group) => <Card key={group} size="small" title={group} styles={{ body: { padding: 10 } }}>
-                <Space direction="vertical" style={{ width: '100%' }} size={10}>
-                  {optionSchema.filter((item) => item.group === group).map((definition) => <div key={definition.key} style={{ borderBottom: '1px solid #f0f0f0', paddingBottom: 9 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}><Text strong>{definition.label}</Text>{renderOption(definition)}</div>
-                    {definition.description && <Paragraph type="secondary" style={{ fontSize: 12, margin: '5px 0 0' }}>{definition.description}</Paragraph>}
-                    {definition.business_talk && <Tooltip title="面试/汇报话术"><Text style={{ color: '#389e0d', fontSize: 12 }}>话术：{definition.business_talk}</Text></Tooltip>}
-                  </div>)}
-                </Space>
-              </Card>)}
+          <Card
+            size="small"
+            title={<Space><ThunderboltOutlined />预排程决策矩阵<Tag color="blue">接口重算 · 不覆盖主数据</Tag></Space>}
+            extra={<Space wrap><Button size="small" onClick={() => applyScenarioPreset('baseline')}>基准</Button><Button size="small" onClick={() => applyScenarioPreset('cost_control')}>控成本</Button><Button size="small" onClick={() => applyScenarioPreset('protect_delivery')}>保交付</Button><Button type="primary" icon={<ReloadOutlined />} loading={recalculating} onClick={recalculate}>重算沙盘</Button></Space>}
+            style={{ marginBottom: 16 }}
+          >
+            <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
+              横向比较五类决策杠杆：调整任一单元后，统一通过沙盘接口计算对交期、齐套、产能与出货的影响。
+            </Paragraph>
+            <div style={{ overflowX: 'auto', border: '1px solid #d9e5f5', borderRadius: 12, background: '#fff' }}>
+              <div style={{ minWidth: 1240, display: 'grid', gridTemplateColumns: `repeat(${Math.max(optionGroups.length, 1)}, minmax(0, 1fr))` }}>
+                {optionGroups.map((group, index) => {
+                  const meta = SCENARIO_GROUP_META[group] || { code: String(index + 1), color: '#1677ff', caption: '预排程假设' }
+                  const groupOptions = optionsByGroup[group] || []
+                  return <div key={group} style={{ minWidth: 0, borderRight: index < optionGroups.length - 1 ? '1px solid #d9e5f5' : undefined }}>
+                    <div style={{ padding: '12px 14px', background: `${meta.color}0d`, borderBottom: `3px solid ${meta.color}` }}>
+                      <Space size={8}><span style={{ display: 'inline-grid', placeItems: 'center', width: 24, height: 24, borderRadius: 6, color: '#fff', background: meta.color, fontSize: 12, fontWeight: 700 }}>{meta.code}</span><div><Text strong>{group}</Text><br /><Text type="secondary" style={{ fontSize: 12 }}>{meta.caption} · {groupOptions.length} 项</Text></div></Space>
+                    </div>
+                    <div style={{ padding: '0 14px' }}>
+                      {groupOptions.map((definition, itemIndex) => <div key={definition.key} style={{ padding: '13px 0', minHeight: 126, borderBottom: itemIndex < groupOptions.length - 1 ? '1px solid #edf2f7' : undefined }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+                          <Text strong>{definition.label}</Text>
+                          {definition.type === 'boolean' ? renderOption(definition, true) : <span style={{ flex: '0 1 148px' }}>{renderOption(definition, true)}</span>}
+                        </div>
+                        {definition.description && <Text type="secondary" style={{ display: 'block', fontSize: 12, lineHeight: 1.55 }}>{definition.description}</Text>}
+                        {definition.business_talk && <Tooltip title="面试/汇报话术"><Text style={{ display: 'block', marginTop: 6, color: meta.color, fontSize: 12, lineHeight: 1.5 }}>影响提示：{definition.business_talk}</Text></Tooltip>}
+                      </div>)}
+                    </div>
+                  </div>
+                })}
+              </div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginTop: 12, padding: '10px 12px', background: '#f6faff', borderRadius: 8 }}>
+              <Text type="secondary">当前沙盘：{options.shift_mode === 'double' ? '双班 20h' : '单班 10h'} · 良率 {Math.round(Number(options.yield_rate ?? 0.97) * 100)}% · {options.enable_air_freight ? '空运' : '海运'} · {options.accept_subcontracting ? '接受外协' : '不启用外协'}</Text>
+              <Text type="secondary">点击“重算沙盘”后，结果会回写到上方 ETA、齐套率和评审结论。</Text>
             </div>
           </Card>
 
