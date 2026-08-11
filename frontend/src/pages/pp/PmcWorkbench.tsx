@@ -86,6 +86,12 @@ export default function PmcWorkbench() {
       const response: any = await api.get('/api/v1/pmc/work-matrix', {
         params: { factory_id: factoryId, work_order_code: workOrderCode },
       })
+      if (response?.error) {
+        setMatrix(null)
+        setOptions({})
+        setError(response.hint || response.error)
+        return
+      }
       setMatrix(response)
       setOptions(response.options || {})
     } catch (err: any) {
@@ -125,6 +131,9 @@ export default function PmcWorkbench() {
         work_order_code: selectedCode,
         options,
       })
+      if (response?.error) {
+        throw new Error(response.hint || response.error)
+      }
       setMatrix(response)
       setOptions(response.options || options)
       message.success('PMC 沙盘已按当前参数重算')

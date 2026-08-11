@@ -226,6 +226,23 @@ def _route_steps(routing: Optional[Routing]) -> List[Dict[str, Any]]:
     return [step for step in steps if isinstance(step, dict)] if isinstance(steps, list) else []
 
 
+def _step_unit_hours(step: Dict[str, Any]) -> Optional[float]:
+    """Read an explicit per-unit process time without inventing a UHN value."""
+    for key in ("UHN", "uhn", "unit_hours_needed", "unit_hour_need"):
+        if step.get(key) is not None:
+            value = _as_number(step.get(key), default=-1)
+            if value >= 0:
+                return value
+    if step.get("duration_min") is not None:
+        value = _as_number(step.get("duration_min"), default=-1)
+        return value / 60.0 if value >= 0 else None
+    # routing_steps.standard_time is traditionally seconds in the legacy data.
+    if step.get("standard_time") is not None:
+        value = _as_number(step.get("standard_time"), default=-1)
+        return value / 3600.0 if value >= 0 else None
+    return None
+
+
 class PmcWorkMatrixService:
     """面向 PMC 当前评审节点的工单证据矩阵。"""
 
@@ -252,8 +269,12 @@ class PmcWorkMatrixService:
         # Keep the query valid for both PostgreSQL and the local SQLite demo DB.
         sql += " ORDER BY expected_date ASC, order_date ASC"
         try:
-            result = await self.db.execute(text(sql), params)
-            rows = [dict(row) for row in result.mappings().all()]
+            # Procurement is optional during phased rollout.  A missing table
+            # must roll back only this evidence lookup, not abort the whole
+            # PMC matrix transaction and hide the otherwise valid BOM/inventory.
+            async with self.db.begin_nested():
+                result = await self.db.execute(text(sql), params)
+                rows = [dict(row) for row in result.mappings().all()]
             return {"available": True, "rows": rows}
         except SQLAlchemyError as exc:
             # The main MES schema can be booted before procurement migration 031.
@@ -271,18 +292,20 @@ class PmcWorkMatrixService:
     ) -> Dict[str, Any]:
         """Read supplier quoted lead time for the PMC LT answer."""
         try:
-            result = await self.db.execute(text("""
-                SELECT s.supplier_code, s.supplier_name, sp.lead_days,
-                       sp.moq, sp.currency, sp.unit_price
-                FROM supplier_prices sp
-                JOIN suppliers s ON s.id = sp.supplier_id
-                WHERE s.factory_id = :fid
-                  AND sp.material_code = :material_code
-                  AND sp.is_active = TRUE
-                  AND s.is_approved = TRUE
-                ORDER BY sp.lead_days ASC, sp.unit_price ASC
-            """), {"fid": factory_id, "material_code": material_code})
-            return {"available": True, "rows": [dict(row) for row in result.mappings().all()]}
+            async with self.db.begin_nested():
+                result = await self.db.execute(text("""
+                    SELECT s.supplier_code, s.supplier_name, sp.lead_days,
+                           sp.moq, sp.currency, sp.unit_price
+                    FROM supplier_prices sp
+                    JOIN suppliers s ON s.id = sp.supplier_id
+                    WHERE s.factory_id = :fid
+                      AND sp.material_code = :material_code
+                      AND sp.is_active = TRUE
+                      AND s.is_approved = TRUE
+                    ORDER BY sp.lead_days ASC, sp.unit_price ASC
+                """), {"fid": factory_id, "material_code": material_code})
+                rows = [dict(row) for row in result.mappings().all()]
+            return {"available": True, "rows": rows}
         except SQLAlchemyError as exc:
             return {
                 "available": False,
@@ -576,11 +599,14 @@ class PmcWorkMatrixService:
             )
         )
         product = product_result.scalar_one_or_none()
+        product_refs = {str(work_order.product_id)}
+        if product:
+            product_refs.update({str(product.id), str(product.product_code)})
 
         routing_result = await self.db.execute(
             select(Routing).where(
                 Routing.factory_id == factory_id,
-                or_(Routing.id == work_order.routing_id, Routing.product_id == work_order.product_id),
+                or_(Routing.id == work_order.routing_id, Routing.product_id.in_(product_refs)),
                 Routing.is_active.is_(True),
             ).order_by(Routing.updated_at.desc())
         )
@@ -612,7 +638,11 @@ class PmcWorkMatrixService:
         bom_result = await self.db.execute(
             select(BomItem).where(
                 BomItem.factory_id == factory_id,
-                BomItem.product_id == work_order.product_id,
+                or_(
+                    BomItem.product_id.in_(product_refs),
+                    BomItem.product_sap_code.in_(product_refs),
+                    BomItem.model_name.in_(product_refs),
+                ),
             ).order_by(BomItem.level, BomItem.material_code)
         )
         bom_items = list(bom_result.scalars().all())
@@ -682,11 +712,12 @@ class PmcWorkMatrixService:
         ]
         if work_order.assigned_station_id:
             route_station_refs.insert(0, work_order.assigned_station_id)
-        seen_stations = set()
+        seen_station_refs = set()
+        seen_station_ids = set()
         for station_ref in route_station_refs:
-            if not station_ref or station_ref in seen_stations:
+            if not station_ref or station_ref in seen_station_refs:
                 continue
-            seen_stations.add(station_ref)
+            seen_station_refs.add(station_ref)
             station_result = await self.db.execute(
                 select(Station).where(
                     Station.factory_id == factory_id,
@@ -702,10 +733,27 @@ class PmcWorkMatrixService:
                     "source": "未找到 stations 主数据",
                 })
                 continue
+            # A work order often carries the first station by ID while routing
+            # carries it by station code.  They are one resource, not two
+            # capacity buckets.
+            if station.id in seen_station_ids:
+                continue
+            seen_station_ids.add(station.id)
 
+            station_identifiers = {str(station_ref), str(station.id), str(station.station_code)}
+            station_steps = [
+                step for step in route_steps
+                if str(step.get("station_id") or step.get("station") or step.get("work_center")) in station_identifiers
+            ]
+            station_unit_hours = [
+                value for value in (_step_unit_hours(step) for step in station_steps)
+                if value is not None
+            ]
             daily_hours = options["shift_hours_per_day"]
             nominal_capacity = float(station.capacity_per_hour or 0)
-            theoretical_hours = nominal_capacity * daily_hours * workdays * options["line_share"] * options["subcontract_capacity_factor"]
+            # availability is time, not units: capacity_per_hour is used only to
+            # convert demand into hours when no explicit UHN exists in routing.
+            theoretical_hours = daily_hours * workdays * options["line_share"]
             tasks_result = await self.db.execute(
                 select(ApsScheduleTask).join(
                     ApsSchedule, ApsScheduleTask.schedule_id == ApsSchedule.id
@@ -723,8 +771,14 @@ class PmcWorkMatrixService:
                     loaded_hours += max(0.0, (task.planned_end - task.planned_start).total_seconds() / 3600)
             available_hours = max(0.0, theoretical_hours - loaded_hours)
             utilization = (loaded_hours / theoretical_hours * 100) if theoretical_hours else None
-            effective_capacity_per_hour = nominal_capacity * capacity_factor
-            required_hours = required_production_qty / effective_capacity_per_hour if effective_capacity_per_hour else None
+            effective_capacity_per_hour = nominal_capacity * options["subcontract_capacity_factor"]
+            required_hours = (
+                required_production_qty * sum(station_unit_hours) / options["subcontract_capacity_factor"]
+                if station_unit_hours
+                else required_production_qty / effective_capacity_per_hour
+                if effective_capacity_per_hour
+                else None
+            )
             capacity_rows.append({
                 "station_id": station.station_code,
                 "station_name": station.station_name,
@@ -737,20 +791,15 @@ class PmcWorkMatrixService:
                 "available_machining_hours": round(available_hours, 2),
                 "required_production_qty": required_production_qty,
                 "required_hours": round(required_hours, 2) if required_hours is not None else None,
+                "unit_hours_needed": round(sum(station_unit_hours), 4) if station_unit_hours else None,
                 "utilization_pct": round(utilization, 1) if utilization is not None else None,
                 "status": "overloaded" if required_hours is not None and required_hours > available_hours else "available" if theoretical_hours else "unknown",
                 "source": "stations.capacity_per_hour + aps_schedule_tasks + PMC生产锤",
             })
 
         # UHN 是企业自定义口径：只有流程/工艺定义显式提供时才填值。
-        uhn = None
-        for step in route_steps:
-            for key in ("UHN", "uhn", "unit_hours_needed", "unit_hour_need"):
-                if step.get(key) is not None:
-                    uhn = step.get(key)
-                    break
-            if uhn is not None:
-                break
+        uhn_values = [value for value in (_step_unit_hours(step) for step in route_steps) if value is not None]
+        uhn = round(sum(uhn_values), 4) if uhn_values else None
         shortage_count = sum(1 for row in material_rows if row["shortage_qty"] > 0)
         projected_shortage_count = sum(1 for row in material_rows if row["projected_shortage_qty"] > 0)
         dead_stock_count = sum(1 for row in material_rows if row["dead_stock"])
@@ -773,7 +822,10 @@ class PmcWorkMatrixService:
             else "unknown"
         )
 
-        production_hours = sum(row.get("required_hours") or 0 for row in capacity_rows)
+        capacity_ready = bool(capacity_rows) and not capacity_unknown and all(
+            row.get("required_hours") is not None for row in capacity_rows
+        )
+        production_hours = sum(row.get("required_hours") or 0 for row in capacity_rows) if capacity_ready else None
         iqc_delay_hours = options["iqc_delay_hours"]
         material_eta_delay_hours = options["material_eta_delay_days"] * 24.0
         fg_ready_hours = (
@@ -782,25 +834,35 @@ class PmcWorkMatrixService:
             + material_eta_delay_hours
             + options["container_hours"]
             + options["customs_delay_hours"]
+            if production_hours is not None
+            else None
         )
         start_at = work_order.planned_start or datetime.combine(today, time(hour=8))
-        production_complete_at = _add_working_hours(
-            start_at,
-            production_hours + iqc_delay_hours + material_eta_delay_hours,
-            daily_hours=options["shift_hours_per_day"],
-            skip_vietnam_holidays=options["skip_vietnam_holidays"],
-            holiday_dates=holiday_dates,
-            working_dates=working_dates,
+        production_complete_at = (
+            _add_working_hours(
+                start_at,
+                production_hours + iqc_delay_hours + material_eta_delay_hours,
+                daily_hours=options["shift_hours_per_day"],
+                skip_vietnam_holidays=options["skip_vietnam_holidays"],
+                holiday_dates=holiday_dates,
+                working_dates=working_dates,
+            )
+            if production_hours is not None
+            else None
         )
-        fg_ready_at = _add_working_hours(
-            start_at,
-            fg_ready_hours,
-            daily_hours=options["shift_hours_per_day"],
-            skip_vietnam_holidays=options["skip_vietnam_holidays"],
-            holiday_dates=holiday_dates,
-            working_dates=working_dates,
+        fg_ready_at = (
+            _add_working_hours(
+                start_at,
+                fg_ready_hours,
+                daily_hours=options["shift_hours_per_day"],
+                skip_vietnam_holidays=options["skip_vietnam_holidays"],
+                holiday_dates=holiday_dates,
+                working_dates=working_dates,
+            )
+            if fg_ready_hours is not None
+            else None
         )
-        estimated_eta = fg_ready_at + timedelta(days=options["transport_days"])
+        estimated_eta = fg_ready_at + timedelta(days=options["transport_days"]) if fg_ready_at else None
         rdd_feasible = estimated_eta.date() <= rdd if rdd else None
         yield_warning = not (0.95 <= options["yield_rate"] <= 0.99)
 
@@ -809,13 +871,17 @@ class PmcWorkMatrixService:
             next_focus = ["先通过 APS 日期级工作日历接口导入当前工厂的 VN 2026 法定日历", "日历未配置前，ETA 不能宣称已按越南法律排除假期"]
         elif not rdd:
             next_focus = ["补齐 RDD/交付节点", "确认客户需求版本后再做倒排"]
+        elif not material_rows:
+            next_focus = ["补齐该成品的已生效 BOM 版本", "BOM 未生效前不能给出库存齐套率或 MRP 结论"]
+        elif not capacity_rows or capacity_unknown:
+            next_focus = ["补齐工艺路线和瓶颈工位主数据", "执行 CRP/APS 后再承诺交期"]
         elif projected_shortage_count and not options["substitute_material_available"]:
             next_focus = ["锁定缺料物料和 PO/在途 ETA", "确认采购交期或替代料，再决定 MPS 是否释放"]
         elif shortage_count and projected_material_ready is True:
             next_focus = ["确认 PO/在途按期到货", "到货后完成 IQC 放行，当前只能条件齐套"]
         elif shortage_count:
             next_focus = ["拿替代料料号和 IQC 放行条件", "替代料未完成验证前只能条件放行，不能视为完全齐套"]
-        elif capacity_overloaded or capacity_unknown:
+        elif capacity_overloaded:
             next_focus = ["确认瓶颈工位可加工时间", "执行 CRP/APS 后再承诺交期"]
         elif rdd is not None and rdd_feasible is False:
             next_focus = ["当前 ETA 晚于 RDD，先选择空运/外协/加班", "向客户或销售确认新的承诺节点"]
@@ -828,7 +894,7 @@ class PmcWorkMatrixService:
             {"key": "rdd", "label": "RDD/需求交期", "value": _iso(work_order.planned_due), "status": "ready" if rdd else "missing", "source": "work_orders.planned_due"},
             {"key": "holiday_calendar", "label": "法定工作日历", "value": holiday_calendar["code"], "status": "ready" if holiday_calendar["configured"] else "missing", "source": "GET /api/v1/aps/holiday-calendars"},
             {"key": "UHN", "label": "UHN（企业口径）", "value": uhn, "unit": "h", "status": "ready" if uhn is not None else "unknown", "source": "routing.steps.UHN；当前模型未强制定义"},
-            {"key": "available_machining_hours", "label": "可加工时间", "value": round(sum(row.get("available_machining_hours", 0) for row in capacity_rows), 2), "unit": "h", "status": "blocked" if capacity_overloaded else "ready" if capacity_rows and not capacity_unknown else "unknown", "source": "stations + APS排程 + 班次/共享产能开关"},
+            {"key": "available_machining_hours", "label": "可加工时间（瓶颈工位）", "value": round(min((row.get("available_machining_hours", 0) for row in capacity_rows), default=0), 2) if capacity_rows and not capacity_unknown else None, "unit": "h", "status": "blocked" if capacity_overloaded else "ready" if capacity_ready else "unknown", "source": "瓶颈工位：APS排程占用后的班次可用时长"},
             {"key": "inventory_kit_rate", "label": "库存齐套率", "value": round(sum(row["required_qty"] - row["shortage_qty"] for row in material_rows) / max(sum(row["required_qty"] for row in material_rows), 1) * 100, 1) if material_rows else None, "unit": "%", "status": "blocked" if shortage_count and not options["substitute_material_available"] else "conditional" if shortage_count else "ready" if material_rows else "unknown", "source": "BOM × Inventory.available_qty"},
             {"key": "projected_kit_rate", "label": "含 PO/在途预计齐套率", "value": round(sum(row["required_qty"] - row["projected_shortage_qty"] for row in material_rows) / max(sum(row["required_qty"] for row in material_rows), 1) * 100, 1) if material_rows else None, "unit": "%", "status": "blocked" if projected_shortage_count else "conditional" if shortage_count else "ready" if material_rows else "unknown", "source": "BOM × Inventory × purchase_orders"},
             {"key": "in_transit_qty", "label": "在途数量", "value": round(sum(row["in_transit_qty"] for row in material_rows), 2) if material_rows else None, "unit": work_order.unit or "pcs", "status": "ready" if purchase_order_data_available else "missing", "source": "purchase_orders.status=shipped"},
@@ -837,10 +903,10 @@ class PmcWorkMatrixService:
             {"key": "supplier_lead_days", "label": "供应商最短 LT", "value": min((row["supplier_lead_days"] for row in material_rows if row["supplier_lead_days"] is not None), default=None), "unit": "天", "status": "ready" if any(row["supplier_lead_days"] is not None for row in material_rows) else "unknown", "source": "supplier_prices.lead_days"},
             {"key": "dead_stock_material_count", "label": "BOM涉及呆滞料数", "value": dead_stock_count, "unit": "种", "status": "warning" if dead_stock_count else "ready", "source": f"库存最后流动时间 ≥ {options['dead_stock_days']}天"},
             {"key": "required_production_qty", "label": "按直通率倒推投入量", "value": required_production_qty, "unit": work_order.unit or "pcs", "status": "warning" if yield_warning else "ready", "source": "需求量 ÷ 预期直通率"},
-            {"key": "required_production_hours", "label": "需求生产工时", "value": round(production_hours, 2) if capacity_rows else None, "unit": "h", "status": "blocked" if capacity_overloaded else "ready" if capacity_rows and not capacity_unknown else "unknown", "source": "倒推投入量 ÷ 有效产能"},
-            {"key": "production_complete_at", "label": "预计生产完成", "value": _iso(production_complete_at), "status": "ready" if capacity_rows else "unknown", "source": "生产工时 + IQC缓冲 + 工作日历"},
-            {"key": "fg_ready_at", "label": "FG Ready", "value": _iso(fg_ready_at), "status": "ready" if capacity_rows else "unknown", "source": "生产完成 + 装柜 + 海关"},
-            {"key": "estimated_eta", "label": "预计 ETA", "value": _iso(estimated_eta), "status": "blocked" if rdd_feasible is False else "ready" if capacity_rows else "unknown", "source": "FG Ready + 海运/空运"},
+            {"key": "required_production_hours", "label": "需求生产工时", "value": round(production_hours, 2) if production_hours is not None else None, "unit": "h", "status": "blocked" if capacity_overloaded else "ready" if capacity_ready else "unknown", "source": "工艺 UHN；未定义时以产能速度倒推"},
+            {"key": "production_complete_at", "label": "预计生产完成", "value": _iso(production_complete_at), "status": "ready" if production_complete_at else "unknown", "source": "生产工时 + IQC缓冲 + 工作日历"},
+            {"key": "fg_ready_at", "label": "FG Ready", "value": _iso(fg_ready_at), "status": "ready" if fg_ready_at else "unknown", "source": "生产完成 + 装柜 + 海关"},
+            {"key": "estimated_eta", "label": "预计 ETA", "value": _iso(estimated_eta), "status": "blocked" if rdd_feasible is False else "ready" if estimated_eta else "unknown", "source": "FG Ready + 海运/空运"},
         ]
 
         risk_flags: List[str] = []
@@ -876,7 +942,7 @@ class PmcWorkMatrixService:
             else "conditional"
             if shortage_count or options["enable_air_freight"] or options["accept_subcontracting"]
             else "ready_for_mps"
-            if capacity_rows and not capacity_unknown
+            if capacity_ready
             else "needs_evidence"
         )
 
@@ -920,14 +986,14 @@ class PmcWorkMatrixService:
                     "material_ready": material_ready,
                     "material_decision": material_decision,
                     "projected_material_ready": projected_material_ready,
-                    "capacity_feasible": False if capacity_overloaded else None if capacity_unknown else True if capacity_rows else None,
+                "capacity_feasible": False if capacity_overloaded else True if capacity_ready else None,
                 "rdd_present": bool(rdd),
                 "rdd_feasible": rdd_feasible,
                 "overall": overall,
             },
             "computed": {
                 "required_production_qty": required_production_qty,
-                "production_hours": round(production_hours, 2),
+                "production_hours": round(production_hours, 2) if production_hours is not None else None,
                 "iqc_delay_hours": iqc_delay_hours,
                 "material_eta_delay_hours": material_eta_delay_hours,
                 "dead_stock_days": options["dead_stock_days"],
