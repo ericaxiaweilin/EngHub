@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 from math import ceil
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy import and_, func, or_, select, text
@@ -17,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import (
     ApsSchedule,
     ApsScheduleTask,
-    ApsHoliday,
     BomItem,
     Inventory,
     InventoryTransaction,
@@ -370,14 +370,23 @@ class PmcWorkMatrixService:
     ) -> Dict[str, Any]:
         """读取 APS 日期级日历；日历缺失时返回证据缺失，不回退到代码内日期。"""
         try:
-            result = await self.db.execute(
-                select(ApsHoliday).where(
-                    ApsHoliday.factory_id == factory_id,
-                    ApsHoliday.is_active.is_(True),
-                    ApsHoliday.year.in_(list(range(start.year, end.year + 1))),
-                ).order_by(ApsHoliday.holiday_date)
-            )
-            items = list(result.scalars().all())
+            # Keep this interface deployable when the host's consolidated ORM
+            # has not yet caught up with the calendar migration.
+            async with self.db.begin_nested():
+                result = await self.db.execute(text("""
+                    SELECT calendar_code, year, holiday_date, holiday_name,
+                           holiday_type, is_working_day, source_name, source_url
+                    FROM aps_holidays
+                    WHERE factory_id = :factory_id
+                      AND is_active = TRUE
+                      AND year BETWEEN :start_year AND :end_year
+                    ORDER BY holiday_date
+                """), {
+                    "factory_id": factory_id,
+                    "start_year": start.year,
+                    "end_year": end.year,
+                })
+                items = [SimpleNamespace(**dict(row)) for row in result.mappings().all()]
         except SQLAlchemyError as exc:
             return {
                 "configured": False,
