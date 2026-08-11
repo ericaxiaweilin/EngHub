@@ -43,6 +43,12 @@ CREATE INDEX IF NOT EXISTS idx_pp_plans_factory ON pp_plans(factory_id);
 CREATE INDEX IF NOT EXISTS idx_pp_plans_status ON pp_plans(status);
 CREATE INDEX IF NOT EXISTS idx_pp_plans_product ON pp_plans(product_id);
 CREATE INDEX IF NOT EXISTS idx_pp_plans_required_date ON pp_plans(required_date);
+ALTER TABLE pp_plans ADD COLUMN IF NOT EXISTS work_order_id VARCHAR(36);
+ALTER TABLE pp_plans ADD COLUMN IF NOT EXISTS cancelled_by VARCHAR(50);
+ALTER TABLE pp_plans ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
+ALTER TABLE pp_plans ADD COLUMN IF NOT EXISTS completed_by VARCHAR(50);
+ALTER TABLE pp_plans ADD COLUMN IF NOT EXISTS update_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_pp_plans_work_order ON pp_plans(work_order_id);
 
 CREATE TABLE IF NOT EXISTS work_order_materials (
     id VARCHAR(36) PRIMARY KEY,
