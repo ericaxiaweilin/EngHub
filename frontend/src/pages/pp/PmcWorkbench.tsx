@@ -231,7 +231,7 @@ export default function PmcWorkbench() {
             <Space wrap>
               <Button ghost icon={<ApartmentOutlined />} onClick={() => navigate('/work-orders')}>工单中心</Button>
               <Button ghost icon={<ReloadOutlined />} onClick={loadOrders} loading={ordersLoading}>刷新数据</Button>
-              <Button type="primary" icon={<ExperimentOutlined />} onClick={() => navigate('/position-trainer')}>职位训练器</Button>
+              <Button type="primary" icon={<ExperimentOutlined />} onClick={() => navigate('/pmc/position-trainer')}>职位训练器</Button>
             </Space>
           </div>
         </div>

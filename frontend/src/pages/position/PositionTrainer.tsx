@@ -41,7 +41,7 @@ interface TrainingQuestion {
   points: number
 }
 
-const PositionTrainer: React.FC = () => {
+const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) => {
   const navigate = useNavigate()
   const factoryId = getActiveFactoryId()
   const [positions, setPositions] = useState<TrainingPosition[]>([])
@@ -134,10 +134,10 @@ const PositionTrainer: React.FC = () => {
     <div style={{ padding: 24, maxWidth: 1180, margin: '0 auto' }}>
       <Space direction="vertical" style={{ width: '100%' }} size={16}>
         <Space align="center" wrap>
-          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/')}>
-            返回首页
+          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate(pmcMode ? '/pmc' : '/')}>
+            {pmcMode ? '返回 PMC 工作台' : '返回首页'}
           </Button>
-          <Title level={3} style={{ margin: 0 }}>职位训练器</Title>
+          <Title level={3} style={{ margin: 0 }}>{pmcMode ? 'PMC 职位训练器' : '职位训练器'}</Title>
           <Tag color="blue">接口驱动</Tag>
         </Space>
 

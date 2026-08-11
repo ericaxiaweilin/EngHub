@@ -42,6 +42,7 @@ import BaseData from './pages/basedata/BaseData'
 import SkillMatrix from './pages/hr/SkillMatrix'
 import HrRoster from './pages/hr/HrRoster'
 import PositionTrainer from './pages/position/PositionTrainer'
+import PmcKnowledge from './pages/pp/PmcKnowledge'
 import WarehouseList from './pages/wms/WarehouseList'
 import Login from './pages/auth/Login'
 import ModuleSelector from './pages/ModuleSelector'
@@ -248,6 +249,11 @@ const App: React.FC = () => {
             <Route path="plans" element={<PermissionGate path="/plans"><PlanList /></PermissionGate>} />
             <Route path="scheduling" element={<PermissionGate path="/scheduling"><SchedulingCenter /></PermissionGate>} />
             <Route path="pmc" element={<PermissionGate path="/pmc"><PmcWorkbench /></PermissionGate>} />
+            {/* 兼容旧版 PMC 菜单地址：旧入口曾经位于 PMC 工作台下。 */}
+            <Route path="pmc/position-trainer" element={<PermissionGate path="/pmc/position-trainer"><PositionTrainer pmcMode /></PermissionGate>} />
+            <Route path="pmc/training" element={<PermissionGate path="/pmc/position-trainer"><PositionTrainer pmcMode /></PermissionGate>} />
+            <Route path="pmc/assessment" element={<PermissionGate path="/pmc/position-trainer"><PositionTrainer pmcMode /></PermissionGate>} />
+            <Route path="pmc/knowledge" element={<PermissionGate path="/pmc/knowledge"><PmcKnowledge /></PermissionGate>} />
             <Route path="orders" element={<PermissionGate path="/orders"><OrderManagement /></PermissionGate>} />
             <Route path="base-data" element={<PermissionGate path="/base-data"><BaseData /></PermissionGate>} />
             <Route path="plant-floor" element={<PermissionGate path="/plant-floor"><PlantFloor /></PermissionGate>} />

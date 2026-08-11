@@ -711,6 +711,8 @@ def get_menu_items_for_user(user) -> list:
             "label": "APS 计划排程",
             "children": [
                 {"key": "/pmc", "label": "PMC 工作台"},
+                {"key": "/pmc/position-trainer", "label": "PMC 职位训练器"},
+                {"key": "/pmc/knowledge", "label": "PMC 知识库"},
                 {"key": "/orders", "label": "销售订单"},
                 {"key": "/plans", "label": "生产计划"},
                 {"key": "/scheduling", "label": "排程中心"},
