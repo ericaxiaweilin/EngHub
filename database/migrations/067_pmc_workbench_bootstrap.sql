@@ -217,6 +217,8 @@ INSERT INTO stations (
     capacity, capacity_unit, equipment_count, capacity_per_hour, status,
     equipment_ids, created_by, created_at, updated_at
 )
+SELECT *
+FROM (
 VALUES
     ('st-vf-hj-01', 'ST-HJ-01', '车架焊接单元', 'FAC_MECH_001', 'welding', 'WS-MECH-01', 60, 'pcs/day', 1, 6, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
     ('st-vf-tz-01', 'ST-TZ-01', '表面涂装单元', 'FAC_MECH_001', 'coating', 'WS-MECH-01', 80, 'pcs/day', 1, 8, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
@@ -224,10 +226,18 @@ VALUES
     ('st-vf-zl-01', 'ST-ZL-01', '总装单元', 'FAC_MECH_001', 'assembly', 'WS-MECH-02', 70, 'pcs/day', 1, 7, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
     ('st-vf-qc-02', 'ST-QC-02', '成品检验单元', 'FAC_MECH_001', 'quality', 'WS-MECH-03', 100, 'pcs/day', 1, 10, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
     ('st-vf-pk-01', 'ST-PK-01', '包装入库单元', 'FAC_MECH_001', 'packing', 'WS-MECH-03', 120, 'pcs/day', 1, 12, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW())
+) AS seed(
+    id, station_code, station_name, factory_id, station_type, workshop_id,
+    capacity, capacity_unit, equipment_count, capacity_per_hour, status,
+    equipment_ids, created_by, created_at, updated_at
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM stations existing WHERE existing.station_code = seed.station_code
+)
 -- Station codes are the shared business key in production.  Preserve a
 -- pre-existing real station's name/capacity instead of creating a duplicate
 -- demo resource with the same code.
-ON CONFLICT (station_code) DO NOTHING;
+ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO routings (
     id, routing_code, factory_id, product_id, version, steps, is_active,
