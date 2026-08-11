@@ -19,10 +19,23 @@ const PmcKnowledge: React.FC = () => {
     setLoading(true)
     setError('')
     try {
-      const data: any = await api.get('/api/v1/trainer/pack', {
-        params: { position_code: 'pmc', factory_id: factoryId },
+      const data: any = await api.get('/api/v1/pmc/training/pack', {
+        params: { factory_id: factoryId },
       })
-      setPack(data)
+      const asList = (value: any) => Array.isArray(value) ? value : []
+      setPack(data.sop ? {
+        ...data,
+        position: {
+          code: 'pmc',
+          title: data.role || 'PMC 计划员',
+          duties: data.sop.duties || '',
+          daily_flow: asList(data.sop.daily_flow).map((item: any, index: number) => (
+            typeof item === 'string' ? { step: index + 1, task: item, detail: '' } : item
+          )),
+          escalation: asList(data.sop.escalation_path).join('；'),
+          related_tools: asList(data.sop.related_tools).join('、'),
+        },
+      } : data)
     } catch (err: any) {
       setPack(null)
       setError(err?.response?.data?.detail || 'PMC 知识库加载失败，请稍后重试。')
@@ -34,7 +47,10 @@ const PmcKnowledge: React.FC = () => {
   useEffect(() => { load() }, [load])
 
   const position = pack?.position
-  const terms = Array.from(new Set((pack?.quiz?.questions || []).flatMap((question: any) => question.reference_terms || []))) as string[]
+  const terms = Array.from(new Set([
+    ...(pack?.terms || []).map((item: any) => item.term || item),
+    ...(pack?.quiz?.questions || []).flatMap((question: any) => question.reference_terms || []),
+  ])) as string[]
 
   return (
     <div style={{ padding: 24, maxWidth: 1180, margin: '0 auto' }}>

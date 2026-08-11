@@ -254,6 +254,9 @@ const App: React.FC = () => {
             <Route path="pmc/training" element={<PermissionGate path="/pmc/position-trainer"><PositionTrainer pmcMode /></PermissionGate>} />
             <Route path="pmc/assessment" element={<PermissionGate path="/pmc/position-trainer"><PositionTrainer pmcMode /></PermissionGate>} />
             <Route path="pmc/knowledge" element={<PermissionGate path="/pmc/knowledge"><PmcKnowledge /></PermissionGate>} />
+            {/* 服务器现有 PMC 菜单使用的旧地址。 */}
+            <Route path="pmc-trainer" element={<PermissionGate path="/pmc-trainer"><PositionTrainer pmcMode /></PermissionGate>} />
+            <Route path="pmc-knowledge" element={<PermissionGate path="/pmc-knowledge"><PmcKnowledge /></PermissionGate>} />
             <Route path="orders" element={<PermissionGate path="/orders"><OrderManagement /></PermissionGate>} />
             <Route path="base-data" element={<PermissionGate path="/base-data"><BaseData /></PermissionGate>} />
             <Route path="plant-floor" element={<PermissionGate path="/plant-floor"><PlantFloor /></PermissionGate>} />
