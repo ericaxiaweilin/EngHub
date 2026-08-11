@@ -894,7 +894,10 @@ class PmcWorkMatrixService:
             else None
         )
         estimated_eta = fg_ready_at + timedelta(days=options["transport_days"]) if fg_ready_at else None
-        rdd_feasible = estimated_eta.date() <= rdd if rdd else None
+        # A valid RDD alone is not enough to calculate an ETA.  Legacy work
+        # orders can legitimately lack routings/station capacity; keep that
+        # as an evidence gap instead of crashing the whole PMC workbench.
+        rdd_feasible = estimated_eta.date() <= rdd if rdd and estimated_eta else None
         yield_warning = not (0.95 <= options["yield_rate"] <= 0.99)
 
         calendar_missing = options["skip_vietnam_holidays"] and not holiday_calendar["configured"]
