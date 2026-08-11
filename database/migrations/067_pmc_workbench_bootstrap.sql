@@ -224,14 +224,10 @@ VALUES
     ('st-vf-zl-01', 'ST-ZL-01', '总装单元', 'FAC_MECH_001', 'assembly', 'WS-MECH-02', 70, 'pcs/day', 1, 7, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
     ('st-vf-qc-02', 'ST-QC-02', '成品检验单元', 'FAC_MECH_001', 'quality', 'WS-MECH-03', 100, 'pcs/day', 1, 10, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW()),
     ('st-vf-pk-01', 'ST-PK-01', '包装入库单元', 'FAC_MECH_001', 'packing', 'WS-MECH-03', 120, 'pcs/day', 1, 12, 'active', '[]'::jsonb, 'pmc_bootstrap', NOW(), NOW())
-ON CONFLICT (id) DO UPDATE SET
-    station_name = EXCLUDED.station_name,
-    capacity = EXCLUDED.capacity,
-    capacity_unit = EXCLUDED.capacity_unit,
-    equipment_count = EXCLUDED.equipment_count,
-    capacity_per_hour = EXCLUDED.capacity_per_hour,
-    status = EXCLUDED.status,
-    updated_at = NOW();
+-- Station codes are the shared business key in production.  Preserve a
+-- pre-existing real station's name/capacity instead of creating a duplicate
+-- demo resource with the same code.
+ON CONFLICT (station_code) DO NOTHING;
 
 INSERT INTO routings (
     id, routing_code, factory_id, product_id, version, steps, is_active,
@@ -344,6 +340,18 @@ ON CONFLICT (work_order_code) DO UPDATE SET
     next_station = EXCLUDED.next_station,
     in_progress_status = EXCLUDED.in_progress_status,
     updated_at = NOW();
+
+-- Map seeded work orders to the actual resource ID selected by the code above.
+UPDATE work_orders w
+SET assigned_station_id = s.id,
+    updated_at = NOW()
+FROM stations s
+WHERE w.factory_id = 'FAC_MECH_001'
+  AND s.factory_id = w.factory_id
+  AND (
+      (w.id = 'wo-vf-tread-001-20260810' AND s.station_code = 'ST-JD-01')
+      OR (w.id IN ('wo-vf-tread-002-20260810', 'wo-vf-tread-003-20260810') AND s.station_code = 'ST-HJ-01')
+  );
 
 UPDATE pp_plans p
 SET work_order_id = w.id,
