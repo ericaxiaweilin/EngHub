@@ -68,28 +68,10 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
     setAnswers({})
     setResult(null)
     try {
-      const data: any = await api.get(pmcMode ? '/api/v1/pmc/training/pack' : '/api/v1/trainer/pack', {
+      const data: any = await api.get('/api/v1/trainer/pack', {
         params: { position_code: positionCode, factory_id: factoryId },
       })
-      if (pmcMode && data.sop) {
-        const asList = (value: any) => Array.isArray(value) ? value : []
-        const dailyFlow = asList(data.sop.daily_flow).map((item: any, index: number) => (
-          typeof item === 'string' ? { step: index + 1, task: item, detail: '' } : item
-        ))
-        setPack({
-          ...data,
-          position: {
-            code: 'pmc',
-            title: data.role || 'PMC 计划员',
-            duties: data.sop.duties || '',
-            daily_flow: dailyFlow,
-            escalation: asList(data.sop.escalation_path).join('；'),
-            related_tools: asList(data.sop.related_tools).join('、'),
-          },
-        })
-      } else {
-        setPack(data)
-      }
+      setPack(data)
     } catch (err: any) {
       setPack(null)
       setError(err?.response?.data?.detail || '职位训练包加载失败，请确认训练数据接口和迁移已就绪。')
@@ -124,7 +106,7 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
     }
     setSubmitting(true)
     try {
-      const data: any = await api.post(pmcMode ? '/api/v1/pmc/training/attempts' : '/api/v1/trainer/attempts', {
+      const data: any = await api.post('/api/v1/trainer/attempts', {
         position_code: positionCode,
         factory_id: factoryId,
         answers,

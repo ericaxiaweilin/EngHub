@@ -80,6 +80,7 @@ export default function PmcWorkbench() {
   const [workOrders, setWorkOrders] = useState<WorkOrder[]>([])
   const [selectedCode, setSelectedCode] = useState('')
   const [matrix, setMatrix] = useState<any>(null)
+  const [capabilities, setCapabilities] = useState<any[]>([])
   const [options, setOptions] = useState<Record<string, any>>({})
   const [ordersLoading, setOrdersLoading] = useState(true)
   const [matrixLoading, setMatrixLoading] = useState(false)
@@ -128,7 +129,18 @@ export default function PmcWorkbench() {
     }
   }, [factoryId, loadMatrix])
 
+  const loadCapabilities = useCallback(async () => {
+    try {
+      const response: any = await api.get('/api/v1/pmc/capabilities')
+      setCapabilities(response?.capabilities || [])
+    } catch {
+      // 工作台仍可由工单矩阵运行；能力清单加载失败不掩盖主评审结果。
+      setCapabilities([])
+    }
+  }, [])
+
   useEffect(() => { loadOrders() }, [loadOrders])
+  useEffect(() => { loadCapabilities() }, [loadCapabilities])
 
   const recalculate = async () => {
     if (!selectedCode) return
@@ -305,6 +317,15 @@ export default function PmcWorkbench() {
             <Card size="small"><Statistic title="可加工时间" value={parameterMap.available_machining_hours?.value ?? '-'} suffix="h" /></Card>
             <Card size="small"><Statistic title="预计 ETA" value={String(parameterMap.estimated_eta?.value || '-').replace('T', ' ').slice(0, 16)} valueStyle={{ color: judgement.rdd_feasible === false ? '#cf1322' : '#0958d9', fontSize: 20 }} /></Card>
           </div>
+
+          {!!capabilities.length && <Card size="small" title="PMC 流程能力清单" extra={<Tag color="blue">{capabilities.length} 个接口能力</Tag>} style={{ marginBottom: 16 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 8 }}>
+              {capabilities.map((item) => <div key={item.key} style={{ padding: '9px 10px', border: '1px solid #edf2f7', borderRadius: 8, background: '#fafcff' }}>
+                <Space size={6}><Tag color={item.mode === 'simulation' ? 'purple' : item.mode === 'training' ? 'cyan' : 'blue'}>{item.mode === 'simulation' ? '沙盘' : item.mode === 'training' ? '训练' : '证据'}</Tag><Text strong>{item.name}</Text></Space>
+                <Text type="secondary" style={{ display: 'block', marginTop: 5, fontSize: 12 }}>{item.path}</Text>
+              </div>)}
+            </div>
+          </Card>}
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))', gap: 16, marginBottom: 16 }}>
             <Card size="small" title={<Space><FileSearchOutlined />评审判断标准</Space>} extra={<Tag color={status.color}>{status.label}</Tag>}>
