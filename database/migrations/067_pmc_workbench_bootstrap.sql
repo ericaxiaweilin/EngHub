@@ -113,14 +113,20 @@ ALTER TABLE bom_items ADD COLUMN IF NOT EXISTS model_name VARCHAR(100);
 -- 本运行库的 bom_items 以 id 为主键，而旧 ORM 查询还会读取 row_id。
 -- 为兼容两个结构补齐唯一行标识，不改动原有 id 及业务数据。
 ALTER TABLE bom_items ADD COLUMN IF NOT EXISTS row_id BIGSERIAL;
-DO $$
-DECLARE sequence_name TEXT;
-BEGIN
-    SELECT pg_get_serial_sequence('bom_items', 'row_id') INTO sequence_name;
-    IF sequence_name IS NOT NULL THEN
-        EXECUTE format('UPDATE bom_items SET row_id = nextval(%L) WHERE row_id IS NULL', sequence_name);
-    END IF;
-END $$;
+-- Some earlier production databases already have a nullable row_id without a
+-- DEFAULT/sequence.  The ORM maps that column as the primary key; rows with a
+-- NULL value therefore materialize as None.  Give every schema a dedicated,
+-- stable sequence before filling historical and seeded records.
+CREATE SEQUENCE IF NOT EXISTS bom_items_row_id_seq;
+ALTER TABLE bom_items ALTER COLUMN row_id SET DEFAULT nextval('bom_items_row_id_seq');
+SELECT setval(
+    'bom_items_row_id_seq',
+    GREATEST(COALESCE((SELECT MAX(row_id) FROM bom_items), 0), 1),
+    TRUE
+);
+UPDATE bom_items
+SET row_id = nextval('bom_items_row_id_seq')
+WHERE row_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_bom_items_row_id ON bom_items(row_id);
 
 -- Current APS task readers materialize the complete ORM object, so align the
