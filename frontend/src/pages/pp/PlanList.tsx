@@ -13,6 +13,7 @@ import type { ColumnsType } from 'antd/es/table'
 import { listPlans, createPlan, confirmPlan, releasePlan, calculateMrp, checkCapacityConflict } from '../../services/modules'
 import DrillDownDrawer from '../../components/trace/DrillDownDrawer'
 import RecordDetailDrawer, { DetailField } from '../../components/trace/RecordDetailDrawer'
+import { getActiveFactoryId } from '../../utils/factory'
 
 const statusMap: Record<string, { color: string; text: string; next?: string }> = {
   draft: { color: 'default', text: '草稿', next: 'confirmed' },
@@ -44,7 +45,7 @@ const MOCK_PLANS = [
 ]
 
 const PlanList: React.FC = () => {
-  const [factory, setFactory] = useState('factory-sh-01')
+  const [factory] = useState(getActiveFactoryId())
   const [data, setData] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
@@ -199,6 +200,8 @@ const PlanList: React.FC = () => {
           )}
           {r.status === 'confirmed' && (
             <Button type="link" size="small" icon={<SendOutlined />}
+              disabled={r.mrp_status !== 'calculated'}
+              title={r.mrp_status !== 'calculated' ? '请先完成 MRP 计算' : undefined}
               onClick={(e) => { e.stopPropagation(); handleStatusAction(r, 'release') }}>下达</Button>
           )}
           <Button type="link" size="small" icon={<CalculatorOutlined />}

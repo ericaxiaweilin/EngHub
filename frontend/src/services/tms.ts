@@ -140,6 +140,7 @@ export const tmsApi = {
     api.get('/api/v1/tms/approvals/pending', { params: { approver_id: approverId } }),
 
   getApprovalFlow: (flowId: string) => api.get(`/api/v1/tms/approvals/${flowId}`),
+  getApprovalFlowDiagram: (flowId: string) => api.get(`/api/v1/tms/approvals/${flowId}/diagram`),
 
   // Agent API
   agentCommand: (data: {

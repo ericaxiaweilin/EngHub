@@ -133,21 +133,21 @@ POSITION_SOPS: Dict[str, Dict[str, Any]] = {
         "daily_flow": [
             {
                 "step": 1,
-                "task": "订单评审",
+                "task": "销售订单评审（Gate 1）",
                 "owner": "PMC计划员",
-                "detail": "把客户需求转换成可计算的需求量、RDD和评审边界，形成是否可进入计划的第一道闸口。",
-                "inputs": ["销售订单/预测版本", "产品型号与需求数量", "RDD/客户收货节点", "BOM与工艺路线版本", "当前库存/在途/开放PO", "APS产能与越南工作日历"],
+                "detail": "接收销售/业务提交的订单，核对需求、RDD、BOM/图纸版本、物料和产能，做出通过或不通过的明确闸口结论。",
+                "inputs": ["销售订单/预测版本", "客户与订单优先级", "产品型号与需求数量", "RDD/客户收货节点", "BOM/图纸/工艺路线版本", "当前库存/在途/开放PO", "APS产能与越南工作日历"],
                 "judgement_criteria": ["订单字段与版本完整", "RDD口径明确且可倒推", "BOM/工艺版本有效", "物料与产能证据可追溯", "预计ETA不晚于RDD；否则只能条件承诺或阻塞"],
-                "outputs": ["评审结论：可计划/条件放行/阻塞", "锁定需求量与RDD", "风险责任人与补证据期限"],
+                "outputs": ["通过：锁定需求量、RDD和有效版本并进入MRP", "不通过：退回补资料或进入交期风险评审", "风险责任人与补证据期限"],
                 "deliverables": ["订单评审记录", "PMC工作矩阵", "MPS可行性初判", "风险/假设清单"],
                 "next_focus": ["通过：进入MRP运算", "条件放行：先跟踪缺口和责任人", "阻塞：不得直接承诺客户交期"],
                 "blockers": ["缺少RDD", "BOM或工艺版本未冻结", "VN工作日历未配置", "库存/PO/产能数据缺失"],
                 "work_matrix": ["需求量", "RDD", "UHN（若企业已定义）", "可加工时间", "库存齐套率", "含PO预计齐套率", "预计ETA"],
                 "systems": ["销售订单", "PMC工作矩阵", "APS日历", "BOM/工艺"],
-                "pass_condition": "需求、RDD、物料和产能证据齐备",
+                "pass_condition": "通过：订单/RDD/版本齐全，物料与产能可行，预计ETA≤RDD",
                 "exception_paths": [
-                    {"condition": "订单/RDD/版本信息缺失", "action": "退回销售/RD补齐", "owner": "销售/RD", "deliverables": ["补齐后的订单与版本确认"], "return_to": "current"},
-                    {"condition": "ETA晚于RDD或产能不足", "action": "发起交付风险评审", "owner": "PMC主管/生产主管", "deliverables": ["加班/外协/改期方案"], "return_to": "current"},
+                    {"condition": "不通过：订单/RDD/BOM/图纸/工艺版本缺失", "action": "退回销售/RD补齐资料", "owner": "销售/RD", "outputs": ["补齐后的订单包与版本确认"], "deliverables": ["退回原因", "补资料责任人", "补齐期限"], "resume_condition": "资料补齐并重新提交订单评审", "return_to": "current"},
+                    {"condition": "不通过：ETA晚于RDD或产能不可行", "action": "发起跨部门交期风险评审", "owner": "PMC主管/生产主管/销售", "inputs": ["缺料清单", "瓶颈负荷", "原RDD"], "outputs": ["加班/外协/分批/改期方案"], "deliverables": ["风险评审结论", "新承诺日期或资源方案"], "resume_condition": "方案获批且更新订单承诺后重新评审", "return_to": "current"},
                 ],
             },
             {
@@ -163,10 +163,10 @@ POSITION_SOPS: Dict[str, Dict[str, Any]] = {
                 "blockers": ["BOM用量缺失", "库存状态不合格", "PO无可靠ETA", "替代料未验证"],
                 "matrix_fields": ["required_qty", "qualified_available_qty", "in_transit_qty", "on_order_qty", "shortage_qty", "supplier_lead_days"],
                 "systems": ["MRP", "库存", "采购订单", "IQC"],
-                "pass_condition": "库存齐套或可信供应覆盖全部缺口",
+                "pass_condition": "通过：库存齐套，或已确认PO/在途可在需求日前完成IQC放行",
                 "exception_paths": [
-                    {"condition": "关键料缺口且无可靠ETA", "action": "升级采购主管并评估改期", "owner": "采购主管/PMC主管", "deliverables": ["供应恢复日期或改期建议"], "return_to": "current"},
-                    {"condition": "存在可替代料", "action": "发起替代料验证", "owner": "RD/品质/采购", "deliverables": ["替代料批准记录"], "return_to": "current"},
+                    {"condition": "不通过：关键料缺口且无可靠ETA", "action": "升级采购主管并评估改期", "owner": "采购主管/PMC主管", "outputs": ["供应恢复日期或改期建议"], "deliverables": ["缺料升级记录", "责任人与恢复ETA"], "resume_condition": "供应ETA覆盖需求日后重新齐套判断", "return_to": "current"},
+                    {"condition": "不通过但存在可替代料", "action": "发起替代料验证", "owner": "RD/品质/采购", "outputs": ["批准/拒绝替代料结论"], "deliverables": ["替代料验证与批准记录"], "resume_condition": "替代料获批并有合格库存后重新齐套判断", "return_to": "current"},
                 ],
             },
             {
@@ -276,6 +276,165 @@ POSITION_SOPS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# ==================== 独立业务流程注册表 ====================
+# 岗位端到端流程与独立子流程必须使用不同注册键。模型只负责识别对象，
+# 流程引擎只按注册定义出图；未知对象不得回退到 PMC 或最近审批实例。
+
+BUSINESS_WORKFLOW_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "process:alternate_material_validation": {
+        "title": "替代料验证与受控放行流程图",
+        "aliases": ["发起替代料验证", "替代料验证", "代用料验证", "替代物料验证", "alternative material validation"],
+        "description": "从缺料/变更需求提出候选替代料，经过技术等效、供应商资料、样品试验、批准或拒绝、主数据更新，最终受控放行。",
+        "role": "RD/品质/采购",
+        "start_title": "替代需求与候选料输入",
+        "start_summary": "提交原物料、候选替代料、使用场景、需求日期和缺料/变更证据。",
+        "end_title": "受控放行或拒绝关闭",
+        "end_summary": "批准时完成版本与库存状态更新后受控放行；拒绝时保留结论并关闭候选。",
+        "metadata": {
+            "workflow_domain": "物料变更/工程验证",
+            "process_scope": "standalone",
+            "parent_contexts": ["MRP缺料处理", "采购降本", "供应中断", "工程变更"],
+            "related_parties": ["需求提出方", "PMC", "采购", "供应商", "RD/工程", "品质/SQE/IQC", "生产", "仓库", "文控/主数据"],
+            "related_tools": ["BOM/PLM", "规格书/图纸", "供应商资料", "检验/试验记录", "ECN/变更单", "ERP物料主数据", "AVL", "库存状态"],
+            "forbid_parent_workflow_fallback": True,
+        },
+        "steps": [
+            {
+                "step": 1,
+                "task": "提交替代料验证申请",
+                "owner": "需求提出方/PMC/采购",
+                "detail": "说明替代原因、原物料与候选料、适用产品/订单、需求日期及临时或永久替代范围。",
+                "inputs": ["原物料编码与版本", "候选替代料编码/供应商", "缺料或降本证据", "适用产品/BOM/订单", "需求日期", "临时/永久替代类型"],
+                "judgement_criteria": ["原料与候选料唯一可识别", "替代原因和范围明确", "需求日期与申请人完整"],
+                "outputs": ["替代料验证申请", "验证范围与优先级", "责任人和目标完成日"],
+                "deliverables": ["替代料申请单", "原料-候选料对照表"],
+                "systems": ["替代料申请", "BOM/ERP", "缺料清单"],
+                "pass_condition": "申请资料完整且候选料、适用范围、目标日期明确",
+                "exception_paths": [
+                    {"condition": "申请缺少原料/候选料/适用范围或需求日期", "action": "退回提出方补齐申请", "owner": "需求提出方", "deliverables": ["退回原因与补齐清单"], "resume_condition": "资料补齐后重新提交", "return_to": "current"},
+                ],
+            },
+            {
+                "step": 2,
+                "task": "技术等效性预评审",
+                "owner": "RD/工程",
+                "detail": "对照规格、尺寸、材料、性能、接口、法规和工艺适配性，判定是否值得进入样品验证。",
+                "inputs": ["原料与候选料规格书", "图纸/材料声明", "关键特性CTQ", "法规与客户特殊要求", "现行工艺条件"],
+                "judgement_criteria": ["关键规格满足或有可验证差异", "接口/尺寸/材料兼容", "法规与客户限制允许", "风险可通过试验覆盖"],
+                "outputs": ["技术差异清单", "预评审通过/拒绝结论", "需要验证的风险项目"],
+                "deliverables": ["技术等效性评审记录", "风险等级"],
+                "systems": ["PLM/图纸", "规格书", "法规资料库"],
+                "pass_condition": "技术预评审通过，差异与验证风险已量化",
+                "exception_paths": [
+                    {"condition": "存在不可接受的规格/接口/法规差异", "action": "拒绝该候选并要求重新选料", "owner": "RD/工程", "outputs": ["拒绝原因"], "deliverables": ["技术拒绝记录"], "resume_condition": "提交新候选料后重新申请", "return_to": 0},
+                    {"condition": "资料不足以判断技术等效性", "action": "要求供应商补规格和声明", "owner": "采购/供应商", "deliverables": ["资料缺口清单"], "resume_condition": "资料齐全后重新预评审", "return_to": "current"},
+                ],
+            },
+            {
+                "step": 3,
+                "task": "供应商资料与样品齐备",
+                "owner": "采购/SQE/供应商",
+                "detail": "收集合格供应商、材质/环保/可靠性资料、批次追溯信息，并取得可验证样品。",
+                "inputs": ["供应商资质与AVL状态", "COC/材质证明", "RoHS/REACH等声明", "样品数量与批次", "报价与供应LT"],
+                "judgement_criteria": ["供应商准入状态有效或已启动临时准入", "文件版本有效", "样品数量和批次满足验证计划", "样品可追溯"],
+                "outputs": ["供应商资料包", "可追溯样品", "供应能力与LT结论"],
+                "deliverables": ["资料检查表", "样品接收记录"],
+                "systems": ["SRM/AVL", "供应商文件", "样品台账"],
+                "pass_condition": "供应商资料有效且样品数量、批次、追溯信息齐备",
+                "exception_paths": [
+                    {"condition": "供应商未准入、文件过期或样品不足", "action": "暂停验证并跟催供应商补齐", "owner": "采购/SQE", "deliverables": ["缺口与承诺日期"], "resume_condition": "准入/文件/样品全部齐备", "return_to": "current"},
+                ],
+            },
+            {
+                "step": 4,
+                "task": "制定并批准验证计划",
+                "owner": "RD/品质/生产",
+                "detail": "根据技术差异和风险等级确定尺寸、功能、可靠性、试产及检验项目、样本量和接受标准。",
+                "inputs": ["技术差异清单", "风险等级", "客户/法规要求", "样品与设备资源", "历史不良模式"],
+                "judgement_criteria": ["每项风险都有对应试验", "样本量和接受标准明确", "责任人、设备和完成日期可执行", "需要客户批准时已列入"],
+                "outputs": ["验证项目与样本量", "接受/拒绝标准", "试验责任人与排期"],
+                "deliverables": ["获批验证计划", "试产/测试排程"],
+                "systems": ["验证计划", "实验室/设备日历", "试产计划"],
+                "pass_condition": "验证计划覆盖全部风险并获RD、品质及相关方确认",
+                "exception_paths": [
+                    {"condition": "风险未覆盖、标准不清或验证资源不可用", "action": "修订验证计划与资源安排", "owner": "RD/品质/生产", "deliverables": ["修订版验证计划"], "resume_condition": "计划获批且资源锁定", "return_to": "current"},
+                ],
+            },
+            {
+                "step": 5,
+                "task": "执行样品试验与试产验证",
+                "owner": "RD/品质/生产",
+                "detail": "按获批计划执行来料、尺寸、功能、可靠性和必要的试产验证，完整记录原始数据与异常。",
+                "inputs": ["获批验证计划", "可追溯样品", "检验/试验设备", "试产工单与工艺参数"],
+                "judgement_criteria": ["试验按计划和有效方法执行", "原始数据可追溯", "所有接受标准逐项判定", "异常有隔离与调查记录"],
+                "outputs": ["逐项试验结果", "试产良率与异常", "通过/失败建议"],
+                "deliverables": ["验证报告", "原始数据", "试产记录", "不符合项清单"],
+                "systems": ["检验/实验室", "试产工单", "NCR/异常记录"],
+                "pass_condition": "全部关键项目满足接受标准且试产风险可接受",
+                "exception_paths": [
+                    {"condition": "试验失败但原因可纠正并允许复测", "action": "隔离样品、完成原因分析后申请复测", "owner": "RD/品质/供应商", "deliverables": ["原因分析与复测申请"], "resume_condition": "纠正措施完成且复测计划获批", "return_to": "current"},
+                    {"condition": "关键项目失败或风险不可接受", "action": "判定候选料验证失败并重新选料", "owner": "RD/品质", "deliverables": ["失败结论与禁用原因"], "resume_condition": "提交新候选料后重新申请", "return_to": 0},
+                ],
+            },
+            {
+                "step": 6,
+                "task": "验证结论评审与批准",
+                "owner": "RD/品质/采购/需求部门",
+                "detail": "汇总技术、质量、供应和成本证据，批准永久替代、限时/限批替代，或拒绝候选。",
+                "inputs": ["验证报告与原始数据", "试产结果", "供应能力/成本/LT", "未关闭风险", "客户批准要求"],
+                "judgement_criteria": ["关键试验全部通过", "残余风险有控制措施", "替代范围和有效期明确", "所需客户/主管批准完成"],
+                "outputs": ["批准/条件批准/拒绝结论", "适用产品与订单范围", "有效期/批次与控制条件"],
+                "deliverables": ["签核后的替代料验证报告", "风险接受记录"],
+                "systems": ["工程变更/ECN", "电子签核", "客户批准记录"],
+                "pass_condition": "替代结论获相关责任方批准，范围、期限和控制条件明确",
+                "exception_paths": [
+                    {"condition": "证据不足、残余风险未接受或批准被驳回", "action": "退回补试验、补批准或重新选料", "owner": "RD/品质/申请方", "deliverables": ["驳回原因与补充行动"], "resume_condition": "证据与批准补齐后重新评审", "return_to": "current"},
+                ],
+            },
+            {
+                "step": 7,
+                "task": "主数据更新与受控放行",
+                "owner": "文控/工程/PMC/仓库/IQC",
+                "detail": "按批准范围更新BOM、AVL、检验标准和ERP状态，区分临时/永久替代并通知执行部门。",
+                "inputs": ["已批准替代结论", "适用范围/有效期/批次", "BOM与AVL变更内容", "检验与仓储控制要求"],
+                "judgement_criteria": ["BOM/AVL/ERP版本一致", "临时替代有效期和批次受控", "IQC与仓库状态已更新", "相关订单与部门已通知"],
+                "outputs": ["可用替代料主数据", "更新后的BOM/AVL/检验标准", "受控库存与订单放行状态"],
+                "deliverables": ["ECN/版本记录", "ERP变更日志", "放行通知", "到期复审任务"],
+                "systems": ["BOM/PLM", "ERP物料主数据", "AVL", "IQC检验标准", "库存状态"],
+                "pass_condition": "所有主数据和控制点同步完成，替代料按批准范围可追溯放行",
+                "exception_paths": [
+                    {"condition": "BOM/AVL/ERP/检验标准未同步或库存状态不一致", "action": "保持冻结并完成主数据纠正", "owner": "文控/工程/IT主数据/IQC", "deliverables": ["未放行清单与纠正记录"], "resume_condition": "系统版本一致且控制点复核通过", "return_to": "current"},
+                ],
+            },
+        ],
+    },
+    "process:work_order_lifecycle": {
+        "title": "生产工单全生命周期流程图",
+        "aliases": ["工单流程图", "工单全生命周期", "生产工单流程", "work order lifecycle"],
+        "description": "生产工单从创建、下达、派工、执行、报工、质检、完工到关闭入库的完整流转。",
+        "role": "生产运营团队",
+        "start_title": "订单/计划需求输入",
+        "end_title": "工单关闭与入库归档",
+        "metadata": {"workflow_domain": "生产工单", "process_scope": "end_to_end", "related_parties": ["PMC", "生产主管", "班组/操作员", "品检", "仓库", "设备/工程"]},
+        "steps": [
+            {
+                "step": index + 1,
+                "task": stage["stage"],
+                "owner": stage["role"],
+                "detail": stage["actions"],
+                "inputs": ["上一阶段已确认状态", "工单主数据与版本"],
+                "judgement_criteria": [f"满足进入{stage['stage']}阶段的状态和责任要求"],
+                "outputs": [f"工单状态：{stage['status']}", f"{stage['stage']}阶段执行记录"],
+                "deliverables": [f"{stage['stage']}留痕"],
+                "pass_condition": f"{stage['stage']}完成并满足下一阶段门槛",
+                "exception_paths": [{"condition": stage["blockpoint"], "action": "按卡点责任链处理并补齐证据", "owner": stage["role"], "resume_condition": f"卡点关闭后重新确认{stage['stage']}", "return_to": "current"}],
+            }
+            for index, stage in enumerate(WORK_ORDER_FLOW)
+        ],
+    },
+}
+
+
 # ==================== RACI 责任矩阵（工单流阶段 × 角色） ====================
 # R=执行(Responsible) A=负责(Accountable) C=咨询(Consulted) I=知会(Informed)
 
@@ -310,6 +469,159 @@ def _match_position(keyword: str) -> Optional[Dict[str, Any]]:
     return entry[1] if entry else None
 
 
+def get_workflow_catalog() -> List[Dict[str, Any]]:
+    """返回流程引擎可渲染对象；供模型工具说明和流程目录使用。"""
+    processes = [
+        {
+            "workflow_key": key,
+            "scope": definition.get("metadata", {}).get("process_scope", "process"),
+            "title": definition["title"],
+            "aliases": definition.get("aliases", []),
+            "description": definition.get("description", ""),
+            "step_count": len(definition.get("steps", [])),
+        }
+        for key, definition in BUSINESS_WORKFLOW_REGISTRY.items()
+    ]
+    positions = [
+        {
+            "workflow_key": "pmc:end_to_end" if key == "pmc_planner" else f"position:{key}",
+            "scope": "position_end_to_end",
+            "title": f"{sop['title']} 工作流",
+            "aliases": sop.get("aliases", []),
+            "description": sop.get("duties", ""),
+            "step_count": len(sop.get("daily_flow", [])),
+        }
+        for key, sop in POSITION_SOPS.items()
+    ]
+    return processes + positions
+
+
+def _match_business_workflow(selector: str) -> Optional[tuple[str, Dict[str, Any]]]:
+    if not selector:
+        return None
+    normalized = selector.strip().casefold()
+    if normalized in BUSINESS_WORKFLOW_REGISTRY:
+        return normalized, BUSINESS_WORKFLOW_REGISTRY[normalized]
+    candidates: List[tuple[int, str, Dict[str, Any]]] = []
+    for key, definition in BUSINESS_WORKFLOW_REGISTRY.items():
+        for alias in [key, definition.get("title", ""), *definition.get("aliases", [])]:
+            alias_text = str(alias).strip().casefold()
+            if alias_text and (alias_text in normalized or normalized in alias_text):
+                candidates.append((len(alias_text), key, definition))
+    if not candidates:
+        return None
+    _, key, definition = max(candidates, key=lambda item: item[0])
+    return key, definition
+
+
+def build_registered_workflow_diagram(
+    workflow_key: str = "",
+    process_name: str = "",
+    position: str = "",
+    current_step: int = 0,
+) -> Dict[str, Any]:
+    """按明确注册对象出图；未知对象返回目录，绝不回退到 PMC 父流程。"""
+    from core.workflow_diagram_engine import build_business_flow_diagram
+
+    key = (workflow_key or "").strip()
+    if key in {"pmc", "pmc:end_to_end", "position:pmc_planner"}:
+        return build_pmc_workflow_diagram(current_step=current_step)
+    if key.startswith("position:"):
+        return build_position_workflow_diagram(key.split(":", 1)[1], current_step=current_step)
+    if position:
+        return build_position_workflow_diagram(position, current_step=current_step)
+
+    selector = key or (process_name or "").strip()
+    entry = _match_business_workflow(selector)
+    if not entry:
+        return {
+            "type": "workflow_diagram",
+            "source": "business_workflow_registry",
+            "error": f"未找到已注册业务流程：{selector or '未指定'}",
+            "requested_scope": "standalone_process" if process_name else "unknown",
+            "available_workflows": get_workflow_catalog(),
+            "hint": "请明确要画岗位端到端流程还是独立业务子流程；系统不会用 PMC 父流程代替未知流程。",
+        }
+    registry_key, definition = entry
+    diagram = build_business_flow_diagram(
+        workflow_key=registry_key,
+        title=definition["title"],
+        role=definition.get("role"),
+        description=definition.get("description", ""),
+        steps=definition.get("steps", []),
+        current_step=current_step,
+        source="business_workflow_registry",
+        metadata={
+            "registry_key": registry_key,
+            "requested_process": process_name or definition["title"],
+            **definition.get("metadata", {}),
+        },
+    )
+    start_node = next(node for node in diagram["nodes"] if node.get("id") == "start")
+    end_node = next(node for node in diagram["nodes"] if node.get("id") == "end")
+    start_node.update({
+        "label": definition.get("start_title", "业务需求输入"),
+        "title": definition.get("start_title", "业务需求输入"),
+        "summary": definition.get("start_summary", definition.get("description", "")),
+    })
+    end_node.update({
+        "label": definition.get("end_title", "流程闭环"),
+        "title": definition.get("end_title", "流程闭环"),
+        "summary": definition.get("end_summary", "所有流程证据闭环。"),
+    })
+    return {
+        "type": "workflow_diagram",
+        "source": "business_workflow_registry",
+        "workflow_key": registry_key,
+        "title": diagram["title"],
+        "scope": definition.get("metadata", {}).get("process_scope", "standalone"),
+        "diagram": diagram,
+    }
+
+
+def build_pmc_workflow_diagram(current_step: int = 0) -> Dict[str, Any]:
+    """PMC专用端到端流程；不经过审批实例，也绝不回退到DCC。"""
+    from core.workflow_diagram_engine import build_business_flow_diagram
+
+    sop = POSITION_SOPS["pmc_planner"]
+    diagram = build_business_flow_diagram(
+        workflow_key="pmc:end_to_end",
+        title="PMC端到端工作流程图（销售订单评审→交付闭环）",
+        role=sop["title"],
+        description="从销售订单输入开始，经过订单评审、MRP齐套、产能排程、工单释放、执行监控，直到交付闭环；每个Gate同时保留通过与不通过/Fallback路径。",
+        steps=sop.get("daily_flow", []),
+        current_step=current_step,
+        source="pmc_workflow_registry",
+        metadata={
+            "workflow_domain": "PMC",
+            "position_key": "pmc_planner",
+            "position_title": sop["title"],
+            "related_parties": ["销售/业务", "RD/工程", "采购", "仓库", "IQC/品质", "生产主管", "车间/班组", "物流/关务"],
+            "escalation": sop.get("escalation"),
+            "related_tools": sop.get("related_tools"),
+            "forbid_approval_fallback": True,
+        },
+    )
+    next(node for node in diagram["nodes"] if node.get("id") == "start").update({
+        "label": "销售订单输入",
+        "title": "销售订单输入",
+        "summary": "销售/业务提交订单、需求数量、RDD和产品版本资料。",
+    })
+    next(node for node in diagram["nodes"] if node.get("id") == "end").update({
+        "label": "交付承诺与订单闭环",
+        "title": "交付承诺与订单闭环",
+        "summary": "质量、数量、出货与ETA证据闭环，完成客户交付承诺和复盘。",
+    })
+    return {
+        "type": "workflow_diagram",
+        "source": "pmc_workflow_registry",
+        "workflow_key": "pmc:end_to_end",
+        "title": diagram["title"],
+        "position": sop["title"],
+        "diagram": diagram,
+    }
+
+
 def build_position_workflow_diagram(position: str, current_step: int = 0) -> Dict[str, Any]:
     """把职位SOP送入通用流程引擎；所有职位共用同一图契约。"""
     from core.workflow_diagram_engine import build_business_flow_diagram
@@ -324,6 +636,8 @@ def build_position_workflow_diagram(position: str, current_step: int = 0) -> Dic
             "hint": "请指定职位名称，例如 PMC、品检员、操作员或生产主管。",
         }
     key, sop = entry
+    if key == "pmc_planner":
+        return build_pmc_workflow_diagram(current_step=current_step)
     diagram = build_business_flow_diagram(
         workflow_key=f"position:{key}",
         title=f"{sop['title']} 工作流",
@@ -445,7 +759,11 @@ def query_knowledge(topic: str = "", keyword: str = "") -> Dict[str, Any]:
 __all__ = [
     "WORK_ORDER_FLOW",
     "POSITION_SOPS",
+    "BUSINESS_WORKFLOW_REGISTRY",
     "RACI_MATRIX",
     "query_knowledge",
+    "get_workflow_catalog",
+    "build_registered_workflow_diagram",
+    "build_pmc_workflow_diagram",
     "build_position_workflow_diagram",
 ]

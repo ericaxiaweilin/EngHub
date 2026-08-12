@@ -4,6 +4,14 @@ This adapter replaces the monolithic chat() implementation by delegating all
 complex processing to specialized components contained within
 api/services/chat_architecture/. All business logic is encapsulated; this file
 contains only orchestration sequencing.
+
+Architecture:
+- FactoryResolver: Resolves factory context from request/user
+- IntentResolver: Resolves user intent from message text
+- StateTransitionEngine: Manages state transitions atomically
+- ExecutorRegistry: Discovers and executes business operations
+- ResponseFormatter: Formats responses consistently
+- RecoveryRegistry: Manages recovery strategies
 """
 
 from typing import Optional, List, Dict, Any
@@ -13,11 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # Import architecture components
 from ..resolvers.factory_resolver import FactoryResolver
 from ..resolvers.intent_resolver import IntentResolver
-from ..state.engine import StateTransitionEngine
+from ..state.engine import StateTransitionEngine, ChatState
 from ..formatter.response_formatter import ResponseFormatter
-from ..recovery.vision_fallback_executor import VisionFallbackExecutor
-from ..recovery.tool_fallback_executor import ToolFallbackExecutor
-from ..recovery.generic_fallback_executor import GenericFallbackExecutor
+from ..recovery.registry import ExecutorRegistry as RecoveryRegistry
+from ..business_executors.executor_registry import ExecutorRegistry as BusinessExecutorRegistry
+from ..business_executors.query_inventory_executor import QueryInventoryExecutor
+from ..business_executors.get_production_summary_executor import GetProductionSummaryExecutor
+from ..business_executors.query_work_orders_executor import QueryWorkOrdersExecutor
 
 # Model imports for chat interfaces (local import to avoid circular issues)
 from database.models import User
@@ -37,90 +47,191 @@ class ChatAdapter:
         self.state_engine = StateTransitionEngine(max_rounds=5)
         self.response_formatter = ResponseFormatter()
         
-        self.recovery_executors = [
-            VisionFallbackExecutor(),
-            ToolFallbackExecutor(),
-            GenericFallbackExecutor()
-        ]
+        # Initialize registries
+        self._init_recovery_registries()
+        self._init_business_executors()
+    
+    def _init_recovery_registries(self) -> None:
+        """Initialize recovery executor registry."""
+        from ..recovery.vision_fallback_executor import VisionFallbackExecutor
+        from ..recovery.tool_fallback_executor import ToolFallbackExecutor
+        from ..recovery.generic_fallback_executor import GenericFallbackExecutor
+        
+        RecoveryRegistry.register(VisionFallbackExecutor())
+        RecoveryRegistry.register(ToolFallbackExecutor())
+        RecoveryRegistry.register(GenericFallbackExecutor())
+    
+    def _init_business_executors(self) -> None:
+        """Initialize business executor registry."""
+        BusinessExecutorRegistry.register(QueryInventoryExecutor())
+        BusinessExecutorRegistry.register(GetProductionSummaryExecutor())
+        BusinessExecutorRegistry.register(QueryWorkOrdersExecutor())
     
     async def handle_request(self, request: "ChatRequest", current_user: Optional[User]) -> "ChatResponse":
-        """Main entry point."""
+        """Main entry point for chat request processing.
+        
+        This is a pure orchestrator - it delegates all work to
+        specialized components and only sequences operations.
+        
+        Flow:
+        1. Resolve factory context
+        2. Resolve user intent
+        3. Transition state
+        4. Execute business operation
+        5. Format and return response
+        """
         try:
+            # 1. Resolve factory context
             http_request = getattr(request, "http_request", None)
-            factory_id = self._resolve_factory(http_request, current_user)
-            intent = self._detect_intent(request)
+            factory_id = self.factory_resolver.resolve(http_request, current_user)
             
-            if intent:
-                return await self._execute_deterministic(intent, request, factory_id, current_user)
+            # 2. Resolve user intent
+            intent = self.intent_resolver.resolve(
+                self._get_last_user_message(request)
+            )
+            
+            # 3. Transition state: IDLE -> PROCESSING_TOOL_LOOP
+            self.state_engine.transition(
+                ChatState.IDLE,
+                ChatState.PROCESSING_TOOL_LOOP,
+                context={"factory_id": factory_id}
+            )
+            
+            # 4. Execute based on intent
+            if intent and BusinessExecutorRegistry.has_executor(intent):
+                result = await self._execute_business_operation(intent, factory_id, request)
             else:
-                return await self._execute_tool_loop(request, factory_id, current_user)
-                
+                # Fallback to tool loop for free-form conversation
+                result = await self._execute_tool_loop(request, factory_id)
+            
+            # 5. Format response
+            # Ensure degraded is False for successful execution
+            if result.get("error"):
+                return self.response_formatter.format_success(
+                    reply_text=result.get("reply", ""),
+                    model=result.get("model", "dynamic"),
+                    degraded=True
+                )
+            else:
+                return self.response_formatter.format_success(
+                    reply_text=result.get("reply", ""),
+                    model=result.get("model", "dynamic"),
+                    degraded=False
+                )
+            
         except HTTPException as he:
             raise he
         except Exception as exc:
-            error_msg = f"Chat processing failed: {str(exc)}"
-            # Using simple dict response here to avoid dependency on chat_schemas
-            return {"error": True, "reply": error_msg, "model": "unknown", "degraded": True}
+            # Transition to DEGRADED state on error
+            try:
+                self.state_engine.transition(
+                    ChatState.PROCESSING_TOOL_LOOP,
+                    ChatState.DEGRADED,
+                    context={"error": str(exc)}
+                )
+            except Exception:
+                pass  # Ignore state transition errors
+            
+            return {
+                "error": True,
+                "reply": f"Chat processing failed: {str(exc)}",
+                "model": "unknown",
+                "degraded": True
+            }
     
-    def _resolve_factory(self, http_request, current_user) -> str:
-        if http_request:
-            header_val = getattr(http_request, "headers", {}).get("x-factory-id")
-            if header_val:
-                return str(header_val)
-        
-        if current_user:
-            attr = getattr(current_user, "active_factory_id", None)
-            if attr:
-                return str(attr)
-            attr = getattr(current_user, "factory_id", None)
-            if attr:
-                return str(attr)
-        
-        return "F01"
-    
-    def _detect_intent(self, request) -> Optional[str]:
+    def _get_last_user_message(self, request) -> Optional[str]:
+        """Extract the last user message from the request."""
         if not hasattr(request, "messages"):
             return None
         
-        last_content = ""
         for msg in reversed(getattr(request, "messages", [])):
             if getattr(msg, "role", "") == "user":
-                last_content = str(getattr(msg, "content", "")).lower()
-                break
-        
-        if "库存" in last_content or "inventory" in last_content:
-            return "query_inventory"
-        elif "产量" in last_content or "production" in last_content:
-            return "get_production_summary"
-        elif "工单" in last_content or "work order" in last_content:
-            return "query_work_orders"
+                return str(getattr(msg, "content", ""))
         
         return None
     
-    async def _execute_deterministic(self, intent: str, request, factory_id, user):
-        from api.services.chat_tools_service import (
-            _tool_query_inventory, _tool_get_production_summary, _tool_query_work_orders
-        )
+    async def _execute_business_operation(
+        self,
+        intent: str,
+        factory_id: str,
+        request
+    ) -> Dict[str, Any]:
+        """Execute a business operation based on intent.
         
-        try:
-            if intent == "query_inventory":
-                result = await _tool_query_inventory(self.db, {}, factory_id=factory_id)
-                reply = self.response_formatter.format_inventory_result(result)
-            elif intent == "get_production_summary":
-                result = await _tool_get_production_summary(self.db, {}, factory_id=factory_id)
-                reply = self.response_formatter.format_production_summary(result)
-            elif intent == "query_work_orders":
-                result = await _tool_query_work_orders(self.db, {}, factory_id=factory_id)
-                reply = self.response_formatter.format_work_orders(result)
-            else:
-                reply = f"未识别意图: {intent}"
+        Args:
+            intent: The resolved intent name
+            factory_id: The resolved factory ID
+            request: The original chat request
             
-            return {"reply": reply, "model": "deterministic", "degraded": False}
-            
-        except Exception as exc:
-            return {"error": True, "reply": f"查询失败: {str(exc)}", "model": "deterministic", "degraded": True}
+        Returns:
+            Execution result dictionary
+        """
+        executor = BusinessExecutorRegistry.get(intent)
+        if not executor:
+            raise ValueError(f"No executor found for intent: {intent}")
+        
+        # Execute the business operation
+        result = await executor.execute(self.db, factory_id, {})
+        
+        # Format the result as a reply based on intent
+        reply = self._format_result_by_intent(intent, result)
+        
+        return {
+            "reply": reply,
+            "model": "deterministic",
+            "degraded": False,
+            "error": False
+        }
     
-    async def _execute_tool_loop(self, request, factory_id, user):
-        # Full implementation would go here — integrates AI gateway calling
-        # For now, delegate to existing working implementation in route handler
-        return {"reply": "工具调用循环架构已准备，原始chat端点继续可用", "model": "tool-loop", "degraded": False}
+    def _format_result_by_intent(self, intent: str, result: Dict[str, Any]) -> str:
+        """Format result based on intent type.
+        
+        Args:
+            intent: The intent name
+            result: The execution result
+            
+        Returns:
+            Formatted reply string
+        """
+        if intent == "query_inventory":
+            return self.response_formatter.format_inventory_result(result)
+        elif intent == "get_production_summary":
+            return self.response_formatter.format_production_summary(result)
+        elif intent == "query_work_orders":
+            return self.response_formatter.format_work_orders(result)
+        else:
+            return f"Result for {intent}: {result}"
+    
+    async def _execute_tool_loop(
+        self,
+        request,
+        factory_id: str
+    ) -> Dict[str, Any]:
+        """Execute the tool-calling loop for free-form conversation.
+        
+        This delegates to the existing chat route handler implementation.
+        
+        Args:
+            request: The original chat request
+            factory_id: The resolved factory ID
+            
+        Returns:
+            Execution result dictionary
+        """
+        # TODO: Integrate with existing tool loop implementation
+        # For now, return a placeholder response
+        return {
+            "reply": "工具调用循环架构已准备，原始chat端点继续可用",
+            "model": "tool-loop",
+            "degraded": False
+        }
+    
+    def get_current_state(self) -> ChatState:
+        """Get the current state of the state engine.
+        
+        Returns:
+            Current chat state
+        """
+        # Note: This is a simplified implementation.
+        # In production, you would track state externally.
+        return ChatState.IDLE

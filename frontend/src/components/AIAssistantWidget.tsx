@@ -22,6 +22,7 @@ import TaskCenter from '../pages/collab/TaskCenter'
 
 // Univer 电子表格（懒加载：仅在用户点击"在电子表格中打开"时才下载分包）
 const SpreadsheetEditor = lazy(() => import('./SpreadsheetEditor'))
+const WorkflowCanvasEditor = lazy(() => import('./WorkflowCanvasEditor'))
 import api from '../services/api'
 import { tmsApi } from '../services/tms'
 import { getStoredUser, logout } from '../services/auth'
@@ -29,23 +30,22 @@ import { getStoredUser, logout } from '../services/auth'
 const { Text } = Typography
 const { TextArea } = Input
 
-function EngineFlowDiagram({ diagram }: { diagram: FlowDiagram }) {
+function EngineFlowDiagram({ diagram: sourceDiagram }: { diagram: FlowDiagram }) {
+  const [diagram, setDiagram] = useState<FlowDiagram>(sourceDiagram)
+  const sourceDiagramKey = sourceDiagram.workflow_key || sourceDiagram.flow_id || sourceDiagram.flow_code || sourceDiagram.title || 'workflow'
+  useEffect(() => setDiagram(sourceDiagram), [sourceDiagramKey])
   const processKinds = ['approval', 'task', 'decision']
   const mainNodes = diagram.nodes.filter(node => ['start', ...processKinds, 'end'].includes(node.kind || ''))
   const processNodes = mainNodes.filter(node => processKinds.includes(node.kind || ''))
-  const branches = diagram.edges.filter(edge => edge.type && edge.type !== 'normal')
-  const nodeLabels = new Map(diagram.nodes.map(node => [node.id, node.title || node.label || node.id]))
+  const nodeMap = new Map(diagram.nodes.map(node => [node.id, node]))
   const initialNode = processNodes.find(node => node.status === 'current') || processNodes[0] || mainNodes[0]
   const [selectedNodeId, setSelectedNodeId] = useState(initialNode?.id || '')
-  const selectedNode = diagram.nodes.find(node => node.id === selectedNodeId)
+  const selectedNode = nodeMap.get(selectedNodeId)
   useEffect(() => {
     const next = processNodes.find(node => node.status === 'current') || processNodes[0] || mainNodes[0]
     setSelectedNodeId(next?.id || '')
   }, [diagram.workflow_key, diagram.flow_id, diagram.flow_code])
-  const statusColor: Record<string, string> = {
-    completed: '#52c41a', current: '#1677ff', pending: '#bfbfbf', rejected: '#f5222d', inactive: '#d9d9d9',
-  }
-  const nodeColor = (node: FlowDiagramNode) => statusColor[node.status || 'pending'] || '#bfbfbf'
+
   const isBusinessFlow = diagram.flow_type === 'business_workflow'
   const currentLabel = diagram.status === 'reference'
     ? `参考流程 · 默认聚焦第 ${(diagram.current_step ?? 0) + 1} 步`
@@ -64,91 +64,77 @@ function EngineFlowDiagram({ diagram }: { diagram: FlowDiagram }) {
     if (!values.length) return <Text type="secondary">流程定义未配置</Text>
     return <ul style={{ margin: 0, paddingLeft: 18 }}>{values.map((item, index) => <li key={index}>{readableItem(item)}</li>)}</ul>
   }
-  const detailBlock = (title: string, value: any, color = '#595959', background = '#fff') => (
-    <div style={{ border: '1px solid #e8edf3', borderRadius: 7, padding: '8px 9px', minHeight: 68, background }}>
-      <div style={{ color, fontWeight: 650, fontSize: 11, marginBottom: 5 }}>{title}</div>
-      <div style={{ color: '#465568', fontSize: 10, lineHeight: '18px', wordBreak: 'break-word' }}>{displayList(value)}</div>
-    </div>
-  )
-  const selectedBranches = selectedNode
-    ? branches.filter(edge => edge.source === selectedNode.id || edge.target === selectedNode.id)
-    : []
-  const visibleBranches = selectedBranches.length ? selectedBranches : branches
+  const compactList = (value: any, limit = 3) => {
+    const values = arrayValue(value).map(readableItem).filter(Boolean)
+    return values.length ? `${values.slice(0, limit).join('、')}${values.length > limit ? ` 等${values.length}项` : ''}` : '未配置'
+  }
   const nextAction = arrayValue(selectedNode?.next_focus)[0] || selectedNode?.action || selectedNode?.summary
-  const kindLabel: Record<string, string> = { approval: '审批', task: '执行', decision: '判断', exception: '异常' }
+  const kindLabel: Record<string, string> = { approval: '审批', task: '执行', decision: '判断', fallback: 'Fallback' }
+  const fallbackEdges = diagram.edges.filter(edge => edge.type === 'fallback' || edge.path === 'fallback' && edge.type !== 'recovery')
+
+  const boundaryRows = [
+    ['流程输入', diagram.inputs, '#0958d9'],
+    ['关联方', diagram.related_parties, '#531dab'],
+    ['关联系统', diagram.systems, '#d46b08'],
+    ['最终输出', diagram.outputs, '#237804'],
+  ] as const
 
   return (
     <div style={{ marginTop: 8, background: '#fff', border: '1px solid #cfe3f6', borderRadius: 10, overflow: 'hidden', boxShadow: '0 4px 16px rgba(16,42,67,.07)' }}>
       <div style={{ padding: '10px 12px', background: 'linear-gradient(135deg,#edf7ff,#f8fbff)', borderBottom: '1px solid #d9e8ff' }}>
         <Space size={6} wrap>
           <ApiOutlined style={{ color: '#1677ff' }} />
-          <Text strong style={{ fontSize: 13 }}>{diagram.title || diagram.flow_code || '流程引擎流程图'}</Text>
+          <Text strong style={{ fontSize: 13 }}>{diagram.title || diagram.flow_code || '完整业务流程图'}</Text>
           <Tag color="blue" style={{ margin: 0, fontSize: 10 }}>{diagram.meta?.step_count ?? diagram.meta?.approval_node_count ?? processNodes.length} 个{isBusinessFlow ? '业务步骤' : '审批节点'}</Tag>
           <Tag color="geekblue" style={{ margin: 0, fontSize: 10 }}>{diagram.meta?.edge_count || 0} 条连线</Tag>
+          <Tag color="red" style={{ margin: 0, fontSize: 10 }}>Fallback {diagram.meta?.fallback_count ?? fallbackEdges.length}</Tag>
           {diagram.status && <Tag color={diagram.status === 'approved' ? 'green' : diagram.status === 'rejected' ? 'red' : diagram.status === 'reference' ? 'cyan' : 'orange'} style={{ margin: 0, fontSize: 10 }}>{diagram.status === 'reference' ? '标准路径' : diagram.status}</Tag>}
         </Space>
-        <div style={{ marginTop: 4, color: '#65758b', fontSize: 10 }}>流程引擎 · {diagram.flow_type || 'sequential'} · {currentLabel} · 点击步骤查看执行要求</div>
+        <div style={{ marginTop: 4, color: '#65758b', fontSize: 10 }}>完整业务流程 · 正常路径 + Fallback回流 · {currentLabel} · 点击任一步骤查看输入/输出/责任方</div>
       </div>
 
-      <div style={{ padding: '14px 12px', overflowX: 'auto', background: '#fbfdff' }}>
-        <div style={{ display: 'flex', alignItems: 'stretch', minWidth: Math.max(680, processNodes.length * 270 + 210), gap: 0 }}>
-          {mainNodes.map((node, index) => (
-            <React.Fragment key={node.id}>
-              <div
-                onClick={() => processKinds.includes(node.kind || '') && setSelectedNodeId(node.id)}
-                style={{
-                  width: processKinds.includes(node.kind || '') ? 205 : 92,
-                  flexShrink: 0,
-                  border: `1px solid ${selectedNodeId === node.id ? '#1677ff' : nodeColor(node)}`,
-                  borderRadius: processKinds.includes(node.kind || '') ? 9 : 28,
-                  background: selectedNodeId === node.id ? '#f0f7ff' : processKinds.includes(node.kind || '') ? '#fff' : '#f6ffed',
-                  padding: processKinds.includes(node.kind || '') ? '9px 10px' : '9px 8px',
-                  cursor: processKinds.includes(node.kind || '') ? 'pointer' : 'default',
-                  boxShadow: selectedNodeId === node.id ? '0 0 0 3px rgba(22,119,255,0.13)' : '0 2px 7px rgba(16,42,67,.05)',
-                }}
-              >
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 4, alignItems: 'center' }}>
-                  <Text strong style={{ fontSize: 11, color: processKinds.includes(node.kind || '') ? '#1f2d3d' : nodeColor(node) }}>{node.title || node.label}</Text>
-                  {processKinds.includes(node.kind || '') && <Tag color={node.kind === 'decision' ? 'gold' : node.kind === 'approval' ? 'purple' : node.status === 'current' ? 'blue' : 'default'} style={{ margin: 0, fontSize: 9, lineHeight: '15px' }}>{kindLabel[node.kind || 'task']}</Tag>}
-                </div>
-                {processKinds.includes(node.kind || '') && (
-                  <>
-                    <div style={{ marginTop: 6, fontSize: 10, color: '#59697b' }}>责任：{node.role || '未指定'}</div>
-                    {(node.summary || node.action) && <div style={{ marginTop: 5, fontSize: 10, lineHeight: '16px', color: '#59697b', height: 32, overflow: 'hidden' }}>{node.summary || node.action}</div>}
-                    <div style={{ marginTop: 7, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                      <Tag style={{ margin: 0, fontSize: 9 }}>输入 {arrayValue(node.inputs).length}</Tag>
-                      <Tag color="gold" style={{ margin: 0, fontSize: 9 }}>门槛 {arrayValue(node.judgement_criteria || node.condition).length}</Tag>
-                      <Tag color="green" style={{ margin: 0, fontSize: 9 }}>交付 {arrayValue(node.deliverables).length}</Tag>
-                    </div>
-                    {node.condition && <div style={{ marginTop: 4, color: '#d46b08', fontSize: 10, wordBreak: 'break-word' }}>条件：{JSON.stringify(node.condition)}</div>}
-                  </>
-                )}
-              </div>
-              {index < mainNodes.length - 1 && (() => {
-                const next = mainNodes[index + 1]
-                const edge = diagram.edges.find(item => item.source === node.id && item.target === next.id && (!item.type || item.type === 'normal'))
-                return <div style={{ width: 72, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#69b1ff' }}><div style={{ fontSize: 20, lineHeight: 1 }}>→</div><div style={{ marginTop: 4, color: '#7b8ba0', fontSize: 9, lineHeight: '13px', textAlign: 'center' }}>{edge?.label || '继续'}</div></div>
-              })()}
-            </React.Fragment>
-          ))}
-        </div>
+      <div style={{ padding: '8px 12px', background: '#fff', borderBottom: '1px solid #e8edf3' }}>
+        {boundaryRows.map(([label, value, color], index) => (
+          <div key={label} style={{ display: 'grid', gridTemplateColumns: '74px 1fr', gap: 8, padding: '4px 0', borderTop: index ? '1px dashed #edf0f3' : undefined, fontSize: 10, lineHeight: '16px' }}>
+            <b style={{ color }}>{label}</b><span style={{ color: '#526579' }}>{compactList(value, 8)}</span>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ padding: 8, background: '#f8fbff', overflow: 'hidden' }}>
+        <Suspense fallback={<div style={{ height: 590, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Spin tip="正在加载流程设计画布…" /></div>}>
+          <WorkflowCanvasEditor
+            diagram={diagram}
+            selectedNodeId={selectedNodeId}
+            onSelect={setSelectedNodeId}
+            onDiagramChange={(next: any) => setDiagram(next as FlowDiagram)}
+          />
+        </Suspense>
       </div>
 
       {selectedNode && !['start', 'end'].includes(selectedNode.kind || '') && (
         <div style={{ borderTop: '1px solid #e8edf3', padding: '10px 12px', background: '#fff' }}>
           <Space size={6} wrap>
             <Text strong style={{ fontSize: 12 }}>当前选择 · {selectedNode.title || selectedNode.label}</Text>
-            <Tag color={selectedNode.kind === 'exception' ? 'red' : selectedNode.status === 'current' ? 'blue' : 'default'} style={{ margin: 0, fontSize: 9 }}>{kindLabel[selectedNode.kind || 'task'] || '步骤'}</Tag>
-            <Text type="secondary" style={{ fontSize: 10 }}>点击上方步骤切换</Text>
+            <Tag color={selectedNode.kind === 'fallback' ? 'red' : selectedNode.status === 'current' ? 'blue' : 'default'} style={{ margin: 0, fontSize: 9 }}>{kindLabel[selectedNode.kind || 'task'] || '步骤'}</Tag>
+            <Text type="secondary" style={{ fontSize: 10 }}>点击主流程或Fallback节点切换</Text>
           </Space>
           {nextAction && <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 7, background: '#e6f4ff', border: '1px solid #91caff' }}><Text strong style={{ color: '#0958d9', fontSize: 11 }}>现在重点：</Text><Text style={{ fontSize: 11 }}>{String(nextAction)}</Text></div>}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 7, marginTop: 8 }}>
-            {detailBlock('① 输入 / 前置证据', selectedNode.inputs, '#0958d9', '#f7fbff')}
-            {detailBlock('② 判断标准 / 放行门槛', selectedNode.judgement_criteria || selectedNode.condition, '#d46b08', '#fffaf0')}
-            {detailBlock('③ 输出 / 状态变化', selectedNode.outputs, '#531dab', '#faf8ff')}
-            {detailBlock('④ 交付物 / 系统留痕', selectedNode.deliverables, '#237804', '#f6ffed')}
-            {detailBlock('⑤ 下一步重点', selectedNode.next_focus, '#1677ff', '#f0f7ff')}
-            {detailBlock('⑥ 阻塞点', selectedNode.blockers, '#cf1322', '#fff7f6')}
+          <div style={{ marginTop: 8, border: '1px solid #e8edf3', borderRadius: 7, overflow: 'hidden' }}>
+            {[
+              ['① 输入 / 前置证据', selectedNode.inputs],
+              ['② 判断标准 / 放行门槛', selectedNode.judgement_criteria || selectedNode.condition],
+              ['③ 输出 / 状态变化', selectedNode.outputs],
+              ['④ 交付物 / 系统留痕', selectedNode.deliverables],
+              ['⑤ 关联方 / 责任链', selectedNode.related_parties || selectedNode.role],
+              ['⑥ 下一步 / 回流条件', selectedNode.next_focus || selectedNode.resume_condition],
+              ['⑦ 阻塞点', selectedNode.blockers],
+              ['⑧ 关联系统', selectedNode.systems],
+            ].map(([label, value], index) => (
+              <div key={String(label)} style={{ display: 'grid', gridTemplateColumns: '150px 1fr', gap: 8, padding: '6px 9px', borderTop: index ? '1px solid #edf0f3' : undefined, fontSize: 10, lineHeight: '17px' }}>
+                <b style={{ color: '#465568' }}>{String(label)}</b><div>{displayList(value)}</div>
+              </div>
+            ))}
           </div>
           {(selectedNode.work_matrix || selectedNode.matrix_fields) && (
             <div style={{ marginTop: 8, border: '1px solid #bae0ff', borderRadius: 7, padding: '8px 9px', background: '#f0f7ff' }}>
@@ -159,22 +145,8 @@ function EngineFlowDiagram({ diagram }: { diagram: FlowDiagram }) {
         </div>
       )}
 
-      {visibleBranches.length > 0 && (
-        <div style={{ borderTop: '1px solid #e8edf3', padding: '9px 12px', background: '#fffdf8' }}>
-          <Text strong style={{ fontSize: 11 }}>{selectedBranches.length ? '当前节点的异常与回流路径' : '全部异常与回流路径'}</Text>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 5, marginTop: 5 }}>
-            {visibleBranches.map((edge, index) => (
-              <div key={edge.id || index} onClick={() => edge.target && diagram.nodes.some(node => node.id === edge.target) && setSelectedNodeId(edge.target)} style={{ padding: '6px 8px', borderRadius: 6, background: edge.type === 'exception' ? '#fff1f0' : edge.type === 'recovery' || edge.type === 'loop' ? '#fff7e6' : '#f9f0ff', border: `1px solid ${edge.type === 'exception' ? '#ffa39e' : edge.type === 'recovery' || edge.type === 'loop' ? '#ffd591' : '#d3adf7'}`, fontSize: 10, cursor: edge.target ? 'pointer' : 'default' }}>
-                <div style={{ color: '#595959' }}>{nodeLabels.get(edge.source || '') || edge.source} → {nodeLabels.get(edge.target || '') || edge.target}</div>
-                <Text code style={{ fontSize: 10 }}>{edge.label || edge.type}</Text>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
       <div style={{ borderTop: '1px dashed #d9d9d9', padding: '7px 10px', color: '#8c8c8c', fontSize: 10 }}>
-        {diagram.engine_note || '节点和连线来自统一流程引擎定义。'}
+        {diagram.engine_note || '节点和连线来自统一流程引擎定义；正常路径与Fallback回流属于同一张流程图。'}
       </div>
     </div>
   )
@@ -219,6 +191,7 @@ interface MsgAttachment {
   content_type?: string
   is_image?: boolean
   size?: number
+  preview_url?: string
 }
 
 // ---------- 结构化表格数据（后端 table 事件推送） ----------
@@ -267,11 +240,26 @@ interface FlowDiagramNode {
   next_focus?: any[]
   blockers?: any[]
   exception_paths?: any[]
+  fallbacks?: any[]
   work_matrix?: any
   matrix_fields?: any[]
   systems?: any[]
+  related_parties?: any[]
+  fallback_of?: string
+  resume_condition?: string
+  generated?: boolean
+  layout?: FlowDiagramLayout
   details?: Record<string, any>
   history?: Record<string, any>[]
+}
+
+interface FlowDiagramLayout {
+  x: number
+  y: number
+  width: number
+  height: number
+  lane?: string
+  rank?: number
 }
 
 interface FlowDiagramEdge {
@@ -280,6 +268,8 @@ interface FlowDiagramEdge {
   target?: string
   label?: string
   type?: string
+  path?: string
+  routing?: string
 }
 
 interface FlowDiagram {
@@ -292,8 +282,20 @@ interface FlowDiagram {
   current_step?: number
   nodes: FlowDiagramNode[]
   edges: FlowDiagramEdge[]
-  meta?: { node_count?: number; edge_count?: number; approval_node_count?: number; step_count?: number; interactive?: boolean }
+  meta?: { node_count?: number; edge_count?: number; approval_node_count?: number; step_count?: number; interactive?: boolean; input_count?: number; output_count?: number; related_party_count?: number; fallback_count?: number; layout?: string }
   legend?: { key: string; label: string; color: string }[]
+  inputs?: any[]
+  outputs?: any[]
+  related_parties?: any[]
+  systems?: any[]
+  normal_path?: FlowDiagramEdge[]
+  fallback_paths?: Record<string, any>[]
+  canvas?: {
+    width: number
+    height: number
+    direction?: string
+    lanes?: { key: string; label: string; x: number; width: number }[]
+  }
   engine_note?: string
 }
 
@@ -570,6 +572,8 @@ export default function AIAssistantWidget() {
   // 待发送附件（先调 /files/upload 拿 file_id，再随消息提交）
   const [pendingAttachments, setPendingAttachments] = useState<MsgAttachment[]>([])
   const [uploading, setUploading] = useState(false)
+  const uploadingRef = useRef(false)
+  const previewUrlsRef = useRef<Set<string>>(new Set())
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 可用工作流清单（从 /chat/tools 拉取，供快捷指令区展示）
   const [workflows, setWorkflows] = useState<{ name: string; label: string; needs_params: boolean }[]>([])
@@ -704,6 +708,11 @@ export default function AIAssistantWidget() {
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight
   }, [messages, loading])
+
+  useEffect(() => () => {
+    previewUrlsRef.current.forEach(url => URL.revokeObjectURL(url))
+    previewUrlsRef.current.clear()
+  }, [])
 
   // 拉取可用工作流（仅展示无需参数的确定性流程，点击即触发）
   useEffect(() => {
@@ -926,7 +935,7 @@ export default function AIAssistantWidget() {
   // agentKeyOverride：快速命令自带的归类智能体，优先于顶部选择器
   const sendMessage = async (preset?: string, agentKeyOverride?: string) => {
     const text = (preset ?? input).trim()
-    if (loading) return
+    if (loading || uploadingRef.current) return
     if (!text && pendingAttachments.length === 0) return
     const atts = [...pendingAttachments]
     const quote = replyingTo
@@ -1214,36 +1223,94 @@ export default function AIAssistantWidget() {
     setShareTarget('info')
   }
 
-  // ---------- 选择并上传附件 → 拿 file_id 暂存，随下一条消息提交 ----------
+  // ---------- 选择/粘贴附件 → 上传拿 file_id，随下一条消息提交 ----------
   const onPickFiles = () => {
     if (!loading && !uploading) fileInputRef.current?.click()
+  }
+
+  const uploadPendingFiles = async (files: File[], source: 'picker' | 'clipboard') => {
+    if (files.length === 0) return
+    if (uploadingRef.current) {
+      message.warning('附件正在上传，请稍候')
+      return
+    }
+    uploadingRef.current = true
+    setUploading(true)
+    let successCount = 0
+    let failedCount = 0
+    try {
+      for (const f of files) {
+        const previewUrl = f.type.startsWith('image/') ? URL.createObjectURL(f) : undefined
+        if (previewUrl) previewUrlsRef.current.add(previewUrl)
+        const fd = new FormData()
+        fd.append('file', f)
+        try {
+          const res: any = await api.post('/api/v1/files/upload', fd, {
+            headers: { 'Content-Type': undefined },  // 让浏览器自动设置 multipart/form-data boundary
+          })
+          setPendingAttachments(prev => [...prev, {
+            file_id: res.id,
+            filename: res.filename,
+            content_type: res.content_type,
+            is_image: res.is_image,
+            size: res.size,
+            preview_url: previewUrl,
+          }])
+          successCount += 1
+        } catch {
+          failedCount += 1
+          if (previewUrl) {
+            URL.revokeObjectURL(previewUrl)
+            previewUrlsRef.current.delete(previewUrl)
+          }
+        }
+      }
+    } finally {
+      uploadingRef.current = false
+      setUploading(false)
+    }
+    if (failedCount > 0) message.error(`${failedCount} 个附件上传失败`)
+    if (source === 'clipboard' && successCount > 0) message.success(`已粘贴 ${successCount} 张图片`)
   }
 
   const onFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
     e.target.value = ''  // 重置，允许重复选择同名文件
-    if (files.length === 0) return
-    setUploading(true)
-    try {
-      for (const f of files) {
-        const fd = new FormData()
-        fd.append('file', f)
-        const res: any = await api.post('/api/v1/files/upload', fd, {
-          headers: { 'Content-Type': undefined },  // 移除默认 application/json，让浏览器自动设置 multipart/form-data + boundary
-        })
-        setPendingAttachments(prev => [...prev, {
-          file_id: res.id,
-          filename: res.filename,
-          content_type: res.content_type,
-          is_image: res.is_image,
-          size: res.size,
-        }])
+    await uploadPendingFiles(files, 'picker')
+  }
+
+  const onChatPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageItems = Array.from(event.clipboardData?.items || [])
+      .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+    if (imageItems.length === 0) return  // 普通文字粘贴保持浏览器默认行为
+
+    const stamp = Date.now()
+    const pastedImages = imageItems.flatMap((item, index) => {
+      const blob = item.getAsFile()
+      if (!blob) return []
+      const extension = ({
+        'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp',
+        'image/gif': 'gif', 'image/bmp': 'bmp', 'image/svg+xml': 'svg',
+      } as Record<string, string>)[blob.type] || 'png'
+      return [new File([blob], `clipboard-${stamp}-${index + 1}.${extension}`, {
+        type: blob.type || 'image/png', lastModified: stamp,
+      })]
+    })
+    if (pastedImages.length === 0) return
+    // 纯图片剪贴板不应向 textarea 插入空白/对象占位；混合文字仍保留默认粘贴。
+    if (!event.clipboardData.getData('text/plain')) event.preventDefault()
+    void uploadPendingFiles(pastedImages, 'clipboard')
+  }
+
+  const removePendingAttachment = (fileId: string) => {
+    setPendingAttachments(prev => {
+      const target = prev.find(item => item.file_id === fileId)
+      if (target?.preview_url) {
+        URL.revokeObjectURL(target.preview_url)
+        previewUrlsRef.current.delete(target.preview_url)
       }
-    } catch {
-      message.error('附件上传失败')
-    } finally {
-      setUploading(false)
-    }
+      return prev.filter(item => item.file_id !== fileId)
+    })
   }
 
   // ---------- 下载系统文件（带鉴权 token，导出报告/附件通用） ----------
@@ -1634,7 +1701,7 @@ export default function AIAssistantWidget() {
                                   att.is_image ? (
                                     <img
                                       key={ai}
-                                      src={`/api/v1/files/${att.file_id}`}
+                                      src={att.preview_url || `/api/v1/files/${att.file_id}`}
                                       alt={att.filename}
                                       style={{ maxWidth: 120, maxHeight: 120, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(0,0,0,0.08)' }}
                                     />
@@ -1650,14 +1717,14 @@ export default function AIAssistantWidget() {
                                 ))}
                               </div>
                             )}
-                            {m.content || (
-                              // 流式输出中：内容尚未到达时显示打字动画
+                            {m.content || (m.role === 'assistant' ? (
+                              // 仅 AI 流式输出中显示打字动画；纯图片用户消息保持为空
                               <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
                                 <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s infinite' }} />
                                 <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s 0.2s infinite' }} />
                                 <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#999', animation: 'typingBlink 1.2s 0.4s infinite' }} />
                               </span>
-                            )}
+                            ) : null)}
                             {/* AI 已执行的操作 */}
                             {m.role === 'assistant' && m.actions && m.actions.length > 0 && (
                               <div style={{ marginTop: 8, borderTop: '1px dashed #d9d9d9', paddingTop: 6 }}>
@@ -2039,13 +2106,13 @@ export default function AIAssistantWidget() {
                       {/* 待发送附件预览（上传后、发送前可移除） */}
                       {pendingAttachments.length > 0 && (
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
-                          {pendingAttachments.map((att, i) => (
+                          {pendingAttachments.map(att => (
                             <div key={att.file_id} style={{
                               position: 'relative', display: 'flex', alignItems: 'center',
                               border: '1px solid #d9d9d9', borderRadius: 6, overflow: 'hidden', background: '#fafafa',
                             }}>
                               {att.is_image ? (
-                                <img src={`/api/v1/files/${att.file_id}`} alt={att.filename}
+                                <img src={att.preview_url || `/api/v1/files/${att.file_id}`} alt={att.filename}
                                   style={{ width: 40, height: 40, objectFit: 'cover' }} />
                               ) : (
                                 <span style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 8px', fontSize: 11, maxWidth: 140 }}>
@@ -2053,7 +2120,7 @@ export default function AIAssistantWidget() {
                                 </span>
                               )}
                               <CloseOutlined
-                                onClick={() => setPendingAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                                onClick={() => removePendingAttachment(att.file_id)}
                                 style={{
                                   position: 'absolute', top: 2, right: 2, fontSize: 10, cursor: 'pointer',
                                   color: '#fff', background: 'rgba(0,0,0,0.5)', borderRadius: '50%', padding: 2,
@@ -2073,8 +2140,9 @@ export default function AIAssistantWidget() {
                         <TextArea
                           value={input}
                           onChange={e => setInput(e.target.value)}
+                          onPaste={onChatPaste}
                           onPressEnter={e => { if (!e.shiftKey) { e.preventDefault(); sendMessage() } }}
-                          placeholder="输入问题，Enter 发送..."
+                          placeholder={uploading ? '图片上传中...' : '输入问题；可直接粘贴图片，Enter 发送...'}
                           autoSize={{ minRows: 1, maxRows: 3 }}
                           style={{ borderRadius: 0 }}
                         />
@@ -2082,7 +2150,8 @@ export default function AIAssistantWidget() {
                           type="primary"
                           icon={<SendOutlined />}
                           onClick={() => sendMessage()}
-                          loading={loading}
+                          loading={loading || uploading}
+                          disabled={uploading}
                           style={{ borderRadius: '0 8px 8px 0', height: 'auto' }}
                         />
                       </Space.Compact>

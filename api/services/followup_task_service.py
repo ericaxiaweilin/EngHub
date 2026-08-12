@@ -81,6 +81,7 @@ async def list_tasks(
                follow_interval_minutes, next_follow_at, last_follow_at, last_follow_note,
                follow_count, max_follows, progress_pct, result_summary,
                item_type, assigned_to, ai_summary, ai_suggestion, due_at,
+               plan_id, plan_seq,
                created_at, updated_at, closed_at
         FROM followup_tasks
         WHERE {' AND '.join(conditions)}
@@ -116,6 +117,8 @@ async def create_task(
     assigned_to: Optional[str] = None,
     payload: str = "",
     due_at: Optional[str] = None,
+    plan_id: Optional[str] = None,
+    plan_seq: Optional[int] = None,
 ) -> Dict[str, Any]:
     """挂一个待办条目。agent_key 为空时自动归类（复用快速命令的归类器）；
     指派给他人时自动推送站内通知。"""
@@ -138,10 +141,10 @@ async def create_task(
         INSERT INTO followup_tasks (id, factory_id, created_by, title, description,
             agent_key, agent_name, status, block_reason, source, conversation_hint,
             follow_interval_minutes, next_follow_at,
-            item_type, assigned_to, payload, due_at)
+            item_type, assigned_to, payload, due_at, plan_id, plan_seq)
         VALUES (:id, :fid, :cb, :title, :desc, :ak, :an, 'open', :br, :src, :hint,
-            :interval, NOW() + (:interval || ' minutes')::interval,
-            :itype, :assignee, :payload, CAST(:due AS timestamptz))
+            :interval, NOW() + make_interval(mins => :interval),
+            :itype, :assignee, :payload, CAST(:due AS timestamptz), :plan_id, :plan_seq)
     """), {
         "id": task_id, "fid": factory_id, "cb": created_by,
         "title": title, "desc": description or "",
@@ -150,6 +153,7 @@ async def create_task(
         "hint": (conversation_hint or "")[:500], "interval": interval,
         "itype": item_type, "assignee": assigned_to,
         "payload": (payload or "")[:20000] or None, "due": due_at,
+        "plan_id": plan_id, "plan_seq": plan_seq,
     })
     await _append_log(db, task_id, factory_id, "status",
                       f"任务已挂入任务中心，每 {interval} 分钟跟进一次"
@@ -204,7 +208,7 @@ async def update_task(
     set_parts.append("updated_at = NOW()")
     # 调整频率时同步顺延下次跟进；关单时记录 closed_at
     if "follow_interval_minutes" in updates:
-        set_parts.append("next_follow_at = NOW() + (:follow_interval_minutes || ' minutes')::interval")
+        set_parts.append("next_follow_at = NOW() + make_interval(mins => :follow_interval_minutes)")
     if updates.get("status") in {"done", "cancelled"}:
         set_parts.append("closed_at = NOW()")
     elif "status" in updates:
@@ -516,13 +520,14 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         SET status = :st, progress_pct = :pct, last_follow_at = NOW(), last_follow_note = :note,
             follow_count = :fc, updated_at = NOW(),
             next_follow_at = CASE WHEN :active
-                THEN NOW() + (follow_interval_minutes || ' minutes')::interval ELSE NULL END,
-            result_summary = CASE WHEN :st = 'done' THEN :note ELSE result_summary END,
-            closed_at = CASE WHEN :st = 'done' THEN NOW() ELSE closed_at END
+                THEN NOW() + make_interval(mins => follow_interval_minutes) ELSE NULL END,
+            result_summary = CASE WHEN :done THEN :note ELSE result_summary END,
+            closed_at = CASE WHEN :done THEN NOW() ELSE closed_at END
         WHERE id = :id
     """), {
         "st": new_status, "pct": conclusion["progress_pct"], "note": conclusion["note"],
-        "fc": follow_count, "active": new_status == "open" and not reached_limit, "id": task_id,
+        "fc": follow_count, "active": new_status == "open" and not reached_limit,
+        "done": new_status == "done", "id": task_id,
     })
     await _append_log(db, task_id, factory_id, trigger_type,
                       conclusion["note"], new_status, conclusion["progress_pct"], "system")
@@ -561,7 +566,7 @@ async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:
     for t in due:
         await db.execute(text("""
             UPDATE followup_tasks
-            SET next_follow_at = NOW() + (follow_interval_minutes || ' minutes')::interval
+            SET next_follow_at = NOW() + make_interval(mins => follow_interval_minutes)
             WHERE id = :id
         """), {"id": t["id"]})
     await db.commit()
@@ -599,3 +604,118 @@ async def followup_scanner_loop() -> None:
             return
         except Exception as exc:  # noqa: BLE001 — 扫描循环必须常驻
             _logger.warning("任务中心扫描异常：%s", exc)
+
+
+# ═══════════════════════════════════════════════════════════
+# 指挥官行动计划（Plan）：决策聚合为目标导向计划，子任务即 followup_tasks
+# ═══════════════════════════════════════════════════════════
+
+async def get_or_create_active_plan(
+    db: AsyncSession,
+    factory_id: str,
+    objective: str,
+    mode: Optional[str],
+    created_by: str,
+    cycle_id: Optional[str] = None,
+) -> str:
+    """取该工厂当前 active 计划；没有则新建。态势演进时同步刷新目标/模式。
+    一个工厂同一时间只有一个 active 计划，全部子任务完成后才置 done。"""
+    row = (await db.execute(text("""
+        SELECT id FROM commander_plans
+        WHERE factory_id = :fid AND status = 'active'
+        ORDER BY created_at DESC LIMIT 1
+    """), {"fid": factory_id})).first()
+    if row:
+        plan_id = row[0]
+        await db.execute(text("""
+            UPDATE commander_plans
+            SET objective = :obj, mode = :mode,
+                cycle_id = COALESCE(:cid, cycle_id), updated_at = NOW()
+            WHERE id = :id
+        """), {"obj": (objective or "")[:500], "mode": mode, "cid": cycle_id, "id": plan_id})
+        await db.commit()
+        return plan_id
+    plan_id = _gen_id()
+    await db.execute(text("""
+        INSERT INTO commander_plans (id, factory_id, created_by, cycle_id, objective, mode, status)
+        VALUES (:id, :fid, :cb, :cid, :obj, :mode, 'active')
+    """), {"id": plan_id, "fid": factory_id, "cb": created_by, "cid": cycle_id,
+           "obj": (objective or "")[:500], "mode": mode})
+    await db.commit()
+    return plan_id
+
+
+async def refresh_plan(db: AsyncSession, plan_id: str) -> Optional[Dict[str, Any]]:
+    """聚合计划进度：子任务进度均值→计划总进度；子任务全部 done→计划 done。
+    返回计划 dict（含子任务 items）。"""
+    agg = (await db.execute(text("""
+        SELECT COUNT(*) AS cnt,
+               COALESCE(AVG(progress_pct), 0) AS avg_pct,
+               COUNT(*) FILTER (WHERE status = 'done') AS done_cnt
+        FROM followup_tasks WHERE plan_id = :pid
+    """), {"pid": plan_id})).first()
+    cnt = int(agg[0] or 0)
+    avg_pct = int(round(float(agg[1] or 0)))
+    done_cnt = int(agg[2] or 0)
+    all_done = cnt > 0 and done_cnt == cnt
+    new_status = "done" if all_done else "active"
+    await db.execute(text("""
+        UPDATE commander_plans
+        SET item_count = :cnt, progress_pct = :pct, status = :st, updated_at = NOW(),
+            closed_at = CASE WHEN :done THEN NOW() ELSE closed_at END
+        WHERE id = :pid
+    """), {"cnt": cnt, "pct": avg_pct, "st": new_status, "done": all_done, "pid": plan_id})
+    await db.commit()
+    return await get_plan_dict(db, plan_id)
+
+
+async def get_plan_dict(db: AsyncSession, plan_id: str) -> Optional[Dict[str, Any]]:
+    """取单个计划（含子任务 items）。"""
+    row = (await db.execute(text("""
+        SELECT id, factory_id, created_by, cycle_id, objective, mode, status,
+               progress_pct, item_count, created_at, updated_at, closed_at
+        FROM commander_plans WHERE id = :pid
+    """), {"pid": plan_id})).first()
+    if not row:
+        return None
+    plan = dict(row._mapping)
+    plan["items"] = await _plan_items(db, plan_id)
+    return plan
+
+
+async def _plan_items(db: AsyncSession, plan_id: str) -> List[Dict[str, Any]]:
+    rows = (await db.execute(text("""
+        SELECT id, title, agent_key, agent_name, status, progress_pct,
+               plan_seq, follow_count, last_follow_note
+        FROM followup_tasks WHERE plan_id = :pid
+        ORDER BY plan_seq ASC NULLS LAST, created_at ASC
+    """), {"pid": plan_id})).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+async def list_plans(
+    db: AsyncSession,
+    factory_id: str,
+    status: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """计划列表（active 优先，其余按时间倒序），每个计划含子任务 items。"""
+    conditions = ["factory_id = :fid"]
+    params: Dict[str, Any] = {"fid": factory_id, "limit": limit}
+    if status:
+        conditions.append("status = :st")
+        params["st"] = status
+    rows = (await db.execute(text(f"""
+        SELECT id, factory_id, created_by, cycle_id, objective, mode, status,
+               progress_pct, item_count, created_at, updated_at, closed_at
+        FROM commander_plans
+        WHERE {' AND '.join(conditions)}
+        ORDER BY (status = 'active') DESC, created_at DESC
+        LIMIT :limit
+    """), params)).fetchall()
+    plans = []
+    for r in rows:
+        plan = dict(r._mapping)
+        plan["items"] = await _plan_items(db, plan["id"])
+        plans.append(plan)
+    return plans

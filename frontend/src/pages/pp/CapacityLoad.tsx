@@ -7,8 +7,9 @@ import {
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { apsApi, CapacityLoadData, CapacityResource } from '../../services/aps'
+import { getActiveFactoryId } from '../../utils/factory'
 
-const FACTORY = localStorage.getItem('active_factory_id') || 'FAC_MECH_001'
+const FACTORY = getActiveFactoryId()
 
 const CapacityLoad: React.FC = () => {
   const [data, setData] = useState<CapacityLoadData | null>(null)

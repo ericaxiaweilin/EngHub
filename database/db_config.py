@@ -110,6 +110,10 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+# 兼容旧设备/QMS路由使用的依赖名称；两者共享同一事务与回滚语义。
+get_async_session = get_db
+
+
 async def get_db_no_commit() -> AsyncGenerator[AsyncSession, None]:
     """
     获取数据库会话 (不自动提交)

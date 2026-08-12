@@ -26,6 +26,12 @@ class TestChatAdapterIntegration:
     @pytest.mark.asyncio
     async def test_adapter_components_initialized(self):
         """Verify all components are properly initialized in ChatAdapter."""
+        # Reset registries first
+        from api.services.chat_architecture.recovery.registry import ExecutorRegistry as RecoveryRegistry
+        from api.services.chat_architecture.business_executors.executor_registry import ExecutorRegistry as BusinessExecutorRegistry
+        RecoveryRegistry.reset()
+        BusinessExecutorRegistry.reset()
+        
         async with db_config.session_factory() as db:
             adapter = ChatAdapter(db=db)
             
@@ -34,10 +40,15 @@ class TestChatAdapterIntegration:
             assert hasattr(adapter, 'intent_resolver')
             assert hasattr(adapter, 'state_engine')
             assert hasattr(adapter, 'response_formatter')
-            assert hasattr(adapter, 'recovery_executors')
-            assert len(adapter.recovery_executors) == 3
             
-            print(f"✅ Adapter initialized with {len(adapter.recovery_executors)} recovery strategies")
+            # Check registries are initialized
+            recovery_executors = RecoveryRegistry.get_all()
+            business_executors = BusinessExecutorRegistry.get_all()
+            
+            assert len(recovery_executors) == 3, f"Expected 3 recovery executors, got {len(recovery_executors)}"
+            assert len(business_executors) >= 3, f"Expected at least 3 business executors, got {len(business_executors)}"
+            
+            print(f"✅ Adapter initialized with {len(recovery_executors)} recovery strategies and {len(business_executors)} business executors")
     
     @pytest.mark.asyncio
     async def test_factory_resolver_resolution(self):

@@ -79,6 +79,30 @@ interface TaskLog {
   created_at: string
 }
 
+interface PlanItem {
+  id: string
+  title: string
+  agent_name?: string
+  status: string
+  progress_pct: number
+  plan_seq?: number
+  follow_count: number
+  last_follow_note?: string
+}
+
+interface CommanderPlan {
+  id: string
+  objective: string
+  mode?: string
+  status: string
+  progress_pct: number
+  item_count: number
+  created_by: string
+  created_at: string
+  closed_at?: string
+  items: PlanItem[]
+}
+
 interface AgentOption { key: string; name: string; description?: string }
 
 const STATUS_META: Record<string, { color: string; label: string }> = {
@@ -94,6 +118,18 @@ const ITEM_TYPE_META: Record<string, { color: string; label: string }> = {
   meeting: { color: 'purple', label: '会议纪要' },
   email: { color: 'cyan', label: '邮件' },
   note: { color: 'default', label: '备忘' },
+}
+
+const PLAN_STATUS_META: Record<string, { color: string; label: string }> = {
+  active: { color: 'processing', label: '执行中' },
+  done: { color: 'success', label: '已完成' },
+  superseded: { color: 'default', label: '已取代' },
+}
+
+const PLAN_MODE_META: Record<string, { color: string; label: string }> = {
+  surplus: { color: 'green', label: '订单充足' },
+  normal: { color: 'blue', label: '产销平衡' },
+  deficit: { color: 'gold', label: '订单欠缺' },
 }
 
 const DISPOSITION_META: Record<string, { color: string; label: string }> = {
@@ -122,6 +158,7 @@ const fmtTime = (v?: string) => (v ? new Date(v).toLocaleString('zh-CN', { hour1
 
 const TaskCenter: React.FC = () => {
   const [tasks, setTasks] = useState<FollowupTask[]>([])
+  const [plans, setPlans] = useState<CommanderPlan[]>([])
   const [workOrders, setWorkOrders] = useState<MyWorkOrder[]>([])
   const [notifications, setNotifications] = useState<InboxNotification[]>([])
   const [agents, setAgents] = useState<AgentOption[]>([])
@@ -145,6 +182,7 @@ const TaskCenter: React.FC = () => {
     try {
       const res: any = await api.get('/api/v1/task-center/inbox')
       setTasks(res.tasks || [])
+      setPlans(res.plans || [])
       setWorkOrders(res.work_orders || [])
       setNotifications(res.notifications || [])
     } catch { /* 拦截器已提示 */ } finally {
@@ -415,6 +453,83 @@ const TaskCenter: React.FC = () => {
     { title: '备注', dataIndex: 'remark', key: 'remark', render: (v?: string) => v || '-' },
   ]
 
+  const planColumns = [
+    {
+      title: '计划目标', dataIndex: 'objective', key: 'objective',
+      render: (v: string, p: CommanderPlan) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{v}</Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {p.created_by} 创建于 {fmtTime(p.created_at)}{p.closed_at ? ` · 完成于 ${fmtTime(p.closed_at)}` : ''}
+          </Text>
+        </Space>
+      ),
+    },
+    {
+      title: '模式', dataIndex: 'mode', key: 'mode', width: 100,
+      render: (v?: string) => {
+        const m = PLAN_MODE_META[v || ''] || { color: 'default', label: v || '-' }
+        return <Tag color={m.color}>{m.label}</Tag>
+      },
+    },
+    {
+      title: '状态', dataIndex: 'status', key: 'status', width: 90,
+      render: (v: string) => {
+        const m = PLAN_STATUS_META[v] || { color: 'default', label: v }
+        return <Tag color={m.color}>{m.label}</Tag>
+      },
+    },
+    {
+      title: '总进度', dataIndex: 'progress_pct', key: 'progress_pct', width: 150,
+      render: (v: number, p: CommanderPlan) => (
+        <Progress percent={v || 0} size="small" status={p.status === 'done' ? 'success' : 'active'} />
+      ),
+    },
+    {
+      title: '子任务', dataIndex: 'item_count', key: 'item_count', width: 80,
+      render: (v: number) => <Tag>{v || 0}</Tag>,
+    },
+  ]
+
+  const planTable = (
+    <Table
+      rowKey="id"
+      size="small"
+      loading={loading}
+      columns={planColumns as any}
+      dataSource={plans}
+      pagination={{ pageSize: 10, showTotal: t => `共 ${t} 个计划` }}
+      locale={{ emptyText: '暂无指挥官计划（开启指挥官后自动产出行动计划）' }}
+      expandable={{
+        rowExpandable: (p: CommanderPlan) => (p.items?.length || 0) > 0,
+        expandedRowRender: (p: CommanderPlan) => (
+          <List
+            size="small"
+            dataSource={p.items}
+            renderItem={(it: PlanItem) => {
+              const sm = STATUS_META[it.status] || { color: 'default', label: it.status }
+              return (
+                <List.Item style={{ padding: '6px 12px' }}>
+                  <Space size={8} style={{ width: '100%', justifyContent: 'space-between' }}>
+                    <Space size={6}>
+                      <Tag color="blue">{it.plan_seq ?? '-'}</Tag>
+                      <Text>{it.title}</Text>
+                      {it.agent_name && <Tag>{it.agent_name}</Tag>}
+                    </Space>
+                    <Space size={8}>
+                      <Tag color={sm.color}>{sm.label}</Tag>
+                      <Progress percent={it.progress_pct || 0} size="small" style={{ width: 100, marginBottom: 0 }} />
+                    </Space>
+                  </Space>
+                </List.Item>
+              )
+            }}
+          />
+        ),
+      }}
+    />
+  )
+
   const taskTable = (
     <Table
       rowKey="id"
@@ -445,6 +560,11 @@ const TaskCenter: React.FC = () => {
 
   const tabItems = [
     { key: 'all', label: <span>全部任务 <Badge count={tasks.length} color="#1677ff" size="small" /></span>, children: taskTable },
+    {
+      key: 'plans',
+      label: <span><ThunderboltOutlined /> 指挥官计划 <Badge count={plans.filter(p => p.status === 'active').length} color="#1677ff" size="small" /></span>,
+      children: planTable,
+    },
     ...(['followup', 'assigned', 'meeting', 'email', 'note'] as const).map(t => ({
       key: t,
       label: <span>{ITEM_TYPE_META[t].label} {typeCount(t) > 0 && <Badge count={typeCount(t)} color="#8c8c8c" size="small" />}</span>,

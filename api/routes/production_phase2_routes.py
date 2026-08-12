@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.db_config import get_db
 from database.models import User
-from core.auth.security import get_current_user
+from core.auth.security import get_current_user, require_permission
 
 from api.services.order_decomposition_service import OrderDecompositionService
 from api.services.aps_engine import ApsEngine
@@ -125,11 +125,11 @@ async def delivery_estimate(
 
 # ==================== APS 排程增强 ====================
 
-@router.post("/aps/schedule")
+@router.post("/aps/schedule", include_in_schema=False)
 async def run_schedule(
     req: ScheduleRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "create")),
 ):
     """执行有限产能排程"""
     engine = ApsEngine(db)
@@ -144,11 +144,11 @@ async def run_schedule(
     return result
 
 
-@router.post("/aps/reschedule")
+@router.post("/aps/reschedule", include_in_schema=False)
 async def run_reschedule(
     req: RescheduleRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "edit")),
 ):
     """插单重排（锁定在制工单）"""
     engine = ApsEngine(db)
@@ -163,23 +163,23 @@ async def run_reschedule(
     return result
 
 
-@router.get("/aps/gantt")
+@router.get("/aps/gantt", include_in_schema=False)
 async def gantt_data(
     factory_id: str = Query(...),
     schedule_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "view")),
 ):
     """甘特图数据"""
     engine = ApsEngine(db)
     return await engine.get_gantt_data(factory_id, schedule_id)
 
 
-@router.get("/aps/conflicts")
+@router.get("/aps/conflicts", include_in_schema=False)
 async def detect_conflicts(
     factory_id: str = Query(...),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "view")),
 ):
     """冲突检测"""
     engine = ApsEngine(db)

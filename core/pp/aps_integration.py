@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Set
 from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from core.pp.mrp import MRPService
 
@@ -124,18 +125,35 @@ class PPAPSLinker:
                 "metrics": Optional[Dict],
             }
         """
-        # 1. 获取计划信息（简化：内存模式返回 dummy 数据）
-        # 在实际生产中，应从数据库查询真实的计划对象
-        plan = {
-            "id": plan_id,
-            "factory_id": "FACT-001",  # 🚨 需从真实数据注入
-            "product_id": "PRODUCT-A",
-            "quantity": 100,
-        }
-        
-        # 2. 检查是否有待处理的 MES 工单（简化）
-        # 实际应查询 WorkOrder 表
-        work_orders = [f"WO-{plan['product_id']}-001"]  # mock 数据
+        if self.db is None:
+            return {
+                "success": False,
+                "plan_id": plan_id,
+                "schedule_id": None,
+                "action_taken": "error",
+                "message": "APS 联动必须使用真实数据库会话",
+            }
+
+        from database.models import Plan, WorkOrder
+        plan = await self.db.get(Plan, plan_id)
+        if not plan:
+            return {
+                "success": False,
+                "plan_id": plan_id,
+                "schedule_id": None,
+                "action_taken": "error",
+                "message": "计划不存在，未触发 APS",
+            }
+
+        work_order_result = await self.db.execute(
+            select(WorkOrder).where(
+                WorkOrder.factory_id == plan.factory_id,
+                WorkOrder.source_plan_id == plan_id,
+                WorkOrder.status.in_(["pending", "released", "in_progress"]),
+                WorkOrder.wo_type == "master",
+            )
+        )
+        work_orders = list(work_order_result.scalars().all())
         
         if not work_orders:
             return {
@@ -159,7 +177,7 @@ class PPAPSLinker:
         
         try:
             aps_result = await aps_svc.generate_schedule(
-                factory_id=plan["factory_id"],
+                factory_id=plan.factory_id,
                 mode="hybrid",
                 horizon_days=horizon_days,
                 optimize_for=optimize_for,
@@ -177,8 +195,11 @@ class PPAPSLinker:
             
             # 4. 如果需要，自动确认排程
             if auto_confirm and aps_result.get("schedule_id"):
-                # 注意：confirm_schedule 也需要 APS service 支持
-                pass
+                confirmation = await aps_svc.confirm_schedule(
+                    aps_result["schedule_id"],
+                    confirmed_by=notify_user or "system",
+                )
+                result["confirmation"] = confirmation
             
             return result
             
@@ -254,14 +275,18 @@ class PPAPSLinker:
             return {"success": False, "message": "APS service unavailable"}
         
         try:
-            result = await self._aps_service.generate_schedule(
+            result = await self._aps_service.reschedule(
                 factory_id=factory_id,
-                mode="hybrid",
-                horizon_days=7,
-                optimize_for="delivery",
+                insert_wo_id=new_work_order_id,
                 created_by=created_by,
+                change_reason=f"insert:{new_work_order_id}",
             )
-            return {"success": True, "schedule_id": result.get("schedule_id"), "message": "重排已触发"}
+            return {
+                "success": result.get("success", False),
+                "schedule_id": result.get("schedule_id"),
+                "message": result.get("message", "重排已触发"),
+                "unscheduled_orders": result.get("unscheduled_orders", []),
+            }
         except Exception as e:
             return {"success": False, "message": str(e)}
     

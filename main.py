@@ -196,12 +196,13 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 日报任务异常: {e}")
 
-        # 自动排产 —— 每 8 小时跑一次（模拟计划员每日排产）
+        # 自动排产默认关闭：APS 版本必须由计划员明确生成/确认/下达，
+        # 防止后台每 8 小时制造无法解释的草案并污染版本审计。
         try:
             import time as _t3
-            if not hasattr(_periodic_scheduler, "_last_aps"):
+            if os.getenv("APS_AUTO_GENERATE_ENABLED", "false").lower() == "true" and not hasattr(_periodic_scheduler, "_last_aps"):
                 _periodic_scheduler._last_aps = 0
-            if _t3.time() - _periodic_scheduler._last_aps > 28800:  # 8h
+            if os.getenv("APS_AUTO_GENERATE_ENABLED", "false").lower() == "true" and _t3.time() - _periodic_scheduler._last_aps > 28800:  # 8h
                 _periodic_scheduler._last_aps = _t3.time()
                 from api.services.aps_service import ApsService
                 async with db_config.session_factory() as db:

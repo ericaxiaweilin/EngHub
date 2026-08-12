@@ -251,6 +251,23 @@ async def get_approval_flow(
     return result
 
 
+@router.get("/approvals/{flow_id}/diagram", summary="流程引擎图定义")
+async def get_approval_flow_diagram(
+    flow_id: str,
+    service: TMSService = Depends(get_tms_service),
+):
+    """只返回流程引擎生成的节点/连线图，供前端和其他客户端复用。"""
+    result = await service.get_approval_flow_status(flow_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="审批流不存在")
+    return result.get("diagram") or {
+        "type": "flow_diagram",
+        "nodes": [],
+        "edges": [],
+        "error": "流程引擎未返回图定义",
+    }
+
+
 # ========== Agent Routes (开放 API) ==========
 
 @router.post("/agent/command", summary="Agent 命令入口")

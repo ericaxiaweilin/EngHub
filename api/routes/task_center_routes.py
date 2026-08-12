@@ -144,6 +144,12 @@ async def unified_inbox(
 
     tasks = await svc.list_tasks(db, factory_id)
 
+    # 指挥官行动计划（Plan）：active 优先，含子任务
+    try:
+        plans = await svc.list_plans(db, factory_id, limit=20)
+    except Exception:
+        plans = []
+
     # 指派给我的工序工单（未完工）
     wo_rows = await db.execute(sql("""
         SELECT id, work_order_code, status, priority, planned_qty, planned_due,
@@ -170,6 +176,7 @@ async def unified_inbox(
     open_tasks = [t for t in tasks if t["status"] in ("open", "blocked")]
     return {
         "tasks": tasks,
+        "plans": plans,
         "work_orders": work_orders,
         "notifications": notifications,
         "stats": {

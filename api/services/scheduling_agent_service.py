@@ -50,7 +50,7 @@ class SchedulingAgent:
 
         # 检查是否需要立即重排（紧急工单）
         wo_result = await self.db.execute(text(
-            "SELECT work_order_code, priority, planned_qty, planned_due FROM work_orders WHERE id = :id"
+            "SELECT work_order_code, priority, planned_qty, planned_due, product_id FROM work_orders WHERE id = :id"
         ), {"id": wo_id})
         wo = wo_result.first()
         if not wo:
@@ -60,9 +60,22 @@ class SchedulingAgent:
         is_urgent = wo_map["priority"] in ("urgent", "emergency")
 
         if is_urgent:
-            # 紧急工单：立即重排
-            result = await self.auto_reschedule(factory_id, reason=f"紧急工单 {wo_map['work_order_code']} 下达")
-            return {"action": "reschedule", "trigger": "urgent_order", **result}
+            # 紧急工单：先查插单审批单（审计 Q4），有已批准批文才重排，否则挂起待审
+            from core.pp.rush_approval_service import RushApprovalService
+
+            appr_svc = RushApprovalService(self.db)
+            approved = await appr_svc.find_approved_for_wo(factory_id, wo_map.get("product_id") or "")
+            if not approved:
+                return {
+                    "action": "pending_approval",
+                    "trigger": "urgent_order",
+                    "message": f"紧急工单 {wo_map['work_order_code']} 无已批准插单审批单，已挂起待审批，不执行全厂重排",
+                }
+            result = await self.auto_reschedule(
+                factory_id,
+                reason=f"紧急工单 {wo_map['work_order_code']} 下达（审批单 {approved.approval_code} 已批准）",
+            )
+            return {"action": "reschedule", "trigger": "urgent_order", "approval_code": approved.approval_code, **result}
         else:
             # 普通工单：追加到当前排程末尾
             result = await self._append_to_schedule(factory_id, wo_id)

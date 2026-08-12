@@ -70,7 +70,7 @@ async def process_request(db: AsyncSession, request: APSRequest) -> bool:
             mode=request.mode,
             horizon_days=request.horizon_days,
             optimize_for=request.optimize_for,
-            updated_by=f"queue_consumer_{request.id}"
+            created_by=f"queue_consumer_{request.id}"
         )
         
         logger.info(f"排程完成 {request.id}, 生成方案: {schedule_result.get('schedule_code', 'unknown')}")

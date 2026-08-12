@@ -157,12 +157,7 @@ class PermissionDenied(Exception):
     pass
 
 
-async def require_permission(
-    module: str,
-    action: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> User:
+def require_permission(module: str, action: str):
     """
     检查当前用户是否拥有指定模块的操作权限
     
@@ -174,20 +169,27 @@ async def require_permission(
         ):
             ...
     """
-    if current_user.is_superuser or current_user.role == "admin":
-        return current_user
+    async def permission_checker(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ) -> User:
+        if current_user.is_superuser or current_user.role == "admin":
+            return current_user
 
-    # 从角色定义中获取权限
-    from core.auth.roles import get_user_permissions, has_permission
-    user_perms = get_user_permissions(current_user)
-    
-    if has_permission(user_perms, module, action):
-        return current_user
+        # 从角色定义中获取权限
+        from core.auth.roles import get_user_permissions, has_permission
+        user_perms = get_user_permissions(current_user)
 
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail=f"权限不足：需要 [{module}.{action}] 权限",
-    )
+        if has_permission(user_perms, module, action):
+            return current_user
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"权限不足：需要 [{module}.{action}] 权限",
+        )
+
+    permission_checker.__name__ = f"require_{module}_{action}"
+    return permission_checker
 
 
 async def require_any_permission(

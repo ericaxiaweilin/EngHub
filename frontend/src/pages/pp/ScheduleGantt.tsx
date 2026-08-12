@@ -10,8 +10,9 @@ import {
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { apsApi, ApsSchedule, GanttData, ApsTask } from '../../services/aps'
+import { getActiveFactoryId } from '../../utils/factory'
 
-const FACTORY = localStorage.getItem('active_factory_id') || 'FAC_MECH_001'
+const FACTORY = getActiveFactoryId()
 
 const statusColorMap: Record<string, string> = {
   draft: 'default',
@@ -183,13 +184,16 @@ const ScheduleGantt: React.FC = () => {
                 placeholder="选择排程方案"
                 options={schedules.map(s => ({
                   value: s.id,
-                  label: `${s.schedule_code} (${statusTextMap[s.status] || s.status})`,
+                  label: `${s.schedule_code} · V${s.version_number || 1} (${statusTextMap[s.status] || s.status})`,
                 }))}
               />
               {currentSchedule && (
-                <Tag color={statusColorMap[currentSchedule.status]}>
-                  {statusTextMap[currentSchedule.status] || currentSchedule.status}
-                </Tag>
+                <Space size={4}>
+                  <Tag color={statusColorMap[currentSchedule.status]}>
+                    V{currentSchedule.version_number || 1} · {statusTextMap[currentSchedule.status] || currentSchedule.status}
+                  </Tag>
+                  {currentSchedule.is_current && <Tag color="blue">当前版本</Tag>}
+                </Space>
               )}
             </Space>
           </Col>

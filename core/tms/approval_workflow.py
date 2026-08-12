@@ -26,6 +26,7 @@ from database.models import (
     User,
 )
 from core.tms.events import tms_event_bus, TMSEventType
+from core.tms.flow_diagram import build_flow_diagram
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,14 @@ class FlowStep:
     condition: Optional[Dict[str, Any]] = None  # 条件表达式
     allow_agent: bool = False                 # 是否允许 Agent 代审
     auto_approve_if: Optional[Dict[str, Any]] = None  # 自动审批条件
+    # 业务工作流扩展：由流程定义维护，图引擎只负责透传和渲染
+    inputs: List[Dict[str, Any]] = field(default_factory=list)
+    judgement_criteria: List[Dict[str, Any]] = field(default_factory=list)
+    outputs: List[Dict[str, Any]] = field(default_factory=list)
+    deliverables: List[Dict[str, Any]] = field(default_factory=list)
+    next_focus: List[str] = field(default_factory=list)
+    blockers: List[Dict[str, Any]] = field(default_factory=list)
+    work_matrix: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -409,7 +418,7 @@ class ApprovalWorkflowEngine:
         )
         records = records_result.scalars().all()
 
-        return {
+        result = {
             "flow_id": str(flow.id),
             "flow_code": flow.flow_code,
             "task_id": str(flow.task_id),
@@ -429,6 +438,16 @@ class ApprovalWorkflowEngine:
                 for r in records
             ],
         }
+        result["diagram"] = build_flow_diagram(
+            flow_id=result["flow_id"],
+            flow_code=result["flow_code"],
+            flow_type=result["flow_type"],
+            status=result["status"],
+            current_step=result["current_step"],
+            steps=result["steps"],
+            records=result["records"],
+        )
+        return result
 
     async def get_pending_approvals(self, approver_id: str) -> List[Dict[str, Any]]:
         """获取待审批列表"""

@@ -6,15 +6,15 @@ PP API Routes
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 import math
-import time
-from sqlalchemy import select, func, and_
+import uuid
+from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from core.auth.security import get_current_user
-from database.models import User, Plan, Product, BomItem, Inventory, Station, WorkOrder
+from core.auth.security import get_current_user, require_permission
+from database.models import User, Plan, Product, BomItem, Inventory, Station, WorkOrder, WorkOrderMaterial
 from core.pp.plan import MPSService
 from core.pp.mrp import MRPService
 
@@ -100,14 +100,15 @@ async def list_plans(
 async def create_plan(
     plan: PlanCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "create")),
 ):
     """创建生产计划（支持优先级自动计算）"""
-    plan_id = f"plan-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    # pp_plans.id 在生产库是 UUID；不要再生成不可写入 UUID 列的业务字符串。
+    plan_id = str(uuid.uuid4())
     
     # 计算优先级分数（基于交期紧迫度+客户等级）
-    required_date = datetime.fromisoformat(plan.required_date)
-    days_until_due = (required_date - datetime.utcnow()).days
+    required_date = datetime.fromisoformat(plan.required_date).date()
+    days_until_due = (datetime.combine(required_date, dtime.min) - datetime.utcnow()).days
     
     # 交期紧迫度评分
     if days_until_due <= 0:
@@ -129,11 +130,12 @@ async def create_plan(
     priority_score = min(due_score + level_score + plan.priority, 150)
     
     new_plan = Plan(
-        plan_code=f"MPS-{plan.factory_id[:8]}-{datetime.utcnow().strftime('%Y%m')}-{int(time.time())}",
+        plan_code=f"MPS-{plan.factory_id[:8]}-{datetime.utcnow().strftime('%Y%m')}-{uuid.uuid4().hex[:8].upper()}",
         factory_id=plan.factory_id,
         product_id=plan.product_id,
         quantity=plan.quantity,
         required_date=required_date,
+        due_date=required_date,
         sales_order_id=plan.sales_order_id,
         customer_level=plan.customer_level.lower(),
         priority=plan.priority,
@@ -164,7 +166,7 @@ async def get_plan(
 async def confirm_plan(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "approve")),
 ):
     """确认计划（仅草稿状态可转换）"""
     p = await db.get(Plan, plan_id)
@@ -185,7 +187,7 @@ async def confirm_plan(
 async def release_plan(
     plan_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "release")),
 ):
     """下达计划（检查产能冲突后生成MES工单）"""
     p = await db.get(Plan, plan_id)
@@ -194,44 +196,83 @@ async def release_plan(
     if p.status != "confirmed":
         raise HTTPException(status_code=400, detail="只有已确认的计划可以下达")
     
-    # 调用业务服务检查产能冲突
-    mps_service = MPSService()
+    if p.mrp_status != "calculated":
+        raise HTTPException(status_code=409, detail="计划尚未完成 MRP 计算，不能下达；请先执行 MRP")
+
+    # 调用业务服务检查产能冲突；必须复用当前 DB 会话，不能使用内存服务。
+    mps_service = MPSService(db)
     conflicts = await mps_service.detect_capacity_conflict(plan_id)
     if conflicts:
         for c in conflicts:
             if c["severity"] == "HIGH":
                 raise HTTPException(status_code=409, detail=f"产能冲突: {c['message']}")
     
+    work_order = await db.get(WorkOrder, p.work_order_id) if p.work_order_id else None
+    if not work_order:
+        product = await db.get(Product, p.product_id)
+        work_order = WorkOrder(
+            work_order_code=f"WO-{p.plan_code}",
+            factory_id=p.factory_id,
+            sales_order_id=p.sales_order_id,
+            product_id=p.product_id,
+            routing_id=product.current_routing_id if product else None,
+            planned_qty=p.quantity,
+            completed_qty=0,
+            status="pending",
+            wo_type="master",
+            planned_due=datetime.combine(p.required_date, datetime.max.time()),
+            source_plan_id=plan_id,
+            created_by=current_user.username if current_user else "system",
+        )
+        db.add(work_order)
+        await db.flush()
+        p.work_order_id = work_order.id
+
+        # 将最近一次 MRP 结果复制到工单物料齐套表，APS 释放时据此拦截缺料。
+        mrp_items = (await db.execute(text("""
+            SELECT mi.material_id, mi.material_code, mi.material_name,
+                   mi.required_qty, mi.available_qty, mi.shortage_qty, mi.unit
+            FROM mrp_items mi
+            JOIN mrp_results mr ON mr.id = mi.mrp_result_id
+            WHERE mr.plan_id = :plan_id
+            ORDER BY mr.calculated_at DESC
+        """), {"plan_id": plan_id})).mappings().all()
+        for item in mrp_items:
+            db.add(WorkOrderMaterial(
+                id=str(uuid.uuid4()),
+                work_order_id=work_order.id,
+                material_id=item["material_id"],
+                material_code=item["material_code"],
+                material_name=item["material_name"],
+                required_qty=int(item["required_qty"] or 0),
+                available_qty=int(item["available_qty"] or 0),
+                received_qty=int(item["available_qty"] or 0),
+                shortage_qty=int(item["shortage_qty"] or 0),
+                unit=item["unit"],
+            ))
+
     p.status = "released"
+    p.release_status = "released"
     p.released_by = current_user.username if current_user else "system"
     p.released_at = datetime.utcnow()
     p.updated_at = datetime.utcnow()
     await db.commit()
-    
-    # 生成MES工单
-    work_order = WorkOrder(
-        work_order_code=f"WO-{p.plan_code}",
+
+    # 在同一请求链路生成 APS 草案，避免后台任务使用已关闭的请求会话，
+    # 也避免自动生成多个无法区分的草案版本。
+    from api.services.aps_service import ApsService
+    aps_result = await ApsService(db).generate_schedule(
         factory_id=p.factory_id,
-        product_id=p.product_id,
-        planned_qty=p.quantity,
-        completed_qty=0,
-        status="draft",
-        due_date=p.required_date,
-        source_plan_id=plan_id,
+        mode="hybrid",
+        horizon_days=7,
+        optimize_for="delivery",
         created_by=current_user.username if current_user else "system",
+        change_reason=f"mps_release:{plan_id}",
     )
-    db.add(work_order)
-    await db.commit()
-    
-    p.work_order_id = work_order.id
-    
-    # 异步触发APS排程（使用后台队列消费者）
-    from core.pp.aps_integration import APSJobQueue
-    import asyncio
-    loop = asyncio.get_event_loop()
-    loop.create_task(APSJobQueue(db).process_plan_release_event(plan_id, auto_confirm=False))
-    
-    return _serialize_plan(p)
+    await db.refresh(p)
+    result = _serialize_plan(p)
+    result["aps"] = aps_result
+    return result
 
 
 @router.post("/plans/{plan_id}/complete", description="完成生产计划。将计划状态标记为completed，记录完成人和完成时间。用于在MES工单执行完成后更新MPS计划状态。")
@@ -718,7 +759,7 @@ async def check_plan_capacity_conflict(
 async def calculate_mrp(
     request: MRPCalculateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("pp", "edit")),
 ):
     """
     MRP 物料需求计算（真实 DB 数据）
@@ -787,14 +828,57 @@ async def calculate_mrp(
             "supplier": b.supplier_code if hasattr(b, "supplier_code") else "",
         })
     
+    mrp_result_id = str(uuid.uuid4())
+    calculated_at = datetime.utcnow()
+    await db.execute(text("""
+        INSERT INTO mrp_results
+            (id, factory_id, plan_id, calculated_at, target_date, status,
+             total_required, total_available, total_shortage, total_value)
+        VALUES
+            (:id, :factory_id, :plan_id, :calculated_at, :target_date, 'calculated',
+             :total_required, :total_available, :total_shortage, 0)
+    """), {
+        "id": mrp_result_id,
+        "factory_id": p.factory_id,
+        "plan_id": p.id,
+        "calculated_at": calculated_at,
+        "target_date": p.required_date,
+        "total_required": sum(item["required_qty"] for item in items),
+        "total_available": sum(item["on_hand_qty"] for item in items),
+        "total_shortage": total_shortage,
+    })
+    for item in items:
+        await db.execute(text("""
+            INSERT INTO mrp_items
+                (id, mrp_result_id, material_id, material_code, material_name,
+                 required_qty, available_qty, reserved_qty, on_order_qty,
+                 shortage_qty, unit)
+            VALUES
+                (:id, :mrp_result_id, :material_id, :material_code, :material_name,
+                 :required_qty, :available_qty, 0, 0, :shortage_qty, :unit)
+        """), {
+            "id": str(uuid.uuid4()),
+            "mrp_result_id": mrp_result_id,
+            "material_id": item["material_id"] or item["material_code"],
+            "material_code": item["material_code"],
+            "material_name": item["material_name"],
+            "required_qty": item["required_qty"],
+            "available_qty": item["on_hand_qty"],
+            "shortage_qty": item["net_qty"],
+            "unit": item["unit"],
+        })
+    p.mrp_status = "calculated"
+    p.updated_at = calculated_at
+    await db.commit()
+
     mrp_result = {
-        "id": f"MRP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{request.plan_id[:8]}",
+        "id": mrp_result_id,
         "plan_id": request.plan_id,
         "plan_code": p.plan_code,
         "product_id": p.product_id,
         "product_name": product_name,
         "status": "calculated",
-        "calculated_at": datetime.utcnow().isoformat(),
+        "calculated_at": calculated_at.isoformat(),
         "target_date": p.required_date.isoformat() if p.required_date else None,
         "bom_version": request.bom_version or "CURRENT",
         "items": items,
@@ -813,9 +897,22 @@ async def get_mrp_history(
     limit: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取MRP计算历史记录（存于独立表或日志表）"""
-    # 此处应查询MRP历史表，当前返回空示例
-    return {"history": [], "count": 0}
+    """获取真实落库的 MRP 计算历史。"""
+    result = await db.execute(text("""
+        SELECT mr.id, mr.factory_id, mr.plan_id, p.plan_code,
+               mr.calculated_at, mr.target_date, mr.status,
+               mr.total_required, mr.total_available, mr.total_shortage
+        FROM mrp_results mr
+        LEFT JOIN pp_plans p ON p.id = mr.plan_id
+        ORDER BY mr.calculated_at DESC
+        LIMIT :limit
+    """), {"limit": limit})
+    history = [dict(row) for row in result.mappings().all()]
+    for row in history:
+        for key, value in list(row.items()):
+            if hasattr(value, "isoformat"):
+                row[key] = value.isoformat()
+    return {"history": history, "count": len(history)}
 
 
 # --- Utility Functions ---
@@ -835,6 +932,9 @@ def _serialize_plan(p: Plan) -> dict:
         "customer_level": p.customer_level,
         "priority": p.priority,
         "status": p.status,
+        "release_status": p.release_status,
+        "mrp_status": p.mrp_status,
+        "work_order_id": p.work_order_id,
         "due_date": p.due_date.isoformat() if p.due_date else None,
         "priority_score": p.priority_score,
         "confirmed_by": p.confirmed_by,

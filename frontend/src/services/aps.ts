@@ -9,6 +9,10 @@ export interface ApsSchedule {
   mode: string
   optimize_for: string
   status: string
+  version_number?: number
+  is_current?: boolean
+  supersedes_schedule_id?: string
+  change_reason?: string
   horizon_start: string
   horizon_end: string
   on_time_rate?: number
@@ -38,6 +42,7 @@ export interface ApsTask {
   status: string
   is_locked: boolean
   priority: number
+  material_ready?: boolean
 }
 
 export interface GanttData {
@@ -66,16 +71,56 @@ export interface CapacityResource {
 export interface CapacityLoadData {
   factory_id: string
   horizon_days: number
-  daily_capacity_hours: number
+  daily_capacity_hours: number | null
   resources: CapacityResource[]
   bottleneck_count: number
+}
+
+// ============== 插单审批流 (Q4) ==============
+
+export interface RushApproval {
+  id: string
+  approval_code: string
+  factory_id: string
+  product_id: string
+  quantity: number
+  due_date?: string | null
+  rush_priority: string
+  impact_json?: {
+    affected_orders: number
+    total_existing_orders: number
+    max_delay_hours: number
+    delayed_orders?: Array<Record<string, any>>
+    rush_feasible?: boolean
+  }
+  affected_orders: number
+  max_delay_days: string | number
+  process_hours?: string | number
+  recommendation?: string
+  approval_level: number
+  required_role?: string
+  status: string
+  applicant?: string
+  approver?: string
+  approved_at?: string
+  reject_reason?: string
+  target_schedule_id?: string
+  created_at?: string
+  logs?: Array<{
+    id: string
+    action: string
+    actor: string
+    actor_role?: string
+    comment?: string
+    created_at: string
+  }>
 }
 
 // ============== API ==============
 
 export const apsApi = {
   /** 生成排程方案 */
-  generate(params: { factory_id: string; mode?: string; horizon_days?: number; optimize_for?: string }) {
+  generate(params: { factory_id: string; mode?: string; horizon_days?: number; optimize_for?: string; reason?: string }) {
     return api.post('/api/v1/aps/generate', params)
   },
 
@@ -100,7 +145,7 @@ export const apsApi = {
   },
 
   /** 插单重排 */
-  reschedule(params: { factory_id: string; insert_wo_id?: string }) {
+  reschedule(params: { factory_id: string; insert_wo_id?: string; reason?: string }) {
     return api.post('/api/v1/aps/reschedule', params)
   },
 
@@ -142,5 +187,42 @@ export const apsApi = {
   /** Phase 2: 冲突检测 */
   detectConflicts(params: { factory_id: string }) {
     return api.get('/api/v1/aps/conflicts', { params })
+  },
+
+  // ===== 插单审批流 (Q4) =====
+
+  /** 插单评估并生成审批单草稿（persist=true 落库） */
+  rushOrderImpact(params: { factory_id: string; product_id: string; quantity: number; due_date?: string; priority?: string; persist?: boolean }) {
+    return api.post('/api/v1/aps/rush-order-impact', params)
+  },
+
+  /** 插单审批单列表 */
+  listRushApprovals(params: { factory_id: string; status?: string; mine?: boolean }) {
+    return api.get('/api/v1/aps/rush-order/approvals', { params })
+  },
+
+  /** 插单审批单详情 */
+  getRushApproval(id: string) {
+    return api.get(`/api/v1/aps/rush-order/approvals/${id}`)
+  },
+
+  /** 提报 */
+  submitRushApproval(id: string, comment?: string) {
+    return api.post(`/api/v1/aps/rush-order/approvals/${id}/submit`, { comment })
+  },
+
+  /** 审批通过（触发重排） */
+  approveRushApproval(id: string, comment?: string) {
+    return api.post(`/api/v1/aps/rush-order/approvals/${id}/approve`, { comment })
+  },
+
+  /** 驳回 */
+  rejectRushApproval(id: string, reason: string) {
+    return api.post(`/api/v1/aps/rush-order/approvals/${id}/reject`, { reason })
+  },
+
+  /** 撤销 */
+  cancelRushApproval(id: string) {
+    return api.post(`/api/v1/aps/rush-order/approvals/${id}/cancel`, {})
   },
 }

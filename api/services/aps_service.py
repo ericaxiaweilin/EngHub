@@ -8,19 +8,20 @@ import uuid
 
 import logging
 
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, date as ddate
 
 from typing import Optional, List, Dict, Any
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_, text
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import (
 
-    WorkOrder, Equipment, RoutingTemplate, RoutingTemplateStep,
+    WorkOrder, Equipment, Routing, RoutingTemplate, RoutingTemplateStep,
 
-    ApsSchedule, ApsScheduleTask, ApsWorkCalendar, Station,
+    ApsSchedule, ApsScheduleTask, ApsWorkCalendar, ApsHoliday,
+    ApsPlanEvent, Station,
 
 )
 
@@ -80,6 +81,28 @@ class ApsService:
                 "metrics": Dict,
             }
         """
+        if not affected_wo_ids:
+            return {
+                "success": True,
+                "schedule_id": None,
+                "affected_wo_count": 0,
+                "tasks_processed": 0,
+                "message": "无工单需要重排",
+                "diff_report": {},
+                "metrics": {},
+            }
+
+        # 现阶段使用同一主引擎做全量重算，并明确标记受影响工单；
+        # 不再返回内存拼造的“增量任务”，避免前端看到不存在于数据库的计划。
+        result = await self.reschedule(
+            factory_id=factory_id,
+            created_by=created_by,
+            change_reason=f"incremental:{','.join(affected_wo_ids)}",
+        )
+        result["affected_wo_count"] = len(affected_wo_ids)
+        result["tasks_processed"] = result.get("total_tasks", 0)
+        return result
+
         from datetime import datetime, timedelta
         import uuid
         
@@ -232,6 +255,65 @@ class ApsService:
 
         self.db = db
 
+    @staticmethod
+    def _routing_step_seconds(step: Dict[str, Any]) -> float:
+        """统一旧 Routing JSON 与模板路线的工时单位。"""
+        if step.get("standard_hours") is not None:
+            return float(step.get("standard_hours") or 0) * 3600
+        if step.get("time_min") is not None:
+            return float(step.get("time_min") or 0) * 60
+        # routings.steps 的 standard_time 历史口径为秒。
+        return float(step.get("standard_time") or 0)
+
+    async def _load_calendar_constraints(
+        self,
+        factory_id: str,
+        resource_id: str,
+        horizon_start: datetime,
+        horizon_end: datetime,
+    ) -> Dict[str, Any]:
+        """读取工厂/资源日历和日期级假期，不在算法内写死班次。"""
+        calendar_result = await self.db.execute(
+            select(ApsWorkCalendar).where(
+                ApsWorkCalendar.factory_id == factory_id,
+                ApsWorkCalendar.resource_id.in_([resource_id, "*"]),
+                ApsWorkCalendar.is_active.is_(True),
+                or_(
+                    ApsWorkCalendar.effective_from.is_(None),
+                    ApsWorkCalendar.effective_from <= horizon_end.date(),
+                ),
+                or_(
+                    ApsWorkCalendar.effective_to.is_(None),
+                    ApsWorkCalendar.effective_to >= horizon_start.date(),
+                ),
+            ).order_by(ApsWorkCalendar.resource_id, ApsWorkCalendar.day_of_week)
+        )
+        calendars = list(calendar_result.scalars().all())
+        by_weekday: Dict[int, List] = {}
+        for item in calendars:
+            by_weekday.setdefault(item.day_of_week, []).append((item.start_time, item.end_time))
+
+        # 只有在工厂没有配置日历时才使用明确标注的兼容默认值；该值不会覆盖已维护的工厂配置。
+        if not by_weekday:
+            by_weekday = {dow: [(dtime(8, 0), dtime(20, 0))] for dow in range(6)}
+
+        holiday_result = await self.db.execute(
+            select(ApsHoliday).where(
+                ApsHoliday.factory_id == factory_id,
+                ApsHoliday.is_active.is_(True),
+                ApsHoliday.holiday_date >= horizon_start.date(),
+                ApsHoliday.holiday_date <= horizon_end.date(),
+            )
+        )
+        holidays = list(holiday_result.scalars().all())
+        blocked_dates = {item.holiday_date for item in holidays if not item.is_working_day}
+        working_dates = {item.holiday_date for item in holidays if item.is_working_day}
+        return {
+            "calendar_by_weekday": by_weekday,
+            "blocked_dates": blocked_dates,
+            "working_dates": working_dates,
+        }
+
     async def generate_schedule(
 
         self,
@@ -245,6 +327,8 @@ class ApsService:
         optimize_for: str = "delivery",
 
         created_by: str = "system",
+
+        change_reason: str = "manual_generation",
 
     ) -> Dict[str, Any]:
 
@@ -281,6 +365,7 @@ class ApsService:
         scheduler = HybridScheduler()
 
         product_routings: Dict[str, List[Dict]] = {}
+        unrouted_orders: List[str] = []
 
         for wo in work_orders:
 
@@ -323,13 +408,40 @@ class ApsService:
 
                         ]
 
+            elif wo.routing_id:
+                # 兼容旧版 routings.steps JSON；新工单优先使用模板路线，
+                # 但历史工单没有模板绑定时也必须进入同一套 APS 引擎。
+                routing = await self.db.get(Routing, str(wo.routing_id))
+                if routing and isinstance(routing.steps, list) and routing.steps:
+                    product_routings[wo.product_id] = [
+                        {
+                            "sequence": int(step.get("sequence", step.get("seq", (idx + 1) * 10))),
+                            "name": step.get("name", step.get("operation_name", f"工序{idx + 1}")),
+                            "standard_time": self._routing_step_seconds(step),
+                            "setup_time": float(step.get("setup_time", 300) or 300),
+                            "allowed_stations": [step.get("station") or step.get("work_center")] if (step.get("station") or step.get("work_center")) else [],
+                            "required_skills": step.get("required_skills", []),
+                        }
+                        for idx, step in enumerate(routing.steps)
+                    ]
+
             # 如果产品有工艺路线，加载到排程器
 
             if wo.product_id in product_routings:
 
                 scheduler.load_process_constraints(wo.product_id, product_routings[wo.product_id])
+            else:
+                unrouted_orders.append(str(wo.id))
 
-        # 3. 加载资源约束（设备/工位）
+        # 3. 加载资源约束（设备/工位、真实产能、班次和假期）
+
+        capacity_result = await self.db.execute(text("""
+            SELECT station_id, available_hours_per_day, efficiency_rate,
+                   setup_time_minutes, max_concurrent_orders
+            FROM station_capacity
+            WHERE factory_id = :factory_id AND is_active = TRUE
+        """), {"factory_id": factory_id})
+        capacity_map = {row["station_id"]: dict(row) for row in capacity_result.mappings().all()}
 
         eq_stmt = select(Equipment).where(
 
@@ -362,6 +474,10 @@ class ApsService:
             if resource_id and resource_id not in loaded_resources:
 
                 is_broken = eq.status in ("broken", "maintenance")
+                capacity = capacity_map.get(resource_id, {})
+                calendar = await self._load_calendar_constraints(
+                    factory_id, resource_id, horizon_start, horizon_end
+                )
 
                 scheduler.load_resource_constraints(
 
@@ -371,11 +487,15 @@ class ApsService:
 
                     available_to=horizon_end,
 
-                    capacity=1,
+                    capacity=int(capacity.get("max_concurrent_orders") or 1),
 
-                    oee=85.0,
+                    oee=float(capacity.get("efficiency_rate") or 0.85),
 
-                    calendar=[(dtime(8, 0), dtime(20, 0))],
+                    calendar_by_weekday=calendar["calendar_by_weekday"],
+
+                    blocked_dates=calendar["blocked_dates"],
+
+                    working_dates=calendar["working_dates"],
 
                     is_broken=is_broken,
 
@@ -388,6 +508,10 @@ class ApsService:
         for station in needed_stations:
 
             if station and station not in loaded_resources:
+                capacity = capacity_map.get(station, {})
+                calendar = await self._load_calendar_constraints(
+                    factory_id, station, horizon_start, horizon_end
+                )
 
                 scheduler.load_resource_constraints(
 
@@ -397,11 +521,15 @@ class ApsService:
 
                     available_to=horizon_end,
 
-                    capacity=1,
+                    capacity=int(capacity.get("max_concurrent_orders") or 1),
 
-                    oee=90.0,
+                    oee=float(capacity.get("efficiency_rate") or 0.9),
 
-                    calendar=[(dtime(8, 0), dtime(20, 0))],
+                    calendar_by_weekday=calendar["calendar_by_weekday"],
+
+                    blocked_dates=calendar["blocked_dates"],
+
+                    working_dates=calendar["working_dates"],
 
                 )
 
@@ -426,6 +554,10 @@ class ApsService:
                 rid = st.station_code or str(st.id)
 
                 if rid not in loaded_resources:
+                    capacity = capacity_map.get(rid, {})
+                    calendar = await self._load_calendar_constraints(
+                        factory_id, rid, horizon_start, horizon_end
+                    )
 
                     scheduler.load_resource_constraints(
 
@@ -435,11 +567,15 @@ class ApsService:
 
                         available_to=horizon_end,
 
-                        capacity=1,
+                        capacity=int(capacity.get("max_concurrent_orders") or 1),
 
-                        oee=90.0,
+                        oee=float(capacity.get("efficiency_rate") or 0.9),
 
-                        calendar=[(dtime(8, 0), dtime(20, 0))],
+                        calendar_by_weekday=calendar["calendar_by_weekday"],
+
+                        blocked_dates=calendar["blocked_dates"],
+
+                        working_dates=calendar["working_dates"],
 
                     )
 
@@ -485,11 +621,57 @@ class ApsService:
 
         result = scheduler.schedule_hybrid(sched_mode, optimize_for)
 
+        if unrouted_orders:
+            result.unscheduled_orders = list(dict.fromkeys(result.unscheduled_orders + unrouted_orders))
+            result.constraint_violations.extend(
+                {"order_id": wo_id, "reason": "工单没有可用工艺路线"}
+                for wo_id in unrouted_orders
+            )
+            result.success = False
+            result.message = f"有 {len(unrouted_orders)} 个工单缺少可用工艺路线"
+
         # 6. 持久化排程方案
 
         schedule_id = str(uuid.uuid4())
 
         schedule_code = f"APS-{factory_id[:6]}-{now.strftime('%Y%m%d%H%M%S')}-{str(uuid.uuid4())[:4].upper()}"
+
+        current_result = await self.db.execute(
+            select(ApsSchedule)
+            .where(
+                ApsSchedule.factory_id == factory_id,
+                ApsSchedule.is_current.is_(True),
+            )
+            .order_by(ApsSchedule.created_at.desc())
+            .limit(1)
+        )
+        current_schedule = current_result.scalar_one_or_none()
+        version_result = await self.db.execute(
+            select(func.max(ApsSchedule.version_number)).where(ApsSchedule.factory_id == factory_id)
+        )
+        next_version = int(version_result.scalar() or 0) + 1
+
+        material_ready_map: Dict[str, bool] = {}
+        if work_orders:
+            material_result = await self.db.execute(
+                text("""
+                    SELECT work_order_id,
+                           SUM(CASE WHEN COALESCE(shortage_qty, 0) > 0 THEN 1 ELSE 0 END) AS shortage_count
+                    FROM work_order_materials
+                    WHERE work_order_id IN (
+                        SELECT id FROM work_orders
+                        WHERE factory_id = :factory_id
+                          AND wo_type = 'master'
+                          AND status IN ('released', 'in_progress', 'pending')
+                    )
+                    GROUP BY work_order_id
+                """),
+                {"factory_id": factory_id},
+            )
+            material_ready_map = {
+                str(row["work_order_id"]): int(row["shortage_count"] or 0) == 0
+                for row in material_result.mappings().all()
+            }
 
         aps_schedule = ApsSchedule(
 
@@ -522,6 +704,10 @@ class ApsService:
             unscheduled_count=len(result.unscheduled_orders),
 
             created_by=created_by,
+            version_number=next_version,
+            is_current=False,
+            supersedes_schedule_id=current_schedule.id if current_schedule else None,
+            change_reason=change_reason,
 
         )
 
@@ -572,11 +758,24 @@ class ApsService:
                 is_locked=False,
 
                 priority=PRIORITY_MAP.get(wo.priority if wo else "medium", SchedulingPriority.NORMAL).value,
+                material_ready=material_ready_map.get(str(task.order_id), True),
 
             )
 
             self.db.add(aps_task)
 
+        await self._record_event(
+            factory_id=factory_id,
+            event_type="schedule_generated",
+            actor=created_by,
+            schedule_id=schedule_id,
+            reason=change_reason,
+            payload={
+                "version_number": next_version,
+                "total_tasks": len(result.schedule),
+                "unscheduled_orders": result.unscheduled_orders,
+            },
+        )
         await self.db.commit()
 
         logger.info(
@@ -606,6 +805,30 @@ class ApsService:
             "message": result.message,
 
         }
+
+    async def _record_event(
+        self,
+        *,
+        factory_id: str,
+        event_type: str,
+        actor: str,
+        schedule_id: Optional[str] = None,
+        plan_id: Optional[str] = None,
+        work_order_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.db.add(ApsPlanEvent(
+            id=str(uuid.uuid4()),
+            factory_id=factory_id,
+            event_type=event_type,
+            actor=actor,
+            schedule_id=schedule_id,
+            plan_id=plan_id,
+            work_order_id=work_order_id,
+            reason=reason,
+            payload=payload or {},
+        ))
 
     async def confirm_schedule(self, schedule_id: str, confirmed_by: str) -> Dict[str, Any]:
 
@@ -663,9 +886,10 @@ class ApsService:
 
             if wo:
 
-                wo.planned_start = times["start"]
-
-                wo.planned_due = times["end"]
+                # planned_due 是 MPS/销售承诺交期，不能被 APS 预计完工覆盖。
+                # APS 任务的 planned_end 保留实际排程结果，工单只补齐计划开始时间。
+                if wo.planned_start is None:
+                    wo.planned_start = times["start"]
 
                 wo.assigned_station_id = times["station"]
 
@@ -682,14 +906,24 @@ class ApsService:
         schedule.status = "confirmed"
 
         schedule.confirmed_by = confirmed_by
+        schedule.approved_by = confirmed_by
+        schedule.is_current = False
 
         schedule.updated_at = datetime.utcnow()
+        await self._record_event(
+            factory_id=schedule.factory_id,
+            event_type="schedule_confirmed",
+            actor=confirmed_by,
+            schedule_id=schedule.id,
+            reason="APS 方案确认",
+            payload={"updated_orders": updated_count},
+        )
 
         await self.db.commit()
 
         return {"success": True, "message": f"已确认，回写 {updated_count} 个工单", "updated_orders": updated_count}
 
-    async def release_schedule(self, schedule_id: str) -> Dict[str, Any]:
+    async def release_schedule(self, schedule_id: str, released_by: str = "system") -> Dict[str, Any]:
 
         """下达排程 → 工单状态 released"""
 
@@ -708,6 +942,33 @@ class ApsService:
         tasks_result = await self.db.execute(tasks_stmt)
 
         tasks = list(tasks_result.scalars().all())
+
+        not_ready = [t for t in tasks if t.material_ready is False]
+        if not_ready:
+            return {
+                "success": False,
+                "message": f"有 {len(not_ready)} 条排程任务物料未齐套，不能下达",
+                "material_shortage_tasks": len(not_ready),
+            }
+        if schedule.unscheduled_count:
+            return {
+                "success": False,
+                "message": f"方案仍有 {schedule.unscheduled_count} 个工单未排产，不能下达",
+                "unscheduled_count": schedule.unscheduled_count,
+            }
+
+        previous_result = await self.db.execute(
+            select(ApsSchedule).where(
+                ApsSchedule.factory_id == schedule.factory_id,
+                ApsSchedule.is_current.is_(True),
+                ApsSchedule.id != schedule.id,
+            )
+        )
+        for previous in previous_result.scalars().all():
+            previous.is_current = False
+            if previous.status == "released":
+                previous.status = "archived"
+            previous.updated_at = datetime.utcnow()
 
         wo_ids = set(t.work_order_id for t in tasks if t.work_order_id)
 
@@ -730,20 +991,64 @@ class ApsService:
             t.status = "released"
 
         schedule.status = "released"
-
+        schedule.is_current = True
+        schedule.released_by = released_by
+        schedule.released_at = datetime.utcnow()
         schedule.updated_at = datetime.utcnow()
+        await self._record_event(
+            factory_id=schedule.factory_id,
+            event_type="schedule_released",
+            actor=released_by,
+            schedule_id=schedule.id,
+            reason="APS 方案下达",
+            payload={"released_orders": released},
+        )
 
         await self.db.commit()
 
-        return {"success": True, "message": f"已下达 {released} 个工单"}
+        return {
+            "success": True,
+            "message": f"已下达 {released} 个工单",
+            "schedule_id": schedule.id,
+            "version_number": schedule.version_number,
+        }
 
     
 
-    async def reschedule(self, factory_id: str, insert_wo_id: Optional[str] = None, created_by: str = "system") -> Dict[str, Any]:
+    async def reschedule(
+        self,
+        factory_id: str,
+        insert_wo_id: Optional[str] = None,
+        created_by: str = "system",
+        change_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
 
-        """插单/重排：将最新工单纳入重新排程"""
+        """插单/重排：校验插单归属后生成新版本，并保留审计原因。"""
+        if insert_wo_id:
+            insert_wo = await self.db.get(WorkOrder, insert_wo_id)
+            if not insert_wo or insert_wo.factory_id != factory_id:
+                return {"success": False, "message": "插入工单不存在或不属于当前工厂", "schedule_id": None}
+            if insert_wo.status not in ("pending", "released", "in_progress"):
+                return {"success": False, "message": f"工单状态 {insert_wo.status} 不允许进入 APS 重排", "schedule_id": None}
 
-        return await self.generate_schedule(factory_id, mode="hybrid", created_by=created_by)
+        result = await self.generate_schedule(
+            factory_id,
+            mode="hybrid",
+            created_by=created_by,
+            change_reason=change_reason or (f"insert:{insert_wo_id}" if insert_wo_id else "manual_reschedule"),
+        )
+        if result.get("schedule_id"):
+            await self._record_event(
+                factory_id=factory_id,
+                event_type="schedule_rescheduled",
+                actor=created_by,
+                schedule_id=result["schedule_id"],
+                work_order_id=insert_wo_id,
+                reason=change_reason or "APS 重排",
+                payload={"insert_wo_id": insert_wo_id},
+            )
+            await self.db.commit()
+        return result
 
         
 
@@ -853,6 +1158,8 @@ class ApsService:
 
                 "status": t.status,
 
+                "material_ready": t.material_ready,
+
                 "is_locked": t.is_locked,
 
                 "priority": t.priority,
@@ -887,14 +1194,16 @@ class ApsService:
 
         # 查询时间窗内所有排程任务
 
-        tasks_stmt = select(ApsScheduleTask).where(
-
-            ApsScheduleTask.planned_start >= now,
-
-            ApsScheduleTask.planned_start <= horizon_end,
-
-            ApsScheduleTask.status.in_(["planned", "confirmed", "released"]),
-
+        tasks_stmt = (
+            select(ApsScheduleTask)
+            .join(ApsSchedule, ApsSchedule.id == ApsScheduleTask.schedule_id)
+            .where(
+                ApsSchedule.factory_id == factory_id,
+                ApsSchedule.is_current.is_(True),
+                ApsScheduleTask.planned_start >= now,
+                ApsScheduleTask.planned_start <= horizon_end,
+                ApsScheduleTask.status.in_(["planned", "confirmed", "released"]),
+            )
         )
 
         tasks_result = await self.db.execute(tasks_stmt)
@@ -919,7 +1228,15 @@ class ApsService:
 
         # 标准产能：12小时/天（08:00-20:00）
 
-        daily_capacity = 12.0
+        capacity_result = await self.db.execute(text("""
+            SELECT station_id, available_hours_per_day
+            FROM station_capacity
+            WHERE factory_id = :factory_id AND is_active = TRUE
+        """), {"factory_id": factory_id})
+        capacity_map = {
+            str(row["station_id"]): float(row["available_hours_per_day"] or 12.0)
+            for row in capacity_result.mappings().all()
+        }
 
         resources = []
 
@@ -929,7 +1246,8 @@ class ApsService:
 
             for date_key, hours in sorted(date_loads.items()):
 
-                utilization = hours / daily_capacity * 100
+                daily_capacity = capacity_map.get(station_id, 12.0)
+                utilization = hours / daily_capacity * 100 if daily_capacity else 0
 
                 dates.append({
 
@@ -956,6 +1274,7 @@ class ApsService:
                 "is_bottleneck": avg_util > 85,
 
                 "daily_load": dates,
+                "capacity_hours_per_day": capacity_map.get(station_id, 12.0),
 
             })
 
@@ -967,7 +1286,7 @@ class ApsService:
 
             "horizon_days": days,
 
-            "daily_capacity_hours": daily_capacity,
+            "daily_capacity_hours": None,
 
             "resources": resources,
 

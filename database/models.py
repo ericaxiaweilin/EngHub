@@ -169,6 +169,7 @@ class WorkOrder(Base):
     work_order_code = Column(String(50), unique=True, nullable=False, index=True)
     factory_id = Column(String(50), nullable=False, index=True)
     sales_order_id = Column(String(50), index=True)
+    source_plan_id = Column(String(36), nullable=True, index=True)  # 来源 MPS 计划
     product_id = Column(String(50), nullable=False, index=True)
     routing_id = Column(String(50))
     planned_qty = Column(Integer, nullable=False, default=0)
@@ -223,6 +224,27 @@ class WorkOrder(Base):
         backref=backref("parent", remote_side=[id]),
         cascade="all, delete-orphan",
     )
+
+
+class WorkOrderMaterial(Base):
+    """工单物料齐套快照，作为 MRP → APS 的数据接口。"""
+
+    __tablename__ = "work_order_materials"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    work_order_id = Column(String(36), nullable=False, index=True)
+    material_id = Column(String(50), nullable=True)
+    material_code = Column(String(50), nullable=True)
+    material_name = Column(String(256), nullable=True)
+    qty_per_unit = Column(Integer, nullable=True)
+    required_qty = Column(Integer, nullable=False, default=0)
+    unit = Column(String(20), nullable=True)
+    received_qty = Column(Integer, default=0)
+    available_qty = Column(Integer, default=0)
+    shortage_qty = Column(Integer, default=0)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 
@@ -382,6 +404,11 @@ class Plan(Base):
     planning_cycle = Column(String(30), nullable=True)
     release_status = Column(String(20), default="unreleased")
     planner_id = Column(String(50), nullable=True)
+    work_order_id = Column(String(36), nullable=True, index=True)
+    cancelled_by = Column(String(50), nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    completed_by = Column(String(50), nullable=True)
+    update_reason = Column(Text, nullable=True)
     
     station_id = Column(String(50))
     scheduled_start_date = Column(Date)
@@ -1734,7 +1761,15 @@ class ApsSchedule(Base):
     unscheduled_count = Column(Integer, default=0)
     created_by = Column(String(50))
     confirmed_by = Column(String(50))
+    approved_by = Column(String(50), nullable=True)
+    released_by = Column(String(50), nullable=True)
+    released_at = Column(DateTime, nullable=True)
+    version_number = Column(Integer, default=1, nullable=False)
+    is_current = Column(Boolean, default=False, nullable=False, index=True)
+    supersedes_schedule_id = Column(String(36), nullable=True, index=True)
+    change_reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ApsScheduleTask(Base):
@@ -1767,6 +1802,58 @@ class ApsScheduleTask(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ApsPlanEvent(Base):
+    """APS 计划/版本/插单审计事件。"""
+
+    __tablename__ = "aps_plan_events"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    plan_id = Column(String(36), nullable=True, index=True)
+    schedule_id = Column(String(36), nullable=True, index=True)
+    work_order_id = Column(String(36), nullable=True, index=True)
+    event_type = Column(String(40), nullable=False, index=True)
+    actor = Column(String(50), nullable=False)
+    reason = Column(Text, nullable=True)
+    payload = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class ApsCoordinationMeeting(Base):
+    """生产协调会记录，用于审计会议频次和计划决议。"""
+
+    __tablename__ = "aps_coordination_meetings"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    meeting_date = Column(Date, nullable=False, index=True)
+    meeting_type = Column(String(40), nullable=False, default="production_coordination")
+    plan_version = Column(String(80), nullable=True)
+    attendees = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    decisions = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    action_items = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    created_by = Column(String(50), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ApsPlannerActivity(Base):
+    """计划员工作活动记录，支持统计 Excel 与 APS UI 调整时间。"""
+
+    __tablename__ = "aps_planner_activities"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    user_id = Column(String(50), nullable=False, index=True)
+    activity_type = Column(String(40), nullable=False, index=True)
+    source = Column(String(20), nullable=False, default="aps_ui")
+    plan_version = Column(String(80), nullable=True)
+    started_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+    duration_minutes = Column(Numeric(10, 2), nullable=True)
+    activity_metadata = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class ApsWorkCalendar(Base):
     """工作日历"""
     __tablename__ = "aps_work_calendars"
@@ -1783,6 +1870,31 @@ class ApsWorkCalendar(Base):
     is_active = Column(Boolean, default=True)
     effective_from = Column(Date)
     effective_to = Column(Date)
+
+
+class ApsHoliday(Base):
+    """工厂日期级节假日/补班配置，由 APS 工作日历接口维护。"""
+
+    __tablename__ = "aps_holidays"
+    __table_args__ = (
+        UniqueConstraint("factory_id", "holiday_date", name="uq_aps_holiday_factory_date"),
+        Index("idx_aps_holiday_factory_year", "factory_id", "year"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(50), nullable=False, index=True)
+    calendar_code = Column(String(80), nullable=False)
+    year = Column(Integer, nullable=False, index=True)
+    holiday_date = Column(Date, nullable=False)
+    holiday_name = Column(String(150), nullable=False)
+    holiday_type = Column(String(30), nullable=False, default="legal")  # legal/compensatory/company
+    is_working_day = Column(Boolean, nullable=False, default=False)  # true=周末补班/调休上班
+    source_name = Column(String(200), nullable=True)
+    source_url = Column(String(500), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 # ==================== EngHub BOM 同步表 ====================
@@ -2236,3 +2348,64 @@ class EngHubBomSyncLog(Base):
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     error_message = Column(Text)
+
+
+class RushOrderApproval(Base):
+    """插单审批单——记录一次插单/急单从评估到审批到执行的完整闭环。
+
+    决策权分配 + 审批留痕的载体：评估快照落库、审批级别自动定级、
+    审批人角色绑定、执行挂钩调度。解决审计 Q4"插单谁拍板不落库"。
+    """
+    __tablename__ = "rush_order_approvals"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    approval_code = Column(String(50), unique=True, nullable=False, index=True)  # RA-YYYYMMDD-XXXXXX
+    factory_id = Column(String(50), nullable=False, index=True)
+
+    # 插单信息
+    product_id = Column(String(50), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    due_date = Column(Date, nullable=True)
+    rush_priority = Column(String(20), default="urgent")  # urgent / emergency
+
+    # 评估快照（rush-order-impact 结果）
+    impact_json = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    affected_orders = Column(Integer, default=0)
+    max_delay_days = Column(Numeric(8, 2), default=0)
+    process_hours = Column(Numeric(10, 2))
+    recommendation = Column(Text)
+
+    # 审批级别与决策权
+    approval_level = Column(Integer, default=2)  # 1/2/3 对应决策权矩阵
+    required_role = Column(String(50))           # 审批人角色编码
+
+    # 流程状态
+    status = Column(String(20), default="draft", index=True)  # draft/submitted/approved/executed/rejected/cancelled
+    applicant = Column(String(50))               # 申请人（计划员 username）
+    approver = Column(String(50))                # 审批人 username
+    approved_at = Column(DateTime)
+    reject_reason = Column(Text)
+
+    # 执行挂钩
+    target_schedule_id = Column(String(36))
+    target_wo_id = Column(String(36))
+    executed_at = Column(DateTime)
+
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class RushOrderApprovalLog(Base):
+    """插单审批动作日志——谁在什么时间做了什么（submit/approve/reject/cancel/execute）。"""
+    __tablename__ = "rush_order_approval_logs"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    approval_id = Column(String(36), ForeignKey("rush_order_approvals.id"), nullable=False, index=True)
+    action = Column(String(20), nullable=False)  # submit/approve/reject/cancel/execute
+    actor = Column(String(50), nullable=False)   # username
+    actor_role = Column(String(50))
+    comment = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

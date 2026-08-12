@@ -64,3 +64,8 @@ uploads/
 /backups/
 /enghub.runtime.env
 /tmp/
+
+# Codex remote working directories (transient agent scratch space)
+.codex-remote-work/
+.codex-remote/
+.codex-weknora-work/

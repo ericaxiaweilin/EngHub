@@ -31,7 +31,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -150,7 +150,10 @@ class CommanderReport:
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     order_mode: OrderMode = OrderMode.NORMAL
     state_summary: str = ""
+    state: Optional[Dict[str, Any]] = None  # 完整感知数据（供前端展示“读了什么”）
     decisions: List[CommanderDecision] = field(default_factory=list)
+    plan: Optional[Dict[str, Any]] = None  # 行动计划（Plan）：决策聚合为目标导向计划，记录在任务中心
+    followup_tasks: List[Dict[str, Any]] = field(default_factory=list)  # 挂入任务中心持续盯办的任务
     next_actions: List[str] = field(default_factory=list)
     alerts: List[str] = field(default_factory=list)
     duration_ms: float = 0
@@ -162,6 +165,7 @@ class CommanderReport:
             "timestamp": self.timestamp,
             "order_mode": self.order_mode.value,
             "state_summary": self.state_summary,
+            "state": self.state,
             "decisions": [{
                 "id": d.decision_id,
                 "action": d.action.value,
@@ -171,6 +175,8 @@ class CommanderReport:
                 "executed": d.executed,
                 "result": d.result,
             } for d in self.decisions],
+            "plan": self.plan,
+            "followup_tasks": self.followup_tasks,
             "next_actions": self.next_actions,
             "alerts": self.alerts,
             "duration_ms": round(self.duration_ms, 1),
@@ -196,6 +202,22 @@ class CommanderReport:
                 parts.append(f"  {icon} {i}. [{d.priority}] {d.reason}")
                 if d.result and d.result.get("message"):
                     parts.append(f"      → {d.result['message']}")
+
+        if self.plan and self.plan.get("objective"):
+            parts.append(f"\n🗂️ 行动计划（Plan）：{self.plan['objective']}")
+            for it in self.plan.get("items") or []:
+                agent = it.get("agent_name") or "通用"
+                parts.append(f"  {it.get('plan_seq') or '•'}. [{agent}] {it.get('title')}")
+            if self.plan.get("progress_pct") is not None:
+                parts.append(f"  📈 计划总进度：{self.plan['progress_pct']}%")
+
+        if self.followup_tasks:
+            parts.append(f"\n📌 已挂入任务中心持续盯办（{len(self.followup_tasks)} 项，智能体将持续跟进直到闭环）：")
+            for t in self.followup_tasks:
+                tag = "🆕 新挂" if t.get("status") == "created" else f"🔄 已跟{t.get('follow_count', 0)}次"
+                parts.append(
+                    f"  • [{t.get('agent_name')}] {t.get('title')}"
+                    f"（每{t.get('interval')}分钟 · {tag} · 进度{t.get('progress_pct', 0)}%）")
 
         if self.alerts:
             parts.append(f"\n⚠️ 预警：")
@@ -246,12 +268,13 @@ class FactoryCommander:
     # Per-user 指挥官管理
     # ═══════════════════════════════════════════════════════════
 
-    def enable_for_user(self, user_id: str, factory_id: str, scope: Optional[Dict] = None):
+    def enable_for_user(self, user_id: str, factory_id: str, scope: Optional[Dict] = None, username: Optional[str] = None):
         """为用户开启指挥官（自动接管其工作范围）"""
         self._user_commanders[user_id] = {
             "enabled": True,
             "factory_id": factory_id,
             "scope": scope or {},  # {departments, role, stations}
+            "username": username or user_id,  # 任务中心挂账/站内通知用的身份
             "enabled_at": datetime.utcnow().isoformat(),
         }
         _logger.info(f"[commander] 用户 {user_id} 开启指挥官 | scope={scope}")
@@ -281,6 +304,7 @@ class FactoryCommander:
         factory_id: str,
         force_mode: Optional[str] = None,
         auto_execute: bool = True,
+        created_by: Optional[str] = None,
     ) -> CommanderReport:
         """
         执行一轮完整的指挥官决策循环：
@@ -306,14 +330,34 @@ class FactoryCommander:
 
         report.order_mode = state.order_mode
         report.state_summary = self._build_state_summary(state)
+        report.state = state.to_dict()
 
         # 3. 决策
         decisions = await self._decide(state)
         report.decisions = decisions
 
-        # 4. 执行
+        # 4. 执行 + 计划（Planner）：是任务就有 plan —— 决策聚合为目标导向的行动计划
         if auto_execute:
             await self._execute_decisions(decisions, factory_id, state)
+            # 4.5 计划物化到任务中心：新挂任务归属当前 active 计划（去重任务沿用原计划持续盯）
+            objective = self._build_objective(state, decisions)
+            report.followup_tasks, plan_id = await self._attach_followup_tasks(
+                decisions, factory_id, state, created_by=created_by or "commander",
+                objective=objective, mode=state.order_mode.value, cycle_id=report.cycle_id)
+            # 4.6 聚合计划进度，产出完整计划（含子任务）——指挥官必须交付的 plan list
+            if plan_id:
+                from api.services import followup_task_service as fts
+                try:
+                    report.plan = await fts.refresh_plan(self.db, plan_id)
+                except Exception as e:
+                    try:
+                        await self.db.rollback()
+                    except Exception:
+                        pass
+                    _logger.warning(f"[commander] 计划聚合失败: {e}")
+        else:
+            # 不执行时也产出计划预览（dry-run），让用户看到指挥官打算做什么
+            report.plan = self._preview_plan(state, decisions)
 
         # 5. 预警 + 下一步
         report.alerts = self._generate_alerts(state)
@@ -347,19 +391,29 @@ class FactoryCommander:
         """全维度态势感知"""
         state = FactoryState(factory_id=factory_id, timestamp=datetime.utcnow().isoformat())
 
-        # 并行采集所有维度
-        results = await asyncio.gather(
-            self._sense_orders(factory_id),
-            self._sense_capacity(factory_id),
-            self._sense_equipment(factory_id),
-            self._sense_material(factory_id),
-            self._sense_delivery(factory_id),
-            self._sense_quality(factory_id),
-            return_exceptions=True,
-        )
+        # 串行采集所有维度（共享同一 db session，并行 gather 会导致事务交叉毒化；
+        # 某维度查询失败时立即 rollback 清除已中止事务，避免后续智能体调用连环失败）
+        async def _safe(coro):
+            try:
+                return await coro
+            except Exception:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                return None
+
+        results = [
+            await _safe(self._sense_orders(factory_id)),
+            await _safe(self._sense_capacity(factory_id)),
+            await _safe(self._sense_equipment(factory_id)),
+            await _safe(self._sense_material(factory_id)),
+            await _safe(self._sense_delivery(factory_id)),
+            await _safe(self._sense_quality(factory_id)),
+        ]
 
         # 解析各维度
-        if not isinstance(results[0], Exception):
+        if results[0] is not None:
             orders = results[0]
             state.active_orders = orders.get("active", 0)
             state.pending_orders = orders.get("pending", 0)
@@ -367,7 +421,7 @@ class FactoryCommander:
             state.overdue_orders = orders.get("overdue", 0)
             state.due_7d_orders = orders.get("due_7d", 0)
 
-        if not isinstance(results[1], Exception):
+        if results[1] is not None:
             cap = results[1]
             state.total_stations = cap.get("total_stations", 0)
             state.busy_stations = cap.get("busy_stations", 0)
@@ -375,24 +429,24 @@ class FactoryCommander:
             state.daily_capacity_hours = cap.get("daily_hours", 16)
             state.scheduled_hours_7d = cap.get("scheduled_7d", 0)
 
-        if not isinstance(results[2], Exception):
+        if results[2] is not None:
             eq = results[2]
             state.equipment_total = eq.get("total", 0)
             state.equipment_running = eq.get("running", 0)
             state.equipment_maintenance = eq.get("maintenance", 0)
             state.equipment_broken = eq.get("broken", 0)
 
-        if not isinstance(results[3], Exception):
+        if results[3] is not None:
             mat = results[3]
             state.low_stock_items = mat.get("low_stock", 0)
             state.pending_procurement = mat.get("pending_po", 0)
 
-        if not isinstance(results[4], Exception):
+        if results[4] is not None:
             dlv = results[4]
             state.on_time_rate_30d = dlv.get("on_time_rate", 0)
             state.avg_days_to_due = dlv.get("avg_days", 0)
 
-        if not isinstance(results[5], Exception):
+        if results[5] is not None:
             q = results[5]
             state.defect_rate_30d = q.get("defect_rate", 0)
             state.open_8d = q.get("open_8d", 0)
@@ -467,6 +521,7 @@ class FactoryCommander:
             """), {"fid": factory_id})
             low = r.scalar() or 0
         except Exception:
+            await self.db.rollback()
             low = 0
         try:
             po = await self.db.execute(text("""
@@ -474,6 +529,7 @@ class FactoryCommander:
             """), {"fid": factory_id})
             pending_po = po.scalar() or 0
         except Exception:
+            await self.db.rollback()
             pending_po = 0
         return {"low_stock": low, "pending_po": pending_po}
 
@@ -505,6 +561,7 @@ class FactoryCommander:
             fail = (row[1] or 0) if row else 0
             defect_rate = fail / max(total, 1)
         except Exception:
+            await self.db.rollback()
             defect_rate = 0
         try:
             d8 = await self.db.execute(text("""
@@ -512,6 +569,7 @@ class FactoryCommander:
             """), {"fid": factory_id})
             open_8d = d8.scalar() or 0
         except Exception:
+            await self.db.rollback()
             open_8d = 0
         return {"defect_rate": defect_rate, "open_8d": open_8d}
 
@@ -641,11 +699,9 @@ class FactoryCommander:
     async def _execute_decisions(
         self, decisions: List[CommanderDecision], factory_id: str, state: FactoryState
     ):
-        """并行执行所有决策"""
-        tasks = []
+        """串行执行所有决策（共享同一 db session，不能并行 gather，否则事务交叉毒化）"""
         for d in decisions:
-            tasks.append(self._execute_single(d, factory_id, state))
-        await asyncio.gather(*tasks, return_exceptions=True)
+            await self._execute_single(d, factory_id, state)
 
     async def _execute_single(self, decision: CommanderDecision, factory_id: str, state: FactoryState):
         """执行单个决策"""
@@ -666,6 +722,10 @@ class FactoryCommander:
                 decision.result = {"message": f"{decision.action.value} 待实现", "status": "planned"}
             decision.executed = True
         except Exception as e:
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
             decision.result = {"message": f"执行失败: {str(e)[:100]}", "status": "error"}
             decision.executed = False
 
@@ -684,6 +744,10 @@ class FactoryCommander:
             created = len(result.get("created_orders", []))
             return {"message": f"已承接{created}个新订单并分解为工单", "created": created}
         except Exception as e:
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
             return {"message": f"接单执行: {str(e)[:80]}", "created": 0}
 
     async def _exec_schedule(self, factory_id: str) -> Dict:
@@ -695,6 +759,10 @@ class FactoryCommander:
             tasks_count = result.get("tasks_created", result.get("total_tasks", 0))
             return {"message": f"自动排程完成，{tasks_count}个任务已排入", "tasks": tasks_count}
         except Exception as e:
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
             return {"message": f"排程: {str(e)[:80]}", "tasks": 0}
 
     async def _exec_expedite(self, factory_id: str) -> Dict:
@@ -708,6 +776,166 @@ class FactoryCommander:
         codes = [row[0] for row in r.fetchall()]
         await self.db.commit()
         return {"message": f"{len(codes)}个逾期工单已升级为紧急", "expedited": len(codes)}
+
+    # ═══════════════════════════════════════════════════════════
+    # 持续盯办：决策 → 挂任务中心（去重）→ 扫描器持续调度智能体跟进
+    # ═══════════════════════════════════════════════════════════
+
+    def _followup_config(self, d: CommanderDecision) -> Optional[Dict[str, Any]]:
+        """决策 → 任务中心跟进配置（智能体/频率/标题）。按兵不动/拒单类不挂任务。"""
+        a = d.action
+        if a == CommanderAction.ACCEPT_ORDER:
+            return {"agent_key": "pmc_agent", "interval": 30, "title": "跟进新订单承接与投产落地"}
+        if a == CommanderAction.SCHEDULE_PRODUCTION:
+            return {"agent_key": "scheduling_agent", "interval": 30, "title": "跟进自动排程落地"}
+        if a == CommanderAction.EXPEDITE:
+            return {"agent_key": "delivery_agent", "interval": 30, "title": "跟进逾期工单加急处理"}
+        if a == CommanderAction.PROCUREMENT:
+            if d.target == "broken_equipment":
+                return {"agent_key": "equipment_agent", "interval": 60, "title": "跟进设备故障维修与产能恢复"}
+            return {"agent_key": "procurement_agent", "interval": 60, "title": "跟催缺料采购补货到位"}
+        if a == CommanderAction.OVERTIME:
+            return {"agent_key": "hr_agent", "interval": 120, "title": "跟进加班安排确认落实"}
+        if a == CommanderAction.DISPATCH:
+            return {"agent_key": "dispatch_agent", "interval": 15, "title": "跟进派工到工位开工"}
+        return None
+
+    async def _attach_followup_tasks(
+        self, decisions: List[CommanderDecision], factory_id: str,
+        state: FactoryState, created_by: str = "commander",
+        objective: str = "", mode: str = "", cycle_id: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """把已执行的决策挂入任务中心并归属到行动计划（Plan）。
+        由 followup_scanner_loop 定期调度对应智能体持续核实跟进，直到彻底完成闭环。
+        按 source='commander' + title 去重：已有未完成任务沿用原计划继续盯，不重复挂账。
+        返回 (attached, plan_id)；plan_id 为物化后的 active 计划（无新挂任务时为 None）。"""
+        from api.services import followup_task_service as fts
+        attached: List[Dict[str, Any]] = []
+        plan_id: Optional[str] = None
+        seq = 0
+        # 按优先级排序后挂账（urgent 优先），plan_seq 体现计划内优先序
+        order = {"urgent": 4, "high": 3, "normal": 2, "low": 1}
+        sorted_decisions = sorted(
+            decisions, key=lambda d: order.get(d.priority, 0), reverse=True)
+        for d in sorted_decisions:
+            if not d.executed:
+                continue
+            cfg = self._followup_config(d)
+            if not cfg:
+                continue
+            # 去重：同厂同类未完成任务已在跟进，跳过（扫描器会持续盯）
+            try:
+                existing = (await self.db.execute(text(
+                    "SELECT id, follow_count, progress_pct FROM followup_tasks "
+                    "WHERE factory_id=:fid AND source='commander' AND title=:title "
+                    "AND status IN ('open','blocked') ORDER BY created_at DESC LIMIT 1"
+                ), {"fid": factory_id, "title": cfg["title"]})).first()
+            except Exception:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                existing = None
+            if existing:
+                attached.append({
+                    "task_id": existing[0], "title": cfg["title"],
+                    "agent_key": cfg["agent_key"], "agent_name": fts._agent_name(cfg["agent_key"]),
+                    "status": "tracked", "follow_count": existing[1] or 0,
+                    "progress_pct": existing[2] or 0, "interval": cfg["interval"],
+                })
+                continue
+            # 懒创建计划：确有要新挂的任务才建计划（避免空计划）
+            if not plan_id:
+                try:
+                    plan_id = await fts.get_or_create_active_plan(
+                        self.db, factory_id, objective, mode, created_by, cycle_id)
+                    cnt = (await self.db.execute(text(
+                        "SELECT COUNT(*) FROM followup_tasks WHERE plan_id=:pid"
+                    ), {"pid": plan_id})).scalar() or 0
+                    seq = int(cnt)
+                except Exception as e:
+                    try:
+                        await self.db.rollback()
+                    except Exception:
+                        pass
+                    _logger.warning(f"[commander] 创建计划失败: {e}")
+                    plan_id = None
+            desc = (
+                f"【指挥官自主决策·持续盯办】\n"
+                f"决策原因：{d.reason}\n"
+                f"首轮执行：{(d.result or {}).get('message', '已派发')}\n"
+                f"决策时态势：{self._build_state_summary(state)}\n"
+                f"请以{fts._agent_name(cfg['agent_key'])}身份持续核实此事进展，"
+                f"调用 MES 工具查证实际状态，未彻底完成前不要关闭，完成后给出结论。"
+            )
+            try:
+                seq += 1
+                task = await fts.create_task(
+                    self.db, factory_id=factory_id, created_by=created_by,
+                    title=cfg["title"], description=desc,
+                    agent_key=cfg["agent_key"], follow_interval_minutes=cfg["interval"],
+                    source="commander", item_type="followup",
+                    plan_id=plan_id, plan_seq=seq if plan_id else None,
+                )
+                if task.get("task_id"):
+                    attached.append({
+                        "task_id": task["task_id"], "title": cfg["title"],
+                        "agent_key": cfg["agent_key"], "agent_name": task.get("agent_name"),
+                        "status": "created", "follow_count": 0, "progress_pct": 0,
+                        "interval": cfg["interval"],
+                    })
+            except Exception as e:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                _logger.warning(f"[commander] 挂任务中心失败: {e}")
+        return attached, plan_id
+
+    def _build_objective(self, state: FactoryState, decisions: List[CommanderDecision]) -> str:
+        """根据态势生成目标导向的计划总目标（一句话）。"""
+        goals: List[str] = []
+        if state.overdue_orders > 0:
+            goals.append(f"消除{state.overdue_orders}个逾期工单")
+        if state.equipment_broken > 0:
+            goals.append(f"修复{state.equipment_broken}台故障设备恢复产能")
+        if state.low_stock_items > 5:
+            goals.append(f"补货{state.low_stock_items}项缺料")
+        if state.pending_orders > 0:
+            goals.append(f"排产{state.pending_orders}个待排工单")
+        if state.due_7d_orders > 5 and state.station_utilization > 0.9:
+            goals.append(f"保{state.due_7d_orders}个7天内到期工单准时交付")
+        if not goals:
+            goals.append("维持生产节奏并持续监控态势变化")
+        mode_label = {"surplus": "订单充足", "normal": "产销平衡", "deficit": "订单欠缺"}
+        return f"[{mode_label.get(state.order_mode.value, '')}] " + "；".join(goals)
+
+    def _preview_plan(self, state: FactoryState, decisions: List[CommanderDecision]) -> Optional[Dict[str, Any]]:
+        """不执行时的计划预览（dry-run）：只生成目标+有序子项列表，不落任务中心。"""
+        actionable = [d for d in decisions if self._followup_config(d)]
+        if not actionable:
+            return None
+        from api.services.agent_supervisor_service import AGENTS
+        objective = self._build_objective(state, decisions)
+        order = {"urgent": 4, "high": 3, "normal": 2, "low": 1}
+        sorted_d = sorted(actionable, key=lambda d: order.get(d.priority, 0), reverse=True)
+        items = []
+        for i, d in enumerate(sorted_d, 1):
+            cfg = self._followup_config(d) or {}
+            agent_key = cfg.get("agent_key")
+            agent = AGENTS.get(agent_key) if agent_key else None
+            items.append({
+                "plan_seq": i,
+                "title": cfg.get("title") or d.reason,
+                "agent_key": agent_key,
+                "agent_name": agent["name"] if agent else "通用",
+                "status": "planned",
+                "progress_pct": 0,
+            })
+        return {
+            "objective": objective, "mode": state.order_mode.value,
+            "status": "preview", "progress_pct": 0, "items": items,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # 预警 + 下一步
@@ -792,17 +1020,20 @@ class FactoryCommander:
         """
         gaps: List[Dict[str, str]] = []
 
-        # 并行检查所有维度
-        checks = await asyncio.gather(
+        # 串行检查所有维度（共享同一 db session，并行 gather 会导致连接并发错误/事务交叉）
+        for check_coro in (
             self._check_equipment_data(factory_id, state),
             self._check_production_data(factory_id, state),
             self._check_inventory_data(factory_id, state),
             self._check_quality_data(factory_id, state),
-            return_exceptions=True,
-        )
-
-        for check in checks:
-            if isinstance(check, Exception):
+        ):
+            try:
+                check = await check_coro
+            except Exception:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
                 continue
             if check:
                 gaps.extend(check)
@@ -953,3 +1184,50 @@ class FactoryCommander:
 
 def _priority_rank(p: str) -> int:
     return {"low": 0, "normal": 1, "high": 2, "urgent": 3}.get(p, 1)
+
+
+# ═══════════════════════════════════════════════════════════
+# 后台持续盯办循环：为每个开启指挥官的用户定期巡检
+# （感知新问题 + 把新决策挂入任务中心；任务的持续跟进由
+#   followup_scanner_loop 调度智能体完成，二者协同形成“长久盯着”闭环）
+# ═══════════════════════════════════════════════════════════
+
+async def commander_watch_loop() -> None:
+    """后台盯办循环（main.py startup 启动）。
+
+    指挥官的核心价值不是一次性决策，而是持续长久地盯着：
+    每隔一段时间为所有开启指挥官的用户重新巡检一遍，发现新问题就
+    生成新决策并挂入任务中心（带去重）；任务中心扫描器再定期调度
+    对应智能体持续跟进，直到任务彻底完成。
+    """
+    import os
+    if os.getenv("COMMANDER_WATCH_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
+        _logger.info("指挥官盯办循环已禁用（COMMANDER_WATCH_ENABLED=0）")
+        return
+    interval = max(60, int(os.getenv("COMMANDER_WATCH_INTERVAL_SECONDS", "300") or 300))
+    _logger.info("工厂指挥官盯办循环启动，每 %s 秒为已开启用户巡检一次", interval)
+    from database.db_config import db_config
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            enabled = [(uid, cfg) for uid, cfg in FactoryCommander._user_commanders.items()
+                       if cfg.get("enabled")]
+            if not enabled:
+                continue
+            for uid, cfg in enabled:
+                fid = cfg.get("factory_id") or "FAC_MECH_001"
+                try:
+                    async with db_config.session_factory() as db:
+                        commander = FactoryCommander(db)
+                        report = await commander.run_cycle(
+                            fid, auto_execute=True, created_by=cfg.get("username") or uid)
+                        _logger.info(
+                            "[commander-watch] 用户 %s 巡检完成 | mode=%s | decisions=%d | 盯办任务=%d",
+                            uid, report.order_mode.value, len(report.decisions), len(report.followup_tasks))
+                except Exception as exc:  # noqa: BLE001 — 单用户巡检失败不影响其他用户
+                    _logger.warning("[commander-watch] 用户 %s 巡检异常：%s", uid, exc)
+        except asyncio.CancelledError:
+            _logger.info("工厂指挥官盯办循环停止")
+            return
+        except Exception as exc:  # noqa: BLE001 — 盯办循环必须常驻
+            _logger.warning("指挥官盯办循环异常：%s", exc)

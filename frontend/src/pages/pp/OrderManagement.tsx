@@ -10,9 +10,10 @@ import {
 import type { ColumnsType } from 'antd/es/table'
 import dayjs from 'dayjs'
 import api from '../../services/api'
+import { getActiveFactoryId } from '../../utils/factory'
 
 const { Title, Text } = Typography
-const FACTORY = localStorage.getItem('active_factory_id') || 'FAC_MECH_001'
+const FACTORY = getActiveFactoryId()
 
 const statusConfig: Record<string, { color: string; label: string }> = {
   pending: { color: 'default', label: '待处理' },

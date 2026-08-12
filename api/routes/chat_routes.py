@@ -30,7 +30,7 @@ from database.db_config import get_db
 from database.models import FileRecord, User
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
 )
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
@@ -70,7 +70,9 @@ SYSTEM_PROMPT = (
     "也可以说“巡检”让你主动扫描异常。只有工具返回了对应证据时，才能给出根因、处置建议和分派对象。\n"
     "【流程知识库】系统内置了完整的流程知识：工单全生命周期（8阶段：创建→下达→派工→执行→报工→质检→完工→入库）、"
     "6大职位标准作业流程(操作员/品检员/设备工程师/PMC计划员/生产主管/仓管员)、各环节RACI责任矩阵。"
-    "用户问流程/职责/该找谁类问题时，调用 query_process_knowledge 工具获取标准答案。\n"
+    "用户只问职责、阶段责任或SOP文字时调用 query_process_knowledge；模型先识别用户所指的岗位、独立业务子流程或审批实例，只有明确要求将该对象画成流程图、查看完整工作流、正常路径、fallback、输入输出物或关联方时才调用 query_workflow_diagram。"
+    "范围必须严格匹配：用户点名“替代料验证”等子流程时，scope=standalone_process，并使用该子流程注册键（替代料验证为 process:alternate_material_validation），不得展开 PMC 父流程；只有明确要求 PMC 端到端时才使用 pmc:end_to_end。"
+    "不要仅因出现“流程图”三个字就触发工具；若对象不明确，先向用户追问。未知流程不得回退PMC或DCC。工具返回后只呈现一张完整连通图，不要拆成散点知识卡。\n"
     "【PMC工作矩阵】用户提到 PMC 矩阵、预排程沙盘、时间锤/物料锤/生产锤/出货锤/紧急锤、UHN、可加工时间或库存齐套时，"
     "有主工单号时必须调用 query_pmc_work_matrix；没有主工单号但只问物料齐套/供应证据时调用 query_pmc_material_supply。该工具只读取真实工单/BOM/库存/工位/APS，沙盘开关只改变本次计算，不修改工单；"
     "输出必须区分真实数据、假设、判断结论、风险和下一步交付物。UHN 未定义时不得猜测。\n"
@@ -382,11 +384,19 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             return f"流程引擎暂时无法生成图：{result['error']}\n{result.get('hint', '')}"
         diagram = result.get("diagram") or {}
         nodes = diagram.get("nodes") or []
+        inputs = diagram.get("inputs") or []
+        outputs = diagram.get("outputs") or []
+        parties = diagram.get("related_parties") or []
+        fallbacks = diagram.get("fallback_paths") or []
         meta = diagram.get("meta") or {}
         is_business = diagram.get("flow_type") == "business_workflow"
         return (
             f"已生成「{diagram.get('title', result.get('title', '详细流程图'))}」。\n"
             f"- 流程引擎步骤：{meta.get('step_count', meta.get('approval_node_count', len(nodes)))} 个，连线：{len(diagram.get('edges') or [])} 条\n"
+            f"- 正常路径：{len(diagram.get('normal_path') or [])} 段；Fallback/回流：{len(fallbacks)} 条\n"
+            f"- 输入物：{'、'.join(str(item) for item in inputs[:8]) or '未配置'}\n"
+            f"- 输出物：{'、'.join(str(item) for item in outputs[:8]) or '未配置'}\n"
+            f"- 关联方：{'、'.join(str(item) for item in parties[:8]) or '未配置'}\n"
             f"- {'点击任一步可查看输入、判断标准、输出、交付物、下一步与异常回流' if is_business else '图中保留审批角色、会签/或签、审批条件和异常路径'}\n"
             f"- {diagram.get('engine_note', '节点与连线均来自流程引擎定义。')}"
         )
@@ -724,29 +734,6 @@ async def chat(
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
-
-    if request.enable_tools and not image_records:
-        direct = resolve_intent(last_user)
-        if direct:
-            tool_name = direct["tool"]
-            arguments = direct.get("args") or {}
-            result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
-            actions.append(ToolAction(
-                tool=tool_name,
-                label=TOOL_LABELS.get(tool_name, tool_name),
-                arguments=arguments,
-                result=result,
-                is_write=tool_name in WRITE_TOOLS,
-                is_sim=tool_name in SIM_TOOLS,
-                success="error" not in result,
-            ))
-            return ChatResponse(
-                reply=_direct_tool_reply(tool_name, result),
-                model="deterministic-tool-router",
-                degraded=False,
-                actions=actions,
-                diagrams=_collect_diagrams(actions),
-            )
 
     # ---- 多智能体并行编排：识别复合意图 → 多Agent并行执行 ----
     if request.enable_tools and not image_records and not request.agent_key:
@@ -1353,32 +1340,6 @@ async def chat_stream(
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
-
-        if request.enable_tools and not image_records:
-            direct = resolve_intent(last_user)
-            if direct:
-                tool_name = direct["tool"]
-                arguments = direct.get("args") or {}
-                result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
-                action = ToolAction(
-                    tool=tool_name,
-                    label=TOOL_LABELS.get(tool_name, tool_name),
-                    arguments=arguments,
-                    result=result,
-                    is_write=tool_name in WRITE_TOOLS,
-                    is_sim=tool_name in SIM_TOOLS,
-                    success="error" not in result,
-                )
-                yield _sse("action", action.model_dump())
-                table_data = _extract_table_data(tool_name, result)
-                if table_data:
-                    yield _sse("table", table_data)
-                diagram_data = _extract_diagram_data(tool_name, result)
-                if diagram_data:
-                    yield _sse("diagram", diagram_data)
-                yield _sse("delta", {"content": _direct_tool_reply(tool_name, result)})
-                yield _sse("done", {"model": "deterministic-tool-router", "degraded": False})
-                return
 
         task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
         prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)

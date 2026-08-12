@@ -502,12 +502,15 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "function": {
             "name": "query_ocap_tasks",
             "description": "查询用户待处理的 OCAP（纠正预防措施）任务。显示所有 ocap_status 为 triggered/in_progress 的缺陷，供 chatbot 向用户汇报。",
-            "properties": {
-                "factory_id": {"type": "string", "description": "工厂ID，可选，默认当前用户工厂"},
-                "operator": {"type": "string", "description": "操作用户ID，必填"},
-                "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "factory_id": {"type": "string", "description": "工厂ID，可选，默认当前用户工厂"},
+                    "operator": {"type": "string", "description": "操作用户ID，必填"},
+                    "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+                },
+                "required": ["operator"],
             },
-            "required": ["operator"],
         },
     },
     {
@@ -537,7 +540,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_workflow_diagram",
-            "description": "从统一流程引擎生成交互式工作流图。岗位/SOP流程按 position 或 workflow_key 查询，审批实例按 flow_id/flow_code 查询；节点统一返回输入、判断标准、输出、交付物、下一步和异常分支。不得把岗位流程替换成无关的最近审批实例。",
+            "description": "在模型识别出明确流程对象和范围后，由流程引擎生成一张完整连通图。必须区分：独立业务子流程、岗位端到端流程、审批实例；用户点名某个子流程时不得展开其父岗位流程。已注册示例：替代料验证=process:alternate_material_validation，生产工单全生命周期=process:work_order_lifecycle，PMC端到端=pmc:end_to_end，其他岗位=position:<key>。对象不明确时先追问；未知注册键返回目录，严禁回退到PMC或最近DCC审批。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -545,7 +548,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "flow_code": {"type": "string", "description": "流程编码，可选，如 FLOW-20260810-ABC123"},
                     "task_type": {"type": "string", "description": "按关联任务类型筛选，可选"},
                     "position": {"type": "string", "description": "岗位名称或别名，如 PMC、品检员、操作员、生产主管"},
-                    "workflow_key": {"type": "string", "description": "业务工作流注册键，如 position:pmc_planner"},
+                    "process_name": {"type": "string", "description": "用户点名的独立业务流程名称，如 发起替代料验证；不得填其父岗位名称"},
+                    "scope": {"type": "string", "enum": ["standalone_process", "position_end_to_end", "approval_instance"], "description": "用户要求的流程范围"},
+                    "workflow_key": {"type": "string", "description": "精确业务流程注册键，如 process:alternate_material_validation、process:work_order_lifecycle、pmc:end_to_end、position:ipqc"},
                     "current_step": {"type": "integer", "minimum": 1, "description": "希望重点查看的当前步骤，按1开始"},
                     "engine_type": {"type": "string", "enum": ["auto", "business", "approval"], "description": "流程来源；岗位流程用business，审批实例用approval，默认auto"},
                 },
@@ -2348,13 +2353,11 @@ _TOOL_EXECUTORS["query_process_knowledge"] = _tool_query_process_knowledge
 
 async def _tool_query_workflow_diagram(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     """按选择器查询业务工作流或审批实例，统一返回 diagram 契约。"""
-    from core.tms.approval_workflow import ApprovalWorkflowEngine
-    from database.models import TMSApprovalFlow, TMSTask
-
     flow_id = str(args.get("flow_id") or "").strip()
     flow_code = str(args.get("flow_code") or "").strip()
     task_type = str(args.get("task_type") or "").strip()
     position = str(args.get("position") or "").strip()
+    process_name = str(args.get("process_name") or "").strip()
     workflow_key = str(args.get("workflow_key") or "").strip()
     engine_type = str(args.get("engine_type") or "auto").strip().lower()
     try:
@@ -2362,19 +2365,26 @@ async def _tool_query_workflow_diagram(db: AsyncSession, args: Dict[str, Any], f
     except (TypeError, ValueError):
         current_step = 0
 
-    if workflow_key.startswith("position:") and not position:
-        position = workflow_key.split(":", 1)[1]
-    if position or (workflow_key and engine_type != "approval"):
-        from api.services.process_knowledge_service import build_position_workflow_diagram
-        return build_position_workflow_diagram(position or workflow_key, current_step=current_step)
+    if engine_type != "approval" and any((workflow_key, process_name, position)):
+        from api.services.process_knowledge_service import build_registered_workflow_diagram
+        return build_registered_workflow_diagram(
+            workflow_key=workflow_key,
+            process_name=process_name,
+            position=position,
+            current_step=current_step,
+        )
 
-    if not any((flow_id, flow_code, task_type)) and engine_type != "approval":
+    # 审批实例必须显式指定；禁止“查最近一条”这种会把PMC误连到DCC的兜底。
+    if not any((flow_id, flow_code, task_type)):
         return {
             "type": "workflow_diagram",
             "source": "unified_workflow_engine",
             "error": "缺少工作流选择器，系统不会再用最近一条无关审批实例代替",
-            "hint": "岗位流程请提供 position（如 PMC）；审批流程请提供 flow_id 或 flow_code。",
+            "hint": "独立业务流程请提供 process_name/workflow_key，岗位流程请提供 position，审批实例必须提供 flow_id、flow_code 或 task_type。",
         }
+
+    from core.tms.approval_workflow import ApprovalWorkflowEngine
+    from database.models import TMSApprovalFlow, TMSTask
 
     query = select(TMSApprovalFlow).order_by(TMSApprovalFlow.created_at.desc())
     if flow_id:
@@ -2526,7 +2536,7 @@ TOOL_LABELS = {
     "run_alert_patrol": "预警巡检",
     "query_ocap_tasks": "OCAP待办任务",
     "query_hr_roster": "人力档案",
-    "query_workflow_diagram": "流程引擎流程图",
+    "query_workflow_diagram": "完整业务流程图",
     "query_pmc_work_matrix": "PMC工作矩阵",
     "query_process_knowledge": "流程知识",
     # 5M1E 预警数据工具
@@ -2741,7 +2751,10 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "流程图", "画流程图", "画成流程图", "绘制流程图", "流程可视化",
             "流程图详细", "画出流程", "流程节点图", "流程引擎",
-            "岗位工作流", "PMC工作流", "PMC的工作流", "PMC 工作流",
+            "岗位工作流", "完整工作流", "完整流程", "端到端流程", "主流程",
+            "正常路径", "fallback", "输入输出物", "输入输出", "关联方", "责任链",
+            "PMC流程", "PMC流程图", "PMC完整流程", "PMC全流程", "PMC端到端流程",
+            "PMC工作流", "PMC的工作流", "PMC 工作流",
         ],
     },
     {
@@ -2799,6 +2812,9 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
 
     tool = detect_intent_tool(message)
     if not tool:
+        return None
+    # 流程图必须先经过模型语义识别；关键词路由不得在模型之前直接弹图。
+    if tool == "query_workflow_diagram":
         return None
     args: Dict[str, Any] = {}
     if tool == "query_order_work_order_status":

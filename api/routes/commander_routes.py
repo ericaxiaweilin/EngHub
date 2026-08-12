@@ -40,7 +40,7 @@ async def run_commander_cycle(
     from api.services.factory_commander import FactoryCommander
     commander = FactoryCommander(db)
     factory_id = req.factory_id or getattr(current_user, "active_factory_id", None) or "FAC_MECH_001"
-    report = await commander.run_cycle(factory_id, force_mode=req.force_mode, auto_execute=req.auto_execute)
+    report = await commander.run_cycle(factory_id, force_mode=req.force_mode, auto_execute=req.auto_execute, created_by=current_user.username or str(current_user.id))
     return report.to_dict()
 
 
@@ -92,7 +92,7 @@ async def toggle_commander(
     factory_id = req.factory_id or getattr(current_user, "active_factory_id", None) or "FAC_MECH_001"
 
     if req.enabled:
-        commander.enable_for_user(user_id, factory_id, req.scope)
+        commander.enable_for_user(user_id, factory_id, req.scope, username=current_user.username)
         return {"enabled": True, "user_id": user_id, "factory_id": factory_id, "message": "指挥官已开启，将自动接管您工作范围内的生产调度、接单、排产、交期管理"}
     else:
         commander.disable_for_user(user_id)

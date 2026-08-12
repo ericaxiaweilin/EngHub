@@ -11,7 +11,7 @@ from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, text
 
-from database.models import WorkOrder, Station, Equipment
+from database.models import WorkOrder, Station, Equipment, ApsSchedule
 
 
 def _gen_id() -> str:
@@ -48,6 +48,31 @@ class ApsEngine:
         4. 逐工单分配到工位+时间段
         5. 检测冲突
         """
+        # 统一到 APS 主引擎；旧版这里的简化算法会写入另一套字段、忽略
+        # 工艺路线/班次/假期，并与 /api/v1/aps 产生两份计划。
+        from api.services.aps_service import ApsService
+        optimize_for = {
+            "EDD": "delivery",
+            "SPT": "efficiency",
+            "CR": "delivery",
+            "PRIORITY": "delivery",
+        }.get(algorithm, "delivery")
+        result = await ApsService(self.db).generate_schedule(
+            factory_id=factory_id,
+            mode="hybrid",
+            horizon_days=horizon_days,
+            optimize_for=optimize_for,
+            created_by=created_by,
+            change_reason=f"compat_schedule:{algorithm}",
+        )
+        result["algorithm"] = algorithm
+        result["algorithm_name"] = ALGORITHMS.get(algorithm, algorithm)
+        result["conflict_count"] = len(result.get("unscheduled_orders", []))
+        if not result.get("success") and not result.get("schedule_id"):
+            result["error"] = result.get("message", "排程失败")
+        return result
+
+        # Legacy implementation retained below for migration reference only.
         now = datetime.utcnow()
         schedule_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         schedule_end = schedule_start + timedelta(days=horizon_days)
@@ -211,6 +236,17 @@ class ApsEngine:
         """
         插单重排：保持已开工(in_progress)不动，重排未开工工单
         """
+        from api.services.aps_service import ApsService
+        result = await ApsService(self.db).reschedule(
+            factory_id=factory_id,
+            insert_wo_id=insert_wo_id,
+            created_by=created_by,
+            change_reason=f"compat_insert:{insert_wo_id}" if insert_wo_id else "compat_reschedule",
+        )
+        result["algorithm"] = algorithm
+        return result
+
+        # Legacy implementation retained below for migration reference only.
         # 标记已开工工单为锁定
         locked_stmt = select(WorkOrder).where(
             and_(
@@ -234,6 +270,21 @@ class ApsEngine:
 
     async def get_gantt_data(self, factory_id: str, schedule_id: Optional[str] = None) -> Dict[str, Any]:
         """获取甘特图数据"""
+        from api.services.aps_service import ApsService
+        if not schedule_id:
+            latest = await self.db.execute(
+                select(ApsSchedule).where(
+                    ApsSchedule.factory_id == factory_id,
+                    ApsSchedule.is_current.is_(True),
+                ).order_by(ApsSchedule.created_at.desc()).limit(1)
+            )
+            current = latest.scalar_one_or_none()
+            if not current:
+                return {"schedule_id": None, "resources": {}, "total_tasks": 0}
+            schedule_id = current.id
+        return await ApsService(self.db).get_gantt_data(schedule_id)
+
+        # Legacy implementation retained below for migration reference only.
         if schedule_id:
             task_result = await self.db.execute(text(
                 "SELECT t.*, w.work_order_code, w.product_id, w.planned_qty, w.priority, w.planned_due "

@@ -4,9 +4,10 @@ import { FieldTimeOutlined, BarChartOutlined, ThunderboltOutlined, WarningOutlin
 import ScheduleGantt from './ScheduleGantt'
 import CapacityLoad from './CapacityLoad'
 import { apsApi } from '../../services/aps'
+import { getActiveFactoryId } from '../../utils/factory'
 
 const { Text } = Typography
-const FACTORY = localStorage.getItem('active_factory_id') || 'FAC_MECH_001'
+const FACTORY = getActiveFactoryId()
 
 const algorithms = [
   { value: 'EDD', label: 'EDD 最早交期优先' },
@@ -42,7 +43,12 @@ const ApsEnhanced: React.FC = () => {
       setResult(res)
       message.success(res.note || '重排完成')
     } catch (e: any) {
-      message.error(e?.response?.data?.detail || '重排失败')
+      const detail = e?.response?.data?.detail || '重排失败'
+      if (String(detail).includes('插单审批')) {
+        message.warning('插单需先走审批流：请在 PMC 工作台 → 插单评估 生成审批单，审批通过后方可重排')
+      } else {
+        message.error(detail)
+      }
     } finally { setScheduling(false) }
   }
 

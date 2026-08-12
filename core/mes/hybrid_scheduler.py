@@ -49,6 +49,9 @@ class ResourceConstraint:
     efficiency: float = 1.0  # 效率系数 (来自 OEE)
     skills_required: List[str] = field(default_factory=list)
     calendar: List[Tuple[datetime.time, datetime.time]] = field(default_factory=list)
+    calendar_by_weekday: Dict[int, List[Tuple[datetime.time, datetime.time]]] = field(default_factory=dict)
+    blocked_dates: Set[datetime.date] = field(default_factory=set)
+    working_dates: Set[datetime.date] = field(default_factory=set)
     is_broken: bool = False  # 是否故障
     maintenance_schedule: List[Tuple[datetime.datetime, datetime.datetime]] = field(default_factory=list)
 
@@ -155,6 +158,9 @@ class HybridScheduler:
         capacity: int = 1,
         oee: float = 1.0,
         calendar: List[Tuple[datetime.time, datetime.time]] = None,
+        calendar_by_weekday: Dict[int, List[Tuple[datetime.time, datetime.time]]] = None,
+        blocked_dates: Set[datetime.date] = None,
+        working_dates: Set[datetime.date] = None,
         is_broken: bool = False,
         maintenance_schedule: List[Tuple[datetime.datetime, datetime.datetime]] = None,
     ):
@@ -166,6 +172,9 @@ class HybridScheduler:
             capacity=capacity,
             efficiency=oee / 100.0 if oee > 1 else oee,
             calendar=calendar or [(datetime.time(8, 0), datetime.time(20, 0))],
+            calendar_by_weekday=calendar_by_weekday or {},
+            blocked_dates=blocked_dates or set(),
+            working_dates=working_dates or set(),
             is_broken=is_broken,
             maintenance_schedule=maintenance_schedule or [],
         )
@@ -275,7 +284,7 @@ class HybridScheduler:
         
         # 4. 检查工作日历
         if not self._is_within_calendar(res, start_time, duration):
-            next_slot = self._find_next_work_slot(res, start_time)
+            next_slot = self._find_next_work_slot(res, start_time, duration)
             return False, next_slot
         
         return True, start_time
@@ -288,10 +297,13 @@ class HybridScheduler:
     ) -> Optional[ScheduleTask]:
         """检查时间轴冲突"""
         end = start + datetime.timedelta(seconds=duration)
-        for task in self.resource_timeline.get(resource_id, []):
-            # 检查重叠
-            if not (end <= task.start_time or start >= task.end_time):
-                return task
+        resource = self.resources.get(resource_id)
+        overlapping = [
+            task for task in self.resource_timeline.get(resource_id, [])
+            if not (end <= task.start_time or start >= task.end_time)
+        ]
+        if resource and len(overlapping) >= max(1, resource.capacity):
+            return max(overlapping, key=lambda task: task.end_time)
         return None
     
     def _is_within_calendar(
@@ -300,12 +312,15 @@ class HybridScheduler:
         start: datetime.datetime,
         duration: float,
     ) -> bool:
-        """检查是否在工作日历内（只要求开始时间在工作时段内，任务可跨天）"""
-        for work_start, work_end in resource.calendar:
+        """检查任务是否完整落在一个有效班次内，并排除法定假期。"""
+        work_slots = resource.calendar_by_weekday.get(start.weekday(), resource.calendar)
+        if start.date() in resource.blocked_dates and start.date() not in resource.working_dates:
+            return False
+        for work_start, work_end in work_slots:
             slot_start = datetime.datetime.combine(start.date(), work_start)
             slot_end = datetime.datetime.combine(start.date(), work_end)
-            
-            if slot_start <= start < slot_end:
+            end = start + datetime.timedelta(seconds=duration)
+            if slot_start <= start and end <= slot_end:
                 return True
         
         return False
@@ -314,13 +329,22 @@ class HybridScheduler:
         self,
         resource: ResourceConstraint,
         from_time: datetime.datetime,
+        duration: float = 0.0,
     ) -> datetime.datetime:
         """查找下一个工作时间段"""
-        # 简化实现：跳到第二天第一个工作时段
-        next_day = from_time.date() + datetime.timedelta(days=1)
-        if resource.calendar:
-            first_start = resource.calendar[0][0]
-            return datetime.datetime.combine(next_day, first_start)
+        # 找下一个能容纳完整任务的工作时间段，最多搜索一年，避免死循环。
+        # 不能只返回下一天的第一班：两班制或当天午休后仍可能有可用窗口。
+        next_day = from_time.date()
+        for _ in range(366):
+            slots = resource.calendar_by_weekday.get(next_day.weekday(), resource.calendar)
+            if slots and (next_day not in resource.blocked_dates or next_day in resource.working_dates):
+                for slot_start, slot_end in sorted(slots):
+                    slot_begin = datetime.datetime.combine(next_day, slot_start)
+                    slot_finish = datetime.datetime.combine(next_day, slot_end)
+                    candidate = max(from_time, slot_begin)
+                    if candidate <= slot_finish and candidate + datetime.timedelta(seconds=duration) <= slot_finish:
+                        return candidate
+            next_day += datetime.timedelta(days=1)
         return from_time + datetime.timedelta(hours=1)
     
     def _calculate_setup_time(
@@ -362,11 +386,18 @@ class HybridScheduler:
         violations = []
         
         # 按优先级和交期排序订单
-        sorted_orders = sorted(
-            self.orders.values(),
-            key=lambda x: (x.priority.value, x.due_date),
-            reverse=True if mode == SchedulingMode.BACKWARD else False
-        )
+        # 优先级数值越大越紧急，交期越早越优先。原实现 forward/hybrid
+        # 按升序排列，导致 LOW 订单先占用资源，破坏 APS 的优先级语义。
+        if mode == SchedulingMode.BACKWARD:
+            sorted_orders = sorted(
+                self.orders.values(),
+                key=lambda x: (-x.priority.value, -x.due_date.timestamp()),
+            )
+        else:
+            sorted_orders = sorted(
+                self.orders.values(),
+                key=lambda x: (-x.priority.value, x.due_date),
+            )
         
         for order in sorted_orders:
             try:
@@ -656,4 +687,3 @@ class HybridScheduler:
             gantt[station_id].sort(key=lambda x: x["start_time"])
         
         return gantt
-

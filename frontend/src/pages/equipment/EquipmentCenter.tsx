@@ -1,160 +1,406 @@
-import React, { useEffect, useState, useCallback } from 'react'
-import {
-  Card, Tabs, Table, Button, Tag, Space, Row, Col, Statistic, Modal, Form,
-  Input, Select, message, Empty, Spin,
-} from 'antd'
-import {
-  ToolOutlined, DashboardOutlined, PlusOutlined,
-} from '@ant-design/icons'
-import api from '../../services/api'
+import React, { useState, useEffect } from 'react';
+import { Card, Table, Button, Tag, Space, Input, Select, Modal, Form, message, Typography, Statistic, Row, Col, Progress } from 'antd';
+import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
+import axios from 'axios';
+import { API_BASE_URL } from '../../config/api';
 
-const FACTORY = 'factory-sh-01'
+const { Title, Text } = Typography;
+const { TextArea } = Input;
 
-const MOCK_DASHBOARD = {
-  total_equipment: 24,
-  oee_7d: { oee: 78.5, availability: 92.3, performance: 88.1, quality: 96.2, downtime_minutes: 342 },
-  open_maintenance_orders: 3,
-  status_distribution: { running: 12, available: 5, maintenance: 3, broken: 2, idle: 2 },
-  downtime_7d: [
-    { category: 'breakdown', count: 4, total_minutes: 180 },
-    { category: 'changeover', count: 6, total_minutes: 95 },
-    { category: 'maintenance', count: 3, total_minutes: 67 },
-  ],
+interface Equipment {
+  id: string;
+  factory_id: string;
+  equipment_name: string;
+  equipment_type: string;
+  model: string;
+  serial_number: string;
+  location: string;
+  status: string;
+  oee: number;
+  last_maintenance: string;
+  next_maintenance: string;
+  created_at: string;
 }
 
-const MOCK_MAINTENANCE = [
-  { id: 'mt-1', order_code: 'MO-2026-001', maintenance_type: 'corrective', priority: 'high', status: 'open', description: 'CNC-03 主轴异响，需检查轴承', created_at: '2026-07-20' },
-  { id: 'mt-2', order_code: 'MO-2026-002', maintenance_type: 'preventive', priority: 'medium', status: 'in_progress', description: '注塑机-01 定期更换液压油', created_at: '2026-07-18' },
-  { id: 'mt-3', order_code: 'MO-2026-003', maintenance_type: 'predictive', priority: 'low', status: 'open', description: '空压机-02 振动分析异常预警', created_at: '2026-07-15' },
-  { id: 'mt-4', order_code: 'MO-2026-004', maintenance_type: 'corrective', priority: 'high', status: 'completed', description: '焊接机器人-01 送丝机构卡死', created_at: '2026-07-10' },
-]
+const EquipmentCenter: React.FC = () => {
+  const [equipment, setEquipment] = useState<Equipment[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [total, setTotal] = useState(0);
+  const [pagination, setPagination] = useState({ current: 1, pageSize: 20 });
+  const [searchText, setSearchText] = useState('');
+  const [typeFilter, setTypeFilter] = useState<string | undefined>();
+  const [statusFilter, setStatusFilter] = useState<string | undefined>();
+  
+  // Modal states
+  const [createModalVisible, setCreateModalVisible] = useState(false);
+  const [detailModalVisible, setDetailModalVisible] = useState(false);
+  const [selectedEquipment, setSelectedEquipment] = useState<Equipment | null>(null);
+  
+  // Form
+  const [createForm] = Form.useForm();
+  const [submitLoading, setSubmitLoading] = useState(false);
 
-// ============== 设备看板 ==============
-const EquipDashboard: React.FC = () => {
-  const [data, setData] = useState<any>(null)
-  const [loading, setLoading] = useState(false)
+  // Fetch equipment
+  const fetchEquipment = async () => {
+    setLoading(true);
+    try {
+      const params: any = {
+        limit: pagination.pageSize,
+        offset: (pagination.current - 1) * pagination.pageSize
+      };
+      
+      if (searchText) {
+        params.search = searchText;
+      }
+      if (typeFilter) {
+        params.equipment_type = typeFilter;
+      }
+      if (statusFilter) {
+        params.status = statusFilter;
+      }
+      
+      const response = await axios.get(`${API_BASE_URL}/equipment/`, { params });
+      setEquipment(response.data.equipment || []);
+      setTotal(response.data.total || 0);
+    } catch (error) {
+      console.error('Failed to fetch equipment:', error);
+      message.error('Failed to load equipment');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    (async () => {
-      setLoading(true)
-      try {
-        const res: any = await api.get('/api/v1/equipment/dashboard', { params: { factory_id: FACTORY } })
-        setData(res ?? null)
-      } catch { setData(null) } finally { setLoading(false) }
-    })()
-  }, [])
+    fetchEquipment();
+  }, [pagination]);
 
-  if (loading) return <Spin />
-  if (!data) return <Empty description="暂无设备数据" />
+  // Handle table change
+  const handleTableChange = (pagination: any) => {
+    setPagination({ current: pagination.current, pageSize: pagination.pageSize });
+  };
 
-  const statusColors: Record<string, string> = { available: 'success', running: 'processing', maintenance: 'warning', broken: 'error', idle: 'default' }
-  const statusText: Record<string, string> = { available: '可用', running: '运行中', maintenance: '维护中', broken: '故障', idle: '空闲' }
+  // Handle search
+  const handleSearch = () => {
+    setPagination({ ...pagination, current: 1 });
+    fetchEquipment();
+  };
+
+  // Handle create
+  const handleCreate = async (values: any) => {
+    setSubmitLoading(true);
+    try {
+      await axios.post(`${API_BASE_URL}/equipment/`, values);
+      message.success('Equipment created successfully');
+      setCreateModalVisible(false);
+      createForm.resetFields();
+      fetchEquipment();
+    } catch (error) {
+      console.error('Failed to create equipment:', error);
+      message.error('Failed to create equipment');
+    } finally {
+      setSubmitLoading(false);
+    }
+  };
+
+  // Column definitions
+  const columns = [
+    {
+      title: 'Equipment Name',
+      dataIndex: 'equipment_name',
+      key: 'equipment_name',
+      width: 150,
+    },
+    {
+      title: 'Type',
+      dataIndex: 'equipment_type',
+      key: 'equipment_type',
+      width: 120,
+      render: (type: string) => <Tag>{type}</Tag>
+    },
+    {
+      title: 'Model',
+      dataIndex: 'model',
+      key: 'model',
+      width: 120,
+    },
+    {
+      title: 'Location',
+      dataIndex: 'location',
+      key: 'location',
+      width: 120,
+    },
+    {
+      title: 'Status',
+      dataIndex: 'status',
+      key: 'status',
+      width: 100,
+      render: (status: string) => {
+        const statusMap: Record<string, { label: string; color: string }> = {
+          'OPERATIONAL': { label: 'Operational', color: 'green' },
+          'MAINTENANCE': { label: 'Maintenance', color: 'orange' },
+          'DOWN': { label: 'Down', color: 'red' },
+          'INSTALLATION': { label: 'Installation', color: 'blue' }
+        };
+        const config = statusMap[status] || { label: status, color: 'default' };
+        return <Tag color={config.color}>{config.label}</Tag>;
+      }
+    },
+    {
+      title: 'OEE',
+      dataIndex: 'oee',
+      key: 'oee',
+      width: 100,
+      render: (oee: number) => (
+        <span style={{ color: oee >= 85 ? '#52c41a' : oee >= 70 ? '#faad14' : '#ff4d4f', fontWeight: 'bold' }}>
+          {oee}%
+        </span>
+      ),
+    },
+    {
+      title: 'Next Maintenance',
+      dataIndex: 'next_maintenance',
+      key: 'next_maintenance',
+      width: 120,
+      render: (date: string) => date ? new Date(date).toLocaleDateString() : '-',
+    },
+    {
+      title: 'Actions',
+      key: 'actions',
+      width: 150,
+      render: (_: any, record: Equipment) => (
+        <Space>
+          <Button 
+            type="link" 
+            icon={<EyeOutlined />} 
+            onClick={() => {
+              setSelectedEquipment(record);
+              setDetailModalVisible(true);
+            }}
+          >
+            View
+          </Button>
+          <Button type="link" icon={<EditOutlined />}>Edit</Button>
+        </Space>
+      ),
+    },
+  ];
 
   return (
     <div>
-      <Row gutter={12} style={{ marginBottom: 12 }}>
-        <Col span={5}><Card size="small"><Statistic title="设备总数" value={data.total_equipment} /></Card></Col>
-        <Col span={5}><Card size="small"><Statistic title="OEE (7天)" value={data.oee_7d?.oee} suffix="%" valueStyle={{ color: (data.oee_7d?.oee || 0) >= 85 ? '#52c41a' : '#faad14' }} /></Card></Col>
-        <Col span={5}><Card size="small"><Statistic title="可用率" value={data.oee_7d?.availability} suffix="%" /></Card></Col>
-        <Col span={5}><Card size="small"><Statistic title="待处理维护" value={data.open_maintenance_orders} valueStyle={{ color: data.open_maintenance_orders > 0 ? '#f5222d' : undefined }} /></Card></Col>
-        <Col span={4}><Card size="small"><Statistic title="停机(7天)" value={data.oee_7d?.downtime_minutes} suffix="min" /></Card></Col>
-      </Row>
+      <Title level={3}>Equipment Center</Title>
+      <Text type="secondary">Manage all factory equipment and their status</Text>
 
-      <Row gutter={12}>
-        <Col span={12}>
-          <Card size="small" title="设备状态分布">
-            <Space wrap>
-              {Object.entries(data.status_distribution || {}).map(([k, v]) => (
-                <Tag key={k} color={statusColors[k] || 'default'}>{statusText[k] || k}: {v as number}</Tag>
-              ))}
-            </Space>
+      {/* Statistics */}
+      <Row gutter={16} style={{ marginTop: 16, marginBottom: 16 }}>
+        <Col span={6}>
+          <Card>
+            <Statistic
+              title="Total Equipment"
+              value={total}
+              prefix={<ThunderboltOutlined />}
+            />
           </Card>
         </Col>
-        <Col span={12}>
-          <Card size="small" title="近7天停机分类">
-            {data.downtime_7d?.length ? (
-              <Space direction="vertical" style={{ width: '100%' }}>
-                {data.downtime_7d.map((d: any, i: number) => (
-                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <Tag color={d.category === 'breakdown' ? 'error' : 'warning'}>{d.category}</Tag>
-                    <span>{d.count}次 / {d.total_minutes}min</span>
-                  </div>
-                ))}
-              </Space>
-            ) : <Empty description="无停机记录" image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+        <Col span={6}>
+          <Card>
+            <Statistic
+              title="Operational"
+              value={equipment.filter(e => e.status === 'OPERATIONAL').length}
+              prefix={<CheckCircleOutlined />}
+              valueStyle={{ color: '#52c41a' }}
+            />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card>
+            <Statistic
+              title="Under Maintenance"
+              value={equipment.filter(e => e.status === 'MAINTENANCE').length}
+              prefix={<WarningOutlined />}
+              valueStyle={{ color: '#faad14' }}
+            />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card>
+            <Statistic
+              title="Down"
+              value={equipment.filter(e => e.status === 'DOWN').length}
+              prefix={<CloseCircleOutlined />}
+              valueStyle={{ color: '#ff4d4f' }}
+            />
           </Card>
         </Col>
       </Row>
-    </div>
-  )
-}
 
-// ============== 维护工单 ==============
-const MaintenancePanel: React.FC = () => {
-  const [orders, setOrders] = useState<any[]>([])
-  const [loading, setLoading] = useState(false)
-  const [createModal, setCreateModal] = useState(false)
-  const [form] = Form.useForm()
+      {/* Filters */}
+      <div style={{ marginBottom: 16, display: 'flex', gap: 16, alignItems: 'center' }}>
+        <Input
+          placeholder="Search equipment..."
+          value={searchText}
+          onChange={(e) => setSearchText(e.target.value)}
+          onPressEnter={handleSearch}
+          style={{ width: 200 }}
+        />
+        <Select
+          placeholder="Type"
+          value={typeFilter}
+          onChange={setTypeFilter}
+          style={{ width: 150 }}
+          allowClear
+        >
+          <Select.Option value="CNC">CNC Machine</Select.Option>
+          <Select.Option value="INJECTION">Injection Molder</Select.Option>
+          <Select.Option value="CONVEYOR">Conveyor</Select.Option>
+          <Select.Option value="ROBOT">Robot</Select.Option>
+          <Select.Option value="PACKAGING">Packaging</Select.Option>
+        </Select>
+        <Select
+          placeholder="Status"
+          value={statusFilter}
+          onChange={setStatusFilter}
+          style={{ width: 150 }}
+          allowClear
+        >
+          <Select.Option value="OPERATIONAL">Operational</Select.Option>
+          <Select.Option value="MAINTENANCE">Maintenance</Select.Option>
+          <Select.Option value="DOWN">Down</Select.Option>
+          <Select.Option value="INSTALLATION">Installation</Select.Option>
+        </Select>
+        <Button type="primary" onClick={handleSearch}>
+          Search
+        </Button>
+        <Button onClick={handleSearch}>Reset</Button>
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalVisible(true)}>
+          Add Equipment
+        </Button>
+      </div>
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res: any = await api.get('/api/v1/equipment/maintenance', { params: { factory_id: FACTORY } })
-      const items = res.items || []
-      setOrders(items)
-    } catch { setOrders([]) } finally { setLoading(false) }
-  }, [])
-  useEffect(() => { load() }, [load])
-
-  const handleCreate = async () => {
-    const vals = await form.validateFields()
-    try {
-      await api.post('/api/v1/equipment/maintenance', { ...vals, factory_id: FACTORY })
-      message.success('维护工单已创建')
-      setCreateModal(false); form.resetFields(); load()
-    } catch (e: any) { message.error(e?.response?.data?.detail || '失败') }
-  }
-
-  const statusColor: Record<string, string> = { open: 'error', in_progress: 'processing', completed: 'success', cancelled: 'default' }
-  const typeText: Record<string, string> = { preventive: '预防', corrective: ' corrective', predictive: '预测' }
-
-  return (
-    <div>
-      <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModal(true)} style={{ marginBottom: 12 }}>新建维护工单</Button>
-      <Table dataSource={orders} rowKey="id" size="small" loading={loading} pagination={{ pageSize: 10 }}
-        columns={[
-          { title: '工单号', dataIndex: 'order_code', width: 180 },
-          { title: '类型', dataIndex: 'maintenance_type', width: 80, render: (v: string) => <Tag>{typeText[v] || v}</Tag> },
-          { title: '优先级', dataIndex: 'priority', width: 80, render: (v: string) => <Tag color={v === 'high' ? 'red' : v === 'medium' ? 'orange' : 'default'}>{v}</Tag> },
-          { title: '状态', dataIndex: 'status', width: 100, render: (v: string) => <Tag color={statusColor[v]}>{v}</Tag> },
-          { title: '描述', dataIndex: 'description', ellipsis: true },
-          { title: '创建时间', dataIndex: 'created_at', width: 110, render: (v: string) => v?.slice(0, 10) },
-        ]}
+      {/* Table */}
+      <Table
+        columns={columns}
+        dataSource={equipment}
+        rowKey="id"
+        loading={loading}
+        pagination={{
+          ...pagination,
+          total,
+          showSizeChanger: true,
+          showTotal: (total) => `Total ${total} equipment`,
+        }}
+        onChange={handleTableChange}
       />
-      <Modal title="新建维护工单" open={createModal} onOk={handleCreate} onCancel={() => setCreateModal(false)}>
-        <Form form={form} layout="vertical">
-          <Form.Item name="equipment_id" label="设备ID" rules={[{ required: true }]}><Input /></Form.Item>
-          <Form.Item name="maintenance_type" label="类型" initialValue="corrective">
-            <Select options={[{ value: 'corrective', label: '纠正性维护' }, { value: 'preventive', label: '预防性维护' }, { value: 'predictive', label: '预测性维护' }]} />
+
+      {/* Create Modal */}
+      <Modal
+        title="Add Equipment"
+        open={createModalVisible}
+        onOk={() => createForm.submit()}
+        onCancel={() => {
+          setCreateModalVisible(false);
+          createForm.resetFields();
+        }}
+        confirmLoading={submitLoading}
+        width={600}
+      >
+        <Form
+          form={createForm}
+          layout="vertical"
+          onFinish={handleCreate}
+        >
+          <Form.Item
+            name="equipment_name"
+            label="Equipment Name"
+            rules={[{ required: true, message: 'Please enter equipment name' }]}
+          >
+            <Input placeholder="Enter equipment name" />
           </Form.Item>
-          <Form.Item name="priority" label="优先级" initialValue="medium">
-            <Select options={[{ value: 'high', label: '高' }, { value: 'medium', label: '中' }, { value: 'low', label: '低' }]} />
+          <Form.Item
+            name="equipment_type"
+            label="Equipment Type"
+            rules={[{ required: true, message: 'Please select type' }]}
+          >
+            <Select>
+              <Select.Option value="CNC">CNC Machine</Select.Option>
+              <Select.Option value="INJECTION">Injection Molder</Select.Option>
+              <Select.Option value="CONVEYOR">Conveyor</Select.Option>
+              <Select.Option value="ROBOT">Robot</Select.Option>
+              <Select.Option value="PACKAGING">Packaging</Select.Option>
+            </Select>
           </Form.Item>
-          <Form.Item name="description" label="描述"><Input.TextArea rows={3} /></Form.Item>
+          <Form.Item
+            name="model"
+            label="Model"
+          >
+            <Input placeholder="Enter model" />
+          </Form.Item>
+          <Form.Item
+            name="serial_number"
+            label="Serial Number"
+          >
+            <Input placeholder="Enter serial number" />
+          </Form.Item>
+          <Form.Item
+            name="location"
+            label="Location"
+          >
+            <Input placeholder="Enter location" />
+          </Form.Item>
         </Form>
       </Modal>
+
+      {/* Detail Modal */}
+      <Modal
+        title="Equipment Detail"
+        open={detailModalVisible}
+        onCancel={() => setDetailModalVisible(false)}
+        footer={[
+          <Button key="close" onClick={() => setDetailModalVisible(false)}>
+            Close
+          </Button>
+        ]}
+        width={600}
+      >
+        {selectedEquipment && (
+          <div>
+            <Descriptions column={2} bordered>
+              <Descriptions.Item label="Equipment Name">{selectedEquipment.equipment_name}</Descriptions.Item>
+              <Descriptions.Item label="Type">{selectedEquipment.equipment_type}</Descriptions.Item>
+              <Descriptions.Item label="Model">{selectedEquipment.model}</Descriptions.Item>
+              <Descriptions.Item label="Serial Number">{selectedEquipment.serial_number}</Descriptions.Item>
+              <Descriptions.Item label="Location">{selectedEquipment.location}</Descriptions.Item>
+              <Descriptions.Item label="Status">
+                <Tag color={
+                  selectedEquipment.status === 'OPERATIONAL' ? 'green' :
+                  selectedEquipment.status === 'MAINTENANCE' ? 'orange' :
+                  selectedEquipment.status === 'DOWN' ? 'red' : 'blue'
+                }>
+                  {selectedEquipment.status}
+                </Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="OEE">
+                <span style={{ 
+                  color: selectedEquipment.oee >= 85 ? '#52c41a' : selectedEquipment.oee >= 70 ? '#faad14' : '#ff4d4f',
+                  fontWeight: 'bold'
+                }}>
+                  {selectedEquipment.oee}%
+                </span>
+              </Descriptions.Item>
+              <Descriptions.Item label="Last Maintenance">
+                {selectedEquipment.last_maintenance ? new Date(selectedEquipment.last_maintenance).toLocaleDateString() : '-'}
+              </Descriptions.Item>
+              <Descriptions.Item label="Next Maintenance">
+                {selectedEquipment.next_maintenance ? new Date(selectedEquipment.next_maintenance).toLocaleDateString() : '-'}
+              </Descriptions.Item>
+              <Descriptions.Item label="Created At">
+                {selectedEquipment.created_at ? new Date(selectedEquipment.created_at).toLocaleString() : '-'}
+              </Descriptions.Item>
+            </Descriptions>
+          </div>
+        )}
+      </Modal>
     </div>
-  )
-}
+  );
+};
 
-// ============== 主页面 ==============
-const EquipmentCenter: React.FC = () => {
-  return (
-    <Tabs size="small" defaultActiveKey="dashboard" items={[
-      { key: 'dashboard', label: <span><DashboardOutlined /> 设备看板</span>, children: <EquipDashboard /> },
-      { key: 'maintenance', label: <span><ToolOutlined /> 维护工单</span>, children: <MaintenancePanel /> },
-    ]} />
-  )
-}
-
-export default EquipmentCenter
+export default EquipmentCenter;
