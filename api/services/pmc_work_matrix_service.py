@@ -290,7 +290,12 @@ class PmcWorkMatrixService:
         factory_id: str,
         material_code: str,
     ) -> Dict[str, Any]:
-        """Read supplier quoted lead time for the PMC LT answer."""
+        """Read supplier quoted lead time for the PMC LT answer.
+
+        优先读供应商报价表 supplier_prices（报价含 LT/MOQ/价格）；
+        报价表无数据时降级读 supplier_materials（供应商物料绑定表，含 lead_time_days），
+        避免供应商主数据存在但报价未维护时 LT 恒为 unknown。
+        """
         try:
             async with self.db.begin_nested():
                 result = await self.db.execute(text("""
@@ -305,7 +310,30 @@ class PmcWorkMatrixService:
                     ORDER BY sp.lead_days ASC, sp.unit_price ASC
                 """), {"fid": factory_id, "material_code": material_code})
                 rows = [dict(row) for row in result.mappings().all()]
-            return {"available": True, "rows": rows}
+            if rows:
+                return {"available": True, "rows": rows, "source": "supplier_prices"}
+
+            # 降级源：supplier_materials 供应商物料绑定（含 lead_time_days）
+            async with self.db.begin_nested():
+                result = await self.db.execute(text("""
+                    SELECT s.supplier_code, s.supplier_name,
+                           sm.lead_time_days AS lead_days,
+                           sm.min_order_qty AS moq,
+                           NULL AS currency,
+                           sm.unit_cost AS unit_price
+                    FROM supplier_materials sm
+                    JOIN suppliers s ON s.id = sm.supplier_id
+                    WHERE s.factory_id = :fid
+                      AND sm.material_code = :material_code
+                      AND sm.is_active = TRUE
+                    ORDER BY sm.lead_time_days ASC, sm.unit_cost ASC
+                """), {"fid": factory_id, "material_code": material_code})
+                rows = [dict(row) for row in result.mappings().all()]
+            return {
+                "available": True,
+                "rows": rows,
+                "source": "supplier_materials" if rows else "missing",
+            }
         except SQLAlchemyError as exc:
             return {
                 "available": False,
@@ -906,7 +934,12 @@ class PmcWorkMatrixService:
         elif not rdd:
             next_focus = ["补齐 RDD/交付节点", "确认客户需求版本后再做倒排"]
         elif not material_rows:
-            next_focus = ["补齐该成品的已生效 BOM 版本", "BOM 未生效前不能给出库存齐套率或 MRP 结论"]
+            # 缺 BOM：主数据缺口，齐套率/ETA 无法计算。区分产品是否已有工艺路线，
+            # 已有路由时产能证据仍可用，问题明确收敛到 BOM。
+            if not route_steps:
+                next_focus = ["产品缺工艺路线与已生效 BOM（双缺）", "先由工艺/工程绑定路由与 BOM 版本，再算齐套率与交期"]
+            else:
+                next_focus = ["补齐该成品的已生效 BOM 版本", "BOM 未生效前不能给出库存齐套率或 MRP 结论"]
         elif not capacity_rows or capacity_unknown:
             next_focus = ["补齐工艺路线和瓶颈工位主数据", "执行 CRP/APS 后再承诺交期"]
         elif projected_shortage_count and not options["substitute_material_available"]:

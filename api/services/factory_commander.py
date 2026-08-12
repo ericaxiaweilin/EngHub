@@ -54,6 +54,7 @@ class CommanderAction(str, Enum):
     DELAY_DELIVERY = "delay_delivery"      # 延交
     OVERTIME = "overtime"                  # 加班
     PROCUREMENT = "procurement"            # 采购
+    DATA_GAP = "data_gap"                  # 计划主数据缺口（补BOM/路由/计划）
     HOLD = "hold"                          # 按兵不动
 
 
@@ -71,6 +72,11 @@ class FactoryState:
     due_7d_orders: int = 0
     order_load_ratio: float = 0.0  # 订单负荷 / 产能
     order_mode: OrderMode = OrderMode.NORMAL
+
+    # 计划主数据缺口（销售订单 vs MPS 计划 / BOM / 工艺路线）
+    so_unplanned: int = 0          # 未纳入 MPS 计划的销售订单数
+    products_no_routing: int = 0   # 无工艺路线的主产品数
+    products_no_bom: int = 0       # 无已生效 BOM 的主产品数
 
     # 产能态势
     total_stations: int = 0
@@ -109,6 +115,11 @@ class FactoryState:
                 "overdue": self.overdue_orders,
                 "due_7d": self.due_7d_orders,
                 "load_ratio": round(self.order_load_ratio, 2),
+            },
+            "plan_data_gaps": {
+                "so_unplanned": self.so_unplanned,
+                "products_no_routing": self.products_no_routing,
+                "products_no_bom": self.products_no_bom,
             },
             "capacity": {
                 "stations": f"{self.busy_stations}/{self.total_stations}",
@@ -420,6 +431,9 @@ class FactoryCommander:
             state.in_progress_orders = orders.get("in_progress", 0)
             state.overdue_orders = orders.get("overdue", 0)
             state.due_7d_orders = orders.get("due_7d", 0)
+            state.so_unplanned = orders.get("so_unplanned", 0)
+            state.products_no_routing = orders.get("products_no_routing", 0)
+            state.products_no_bom = orders.get("products_no_bom", 0)
 
         if results[1] is not None:
             cap = results[1]
@@ -471,6 +485,41 @@ class FactoryCommander:
             FROM work_orders WHERE factory_id = :fid
         """), {"fid": factory_id})
         row = dict(r.first()._mapping)
+
+        # 计划主数据缺口：未纳入 MPS 计划的销售订单
+        try:
+            so = await self.db.execute(text("""
+                SELECT COUNT(*) AS unplanned
+                FROM sales_orders so
+                WHERE so.factory_id = :fid
+                  AND so.status NOT IN ('cancelled', 'completed')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pp_plans pp
+                      WHERE pp.sales_order_id = so.order_code
+                  )
+            """), {"fid": factory_id})
+            row["so_unplanned"] = so.scalar() or 0
+        except Exception:
+            row["so_unplanned"] = 0
+
+        # 产品主数据缺口：无工艺路线 / 无 BOM 的产品（在售且非取消）
+        try:
+            md = await self.db.execute(text("""
+                SELECT
+                    COUNT(*) FILTER (WHERE r.id IS NULL) AS no_routing,
+                    COUNT(*) FILTER (WHERE b.id IS NULL) AS no_bom
+                FROM products p
+                LEFT JOIN routings r ON r.factory_id = p.factory_id AND r.product_id = p.id AND r.is_active = TRUE
+                LEFT JOIN (SELECT DISTINCT product_id FROM bom_items WHERE factory_id = :fid2) b ON b.product_id = p.id
+                WHERE p.factory_id = :fid AND p.status = 'active'
+            """), {"fid": factory_id, "fid2": factory_id})
+            mrow = dict(md.first()._mapping)
+            row["products_no_routing"] = mrow.get("no_routing", 0)
+            row["products_no_bom"] = mrow.get("no_bom", 0)
+        except Exception:
+            row["products_no_routing"] = 0
+            row["products_no_bom"] = 0
+
         return row
 
     async def _sense_capacity(self, factory_id: str) -> Dict:
@@ -684,6 +733,29 @@ class FactoryCommander:
                 target="capacity",
             ))
 
+        # 计划主数据缺口 → 提醒 PMC 补数据/纳入计划
+        if state.so_unplanned > 0:
+            decisions.append(CommanderDecision(
+                action=CommanderAction.DATA_GAP,
+                priority="high" if state.so_unplanned >= 10 else "normal",
+                reason=f"{state.so_unplanned}张销售订单未纳入 MPS 计划，请计划员建计划并完成评估",
+                target="so_unplanned",
+            ))
+        if state.products_no_routing > 0:
+            decisions.append(CommanderDecision(
+                action=CommanderAction.DATA_GAP,
+                priority="high",
+                reason=f"{state.products_no_routing}个产品缺工艺路线，APS 无法排程，需工艺/IE 补路由",
+                target="products_no_routing",
+            ))
+        if state.products_no_bom > 0:
+            decisions.append(CommanderDecision(
+                action=CommanderAction.DATA_GAP,
+                priority="high" if state.products_no_bom >= 50 else "normal",
+                reason=f"{state.products_no_bom}个产品缺已生效 BOM，PMC 矩阵无法算齐套率/ETA",
+                target="products_no_bom",
+            ))
+
         # 去重（同 action+target 只保留最高优先级）
         seen = {}
         for d in decisions:
@@ -718,6 +790,12 @@ class FactoryCommander:
                 decision.result = {"message": "加班建议已生成，待主管确认", "status": "pending_approval"}
             elif decision.action == CommanderAction.REJECT_ORDER:
                 decision.result = {"message": "暂缓接单，产能已满", "status": "hold"}
+            elif decision.action == CommanderAction.DATA_GAP:
+                decision.result = {
+                    "message": f"计划主数据缺口：{decision.reason}",
+                    "status": "notified_pmc",
+                    "recipient": "planner",
+                }
             else:
                 decision.result = {"message": f"{decision.action.value} 待实现", "status": "planned"}
             decision.executed = True
@@ -955,6 +1033,12 @@ class FactoryCommander:
             alerts.append("产能接近满载，新单需排队或加班")
         if state.on_time_rate_30d < 0.8 and state.on_time_rate_30d > 0:
             alerts.append(f"交期达成率仅{state.on_time_rate_30d:.0%}，低于80%目标")
+        if state.so_unplanned > 0:
+            alerts.append(f"{state.so_unplanned}张销售订单未纳入 MPS 计划，需 PMC 建计划")
+        if state.products_no_routing > 0:
+            alerts.append(f"{state.products_no_routing}个产品缺工艺路线，APS 排程会卡住")
+        if state.products_no_bom > 0:
+            alerts.append(f"{state.products_no_bom}个产品缺已生效 BOM，齐套率/ETA 无法计算")
         return alerts
 
     def _plan_next_actions(self, state: FactoryState, decisions: List[CommanderDecision]) -> List[str]:
@@ -972,6 +1056,12 @@ class FactoryCommander:
                 next_actions.append(f"下一轮排程消化{state.pending_orders}个待排工单")
         if state.low_stock_items > 0:
             next_actions.append("跟催采购到货情况")
+        if state.so_unplanned > 0:
+            next_actions.append(f"把{state.so_unplanned}张未计划销售订单纳入 MPS 计划并做 PMC 评估")
+        if state.products_no_routing > 0:
+            next_actions.append("联系工艺/IE 补齐缺工艺路线的产品")
+        if state.products_no_bom > 0:
+            next_actions.append("联系工程/PP 补齐缺 BOM 的产品")
         return next_actions
 
     # ═══════════════════════════════════════════════════════════
@@ -1026,6 +1116,7 @@ class FactoryCommander:
             self._check_production_data(factory_id, state),
             self._check_inventory_data(factory_id, state),
             self._check_quality_data(factory_id, state),
+            self._check_plan_master_data(factory_id, state),
         ):
             try:
                 check = await check_coro
@@ -1156,23 +1247,71 @@ class FactoryCommander:
             pass
         return gaps
 
+    async def _check_plan_master_data(self, factory_id: str, state: FactoryState) -> List[Dict]:
+        """计划主数据充足性：销售订单是否纳入 MPS 计划、产品是否缺 BOM/工艺路线。
+
+        这是 PMC 全链"待确认"的根因——产品没有已生效 BOM/路由，PMC 工作矩阵
+        会在物料证据处断链，UHN/齐套率/FG Ready/ETA 全部无法输出。
+        """
+        gaps = []
+        try:
+            if state.so_unplanned > 0:
+                gaps.append({
+                    "dimension": "plan_master_data",
+                    "issue": f"{state.so_unplanned}张销售订单未纳入 MPS 计划",
+                    "fallback": "订单未建计划，视为待计划需求，不进入排产",
+                    "alert": f"📋 计划缺口：{state.so_unplanned}张销售订单未纳入 MPS 计划",
+                    "action": "计划员为未计划订单建 MPS 计划并做 PMC 评估",
+                    "responsible": ["planner", "production_manager"],
+                    "severity": "high",
+                })
+            if state.products_no_routing > 0:
+                gaps.append({
+                    "dimension": "plan_master_data",
+                    "issue": f"{state.products_no_routing}个产品缺工艺路线，APS 无法排程",
+                    "fallback": "缺路由产品以产能速度倒推，不承诺精确交期",
+                    "alert": f"🗺️ 工艺缺口：{state.products_no_routing}个产品缺工艺路线",
+                    "action": "工艺/IE 为缺路由产品绑定工艺路线与标准工时",
+                    "responsible": ["process_engineer", "planner"],
+                    "severity": "high",
+                })
+            if state.products_no_bom > 0:
+                gaps.append({
+                    "dimension": "plan_master_data",
+                    "issue": f"{state.products_no_bom}个产品缺已生效 BOM，齐套率/ETA 无法计算",
+                    "fallback": "缺 BOM 产品不做 MRP 齐套结论",
+                    "alert": f"🧩 BOM 缺口：{state.products_no_bom}个产品缺已生效 BOM",
+                    "action": "工程/PP 为缺 BOM 产品维护并生效 BOM 版本",
+                    "responsible": ["planner", "engineering"],
+                    "severity": "high",
+                })
+        except Exception:
+            pass
+        return gaps
+
     async def _notify_data_gap(self, factory_id: str, gap: Dict):
-        """数据缺口 → 自动通知责任人补填"""
+        """数据缺口 → 通知责任人补填。
+
+        采用广播通知（recipient=NULL）：通知中心按 username 过滤，
+        而缺口责任人是角色（planner/process_engineer 等）而非具体账号，
+        写角色字符串会导致通知无人可见。改广播后所有用户都能在通知中心看到，
+        内容中保留责任角色（responsible）与处理建议（action）。
+        """
         try:
             import uuid as _uuid
-            responsible_list = gap.get("responsible", [])
-            for recipient in responsible_list[:3]:  # 最多通知3人
-                await self.db.execute(text("""
-                    INSERT INTO notifications (id, factory_id, title, content, severity, category, recipient, is_read, source_type, created_at)
-                    VALUES (:id, :fid, :title, :content, :sev, 'data_governance', :rec, FALSE, 'commander', NOW())
-                """), {
-                    "id": str(_uuid.uuid4()),
-                    "fid": factory_id,
-                    "title": f"[指挥官] 数据缺失预警: {gap['dimension']}",
-                    "content": f"{gap['issue']}\n降级策略: {gap['fallback']}\n请补填相关数据。",
-                    "sev": gap.get("severity", "warning"),
-                    "rec": recipient,
-                })
+            responsible_list = ", ".join(gap.get("responsible", []))
+            reason = gap.get("issue", "")
+            action = gap.get("action", "")
+            await self.db.execute(text("""
+                INSERT INTO notifications (id, factory_id, title, content, severity, category, recipient, is_read, source_type, created_at)
+                VALUES (:id, :fid, :title, :content, :sev, 'data_governance', NULL, FALSE, 'commander', NOW())
+            """), {
+                "id": str(_uuid.uuid4()),
+                "fid": factory_id,
+                "title": f"[指挥官] 数据缺口：{gap['dimension']}",
+                "content": f"{reason}\n处理建议: {action}\n责任角色: {responsible_list or '未指定'}\n降级策略: {gap.get('fallback', '')}",
+                "sev": gap.get("severity", "warning"),
+            })
             await self.db.commit()
         except Exception as e:
             _logger.debug(f"[commander] 通知发送失败: {e}")
