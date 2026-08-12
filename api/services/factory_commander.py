@@ -506,13 +506,19 @@ class FactoryCommander:
         try:
             md = await self.db.execute(text("""
                 SELECT
-                    COUNT(*) FILTER (WHERE r.id IS NULL) AS no_routing,
-                    COUNT(*) FILTER (WHERE b.id IS NULL) AS no_bom
+                    COUNT(*) FILTER (WHERE NOT EXISTS (
+                        SELECT 1 FROM routings r
+                        WHERE r.factory_id = p.factory_id AND r.is_active = TRUE
+                          AND (r.product_id = p.id OR r.product_id = p.product_code)
+                    )) AS no_routing,
+                    COUNT(*) FILTER (WHERE NOT EXISTS (
+                        SELECT 1 FROM bom_items b
+                        WHERE b.factory_id = p.factory_id
+                          AND (b.product_id = p.id OR b.product_id = p.product_code)
+                    )) AS no_bom
                 FROM products p
-                LEFT JOIN routings r ON r.factory_id = p.factory_id AND r.product_id = p.id AND r.is_active = TRUE
-                LEFT JOIN (SELECT DISTINCT product_id FROM bom_items WHERE factory_id = :fid2) b ON b.product_id = p.id
                 WHERE p.factory_id = :fid AND p.status = 'active'
-            """), {"fid": factory_id, "fid2": factory_id})
+            """), {"fid": factory_id})
             mrow = dict(md.first()._mapping)
             row["products_no_routing"] = mrow.get("no_routing", 0)
             row["products_no_bom"] = mrow.get("no_bom", 0)
@@ -1257,7 +1263,7 @@ class FactoryCommander:
         try:
             if state.so_unplanned > 0:
                 gaps.append({
-                    "dimension": "plan_master_data",
+                    "dimension": "plan_master_data:so_unplanned",
                     "issue": f"{state.so_unplanned}张销售订单未纳入 MPS 计划",
                     "fallback": "订单未建计划，视为待计划需求，不进入排产",
                     "alert": f"📋 计划缺口：{state.so_unplanned}张销售订单未纳入 MPS 计划",
@@ -1267,7 +1273,7 @@ class FactoryCommander:
                 })
             if state.products_no_routing > 0:
                 gaps.append({
-                    "dimension": "plan_master_data",
+                    "dimension": "plan_master_data:no_routing",
                     "issue": f"{state.products_no_routing}个产品缺工艺路线，APS 无法排程",
                     "fallback": "缺路由产品以产能速度倒推，不承诺精确交期",
                     "alert": f"🗺️ 工艺缺口：{state.products_no_routing}个产品缺工艺路线",
@@ -1277,7 +1283,7 @@ class FactoryCommander:
                 })
             if state.products_no_bom > 0:
                 gaps.append({
-                    "dimension": "plan_master_data",
+                    "dimension": "plan_master_data:no_bom",
                     "issue": f"{state.products_no_bom}个产品缺已生效 BOM，齐套率/ETA 无法计算",
                     "fallback": "缺 BOM 产品不做 MRP 齐套结论",
                     "alert": f"🧩 BOM 缺口：{state.products_no_bom}个产品缺已生效 BOM",
@@ -1296,9 +1302,27 @@ class FactoryCommander:
         而缺口责任人是角色（planner/process_engineer 等）而非具体账号，
         写角色字符串会导致通知无人可见。改广播后所有用户都能在通知中心看到，
         内容中保留责任角色（responsible）与处理建议（action）。
+
+        去重：同一工厂同一缺口维度 24 小时内已有未读通知则不重复发送，
+        避免盯办循环每轮巡检都轰炸通知中心。
         """
         try:
             import uuid as _uuid
+            # 去重检查：24 小时内是否已有同工厂同维度未读缺口通知
+            dup = await self.db.execute(text("""
+                SELECT 1 FROM notifications
+                WHERE factory_id = :fid AND category = 'data_governance'
+                  AND recipient IS NULL AND is_read = FALSE
+                  AND title = :title
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                LIMIT 1
+            """), {
+                "fid": factory_id,
+                "title": f"[指挥官] 数据缺口：{gap['dimension']}",
+            })
+            if dup.first() is not None:
+                return
+
             responsible_list = ", ".join(gap.get("responsible", []))
             reason = gap.get("issue", "")
             action = gap.get("action", "")
@@ -1352,6 +1376,16 @@ async def commander_watch_loop() -> None:
             enabled = [(uid, cfg) for uid, cfg in FactoryCommander._user_commanders.items()
                        if cfg.get("enabled")]
             if not enabled:
+                # 无用户开启指挥官时，仍对默认工厂做数据治理巡检（只发缺口通知，
+                # 不执行决策/不挂任务），确保计划主数据缺口提醒自动生效。
+                try:
+                    async with db_config.session_factory() as db:
+                        commander = FactoryCommander(db)
+                        state = await commander._sense("FAC_MECH_001")
+                        gaps = await commander._check_data_governance("FAC_MECH_001", state)
+                        _logger.info("[commander-watch] 默认工厂数据治理巡检 | 缺口=%d", len(gaps))
+                except Exception as exc:  # noqa: BLE001
+                    _logger.warning("[commander-watch] 默认工厂巡检异常：%s", exc)
                 continue
             for uid, cfg in enabled:
                 fid = cfg.get("factory_id") or "FAC_MECH_001"

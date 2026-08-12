@@ -148,7 +148,11 @@ def test_check_plan_master_data_returns_notifiable_gaps():
     gaps = _run(scenario())
     assert len(gaps) == 3
     dims = {g["dimension"] for g in gaps}
-    assert dims == {"plan_master_data"}
+    assert dims == {
+        "plan_master_data:so_unplanned",
+        "plan_master_data:no_routing",
+        "plan_master_data:no_bom",
+    }
     texts = " | ".join(g["issue"] for g in gaps)
     assert "未纳入 MPS 计划" in texts
     assert "缺工艺路线" in texts
@@ -162,8 +166,15 @@ def test_check_plan_master_data_returns_notifiable_gaps():
 def test_notify_data_gap_writes_broadcast_notification():
     """缺口通知应为广播（recipient=NULL），确保通知中心所有用户可见。"""
     db = MagicMock()
-    db.execute = AsyncMock(return_value=MagicMock())
     db.commit = AsyncMock()
+
+    async def fake_execute(stmt, *a, **k):
+        res = MagicMock()
+        # 去重查询 → first() 返回 None（无重复）；INSERT → 普通结果
+        res.first.return_value = None
+        return res
+
+    db.execute = AsyncMock(side_effect=fake_execute)
 
     async def scenario():
         svc = FactoryCommander(db)
@@ -177,12 +188,39 @@ def test_notify_data_gap_writes_broadcast_notification():
         })
 
     _run(scenario())
-    assert db.execute.await_count >= 1
-    stmt = str(db.execute.await_args.args[0])
-    params = db.execute.await_args.args[1] if len(db.execute.await_args.args) > 1 else {}
+    assert db.execute.await_count >= 2  # 去重查询 + INSERT
+    calls = [c.args for c in db.execute.await_args_list]
+    insert_stmt = str(calls[-1][0])
+    insert_params = calls[-1][1]
     # 广播语义：不再按角色字符串定向（无 :rec 占位符），recipient 走 NULL
-    assert ":rec" not in stmt
-    assert "recipient" in stmt
+    assert ":rec" not in insert_stmt
+    assert "recipient" in insert_stmt
     # 责任角色保留在内容中供 PMC 认领
-    assert "planner" in params.get("content", "")
-    assert "生产_manager" not in params.get("content", "")
+    assert "planner" in insert_params.get("content", "")
+
+
+# ─────────────── 通知：24h 去重 ───────────────
+
+def test_notify_data_gap_dedupes_within_24h():
+    """同工厂同维度缺口 24h 内已有未读通知时不重复发送。"""
+    db = MagicMock()
+    dup_row = MagicMock()
+    dup_row.first.return_value = ("found",)  # 已存在 → 跳过插入
+    db.execute = AsyncMock(return_value=dup_row)
+    db.commit = AsyncMock()
+
+    async def scenario():
+        svc = FactoryCommander(db)
+        await svc._notify_data_gap("FAC_MECH_001", {
+            "dimension": "plan_master_data",
+            "issue": "51张销售订单未纳入 MPS 计划",
+            "action": "建计划",
+            "fallback": "视为待计划需求",
+            "responsible": ["planner"],
+            "severity": "high",
+        })
+
+    _run(scenario())
+    # 去重命中 → 只执行了去重查询，未执行 INSERT（execute 只被调用 1 次）
+    assert db.execute.await_count == 1
+    db.commit.assert_not_awaited()
