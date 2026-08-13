@@ -488,7 +488,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                                 "source_column": {"type": "string", "description": "快速填充源列，例如 A"},
                                 "target_column": {"type": "string", "description": "快速填充目标列，例如 B"},
                                 "end_row": {"type": "integer"},
-                                "overwrite": {"type": "boolean", "default": false},
+                                "overwrite": {"type": "boolean", "default": False},
                             },
                             "required": ["type", "sheet"],
                         },
