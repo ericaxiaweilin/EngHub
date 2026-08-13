@@ -630,6 +630,82 @@ class ApsService:
             result.success = False
             result.message = f"有 {len(unrouted_orders)} 个工单缺少可用工艺路线"
 
+        # 生成可解释结果：把“算法跑完”拆成输入、排入、未排和约束原因，供前端审阅。
+        work_order_map = {str(wo.id): wo for wo in work_orders}
+        scheduled_order_ids = {str(task.order_id) for task in result.schedule}
+        violation_by_order: Dict[str, List[str]] = {}
+        for violation in result.constraint_violations:
+            order_id = str(violation.get("order_id") or "")
+            reason = str(violation.get("reason") or "未满足排程约束")
+            violation_by_order.setdefault(order_id, []).append(reason)
+
+        unscheduled_details = []
+        for order_id in result.unscheduled_orders:
+            key = str(order_id)
+            wo = work_order_map.get(key)
+            due_date = getattr(wo, "planned_due", None) if wo else None
+            unscheduled_details.append({
+                "order_id": key,
+                "work_order_code": getattr(wo, "work_order_code", None) if wo else None,
+                "product_id": getattr(wo, "product_id", None) if wo else None,
+                "priority": getattr(wo, "priority", None) if wo else None,
+                "due_date": due_date.isoformat() if due_date else None,
+                "reasons": violation_by_order.get(key, ["未生成排程任务"]),
+            })
+
+        violation_details = []
+        for violation in result.constraint_violations:
+            key = str(violation.get("order_id") or "")
+            wo = work_order_map.get(key)
+            violation_details.append({
+                "order_id": key,
+                "work_order_code": getattr(wo, "work_order_code", None) if wo else None,
+                "reason": str(violation.get("reason") or "未满足排程约束"),
+            })
+
+        station_load_map: Dict[str, Dict[str, Any]] = {}
+        for task in result.schedule:
+            station_id = str(task.station_id)
+            load = station_load_map.setdefault(station_id, {
+                "station_id": station_id,
+                "task_count": 0,
+                "order_ids": set(),
+                "load_minutes": 0.0,
+                "first_start": task.start_time,
+                "last_end": task.end_time,
+            })
+            load["task_count"] += 1
+            load["order_ids"].add(str(task.order_id))
+            load["load_minutes"] += max(0.0, (task.end_time - task.start_time).total_seconds() / 60)
+            load["first_start"] = min(load["first_start"], task.start_time)
+            load["last_end"] = max(load["last_end"], task.end_time)
+
+        station_loads = []
+        for load in station_load_map.values():
+            load["order_count"] = len(load.pop("order_ids"))
+            load["load_minutes"] = round(load["load_minutes"], 1)
+            load["load_hours"] = round(load["load_minutes"] / 60, 2)
+            load["first_start"] = load["first_start"].isoformat()
+            load["last_end"] = load["last_end"].isoformat()
+            station_loads.append(load)
+        station_loads.sort(key=lambda item: item["load_minutes"], reverse=True)
+
+        rule_explanations = {
+            "delivery": "先按工单优先级，再按交期排序；同时遵守工艺路线、资源日历、设备可用性和工位不重叠约束。",
+            "efficiency": "先按预计加工工时从短到长，再按优先级和交期排序；同时遵守工艺路线、资源日历、设备可用性和工位不重叠约束。",
+            "critical_ratio": "先按关键比率（剩余交期时间 ÷ 预计加工工时）从低到高，再按优先级和交期排序。",
+            "priority": "先按工单优先级，再按交期和预计加工工时排序。",
+            "cost": "当前以优先级和交期为主排序，换型时间计入任务负荷；成本优化将在后续版本继续细化。",
+        }
+        input_summary = {
+            "total_orders": len(work_orders),
+            "routable_orders": len(work_orders) - len(unrouted_orders),
+            "skipped_orders": len(unrouted_orders),
+            "scheduled_orders": len(scheduled_order_ids),
+            "unscheduled_orders": len(result.unscheduled_orders),
+            "scheduled_tasks": len(result.schedule),
+        }
+
         # 6. 持久化排程方案
 
         schedule_id = str(uuid.uuid4())
@@ -799,6 +875,29 @@ class ApsService:
             "total_tasks": len(result.schedule),
 
             "unscheduled_orders": result.unscheduled_orders,
+
+            "unscheduled_count": len(result.unscheduled_orders),
+
+            "constraint_violation_count": len(result.constraint_violations),
+
+            "horizon_days": horizon_days,
+
+            "horizon": f"{horizon_days}天",
+
+            "horizon_start": horizon_start.isoformat(),
+
+            "horizon_end": horizon_end.isoformat(),
+
+            "input_summary": input_summary,
+
+            "diagnostics": {
+                "unscheduled": unscheduled_details,
+                "constraint_violations": violation_details,
+            },
+
+            "station_loads": station_loads,
+
+            "rule_explanation": rule_explanations.get(optimize_for, rule_explanations["delivery"]),
 
             "metrics": result.performance_metrics,
 

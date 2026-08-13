@@ -388,10 +388,36 @@ class HybridScheduler:
         # 按优先级和交期排序订单
         # 优先级数值越大越紧急，交期越早越优先。原实现 forward/hybrid
         # 按升序排列，导致 LOW 订单先占用资源，破坏 APS 的优先级语义。
+        def estimated_work_seconds(order: OrderConstraint) -> float:
+            operations = self.processes.get(order.product_code, {})
+            return sum(
+                max(0.0, op.standard_time) * max(1, order.quantity) + max(0.0, op.setup_time)
+                for op in operations.values()
+            )
+
+        def critical_ratio(order: OrderConstraint) -> float:
+            remaining = max(0.0, (order.due_date - order.release_date).total_seconds())
+            return remaining / max(estimated_work_seconds(order), 1.0)
+
         if mode == SchedulingMode.BACKWARD:
             sorted_orders = sorted(
                 self.orders.values(),
                 key=lambda x: (-x.priority.value, -x.due_date.timestamp()),
+            )
+        elif optimize_for == "efficiency":
+            sorted_orders = sorted(
+                self.orders.values(),
+                key=lambda x: (estimated_work_seconds(x), -x.priority.value, x.due_date),
+            )
+        elif optimize_for == "critical_ratio":
+            sorted_orders = sorted(
+                self.orders.values(),
+                key=lambda x: (critical_ratio(x), -x.priority.value, x.due_date),
+            )
+        elif optimize_for == "priority":
+            sorted_orders = sorted(
+                self.orders.values(),
+                key=lambda x: (-x.priority.value, x.due_date, estimated_work_seconds(x)),
             )
         else:
             sorted_orders = sorted(

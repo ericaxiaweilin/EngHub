@@ -1052,8 +1052,14 @@ async def schedule_with_algorithm(
     algo_map = {
         "EDD": "delivery",
         "SPT": "efficiency",
-        "CR": "delivery",
-        "PRIORITY": "delivery",
+        "CR": "critical_ratio",
+        "PRIORITY": "priority",
+    }
+    algorithm_names = {
+        "EDD": "EDD 最早交期优先",
+        "SPT": "SPT 最短加工优先",
+        "CR": "CR 关键比率优先",
+        "PRIORITY": "优先级优先",
     }
     optimize_for = algo_map.get(req.algorithm, "delivery")
     result = await svc.generate_schedule(
@@ -1067,7 +1073,9 @@ async def schedule_with_algorithm(
         raise HTTPException(status_code=400, detail=result.get("message", "排程失败"))
     # 添加算法信息
     result["algorithm"] = req.algorithm
-    result["conflict_count"] = result.get("unscheduled_count", 0)
+    result["algorithm_name"] = algorithm_names.get(req.algorithm, req.algorithm)
+    result["optimize_for"] = optimize_for
+    result["conflict_count"] = result.get("constraint_violation_count", 0)
     return result
 
 

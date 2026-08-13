@@ -45,6 +45,19 @@ echo " EngHub Deploy Verification"
 echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo "═══════════════════════════════════════════════════"
 
+# ─── 0. 代码版本指纹 ───
+echo ""
+echo "▶ [0/6] 代码版本指纹"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEPLOYED_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+DEPLOYED_TREE=$(git -C "$REPO_ROOT" rev-parse HEAD^{tree} 2>/dev/null || true)
+if [ -n "$DEPLOYED_COMMIT" ] && [ -n "$DEPLOYED_TREE" ]; then
+    pass "代码提交 $DEPLOYED_COMMIT"
+    pass "代码树 $DEPLOYED_TREE"
+else
+    warn "无法读取 Git 版本指纹（运行环境可能未包含 .git）"
+fi
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 1. 容器健康检查
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -157,6 +170,11 @@ REQUIRED_TABLES=(
     org_units rcc_organizations rcc_tasks rcc_approval_records
     deterministic_logic_chains global_adjustable_params
     chat_quick_commands
+    # Chat V2 stream persistence is required by /api/v1/chat/stream before
+    # the first SSE event is emitted. Keep these in the deployment gate so a
+    # missed 082 migration cannot surface as a generic frontend network error.
+    chat_sessions chat_messages chat_telemetry chat_eval_cases
+    agent_events agent_checkpoints
     followup_tasks followup_task_logs
     im_groups im_messages
     tms_tasks suppliers
@@ -369,6 +387,18 @@ if [ -n "$TOKEN" ]; then
         pass "模型底座真实生成探针"
     else
         fail "模型底座真实生成失败: ${MODEL_CHAT_PROBE:0:240}"
+    fi
+
+    CHAT_STREAM_PROBE=$(curl -sS -N --max-time 45 -X POST "http://localhost:${BACKEND_PORT}/api/v1/chat/stream" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "X-Factory-Id: ${FACTORY_ID}" \
+        -d '{"messages":[{"role":"user","content":"请只回复：流式链路正常"}],"enable_tools":false}' 2>/dev/null || true)
+    CHAT_STREAM_PROBE_OK=$(printf '%s' "$CHAT_STREAM_PROBE" | python3 -c "import json,sys; lines=sys.stdin.read().splitlines(); done=[json.loads(line[6:]) for i,line in enumerate(lines) if line.startswith('data: ') and i > 0 and lines[i-1] == 'event: done']; print('1' if done and not done[-1].get('degraded', True) else '0')" 2>/dev/null || echo "0")
+    if [ "$CHAT_STREAM_PROBE_OK" = "1" ]; then
+        pass "Chatbot 流式 SSE 探针"
+    else
+        fail "Chatbot 流式 SSE 失败: ${CHAT_STREAM_PROBE:0:240}"
     fi
 fi
 

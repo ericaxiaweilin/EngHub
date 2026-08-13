@@ -42,6 +42,7 @@ dist/
 # Frontend build artifacts
 frontend/node_modules/
 frontend/dist/
+frontend_dist/
 
 # Coverage
 .coverage
@@ -63,6 +64,7 @@ uploads/
 # Remote deployment artifacts (runtime state and backups stay outside source control)
 /backups/
 /enghub.runtime.env
+.last_deployed_commit
 /tmp/
 
 # Codex remote working directories (transient agent scratch space)
