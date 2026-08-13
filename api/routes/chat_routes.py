@@ -1240,7 +1240,7 @@ async def chat(
         "max_tokens": route["max_completion_tokens"],
     }
     # 图片内容由视觉任务模型理解；业务侧不再用 OCR 关键词选择具体模型。
-    if not image_records and request.enable_tools:
+    if not image_records and request.enable_tools and tool_definitions:
         payload["tools"] = tool_definitions
         payload["tool_choice"] = "auto"
 
@@ -2336,7 +2336,7 @@ async def chat_stream(
             "max_tokens": route["max_completion_tokens"],
         }
         # 图片内容由视觉任务模型做语义理解，不在业务侧做关键词分流。
-        if not image_records and request.enable_tools:
+        if not image_records and request.enable_tools and tool_definitions:
             payload["tools"] = tool_definitions
             payload["tool_choice"] = "auto"
 
