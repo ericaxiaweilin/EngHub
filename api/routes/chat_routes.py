@@ -140,6 +140,24 @@ def _workbook_context_prompt(workbook_id: Optional[str]) -> str:
     )
 
 
+_ONLINE_WORKBOOK_TOOL_NAMES = frozenset({
+    "query_online_workbook",
+    "edit_online_workbook",
+    "export_online_workbook",
+    "create_online_pivot",
+})
+
+
+def _chat_tool_definitions(*, has_spreadsheet_attachment: bool) -> List[Dict[str, Any]]:
+    """选择本轮模型工具；上传表格时隔离旧的在线工作簿上下文。"""
+    if not has_spreadsheet_attachment:
+        return TOOL_DEFINITIONS
+    return [
+        definition for definition in TOOL_DEFINITIONS
+        if definition.get("function", {}).get("name") not in _ONLINE_WORKBOOK_TOOL_NAMES
+    ]
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -1169,8 +1187,14 @@ async def chat(
             model=task_id, degraded=True, actions=actions,
         )
 
+    # 有本轮表格附件时，模型只基于附件回答；不能把浏览器里残留的在线工作簿
+    # ID 注入进来，否则会把“上传文件”和“在线工作簿”混成两条数据链路。
+    workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
+    tool_definitions = _chat_tool_definitions(
+        has_spreadsheet_attachment=bool(spreadsheet_tables),
+    )
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + _workbook_context_prompt(request.workbook_id)}]
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + workbook_context}]
     # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
     if request.agent_key:
         agent_prompt = build_agent_system_prompt(request.agent_key)
@@ -1201,7 +1225,7 @@ async def chat(
     }
     # 图片内容由视觉任务模型理解；业务侧不再用 OCR 关键词选择具体模型。
     if not image_records and request.enable_tools:
-        payload["tools"] = TOOL_DEFINITIONS
+        payload["tools"] = tool_definitions
         payload["tool_choice"] = "auto"
 
     model_request_timeout = (
@@ -1527,6 +1551,10 @@ async def chat_v2(
             MODEL_COLD_START_RETRY_TIMEOUT if spreadsheet_tables else 60.0
         ),
     )
+    workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
+    tool_definitions = _chat_tool_definitions(
+        has_spreadsheet_attachment=bool(spreadsheet_tables),
+    )
 
     async def persist_after(ctx, response):
         """Phase 3：请求结束后落库（消息 + 遥测）。"""
@@ -1559,8 +1587,8 @@ async def chat_v2(
         make_tool_action=make_tool_action,
         write_tools=frozenset(WRITE_TOOLS),
         sim_tools=frozenset(SIM_TOOLS),
-        tool_definitions=TOOL_DEFINITIONS,
-        system_prompt=SYSTEM_PROMPT + _workbook_context_prompt(request.workbook_id),
+        tool_definitions=tool_definitions,
+        system_prompt=SYSTEM_PROMPT + workbook_context,
         final_grounding_prompt=FINAL_GROUNDING_PROMPT,
         chat_task_id=MODEL_STACK_CHAT_TASK_ID,
         vision_task_id=MODEL_STACK_VISION_TASK_ID,
@@ -2251,8 +2279,12 @@ async def chat_stream(
                 if tbl:
                     yield _sse("table", tbl)
 
+        workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
+        tool_definitions = _chat_tool_definitions(
+            has_spreadsheet_attachment=bool(spreadsheet_tables),
+        )
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + _workbook_context_prompt(request.workbook_id)}]
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + workbook_context}]
         # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
         if request.agent_key:
             agent_prompt = build_agent_system_prompt(request.agent_key)
@@ -2280,7 +2312,7 @@ async def chat_stream(
         }
         # 图片内容由视觉任务模型做语义理解，不在业务侧做关键词分流。
         if not image_records and request.enable_tools:
-            payload["tools"] = TOOL_DEFINITIONS
+            payload["tools"] = tool_definitions
             payload["tool_choice"] = "auto"
 
         model_request_timeout = (

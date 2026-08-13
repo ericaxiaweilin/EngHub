@@ -998,7 +998,11 @@ export default function AIAssistantWidget() {
       const dispatchAgent = agentKeyOverride || (selectedAgent !== 'auto' ? selectedAgent : undefined)
       if (dispatchAgent) payload.agent_key = dispatchAgent
       if (sessionId) payload.session_id = sessionId
-      const activeWorkbookId = localStorage.getItem('enghub-active-workbook-id')
+      // 文件附件和在线工作簿是两条独立数据链路；本轮有附件时不要把浏览器
+      // 中残留的 workbook_id 一起发送，避免模型读取到另一工厂的旧工作簿。
+      const activeWorkbookId = atts.length === 0
+        ? localStorage.getItem('enghub-active-workbook-id')
+        : null
       if (activeWorkbookId) payload.workbook_id = activeWorkbookId
       const token = localStorage.getItem('token')
       const factoryId = localStorage.getItem('active_factory_id')
