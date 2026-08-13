@@ -15,6 +15,7 @@ import {
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
   PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
   CarryOutOutlined, InfoCircleOutlined,
+  SaveOutlined, FileExcelOutlined,
 } from '@ant-design/icons'
 
 // 任务中心（嵌入 chatbot 浮窗第三个 tab）
@@ -26,6 +27,7 @@ const WorkflowCanvasEditor = lazy(() => import('./WorkflowCanvasEditor'))
 import api from '../services/api'
 import { tmsApi } from '../services/tms'
 import { getStoredUser, logout } from '../services/auth'
+import type { SpreadsheetEditorHandle } from './SpreadsheetEditor'
 
 const { Text } = Typography
 const { TextArea } = Input
@@ -204,6 +206,7 @@ interface TableData {
   pmc_options?: Record<string, any>
   pmc_option_schema?: PmcOptionDefinition[]
   pmc_result?: any
+  workbook_id?: string
 }
 
 interface PmcOptionDefinition {
@@ -624,6 +627,17 @@ export default function AIAssistantWidget() {
   const [callSubmitting, setCallSubmitting] = useState(false)
   // 电子表格弹窗（chatbot 查询结果 → Univer 在线表格）
   const [sheetTable, setSheetTable] = useState<TableData | null>(null)
+  const sheetRef = useRef<SpreadsheetEditorHandle>(null)
+  const [sheetWorkbookId, setSheetWorkbookId] = useState<string | null>(null)
+  const [sheetWorkbookSaving, setSheetWorkbookSaving] = useState(false)
+  const openSheetTable = (table: TableData) => {
+    // The chatbot table is a bounded view.  Start a separate workbook for
+    // manual edits so saving it cannot accidentally replace other sheets in
+    // the source workbook; natural-language edits still target the bound
+    // workbook through the backend tools.
+    setSheetWorkbookId(null)
+    setSheetTable(table)
+  }
   // 工厂指挥官开关
   const [commanderOn, setCommanderOn] = useState(false)
   const [commanderLoading, setCommanderLoading] = useState(false)
@@ -981,6 +995,8 @@ export default function AIAssistantWidget() {
       const dispatchAgent = agentKeyOverride || (selectedAgent !== 'auto' ? selectedAgent : undefined)
       if (dispatchAgent) payload.agent_key = dispatchAgent
       if (sessionId) payload.session_id = sessionId
+      const activeWorkbookId = localStorage.getItem('enghub-active-workbook-id')
+      if (activeWorkbookId) payload.workbook_id = activeWorkbookId
       const token = localStorage.getItem('token')
       const factoryId = localStorage.getItem('active_factory_id')
       const resp = await fetch('/api/v1/chat/stream', {
@@ -1343,6 +1359,61 @@ export default function AIAssistantWidget() {
       URL.revokeObjectURL(url)
     } catch {
       message.error('下载失败（可能无权访问或文件不存在）')
+    }
+  }
+
+  const saveSheetWorkbook = async (): Promise<string | null> => {
+    const snapshot = sheetRef.current?.getWorkbookSnapshot()
+    if (!snapshot || !sheetTable) {
+      message.error('在线表格尚未加载完成')
+      return null
+    }
+    setSheetWorkbookSaving(true)
+    try {
+      const result: any = sheetWorkbookId
+        ? await api.put(`/api/v1/workbooks/${sheetWorkbookId}`, {
+          name: sheetTable.title || 'Chatbot 在线工作簿',
+          snapshot,
+        })
+        : await api.post('/api/v1/workbooks', {
+          name: sheetTable.title || 'Chatbot 在线工作簿',
+          snapshot,
+        })
+      const id = result?.id as string
+      if (!id) throw new Error('工作簿保存接口未返回 ID')
+      localStorage.setItem('enghub-active-workbook-id', id)
+      setSheetWorkbookId(id)
+      message.success('在线工作簿已保存，并已绑定到 Chatbot')
+      return id
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '在线工作簿保存失败')
+      return null
+    } finally {
+      setSheetWorkbookSaving(false)
+    }
+  }
+
+  const exportSheetWorkbook = async () => {
+    // Always persist the current editor state before downloading.  This is
+    // important when the user changed a formula/value after opening the table.
+    const id = await saveSheetWorkbook()
+    if (!id) return
+    try {
+      const token = localStorage.getItem('token')
+      const response = await fetch(`/api/v1/workbooks/${id}/export`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `${sheetTable?.title || 'chatbot-workbook'}.xlsx`
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      message.success('XLSX 已导出，公式已保留')
+    } catch {
+      message.error('XLSX 导出失败')
     }
   }
 
@@ -1856,7 +1927,7 @@ export default function AIAssistantWidget() {
                               <div style={{ marginTop: 8 }}>
                                 {m.tables.map((tbl, ti) => (
                                   tbl.type === 'pmc_work_matrix' ? (
-                                    <PmcWorkbench key={ti} table={tbl} onOpenSheet={setSheetTable} />
+                                    <PmcWorkbench key={ti} table={tbl} onOpenSheet={openSheetTable} />
                                   ) : <div key={ti} style={{
                                     background: '#fff', border: '1px solid #e6f4ff',
                                     borderRadius: 8, overflow: 'hidden', marginTop: ti > 0 ? 8 : 0,
@@ -1875,7 +1946,7 @@ export default function AIAssistantWidget() {
                                         type="link" size="small"
                                         icon={<TableOutlined />}
                                         style={{ fontSize: 11, padding: 0, height: 'auto' }}
-                                        onClick={() => setSheetTable(tbl)}
+                                        onClick={() => openSheetTable(tbl)}
                                       >
                                         在电子表格中打开
                                       </Button>
@@ -2693,7 +2764,11 @@ export default function AIAssistantWidget() {
         open={!!sheetTable}
         onCancel={() => setSheetTable(null)}
         footer={
-          <Button onClick={() => setSheetTable(null)}>关闭</Button>
+          <Space>
+            <Button icon={<SaveOutlined />} loading={sheetWorkbookSaving} onClick={() => { void saveSheetWorkbook() }}>保存并绑定 Chatbot</Button>
+            <Button icon={<FileExcelOutlined />} loading={sheetWorkbookSaving} onClick={() => { void exportSheetWorkbook() }}>导出 XLSX</Button>
+            <Button onClick={() => setSheetTable(null)}>关闭</Button>
+          </Space>
         }
         width="85vw"
         style={{ top: 32 }}
@@ -2702,6 +2777,8 @@ export default function AIAssistantWidget() {
         {sheetTable && (
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48 }}><Spin tip="加载电子表格组件..." /></div>}>
             <SpreadsheetEditor
+              ref={sheetRef}
+              key={sheetTable.title}
               headers={sheetTable.columns.map(c => c.label)}
               initialData={sheetTable.rows.map(r => sheetTable.columns.map(c => r[c.key] ?? ''))}
               height={Math.min(520, Math.max(280, sheetTable.rows.length * 28 + 80))}

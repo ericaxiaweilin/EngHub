@@ -282,6 +282,7 @@ export default function PmcWorkbench() {
             </div>
             <Space wrap>
               <Button ghost icon={<ApartmentOutlined />} onClick={() => navigate('/work-orders')}>工单中心</Button>
+              <Button ghost icon={<FileSearchOutlined />} onClick={() => navigate('/pmc/forms')}>PMC 表单中心</Button>
               <Button ghost icon={<ThunderboltOutlined />} onClick={() => document.getElementById('rush-approval-anchor')?.scrollIntoView({ behavior: 'smooth' })}>插单审批</Button>
               <Button ghost icon={<ReloadOutlined />} onClick={loadOrders} loading={ordersLoading}>刷新数据</Button>
               <Button type="primary" icon={<ExperimentOutlined />} onClick={() => navigate('/pmc/position-trainer')}>职位训练器</Button>

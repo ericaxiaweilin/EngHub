@@ -22,6 +22,8 @@ export interface SpreadsheetEditorHandle {
   getData: () => CellValue[][]
   /** 获取包含表头的完整数据 */
   getDataWithHeaders: () => CellValue[][]
+  /** 获取完整 Univer 工作簿快照（包含公式、多个 Sheet 与基础样式） */
+  getWorkbookSnapshot: () => Record<string, any> | null
   /** 获取 Univer 实例 API（高级操作） */
   getUniverAPI: () => FUniver | null
 }
@@ -37,11 +39,13 @@ interface SpreadsheetEditorProps {
   onChange?: (data: CellValue[][]) => void
   /** 工作表名称 */
   sheetName?: string
+  /** 已保存的 Univer 工作簿快照；传入后保留多 Sheet/公式/基础样式 */
+  initialWorkbook?: Record<string, any>
 }
 
 /** 二维数组 → Univer workbookData 的 cellData */
 function buildCellData(headers: string[], data: CellValue[][]) {
-  const cellData: Record<number, Record<number, { v: string | number }>> = {}
+  const cellData: Record<number, Record<number, { v: string | number; f?: string }>> = {}
   // 表头行
   headers.forEach((h, col) => {
     if (!cellData[0]) cellData[0] = {}
@@ -53,7 +57,11 @@ function buildCellData(headers: string[], data: CellValue[][]) {
       if (val === null || val === undefined || val === '') return
       const ri = r + 1
       if (!cellData[ri]) cellData[ri] = {}
-      cellData[ri][col] = { v: typeof val === 'number' ? val : String(val) }
+      if (typeof val === 'string' && val.startsWith('=')) {
+        cellData[ri][col] = { v: '', f: val }
+      } else {
+        cellData[ri][col] = { v: typeof val === 'number' ? val : String(val) }
+      }
     })
   })
   return cellData
@@ -78,7 +86,7 @@ function readSheetValues(univerAPI: FUniver, maxRows: number, maxCols: number): 
 }
 
 const SpreadsheetEditor = forwardRef<SpreadsheetEditorHandle, SpreadsheetEditorProps>(
-  ({ headers = [], initialData = [], height = 420, onChange, sheetName = 'Sheet1' }, ref) => {
+  ({ headers = [], initialData = [], height = 420, onChange, sheetName = 'Sheet1', initialWorkbook }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null)
     const univerRef = useRef<FUniver | null>(null)
     const onChangeRef = useRef(onChange)
@@ -94,6 +102,13 @@ const SpreadsheetEditor = forwardRef<SpreadsheetEditorHandle, SpreadsheetEditorP
       },
       getDataWithHeaders: () => {
         return univerRef.current ? readSheetValues(univerRef.current, 500, colCountRef.current) : []
+      },
+      getWorkbookSnapshot: () => {
+        try {
+          return univerRef.current?.getActiveWorkbook()?.save() as Record<string, any> || null
+        } catch {
+          return null
+        }
       },
       getUniverAPI: () => univerRef.current,
     }))
@@ -113,7 +128,7 @@ const SpreadsheetEditor = forwardRef<SpreadsheetEditorHandle, SpreadsheetEditorP
         ],
       })
 
-      univerAPI.createWorkbook({
+      const workbookData = initialWorkbook || {
         id: 'mes-sheet',
         name: sheetName,
         sheetOrder: ['sheet-01'],
@@ -126,7 +141,16 @@ const SpreadsheetEditor = forwardRef<SpreadsheetEditorHandle, SpreadsheetEditorP
             columnCount: Math.max(headers.length, initialData[0]?.length || 0, 10) + 5,
           },
         },
-      })
+      }
+      headerCountRef.current = initialWorkbook ? 0 : (headers.length ? 1 : 0)
+      const activeSheet = initialWorkbook ? Object.values(initialWorkbook.sheets || {})[0] as any : null
+      colCountRef.current = Math.max(
+        headers.length,
+        initialData[0]?.length || 0,
+        Number(activeSheet?.columnCount || 0),
+        1,
+      )
+      univerAPI.createWorkbook(workbookData as any)
 
       univerRef.current = univerAPI
 

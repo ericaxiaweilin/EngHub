@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS quality_red_tag (
     created_by VARCHAR(36),
     
     CONSTRAINT fk_red_tag_defect FOREIGN KEY (defect_id) REFERENCES defect_records(id) ON DELETE CASCADE,
-    CONSTRAINT fk_red_tag_inspection FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE SET NULL,
     CONSTRAINT fk_red_tag_workorder FOREIGN KEY (work_order_id) REFERENCES work_orders(id) ON DELETE SET NULL,
     CONSTRAINT fk_red_tag_station FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
 );

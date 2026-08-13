@@ -1226,25 +1226,58 @@ class ApsService:
 
             load_map[t.station_id][date_key] = load_map[t.station_id].get(date_key, 0) + hours
 
-        # 标准产能：12小时/天（08:00-20:00）
-
+        # Load configured capacity first, then include active stations even
+        # when there are no APS tasks. Returning an empty resource list for a
+        # configured but idle factory made the PMC dashboard look incomplete.
         capacity_result = await self.db.execute(text("""
             SELECT station_id, available_hours_per_day
             FROM station_capacity
             WHERE factory_id = :factory_id AND is_active = TRUE
         """), {"factory_id": factory_id})
+        capacity_rows = [dict(row) for row in capacity_result.mappings().all()]
         capacity_map = {
             str(row["station_id"]): float(row["available_hours_per_day"] or 12.0)
-            for row in capacity_result.mappings().all()
+            for row in capacity_rows
         }
+        station_result = await self.db.execute(
+            select(Station).where(
+                Station.factory_id == factory_id,
+                Station.status == "active",
+            )
+        )
+        active_stations = list(station_result.scalars().all())
+        station_aliases: Dict[str, str] = {}
+        for station in active_stations:
+            canonical = str(station.station_code or station.id)
+            station_aliases[str(station.id)] = canonical
+            station_aliases[canonical] = canonical
+            if canonical not in capacity_map and station.capacity_per_hour:
+                capacity_map[canonical] = float(station.capacity_per_hour) * 8.0
+
+        normalized_load_map: Dict[str, Dict[str, float]] = {}
+        for resource_id, date_loads in load_map.items():
+            canonical = station_aliases.get(str(resource_id), str(resource_id))
+            target = normalized_load_map.setdefault(canonical, {})
+            for date_key, hours in date_loads.items():
+                target[date_key] = target.get(date_key, 0.0) + hours
+        load_map = normalized_load_map
+        resource_ids = set(load_map)
+        resource_ids.update(station_aliases.values())
+        resource_ids.update(str(row["station_id"]) for row in capacity_rows if row.get("station_id"))
+        horizon_dates = [
+            (now + timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(max(1, days))
+        ]
 
         resources = []
 
-        for station_id, date_loads in load_map.items():
+        for station_id in resource_ids:
+            date_loads = load_map.get(station_id, {})
 
             dates = []
 
-            for date_key, hours in sorted(date_loads.items()):
+            for date_key in horizon_dates:
+                hours = date_loads.get(date_key, 0.0)
 
                 daily_capacity = capacity_map.get(station_id, 12.0)
                 utilization = hours / daily_capacity * 100 if daily_capacity else 0
@@ -1278,7 +1311,7 @@ class ApsService:
 
             })
 
-        resources.sort(key=lambda x: x["avg_utilization"], reverse=True)
+        resources.sort(key=lambda x: (-x["avg_utilization"], x["station_id"]))
 
         return {
 

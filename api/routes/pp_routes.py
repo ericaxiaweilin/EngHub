@@ -9,7 +9,8 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta, time as dtime
 import math
 import uuid
-from sqlalchemy import select, func, and_, text
+from sqlalchemy import select, func, and_, or_, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
@@ -776,8 +777,15 @@ async def calculate_mrp(
     product = prod_res.scalar()
     product_name = product.product_name if product else p.product_id
     
-    # BOM展开：按产品取物料清单
-    bom_res = await db.execute(select(BomItem).where(BomItem.product_id == p.product_id))
+    # BOM展开：同时按工厂和生效版本过滤，避免同一产品在不同工厂/版本
+    # 的物料被串进本次 MRP。
+    bom_filters = [BomItem.product_id == p.product_id, BomItem.factory_id == p.factory_id]
+    selected_bom_version = request.bom_version or (product.current_bom_version if product else None)
+    if selected_bom_version:
+        bom_filters.append(BomItem.bom_version == selected_bom_version)
+    else:
+        bom_filters.append(or_(BomItem.bom_version.is_(None), BomItem.bom_version == "CURRENT"))
+    bom_res = await db.execute(select(BomItem).where(*bom_filters))
     bom_items = bom_res.scalars().all()
     
     if not bom_items:
@@ -789,8 +797,9 @@ async def calculate_mrp(
             ),
         )
     
-    # 库存可用量：按material_code汇总（跨仓库），按厂区过滤
-    mat_codes = [b.material_code for b in bom_items]
+    # 库存可用量：按 material_code 汇总（跨仓库），按厂区过滤。
+    mat_codes = [str(getattr(b, "material_code", "") or "") for b in bom_items]
+    mat_codes = [code for code in mat_codes if code]
     inv_res = await db.execute(
         select(Inventory.material_code, func.sum(Inventory.available_qty))
         .where(Inventory.material_code.in_(mat_codes))
@@ -798,34 +807,92 @@ async def calculate_mrp(
         .group_by(Inventory.material_code)
     )
     on_hand_map = {row[0]: int(row[1] or 0) for row in inv_res.all()}
+
+    # 只把在目标日期前已确认/已发运、尚未收货的 PO 计入在途，避免把
+    # draft PO 或目标日期之后的交期当成当前可用供应。
+    on_order_map: Dict[str, float] = {}
+    if mat_codes:
+        code_params = {f"material_{index}": code for index, code in enumerate(mat_codes)}
+        placeholders = ", ".join(f":material_{index}" for index in range(len(mat_codes)))
+        po_params = {**code_params, "factory_id": p.factory_id, "target_date": p.required_date or datetime.utcnow().date()}
+        try:
+            po_res = await db.execute(text(f"""
+                SELECT material_code, COALESCE(SUM(qty), 0) AS on_order_qty
+                FROM purchase_orders
+                WHERE factory_id = :factory_id
+                  AND material_code IN ({placeholders})
+                  AND status IN ('confirmed', 'shipped')
+                  AND expected_date IS NOT NULL
+                  AND expected_date <= :target_date
+                GROUP BY material_code
+            """), po_params)
+            on_order_map = {str(row[0]): float(row[1] or 0) for row in po_res.all()}
+        except SQLAlchemyError:
+            # Older deployments may not have procurement tables yet; MRP can
+            # still calculate, but it must show on-order as zero rather than
+            # fail the whole plan.
+            on_order_map = {}
+
+    moq_map: Dict[str, int] = {}
+    supplier_map: Dict[str, str] = {}
+    if mat_codes:
+        code_params = {f"material_{index}": code for index, code in enumerate(mat_codes)}
+        placeholders = ", ".join(f":material_{index}" for index in range(len(mat_codes)))
+        try:
+            supplier_res = await db.execute(text(f"""
+                SELECT sm.material_code,
+                       MIN(GREATEST(COALESCE(sm.min_order_qty, 1), 1)) AS moq,
+                       MIN(s.supplier_code) AS supplier_code
+                FROM supplier_materials sm
+                LEFT JOIN suppliers s ON s.id = sm.supplier_id
+                WHERE sm.is_active = TRUE
+                  AND sm.material_code IN ({placeholders})
+                GROUP BY sm.material_code
+            """), code_params)
+            for row in supplier_res.mappings().all():
+                code = str(row.get("material_code"))
+                moq_map[code] = max(1, int(row.get("moq") or 1))
+                if row.get("supplier_code"):
+                    supplier_map[code] = str(row.get("supplier_code"))
+        except SQLAlchemyError:
+            # Supplier master is optional in older installations. The
+            # explicit default MOQ is still returned in the result.
+            pass
     
     items = []
     shortage_count = 0
     total_shortage = 0
     
     for b in bom_items:
-        required = math.ceil(p.quantity * float(b.qty_per_unit))
-        on_hand = on_hand_map.get(b.material_code, 0)
-        net = max(0, required - on_hand)
+        material_code = str(getattr(b, "material_code", "") or "")
+        qty_per_unit = float(getattr(b, "qty_per_unit", 1) or 1)
+        required = math.ceil(p.quantity * qty_per_unit)
+        on_hand = on_hand_map.get(material_code, 0)
+        on_order = on_order_map.get(material_code, 0)
+        net = max(0, required - on_hand - on_order)
         
-        # 采购建议：净缺口向上取整到 MOQ=100 的整数倍
-        suggested = ((net + 99) // 100) * 100 if net > 0 else 0
+        # 采购建议：按供应商 MOQ 向上取整；没有供应商主数据时明确使用
+        # 兼容默认 MOQ=100，不能悄悄把默认值当成真实供应商承诺。
+        moq = moq_map.get(material_code, 100)
+        suggested = math.ceil(net / moq) * moq if net > 0 else 0
         
         if net > 0:
             shortage_count += 1
             total_shortage += net
         
         items.append({
-            "material_id": b.material_id,
-            "material_code": b.material_code,
-            "material_name": b.material_name,
-            "unit": b.unit,
-            "qty_per_unit": b.qty_per_unit,
+            "material_id": material_code,
+            "material_code": material_code,
+            "material_name": getattr(b, "material_name", None) or material_code,
+            "unit": getattr(b, "unit", None) or "pcs",
+            "qty_per_unit": qty_per_unit,
             "required_qty": required,
             "on_hand_qty": on_hand,
+            "on_order_qty": on_order,
             "net_qty": net,
             "suggested_order_qty": suggested,
-            "supplier": b.supplier_code if hasattr(b, "supplier_code") else "",
+            "moq": moq,
+            "supplier": supplier_map.get(material_code) or getattr(b, "vendor_code", "") or "",
         })
     
     mrp_result_id = str(uuid.uuid4())
@@ -855,7 +922,7 @@ async def calculate_mrp(
                  shortage_qty, unit)
             VALUES
                 (:id, :mrp_result_id, :material_id, :material_code, :material_name,
-                 :required_qty, :available_qty, 0, 0, :shortage_qty, :unit)
+                 :required_qty, :available_qty, 0, :on_order_qty, :shortage_qty, :unit)
         """), {
             "id": str(uuid.uuid4()),
             "mrp_result_id": mrp_result_id,
@@ -864,6 +931,7 @@ async def calculate_mrp(
             "material_name": item["material_name"],
             "required_qty": item["required_qty"],
             "available_qty": item["on_hand_qty"],
+            "on_order_qty": item["on_order_qty"],
             "shortage_qty": item["net_qty"],
             "unit": item["unit"],
         })

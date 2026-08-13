@@ -33,7 +33,7 @@ from database.db_config import get_db
 from database.models import FileRecord, User, ChatTelemetry, ChatEvalCase
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
 )
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
@@ -79,6 +79,7 @@ SYSTEM_PROMPT = (
     "用户只问职责、阶段责任或SOP文字时调用 query_process_knowledge；模型先识别用户所指的岗位、独立业务子流程或审批实例，只有明确要求将该对象画成流程图、查看完整工作流、正常路径、fallback、输入输出物或关联方时才调用 query_workflow_diagram。"
     "范围必须严格匹配：用户点名“替代料验证”等子流程时，scope=standalone_process，并使用该子流程注册键（替代料验证为 process:alternate_material_validation），不得展开 PMC 父流程；只有明确要求 PMC 端到端时才使用 pmc:end_to_end。"
     "不要仅因出现“流程图”三个字就触发工具；若对象不明确，先向用户追问。未知流程不得回退PMC或DCC。工具返回后只呈现一张完整连通图，不要拆成散点知识卡。\n"
+    "【PMC控制塔】当用户询问‘排过多少订单、控过多少物料、shortage怎么处理、库存怎么降、OTD怎么保证、产能怎么平衡、紧急插单怎么排、EC/BOM change怎么处理、supplier delay怎么处理’中的任一项或多项时，必须调用 query_pmc_control_tower。单项使用对应 scope，多个问题使用 scope=all。回答必须区分系统事实、统计口径、当前无记录/缺失来源和处理流程；没有历史记录时明确说无系统记录，不得补造订单、PO、供应商、ECN或OTD数字。\n"
     "【PMC工作矩阵】用户提到 PMC 矩阵、预排程沙盘、时间锤/物料锤/生产锤/出货锤/紧急锤、UHN、可加工时间或库存齐套时，"
     "有主工单号时必须调用 query_pmc_work_matrix；没有主工单号但只问物料齐套/供应证据时调用 query_pmc_material_supply。该工具只读取真实工单/BOM/库存/工位/APS，沙盘开关只改变本次计算，不修改工单；"
     "输出必须区分真实数据、假设、判断结论、风险和下一步交付物。UHN 未定义时不得猜测。\n"
@@ -105,6 +106,17 @@ FINAL_GROUNDING_PROMPT = (
 )
 
 
+def _workbook_context_prompt(workbook_id: Optional[str]) -> str:
+    if not workbook_id:
+        return ""
+    return (
+        "\n【当前在线工作簿】用户当前绑定的 Univer 在线工作簿 ID 是 "
+        f"{workbook_id}。用户询问或要求修改当前在线表格时，必须优先调用 "
+        "query_online_workbook 或 edit_online_workbook，并把该 workbook_id 传入；"
+        "不得只在文字中假装已经修改。修改类操作必须只执行用户明确指定的单元格、公式或行。\n"
+    )
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -123,6 +135,7 @@ class ChatRequest(BaseModel):
     attachments: List[Attachment] = Field(default_factory=list)  # 本轮用户消息附带的附件
     agent_key: Optional[str] = None  # 指定调度的智能体（空=自动，由模型自行选择工具）
     session_id: Optional[str] = None  # Chat V2 会话 ID（新建对话传空）
+    workbook_id: Optional[str] = None  # 当前绑定的 Univer 在线工作簿，供 chatbot 读写
 
 
 class ToolAction(BaseModel):
@@ -426,6 +439,8 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 风险/假设：{'；'.join(str(item) for item in risks) if risks else '暂无额外风险'}\n"
             f"- 交付物：{'；'.join(str(item) for item in result.get('deliverables') or [])}"
         )
+    if tool_name == "query_pmc_control_tower":
+        return _format_pmc_control_tower_reply(result)
     if tool_name in {"query_pmc_material_supply", "query_stagnant"}:
         items = result.get("items") or []
         if not items:
@@ -466,6 +481,118 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         lines.append(result.get("note", ""))
         return "\n".join(line for line in lines if line)
     return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
+
+
+def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
+    """统一 PMC 控制塔的无模型兜底答复；所有数字均直接来自工具结果。"""
+    if result.get("error"):
+        return f"PMC控制塔查询失败：{result['error']}"
+
+    def n(value: Any) -> str:
+        if value is None:
+            return "暂无"
+        try:
+            number = float(value)
+            return str(int(number)) if number.is_integer() else f"{number:.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    facts = result.get("facts") or {}
+    lines = [f"PMC控制塔（工厂 {result.get('factory_id', '未指定')}，范围 {result.get('scope', 'all')}）"]
+
+    orders = facts.get("orders")
+    if orders is not None:
+        lines.extend([
+            "\n1. 订单排程",
+            f"- 系统APS实际排程订单：{n(orders.get('scheduled_order_count'))} 张；APS方案：{n(orders.get('aps_schedule_count'))} 个；APS任务：{n(orders.get('aps_task_count'))} 条",
+            f"- MPS计划：{n(orders.get('mps_plan_count'))} 个、计划数量 {n(orders.get('mps_planned_qty'))}；工单：{n(orders.get('work_order_count'))} 张（主工单 {n(orders.get('master_work_order_count'))} 张）",
+            f"- 口径：只有APS任务去重工单数算“排过”；MPS/工单数不冒充APS排程历史。",
+        ])
+
+    materials = facts.get("materials")
+    if materials is not None:
+        lines.extend([
+            "\n2. 物料控制",
+            f"- 当前控制物料：{n(materials.get('controlled_material_count'))} 种；BOM {n(materials.get('bom_material_count'))} 种；工单物料 {n(materials.get('work_order_material_count'))} 种；库存SKU {n(materials.get('inventory_sku_count'))} 种",
+            f"- 有历史库存流水的物料：{n(materials.get('historical_transaction_material_count'))} 种，流水 {n(materials.get('inventory_transaction_count'))} 条",
+            "- 口径：这是系统当前主数据/工单控制范围，不等于线下历史累计控制过的物料数。",
+        ])
+
+    shortage = facts.get("shortage")
+    if shortage is not None:
+        lines.extend([
+            "\n3. Shortage",
+            f"- 受影响工单：{n(shortage.get('affected_work_order_count'))} 张；缺料物料：{n(shortage.get('shortage_material_count'))} 种；缺口合计：{n(shortage.get('total_shortage_qty'))}",
+        ])
+        for item in (shortage.get("items") or [])[:10]:
+            lines.append(f"- {item.get('material_code')}: 缺 {n(item.get('shortage_qty'))}，影响工单 {','.join(map(str, item.get('affected_work_orders') or [])) or '暂无'}")
+        lines.append("- 处理闭环：锁定缺口与受影响工单 → 核实库存/在途/PO ETA → 替代料验证或调整排程 → 齐套后放行。")
+
+    inventory = facts.get("inventory")
+    if inventory is not None:
+        lines.extend([
+            "\n4. 库存下降",
+            f"- SKU：{n(inventory.get('sku_count'))}；总量：{n(inventory.get('total_qty'))}；可用：{n(inventory.get('available_qty'))}；预留：{n(inventory.get('reserved_qty'))}；呆滞：{n(inventory.get('stagnant_count'))} 种（阈值 {n(inventory.get('stagnant_threshold_days'))} 天）",
+            "- 降库存动作：按已确认需求/BOM净需求停止无需求补货；优先复用共用BOM，再做调拨/退供应商/报废审批；用库存流水按周验证效果。",
+        ])
+        for item in [i for i in (inventory.get("items") or []) if i.get("dead_stock")][:8]:
+            lines.append(f"- 呆滞 {item.get('material_code')}: 可用 {n(item.get('available_qty'))}，库龄 {n(item.get('aging_days'))} 天")
+
+    otd = facts.get("otd")
+    if otd is not None:
+        pct = otd.get("otd_pct")
+        lines.extend([
+            "\n5. OTD",
+            f"- 口径：{otd.get('otd_scope')}；到期订单 {n(otd.get('due_order_count'))}；已完工 {n(otd.get('completed_order_count'))}；准时 {n(otd.get('on_time_order_count'))}；OTD：{f'{pct}%' if pct is not None else '暂无已完工样本'}；未完工逾期 {n(otd.get('open_overdue_count'))} 张",
+            "- 保证方法：MPS前同时核对ATP/物料齐套/产能/RDD；每日重算计划完工与实际完工；插单、缺料、ECN、供应延迟均触发影响评估和重排。",
+        ])
+
+    capacity = facts.get("capacity")
+    if capacity is not None:
+        lines.append("\n6. 产能平衡")
+        lines.append(f"- 当前负荷来源：{capacity.get('load_source')}；瓶颈按利用率排序：")
+        for item in (capacity.get("bottlenecks") or [])[:3]:
+            lines.append(f"- {item.get('station_code') or item.get('station_name')}: 利用率 {n(item.get('utilization_pct'))}%、负荷 {n(item.get('load_hours_used'))}/{n(item.get('available_hours'))} 小时，{item.get('status')}")
+        lines.append("- 平衡方法：先重排未开工工单和换型顺序，再评估加班/换线/外协/分批交付，重排后复核物料、交期和工序重叠。")
+
+    rush = facts.get("rush")
+    if rush is not None:
+        lines.extend([
+            "\n7. 紧急插单",
+            f"- 系统插单审批记录：{n(rush.get('approval_count'))} 单；已执行：{n(rush.get('executed_count'))} 单；状态：{rush.get('status_counts') or {}}",
+            "- 排法：核对BOM/库存/产能/交期 → 只读评估受影响订单和最大延迟 → 审批 → APS生成新版本并保留差异/日志 → 重算OTD风险。",
+        ])
+        simulation = rush.get("simulation") or {}
+        if simulation:
+            lines.append(f"- 本次急单沙盘：数量 {n(simulation.get('quantity'))}，预计加工 {n(simulation.get('estimated_process_hours'))} 小时，交期可行：{simulation.get('due_feasible')}")
+
+    engineering = facts.get("engineering_change")
+    if engineering is not None:
+        lines.extend([
+            "\n8. EC/BOM变更",
+            f"- ECN记录：{n(engineering.get('ecn_count'))}；ECN标记工单：{n(engineering.get('ecn_marked_work_order_count'))}；当前产品/BOM版本组合：{n(engineering.get('bom_product_version_count'))}",
+            "- 处理闭环：评审影响 → 批准并生效新BOM/工艺版本 → 重算MRP并核对旧料/替代料/在途PO → 传播到未完工工单 → APS重排并留审计。",
+        ])
+
+    supplier = facts.get("supplier_delay")
+    if supplier is not None:
+        lines.extend([
+            "\n9. Supplier delay",
+            f"- PO：{n(supplier.get('po_count'))}；未关闭：{n(supplier.get('open_po_count'))}；逾期：{n(supplier.get('overdue_count'))}；最大延迟：{n(supplier.get('max_delay_days'))} 天",
+            "- 处理闭环：按逾期天数和受影响工单升级跟催 → 更新PO新ETA → 重评Shortage/ATP/OTD → 必要时切换合格供应商、空运或调整排产并保留审批原因。",
+        ])
+
+    quality = [q for q in (result.get("data_quality") or []) if q.get("status") not in ("ready",)]
+    if quality:
+        lines.append("\n数据质量提示：")
+        for item in quality:
+            missing = ", ".join(map(str, item.get("missing_sources") or [])) or "无缺表，当前记录不足"
+            lines.append(f"- {item.get('key')}: {item.get('status')}；{missing}。{item.get('note') or ''}")
+
+    if result.get("actions"):
+        lines.append("\n当前建议动作：")
+        lines.extend(f"- {action}" for action in result["actions"][:8])
+    return "\n".join(lines)
 
 
 async def _verify_grounded_reply(
@@ -744,6 +871,27 @@ async def chat(
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
 
+    # 这组 PMC 管理问题必须有确定性事实答复；不让模型自行决定是否查数。
+    direct_intent = resolve_intent(last_user) if request.enable_tools and not image_records else None
+    if direct_intent and direct_intent.get("tool") == "query_pmc_control_tower":
+        arguments = direct_intent.get("args") or {}
+        result = await execute_tool(db, "query_pmc_control_tower", arguments, operator=operator, factory_id=factory_id)
+        action = ToolAction(
+            tool="query_pmc_control_tower",
+            label=TOOL_LABELS["query_pmc_control_tower"],
+            arguments=arguments,
+            result=result,
+            is_write=False,
+            is_sim=False,
+            success="error" not in result,
+        )
+        return ChatResponse(
+            reply=_direct_tool_reply("query_pmc_control_tower", result),
+            model="pmc-control-tower",
+            degraded="error" in result,
+            actions=[action],
+        )
+
     # ---- 多智能体并行编排：识别复合意图 → 多Agent并行执行 ----
     if request.enable_tools and not image_records and not request.agent_key:
         try:
@@ -810,7 +958,7 @@ async def chat(
         )
 
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + _workbook_context_prompt(request.workbook_id)}]
     # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
     if request.agent_key:
         agent_prompt = build_agent_system_prompt(request.agent_key)
@@ -1174,7 +1322,7 @@ async def chat_v2(
         write_tools=frozenset(WRITE_TOOLS),
         sim_tools=frozenset(SIM_TOOLS),
         tool_definitions=TOOL_DEFINITIONS,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT + _workbook_context_prompt(request.workbook_id),
         final_grounding_prompt=FINAL_GROUNDING_PROMPT,
         chat_task_id=MODEL_STACK_CHAT_TASK_ID,
         vision_task_id=MODEL_STACK_VISION_TASK_ID,
@@ -1336,6 +1484,12 @@ def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict
 
     返回 {title, columns: [{key, label}], rows: [{...}]} 或 None（不适用表格的工具）。
     """
+    if tool_name in {"query_online_workbook", "edit_online_workbook", "create_online_pivot"}:
+        table = result.get("table")
+        if isinstance(table, dict) and table.get("columns"):
+            return table
+        return None
+
     # 指标汇总型 → 转为 指标/数值 两列表格
     if tool_name == "get_production_summary":
         rows = [
@@ -1397,6 +1551,43 @@ def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict
         return {
             "title": "PMC插单影响明细",
             "columns": _TABLE_COLUMNS["query_pmc_rush_impact"],
+            "rows": rows,
+        }
+
+    if tool_name == "query_pmc_control_tower":
+        facts = result.get("facts") or {}
+        summary_fields = {
+            "orders": [("APS实际排程订单", "scheduled_order_count"), ("MPS计划", "mps_plan_count"), ("工单", "work_order_count")],
+            "materials": [("当前控制物料", "controlled_material_count"), ("库存SKU", "inventory_sku_count"), ("库存流水物料", "historical_transaction_material_count")],
+            "shortage": [("受影响工单", "affected_work_order_count"), ("缺料物料", "shortage_material_count"), ("缺口合计", "total_shortage_qty")],
+            "inventory": [("库存SKU", "sku_count"), ("可用库存", "available_qty"), ("呆滞物料", "stagnant_count")],
+            "otd": [("到期订单", "due_order_count"), ("已完工", "completed_order_count"), ("OTD(%)", "otd_pct")],
+            "capacity": [("负荷来源", "load_source")],
+            "rush": [("插单审批", "approval_count"), ("已执行插单", "executed_count")],
+            "engineering_change": [("ECN记录", "ecn_count"), ("ECN标记工单", "ecn_marked_work_order_count"), ("BOM版本组合", "bom_product_version_count")],
+            "supplier_delay": [("PO", "po_count"), ("逾期PO", "overdue_count"), ("最大延迟天数", "max_delay_days")],
+        }
+        rows = []
+        quality = {item.get("key"): item for item in result.get("data_quality") or []}
+        for domain, fields in summary_fields.items():
+            fact = facts.get(domain) or {}
+            for metric, key in fields:
+                rows.append({
+                    "domain": domain,
+                    "metric": metric,
+                    "value": fact.get(key),
+                    "data_status": (quality.get(domain) or {}).get("status", "unknown"),
+                })
+        if not rows:
+            return None
+        return {
+            "title": "PMC控制塔事实汇总",
+            "columns": [
+                {"key": "domain", "label": "事实域"},
+                {"key": "metric", "label": "指标"},
+                {"key": "value", "label": "数值"},
+                {"key": "data_status", "label": "数据状态"},
+            ],
             "rows": rows,
         }
 
@@ -1679,6 +1870,36 @@ async def chat_stream(
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
 
+        # Stream 是前端主链路；PMC九类问题在这里直接执行统一事实工具，保证不依赖模型是否正确选工具。
+        direct_intent = resolve_intent(last_user) if request.enable_tools and not image_records else None
+        if direct_intent and direct_intent.get("tool") == "query_pmc_control_tower":
+            arguments = direct_intent.get("args") or {}
+            result = await execute_tool(db, "query_pmc_control_tower", arguments, operator=operator, factory_id=factory_id)
+            action = ToolAction(
+                tool="query_pmc_control_tower",
+                label=TOOL_LABELS["query_pmc_control_tower"],
+                arguments=arguments,
+                result=result,
+                is_write=False,
+                is_sim=False,
+                success="error" not in result,
+            )
+            actions.append(action)
+            acc_reply = _direct_tool_reply("query_pmc_control_tower", result)
+            yield _sse("action", action.model_dump())
+            table_data = _extract_table_data("query_pmc_control_tower", result)
+            if table_data:
+                yield _sse("table", table_data)
+            yield _sse("delta", {"content": acc_reply})
+            yield _sse("done", {
+                "model": "pmc-control-tower",
+                "degraded": "error" in result,
+                "session_id": session_id,
+                "request_id": stream_request_id,
+            })
+            await persist_stream_round("pmc-control-tower")
+            return
+
         task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
         prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
         try:
@@ -1708,7 +1929,7 @@ async def chat_stream(
                     yield _sse("table", tbl)
 
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + _workbook_context_prompt(request.workbook_id)}]
         # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
         if request.agent_key:
             agent_prompt = build_agent_system_prompt(request.agent_key)

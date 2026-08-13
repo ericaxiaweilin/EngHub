@@ -383,6 +383,44 @@ class FileRecord(Base):
         }
 
 
+class WorkbookRecord(Base):
+    """Persisted online workbook backed by a Univer snapshot.
+
+    The snapshot keeps raw formulas in cell ``f`` and calculated/display values
+    in ``v`` so an imported or edited workbook can be exported back to XLSX.
+    """
+    __tablename__ = "online_workbooks"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    name = Column(String(255), nullable=False)
+    factory_id = Column(String(50), nullable=True, index=True)
+    snapshot = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=dict)
+    source_file_id = Column(String(36), nullable=True, index=True)
+    created_by = Column(String(50), nullable=True)
+    updated_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_online_workbooks_factory", "factory_id", "updated_at"),
+    )
+
+    def to_dict(self, include_snapshot: bool = False):
+        result = {
+            "id": self.id,
+            "name": self.name,
+            "factory_id": self.factory_id,
+            "source_file_id": self.source_file_id,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_snapshot:
+            result["snapshot"] = self.snapshot or {}
+        return result
+
+
 class Plan(Base):
     """生产计划表 (MPS)"""
     

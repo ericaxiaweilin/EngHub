@@ -24,7 +24,7 @@ from sqlalchemy import select, func, text
 
 from database.models import (
     WorkOrder, ProductionReport, Station, Equipment, Product,
-    Inventory, DefectRecord, User, Routing, FileRecord, QualityInspection,
+    Inventory, DefectRecord, User, Routing, FileRecord, QualityInspection, WorkbookRecord,
 )
 from core.mes.work_order_coding import (
     generate_master_work_order_code,
@@ -38,6 +38,7 @@ from core.sim_erp.models import (
     ActionType, EnvironmentSnapshot, PhysicalInput, WorkContext,
 )
 from core.sim_erp.plugins.registry import build_default_registry
+from api.services.workbook_service import apply_workbook_operations, build_pivot_summary, snapshot_to_table, workbook_snapshot_to_xlsx
 
 
 # ==================== Sim-ERP 仿真引擎（模块级单例，直连引擎不走 HTTP） ====================
@@ -446,6 +447,90 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_online_workbook",
+            "description": "读取当前绑定的在线工作簿内容，返回指定工作表的表头、行数据和公式单元格数量。用户询问当前在线表格内容、公式或数据时使用。只能读取当前用户工厂的工作簿。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workbook_id": {"type": "string", "description": "当前在线工作簿ID；系统会在当前会话上下文中提供"},
+                    "sheet_name": {"type": "string", "description": "工作表名称，可选；不传读取第一张工作表"},
+                },
+                "required": ["workbook_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_online_workbook",
+            "description": "按用户明确要求修改当前在线工作簿。支持 set_cell/set_formula/clear_cell/append_rows/flash_fill；修改后立即保存。也可输入 VLOOKUP、XLOOKUP、SUMIFS 等公式。涉及批量改动、公式改写或删除数据时，只执行用户明确指定的操作。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workbook_id": {"type": "string", "description": "当前在线工作簿ID；系统会在当前会话上下文中提供"},
+                    "sheet_name": {"type": "string", "description": "修改后返回的工作表名称，可选"},
+                    "operations": {
+                        "type": "array",
+                        "description": "明确的单元格操作列表。例：[{type:'set_formula',sheet:'MRP',cell:'F2',formula:'=D2-E2'}]",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["set_cell", "set_value", "set_formula", "clear_cell", "append_rows", "flash_fill"]},
+                                "sheet": {"type": "string"},
+                                "cell": {"type": "string"},
+                                "value": {},
+                                "formula": {"type": "string"},
+                                "rows": {"type": "array", "items": {"type": "array", "items": {}}},
+                                "start_row": {"type": "integer"},
+                                "source_column": {"type": "string", "description": "快速填充源列，例如 A"},
+                                "target_column": {"type": "string", "description": "快速填充目标列，例如 B"},
+                                "end_row": {"type": "integer"},
+                                "overwrite": {"type": "boolean", "default": false},
+                            },
+                            "required": ["type", "sheet"],
+                        },
+                    },
+                },
+                "required": ["workbook_id", "operations"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "export_online_workbook",
+            "description": "把当前绑定的在线工作簿导出为 XLSX 文件。导出保留多个 Sheet、单元格公式和基础样式，并返回下载文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workbook_id": {"type": "string", "description": "当前在线工作簿ID；系统会在当前会话上下文中提供"},
+                },
+                "required": ["workbook_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_online_pivot",
+            "description": "把当前在线工作簿的明细按指定行字段做基础透视汇总，生成或刷新一个透视汇总 Sheet。支持 sum/count/avg。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workbook_id": {"type": "string"},
+                    "sheet": {"type": "string", "description": "明细工作表名称，可选"},
+                    "row_field": {"type": "string", "description": "分组行字段，必须是表头名称"},
+                    "value_field": {"type": "string", "description": "汇总数值字段，必须是表头名称"},
+                    "aggregation": {"type": "string", "enum": ["sum", "count", "avg"], "default": "sum"},
+                    "output_sheet_name": {"type": "string", "default": "透视汇总"},
+                },
+                "required": ["workbook_id", "row_field", "value_field"],
+            },
+        },
+    },
     # ---- 预警情报审查工具（017） ----
     {
         "type": "function",
@@ -604,6 +689,30 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                         "description": "知识类型：work_order_flow=工单流程, position_sop=职位SOP, who_handles=责任归属",
                     },
                     "keyword": {"type": "string", "description": "过滤关键词（阶段名/职位名，如'下达''品检'）"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_pmc_control_tower",
+            "description": "PMC统一控制塔事实查询。一次查询可回答：排过多少订单、控过多少物料、Shortage如何处理、库存如何降低、OTD如何保证、产能如何平衡、紧急插单如何排、EC/BOM变更如何处理、supplier delay如何处理。返回当前工厂真实记录、统计口径、数据缺口和处理流程；只读不修改排程，不把建议说成已执行动作。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "orders", "materials", "shortage", "inventory", "otd", "capacity", "rush", "engineering_change", "supplier_delay"],
+                        "description": "问题范围；复合问题用 all",
+                        "default": "all",
+                    },
+                    "material_keyword": {"type": "string", "description": "物料编码或名称关键词，可选"},
+                    "work_order_code": {"type": "string", "description": "主工单号，可选"},
+                    "days": {"type": "integer", "description": "呆滞判定天数，默认180天", "default": 180},
+                    "rush_quantity": {"type": "integer", "description": "若询问具体急单，可提供插单数量，触发只读沙盘"},
+                    "rush_due_date": {"type": "string", "description": "急单交期，YYYY-MM-DD，可选"},
+                    "limit": {"type": "integer", "description": "明细条数上限，默认20", "default": 20},
                 },
             },
         },
@@ -1704,6 +1813,120 @@ async def _tool_export_report_file(db: AsyncSession, args: Dict[str, Any], opera
     }
 
 
+async def _tool_query_online_workbook(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    workbook_id = str(args.get("workbook_id") or "").strip()
+    if not workbook_id:
+        return {"error": "未提供 workbook_id；请先在在线表格中保存并绑定工作簿"}
+    record = (await db.execute(select(WorkbookRecord).where(WorkbookRecord.id == workbook_id))).scalar_one_or_none()
+    if not record:
+        return {"error": f"工作簿不存在: {workbook_id}"}
+    if factory_id and record.factory_id and record.factory_id != factory_id:
+        return {"error": "无权访问其他工厂的工作簿"}
+    table = snapshot_to_table(record.snapshot or {}, args.get("sheet_name"))
+    table["workbook_id"] = record.id
+    table["workbook_name"] = record.name
+    return {"success": True, "workbook_id": record.id, "workbook_name": record.name, "table": table}
+
+
+async def _tool_edit_online_workbook(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    workbook_id = str(args.get("workbook_id") or "").strip()
+    if not workbook_id:
+        return {"error": "未提供 workbook_id；请先在在线表格中保存并绑定工作簿"}
+    record = (await db.execute(select(WorkbookRecord).where(WorkbookRecord.id == workbook_id))).scalar_one_or_none()
+    if not record:
+        return {"error": f"工作簿不存在: {workbook_id}"}
+    if factory_id and record.factory_id and record.factory_id != factory_id:
+        return {"error": "无权修改其他工厂的工作簿"}
+    try:
+        snapshot, changed = apply_workbook_operations(record.snapshot or {}, args.get("operations") or [])
+    except ValueError as exc:
+        return {"error": str(exc)}
+    record.snapshot = snapshot
+    record.updated_by = operator
+    await db.commit()
+    table = snapshot_to_table(snapshot, args.get("sheet_name"))
+    table["workbook_id"] = record.id
+    table["workbook_name"] = record.name
+    return {"success": True, "workbook_id": record.id, "workbook_name": record.name, "changed": changed, "table": table}
+
+
+async def _tool_export_online_workbook(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    from api.routes.file_routes import UPLOAD_DIR
+
+    workbook_id = str(args.get("workbook_id") or "").strip()
+    record = (await db.execute(select(WorkbookRecord).where(WorkbookRecord.id == workbook_id))).scalar_one_or_none()
+    if not record:
+        return {"error": f"工作簿不存在: {workbook_id}"}
+    if factory_id and record.factory_id and record.factory_id != factory_id:
+        return {"error": "无权导出其他工厂的工作簿"}
+    file_id = str(uuid.uuid4())
+    safe_name = re.sub(r'[\\/:*?"<>|]+', "_", record.name or "workbook").strip() or "workbook"
+    filename = f"{safe_name}.xlsx"
+    storage_path = UPLOAD_DIR / f"{file_id}_{filename}"
+    try:
+        workbook_snapshot_to_xlsx(record.snapshot or {}, storage_path)
+    except Exception as exc:  # noqa: BLE001
+        storage_path.unlink(missing_ok=True)
+        return {"error": f"XLSX 导出失败: {exc}"}
+    file_record = FileRecord(
+        id=file_id,
+        filename=filename,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        size=storage_path.stat().st_size,
+        storage_path=str(storage_path),
+        uploaded_by=operator,
+        factory_id=factory_id or record.factory_id,
+        related_type="workbook_export",
+        related_id=record.id,
+    )
+    db.add(file_record)
+    await db.commit()
+    return {
+        "success": True,
+        "workbook_id": record.id,
+        "filename": filename,
+        "file_id": file_id,
+        "download_url": f"/api/v1/files/{file_id}",
+        "format": "xlsx",
+        "formulas_preserved": True,
+    }
+
+
+async def _tool_create_online_pivot(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    workbook_id = str(args.get("workbook_id") or "").strip()
+    record = (await db.execute(select(WorkbookRecord).where(WorkbookRecord.id == workbook_id))).scalar_one_or_none()
+    if not record:
+        return {"error": f"工作簿不存在: {workbook_id}"}
+    if factory_id and record.factory_id and record.factory_id != factory_id:
+        return {"error": "无权修改其他工厂的工作簿"}
+    try:
+        snapshot, summary = build_pivot_summary(
+            record.snapshot or {},
+            args.get("sheet"),
+            str(args.get("row_field") or ""),
+            str(args.get("value_field") or ""),
+            str(args.get("aggregation") or "sum"),
+            str(args.get("output_sheet_name") or "透视汇总"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    record.snapshot = snapshot
+    record.updated_by = operator
+    await db.commit()
+    table = snapshot_to_table(snapshot, summary["output_sheet"])
+    table["workbook_id"] = record.id
+    table["workbook_name"] = record.name
+    return {"success": True, "workbook_id": record.id, "summary": summary, "table": table}
+
+
 # ==================== 预警情报审查工具执行器（017） ====================
 
 async def _tool_get_pending_alerts(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2289,6 +2512,10 @@ _TOOL_EXECUTORS = {
     "get_work_order_form": _tool_get_work_order_form,
     "get_inspection_form": _tool_get_inspection_form,
     "export_report_file": _tool_export_report_file,
+    "query_online_workbook": _tool_query_online_workbook,
+    "edit_online_workbook": _tool_edit_online_workbook,
+    "export_online_workbook": _tool_export_online_workbook,
+    "create_online_pivot": _tool_create_online_pivot,
     "get_pending_alerts": _tool_get_pending_alerts,
     "query_ocap_tasks": _tool_query_ocap_tasks,  # OCAP待办任务查询（chatbot集成）
     "query_alert_reviews": _tool_query_alert_reviews,
@@ -2429,6 +2656,29 @@ async def _tool_query_pmc_work_matrix(db: AsyncSession, args: Dict[str, Any], fa
 _TOOL_EXECUTORS["query_pmc_work_matrix"] = _tool_query_pmc_work_matrix
 
 
+async def _tool_query_pmc_control_tower(
+    db: AsyncSession,
+    args: Dict[str, Any],
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """统一 PMC 控制塔事实查询；跨模块只读，缺表/无记录都显式返回。"""
+    from api.services.pmc_control_tower_service import PmcControlTowerService
+
+    return await PmcControlTowerService(db).collect(
+        factory_id or "FAC_MECH_001",
+        scope=str(args.get("scope") or "all"),
+        material_keyword=args.get("material_keyword"),
+        work_order_code=args.get("work_order_code"),
+        days=int(args.get("days") or 180),
+        rush_quantity=int(args["rush_quantity"]) if args.get("rush_quantity") is not None else None,
+        rush_due_date=args.get("rush_due_date"),
+        limit=int(args.get("limit") or 20),
+    )
+
+
+_TOOL_EXECUTORS["query_pmc_control_tower"] = _tool_query_pmc_control_tower
+
+
 async def _tool_query_collaboration(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     """岗位协同规则查询（事件规则/岗位边界/权限检查）。"""
     from api.services.collaboration_service import CollaborationService
@@ -2493,6 +2743,9 @@ WRITE_TOOLS = {
     "run_compliance_simulation",
     "run_workflow",
     "export_report_file",
+    "edit_online_workbook",
+    "export_online_workbook",
+    "create_online_pivot",
     "acknowledge_alert", "run_alert_patrol",
     "create_followup_task",
 }
@@ -2513,6 +2766,7 @@ TOOL_LABELS = {
     "query_inventory": "查询库存",
     "query_pmc_material_supply": "PMC物料供应证据",
     "query_pmc_rush_impact": "PMC插单影响",
+    "query_pmc_control_tower": "PMC控制塔",
     "query_defects": "查询不良品",
     "query_equipment": "查询设备",
     "create_work_order": "创建工单",
@@ -2530,6 +2784,10 @@ TOOL_LABELS = {
     "get_work_order_form": "工单表单",
     "get_inspection_form": "检验单表单",
     "export_report_file": "导出报告",
+    "query_online_workbook": "读取在线工作簿",
+    "edit_online_workbook": "修改在线工作簿",
+    "export_online_workbook": "导出在线工作簿",
+    "create_online_pivot": "生成在线透视汇总",
     "get_pending_alerts": "预警汇总",
     "query_alert_reviews": "预警审查记录",
     "acknowledge_alert": "确认预警",
@@ -2597,6 +2855,20 @@ INTENT_RULES: List[Dict[str, Any]] = [
         ],
     },
     {
+        # PMC九类管理问题统一走控制塔，避免被普通“库存/订单/流程”关键词截断。
+        "tool": "query_pmc_control_tower",
+        "keywords": [
+            "PMC能不能回答", "PMC控制塔", "排过多少订单", "排了多少订单", "排产过多少订单",
+            "控过多少物料", "控制过多少物料", "控制了多少物料", "Shortage怎么处理", "shortage怎么处理", "shortage 怎么处理",
+            "缺料怎么处理", "缺料如何处理", "物料短缺怎么处理", "物料缺口怎么处理",
+            "库存怎么降", "如何降库存", "怎么降库存", "OTD怎么保证", "OTD 怎么保证", "otd怎么保证", "otd 怎么保证", "如何保证OTD",
+            "产能怎么平衡", "产能如何平衡", "如何平衡产能", "紧急插单怎么排", "紧急插单如何排", "急单怎么排", "EC/BOM change", "ec/bom change",
+            "EC/BOM变更", "ECN怎么处理", "工程变更怎么处理", "BOM变更怎么处理", "supplier delay",
+            "supplier delay怎么处理", "供应商 delay 怎么处理", "供应商延迟怎么处理", "供应商延期怎么处理", "供应延迟怎么处理",
+            "需要补齐什么数据", "需要补什么数据", "缺什么数据", "数据缺口", "数据完整性", "补齐数据", "补数清单",
+        ],
+    },
+    {
         # PMC 专项规则必须早于普通“库存”，否则“库存齐套率/在途库存”会被截成普通库存查询。
         "tool": "query_pmc_rush_impact",
         "keywords": ["插单影响", "原有订单会晚多久", "VIP急单", "占50%产能", "占用50%产能"],
@@ -2659,6 +2931,22 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "导出报告", "导出报表", "生成报告", "生成报表", "报告导出", "导出生产报告",
             "导出成文件", "导出文件", "导出成", "导出为文件", "生成文件", "导出成csv",
         ],
+    },
+    {
+        "tool": "query_online_workbook",
+        "keywords": ["在线表格内容", "在线工作簿", "读取表格", "查看表格公式", "表格里有什么", "当前表格"],
+    },
+    {
+        "tool": "edit_online_workbook",
+        "keywords": ["修改在线表格", "编辑在线表格", "改表格", "改单元格", "写入表格公式", "在线表格加一行"],
+    },
+    {
+        "tool": "export_online_workbook",
+        "keywords": ["导出在线表格", "导出当前表格", "导出工作簿", "表格导出xlsx", "下载当前表格"],
+    },
+    {
+        "tool": "create_online_pivot",
+        "keywords": ["在线透视表", "生成透视汇总", "做个透视表", "透视汇总"],
     },
     {
         # 工单表单需工单号：resolve_intent 尝试轻量提取，提不到则交 auto 让模型提取
@@ -2882,6 +3170,35 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
             step_match = re.search(r"(?:第|当前第)\s*(\d+)\s*步", message)
             if step_match:
                 args["current_step"] = int(step_match.group(1))
+    elif tool == "query_pmc_control_tower":
+        scope_keywords = [
+            ("orders", ["排过多少订单", "排了多少订单", "排产过多少订单", "订单排程", "排过订单"]),
+            ("materials", ["控过多少物料", "控制过多少物料", "物料控制"]),
+            ("shortage", ["shortage", "缺料", "缺口"]),
+            ("inventory", ["库存怎么降", "如何降库存", "怎么降库存", "降库存", "呆滞库存"]),
+            ("otd", ["otd", "交期怎么保证", "准时交付"]),
+            ("capacity", ["产能怎么平衡", "产能如何平衡", "如何平衡产能", "产能平衡", "瓶颈"]),
+            ("rush", ["紧急插单", "急单怎么排", "插单怎么排", "插单"]),
+            ("engineering_change", ["ec/bom", "ecn", "工程变更", "bom变更", "bom change"]),
+            ("supplier_delay", ["supplier delay", "供应商延迟", "供应商延期", "供应延迟"]),
+        ]
+        matched_scopes = [scope for scope, keywords in scope_keywords if any(keyword.lower() in message.lower() for keyword in keywords)]
+        args["scope"] = matched_scopes[0] if len(set(matched_scopes)) == 1 else "all"
+        material_match = re.search(r"(?:物料|料号|料\s*编码|material)\s*[:：#]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{2,})", message, flags=re.IGNORECASE)
+        if material_match:
+            args["material_keyword"] = material_match.group(1)
+        wo_code = _extract_wo_code(message)
+        if wo_code:
+            args["work_order_code"] = wo_code
+        days_match = re.search(r"(\d+)\s*(?:天|日)", message)
+        if days_match:
+            args["days"] = int(days_match.group(1))
+        quantity_match = re.search(r"(?:插单|急单).{0,12}?(\d+)\s*(?:台|件|pcs|个|数量)?", message, flags=re.IGNORECASE)
+        if quantity_match:
+            args["rush_quantity"] = int(quantity_match.group(1))
+        due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message)
+        if due_match:
+            args["rush_due_date"] = due_match.group(1)
     elif tool == "query_pmc_rush_impact":
         quantity_match = re.search(r"(\d+)\s*(?:台|件|pcs|个|数量)", message, flags=re.IGNORECASE)
         if quantity_match:
@@ -2995,6 +3312,12 @@ async def execute_tool(
     try:
         if tool_name == "create_followup_task":
             # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
+            return await executor(db, arguments, operator=operator, factory_id=factory_id)
+        if tool_name == "edit_online_workbook":
+            return await executor(db, arguments, operator=operator, factory_id=factory_id)
+        if tool_name == "export_online_workbook":
+            return await executor(db, arguments, operator=operator, factory_id=factory_id)
+        if tool_name == "create_online_pivot":
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name in WRITE_TOOLS:
             return await executor(db, arguments, operator)

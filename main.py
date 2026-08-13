@@ -41,6 +41,7 @@ from api.routes.production_dashboard_routes import router as production_dashboar
 from api.routes.search_routes import router as search_router
 from api.routes.code_table_routes import router as code_table_router
 from api.routes.file_routes import router as file_router
+from api.routes.workbook_routes import router as workbook_router
 from api.routes.routing_template_routes import router as routing_template_router
 from api.routes.alert_intelligence_routes import router as alert_intelligence_router
 from api.routes.aps_routes import router as aps_router
@@ -102,6 +103,7 @@ app.include_router(equipment_router)  # 设备 TPM
 app.include_router(search_router)  # 全站系统搜索
 app.include_router(code_table_router)  # 统一码表/基础数据管理
 app.include_router(file_router)  # 文件/附件上传下载（chatbot 多模态 + 表单/报告导出）
+app.include_router(workbook_router)  # 在线工作簿：公式保留、保存、导入导出
 app.include_router(routing_template_router)  # 工艺路线模板 CRUD（016 工序流转）
 app.include_router(alert_intelligence_router)  # 预警情报审查（017 Chatbot 主动智能）
 app.include_router(production_phase1_router)  # 岗位替代 Phase 1: 报工终端/实时看板/报表中心

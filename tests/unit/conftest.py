@@ -14,10 +14,15 @@ import asyncio
 
 @pytest.fixture(scope="session")
 def event_loop():
-    """pytest-asyncio 的事件循环fixture"""
-    loop = asyncio.get_event_loop_policy().get_event_loop()
+    """pytest-asyncio 的 Python 3.14 兼容事件循环 fixture。"""
+    # get_event_loop() may return a loop already closed by another module's
+    # fixture under Python 3.14. Create and own a fresh loop for the session.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     yield loop
-    loop.close()
+    if not loop.is_closed():
+        loop.close()
+    asyncio.set_event_loop(None)
 
 
 @pytest.fixture(scope="function")

@@ -9,9 +9,105 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.auth.security import get_current_user
 from database.db_config import get_db
 from database.models import User
+from api.services.pmc_control_tower_service import PmcControlTowerService
 from api.services.pmc_work_matrix_service import PmcWorkMatrixService
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
+
+
+PMC_DATA_CONTRACT = [
+    {
+        "key": "orders",
+        "question": "排过多少订单",
+        "source_tables": ["sales_orders", "work_orders", "aps_schedules", "aps_schedule_tasks"],
+        "minimum_fields": {
+            "sales_orders": ["order_code", "factory_id", "product_id", "quantity", "delivery_date", "status"],
+            "work_orders": ["sales_order_id", "work_order_code", "planned_due", "actual_complete", "status"],
+            "aps_schedule_tasks": ["schedule_id", "work_order_id", "planned_start", "planned_end", "status"],
+        },
+        "why": "订单历史、实际排程数量和交期结果必须能追溯到订单与APS任务。",
+    },
+    {
+        "key": "materials",
+        "question": "控过多少物料",
+        "source_tables": ["bom_items", "work_order_materials", "inventory", "inventory_transactions"],
+        "minimum_fields": {
+            "bom_items": ["factory_id", "product_id", "bom_version", "material_code", "qty_per_unit"],
+            "inventory_transactions": ["factory_id", "material_id", "transaction_type", "quantity", "created_at"],
+        },
+        "why": "主数据能说明当前控制范围，库存流水才能证明历史控制过和消耗过。",
+    },
+    {
+        "key": "shortage",
+        "question": "Shortage怎么处理",
+        "source_tables": ["work_order_materials", "purchase_orders", "supplier_materials"],
+        "minimum_fields": {
+            "work_order_materials": ["work_order_id", "material_code", "required_qty", "available_qty", "received_qty", "shortage_qty"],
+            "purchase_orders": ["material_code", "qty", "expected_date", "status"],
+        },
+        "why": "缺口、在途、ETA和替代供应必须在同一条物料证据链上。",
+    },
+    {
+        "key": "inventory",
+        "question": "库存怎么降",
+        "source_tables": ["inventory", "inventory_transactions", "bom_items", "purchase_orders"],
+        "minimum_fields": {
+            "inventory": ["material_code", "total_qty", "available_qty", "reserved_qty", "unit_cost", "last_movement_at"],
+            "inventory_transactions": ["material_id", "transaction_type", "quantity", "created_at"],
+        },
+        "why": "库存余额、消耗趋势、需求复用和在途补货缺一不可。",
+    },
+    {
+        "key": "otd",
+        "question": "OTD怎么保证",
+        "source_tables": ["sales_orders", "work_orders", "aps_schedule_tasks"],
+        "minimum_fields": {
+            "sales_orders": ["delivery_date", "actual_ship_date", "status"],
+            "work_orders": ["planned_due", "actual_complete", "status"],
+        },
+        "why": "有客户订单时按实际出货计算；没有客户订单才使用工单完成作为明确标注的后备口径。",
+    },
+    {
+        "key": "capacity",
+        "question": "产能怎么平衡",
+        "source_tables": ["stations", "station_capacity", "routings", "aps_work_calendars", "aps_schedule_tasks"],
+        "minimum_fields": {
+            "station_capacity": ["factory_id", "station_id", "available_hours_per_day", "efficiency_rate", "is_active"],
+            "aps_schedule_tasks": ["station_id", "planned_start", "planned_end", "status"],
+        },
+        "why": "工位能力、班次日历和实际任务负荷要分开记录，不能用固定12小时假设替代。",
+    },
+    {
+        "key": "rush",
+        "question": "紧急插单怎么排",
+        "source_tables": ["rush_order_approvals", "rush_order_approval_logs", "aps_schedules", "aps_plan_events"],
+        "minimum_fields": {
+            "rush_order_approvals": ["approval_code", "quantity", "due_date", "status", "affected_orders"],
+            "rush_order_approval_logs": ["approval_id", "action", "operator", "created_at"],
+        },
+        "why": "插单必须保留影响评估、审批、重排版本和受影响订单。",
+    },
+    {
+        "key": "engineering_change",
+        "question": "EC/BOM change怎么处理",
+        "source_tables": ["engineering_changes", "bom_items", "work_orders"],
+        "minimum_fields": {
+            "engineering_changes": ["ecn_code", "affected_product", "old_value", "new_value", "status", "propagated_at"],
+            "bom_items": ["product_id", "bom_version", "material_code", "qty_per_unit"],
+        },
+        "why": "要能区分变更批准、生效版本、MRP重算和未完工工单传播。",
+    },
+    {
+        "key": "supplier_delay",
+        "question": "supplier delay怎么处理",
+        "source_tables": ["purchase_orders", "suppliers", "supplier_materials"],
+        "minimum_fields": {
+            "purchase_orders": ["po_code", "supplier_id", "material_code", "qty", "expected_date", "actual_date", "status"],
+            "suppliers": ["supplier_code", "supplier_name", "on_time_rate", "avg_lead_days"],
+        },
+        "why": "供应商延迟必须由PO预计/实际日期和供应商主数据共同证明。",
+    },
+]
 
 
 class PmcScenarioRequest(BaseModel):
@@ -120,6 +216,32 @@ async def get_material_supply(
     )
 
 
+@router.get("/data-readiness", summary="获取 PMC 数据完整性与补数清单")
+async def get_data_readiness(
+    factory_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """返回九类PMC问题的当前证据状态和可执行补数合同。"""
+    del current_user
+    tower = await PmcControlTowerService(db).collect(factory_id, scope="all")
+    quality_by_key = {item.get("key"): item for item in tower.get("data_quality", [])}
+    return {
+        "factory_id": factory_id,
+        "generated_at": tower.get("generated_at"),
+        "sources": [
+            {
+                **contract,
+                "current_status": quality_by_key.get(contract["key"], {}).get("status", "unknown"),
+                "missing_sources": quality_by_key.get(contract["key"], {}).get("missing_sources", []),
+                "current_note": quality_by_key.get(contract["key"], {}).get("note", ""),
+            }
+            for contract in PMC_DATA_CONTRACT
+        ],
+        "policy": "只接收可追溯的业务源数据；系统不会用训练数据或估算记录冒充订单、PO、出货或ECN历史。",
+    }
+
+
 @router.get("/delivery/countdown", summary="获取 PMC 交期倒计时")
 async def get_delivery_countdown(
     factory_id: str = Query(...),
@@ -172,6 +294,7 @@ async def get_pmc_capabilities(
             {"key": "delivery_countdown", "name": "交期倒计时", "path": "/api/v1/pmc/delivery/countdown", "mode": "read_only"},
             {"key": "delivery_progress", "name": "生产进度汇总", "path": "/api/v1/pmc/delivery/progress", "mode": "read_only"},
             {"key": "delivery_alerts", "name": "交期与供应异常", "path": "/api/v1/pmc/delivery/alerts", "mode": "read_only"},
+            {"key": "data_readiness", "name": "PMC 数据完整性与补数清单", "path": "/api/v1/pmc/data-readiness", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。",

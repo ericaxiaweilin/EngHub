@@ -374,6 +374,11 @@ class ChangeManagementService:
         """获取计划的版本历史"""
         return self._versions.get(plan_id, [])
 
+    def get_current_version(self, plan_id: str) -> int:
+        """返回计划当前版本号；没有版本时返回 0。"""
+        versions = self.get_versions(plan_id)
+        return max((version.version_number for version in versions), default=0)
+
 
 # 全局实例（单例模式供其他模块使用）
 

@@ -24,6 +24,7 @@ import PlanList from './pages/pp/PlanList'
 import SchedulingCenter from './pages/pp/SchedulingCenter'
 import OrderManagement from './pages/pp/OrderManagement'
 import PmcWorkbench from './pages/pp/PmcWorkbench'
+import PmcForms from './pages/pp/PmcForms'
 import QualityCenter from './pages/qms/QualityCenter'
 import QualityGoals from './pages/qms/QualityGoals'
 import InspectionTerminal from './pages/qms/InspectionTerminal'
@@ -249,6 +250,7 @@ const App: React.FC = () => {
             <Route path="plans" element={<PermissionGate path="/plans"><PlanList /></PermissionGate>} />
             <Route path="scheduling" element={<PermissionGate path="/scheduling"><SchedulingCenter /></PermissionGate>} />
             <Route path="pmc" element={<PermissionGate path="/pmc"><PmcWorkbench /></PermissionGate>} />
+            <Route path="pmc/forms" element={<PermissionGate path="/pmc"><PmcForms /></PermissionGate>} />
             {/* 兼容旧版 PMC 菜单地址：旧入口曾经位于 PMC 工作台下。 */}
             <Route path="pmc/position-trainer" element={<PermissionGate path="/pmc/position-trainer"><PositionTrainer pmcMode /></PermissionGate>} />
             <Route path="pmc/training" element={<PermissionGate path="/pmc/position-trainer"><PositionTrainer pmcMode /></PermissionGate>} />

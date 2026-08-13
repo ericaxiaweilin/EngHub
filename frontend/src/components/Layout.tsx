@@ -38,6 +38,7 @@ import {
   BranchesOutlined,
   CarryOutOutlined,
   BookOutlined,
+  FormOutlined,
 } from '@ant-design/icons'
 import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
@@ -69,6 +70,7 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/plans': <ScheduleOutlined />,
   '/scheduling': <FieldTimeOutlined />,
   '/pmc': <ProjectOutlined />,
+  '/pmc/forms': <FormOutlined />,
   '/pmc/position-trainer': <ExperimentOutlined />,
   '/pmc/knowledge': <BookOutlined />,
   '/inventory': <InboxOutlined />,

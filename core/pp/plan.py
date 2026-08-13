@@ -130,10 +130,11 @@ class MPSService:
         """更新计划字段，返回是否成功"""
         db = await self._get_db()
         
-        update_stmt = update(Plan).where(Plan.id == plan_id).values({
+        update_values = {
             k: v for k, v in updates.items() if v is not None and k != 'id'
-        })
-        update_stmt = update_stmt.updated_at(datetime.utcnow())
+        }
+        update_values.setdefault("updated_at", datetime.utcnow())
+        update_stmt = update(Plan).where(Plan.id == plan_id).values(update_values)
         result = await db.execute(update_stmt)
         await db.commit()
         return result.rowcount > 0
@@ -187,7 +188,7 @@ class MPSService:
         )
         result = await db.execute(update_stmt)
         await db.commit()
-        return result.rowcount > 1
+        return result.rowcount > 0
     
     def _plan_to_dict(self, plan_obj) -> Dict[str, Any]:
         """将 Plan ORM 对象转换为字典"""
@@ -265,10 +266,12 @@ class MPSService:
         # 创建初始版本（版本 1）
         self.change_mgmt.add_version(
             plan_id=plan_id,
-            version=1,
-            user=created_by,
-            action="create",
+            version_number=1,
+            changed_by=created_by or "system",
+            change_type="create",
             description=f"创建生产计划 {plan['plan_code']}",
+            previous_state={},
+            current_state=plan or {},
         )
         
         return plan
@@ -348,10 +351,12 @@ class MPSService:
         if success:
             self.change_mgmt.add_version(
                 plan_id=plan_id,
-                version=self.change_mgmt.get_current_version(plan_id) + 1 if self.change_mgmt.get_current_version(plan_id) else 2,
-                user=confirmed_by,
-                action="confirm",
+                version_number=self.change_mgmt.get_current_version(plan_id) + 1,
+                changed_by=confirmed_by,
+                change_type="confirm",
                 description=f"确认生产计划 {plan['plan_code']}",
+                previous_state=plan,
+                current_state={**plan, "status": PlanStatus.CONFIRMED.value},
             )
         
         return await self.get_plan(plan_id)

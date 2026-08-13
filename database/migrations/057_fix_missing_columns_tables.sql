@@ -34,7 +34,7 @@ ALTER TABLE pp_plans ADD COLUMN IF NOT EXISTS updated_by VARCHAR(50);
 -- ============================================================
 CREATE TABLE IF NOT EXISTS andon_escalation_logs (
   id VARCHAR(36) PRIMARY KEY,
-  ticket_id UUID NOT NULL REFERENCES andon_tickets(id),
+  ticket_id VARCHAR(36) NOT NULL REFERENCES andon_tickets(id),
   event_type VARCHAR(30) NOT NULL,
   from_role VARCHAR(50),
   to_role VARCHAR(50),
