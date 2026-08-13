@@ -158,6 +158,16 @@ def _chat_tool_definitions(*, has_spreadsheet_attachment: bool) -> List[Dict[str
     ]
 
 
+def _attachment_analysis_context(has_spreadsheet_attachment: bool) -> str:
+    if not has_spreadsheet_attachment:
+        return ""
+    return (
+        "\n【本轮附件分析模式】系统已经成功读取用户上传的表格，并把真实摘要追加在最后一条用户消息中。"
+        "本轮必须只根据这份附件的真实内容回答；不要调用业务检索工具、在线工作簿工具或 search_entity，"
+        "不要把文件名当成业务实体，也不要说无法访问用户电脑上的文件。"
+    )
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -1190,11 +1200,17 @@ async def chat(
     # 有本轮表格附件时，模型只基于附件回答；不能把浏览器里残留的在线工作簿
     # ID 注入进来，否则会把“上传文件”和“在线工作簿”混成两条数据链路。
     workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
-    tool_definitions = _chat_tool_definitions(
-        has_spreadsheet_attachment=bool(spreadsheet_tables),
+    attachment_analysis = bool(spreadsheet_tables) and _is_attachment_analysis_request(last_user)
+    tool_definitions = (
+        [] if attachment_analysis else _chat_tool_definitions(
+            has_spreadsheet_attachment=bool(spreadsheet_tables),
+        )
     )
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + workbook_context}]
+    messages: List[Dict[str, Any]] = [{
+        "role": "system",
+        "content": SYSTEM_PROMPT + _attachment_analysis_context(attachment_analysis) + workbook_context,
+    }]
     # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
     if request.agent_key:
         agent_prompt = build_agent_system_prompt(request.agent_key)
@@ -1552,8 +1568,11 @@ async def chat_v2(
         ),
     )
     workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
-    tool_definitions = _chat_tool_definitions(
-        has_spreadsheet_attachment=bool(spreadsheet_tables),
+    attachment_analysis = bool(spreadsheet_tables) and _is_attachment_analysis_request(last_user)
+    tool_definitions = (
+        [] if attachment_analysis else _chat_tool_definitions(
+            has_spreadsheet_attachment=bool(spreadsheet_tables),
+        )
     )
 
     async def persist_after(ctx, response):
@@ -1588,7 +1607,7 @@ async def chat_v2(
         write_tools=frozenset(WRITE_TOOLS),
         sim_tools=frozenset(SIM_TOOLS),
         tool_definitions=tool_definitions,
-        system_prompt=SYSTEM_PROMPT + workbook_context,
+        system_prompt=SYSTEM_PROMPT + _attachment_analysis_context(attachment_analysis) + workbook_context,
         final_grounding_prompt=FINAL_GROUNDING_PROMPT,
         chat_task_id=MODEL_STACK_CHAT_TASK_ID,
         vision_task_id=MODEL_STACK_VISION_TASK_ID,
@@ -2280,11 +2299,17 @@ async def chat_stream(
                     yield _sse("table", tbl)
 
         workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
-        tool_definitions = _chat_tool_definitions(
-            has_spreadsheet_attachment=bool(spreadsheet_tables),
+        attachment_analysis = bool(spreadsheet_tables) and _is_attachment_analysis_request(last_user)
+        tool_definitions = (
+            [] if attachment_analysis else _chat_tool_definitions(
+                has_spreadsheet_attachment=bool(spreadsheet_tables),
+            )
         )
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT + workbook_context}]
+        messages: List[Dict[str, Any]] = [{
+            "role": "system",
+            "content": SYSTEM_PROMPT + _attachment_analysis_context(attachment_analysis) + workbook_context,
+        }]
         # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
         if request.agent_key:
             agent_prompt = build_agent_system_prompt(request.agent_key)
