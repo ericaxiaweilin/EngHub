@@ -2412,6 +2412,40 @@ class RushOrderApprovalLog(Base):
 
 
 # ============================================================
+# Agent Event Bus 持久化（Migration 041）
+# ============================================================
+
+class AgentEventRecord(Base):
+    """Agent Event Bus 的长期审计记录；实时流仍由内存 ring buffer 提供。"""
+    __tablename__ = "agent_events"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id = Column(String(36), nullable=False, index=True)
+    event_type = Column(String(30), nullable=False, index=True)
+    agent_key = Column(String(50), nullable=False, index=True)
+    factory_id = Column(String(50), nullable=False, index=True)
+    task_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    data = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AgentCheckpointRecord(Base):
+    """AgentLoop 断点冷存储；内存 CheckpointManager 仍是热路径。"""
+    __tablename__ = "agent_checkpoints"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    checkpoint_key = Column(String(64), unique=True, nullable=False, index=True)
+    request_id = Column(String(64), nullable=False, index=True)
+    messages = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)
+    messages_fp = Column(String(64), nullable=False)
+    message_count = Column(Integer, nullable=False, default=0)
+    actions_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+# ============================================================
 # Chat 持久化（Phase 3 — 会话/消息/遥测）
 # ============================================================
 

@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import (
@@ -16,6 +17,10 @@ from database.models import (
 )
 
 HISTORY_LIMIT = 50
+
+
+class ChatSessionAccessError(PermissionError):
+    """会话不存在或不属于当前用户/工厂。"""
 
 
 # ──────────────────────────────────────────────
@@ -30,12 +35,19 @@ async def get_or_create_session(
     session_id: Optional[str] = None,
     title: Optional[str] = None,
 ) -> ChatSession:
-    """按 session_id 取既有会话；无则新建。返回的 session 不强制 flush。"""
+    """按 session_id 取既有会话；无 session_id 才允许新建。
+
+    不能把不存在或不属于当前用户的 session_id 静默创建/复用，否则会造成
+    会话串线或跨用户读取历史。
+    """
     user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
     if session_id:
         cached = await _get_session(db, session_id)
-        if cached is not None:
-            return cached
+        if cached is None:
+            raise ChatSessionAccessError("会话不存在或已失效")
+        if cached.user_id != user_id or cached.factory_id != factory_id:
+            raise ChatSessionAccessError("无权访问该会话")
+        return cached
     session = ChatSession(
         id=session_id or generate_uuid(),
         factory_id=factory_id,
@@ -44,6 +56,21 @@ async def get_or_create_session(
     )
     db.add(session)
     await db.flush()
+    return session
+
+
+async def get_session_for_user(
+    db: AsyncSession,
+    session_id: str,
+    *,
+    user: Any,
+    factory_id: str,
+) -> ChatSession:
+    """读取并校验会话归属，供历史加载、Trace 和 Replay 共用。"""
+    user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
+    session = await _get_session(db, session_id)
+    if session is None or session.user_id != user_id or session.factory_id != factory_id:
+        raise ChatSessionAccessError("无权访问该会话")
     return session
 
 
@@ -126,7 +153,7 @@ async def append_message(
     # 会话 touched → 前端会话栏排序
     session = await _get_session(db, session_id)
     if session is not None:
-        session.updated_at = session.updated_at
+        session.updated_at = datetime.utcnow()
     return msg
 
 
@@ -136,15 +163,21 @@ async def get_history(
     *,
     limit: int = HISTORY_LIMIT,
     include_tools: bool = True,
+    include_tool_calls: bool = True,
 ) -> List[Dict[str, Any]]:
-    """按时间序返回可视历史（OpenAI messages 风格，供 Kernel 注入）。"""
+    """按时间序返回历史（OpenAI messages 风格）。
+
+    `include_tool_calls=False` 用于把持久化的 ToolAction 轨迹排除在模型上下文
+    外；这些轨迹不是 OpenAI 原生 tool_calls，直接回灌会破坏下一轮请求格式。
+    """
     stmt = (
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
         .limit(limit)
     )
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = list((await db.execute(stmt)).scalars().all())
+    rows.reverse()
     messages: List[Dict[str, Any]] = []
     for m in rows:
         entry: Dict[str, Any] = {"role": m.role}
@@ -153,11 +186,20 @@ async def get_history(
         if m.role == "tool":
             entry["content"] = _format_tool_content(m.tool_results or {})
             if m.tool_calls:
-                entry["tool_call_id"] = m.tool_calls.get("id", m.tool_calls.get("tool_call_id"))
+                if isinstance(m.tool_calls, dict):
+                    entry["tool_call_id"] = m.tool_calls.get(
+                        "id", m.tool_calls.get("tool_call_id")
+                    )
+                elif isinstance(m.tool_calls, list):
+                    first = m.tool_calls[0] if m.tool_calls else {}
+                    if isinstance(first, dict):
+                        entry["tool_call_id"] = first.get(
+                            "id", first.get("tool_call_id")
+                        )
             messages.append(entry)
             continue
         entry["content"] = m.content or ""
-        if m.tool_calls:
+        if include_tool_calls and m.tool_calls:
             entry["tool_calls"] = m.tool_calls
         messages.append(entry)
     return messages
@@ -212,6 +254,8 @@ async def get_trace(
     request_id: Optional[str] = None,
     *,
     session_id: Optional[str] = None,
+    user: Any = None,
+    factory_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """重建一次完整请求的 Trace：会话 + 消息链 + 遥测。
 
@@ -242,6 +286,15 @@ async def get_trace(
             session = await _get_session(db, sid)
     elif sid:
         session = await _get_session(db, sid)
+
+    if user is not None:
+        user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
+        if (
+            session is None
+            or session.user_id != user_id
+            or (factory_id is not None and session.factory_id != factory_id)
+        ):
+            raise ChatSessionAccessError("无权访问该会话 Trace")
 
     if sid:
         messages = await get_history(db, sid, include_tools=True)
@@ -293,6 +346,17 @@ async def persist_round(
     duration_ms: float = 0,
 ) -> None:
     """一次请求的完整落库：user 消息 + assistant 回复（含工具动作轨迹）。"""
+    if request_id:
+        existing = await db.execute(
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.session_id == session_id,
+                ChatMessage.request_id == request_id,
+            )
+            .limit(1)
+        )
+        if existing.scalar_one_or_none() is not None:
+            return
     await append_message(
         db, session_id=session_id, role="user", content=user_content,
         request_id=request_id,

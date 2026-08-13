@@ -94,12 +94,29 @@ class AgentEventBus:
         self._ring_buffer: List[AgentEvent] = []
         self._ring_max = 500
         self._lock = asyncio.Lock()
+        # 数据库持久化是可选能力：未配置时完全保持原来的内存行为。
+        self._session_factory: Optional[Callable[[], Any]] = None
+        self._persistence_enabled = False
 
     @classmethod
     def get_instance(cls) -> "AgentEventBus":
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    def configure_persistence(
+        self,
+        session_factory: Callable[[], Any],
+        *,
+        enabled: bool = True,
+    ) -> None:
+        """配置异步数据库 session factory。
+
+        持久化失败只记录日志，不阻断事件订阅者和 Agent Runtime；这样数据库
+        短暂不可用时，实时事件仍能继续通过 SSE 送达。
+        """
+        self._session_factory = session_factory
+        self._persistence_enabled = enabled
 
     async def emit(
         self,
@@ -108,8 +125,9 @@ class AgentEventBus:
         factory_id: str,
         task_id: Optional[str] = None,
         data: Optional[Dict[str, Any]] = None,
+        persist: Optional[bool] = None,
     ) -> AgentEvent:
-        """发布事件 → 通知所有订阅者 + 入环形缓冲"""
+        """发布事件 → 可选落库 → 通知订阅者 + 入环形缓冲。"""
         event = AgentEvent(
             type=event_type,
             agent_key=agent_key,
@@ -124,6 +142,10 @@ class AgentEventBus:
             if len(self._ring_buffer) > self._ring_max:
                 self._ring_buffer = self._ring_buffer[-self._ring_max:]
 
+        should_persist = self._persistence_enabled if persist is None else persist
+        if should_persist:
+            await self._persist_event(event)
+
         # 通知工厂级订阅者
         targets = self._subscribers.get(factory_id, []) + self._global_subscribers
         for sub_id, callback in targets:
@@ -133,6 +155,91 @@ class AgentEventBus:
                 _logger.warning(f"[EventBus] subscriber {sub_id} error: {e}")
 
         return event
+
+    async def _persist_event(self, event: AgentEvent) -> None:
+        """写入已有 `agent_events` 审计表；所有异常都被隔离。"""
+        if self._session_factory is None:
+            return
+        try:
+            from database.models import AgentEventRecord
+
+            task_uuid = None
+            if event.task_id:
+                try:
+                    task_uuid = uuid.UUID(str(event.task_id))
+                except (ValueError, TypeError, AttributeError):
+                    # 旧调用方可能使用业务 task code；agent_events.task_id
+                    # 是 UUID 列，保留原值到 data 以免审计信息丢失。
+                    pass
+            record_data = dict(event.data or {})
+            if event.task_id and task_uuid is None:
+                record_data.setdefault("_task_id", event.task_id)
+
+            async with self._session_factory() as db:
+                db.add(
+                    AgentEventRecord(
+                        event_id=event.event_id,
+                        event_type=event.type.value,
+                        agent_key=event.agent_key,
+                        factory_id=event.factory_id,
+                        task_id=task_uuid,
+                        data=record_data,
+                    )
+                )
+                await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("[EventBus] persist event failed: %s", exc)
+
+    async def replay(
+        self,
+        *,
+        factory_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """从 DB 回放事件；未配置 DB 时退回内存 ring buffer。"""
+        if self._session_factory is None:
+            events = self._ring_buffer
+            if factory_id:
+                events = [e for e in events if e.factory_id == factory_id]
+            if task_id:
+                events = [e for e in events if e.task_id == task_id]
+            return [e.to_dict() for e in events[-max(1, min(limit, 500)):]]
+
+        try:
+            from sqlalchemy import select
+            from database.models import AgentEventRecord
+
+            stmt = select(AgentEventRecord).order_by(AgentEventRecord.created_at.desc())
+            if factory_id:
+                stmt = stmt.where(AgentEventRecord.factory_id == factory_id)
+            if task_id:
+                try:
+                    task_uuid = uuid.UUID(str(task_id))
+                except (ValueError, TypeError, AttributeError):
+                    task_uuid = None
+                if task_uuid is None:
+                    return []
+                stmt = stmt.where(AgentEventRecord.task_id == task_uuid)
+            stmt = stmt.limit(max(1, min(limit, 500)))
+            async with self._session_factory() as db:
+                rows = list((await db.execute(stmt)).scalars().all())
+            rows.reverse()
+            return [
+                {
+                    "event_id": row.event_id,
+                    "type": row.event_type,
+                    "agent_key": row.agent_key,
+                    "factory_id": row.factory_id,
+                    "task_id": str(row.task_id) if row.task_id else (row.data or {}).get("_task_id"),
+                    "data": row.data or {},
+                    "timestamp": row.created_at.timestamp() if row.created_at else None,
+                }
+                for row in rows
+            ]
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("[EventBus] replay failed, using ring buffer: %s", exc)
+            return self.get_recent_events(factory_id=factory_id, limit=limit)
 
     def subscribe(self, factory_id: str, callback: Subscriber) -> str:
         """订阅某工厂的事件流，返回订阅ID"""

@@ -1,4 +1,23 @@
-# EngFlow Chatbot Architecture Migration Plan
+# EngFlow Chatbot Architecture Migration Plan & Status
+
+> 本文同时维护目标架构和实际落地进度。以下进度快照基于工作区分支
+> `codex/pmc-workbench-data-closure` 的 HEAD `1d22fbb`（2026-08-13 09:42，+07:00）核对；
+> 远端 `origin/main` 当前仍停留在 2026-07-31，不代表这条 EngFlow 开发线的最新状态。
+
+## 0.1 实际进度快照（2026-08-13）
+
+| 阶段 | 状态 | 已落地 | 当前边界 / 风险 |
+|------|------|--------|----------------|
+| Phase 1 Kernel | 🟡 可运行骨架 | `core/kernel/`、`HarnessKernel`、`AgentLoop`、`KernelContext`、Telemetry、`POST /api/v1/chat/v2`；Checkpoint 已按工具轮次保存，支持可选 DB 冷存储和进程重启恢复 | DB 冷存储需执行 084 并开启 `CHECKPOINT_PERSISTENCE_ENABLED=1`；State Runtime/Recovery 尚未接入 |
+| Phase 2 Skills | 🟡 部分完成 | `SkillRegistry`、WorkOrder/Inventory/Quality 三个 Skill，V2 采用 Skill-first；质量域已迁移不良记录和 SPC 失控查询 | PMC、BOM、设备、HR、仿真、工作流等仍走 `chat_tools_service.py` legacy fallback，约 30+ 工具尚未完成拆分 |
+| Phase 3 Persistence | 🟡 基础完成 | `ChatSession/Message/Telemetry` ORM、`082_chat_engflow_persistence.sql`、持久化服务、V2/stream session_id、服务端历史自动加载、Trace/Replay、会话列表 | 历史仍按最近 50 条截断；流式链路已持久化但仍缺完整断线续传 |
+| Phase 4 Permission/Event | 🟡 权限完成，事件基础完成 | V2/stream 的 `PermissionGate`；Agent Event Bus 已支持 `agent_events` 持久化、DB replay 和 `/api/v1/agent-supervisor/events` | Event Bus 持久化为可选配置；缺权限信息时当前策略仍会放行 |
+| Phase 5 Review/Evidence | 🟡 基础完成 | Evidence chain、`ModelReviewer`、grounded/partial/hallucinated 分类和最多 2 次修正 | 审查分类仍含启发式逻辑，source table 证据尚未由工具统一填充，缺少持久化审查审计 |
+| Phase 6 Engineering Surface | 🟡 端点已落地 | trace、replay、eval、plugins、version、model-compare、failures 共 7 类端点 | Eval 当前是单 case；Replay 主要是消息回放而非重新执行；model-compare 未走完整工具/审查链 |
+
+**当前结论**：Chat V2 已具备可运行的 Kernel 链路和工程观测基础，但仍处于渐进迁移期；V1 保持回退，剩余 Skill 拆分、Checkpoint DB 化、生产环境 migration/配置和端到端压测完成前，不宜宣称 chatbot 架构迁移完毕。
+
+**当前最高优先级**：完成剩余 Skill 拆分；确认生产环境执行 082/083/084 migration 并开启 Event Bus/Checkpoint 持久化；再做端到端压测和断线恢复。
 
 ## 0. Scope 界定（重要）
 
@@ -11,6 +30,8 @@
 > 迁移期间 Chat V1（现有 `POST /api/v1/chat`）保持可用作为回退，V2 完全稳定后再下线。
 
 ## 1. Current State Summary
+
+> 本节保留迁移开始时的基线问题，实时完成度以第 0.1 节为准。
 
 ### 1.1 文件规模
 
@@ -75,23 +96,23 @@ POST /api/v1/chat
 ENGFLOW Target (Chat V2)          Current Codebase                Status
 ─────────────────────────────────────────────────────────────────────────
 Experience Surface
-  Chat / UI / API                chat_routes.py (POST /chat/v2)  ✅ 新端点
+  Chat / UI / API                chat_routes.py (POST /chat/v2)  ✅ V2 已接入
   CLI                           （独立，不经过 Kernel）           ➖ 不在范围
 
 Harness Kernel
-  Agent Loop                     chat_routes.py L840-911 loop    ⚠️ 硬编码在路由
+  Agent Loop                     core/kernel/agent_loop.py        ✅ V2 已接入
   State Runtime                  chat_architecture/state/engine.py ⚠️ 已建未接入
-  Context                        ❌ 无                            🔴 待建
-  Permission                     ❌ 仅 operator 传递              🔴 待建
-  Recovery                       chat_architecture/recovery/      ⚠️ 已建未接入
-  Checkpoint                     ❌ 无                            🔴 待建
-  Event Bus                      core/agent/event_bus.py          ⚠️ 仅内存
-  Telemetry                      ❌ 无                            🔴 待建
+  Context                        core/kernel/context.py            ✅
+  Permission                     core/kernel/permission.py         🟡 已接入，缺权限时放行
+  Recovery                       chat_architecture/recovery/      ⚠️ 骨架未接入
+  Checkpoint                     core/kernel/checkpoint.py         🟡 内存热路径 + 可选 agent_checkpoints DB
+  Event Bus                      core/agent/event_bus.py           🟡 内存 + agent_events DB replay
+  Telemetry                      core/kernel/telemetry.py          ✅ 内存 + V2 DB 总体遥测
 
 Capability Layer
-  Skills                         chat_tools_service.py (35 tools) ⚠️ 未模块化
-  Capability Plugins             chat_architecture/business_executors/ ⚠️ 3个
-  Binder/Policy                  ❌ 无                            🔴 待建
+  Skills                         core/skills/ + legacy fallback    🟡 3 个 Skill 已接入
+  Capability Plugins             SkillRegistry                    🟡 WorkOrder/Inventory/Quality
+  Binder/Policy                  core/kernel/permission.py         🟡 工具级权限已接入
   Connector                      ❌ 无                            🔴 待建
 
 Model Adapters
@@ -99,18 +120,18 @@ Model Adapters
   LLM Gateway (litellm)          chat_routes.py L268-286          ✅ 可用
 
 Source Truth                     DB (PostgreSQL)                  ✅
-Evidence                         ❌ 无                            🔴 待建
-Model Review                     grounding verification           ⚠️ 仅文本
-Correction / Done                ❌ 无                            🔴 待建
+Evidence                         core/kernel/evidence.py           🟡 已结构化
+Model Review                     core/kernel/model_review.py        🟡 已接入 V2
+Correction / Done                ModelReviewer retry               ⚠️ 有修正，无完整审计事件
 
 Engineering Surface
-  Trace                          ❌ 无                            🔴 待建
-  Replay                         ❌ 无                            🔴 待建
-  Eval                           ❌ 无                            🔴 待建
-  Plugin Registry                chat_architecture/executors/     ⚠️ 已建
-  Harness Version                ❌ 无                            🔴 待建
-  Model Comparison               ❌ 无                            🔴 待建
-  Failure Analysis               ❌ 无                            🔴 待建
+  Trace                          GET /chat/trace/{request_id}       ✅
+  Replay                         GET /chat/replay/{session_id}      🟡 消息回放
+  Eval                           POST /chat/eval                    🟡 单 case
+  Plugin Registry                GET /chat/plugins                   ✅
+  Harness Version                GET /chat/version                   ✅ 0.8.0
+  Model Comparison               POST /chat/model-compare             🟡 基础对比
+  Failure Analysis               GET /chat/failures                   ✅ 内存 + DB
 ```
 
 ### 2.2 可直接复用的模块
@@ -227,8 +248,8 @@ core/skills/
 │   ├── skill.py
 │   └── schema.py
 ├── quality/
-│   ├── skill.py
-│   └── schema.py
+│   ├── __init__.py
+│   └── skill.py             # query_defects, query_spc_anomalies（已迁移）
 ├── pmc/
 │   ├── skill.py
 │   └── schema.py
@@ -495,9 +516,10 @@ Phase 1 是所有后续阶段的基础。Phase 2 和 3 可并行。Phase 4 依�
 
 ---
 
-## 9. Quick Wins (可立即执行)
+## 9. Quick Wins / Remaining Work（当前）
 
-1. **将 `chat_architecture/` 骨架接入主流程**：`ChatAdapter._execute_tool_loop()` 补全 tool loop 逻辑（1 天）
-2. **统一 Agent 注册表**：将 3 套 Agent 定义合并到 `core/agent/` 下（0.5 天）
-3. **IntentResolver 扩展**：从 5 个意图扩展到覆盖全部 35+ 工具（0.5 天）
-4. **Event Bus 添加 persist 参数**：emit 时可选写 DB（0.5 天）
+1. **启用 Checkpoint DB 冷存储**：代码已接入 `agent_checkpoints`，生产执行 084 migration 后设置 `CHECKPOINT_PERSISTENCE_ENABLED=1`。
+2. **扩大 Skill 覆盖**：按质量、PMC、BOM、设备、HR、仿真、工作流等领域继续拆分，逐步减少 `chat_tools_service.py` fallback。
+3. **将 Event Bus 持久化纳入所有生产环境**：确认 `AGENT_EVENT_PERSISTENCE_ENABLED=1` 并执行 083 migration。
+4. **收敛 Engineering Surface**：把 Eval 扩展为批量用例，把 Replay 增加可选工具重执行，并让 model-compare 使用同一 V2 工具/审查链。
+5. **端到端压测与断线恢复**：验证 stream/V2 的超时、重试、重复提交和大历史截断行为。

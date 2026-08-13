@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from core.kernel.checkpoint import CheckpointManager
+
 MAX_TOOL_ROUNDS = 5
 
 
@@ -28,6 +30,8 @@ class LoopResult:
     diagrams: List[Dict[str, Any]] = field(default_factory=list)
     status: str = "complete"  # complete | no_reply | max_rounds | gateway_error | exception
     error: Optional[str] = None
+    checkpoint_key: Optional[str] = None
+    restored_from_checkpoint: bool = False
 
 
 # 类型别名：外部注入的能力
@@ -79,7 +83,13 @@ class AgentLoop:
         self._final_grounding_prompt = final_grounding_prompt
         self.max_rounds = max_rounds
 
-    async def run(self, payload: Dict[str, Any]) -> LoopResult:
+    async def run(
+        self,
+        payload: Dict[str, Any],
+        *,
+        request_id: Optional[str] = None,
+        checkpoint: Optional[CheckpointManager] = None,
+    ) -> LoopResult:
         """执行一次工具调用循环。
 
         Args:
@@ -96,6 +106,7 @@ class AgentLoop:
         model = payload.get("model", "")
         actions: List[Any] = []
         diagrams: List[Dict[str, Any]] = []
+        last_checkpoint_key: Optional[str] = None
 
         for round_no in range(self.max_rounds):
             resp = await self._call_llm(payload)
@@ -134,6 +145,7 @@ class AgentLoop:
                     actions=actions,
                     diagrams=diagrams,
                     status="complete",
+                    checkpoint_key=last_checkpoint_key,
                 )
 
             # 有工具调用 → 逐个执行并回填上下文
@@ -147,7 +159,31 @@ class AgentLoop:
                 tool_name = fn.get("name", "")
                 arguments = self._parse_arguments(fn.get("arguments"))
 
-                result = await self._execute_tool(tool_name, arguments)
+                try:
+                    result = await self._execute_tool(tool_name, arguments)
+                except Exception as exc:  # noqa: BLE001
+                    # 工具可能已经完成前序副作用；恢复到最近已完成轮次，避免
+                    # 调用方误以为当前半轮可以安全重放。
+                    restored_key = None
+                    restored = None
+                    if checkpoint is not None and request_id:
+                        restored = await checkpoint.restore_async(request_id)
+                    if restored is not None:
+                        messages = restored.get("messages") or []
+                        payload["messages"] = messages
+                        restored_key = restored.get("key")
+                        saved_actions = max(0, int(restored.get("actions_count", 0)))
+                        del actions[saved_actions:]
+                    return LoopResult(
+                        model=model,
+                        degraded=True,
+                        rounds_used=round_no + 1,
+                        actions=actions,
+                        status="tool_error",
+                        error=f"{type(exc).__name__}: {exc}",
+                        checkpoint_key=restored_key,
+                        restored_from_checkpoint=restored is not None,
+                    )
                 is_error = "error" in result
 
                 if self._make_tool_action is not None:
@@ -172,6 +208,13 @@ class AgentLoop:
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
 
+            if checkpoint is not None and request_id:
+                last_checkpoint_key = await checkpoint.save_async(
+                    request_id,
+                    messages=messages,
+                    actions_count=len(actions),
+                )
+
         # 超过最大轮次
         return LoopResult(
             model=model,
@@ -179,6 +222,7 @@ class AgentLoop:
             rounds_used=self.max_rounds,
             actions=actions,
             status="max_rounds",
+            checkpoint_key=last_checkpoint_key,
         )
 
     @staticmethod

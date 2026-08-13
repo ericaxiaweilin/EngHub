@@ -81,6 +81,9 @@ class HarnessKernel:
         persist_hook: Optional[Callable[[KernelContext, "KernelResponse"], Awaitable[None]]] = None,
         permission_gate: Any = None,
         model_reviewer: Any = None,
+        checkpoint_manager: Optional[CheckpointManager] = None,
+        checkpoint_session_factory: Optional[Callable[[], Any]] = None,
+        checkpoint_persistence_enabled: bool = False,
     ) -> None:
         self.db = db
         self._active_ctx = None
@@ -95,7 +98,10 @@ class HarnessKernel:
         self._vision_task_id = vision_task_id
         self._max_tool_rounds = max_tool_rounds
         self._telemetry = telemetry or Telemetry.get_instance()
-        self._checkpoints = CheckpointManager()
+        self._checkpoints = checkpoint_manager or CheckpointManager(
+            session_factory=checkpoint_session_factory,
+            persistence_enabled=checkpoint_persistence_enabled,
+        )
         self._skill_registry = skill_registry
         # execute_tool 统一走 _skill_execute_tool：始终先做权限门控，
         # 再有 Skill → legacy 回退（skill_registry 可空）。
@@ -126,10 +132,19 @@ class HarnessKernel:
 
                 # 2) 工具级权限门控在 _skill_execute_tool / legacy 执行前逐工具校验
 
-                # 3) Agent Loop（内部每轮写 checkpoint）
-                loop_result = await self._loop.run(payload)
-                ctx.checkpoint_key = self._checkpoints.latest(request_id)["key"] \
-                    if self._checkpoints.has(request_id) else None
+                # 3) Agent Loop（每轮工具执行后保存 checkpoint）
+                loop_result = await self._loop.run(
+                    payload,
+                    request_id=request_id,
+                    checkpoint=self._checkpoints,
+                )
+                ctx.checkpoint_key = (
+                    loop_result.checkpoint_key
+                    or (self._checkpoints.latest(request_id)["key"]
+                        if self._checkpoints.has(request_id) else None)
+                )
+                if loop_result.restored_from_checkpoint:
+                    ctx.metadata["checkpoint_restored"] = True
 
                 # 4) 组装响应（可选 ModelReview 替换草稿）
                 reply = loop_result.reply

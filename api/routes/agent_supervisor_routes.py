@@ -1,7 +1,7 @@
 """
 智能体监督路由 - 长任务追踪/卡住检测/预测/闭环验证
 """
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, Dict, Any
 
@@ -10,6 +10,39 @@ from core.auth.security import get_current_user
 from database.models import User
 
 router = APIRouter(prefix="/api/v1/agent-supervisor", tags=["智能体监督"])
+
+
+@router.get("/events")
+async def replay_agent_events(
+    factory_id: str = Query(...),
+    task_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+):
+    """回放 Agent Event Bus 的 DB 审计事件（DB 不可用时退回内存 ring）。"""
+    from core.agent import AgentEventBus
+
+    user_factory = (
+        getattr(current_user, "active_factory_id", None)
+        or getattr(current_user, "factory_id", None)
+    )
+    if (
+        not getattr(current_user, "is_superuser", False)
+        and user_factory
+        and factory_id != user_factory
+    ):
+        raise HTTPException(status_code=403, detail="无权查看其他工厂的智能体事件")
+
+    bus = AgentEventBus.get_instance()
+    return {
+        "factory_id": factory_id,
+        "task_id": task_id,
+        "events": await bus.replay(
+            factory_id=factory_id,
+            task_id=task_id,
+            limit=limit,
+        ),
+    }
 
 
 @router.get("/agents")

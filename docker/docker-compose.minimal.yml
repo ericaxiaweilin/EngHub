@@ -50,6 +50,9 @@ services:
       - MODEL_STACK_CHAT_TASK_ID=${MODEL_STACK_CHAT_TASK_ID:-data_coin.advisor.chat}
       - MODEL_STACK_VISION_TASK_ID=${MODEL_STACK_VISION_TASK_ID:-luaguage.vision.content_analysis}
       - MODEL_STACK_ROUTE_TIMEOUT=${MODEL_STACK_ROUTE_TIMEOUT:-5}
+      # EngFlow Chat V2 运行时持久化：生产默认开启，数据库需先执行 082/083/084。
+      - AGENT_EVENT_PERSISTENCE_ENABLED=${AGENT_EVENT_PERSISTENCE_ENABLED:-1}
+      - CHECKPOINT_PERSISTENCE_ENABLED=${CHECKPOINT_PERSISTENCE_ENABLED:-1}
     ports:
       - "18888:8000"
     depends_on:

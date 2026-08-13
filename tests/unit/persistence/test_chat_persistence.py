@@ -76,6 +76,25 @@ async def test_get_or_create_session_reuses(db, user):
 
 
 @pytest.mark.asyncio
+async def test_get_or_create_session_rejects_wrong_owner(db, user):
+    s = await cp.get_or_create_session(db, factory_id="F01", user=user)
+    other = SimpleNamespace(username="alice", id="u-alice", factory_id="F01")
+    with pytest.raises(cp.ChatSessionAccessError):
+        await cp.get_or_create_session(
+            db, factory_id="F01", user=other, session_id=s.id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_session_rejects_wrong_factory(db, user):
+    s = await cp.get_or_create_session(db, factory_id="F01", user=user)
+    with pytest.raises(cp.ChatSessionAccessError):
+        await cp.get_or_create_session(
+            db, factory_id="F02", user=user, session_id=s.id,
+        )
+
+
+@pytest.mark.asyncio
 async def test_list_sessions(db, user):
     s1 = await cp.get_or_create_session(db, factory_id="F01", user=user)
     await cp.get_or_create_session(db, factory_id="F01", user=user)
@@ -105,6 +124,30 @@ async def test_append_and_get_history(db, user):
 
 
 @pytest.mark.asyncio
+async def test_history_limit_is_latest_messages_in_chronological_order(db, user):
+    s = await cp.get_or_create_session(db, factory_id="F01", user=user)
+    for idx in range(4):
+        await cp.append_message(db, session_id=s.id, role="user", content=f"q{idx}")
+    history = await cp.get_history(db, s.id, limit=2)
+    assert [m["content"] for m in history] == ["q2", "q3"]
+
+
+@pytest.mark.asyncio
+async def test_history_can_hide_persisted_tool_action_shape(db, user):
+    s = await cp.get_or_create_session(db, factory_id="F01", user=user)
+    await cp.append_message(db, session_id=s.id, role="user", content="查库存")
+    await cp.append_message(
+        db,
+        session_id=s.id,
+        role="assistant",
+        content="查到了",
+        tool_calls=[{"tool": "query_inventory", "id": "a1"}],
+    )
+    history = await cp.get_history(db, s.id, include_tool_calls=False)
+    assert history[-1] == {"role": "assistant", "content": "查到了"}
+
+
+@pytest.mark.asyncio
 async def test_persist_round_traces_actions(db, user):
     s = await cp.get_or_create_session(db, factory_id="F01", user=user)
     action = SimpleNamespace(
@@ -121,6 +164,27 @@ async def test_persist_round_traces_actions(db, user):
     assert rows[0].content == "查库存"
     assert rows[1].role == "assistant"
     assert rows[1].tool_calls[0]["tool"] == "query_inventory"
+
+
+@pytest.mark.asyncio
+async def test_persist_round_is_idempotent_by_request_id(db, user):
+    s = await cp.get_or_create_session(db, factory_id="F01", user=user)
+    await cp.persist_round(
+        db,
+        session_id=s.id,
+        user_content="查库存",
+        reply="查到了",
+        request_id="req-idempotent",
+    )
+    await cp.persist_round(
+        db,
+        session_id=s.id,
+        user_content="查库存",
+        reply="查到了",
+        request_id="req-idempotent",
+    )
+    rows = (await db.execute(select(ChatMessage))).scalars().all()
+    assert len(rows) == 2
 
 
 # ──────────────────────────────────────────────
@@ -164,6 +228,16 @@ async def test_get_trace_by_session(db, user):
     trace = await cp.get_trace(db, None, session_id=s.id)
     assert trace["session_id"] == s.id
     assert len(trace["messages"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_trace_rejects_wrong_owner(db, user):
+    s = await cp.get_or_create_session(db, factory_id="F01", user=user)
+    other = SimpleNamespace(username="alice", id="u-alice", factory_id="F01")
+    with pytest.raises(cp.ChatSessionAccessError):
+        await cp.get_trace(
+            db, None, session_id=s.id, user=other, factory_id="F01",
+        )
 
 
 # ──────────────────────────────────────────────

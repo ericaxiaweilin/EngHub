@@ -218,6 +218,127 @@ def test_checkpoint_fingerprint_is_deterministic():
     assert len(fp1) == 16
 
 
+class _FakeCheckpointSession:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def add(self, row):
+        self.rows.append(row)
+
+    async def commit(self):
+        pass
+
+    async def execute(self, _stmt):
+        rows = list(reversed(self.rows))
+        return SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: rows),
+        )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_db_cold_storage_survives_manager_restart():
+    rows = []
+
+    def session_factory():
+        return _FakeCheckpointSession(rows)
+
+    writer = CheckpointManager(
+        session_factory=session_factory,
+        persistence_enabled=True,
+    )
+    key = await writer.save_async(
+        "req-db-checkpoint",
+        messages=[{"role": "user", "content": "从数据库恢复"}],
+        actions_count=2,
+    )
+    assert key
+    assert len(rows) == 1
+
+    # 新 manager 无内存状态，只能从 DB 冷存储恢复。
+    reader = CheckpointManager(
+        session_factory=session_factory,
+        persistence_enabled=True,
+    )
+    restored = await reader.restore_async("req-db-checkpoint")
+    assert restored is not None
+    assert restored["key"] == key
+    assert restored["actions_count"] == 2
+    assert restored["messages"][0]["content"] == "从数据库恢复"
+
+
+@pytest.mark.asyncio
+async def test_loop_saves_checkpoint_after_tool_round():
+    from core.kernel.checkpoint import CheckpointManager
+
+    async def responder(payload):
+        if any(m.get("role") == "tool" for m in payload["messages"]):
+            return FakeLlmResponse(200, _final_reply_payload("基于断点完成"))
+        return FakeLlmResponse(200, _tool_call_payload([
+            _make_tool_call("query_inventory", {"material": "steel"})
+        ]))
+
+    checkpoint = CheckpointManager()
+    loop = _make_loop(responder)
+    result = await loop.run(
+        {"model": "m1", "messages": [{"role": "user", "content": "查库存"}], "tools": []},
+        request_id="req-checkpoint",
+        checkpoint=checkpoint,
+    )
+    assert result.status == "complete"
+    assert result.checkpoint_key
+    saved = checkpoint.latest("req-checkpoint")
+    assert saved["actions_count"] == 1
+    assert saved["messages"][-1]["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_loop_restores_latest_checkpoint_on_tool_exception():
+    from core.kernel.checkpoint import CheckpointManager
+
+    calls = 0
+
+    async def execute_tool(name, args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"ok": True}
+        raise RuntimeError("tool unavailable")
+
+    async def responder(payload):
+        return FakeLlmResponse(200, _tool_call_payload([
+            _make_tool_call("query_inventory", {})
+        ]))
+
+    loop = AgentLoop(
+        call_llm=responder,
+        execute_tool=execute_tool,
+        clean_reply=lambda c: c or "",
+        ground_tool_result=lambda r: str(r),
+        max_rounds=2,
+    )
+    checkpoint = CheckpointManager()
+    checkpoint.save(
+        "req-restore",
+        messages=[{"role": "user", "content": "已完成前序"}],
+        actions_count=1,
+    )
+    result = await loop.run(
+        {"model": "m1", "messages": [{"role": "user", "content": "继续"}]},
+        request_id="req-restore",
+        checkpoint=checkpoint,
+    )
+    assert result.status == "tool_error"
+    assert result.degraded
+    assert result.restored_from_checkpoint is True
+    assert result.checkpoint_key
+
+
 # ──────────────────────────────────────────────
 # Telemetry
 # ──────────────────────────────────────────────

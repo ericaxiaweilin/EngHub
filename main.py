@@ -372,6 +372,28 @@ async def _periodic_scheduler():
 
 @app.on_event("startup")
 async def _start_scheduler():
+    # Agent Event Bus：开启 DB 审计持久化（失败不阻断实时事件流）。
+    from core.agent import AgentEventBus
+    from database.db_config import db_config
+    event_persistence_enabled = os.getenv(
+        "AGENT_EVENT_PERSISTENCE_ENABLED", "1"
+    ).lower() not in {"0", "false", "no", "off"}
+    AgentEventBus.get_instance().configure_persistence(
+        db_config.session_factory,
+        enabled=event_persistence_enabled,
+    )
+    _logger.info(
+        "[event-bus] DB persistence %s",
+        "enabled" if event_persistence_enabled else "disabled",
+    )
+    checkpoint_persistence_enabled = os.getenv(
+        "CHECKPOINT_PERSISTENCE_ENABLED", "0"
+    ).lower() not in {"0", "false", "no", "off"}
+    _logger.info(
+        "[checkpoint] DB cold storage %s (migration 084 required)",
+        "enabled" if checkpoint_persistence_enabled else "disabled",
+    )
+
     asyncio.create_task(_periodic_scheduler())
     _logger.info(f"[scheduler] 后台调度器已启动，间隔 {_SCHEDULER_INTERVAL}s")
 

@@ -564,11 +564,20 @@ export default function AIAssistantWidget() {
     { id: createId('welcome'), role: 'assistant', content: '你好！我是 EngHub MES 智能助手，可以回答生产工单、报工、检验、不良品、库存、计划等问题。', time: now() },
   ])
   const [input, setInput] = useState('')
+  // Phase 3：新对话——清空会话并提示
+  const startNewConversation = useCallback(() => {
+    setSessionId(null)
+    setMessages([])
+    setInput('')
+    message.info('已开启新会话（历史已自动保存）')
+  }, [])
   const [replyingTo, setReplyingTo] = useState<ChatMsg | null>(null)
   const [shareMessage, setShareMessage] = useState<ChatMsg | null>(null)
   const [shareTarget, setShareTarget] = useState('info')
   const [loading, setLoading] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
+  // Phase 3：会话持久化——done 事件回传 session_id，下一轮带入
+  const [sessionId, setSessionId] = useState<string | null>(null)
   // 待发送附件（先调 /files/upload 拿 file_id，再随消息提交）
   const [pendingAttachments, setPendingAttachments] = useState<MsgAttachment[]>([])
   const [uploading, setUploading] = useState(false)
@@ -971,6 +980,7 @@ export default function AIAssistantWidget() {
       // 智能体调度：快速命令归类 > 选择器指定；auto 不传，由模型自动调度
       const dispatchAgent = agentKeyOverride || (selectedAgent !== 'auto' ? selectedAgent : undefined)
       if (dispatchAgent) payload.agent_key = dispatchAgent
+      if (sessionId) payload.session_id = sessionId
       const token = localStorage.getItem('token')
       const factoryId = localStorage.getItem('active_factory_id')
       const resp = await fetch('/api/v1/chat/stream', {
@@ -1048,6 +1058,7 @@ export default function AIAssistantWidget() {
               applyUpdate()
             } else if (eventType === 'done') {
               degraded = !!data.degraded
+              if (data.session_id) setSessionId(data.session_id)
               applyUpdate()
             } else if (eventType === 'error') {
               accContent += data.message || '服务异常'
@@ -2131,11 +2142,18 @@ export default function AIAssistantWidget() {
                       )}
                       <Space.Compact style={{ width: '100%' }}>
                         <Button
+                          icon={<PlusOutlined />}
+                          onClick={startNewConversation}
+                          disabled={loading}
+                          title="新对话（开启新会话，历史自动保存）"
+                          style={{ borderRadius: '8px 0 0 8px' }}
+                        />
+                        <Button
                           icon={<PaperClipOutlined />}
                           onClick={onPickFiles}
                           loading={uploading}
                           title="上传图片/文件"
-                          style={{ borderRadius: '8px 0 0 8px' }}
+                          style={{ borderRadius: 0 }}
                         />
                         <TextArea
                           value={input}

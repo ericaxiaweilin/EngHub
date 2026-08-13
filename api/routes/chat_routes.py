@@ -15,12 +15,15 @@ import base64
 import json
 import os
 import re
+import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -47,6 +50,9 @@ MODEL_STACK_CONTROL_PLANE_URL = os.getenv("MODEL_STACK_CONTROL_PLANE_URL", "").r
 MODEL_STACK_CHAT_TASK_ID = os.getenv("MODEL_STACK_CHAT_TASK_ID", "").strip()
 MODEL_STACK_VISION_TASK_ID = os.getenv("MODEL_STACK_VISION_TASK_ID", "").strip()
 MODEL_STACK_ROUTE_TIMEOUT = float(os.getenv("MODEL_STACK_ROUTE_TIMEOUT", "5"))
+CHECKPOINT_PERSISTENCE_ENABLED = os.getenv(
+    "CHECKPOINT_PERSISTENCE_ENABLED", "0"
+).lower() not in {"0", "false", "no", "off"}
 
 SYSTEM_PROMPT = (
     "你是 EngHub MES 制造执行系统的智能助手，可以直接操作系统完成用户的请求。"
@@ -948,6 +954,115 @@ def _get_skill_registry():
     return reg
 
 
+def _checkpoint_options() -> Dict[str, Any]:
+    """按环境开关给 Chat V2 Kernel 注入 checkpoint DB 冷存储。"""
+    if not CHECKPOINT_PERSISTENCE_ENABLED:
+        return {}
+    from database.db_config import db_config
+
+    return {
+        "checkpoint_session_factory": db_config.session_factory,
+        "checkpoint_persistence_enabled": True,
+    }
+
+
+def _chat_factory_id(http_request: Optional[Request], current_user: User) -> str:
+    """解析当前请求工厂；会话访问必须使用同一个解析结果。"""
+    return (
+        (http_request.headers.get("x-factory-id") if http_request else None)
+        or getattr(current_user, "active_factory_id", None)
+        or getattr(current_user, "factory_id", None)
+        or "FAC_MECH_001"
+    )
+
+
+async def _open_chat_session(
+    db: AsyncSession,
+    *,
+    factory_id: str,
+    user: User,
+    session_id: Optional[str],
+    title: Optional[str],
+):
+    """打开会话并把越权/失效 session 转成稳定的 HTTP 403。"""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_or_create_session,
+    )
+
+    try:
+        return await get_or_create_session(
+            db,
+            factory_id=factory_id,
+            user=user,
+            session_id=session_id,
+            title=title,
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+async def _build_chat_history(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    request_messages: List[ChatMessage],
+) -> List[Dict[str, Any]]:
+    """以服务端持久化历史为主，兼容新会话/旧客户端的 messages 回退。"""
+    from api.services.chat_persistence_service import get_history
+
+    client_history = [m.model_dump() for m in request_messages]
+    persisted = await get_history(
+        db,
+        session_id,
+        limit=50,
+        include_tools=False,
+        include_tool_calls=False,
+    )
+    if not persisted:
+        return client_history
+
+    current_user = next(
+        (m for m in reversed(client_history) if m.get("role") == "user"),
+        None,
+    )
+    history = list(persisted)
+    if current_user:
+        # 当前轮尚未落库；历史中最后一条通常是上一轮 assistant。
+        last_persisted = persisted[-1]
+        if not (
+            last_persisted.get("role") == "user"
+            and last_persisted.get("content") == current_user.get("content")
+        ):
+            history.append(current_user)
+    return history
+
+
+def _inject_chat_attachments(
+    history: List[Dict[str, Any]],
+    *,
+    image_records: List[Any],
+    non_image_note: str,
+    fallback_user_text: str,
+) -> None:
+    """只把本轮附件挂到最后一条用户消息，避免重复污染历史轮次。"""
+    injected = False
+    for idx in range(len(history) - 1, -1, -1):
+        if history[idx].get("role") != "user":
+            continue
+        text = history[idx].get("content") or ""
+        if non_image_note:
+            text = f"{text}{non_image_note}"
+        history[idx]["content"] = _build_multimodal_content(text, image_records)
+        injected = True
+        break
+    if not injected and image_records:
+        history.append({
+            "role": "user",
+            "content": _build_multimodal_content(fallback_user_text, image_records),
+        })
+
+
 @router.post("/v2", response_model=ChatResponse)
 async def chat_v2(
     request: ChatRequest,
@@ -960,14 +1075,21 @@ async def chat_v2(
     Phase 3：会话持久化——无 session_id 自动建会话，请求结束落库消息+遥测。
     """
     from core.kernel import HarnessKernel
-    from api.services import chat_persistence_service as chat_persist
 
     operator = current_user.username or current_user.id
-    factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
+    factory_id = _chat_factory_id(http_request, current_user)
+    last_user = next(
+        (m.content for m in reversed(request.messages) if m.role == "user"),
+        "",
+    )
 
     # ── 会话持久化（Phase 3）：取既有或新建 session ──
-    session = await chat_persist.get_or_create_session(
-        db, factory_id=factory_id, user=current_user, session_id=request.session_id,
+    session = await _open_chat_session(
+        db,
+        factory_id=factory_id,
+        user=current_user,
+        session_id=request.session_id,
+        title=last_user,
     )
     session_id = session.id
 
@@ -978,21 +1100,17 @@ async def chat_v2(
     non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
 
     # 历史消息注入附件（图片 → 多模态 content；非图片 → 文字摘要）
-    history = [m.model_dump() for m in request.messages]
-    injected = False
-    for idx in range(len(history) - 1, -1, -1):
-        if history[idx].get("role") == "user":
-            text = history[idx].get("content") or ""
-            if non_image_note:
-                text = f"{text}{non_image_note}"
-            history[idx]["content"] = _build_multimodal_content(text, image_records)
-            injected = True
-            break
-    if not injected and image_records:
-        last_user = next(
-            (m.content for m in reversed(request.messages) if m.role == "user"), ""
-        )
-        history.append({"role": "user", "content": _build_multimodal_content(last_user, image_records)})
+    history = await _build_chat_history(
+        db,
+        session_id=session_id,
+        request_messages=request.messages,
+    )
+    _inject_chat_attachments(
+        history,
+        image_records=image_records,
+        non_image_note=non_image_note,
+        fallback_user_text=last_user,
+    )
 
     prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
 
@@ -1066,6 +1184,7 @@ async def chat_v2(
         persist_hook=persist_after,
         permission_gate=permission_gate,
         model_reviewer=model_reviewer,
+        **_checkpoint_options(),
     )
 
     ctx = await kernel.build_context(
@@ -1497,14 +1616,63 @@ async def chat_stream(
 ):
     """SSE 流式对话：工具执行实时推送 action 事件，最终回复逐 token 流式输出。"""
     operator = current_user.username or current_user.id
-    factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
-
+    factory_id = _chat_factory_id(http_request, current_user)
     last_user = next(
         (m.content for m in reversed(request.messages) if m.role == "user"), ""
     )
 
+    # Phase 3：会话持久化（新建/复用 session；done 事件回传 session_id）
+    from core.kernel.permission import PermissionGate
+    session = await _open_chat_session(
+        db,
+        factory_id=factory_id,
+        user=current_user,
+        session_id=request.session_id,
+        title=last_user,
+    )
+    session_id = session.id
+    round_started = time.monotonic()
+    stream_request_id = f"req-{uuid.uuid4().hex[:12]}"
+
     async def generate():
         actions: List[ToolAction] = []
+        acc_reply = ""  # 累积最终答复（Phase 3 持久化用）
+        stream_degraded = False
+        permission_gate = PermissionGate()
+        try:
+            from core.auth.roles import get_user_permissions
+            stream_permissions = get_user_permissions(current_user) or []
+        except Exception:  # noqa: BLE001
+            stream_permissions = []
+
+        async def persist_stream_round(model: Optional[str] = None) -> None:
+            """流式链路结束时写消息与 telemetry；落库失败不影响 SSE。"""
+            from api.services.chat_persistence_service import (
+                persist_round,
+                save_telemetry,
+            )
+            try:
+                await persist_round(
+                    db,
+                    session_id=session_id,
+                    user_content=last_user or "（图片/附件消息）",
+                    reply=acc_reply or "（本轮无文本回复）",
+                    model=model,
+                    actions=actions,
+                    request_id=stream_request_id,
+                    duration_ms=(time.monotonic() - round_started) * 1000,
+                )
+                await save_telemetry(
+                    db,
+                    request_id=stream_request_id,
+                    session_id=session_id,
+                    model=model,
+                    tools_called=[a.tool for a in actions],
+                    rounds=len(actions),
+                    success=not stream_degraded,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         # ---- 加载附件 ----
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
@@ -1516,12 +1684,20 @@ async def chat_stream(
         try:
             route = await _resolve_model_route(task_id, prompt_tokens=prompt_tokens)
         except Exception as exc:  # noqa: BLE001
+            stream_degraded = True
+            acc_reply = _degraded_message(
+                f"模型底座路由失败 ({type(exc).__name__})"
+            )
             yield _sse("delta", {
-                "content": _degraded_message(
-                    f"模型底座路由失败 ({type(exc).__name__})"
-                ),
+                "content": acc_reply,
             })
-            yield _sse("done", {"model": task_id, "degraded": True})
+            yield _sse("done", {
+                "model": task_id,
+                "degraded": True,
+                "session_id": session_id,
+                "request_id": stream_request_id,
+            })
+            await persist_stream_round(task_id)
             return
 
         # ---- Excel/CSV 附件 → 推送结构化表格事件（前端渲染可交互表格 + Univer 电子表格） ----
@@ -1539,19 +1715,18 @@ async def chat_stream(
             if agent_prompt:
                 messages.append({"role": "system", "content": agent_prompt})
                 await record_agent_dispatch(db, factory_id, request.agent_key, last_user)
-        history = [m.model_dump() for m in request.messages]
+        history = await _build_chat_history(
+            db,
+            session_id=session_id,
+            request_messages=request.messages,
+        )
         non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
-        injected = False
-        for idx in range(len(history) - 1, -1, -1):
-            if history[idx].get("role") == "user":
-                text = history[idx].get("content") or ""
-                if non_image_note:
-                    text = f"{text}{non_image_note}"
-                history[idx]["content"] = _build_multimodal_content(text, image_records)
-                injected = True
-                break
-        if not injected and image_records:
-            history.append({"role": "user", "content": _build_multimodal_content(last_user, image_records)})
+        _inject_chat_attachments(
+            history,
+            image_records=image_records,
+            non_image_note=non_image_note,
+            fallback_user_text=last_user,
+        )
         messages += history
 
         payload: Dict[str, Any] = {
@@ -1576,6 +1751,7 @@ async def chat_stream(
                     text = delta.get("content") or ""
                     if text:
                         streamed_content.append(text)
+                        acc_reply += text
                         yield _sse("delta", {"content": text})
                     _merge_stream_tool_calls(
                         streamed_tool_calls,
@@ -1589,10 +1765,19 @@ async def chat_stream(
                 ]
                 if not tool_calls:
                     if not streamed_content:
-                        yield _sse("delta", {"content": _degraded_message("网关无有效回复")})
-                        yield _sse("done", {"model": route["task_id"], "degraded": True})
+                        stream_degraded = True
+                        acc_reply = _degraded_message("网关无有效回复")
+                        yield _sse("delta", {"content": acc_reply})
+                        yield _sse("done", {
+                            "model": route["task_id"],
+                            "degraded": True,
+                            "session_id": session_id,
+                            "request_id": stream_request_id,
+                        })
                         return
-                    yield _sse("done", {"model": route["task_id"], "degraded": False})
+                    yield _sse("done", {"model": route["task_id"], "degraded": False,
+                                        "session_id": session_id,
+                                        "request_id": stream_request_id})
                     return
 
                 # 模型通过流协议下发工具调用，后端执行并实时推送 action。
@@ -1608,7 +1793,28 @@ async def chat_stream(
                         arguments = json.loads(fn.get("arguments") or "{}")
                     except (json.JSONDecodeError, TypeError):
                         arguments = {}
-                    result = await execute_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+                    permission_error = None
+                    if stream_permissions:
+                        permission_error = permission_gate.check(
+                            tool_name=tool_name,
+                            ctx=SimpleNamespace(user=current_user),
+                            user_permissions=stream_permissions,
+                            operator=operator,
+                            factory_id=factory_id,
+                        )
+                    if permission_error:
+                        result = {
+                            "error": permission_error,
+                            "permission_denied": True,
+                        }
+                    else:
+                        result = await execute_tool(
+                            db,
+                            tool_name,
+                            arguments,
+                            operator=operator,
+                            factory_id=factory_id,
+                        )
                     is_error = "error" in result
                     action = ToolAction(
                         tool=tool_name,
@@ -1661,11 +1867,22 @@ async def chat_stream(
                     "max_tokens": route["max_completion_tokens"],
                 }
 
-            yield _sse("delta", {"content": "操作轮次过多，已停止。请简化您的请求后重试。"})
-            yield _sse("done", {"model": route["task_id"], "degraded": True})
+            stream_degraded = True
+            acc_reply = "操作轮次过多，已停止。请简化您的请求后重试。"
+            yield _sse("delta", {"content": acc_reply})
+            yield _sse("done", {"model": route["task_id"], "degraded": True,
+                                "session_id": session_id,
+                                "request_id": stream_request_id})
         except Exception as exc:  # noqa: BLE001
+            stream_degraded = True
             yield _sse("delta", {"content": _degraded_message(f"网关连接失败 ({type(exc).__name__})")})
-            yield _sse("done", {"model": route["task_id"], "degraded": True})
+            yield _sse("done", {"model": route["task_id"], "degraded": True,
+                                "session_id": session_id, "request_id": stream_request_id})
+        finally:
+            # Phase 3：本轮落库（user + assistant 草稿 + 工具轨迹 + telemetry）。
+            await persist_stream_round(
+                route.get("gateway_model") if "route" in locals() else None
+            )
 
     return StreamingResponse(
         generate(),
@@ -1682,23 +1899,62 @@ async def chat_stream(
 @router.get("/trace/{request_id}")
 async def chat_trace(
     request_id: str,
+    http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """单次请求的完整执行链：会话 + 消息 + 遥测。"""
-    from api.services.chat_persistence_service import get_trace
-    return await get_trace(db, request_id)
+    from api.services.chat_persistence_service import ChatSessionAccessError, get_trace
+    try:
+        return await get_trace(
+            db,
+            request_id,
+            user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @router.get("/replay/{session_id}")
 async def chat_replay(
     session_id: str,
+    http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """会话回放：按时间序返回全部消息（含工具轨迹）。"""
-    from api.services.chat_persistence_service import get_trace
-    return await get_trace(db, None, session_id=session_id)
+    from api.services.chat_persistence_service import ChatSessionAccessError, get_trace
+    try:
+        return await get_trace(
+            db,
+            None,
+            session_id=session_id,
+            user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/sessions")
+async def chat_sessions(
+    http_request: Request = None,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """当前用户在当前工厂的会话列表，供会话恢复 UI 使用。"""
+    from api.services.chat_persistence_service import list_sessions
+
+    return {
+        "sessions": await list_sessions(
+            db,
+            user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+            limit=max(1, min(limit, 100)),
+        )
+    }
 
 
 @router.get("/plugins")
@@ -1816,6 +2072,7 @@ async def chat_eval_run(
         legacy_execute_tool=bound_execute,
         permission_gate=PermissionGate(),
         model_reviewer=ModelReviewer(call_llm=_call_llm, clean_reply=_clean_model_reply),
+        **_checkpoint_options(),
     )
     ctx = await kernel.build_context(
         factory_id=factory_id, user=current_user,

@@ -23,5 +23,11 @@
   "chatbot_tickets": ["id", "ticket_code", "requester_id", "status"],
   "deterministic_logic_chains": ["id", "chain_code", "trigger_event", "enabled"],
   "inbound_orders": ["purchase_order_id", "location_id", "completed_at"],
-  "wo_status_logs": ["id", "work_order_id", "action", "to_status", "operator", "created_at"]
+  "wo_status_logs": ["id", "work_order_id", "action", "to_status", "operator", "created_at"],
+  "chat_sessions": ["id", "factory_id", "user_id", "title", "metadata", "created_at", "updated_at"],
+  "chat_messages": ["id", "session_id", "role", "content", "tool_calls", "tool_results", "model", "tokens_used", "duration_ms", "request_id", "created_at"],
+  "chat_telemetry": ["id", "request_id", "session_id", "phase", "duration_ms", "model", "provider", "tools_called", "rounds", "success", "error", "created_at"],
+  "chat_eval_cases": ["id", "name", "prompt", "expected_tool", "expected_reply_keyword", "model", "factory_id", "enabled", "created_at"],
+  "agent_events": ["id", "event_id", "event_type", "agent_key", "factory_id", "task_id", "data", "created_at"],
+  "agent_checkpoints": ["id", "checkpoint_key", "request_id", "messages", "messages_fp", "message_count", "actions_count", "created_at"]
 }
