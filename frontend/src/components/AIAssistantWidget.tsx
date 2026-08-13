@@ -583,6 +583,8 @@ export default function AIAssistantWidget() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   // 待发送附件（先调 /files/upload 拿 file_id，再随消息提交）
   const [pendingAttachments, setPendingAttachments] = useState<MsgAttachment[]>([])
+  // React state 更新是异步的；用 ref 保证“上传刚完成就按 Enter”时不会丢 file_id。
+  const pendingAttachmentsRef = useRef<MsgAttachment[]>([])
   const [uploading, setUploading] = useState(false)
   const uploadingRef = useRef(false)
   const previewUrlsRef = useRef<Set<string>>(new Set())
@@ -959,13 +961,14 @@ export default function AIAssistantWidget() {
   const sendMessage = async (preset?: string, agentKeyOverride?: string) => {
     const text = (preset ?? input).trim()
     if (loading || uploadingRef.current) return
-    if (!text && pendingAttachments.length === 0) return
-    const atts = [...pendingAttachments]
+    const atts = [...pendingAttachmentsRef.current]
+    if (!text && atts.length === 0) return
     const quote = replyingTo
       ? { id: replyingTo.id, role: replyingTo.role, content: quotePreview(replyingTo.content) }
       : undefined
     setInput('')
     setReplyingTo(null)
+    pendingAttachmentsRef.current = []
     setPendingAttachments([])
     const userMsg: ChatMsg = { id: createId('user'), role: 'user', content: text, time: now(), attachments: atts, quote }
     const history = [...messages, userMsg]
@@ -1275,14 +1278,17 @@ export default function AIAssistantWidget() {
           const res: any = await api.post('/api/v1/files/upload', fd, {
             headers: { 'Content-Type': undefined },  // 让浏览器自动设置 multipart/form-data boundary
           })
-          setPendingAttachments(prev => [...prev, {
+          const attachment: MsgAttachment = {
             file_id: res.id,
             filename: res.filename,
             content_type: res.content_type,
             is_image: res.is_image,
             size: res.size,
             preview_url: previewUrl,
-          }])
+          }
+          const nextAttachments = [...pendingAttachmentsRef.current, attachment]
+          pendingAttachmentsRef.current = nextAttachments
+          setPendingAttachments(nextAttachments)
           successCount += 1
         } catch {
           failedCount += 1
@@ -1330,14 +1336,14 @@ export default function AIAssistantWidget() {
   }
 
   const removePendingAttachment = (fileId: string) => {
-    setPendingAttachments(prev => {
-      const target = prev.find(item => item.file_id === fileId)
-      if (target?.preview_url) {
-        URL.revokeObjectURL(target.preview_url)
-        previewUrlsRef.current.delete(target.preview_url)
-      }
-      return prev.filter(item => item.file_id !== fileId)
-    })
+    const target = pendingAttachmentsRef.current.find(item => item.file_id === fileId)
+    if (target?.preview_url) {
+      URL.revokeObjectURL(target.preview_url)
+      previewUrlsRef.current.delete(target.preview_url)
+    }
+    const nextAttachments = pendingAttachmentsRef.current.filter(item => item.file_id !== fileId)
+    pendingAttachmentsRef.current = nextAttachments
+    setPendingAttachments(nextAttachments)
   }
 
   // ---------- 下载系统文件（带鉴权 token，导出报告/附件通用） ----------

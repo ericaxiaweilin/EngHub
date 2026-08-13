@@ -982,6 +982,42 @@ def _attachment_text_note(
     return "\n".join(lines)
 
 
+def _is_attachment_analysis_request(text: str) -> bool:
+    """判断用户是否在要求读取/解析本轮附件，而不是普通业务问答。"""
+    return bool(re.search(r"文件|附件|表格|xlsx|xls|csv|numbers|解析|读取|导入|分析", text or "", re.I))
+
+
+def _unsupported_attachment_message(
+    records: List[FileRecord],
+    spreadsheet_tables: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """对已收到但暂不能解析的附件给出确定性提示，禁止模型误报“未收到文件”。"""
+    tables = spreadsheet_tables or {}
+    for rec in records:
+        if _is_image_record(rec):
+            continue
+        if _is_spreadsheet_record(rec) and tables.get(str(rec.id)):
+            continue
+        filename = rec.filename or "未命名文件"
+        suffix = Path(filename).suffix.lower()
+        if suffix == ".numbers" or "iwork-numbers" in (rec.content_type or "").lower():
+            return (
+                f"已收到附件《{filename}》，但它实际是 Apple Numbers 格式（.numbers），不是 XLSX。\n\n"
+                "当前 Chatbot 暂不能直接读取 Numbers 文件内容。请在 Numbers 中选择“文件 → 导出到 → Excel（.xlsx）”，"
+                "再重新上传导出的 .xlsx 文件，我就可以继续解析。"
+            )
+        if _is_spreadsheet_record(rec):
+            return (
+                f"已收到表格附件《{filename}》，但当前文件无法解析。\n\n"
+                "请确认文件未损坏，并另存为标准 .xlsx 后重新上传。"
+            )
+        return (
+            f"已收到附件《{filename}》（{rec.content_type or '未知格式'}），但当前 Chatbot 暂不能读取该文件格式。\n\n"
+            "请上传 .xlsx、.xlsm 或 .csv 文件后再试。"
+        )
+    return None
+
+
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -1085,6 +1121,17 @@ async def chat(
         non_image_records,
         spreadsheet_tables=spreadsheet_tables,
     )
+    unsupported_attachment = _unsupported_attachment_message(
+        non_image_records,
+        spreadsheet_tables,
+    )
+    if unsupported_attachment and _is_attachment_analysis_request(last_user):
+        return ChatResponse(
+            reply=unsupported_attachment,
+            model="attachment-parser",
+            degraded=False,
+            actions=actions,
+        )
     task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
     prompt_tokens = max(
         1,
@@ -1396,6 +1443,18 @@ async def chat_v2(
         non_image_records,
         spreadsheet_tables=spreadsheet_tables,
     )
+    unsupported_attachment = _unsupported_attachment_message(
+        non_image_records,
+        spreadsheet_tables,
+    )
+    if unsupported_attachment and _is_attachment_analysis_request(last_user):
+        return ChatResponse(
+            reply=unsupported_attachment,
+            model="attachment-parser",
+            degraded=False,
+            actions=[],
+            session_id=session_id,
+        )
 
     # 历史消息注入附件（图片 → 多模态 content；非图片 → 文字摘要）
     history = await _build_chat_history(
@@ -2085,6 +2144,22 @@ async def chat_stream(
                 "request_id": stream_request_id,
             })
             await persist_stream_round("pmc-control-tower")
+            return
+
+        unsupported_attachment = _unsupported_attachment_message(
+            non_image_records,
+            spreadsheet_tables,
+        )
+        if unsupported_attachment and _is_attachment_analysis_request(last_user):
+            acc_reply = unsupported_attachment
+            yield _sse("delta", {"content": acc_reply})
+            yield _sse("done", {
+                "model": "attachment-parser",
+                "degraded": False,
+                "session_id": session_id,
+                "request_id": stream_request_id,
+            })
+            await persist_stream_round("attachment-parser")
             return
 
         task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
