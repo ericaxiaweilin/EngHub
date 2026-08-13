@@ -79,10 +79,12 @@ class HarnessKernel:
         skill_registry: Any = None,
         legacy_execute_tool: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         persist_hook: Optional[Callable[[KernelContext, "KernelResponse"], Awaitable[None]]] = None,
+        permission_gate: Any = None,
     ) -> None:
         self.db = db
         self._active_ctx = None
         self._persist_hook = persist_hook
+        self._permission_gate = permission_gate
         self._resolve_model_route = resolve_model_route
         self._tool_definitions = tool_definitions or []
         self._system_prompt = system_prompt
@@ -93,13 +95,12 @@ class HarnessKernel:
         self._telemetry = telemetry or Telemetry.get_instance()
         self._checkpoints = CheckpointManager()
         self._skill_registry = skill_registry
-        # skill_registry 开启时，execute_tool 优先走 Skill；未迁移工具或哨兵回退到 legacy。
+        # execute_tool 统一走 _skill_execute_tool：始终先做权限门控，
+        # 再有 Skill → legacy 回退（skill_registry 可空）。
         self._legacy_execute_tool = legacy_execute_tool or execute_tool
-        if skill_registry is not None:
-            execute_tool = self._skill_execute_tool
         self._loop = AgentLoop(
             call_llm=call_llm,
-            execute_tool=execute_tool,
+            execute_tool=self._skill_execute_tool,
             clean_reply=clean_reply,
             ground_tool_result=ground_tool_result,
             verify_reply=verify_reply,
@@ -120,13 +121,7 @@ class HarnessKernel:
                 # 1) 构建 payload（含 system prompt / 工具定义 / 路由）
                 payload = self._build_payload(ctx)
 
-                # 2) 权限门控：写工具放行条件先验检查（基础版）
-                gate_error = self._permission_gate(ctx)
-                if gate_error:
-                    return KernelResponse(
-                        reply=gate_error, model=ctx.model_route.get("gateway_model", ""),
-                        degraded=True, request_id=request_id,
-                    )
+                # 2) 工具级权限门控在 _skill_execute_tool / legacy 执行前逐工具校验
 
                 # 3) Agent Loop（内部每轮写 checkpoint）
                 loop_result = await self._loop.run(payload)
@@ -191,16 +186,6 @@ class HarnessKernel:
         payload["_task_id"] = task_id
         return payload
 
-    def _permission_gate(self, ctx: KernelContext) -> Optional[str]:
-        """基础权限门控：Phase 1 仅校验用户是否持有操作权限。
-
-        Phase 4 将扩展为：角色 → 工具级 ACL + 工厂隔离 + 写操作审计。
-        """
-        if not ctx.permissions:
-            return None
-        # 当前不做硬拒绝；预留扩展点。
-        return None
-
     def _telemetry_trace_event(self, ctx: KernelContext, **kwargs: Any):
         from core.kernel.telemetry import TelemetryEvent
 
@@ -217,14 +202,19 @@ class HarnessKernel:
     ) -> Dict[str, Any]:
         """execute_tool 的 Skill 优先版本。
 
+        - 权限门控：不通过 → 返回拒绝结果（不执行）
         - 注册表有该工具 → 走 Skill
         - Skill 返回 LEGACY_FALLBACK 哨兵 → 回退 legacy
         - 注册表无该工具 → 直接回退 legacy
         """
         from core.skills.registry import is_legacy_fallback
 
+        active = self._active_ctx
+        gate_error = self._check_permission(tool_name, arguments, active)
+        if gate_error:
+            return {"error": gate_error, "permission_denied": True}
+
         if self._skill_registry is not None and self._skill_registry.has_tool(tool_name):
-            active = self._active_ctx
             operator = active.operator if active else "ai_assistant"
             factory_id = active.factory_id if active else None
             result = await self._skill_registry.execute(
@@ -238,6 +228,29 @@ class HarnessKernel:
         if self._legacy_execute_tool is not None:
             return await self._legacy_execute_tool(tool_name, arguments)
         return {"error": f"未知工具：{tool_name}"}
+
+    def _check_permission(
+        self, tool_name: str, arguments: Dict[str, Any], ctx: Optional[KernelContext],
+    ) -> Optional[str]:
+        """权限门控：基于用户权限集 + 作用域。未配置 gate 时不拦截。"""
+        if self._permission_gate is None or ctx is None:
+            return None
+        from core.auth.roles import get_user_permissions
+        user_perm_list = []
+        try:
+            perms = get_user_permissions(ctx.user) or []
+        except Exception:  # noqa: BLE001
+            perms = []
+        if not perms:
+            user_perm_list = list(getattr(ctx, "permissions", set()) or [])
+            if not user_perm_list:
+                # 无权限集信息：不硬拦截（V2 前端可能不上权限），交由后续阶段收紧
+                return None
+            perms = user_perm_list
+        return self._permission_gate.check(
+            tool_name=tool_name, ctx=ctx, user_permissions=perms,
+            operator=ctx.operator, factory_id=ctx.factory_id,
+        )
 
     # ── 供路由层使用的辅助 ──
 
@@ -263,6 +276,13 @@ class HarnessKernel:
         )
         task_id = self._vision_task_id if has_images else self._chat_task_id
         route = await self._resolve_model_route(task_id, prompt_tokens=prompt_tokens)
+        # 若调用方未显式传入权限集，则由用户角色推导（Phase 4）
+        if not permissions:
+            try:
+                from core.auth.roles import get_user_permissions
+                permissions = set(str(p) for p in get_user_permissions(user))
+            except Exception:  # noqa: BLE001
+                permissions = set()
         return KernelContext(
             request_id=request_id,
             factory_id=factory_id,

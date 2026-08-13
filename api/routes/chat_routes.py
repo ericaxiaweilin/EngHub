@@ -1012,6 +1012,10 @@ async def chat_v2(
     # Chat V2 Kernel；启用 Skill 优先（未迁移工具自动回退 legacy execute_tool）。
     skill_registry = _get_skill_registry()
 
+    # Phase 4：权限门控（基于用户权限集 + 数据作用域）
+    from core.kernel.permission import PermissionGate
+    permission_gate = PermissionGate()
+
     async def persist_after(ctx, response):
         """Phase 3：请求结束后落库（消息 + 遥测）。"""
         from api.services import chat_persistence_service as cp
@@ -1052,6 +1056,7 @@ async def chat_v2(
         skill_registry=skill_registry,
         legacy_execute_tool=bound_execute,
         persist_hook=persist_after,
+        permission_gate=permission_gate,
     )
 
     ctx = await kernel.build_context(
