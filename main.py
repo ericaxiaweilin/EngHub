@@ -399,6 +399,10 @@ async def _start_scheduler():
     asyncio.create_task(_periodic_scheduler())
     _logger.info(f"[scheduler] 后台调度器已启动，间隔 {_SCHEDULER_INTERVAL}s")
 
+    # Chatbot 模型预热：避免上游空闲后首个用户请求撞上冷启动超时。
+    from api.routes.chat_routes import model_warmup_loop
+    asyncio.create_task(model_warmup_loop())
+
     # 幂等技能种子：确保 skills + hr_employee_skills 数据存在（防 DB 重建后丢失）
     from scripts.seed_skills_startup import run_skill_seed
     asyncio.create_task(run_skill_seed())

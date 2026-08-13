@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import time
@@ -40,6 +41,7 @@ from api.services.quick_command_service import (
 )
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
+_logger = logging.getLogger("enghub.chat")
 
 # --- 模型底座接入配置 ---
 GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://host.docker.internal:14040").rstrip("/")
@@ -50,6 +52,17 @@ MODEL_STACK_CONTROL_PLANE_URL = os.getenv("MODEL_STACK_CONTROL_PLANE_URL", "").r
 MODEL_STACK_CHAT_TASK_ID = os.getenv("MODEL_STACK_CHAT_TASK_ID", "").strip()
 MODEL_STACK_VISION_TASK_ID = os.getenv("MODEL_STACK_VISION_TASK_ID", "").strip()
 MODEL_STACK_ROUTE_TIMEOUT = float(os.getenv("MODEL_STACK_ROUTE_TIMEOUT", "5"))
+MODEL_COLD_START_RETRY_TIMEOUT = max(
+    REQUEST_TIMEOUT,
+    float(os.getenv("LLM_COLD_START_RETRY_TIMEOUT", "90")),
+)
+MODEL_WARMUP_ENABLED = os.getenv("LLM_WARMUP_ENABLED", "1").lower() not in {
+    "0", "false", "no", "off",
+}
+MODEL_WARMUP_INTERVAL_SECONDS = max(
+    60.0,
+    float(os.getenv("LLM_WARMUP_INTERVAL_SECONDS", "600")),
+)
 CHECKPOINT_PERSISTENCE_ENABLED = os.getenv(
     "CHECKPOINT_PERSISTENCE_ENABLED", "0"
 ).lower() not in {"0", "false", "no", "off"}
@@ -94,6 +107,16 @@ SYSTEM_PROMPT = (
     "最终回答只输出面向用户的结论，禁止输出 <think>、推理过程、内部分析或工具选择过程。\n"
     "请用简洁专业的中文回答制造与车间管理相关问题。"
 )
+
+_model_warmup_lock = asyncio.Lock()
+_model_warmup_state: Dict[str, Any] = {
+    "enabled": MODEL_WARMUP_ENABLED,
+    "interval_seconds": MODEL_WARMUP_INTERVAL_SECONDS,
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_ok": None,
+    "last_error": None,
+}
 
 TOOL_RESULT_GROUNDING = (
     "以下 JSON 是本次回答唯一可用的业务事实。只陈述 JSON 明确提供的数据，"
@@ -191,6 +214,7 @@ async def chat_health():
         "gateway": GATEWAY_URL,
         "control_plane": MODEL_STACK_CONTROL_PLANE_URL,
         "detail": detail,
+        "warmup": dict(_model_warmup_state),
     }
 
 
@@ -306,6 +330,78 @@ async def _call_llm(
             json=payload,
             headers=headers,
         )
+
+
+async def _warm_model_once(reason: str = "interval") -> bool:
+    """Send a tiny no-tools request so a sleeping upstream is ready for users.
+
+    This is deliberately separate from user traffic.  It never executes MES
+    tools and it is guarded by a lock so startup and interval ticks cannot
+    create concurrent warmup requests.
+    """
+    if not MODEL_WARMUP_ENABLED or not MODEL_STACK_CHAT_TASK_ID:
+        return False
+    async with _model_warmup_lock:
+        started = time.monotonic()
+        _model_warmup_state["last_started_at"] = time.time()
+        _model_warmup_state["last_error"] = None
+        try:
+            route = await _resolve_model_route(
+                MODEL_STACK_CHAT_TASK_ID,
+                prompt_tokens=8,
+                max_completion_tokens=1,
+            )
+            response = await _call_llm(
+                {
+                    "model": route["gateway_model"],
+                    "messages": [{
+                        "role": "user",
+                        "content": "连接预热。只回复 OK。",
+                    }],
+                    "temperature": 0,
+                    "max_tokens": 1,
+                },
+                request_timeout=max(
+                    route["request_timeout"],
+                    MODEL_COLD_START_RETRY_TIMEOUT,
+                ),
+            )
+            response.raise_for_status()
+            _model_warmup_state["last_ok"] = True
+            _logger.info(
+                "[model-warmup] ok reason=%s model=%s elapsed_ms=%.0f",
+                reason,
+                route["gateway_model"],
+                (time.monotonic() - started) * 1000,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _model_warmup_state["last_ok"] = False
+            _model_warmup_state["last_error"] = type(exc).__name__
+            _logger.warning(
+                "[model-warmup] failed reason=%s error=%s elapsed_ms=%.0f",
+                reason,
+                type(exc).__name__,
+                (time.monotonic() - started) * 1000,
+            )
+            return False
+        finally:
+            _model_warmup_state["last_finished_at"] = time.time()
+
+
+async def model_warmup_loop() -> None:
+    """Keep the selected Chatbot route warm across upstream idle periods."""
+    if not MODEL_WARMUP_ENABLED:
+        _logger.info("[model-warmup] disabled by LLM_WARMUP_ENABLED")
+        return
+    _logger.info(
+        "[model-warmup] started interval=%ss retry_timeout=%ss",
+        int(MODEL_WARMUP_INTERVAL_SECONDS),
+        int(MODEL_COLD_START_RETRY_TIMEOUT),
+    )
+    while True:
+        await _warm_model_once("startup" if _model_warmup_state["last_finished_at"] is None else "interval")
+        await asyncio.sleep(MODEL_WARMUP_INTERVAL_SECONDS)
 
 
 def _clean_model_reply(content: str) -> str:
@@ -1750,29 +1846,52 @@ async def _stream_llm_deltas(
         "stream": True,
         "cache": {"no-cache": True},
     }
-    async with httpx.AsyncClient(timeout=request_timeout) as client:
-        async with client.stream(
-            "POST",
-            f"{GATEWAY_URL}/v1/chat/completions",
-            json=stream_payload,
-            headers=headers,
-        ) as resp:
-            if resp.status_code >= 400:
-                body = await resp.aread()
-                raise RuntimeError(
-                    f"gateway {resp.status_code}: {body[:300].decode(errors='replace')}"
-                )
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    yield chunk.get("choices", [{}])[0].get("delta", {}) or {}
-                except (json.JSONDecodeError, IndexError, KeyError):
-                    continue
+    base_timeout = max(5.0, float(request_timeout))
+    timeouts = (base_timeout, max(base_timeout, MODEL_COLD_START_RETRY_TIMEOUT))
+    emitted_any = False
+    for attempt, read_timeout in enumerate(timeouts, start=1):
+        try:
+            timeout = httpx.Timeout(
+                read=read_timeout,
+                connect=min(10.0, read_timeout),
+                write=min(30.0, read_timeout),
+                pool=min(10.0, read_timeout),
+            )
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{GATEWAY_URL}/v1/chat/completions",
+                    json=stream_payload,
+                    headers=headers,
+                ) as resp:
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        raise RuntimeError(
+                            f"gateway {resp.status_code}: {body[:300].decode(errors='replace')}"
+                        )
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {}) or {}
+                            if delta:
+                                emitted_any = True
+                            yield delta
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            continue
+            return
+        except httpx.ReadTimeout:
+            if attempt >= len(timeouts) or emitted_any:
+                raise
+            _logger.warning(
+                "[model-stream] cold-start timeout; retrying with extended read timeout=%ss",
+                int(timeouts[1]),
+            )
+            await asyncio.sleep(0.25)
 
 
 def _merge_stream_tool_calls(
