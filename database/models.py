@@ -2409,3 +2409,60 @@ class RushOrderApprovalLog(Base):
     actor_role = Column(String(50))
     comment = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ============================================================
+# Chat 持久化（Phase 3 — 会话/消息/遥测）
+# ============================================================
+
+class ChatSession(Base):
+    """Chat 会话（前端新建对话 → 后端建 session；后续请求带入 session_id）。"""
+    __tablename__ = "chat_sessions"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(32), nullable=False, index=True)
+    user_id = Column(String(36), index=True)          # username 或 User.id
+    title = Column(String(255), nullable=True)
+    metadata_ = Column("metadata", JSON().with_variant(JSONB, "postgresql"), default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class ChatMessage(Base):
+    """Chat 消息——按会话顺序追加，供 Trace/Replay/Eval 重建执行链。"""
+    __tablename__ = "chat_messages"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    session_id = Column(String(36), ForeignKey("chat_sessions.id"), nullable=False, index=True)
+    role = Column(String(16), nullable=False)         # user | assistant | tool | system
+    content = Column(Text, nullable=True)
+    tool_calls = Column(JSON().with_variant(JSONB, "postgresql"), default=None)   # assistant 的工具调用
+    tool_results = Column(JSON().with_variant(JSONB, "postgresql"), default=None) # 工具执行结果
+    model = Column(String(64), nullable=True)
+    tokens_used = Column(Integer, default=0)
+    duration_ms = Column(Integer, default=0)
+    request_id = Column(String(64), index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    session = relationship("ChatSession", backref="messages")
+
+
+class ChatTelemetry(Base):
+    """Chat 请求遥测——一次 handle() 一个 telemetry 事件（Trace 的骨架）。"""
+    __tablename__ = "chat_telemetry"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    request_id = Column(String(64), nullable=False, index=True)
+    session_id = Column(String(36), ForeignKey("chat_sessions.id"), index=True)
+    phase = Column(String(32), nullable=False)
+    duration_ms = Column(Numeric(10, 2), default=0)
+    model = Column(String(64), nullable=True)
+    provider = Column(String(32), nullable=True)
+    tools_called = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    rounds = Column(Integer, default=0)
+    success = Column(Boolean, default=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

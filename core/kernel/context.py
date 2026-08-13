@@ -44,6 +44,10 @@ class KernelContext:
     # ── 元数据（Telemetry / hooks 可写）──
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # ── 会话持久化（Phase 3）──
+    history_loaded: bool = False    # 是否已从 DB 加载历史（Trace/Replay）
+    persist_hook: Any = None        # async(session_id, ctx, response) 落库钩子
+
     @property
     def last_user_content(self) -> str:
         """取最后一条用户纯文本（仅 content 为 str 时）。"""

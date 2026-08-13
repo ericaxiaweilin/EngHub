@@ -116,6 +116,7 @@ class ChatRequest(BaseModel):
     enable_tools: bool = True  # 是否启用工具调用
     attachments: List[Attachment] = Field(default_factory=list)  # 本轮用户消息附带的附件
     agent_key: Optional[str] = None  # 指定调度的智能体（空=自动，由模型自行选择工具）
+    session_id: Optional[str] = None  # Chat V2 会话 ID（新建对话传空）
 
 
 class ToolAction(BaseModel):
@@ -135,6 +136,8 @@ class ChatResponse(BaseModel):
     degraded: bool = False
     actions: List[ToolAction] = Field(default_factory=list)
     diagrams: List[Dict[str, Any]] = Field(default_factory=list)
+    session_id: Optional[str] = None  # Chat V2：供前端带入下一轮
+    request_id: Optional[str] = None  # Chat V2：Trace 锚点
 
 
 @router.get("/health")
@@ -952,11 +955,21 @@ async def chat_v2(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
-    """Chat V2（Harness Kernel 链路）。与 V1 行为等价，返回结构相同。"""
+    """Chat V2（Harness Kernel 链路）。与 V1 行为等价，返回结构相同。
+
+    Phase 3：会话持久化——无 session_id 自动建会话，请求结束落库消息+遥测。
+    """
     from core.kernel import HarnessKernel
+    from api.services import chat_persistence_service as chat_persist
 
     operator = current_user.username or current_user.id
     factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
+
+    # ── 会话持久化（Phase 3）：取既有或新建 session ──
+    session = await chat_persist.get_or_create_session(
+        db, factory_id=factory_id, user=current_user, session_id=request.session_id,
+    )
+    session_id = session.id
 
     # 附件加载与 V1 一致
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
@@ -999,6 +1012,26 @@ async def chat_v2(
     # Chat V2 Kernel；启用 Skill 优先（未迁移工具自动回退 legacy execute_tool）。
     skill_registry = _get_skill_registry()
 
+    async def persist_after(ctx, response):
+        """Phase 3：请求结束后落库（消息 + 遥测）。"""
+        from api.services import chat_persistence_service as cp
+        last_user = ctx.last_user_content
+        await cp.persist_round(
+            db, session_id=session_id,
+            user_content=last_user or "（图片/附件消息）",
+            reply=response.reply,
+            model=response.model,
+            actions=response.actions,
+            request_id=ctx.request_id,
+        )
+        await cp.save_telemetry(
+            db, request_id=ctx.request_id, session_id=session_id,
+            model=response.model,
+            tools_called=[a.tool for a in response.actions],
+            rounds=len(response.actions),
+            success=not response.degraded,
+        )
+
     kernel = HarnessKernel(
         db=db,
         call_llm=_call_llm,
@@ -1018,6 +1051,7 @@ async def chat_v2(
         max_tool_rounds=MAX_TOOL_ROUNDS,
         skill_registry=skill_registry,
         legacy_execute_tool=bound_execute,
+        persist_hook=persist_after,
     )
 
     ctx = await kernel.build_context(
@@ -1028,6 +1062,7 @@ async def chat_v2(
         enable_tools=request.enable_tools,
         agent_key=request.agent_key,
         temperature=request.temperature,
+        session_id=session_id,
         prompt_tokens=prompt_tokens,
     )
     result = await kernel.handle(ctx)
@@ -1038,6 +1073,8 @@ async def chat_v2(
         degraded=result.degraded,
         actions=result.actions,
         diagrams=result.diagrams,
+        session_id=session_id,
+        request_id=result.request_id,
     )
 
 

@@ -78,9 +78,11 @@ class HarnessKernel:
         telemetry: Optional[Telemetry] = None,
         skill_registry: Any = None,
         legacy_execute_tool: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        persist_hook: Optional[Callable[[KernelContext, "KernelResponse"], Awaitable[None]]] = None,
     ) -> None:
         self.db = db
         self._active_ctx = None
+        self._persist_hook = persist_hook
         self._resolve_model_route = resolve_model_route
         self._tool_definitions = tool_definitions or []
         self._system_prompt = system_prompt
@@ -132,7 +134,7 @@ class HarnessKernel:
                     if self._checkpoints.has(request_id) else None
 
                 # 4) 组装响应
-                return KernelResponse(
+                response = KernelResponse(
                     reply=loop_result.reply,
                     model=loop_result.model or ctx.model_route.get("gateway_model", ""),
                     degraded=loop_result.degraded,
@@ -140,6 +142,15 @@ class HarnessKernel:
                     diagrams=loop_result.diagrams,
                     request_id=request_id,
                 )
+
+                # 5) 会话持久化（Phase 3：写消息 + 遥测，失败不阻断响应）
+                if self._persist_hook is not None:
+                    try:
+                        await self._persist_hook(ctx, response)
+                    except Exception:  # noqa: BLE001
+                        _logger.exception("[kernel] persist hook failed for %s", request_id)
+
+                return response
         except Exception as exc:  # noqa: BLE001
             _logger.exception("[kernel] request %s failed", request_id)
             self._telemetry.record(
