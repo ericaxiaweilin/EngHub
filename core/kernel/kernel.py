@@ -76,8 +76,11 @@ class HarnessKernel:
         vision_task_id: str = "",
         max_tool_rounds: int = 5,
         telemetry: Optional[Telemetry] = None,
+        skill_registry: Any = None,
+        legacy_execute_tool: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     ) -> None:
         self.db = db
+        self._active_ctx = None
         self._resolve_model_route = resolve_model_route
         self._tool_definitions = tool_definitions or []
         self._system_prompt = system_prompt
@@ -87,6 +90,11 @@ class HarnessKernel:
         self._max_tool_rounds = max_tool_rounds
         self._telemetry = telemetry or Telemetry.get_instance()
         self._checkpoints = CheckpointManager()
+        self._skill_registry = skill_registry
+        # skill_registry 开启时，execute_tool 优先走 Skill；未迁移工具或哨兵回退到 legacy。
+        self._legacy_execute_tool = legacy_execute_tool or execute_tool
+        if skill_registry is not None:
+            execute_tool = self._skill_execute_tool
         self._loop = AgentLoop(
             call_llm=call_llm,
             execute_tool=execute_tool,
@@ -104,6 +112,7 @@ class HarnessKernel:
 
     async def handle(self, ctx: KernelContext) -> KernelResponse:
         request_id = ctx.request_id
+        self._active_ctx = ctx
         try:
             with self._telemetry.timed(request_id, "total") as _timer:
                 # 1) 构建 payload（含 system prompt / 工具定义 / 路由）
@@ -191,6 +200,33 @@ class HarnessKernel:
             task_id=ctx.model_route.get("task_id", ""),
             **kwargs,
         )
+
+    async def _skill_execute_tool(
+        self, tool_name: str, arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """execute_tool 的 Skill 优先版本。
+
+        - 注册表有该工具 → 走 Skill
+        - Skill 返回 LEGACY_FALLBACK 哨兵 → 回退 legacy
+        - 注册表无该工具 → 直接回退 legacy
+        """
+        from core.skills.registry import is_legacy_fallback
+
+        if self._skill_registry is not None and self._skill_registry.has_tool(tool_name):
+            active = self._active_ctx
+            operator = active.operator if active else "ai_assistant"
+            factory_id = active.factory_id if active else None
+            result = await self._skill_registry.execute(
+                tool_name, arguments,
+                db=self.db, operator=operator,
+                factory_id=factory_id,
+                ctx=active,
+            )
+            if not is_legacy_fallback(result):
+                return result
+        if self._legacy_execute_tool is not None:
+            return await self._legacy_execute_tool(tool_name, arguments)
+        return {"error": f"未知工具：{tool_name}"}
 
     # ── 供路由层使用的辅助 ──
 

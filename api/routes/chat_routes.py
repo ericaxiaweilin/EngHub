@@ -930,6 +930,20 @@ async def chat(
 #
 # CLI 独立于本链路，不经过 Harness Kernel。
 
+_skill_registry_instance = None
+
+
+def _get_skill_registry():
+    """按需构建并缓存 Skill 注册表（含自动发现）。"""
+    global _skill_registry_instance
+    if _skill_registry_instance is not None:
+        return _skill_registry_instance
+    from core.skills import SkillRegistry
+    reg = SkillRegistry.get_instance()
+    reg.autodiscover()
+    _skill_registry_instance = reg
+    return reg
+
 
 @router.post("/v2", response_model=ChatResponse)
 async def chat_v2(
@@ -982,6 +996,9 @@ async def chat_v2(
             is_write=is_write, is_sim=is_sim, success=success,
         )
 
+    # Chat V2 Kernel；启用 Skill 优先（未迁移工具自动回退 legacy execute_tool）。
+    skill_registry = _get_skill_registry()
+
     kernel = HarnessKernel(
         db=db,
         call_llm=_call_llm,
@@ -999,6 +1016,8 @@ async def chat_v2(
         chat_task_id=MODEL_STACK_CHAT_TASK_ID,
         vision_task_id=MODEL_STACK_VISION_TASK_ID,
         max_tool_rounds=MAX_TOOL_ROUNDS,
+        skill_registry=skill_registry,
+        legacy_execute_tool=bound_execute,
     )
 
     ctx = await kernel.build_context(
