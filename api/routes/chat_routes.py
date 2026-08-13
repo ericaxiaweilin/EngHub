@@ -1059,6 +1059,30 @@ async def chat(
             degraded="error" in result,
             actions=[action],
         )
+    if direct_intent and direct_intent.get("tool") == "query_order_work_order_status":
+        arguments = direct_intent.get("args") or {}
+        result = await execute_tool(
+            db,
+            "query_order_work_order_status",
+            arguments,
+            operator=operator,
+            factory_id=factory_id,
+        )
+        action = ToolAction(
+            tool="query_order_work_order_status",
+            label=TOOL_LABELS["query_order_work_order_status"],
+            arguments=arguments,
+            result=result,
+            is_write=False,
+            is_sim=False,
+            success="error" not in result,
+        )
+        return ChatResponse(
+            reply=_direct_tool_reply("query_order_work_order_status", result),
+            model="order-work-order-status",
+            degraded="error" in result,
+            actions=[action],
+        )
 
     # ---- 多智能体并行编排：识别复合意图 → 多Agent并行执行 ----
     if request.enable_tools and not image_records and not request.agent_key:
@@ -2144,6 +2168,40 @@ async def chat_stream(
                 "request_id": stream_request_id,
             })
             await persist_stream_round("pmc-control-tower")
+            return
+
+        if direct_intent and direct_intent.get("tool") == "query_order_work_order_status":
+            arguments = direct_intent.get("args") or {}
+            result = await execute_tool(
+                db,
+                "query_order_work_order_status",
+                arguments,
+                operator=operator,
+                factory_id=factory_id,
+            )
+            action = ToolAction(
+                tool="query_order_work_order_status",
+                label=TOOL_LABELS["query_order_work_order_status"],
+                arguments=arguments,
+                result=result,
+                is_write=False,
+                is_sim=False,
+                success="error" not in result,
+            )
+            actions.append(action)
+            acc_reply = _direct_tool_reply("query_order_work_order_status", result)
+            yield _sse("action", action.model_dump())
+            table_data = _extract_table_data("query_order_work_order_status", result)
+            if table_data:
+                yield _sse("table", table_data)
+            yield _sse("delta", {"content": acc_reply})
+            yield _sse("done", {
+                "model": "order-work-order-status",
+                "degraded": "error" in result,
+                "session_id": session_id,
+                "request_id": stream_request_id,
+            })
+            await persist_stream_round("order-work-order-status")
             return
 
         unsupported_attachment = _unsupported_attachment_message(
