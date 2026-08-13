@@ -80,11 +80,13 @@ class HarnessKernel:
         legacy_execute_tool: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         persist_hook: Optional[Callable[[KernelContext, "KernelResponse"], Awaitable[None]]] = None,
         permission_gate: Any = None,
+        model_reviewer: Any = None,
     ) -> None:
         self.db = db
         self._active_ctx = None
         self._persist_hook = persist_hook
         self._permission_gate = permission_gate
+        self._model_reviewer = model_reviewer
         self._resolve_model_route = resolve_model_route
         self._tool_definitions = tool_definitions or []
         self._system_prompt = system_prompt
@@ -103,7 +105,8 @@ class HarnessKernel:
             execute_tool=self._skill_execute_tool,
             clean_reply=clean_reply,
             ground_tool_result=ground_tool_result,
-            verify_reply=verify_reply,
+            # ModelReviewer 接管审校时，跳过 AgentLoop 内部 verify（避免重复 LLM 调用）
+            verify_reply=None if model_reviewer is not None else verify_reply,
             make_tool_action=make_tool_action,
             write_tools=write_tools,
             sim_tools=sim_tools,
@@ -128,15 +131,27 @@ class HarnessKernel:
                 ctx.checkpoint_key = self._checkpoints.latest(request_id)["key"] \
                     if self._checkpoints.has(request_id) else None
 
-                # 4) 组装响应
+                # 4) 组装响应（可选 ModelReview 替换草稿）
+                reply = loop_result.reply
+                review_result = None
+                if self._model_reviewer is not None and loop_result.actions:
+                    review_result = await self._model_reviewer.review(
+                        reply, loop_result.actions,
+                        loop_result.model or ctx.model_route.get("gateway_model", ""),
+                    )
+                    reply = review_result.revised_reply
+                    ctx.metadata["model_review"] = review_result.to_dict()
+
                 response = KernelResponse(
-                    reply=loop_result.reply,
+                    reply=reply,
                     model=loop_result.model or ctx.model_route.get("gateway_model", ""),
                     degraded=loop_result.degraded,
                     actions=loop_result.actions,
                     diagrams=loop_result.diagrams,
                     request_id=request_id,
                 )
+                if review_result is not None:
+                    response.telemetry["review"] = review_result.to_dict()
 
                 # 5) 会话持久化（Phase 3：写消息 + 遥测，失败不阻断响应）
                 if self._persist_hook is not None:

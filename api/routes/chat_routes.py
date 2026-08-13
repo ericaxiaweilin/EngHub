@@ -1016,6 +1016,14 @@ async def chat_v2(
     from core.kernel.permission import PermissionGate
     permission_gate = PermissionGate()
 
+    # Phase 5：结构化事实审查（Evidence 链 → ModelReview）
+    from core.kernel.model_review import ModelReviewer
+    model_reviewer = ModelReviewer(
+        call_llm=_call_llm,
+        clean_reply=_clean_model_reply,
+        request_timeout=60.0,
+    )
+
     async def persist_after(ctx, response):
         """Phase 3：请求结束后落库（消息 + 遥测）。"""
         from api.services import chat_persistence_service as cp
@@ -1057,6 +1065,7 @@ async def chat_v2(
         legacy_execute_tool=bound_execute,
         persist_hook=persist_after,
         permission_gate=permission_gate,
+        model_reviewer=model_reviewer,
     )
 
     ctx = await kernel.build_context(
