@@ -922,6 +922,106 @@ async def chat(
         )
 
 
+# =================================================================
+# Chat V2 — Harness Kernel 链路（Phase 1 Skeleton）
+# =================================================================
+# 逐步把上述 chat() 的非 HTTP 逻辑收敛进 core/kernel。
+# V2 与 V1 保持行为等价。
+#
+# CLI 独立于本链路，不经过 Harness Kernel。
+
+
+@router.post("/v2", response_model=ChatResponse)
+async def chat_v2(
+    request: ChatRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatResponse:
+    """Chat V2（Harness Kernel 链路）。与 V1 行为等价，返回结构相同。"""
+    from core.kernel import HarnessKernel
+
+    operator = current_user.username or current_user.id
+    factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
+
+    # 附件加载与 V1 一致
+    att_records = await _load_attachment_records(db, request.attachments, current_user) \
+        if request.attachments else []
+    image_records = [r for r in att_records if _is_image_record(r)]
+    non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
+
+    # 历史消息注入附件（图片 → 多模态 content；非图片 → 文字摘要）
+    history = [m.model_dump() for m in request.messages]
+    injected = False
+    for idx in range(len(history) - 1, -1, -1):
+        if history[idx].get("role") == "user":
+            text = history[idx].get("content") or ""
+            if non_image_note:
+                text = f"{text}{non_image_note}"
+            history[idx]["content"] = _build_multimodal_content(text, image_records)
+            injected = True
+            break
+    if not injected and image_records:
+        last_user = next(
+            (m.content for m in reversed(request.messages) if m.role == "user"), ""
+        )
+        history.append({"role": "user", "content": _build_multimodal_content(last_user, image_records)})
+
+    prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
+
+    async def bound_execute(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        from api.services.chat_tools_service import execute_tool as exec_tool
+        return await exec_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+
+    def make_tool_action(
+        tool: str, label: str, arguments: Dict[str, Any],
+        result: Dict[str, Any], is_write: bool, is_sim: bool, success: bool,
+    ) -> ToolAction:
+        return ToolAction(
+            tool=tool, label=label, arguments=arguments, result=result,
+            is_write=is_write, is_sim=is_sim, success=success,
+        )
+
+    kernel = HarnessKernel(
+        db=db,
+        call_llm=_call_llm,
+        resolve_model_route=_resolve_model_route,
+        execute_tool=bound_execute,
+        clean_reply=_clean_model_reply,
+        ground_tool_result=_grounded_tool_result,
+        verify_reply=_verify_grounded_reply,
+        make_tool_action=make_tool_action,
+        write_tools=frozenset(WRITE_TOOLS),
+        sim_tools=frozenset(SIM_TOOLS),
+        tool_definitions=TOOL_DEFINITIONS,
+        system_prompt=SYSTEM_PROMPT,
+        final_grounding_prompt=FINAL_GROUNDING_PROMPT,
+        chat_task_id=MODEL_STACK_CHAT_TASK_ID,
+        vision_task_id=MODEL_STACK_VISION_TASK_ID,
+        max_tool_rounds=MAX_TOOL_ROUNDS,
+    )
+
+    ctx = await kernel.build_context(
+        factory_id=factory_id,
+        user=current_user,
+        messages=history,
+        attachments=att_records,
+        enable_tools=request.enable_tools,
+        agent_key=request.agent_key,
+        temperature=request.temperature,
+        prompt_tokens=prompt_tokens,
+    )
+    result = await kernel.handle(ctx)
+
+    return ChatResponse(
+        reply=result.reply,
+        model=result.model,
+        degraded=result.degraded,
+        actions=result.actions,
+        diagrams=result.diagrams,
+    )
+
+
 def _degraded_message(reason: str) -> str:
     return (
         f"AI 服务暂不可用（{reason}）。\n\n"
