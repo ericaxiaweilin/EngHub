@@ -14,6 +14,8 @@ from core.kernel.context import KernelContext
 from core.kernel.kernel import HarnessKernel, KernelResponse
 from core.kernel.telemetry import Telemetry, TelemetryEvent, TelTimer
 
+__version__ = "0.6.0"
+
 __all__ = [
     "AgentLoop",
     "LoopResult",
@@ -24,4 +26,5 @@ __all__ = [
     "Telemetry",
     "TelemetryEvent",
     "TelTimer",
+    "__version__",
 ]

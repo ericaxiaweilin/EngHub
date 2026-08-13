@@ -2466,3 +2466,19 @@ class ChatTelemetry(Base):
     success = Column(Boolean, default=True)
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ChatEvalCase(Base):
+    """Chat 批量评估用例（Phase 6 Engineering Surface）。"""
+    __tablename__ = "chat_eval_cases"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    name = Column(String(120), nullable=False)
+    prompt = Column(Text, nullable=False)                      # 待评估的用户输入
+    expected_tool = Column(String(64), nullable=True)          # 期望调用的工具（可空）
+    expected_reply_keyword = Column(String(120), nullable=True)  # 期望回复包含关键词
+    model = Column(String(64), nullable=True)                  # 指定模型（空=默认路由）
+    factory_id = Column(String(32), default="F01")
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

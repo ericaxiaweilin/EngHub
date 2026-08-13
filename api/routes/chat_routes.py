@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from database.models import FileRecord, User
+from database.models import FileRecord, User, ChatTelemetry, ChatEvalCase
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
     TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool,
@@ -1672,6 +1672,242 @@ async def chat_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# =================================================================
+# Phase 6 — Engineering Surface（Trace / Replay / Eval / Plugins /
+#           Version / Model-Compare / Failures）
+# =================================================================
+
+@router.get("/trace/{request_id}")
+async def chat_trace(
+    request_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """单次请求的完整执行链：会话 + 消息 + 遥测。"""
+    from api.services.chat_persistence_service import get_trace
+    return await get_trace(db, request_id)
+
+
+@router.get("/replay/{session_id}")
+async def chat_replay(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """会话回放：按时间序返回全部消息（含工具轨迹）。"""
+    from api.services.chat_persistence_service import get_trace
+    return await get_trace(db, None, session_id=session_id)
+
+
+@router.get("/plugins")
+async def chat_plugins():
+    """Plugin Registry：当前注册的全部 Skill 及其工具。"""
+    reg = _get_skill_registry()
+    return {
+        "plugins": [
+            {
+                "name": s.name,
+                "module": s.module,
+                "tools": s.tool_names(),
+            }
+            for s in reg.get_all()
+        ],
+        "tool_count": len(reg.all_tool_definitions()),
+    }
+
+
+@router.get("/version")
+async def chat_version():
+    """Harness 版本信息（与路由端点同时暴露完整能力面）。"""
+    from core.kernel import __version__ as harness_version
+    from core.agent import event_bus as event_bus_mod
+    return {
+        "harness": harness_version,
+        "api": "/api/v1/chat/v2",
+        "phases": [1, 2, 3, 4, 5, 6],
+        "event_bus": event_bus_mod.__file__,
+    }
+
+
+@router.get("/failures")
+async def chat_failures(
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """失败分析：聚合最近失败请求（进程内 ring + DB 遥测）。"""
+    from core.kernel.telemetry import Telemetry
+    mem = Telemetry.get_instance().failures(limit)
+
+    stmt = (
+        select(ChatTelemetry)
+        .where(ChatTelemetry.success == False)  # noqa: E712
+        .order_by(ChatTelemetry.created_at.desc())
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    db_failures = [
+        {
+            "request_id": t.request_id,
+            "phase": t.phase,
+            "error": t.error,
+            "model": t.model,
+            "duration_ms": float(t.duration_ms or 0),
+            "created_at": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else None,
+        }
+        for t in rows
+    ]
+    return {"db": db_failures, "memory": mem}
+
+
+class EvalRunRequest(BaseModel):
+    prompt: str
+    expected_tool: Optional[str] = None
+    expected_reply_keyword: Optional[str] = None
+    model: Optional[str] = None
+    factory_id: str = "F01"
+
+
+@router.post("/eval")
+async def chat_eval_run(
+    request: EvalRunRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """批量评估单个用例：发起一次 Kernel 执行并返回通过/失败 + 证据链。
+
+    Phase 6 简化版：逐 case 跑 /v2 同款链路（不依赖会话），输出结构化结果。
+    """
+    from core.kernel import HarnessKernel
+    from core.kernel.model_review import ModelReviewer
+    from core.kernel.permission import PermissionGate
+
+    operator = current_user.username or current_user.id
+    factory_id = request.factory_id
+    model_task_id = request.model or MODEL_STACK_CHAT_TASK_ID
+
+    async def bound_execute(tool_name, arguments):
+        from api.services.chat_tools_service import execute_tool as exec_tool
+        return await exec_tool(db, tool_name, arguments, operator=operator, factory_id=factory_id)
+
+    kernel = HarnessKernel(
+        db=db,
+        call_llm=_call_llm,
+        resolve_model_route=_route_resolver_for(model_task_id),
+        execute_tool=bound_execute,
+        clean_reply=_clean_model_reply,
+        ground_tool_result=_grounded_tool_result,
+        verify_reply=None,
+        make_tool_action=lambda tool, label, args, res, is_w, is_s, ok: {
+            "tool": tool, "success": ok,
+        },
+        write_tools=frozenset(WRITE_TOOLS),
+        sim_tools=frozenset(SIM_TOOLS),
+        tool_definitions=TOOL_DEFINITIONS,
+        system_prompt=SYSTEM_PROMPT,
+        final_grounding_prompt=FINAL_GROUNDING_PROMPT,
+        chat_task_id=model_task_id,
+        vision_task_id=MODEL_STACK_VISION_TASK_ID,
+        max_tool_rounds=MAX_TOOL_ROUNDS,
+        skill_registry=_get_skill_registry(),
+        legacy_execute_tool=bound_execute,
+        permission_gate=PermissionGate(),
+        model_reviewer=ModelReviewer(call_llm=_call_llm, clean_reply=_clean_model_reply),
+    )
+    ctx = await kernel.build_context(
+        factory_id=factory_id, user=current_user,
+        messages=[{"role": "user", "content": request.prompt}],
+        prompt_tokens=max(1, len(request.prompt) // 4),
+    )
+    import time
+    started = time.monotonic()
+    result = await kernel.handle(ctx)
+    elapsed_ms = (time.monotonic() - started) * 1000
+
+    called_tools = [a.tool if isinstance(a, dict) else getattr(a, "tool", "") for a in result.actions]
+    tool_ok = (request.expected_tool is None) or (request.expected_tool in called_tools)
+    keyword_ok = (request.expected_reply_keyword is None) or (
+        request.expected_reply_keyword in result.reply
+    )
+    passed = bool(tool_ok and keyword_ok and not result.degraded)
+
+    # 记录评估用例（供后续聚合）
+    case = ChatEvalCase(
+        name=f"eval-{request.prompt[:40]}", prompt=request.prompt,
+        expected_tool=request.expected_tool,
+        expected_reply_keyword=request.expected_reply_keyword,
+        model=request.model, factory_id=factory_id,
+    )
+    db.add(case)
+
+    return {
+        "passed": passed,
+        "reply": result.reply,
+        "tools_called": called_tools,
+        "expected_tool": request.expected_tool,
+        "expected_reply_keyword": request.expected_reply_keyword,
+        "duration_ms": round(elapsed_ms, 1),
+        "request_id": result.request_id,
+        "review": result.telemetry.get("review"),
+    }
+
+
+class ModelCompareRequest(BaseModel):
+    prompt: str
+    models: List[str]
+    factory_id: str = "F01"
+
+
+@router.post("/model-compare")
+async def chat_model_compare(
+    request: ModelCompareRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """模型对比：同一 prompt 分别路由到多个模型，返回各自的回复与耗时。"""
+    results = []
+    for model_task_id in request.models:
+        try:
+            route = await _resolve_model_route(model_task_id, prompt_tokens=max(1, len(request.prompt) // 4))
+            payload = {
+                "model": route.get("gateway_model"),
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": request.prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": route.get("max_completion_tokens", 768),
+                "_task_id": model_task_id,
+            }
+            import httpx as _httpx
+            timeout = float(route.get("request_timeout", REQUEST_TIMEOUT))
+            async with _httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{GATEWAY_URL}/v1/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else {},
+                )
+            status = resp.status_code
+            if status >= 400:
+                results.append({"model": model_task_id, "status": status, "reply": "", "error": "gateway_error"})
+                continue
+            data = resp.json()
+            reply = (data.get("choices", [{}])[0].get("message", {}).get("content", ""))
+            results.append({"model": model_task_id, "status": status, "reply": reply})
+        except Exception as exc:  # noqa: BLE001
+            results.append({"model": model_task_id, "status": 0, "reply": "", "error": str(exc)})
+    return {"prompt": request.prompt, "results": results}
+
+
+def _route_resolver_for(task_id: str):
+    """生成解析指定任务路由的闭包（供 eval 与 v2 同源）。"""
+    async def _resolve(_task_id: str, prompt_tokens: int = 1000):
+        return await _resolve_model_route(_task_id, prompt_tokens=prompt_tokens)
+    return _resolve
 
 
 __all__ = ["router"]
