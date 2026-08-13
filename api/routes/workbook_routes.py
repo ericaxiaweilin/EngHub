@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import uuid
@@ -143,7 +144,9 @@ async def import_workbook(
     source_path = UPLOAD_DIR / f"{file_id}_{safe_name}"
     source_path.write_bytes(content)
     try:
-        snapshot = xlsx_to_workbook_snapshot(source_path)
+        # openpyxl 是同步 CPU/磁盘操作；大工作簿导入时不能阻塞事件循环，
+        # 否则会同时拖慢 chatbot SSE 和其它 API 请求。
+        snapshot = await asyncio.to_thread(xlsx_to_workbook_snapshot, source_path)
     except Exception as exc:  # noqa: BLE001
         source_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"XLSX 解析失败：{exc}") from exc

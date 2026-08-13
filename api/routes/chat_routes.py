@@ -855,6 +855,34 @@ def _parse_spreadsheet_record(
         return None
 
 
+async def _load_spreadsheet_tables(
+    records: List[FileRecord],
+) -> Dict[str, Dict[str, Any]]:
+    """在线程池中解析表格附件，避免 openpyxl 阻塞 FastAPI 事件循环。
+
+    同一轮请求后续还要生成模型摘要；这里统一解析一次，流式表格事件和模型
+    prompt 共用结果，避免大表被重复打开、重复遍历。
+    """
+    spreadsheet_records = [r for r in records if _is_spreadsheet_record(r)]
+    if not spreadsheet_records:
+        return {}
+
+    async def load_one(rec: FileRecord):
+        started = time.monotonic()
+        table = await asyncio.to_thread(_parse_spreadsheet_record, rec)
+        _logger.info(
+            "[xlsx] parsed file=%s rows=%s cols=%s elapsed_ms=%.0f",
+            rec.filename,
+            len(table.get("rows", [])) if table else 0,
+            len(table.get("columns", [])) if table else 0,
+            (time.monotonic() - started) * 1000,
+        )
+        return str(rec.id), table
+
+    loaded = await asyncio.gather(*(load_one(rec) for rec in spreadsheet_records))
+    return {file_id: table for file_id, table in loaded if table}
+
+
 def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 30) -> str:
     """智能摘要：表头 + 统计 + 样本行，替代全量 Markdown dump。
 
@@ -921,7 +949,11 @@ def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 30) -> str
     return "\n".join(parts)
 
 
-def _attachment_text_note(records: List[FileRecord]) -> str:
+def _attachment_text_note(
+    records: List[FileRecord],
+    *,
+    spreadsheet_tables: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> str:
     """附件文字摘要。
 
     - Excel/CSV：智能摘要（表头+统计+样本），完整数据由 Univer 在线表格渲染；
@@ -931,7 +963,11 @@ def _attachment_text_note(records: List[FileRecord]) -> str:
     lines = ["\n\n【用户本次上传的附件（已存入系统文件库）】"]
     for rec in records:
         if _is_spreadsheet_record(rec):
-            table = _parse_spreadsheet_record(rec)
+            table = (
+                spreadsheet_tables.get(str(rec.id))
+                if spreadsheet_tables is not None
+                else _parse_spreadsheet_record(rec)
+            )
             if table:
                 lines.append(f"- 表格文件：{rec.filename}\n{_spreadsheet_to_summary(table)}")
             else:
@@ -1043,8 +1079,17 @@ async def chat(
             import logging as _lg
             _lg.getLogger("chat").debug(f"parallel orchestrator skip: {_orch_err}")
 
+    non_image_records = [r for r in att_records if not _is_image_record(r)]
+    spreadsheet_tables = await _load_spreadsheet_tables(non_image_records)
+    non_image_note = _attachment_text_note(
+        non_image_records,
+        spreadsheet_tables=spreadsheet_tables,
+    )
     task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
-    prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
+    prompt_tokens = max(
+        1,
+        (sum(len(m.content or "") for m in request.messages) + len(non_image_note)) // 4,
+    )
     try:
         route = await _resolve_model_route(task_id, prompt_tokens=prompt_tokens)
     except Exception as exc:  # noqa: BLE001
@@ -1063,7 +1108,6 @@ async def chat(
             await record_agent_dispatch(db, factory_id, request.agent_key, last_user)
     history = [m.model_dump() for m in request.messages]
     # 将附件注入「最后一条用户消息」：图片 → 多模态 content；非图片 → 文字摘要追加
-    non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
     injected = False
     for idx in range(len(history) - 1, -1, -1):
         if history[idx].get("role") == "user":
@@ -1089,11 +1133,16 @@ async def chat(
         payload["tools"] = TOOL_DEFINITIONS
         payload["tool_choice"] = "auto"
 
+    model_request_timeout = (
+        max(route["request_timeout"], MODEL_COLD_START_RETRY_TIMEOUT)
+        if spreadsheet_tables
+        else route["request_timeout"]
+    )
     try:
         for _ in range(MAX_TOOL_ROUNDS):
             resp = await _call_llm(
                 payload,
-                request_timeout=route["request_timeout"],
+                request_timeout=model_request_timeout,
             )
 
             if resp.status_code >= 400:
@@ -1341,7 +1390,12 @@ async def chat_v2(
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
-    non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
+    non_image_records = [r for r in att_records if not _is_image_record(r)]
+    spreadsheet_tables = await _load_spreadsheet_tables(non_image_records)
+    non_image_note = _attachment_text_note(
+        non_image_records,
+        spreadsheet_tables=spreadsheet_tables,
+    )
 
     # 历史消息注入附件（图片 → 多模态 content；非图片 → 文字摘要）
     history = await _build_chat_history(
@@ -1356,7 +1410,10 @@ async def chat_v2(
         fallback_user_text=last_user,
     )
 
-    prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
+    prompt_tokens = max(
+        1,
+        (sum(len(m.content or "") for m in request.messages) + len(non_image_note)) // 4,
+    )
 
     async def bound_execute(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         from api.services.chat_tools_service import execute_tool as exec_tool
@@ -1383,7 +1440,9 @@ async def chat_v2(
     model_reviewer = ModelReviewer(
         call_llm=_call_llm,
         clean_reply=_clean_model_reply,
-        request_timeout=60.0,
+        request_timeout=(
+            MODEL_COLD_START_RETRY_TIMEOUT if spreadsheet_tables else 60.0
+        ),
     )
 
     async def persist_after(ctx, response):
@@ -1984,10 +2043,19 @@ async def chat_stream(
             except Exception:  # noqa: BLE001
                 pass
 
+        # 先发状态帧，避免大一点的表格解析期间代理/浏览器误判连接空闲。
+        yield _sse("status", {"message": "正在读取表格附件…"})
+
         # ---- 加载附件 ----
         att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
+        non_image_records = [r for r in att_records if not _is_image_record(r)]
+        spreadsheet_tables = await _load_spreadsheet_tables(non_image_records)
+        non_image_note = _attachment_text_note(
+            non_image_records,
+            spreadsheet_tables=spreadsheet_tables,
+        )
 
         # Stream 是前端主链路；PMC九类问题在这里直接执行统一事实工具，保证不依赖模型是否正确选工具。
         direct_intent = resolve_intent(last_user) if request.enable_tools and not image_records else None
@@ -2020,7 +2088,10 @@ async def chat_stream(
             return
 
         task_id = MODEL_STACK_VISION_TASK_ID if image_records else MODEL_STACK_CHAT_TASK_ID
-        prompt_tokens = max(1, sum(len(m.content or "") for m in request.messages) // 4)
+        prompt_tokens = max(
+            1,
+            (sum(len(m.content or "") for m in request.messages) + len(non_image_note)) // 4,
+        )
         try:
             route = await _resolve_model_route(task_id, prompt_tokens=prompt_tokens)
         except Exception as exc:  # noqa: BLE001
@@ -2043,7 +2114,7 @@ async def chat_stream(
         # ---- Excel/CSV 附件 → 推送结构化表格事件（前端渲染可交互表格 + Univer 电子表格） ----
         for rec in att_records:
             if _is_spreadsheet_record(rec):
-                tbl = _parse_spreadsheet_record(rec)
+                tbl = spreadsheet_tables.get(str(rec.id))
                 if tbl:
                     yield _sse("table", tbl)
 
@@ -2060,7 +2131,6 @@ async def chat_stream(
             session_id=session_id,
             request_messages=request.messages,
         )
-        non_image_note = _attachment_text_note([r for r in att_records if not _is_image_record(r)])
         _inject_chat_attachments(
             history,
             image_records=image_records,
@@ -2080,13 +2150,18 @@ async def chat_stream(
             payload["tools"] = TOOL_DEFINITIONS
             payload["tool_choice"] = "auto"
 
+        model_request_timeout = (
+            max(route["request_timeout"], MODEL_COLD_START_RETRY_TIMEOUT)
+            if spreadsheet_tables
+            else route["request_timeout"]
+        )
         try:
             for _ in range(MAX_TOOL_ROUNDS):
                 streamed_content: List[str] = []
                 streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
                 async for delta in _stream_llm_deltas(
                     payload,
-                    request_timeout=route["request_timeout"],
+                    request_timeout=model_request_timeout,
                 ):
                     text = delta.get("content") or ""
                     if text:
