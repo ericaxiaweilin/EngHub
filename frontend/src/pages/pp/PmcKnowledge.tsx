@@ -87,7 +87,7 @@ const PmcKnowledge: React.FC = () => {
               title={<Text style={{ color: NEURAL_COLORS.text }}>知识术语索引</Text>}
               style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}
             >
-              <Space wrap>{terms.map((term) => <Tag key={term} color="cyan" style={{ color: NEURAL_COLORS.text }}>{term}</Tag>)}</Space>
+              <Space wrap>{terms.map((term) => <Tag key={term} style={{ background: NEURAL_COLORS.bg, border: `1px solid ${NEURAL_COLORS.accent}66`, color: NEURAL_COLORS.accent, fontWeight: 500 }}>{term}</Tag>)}</Space>
             </Card>
 
             <Card

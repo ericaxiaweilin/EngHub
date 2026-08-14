@@ -13,8 +13,9 @@ export const NEURAL_COLORS = {
   accentPurple: '#a78bfa',
   warning: '#fbbf24',
   danger: '#f87171',
-  text: '#e2e8f0',
-  textDim: '#94a3b8',
+  text: '#f1f5f9',
+  textDim: '#cbd5e1',
+  textMuted: '#94a3b8',
 }
 
 interface GraphQuestion {
@@ -130,7 +131,7 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
             id: tId,
             label: term,
             type: 'term',
-            radius: 3,
+            radius: 4,
             color: NEURAL_COLORS.textDim,
             angle: angle + (k * 0.35 + m * 0.12) * (k % 2 === 0 ? 1 : -1),
             ring: 2,
@@ -229,8 +230,8 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         ctx.beginPath()
         ctx.moveTo(ps.x, ps.y)
         ctx.lineTo(pe.x, pe.y)
-        ctx.strokeStyle = active ? edge.color : selected ? edge.color + 'aa' : edge.color + '2e'
-        ctx.lineWidth = (active ? 2 : 1) / v.scale
+        ctx.strokeStyle = active ? edge.color : selected ? edge.color + 'cc' : edge.color + '55'
+        ctx.lineWidth = (active ? 2.2 : 1.3) / v.scale
         ctx.stroke()
       })
 
@@ -252,6 +253,13 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         ctx.arc(p.x, p.y, radius, 0, Math.PI * 2)
         ctx.fillStyle = active ? '#ffffff' : n.color
         ctx.fill()
+        if (n.type === 'term') {
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, radius + 1.5 / v.scale, 0, Math.PI * 2)
+          ctx.strokeStyle = (active ? '#ffffff' : n.color) + 'aa'
+          ctx.lineWidth = 1 / v.scale
+          ctx.stroke()
+        }
         if (active || selected || n.type === 'skill') {
           ctx.beginPath()
           ctx.arc(p.x, p.y, radius + 4 / v.scale, 0, Math.PI * 2)
@@ -260,8 +268,8 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
           ctx.stroke()
         }
         if (n.type === 'skill') {
-          ctx.font = `${11 / v.scale}px system-ui, sans-serif`
-          ctx.fillStyle = active || selected ? n.color : 'rgba(148, 163, 184, 0.9)'
+          ctx.font = `600 ${12 / v.scale}px system-ui, sans-serif`
+          ctx.fillStyle = active || selected ? n.color : 'rgba(241, 245, 249, 0.95)'
           ctx.textAlign = 'center'
           ctx.textBaseline = 'top'
           ctx.fillText(n.label, p.x, p.y + radius + 6 / v.scale)
@@ -472,7 +480,7 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
               <Tag
                 key={skill}
                 style={{
-                  background: active ? n?.color + '22' : 'transparent',
+                  background: active ? n?.color + '33' : 'rgba(15, 25, 35, 0.7)',
                   border: `1px solid ${active ? n?.color : NEURAL_COLORS.border}`,
                   color: active ? n?.color : NEURAL_COLORS.textDim,
                   cursor: 'pointer',
