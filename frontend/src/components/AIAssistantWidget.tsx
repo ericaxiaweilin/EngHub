@@ -530,6 +530,20 @@ interface TrajectoryData {
   title?: string | null
   event_count: number
   nodes: TrajectoryNode[]
+  overview?: {
+    request_id: string
+    seq_from: number
+    seq_to: number
+    injections: { source?: string; label?: string }[]
+    user_message?: string | null
+    tools: { tool?: string; label?: string; success?: boolean; is_write?: boolean }[]
+    tool_sequence?: string[]
+    tool_count: number
+    reply?: string | null
+    model?: string | null
+    duration_ms?: number | null
+    degraded?: boolean
+  }[]
 }
 
 // ---------- 快捷指令（后端不可用时的本地兜底） ----------
@@ -2644,64 +2658,117 @@ export default function AIAssistantWidget() {
                         {trajectory && (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                             <Text type="secondary" style={{ fontSize: 12 }}>
-                              共 {trajectory.event_count} 个事件 · 按会话事件流顺序展示（每个节点带 seq 序号与来源）
+                              共 {trajectory.event_count} 个事件 · {trajectory.overview?.length || 0} 次请求
                             </Text>
-                            <List
+                            <Tabs
                               size="small"
-                              dataSource={trajectory.nodes}
-                              renderItem={node => {
-                                const color = node.kind === 'context_injection' ? 'purple'
-                                  : node.kind === 'tool_call' ? 'orange'
-                                  : node.kind === 'assistant_reply' ? 'green'
-                                  : 'default'
-                                const title = node.kind === 'context_injection'
-                                  ? `${node.label}（注入 · ${node.source}）`
-                                  : node.kind === 'user_message' ? '用户消息'
-                                  : node.kind === 'tool_call' ? `工具调用：${node.tool}`
-                                  : 'AI 回复'
-                                return (
-                                  <List.Item style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                                    <Tag color={color} style={{ flexShrink: 0, marginTop: 2 }}>#{node.seq}</Tag>
-                                    <div style={{ flex: 1, minWidth: 0 }}>
-                                      <Text strong style={{ fontSize: 12 }}>{title}</Text>
-                                      {node.kind === 'context_injection' && (
-                                        <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{node.content}</pre>
-                                      )}
-                                      {node.kind === 'user_message' && (
-                                        <div style={{ marginTop: 2, fontSize: 12 }}>{node.content}</div>
-                                      )}
-                                      {node.kind === 'tool_call' && (
-                                        <div style={{ marginTop: 2, fontSize: 11 }}>
-                                          {node.is_write && <Tag color="red" style={{ fontSize: 10 }}>写</Tag>}
-                                          <span style={{ color: node.success ? undefined : '#cf1322' }}>
-                                            {node.success ? '成功' : '失败'}
-                                          </span>
-                                          {node.args ? (
-                                            <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                                              参数：{typeof node.args === 'string' ? node.args : JSON.stringify(node.args)}
-                                            </pre>
-                                          ) : null}
-                                          {node.result ? (
-                                            <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 120, overflowY: 'auto' }}>
-                                              结果：{typeof node.result === 'string' ? node.result : JSON.stringify(node.result).slice(0, 1200)}
-                                            </pre>
-                                          ) : null}
-                                        </div>
-                                      )}
-                                      {node.kind === 'assistant_reply' && (
-                                        <div style={{ marginTop: 2, fontSize: 12 }}>
-                                          <div style={{ color: '#666', fontSize: 11 }}>
-                                            {node.model && <Tag style={{ fontSize: 10 }}>{node.model}</Tag>}
-                                            {node.tool_count != null && node.tool_count > 0 && <Tag color="blue" style={{ fontSize: 10 }}>{node.tool_count} 次工具</Tag>}
-                                            {node.duration_ms != null && <span>耗时 {Math.round(node.duration_ms)}ms</span>}
+                              items={[
+                                {
+                                  key: 'overview',
+                                  label: '请求概览（按 request 折叠）',
+                                  children: (
+                                    <List
+                                      size="small"
+                                      dataSource={trajectory.overview || []}
+                                      locale={{ emptyText: '暂无请求概览' }}
+                                      renderItem={stage => (
+                                        <List.Item style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                          <div style={{ flex: 1, minWidth: 0 }}>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                              <Tag color="geekblue" style={{ flexShrink: 0, marginInlineEnd: 0 }}>#{stage.seq_from}–{stage.seq_to}</Tag>
+                                              <Text strong style={{ fontSize: 12 }}>{stage.user_message || '（附件消息）'}</Text>
+                                              {stage.degraded && <Tag color="red" style={{ fontSize: 10 }}>降级</Tag>}
+                                            </div>
+                                            <div style={{ marginTop: 3, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                                              {(stage.injections || []).map((inj, idx) => (
+                                                <Tag key={`${inj.source}-${idx}`} color={inj.source === 'guidance' ? 'purple' : inj.source === 'profile' ? 'blue' : inj.source === 'preferences' ? 'green' : 'default'} style={{ fontSize: 10 }}>{inj.label}</Tag>
+                                              ))}
+                                              {(stage.tool_sequence || []).map((t, idx) => (
+                                                <Tag key={`${t}-${idx}`} color="orange" style={{ fontSize: 10 }}>{t}</Tag>
+                                              ))}
+                                              {stage.tool_count === 0 && <span style={{ fontSize: 11, color: '#999' }}>无工具调用</span>}
+                                            </div>
+                                            {stage.reply && (
+                                              <div style={{ marginTop: 4, fontSize: 12, color: '#555', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                                {stage.reply}
+                                              </div>
+                                            )}
+                                            <div style={{ marginTop: 3, color: '#999', fontSize: 11 }}>
+                                              {stage.model && <span>{stage.model} · </span>}
+                                              {stage.tool_count > 0 && <span>{stage.tool_count} 次工具 · </span>}
+                                              {stage.duration_ms != null && <span>耗时 {Math.round(stage.duration_ms)}ms</span>}
+                                              {!stage.model && stage.duration_ms == null && <span>阶段完成</span>}
+                                            </div>
                                           </div>
-                                          <div style={{ marginTop: 2 }}>{node.reply}</div>
-                                        </div>
+                                        </List.Item>
                                       )}
-                                    </div>
-                                  </List.Item>
-                                )
-                              }}
+                                    />
+                                  ),
+                                },
+                                {
+                                  key: 'events',
+                                  label: '事件流（逐节点）',
+                                  children: (
+                                    <List
+                                      size="small"
+                                      dataSource={trajectory.nodes}
+                                      renderItem={node => {
+                                        const color = node.kind === 'context_injection' ? 'purple'
+                                          : node.kind === 'tool_call' ? 'orange'
+                                          : node.kind === 'assistant_reply' ? 'green'
+                                          : 'default'
+                                        const title = node.kind === 'context_injection'
+                                          ? `${node.label}（注入 · ${node.source}）`
+                                          : node.kind === 'user_message' ? '用户消息'
+                                          : node.kind === 'tool_call' ? `工具调用：${node.tool}`
+                                          : 'AI 回复'
+                                        return (
+                                          <List.Item style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                            <Tag color={color} style={{ flexShrink: 0, marginTop: 2 }}>#{node.seq}</Tag>
+                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                              <Text strong style={{ fontSize: 12 }}>{title}</Text>
+                                              {node.kind === 'context_injection' && (
+                                                <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{node.content}</pre>
+                                              )}
+                                              {node.kind === 'user_message' && (
+                                                <div style={{ marginTop: 2, fontSize: 12 }}>{node.content}</div>
+                                              )}
+                                              {node.kind === 'tool_call' && (
+                                                <div style={{ marginTop: 2, fontSize: 11 }}>
+                                                  {node.is_write && <Tag color="red" style={{ fontSize: 10 }}>写</Tag>}
+                                                  <span style={{ color: node.success ? undefined : '#cf1322' }}>
+                                                    {node.success ? '成功' : '失败'}
+                                                  </span>
+                                                  {node.args ? (
+                                                    <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                                      参数：{typeof node.args === 'string' ? node.args : JSON.stringify(node.args)}
+                                                    </pre>
+                                                  ) : null}
+                                                  {node.result ? (
+                                                    <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 120, overflowY: 'auto' }}>
+                                                      结果：{typeof node.result === 'string' ? node.result : JSON.stringify(node.result).slice(0, 1200)}
+                                                    </pre>
+                                                  ) : null}
+                                                </div>
+                                              )}
+                                              {node.kind === 'assistant_reply' && (
+                                                <div style={{ marginTop: 2, fontSize: 12 }}>
+                                                  <div style={{ color: '#666', fontSize: 11 }}>
+                                                    {node.model && <Tag style={{ fontSize: 10 }}>{node.model}</Tag>}
+                                                    {node.tool_count != null && node.tool_count > 0 && <Tag color="blue" style={{ fontSize: 10 }}>{node.tool_count} 次工具</Tag>}
+                                                    {node.duration_ms != null && <span>耗时 {Math.round(node.duration_ms)}ms</span>}
+                                                  </div>
+                                                  <div style={{ marginTop: 2 }}>{node.reply}</div>
+                                                </div>
+                                              )}
+                                            </div>
+                                          </List.Item>
+                                        )
+                                      }}
+                                    />
+                                  ),
+                                },
+                              ]}
                             />
                           </div>
                         )}

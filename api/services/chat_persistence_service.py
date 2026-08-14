@@ -567,4 +567,62 @@ async def get_trajectory(
         "event_count": len(rows),
         "nodes": nodes,
         "injection_requests": context_requests,
+        "overview": _trajectory_overview(nodes),
     }
+
+
+def _trajectory_overview(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """阶段导向读模型（DSH stage-oriented）：每次请求折叠为紧凑摘要。
+
+    每个 request 一条：注入 sources / 用户消息 / 工具调用序列 / 回复 / 模型 /
+    耗时 / 是否降级。Overview 不复制原始事件，仅引用折叠后的阶段事实。
+    """
+    by_request: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for node in nodes:
+        rid = node.get("request_id") or "-"
+        if rid not in by_request:
+            by_request[rid] = {
+                "request_id": rid,
+                "seq_from": node["seq"],
+                "seq_to": node["seq"],
+                "injections": [],
+                "user_message": None,
+                "tools": [],
+                "tool_count": 0,
+                "reply": None,
+                "model": None,
+                "duration_ms": None,
+                "degraded": False,
+            }
+            order.append(rid)
+        stage = by_request[rid]
+        stage["seq_from"] = min(stage["seq_from"], node["seq"])
+        stage["seq_to"] = max(stage["seq_to"], node["seq"])
+        kind = node.get("kind")
+        if kind == "context_injection":
+            stage["injections"].append({
+                "source": node.get("source"),
+                "label": node.get("label"),
+            })
+        elif kind == "user_message":
+            stage["user_message"] = node.get("content")
+        elif kind == "tool_call":
+            stage["tools"].append({
+                "tool": node.get("tool"),
+                "label": node.get("label") or node.get("tool"),
+                "success": node.get("success", True),
+                "is_write": node.get("is_write", False),
+            })
+            stage["tool_count"] += 1
+        elif kind == "assistant_reply":
+            stage["reply"] = node.get("reply")
+            stage["model"] = node.get("model")
+            stage["duration_ms"] = node.get("duration_ms")
+            stage["degraded"] = node.get("degraded", False)
+
+    out = [by_request[r] for r in order]
+    # 工具序列简化为名称列表（前端可直接展示），保留完整数组供展开。
+    for stage in out:
+        stage["tool_sequence"] = [t["tool"] for t in stage["tools"]]
+    return out
