@@ -264,4 +264,220 @@ async def submit_training_attempt(
     }
 
 
+@router.get("/review", summary="错题本：按技能聚合历史错题")
+async def get_review_book(
+    position_code: str = Query("pmc", description="职位训练编码"),
+    factory_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """从该用户的历史答题中聚合错题，按技能分组，附解析与重练建议。"""
+    position = _position_summary(position_code)
+    canonical_code = position["code"]
+    uid = _user_id(current_user)
+    fid = _factory_id(current_user, factory_id)
+
+    # 取最近 200 次答题记录，展开 details，筛出错误项
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT details, created_at
+                FROM position_training_attempts
+                WHERE position_code = :position_code
+                  AND user_id = :user_id
+                  AND (factory_id = :factory_id OR :factory_id IS NULL)
+                ORDER BY created_at DESC
+                LIMIT 200
+                """
+            ),
+            {"position_code": canonical_code, "user_id": uid, "factory_id": fid},
+        )
+    ).mappings().all()
+
+    wrong_by_skill: Dict[str, List[Dict[str, Any]]] = {}
+    wrong_ids: List[str] = []
+    total_wrong = 0
+    for row in rows:
+        try:
+            details = json.loads(row["details"]) if isinstance(row["details"], str) else (row["details"] or [])
+        except (TypeError, ValueError):
+            details = []
+        for item in details:
+            if item.get("correct"):
+                continue
+            qid = item.get("id") or item.get("question_code") or ""
+            if not qid:
+                continue
+            total_wrong += 1
+            if qid in wrong_ids:
+                continue
+            wrong_ids.append(qid)
+            skill = item.get("skill") or "未分类"
+            wrong_by_skill.setdefault(skill, []).append(
+                {
+                    "id": qid,
+                    "question_code": item.get("question_code", qid),
+                    "skill": skill,
+                    "selected": item.get("selected") or [],
+                    "answer": item.get("answer") or [],
+                    "explanation": item.get("explanation") or "",
+                    "points": item.get("points") or 1,
+                }
+            )
+
+    # 补充题目信息（prompt/type/difficulty/reference_terms）——若题目仍有效
+    if wrong_ids:
+        q_rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT id, question_code, skill, difficulty, question_type,
+                           prompt, options, reference_terms
+                    FROM position_training_questions
+                    WHERE id = ANY(:ids)
+                    """
+                ),
+                {"ids": wrong_ids},
+            )
+        ).mappings().all()
+        qinfo = {row["id"]: dict(row) for row in q_rows}
+    else:
+        qinfo = {}
+
+    skills_out: List[Dict[str, Any]] = []
+    for skill, items in wrong_by_skill.items():
+        enriched = []
+        for it in items:
+            info = qinfo.get(it["id"], {})
+            enriched.append({**it, **info})
+        skills_out.append({"skill": skill, "count": len(items), "questions": enriched})
+
+    skills_out.sort(key=lambda s: -s["count"])
+
+    return {
+        "position": position,
+        "factory_id": fid,
+        "total_attempts": len(rows),
+        "distinct_wrong": len(wrong_ids),
+        "total_wrong_instances": total_wrong,
+        "skills": skills_out,
+        "mission": "错题按技能聚合，优先复习错误率最高的技能；解析已给出标准答案。",
+    }
+
+
+@router.get("/mastery", summary="掌握度：按技能与难度计算熟练度雷达")
+async def get_mastery(
+    position_code: str = Query("pmc", description="职位训练编码"),
+    factory_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """基于全部题库 + 历史答题，计算每个技能的作答次数/正确率/掌握度。"""
+    position = _position_summary(position_code)
+    canonical_code = position["code"]
+    uid = _user_id(current_user)
+    fid = _factory_id(current_user, factory_id)
+
+    bank = (
+        await db.execute(
+            text(
+                """
+                SELECT id, skill, difficulty, points
+                FROM position_training_questions
+                WHERE position_code = :position_code AND is_active = true
+                """
+            ),
+            {"position_code": canonical_code},
+        )
+    ).mappings().all()
+
+    attempts = (
+        await db.execute(
+            text(
+                """
+                SELECT details
+                FROM position_training_attempts
+                WHERE position_code = :position_code
+                  AND user_id = :user_id
+                  AND (factory_id = :factory_id OR :factory_id IS NULL)
+                ORDER BY created_at DESC
+                LIMIT 500
+                """
+            ),
+            {"position_code": canonical_code, "user_id": uid, "factory_id": fid},
+        )
+    ).mappings().all()
+
+    # 每道题累计 答对/答错 次数
+    question_stats: Dict[str, Dict[str, int]] = {}
+    for row in attempts:
+        try:
+            details = json.loads(row["details"]) if isinstance(row["details"], str) else (row["details"] or [])
+        except (TypeError, ValueError):
+            details = []
+        for item in details:
+            qid = item.get("id") or item.get("question_code") or ""
+            if not qid:
+                continue
+            st = question_stats.setdefault(qid, {"correct": 0, "wrong": 0})
+            if item.get("correct"):
+                st["correct"] += 1
+            else:
+                st["wrong"] += 1
+
+    bank_by_skill: Dict[str, Dict[str, Any]] = {}
+    skill_qids: Dict[str, set] = {}
+    for row in bank:
+        skill = row["skill"]
+        b = bank_by_skill.setdefault(skill, {"total": 0, "points": 0, "difficulty_sum": 0})
+        b["total"] += 1
+        b["points"] += int(row["points"] or 1)
+        b["difficulty_sum"] += int(row["difficulty"] or 1)
+        skill_qids.setdefault(skill, set()).add(row["id"])
+
+    skills_out: List[Dict[str, Any]] = []
+    for skill, b in bank_by_skill.items():
+        skill_attempts = 0
+        skill_correct = 0
+        qids = skill_qids.get(skill, set())
+        for qid, st in question_stats.items():
+            if qid in qids:
+                skill_attempts += st["correct"] + st["wrong"]
+                skill_correct += st["correct"]
+        accuracy = round(skill_correct / skill_attempts * 100, 1) if skill_attempts else None
+        mastery = round(skill_correct / (b["total"] * 2) * 100, 1)  # 全对一次=50%，两次全对=100%
+        mastery = min(mastery, 100)
+        skills_out.append(
+            {
+                "skill": skill,
+                "bank_size": b["total"],
+                "attempts": skill_attempts,
+                "accuracy": accuracy,
+                "mastery": mastery,
+                "avg_difficulty": round(b["difficulty_sum"] / b["total"], 1),
+                "status": (
+                    "suggest_review"
+                    if (accuracy is None or accuracy < 60)
+                    else "practice"
+                    if accuracy < 80
+                    else "solid"
+                ),
+            }
+        )
+
+    skills_out.sort(key=lambda s: (s["mastery"], -s["bank_size"]))
+
+    return {
+        "position": position,
+        "factory_id": fid,
+        "skills": skills_out,
+        "legend": {
+            "suggest_review": "建议复盘（正确率<60% 或未练习）",
+            "practice": "需要练习（正确率 60%-80%）",
+            "solid": "掌握扎实（正确率≥80%）",
+        },
+    }
+
+
 __all__ = ["router"]
