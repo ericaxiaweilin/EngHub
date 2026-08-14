@@ -68,6 +68,7 @@ class HarnessKernel:
         ground_tool_result: Callable[[Dict[str, Any]], str],
         verify_reply: Optional[Callable[..., Awaitable[str]]] = None,
         make_tool_action: Optional[Callable[..., Any]] = None,
+        on_tool_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         write_tools: Optional[frozenset] = None,
         sim_tools: Optional[frozenset] = None,
         tool_definitions: Optional[List[Dict[str, Any]]] = None,
@@ -120,6 +121,7 @@ class HarnessKernel:
             # ModelReviewer 接管审校时，跳过 AgentLoop 内部 verify（避免重复 LLM 调用）
             verify_reply=None if model_reviewer is not None else verify_reply,
             make_tool_action=make_tool_action,
+            on_tool_event=on_tool_event,
             write_tools=write_tools,
             sim_tools=sim_tools,
             final_grounding_prompt=final_grounding_prompt,

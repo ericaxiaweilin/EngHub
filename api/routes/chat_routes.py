@@ -1749,10 +1749,12 @@ async def _handle_kernel_chat(
     http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
 ) -> ChatResponse:
     """统一 Harness Kernel 请求处理器，供 V1/V2/SSE 共用。
 
     Phase 3：会话持久化——无 session_id 自动建会话，请求结束落库消息+遥测。
+    on_event: 可选异步回调，每次工具执行完成后触发（SSE 实时推送轨迹用）。
     """
     from core.kernel import HarnessKernel, KernelResponse
 
@@ -2017,6 +2019,7 @@ async def _handle_kernel_chat(
         ground_tool_result=_grounded_tool_result,
         verify_reply=_verify_grounded_reply,
         make_tool_action=make_tool_action,
+        on_tool_event=on_event,
         write_tools=frozenset(WRITE_TOOLS),
         sim_tools=frozenset(SIM_TOOLS),
         tool_definitions=tool_definitions,
@@ -3023,26 +3026,36 @@ async def chat_stream(
 
     async def generate():
         yield _sse("status", {"message": "正在由统一 Chat Kernel 处理…"})
-        try:
-            result = await _handle_kernel_chat(
-                request, http_request, db, current_user,
+        events = asyncio.Queue()
+        pushed = {"count": 0}
+
+        async def emit(event: Dict[str, Any]) -> None:
+            await events.put(event)
+            pushed["count"] += 1
+
+        kernel_task = asyncio.create_task(
+            _handle_kernel_chat(
+                request, http_request, db, current_user, on_event=emit,
             )
-            for action in result.actions:
-                payload = action.model_dump() if hasattr(action, "model_dump") else action
-                yield _sse("action", payload)
-            for table in result.tables:
-                yield _sse("table", table)
-            for diagram in result.diagrams:
-                yield _sse("diagram", diagram)
-            if result.reply:
-                yield _sse("delta", {"content": result.reply})
-            yield _sse("done", {
-                "model": result.model,
-                "degraded": result.degraded,
-                "session_id": result.session_id,
-                "request_id": result.request_id or request_id,
-                "memory": getattr(result, "memory", None),
-            })
+        )
+        # 并发消费：kernel 每完成一次工具执行即实时推送 trajectory 事件，
+        # 不等整个请求结束（对齐 DSH trajectory 运行中状态）。
+        while not kernel_task.done():
+            try:
+                evt = await asyncio.wait_for(
+                    events.get(), timeout=0.2,
+                )
+                yield _sse("trajectory", evt)
+            except asyncio.TimeoutError:
+                continue
+        # kernel 完成后清空剩余事件（理论上无剩余；防御性补推）
+        while not events.empty():
+            try:
+                yield _sse("trajectory", events.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        try:
+            result = kernel_task.result()
         except Exception as exc:  # noqa: BLE001
             _logger.exception("[chat-stream-kernel] failed request=%s", request_id)
             yield _sse("delta", {
@@ -3056,6 +3069,37 @@ async def chat_stream(
                 "session_id": request.session_id,
                 "request_id": request_id,
             })
+            return
+        if pushed["count"] == 0:
+            # 无实时回调（deterministic 路径等）：从 result.actions 回放为
+            # trajectory 事件，保证前端轨迹与事件流视图一致。
+            for action in result.actions:
+                payload = action.model_dump() if hasattr(action, "model_dump") else action
+                yield _sse("trajectory", {
+                    "type": "tool_call",
+                    "tool": payload.get("tool") or getattr(action, "tool", ""),
+                    "label": payload.get("label") or getattr(action, "label", ""),
+                    "args": payload.get("arguments") or getattr(action, "arguments", None),
+                    "result": payload.get("result") or getattr(action, "result", None),
+                    "success": payload.get("success", True),
+                    "is_write": payload.get("is_write", False),
+                })
+        for action in result.actions:
+            payload = action.model_dump() if hasattr(action, "model_dump") else action
+            yield _sse("action", payload)
+        for table in result.tables:
+            yield _sse("table", table)
+        for diagram in result.diagrams:
+            yield _sse("diagram", diagram)
+        if result.reply:
+            yield _sse("delta", {"content": result.reply})
+        yield _sse("done", {
+            "model": result.model,
+            "degraded": result.degraded,
+            "session_id": result.session_id,
+            "request_id": result.request_id or request_id,
+            "memory": getattr(result, "memory", None),
+        })
 
     return StreamingResponse(
         generate(),

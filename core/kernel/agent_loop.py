@@ -41,6 +41,7 @@ CleanReplyFn = Callable[[str], str]
 GroundToolResultFn = Callable[[Dict[str, Any]], str]
 VerifyReplyFn = Callable[[str, List[Any], Dict[str, Any]], Awaitable[str]]
 MakeToolActionFn = Callable[[str, str, Dict[str, Any], Dict[str, Any], bool, bool, bool], Any]
+ToolEventFn = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
 class AgentLoop:
@@ -55,6 +56,7 @@ class AgentLoop:
         ground_tool_result: 将工具结果包装为注入模型的 grounding 文本
         verify_reply: 对最终回复做 grounding 校验（可空）
         make_tool_action: 构造前端展示的 ToolAction 对象（可空，空则不收集）
+        on_tool_event: 每次工具执行完成后异步回调（用于 SSE 实时推送轨迹）
         write_tools / sim_tools: 判断工具是否写/仿真，用于标注 action
         final_grounding_prompt: 每轮工具执行后追加给模型的 grounding 约束
     """
@@ -67,6 +69,7 @@ class AgentLoop:
         ground_tool_result: GroundToolResultFn,
         verify_reply: Optional[VerifyReplyFn] = None,
         make_tool_action: Optional[MakeToolActionFn] = None,
+        on_tool_event: Optional[ToolEventFn] = None,
         write_tools: Optional[frozenset] = None,
         sim_tools: Optional[frozenset] = None,
         final_grounding_prompt: str = "",
@@ -78,6 +81,7 @@ class AgentLoop:
         self._ground_tool_result = ground_tool_result
         self._verify_reply = verify_reply
         self._make_tool_action = make_tool_action
+        self._on_tool_event = on_tool_event
         self._write_tools = write_tools or frozenset()
         self._sim_tools = sim_tools or frozenset()
         self._final_grounding_prompt = final_grounding_prompt
@@ -194,6 +198,21 @@ class AgentLoop:
                         not is_error,
                     )
                     actions.append(action)
+
+                # SSE 实时推送轨迹：每次工具执行完成即触发（不阻塞循环关键路径）
+                if self._on_tool_event is not None:
+                    try:
+                        await self._on_tool_event({
+                            "type": "tool_call",
+                            "tool": tool_name,
+                            "label": tool_name,
+                            "args": arguments,
+                            "result": result,
+                            "success": not is_error,
+                            "is_write": tool_name in self._write_tools,
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 messages.append({
                     "role": "tool",

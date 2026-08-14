@@ -1318,6 +1318,31 @@ export default function AIAssistantWidget() {
             } else if (eventType === 'action') {
               accActions = [...accActions, data]
               applyUpdate()
+            } else if (eventType === 'trajectory') {
+              // DSH trajectory 实时推送：工具执行完成即追加轨迹节点（静默累积）
+              setTrajectory(prev => {
+                const base = prev || {
+                  session_id: data.session_id || sessionId || '',
+                  event_count: 0,
+                  nodes: [],
+                }
+                const seq = (base.nodes?.length || 0) + 1
+                const node: TrajectoryNode = {
+                  kind: 'tool_call',
+                  seq,
+                  tool: data.tool,
+                  label: data.label || data.tool,
+                  args: data.args,
+                  result: data.result,
+                  success: data.success !== false,
+                  is_write: !!data.is_write,
+                }
+                return {
+                  ...base,
+                  event_count: (base.event_count || 0) + 1,
+                  nodes: [...(base.nodes || []), node],
+                }
+              })
             } else if (eventType === 'table') {
               const table = data as TableData
               if (table.workbook_id) {
