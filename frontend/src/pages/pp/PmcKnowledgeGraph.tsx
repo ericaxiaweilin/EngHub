@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Card, Empty, Space, Tag, Typography } from 'antd'
-import { CloseOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { CloseOutlined, FullscreenOutlined, ThunderboltOutlined } from '@ant-design/icons'
 
 const { Text, Title } = Typography
 
@@ -68,11 +68,30 @@ interface PmcKnowledgeGraphProps {
   selectedSkill: string | null
 }
 
+const ZOOM_MIN = 0.35
+const ZOOM_MAX = 3
+
+interface Viewport {
+  tx: number
+  ty: number
+  scale: number
+}
+
 const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSkill, selectedSkill }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [hovered, setHovered] = useState<string | null>(null)
   const hoveredRef = useRef<string | null>(null)
+  const viewRef = useRef<Viewport>({ tx: 0, ty: 0, scale: 1 })
+  const dragRef = useRef<{ active: boolean; moved: boolean; sx: number; sy: number; ox: number; oy: number }>({
+    active: false,
+    moved: false,
+    sx: 0,
+    sy: 0,
+    ox: 0,
+    oy: 0,
+  })
+  const [dragging, setDragging] = useState(false)
 
   const { nodes, edges, skillList } = useMemo(() => {
     const questions: GraphQuestion[] = pack?.quiz?.questions || []
@@ -149,45 +168,55 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
       canvas.height = height * dpr
       canvas.style.width = `${width}px`
       canvas.style.height = `${height}px`
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     }
     resize()
     const ro = new ResizeObserver(resize)
     ro.observe(wrap)
 
+    // 世界坐标以画布中心为原点；屏幕坐标 = (世界坐标 * scale) + (中心 + offset)
+    const cx = () => width / 2
+    const cy = () => height / 2
+    const r1 = () => Math.min(width, height) * 0.36
+    const r2 = () => r1() * 0.58
+
     const pos = (angle: number, ring: number): { x: number; y: number } => {
-      const cx = width / 2
-      const cy = height / 2
-      const r1 = Math.min(width, height) * 0.36
-      const r2 = r1 * 0.58
-      const r = ring === 0 ? 0 : ring === 1 ? r1 : r2
+      const r = ring === 0 ? 0 : ring === 1 ? r1() : r2()
       const a = angle + Math.sin(t * 0.0004) * 0.02
-      return { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r }
+      return { x: Math.cos(a) * r, y: Math.sin(a) * r }
+    }
+
+    const worldToScreen = (wx: number, wy: number): { x: number; y: number } => {
+      const v = viewRef.current
+      return { x: cx() + v.tx + wx * v.scale, y: cy() + v.ty + wy * v.scale }
+    }
+    const screenToWorld = (mx: number, my: number): { x: number; y: number } => {
+      const v = viewRef.current
+      return { x: (mx - cx() - v.tx) / v.scale, y: (my - cy() - v.ty) / v.scale }
     }
 
     const nodePos = (n: WebNode): { x: number; y: number } => pos(n.angle, n.ring)
 
     const draw = () => {
       t += 1
+      const v = viewRef.current
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       ctx.clearRect(0, 0, width, height)
-      const cx = width / 2
-      const cy = height / 2
-      const r1 = Math.min(width, height) * 0.36
-      const r2 = r1 * 0.58
       const hover = hoveredRef.current
 
       ctx.save()
+      ctx.translate(cx() + v.tx, cy() + v.ty)
+      ctx.scale(v.scale, v.scale)
+
       ctx.beginPath()
-      ctx.arc(cx, cy, r2, 0, Math.PI * 2)
+      ctx.arc(0, 0, r2(), 0, Math.PI * 2)
       ctx.strokeStyle = 'rgba(42, 63, 80, 0.5)'
-      ctx.lineWidth = 1
+      ctx.lineWidth = 1 / v.scale
       ctx.stroke()
       ctx.beginPath()
-      ctx.arc(cx, cy, r1, 0, Math.PI * 2)
+      ctx.arc(0, 0, r1(), 0, Math.PI * 2)
       ctx.strokeStyle = 'rgba(42, 63, 80, 0.65)'
-      ctx.lineWidth = 1.2
+      ctx.lineWidth = 1.2 / v.scale
       ctx.stroke()
-      ctx.restore()
 
       edges.forEach((edge) => {
         const s = nodes.find((n) => n.id === edge.source)
@@ -200,12 +229,8 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         ctx.beginPath()
         ctx.moveTo(ps.x, ps.y)
         ctx.lineTo(pe.x, pe.y)
-        ctx.strokeStyle = active
-          ? edge.color
-          : selected
-            ? edge.color + 'aa'
-            : edge.color + '2e'
-        ctx.lineWidth = active ? 2 : 1
+        ctx.strokeStyle = active ? edge.color : selected ? edge.color + 'aa' : edge.color + '2e'
+        ctx.lineWidth = (active ? 2 : 1) / v.scale
         ctx.stroke()
       })
 
@@ -213,9 +238,10 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         const p = nodePos(n)
         const active = hover === n.id
         const selected = selectedSkill && (n.id === `skill:${selectedSkill}` || n.skill === selectedSkill)
+        const radius = n.radius / Math.sqrt(v.scale)
         if (n.type === 'root') {
           ctx.beginPath()
-          ctx.arc(p.x, p.y, 22, 0, Math.PI * 2)
+          ctx.arc(p.x, p.y, 22 / Math.sqrt(v.scale), 0, Math.PI * 2)
           const grad = ctx.createRadialGradient(p.x, p.y, 2, p.x, p.y, 22)
           grad.addColorStop(0, 'rgba(0, 212, 170, 0.35)')
           grad.addColorStop(1, 'rgba(0, 212, 170, 0)')
@@ -223,51 +249,53 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
           ctx.fill()
         }
         ctx.beginPath()
-        ctx.arc(p.x, p.y, n.radius, 0, Math.PI * 2)
+        ctx.arc(p.x, p.y, radius, 0, Math.PI * 2)
         ctx.fillStyle = active ? '#ffffff' : n.color
         ctx.fill()
         if (active || selected || n.type === 'skill') {
           ctx.beginPath()
-          ctx.arc(p.x, p.y, n.radius + 4, 0, Math.PI * 2)
+          ctx.arc(p.x, p.y, radius + 4 / v.scale, 0, Math.PI * 2)
           ctx.strokeStyle = (active ? '#ffffff' : n.color) + '55'
-          ctx.lineWidth = 1.5
+          ctx.lineWidth = 1.5 / v.scale
           ctx.stroke()
         }
         if (n.type === 'skill') {
-          ctx.font = '11px system-ui, sans-serif'
+          ctx.font = `${11 / v.scale}px system-ui, sans-serif`
           ctx.fillStyle = active || selected ? n.color : 'rgba(148, 163, 184, 0.9)'
           ctx.textAlign = 'center'
           ctx.textBaseline = 'top'
-          ctx.fillText(n.label, p.x, p.y + n.radius + 6)
+          ctx.fillText(n.label, p.x, p.y + radius + 6 / v.scale)
         }
       })
 
       ;(nodes.filter((n) => n.type === 'skill') as WebNode[]).forEach((skill) => {
         const ps = nodePos(skill)
         const prog = (t * 0.0012 + skill.angle * 3) % 1
-        const pr = r2 + (r1 - r2) * prog
+        const pr = r2() + (r1() - r2()) * prog
         const a = skill.angle + Math.sin(t * 0.0004) * 0.02
-        const px = cx + Math.cos(a) * pr
-        const py = cy + Math.sin(a) * pr
+        const px = Math.cos(a) * pr
+        const py = Math.sin(a) * pr
         ctx.beginPath()
-        ctx.arc(px, py, 2, 0, Math.PI * 2)
+        ctx.arc(px, py, 2 / v.scale, 0, Math.PI * 2)
         ctx.fillStyle = skill.color + 'cc'
         ctx.fill()
         ctx.beginPath()
         ctx.moveTo(ps.x, ps.y)
         ctx.lineTo(px, py)
         ctx.strokeStyle = skill.color + '18'
-        ctx.lineWidth = 0.8
+        ctx.lineWidth = 0.8 / v.scale
         ctx.stroke()
         const back = (t * 0.0008 + skill.angle * 5) % 1
-        const br = r2 + (r1 - r2) * back
-        const bx = cx + Math.cos(a) * br
-        const by = cy + Math.sin(a) * br
+        const br = r2() + (r1() - r2()) * back
+        const bx = Math.cos(a) * br
+        const by = Math.sin(a) * br
         ctx.beginPath()
-        ctx.arc(bx, by, 1.4, 0, Math.PI * 2)
+        ctx.arc(bx, by, 1.4 / v.scale, 0, Math.PI * 2)
         ctx.fillStyle = '#ffffff40'
         ctx.fill()
       })
+
+      ctx.restore()
 
       raf = requestAnimationFrame(draw)
     }
@@ -275,23 +303,74 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
 
     const hitTest = (clientX: number, clientY: number): string | null => {
       const rect = canvas.getBoundingClientRect()
-      const mx = clientX - rect.left
-      const my = clientY - rect.top
+      const w = screenToWorld(clientX - rect.left, clientY - rect.top)
+      const v = viewRef.current
       let best: { id: string; d: number } | null = null
       nodes.forEach((n) => {
         const p = nodePos(n)
-        const dist = Math.hypot(p.x - mx, p.y - my)
-        const rr = n.type === 'root' ? 22 : n.radius + (n.type === 'skill' ? 8 : 6)
+        const radius = v.scale >= 1 ? n.radius : n.radius * Math.sqrt(v.scale)
+        const rr = n.type === 'root' ? 22 * (v.scale >= 1 ? 1 : Math.sqrt(v.scale)) : radius + (n.type === 'skill' ? 8 : 6)
+        const dist = Math.hypot(p.x - w.x, p.y - w.y)
         if (dist < rr && (!best || dist < best.d)) best = { id: n.id, d: dist }
       })
       return best?.id ?? null
     }
 
-    const onMove = (ev: MouseEvent) => {
-      const id = hitTest(ev.clientX, ev.clientY)
-      setHovered((prev) => (prev === id ? prev : id))
+    const onPointerDown = (ev: PointerEvent) => {
+      const rect = canvas.getBoundingClientRect()
+      dragRef.current = {
+        active: true,
+        moved: false,
+        sx: ev.clientX - rect.left,
+        sy: ev.clientY - rect.top,
+        ox: ev.clientX,
+        oy: ev.clientY,
+      }
+      setDragging(true)
+      canvas.setPointerCapture(ev.pointerId)
+    }
+    const onPointerMove = (ev: PointerEvent) => {
+      const d = dragRef.current
+      if (d.active) {
+        const dx = ev.clientX - d.ox
+        const dy = ev.clientY - d.oy
+        if (Math.hypot(dx, dy) > 3) d.moved = true
+        if (d.moved) {
+          viewRef.current.tx += dx
+          viewRef.current.ty += dy
+          d.ox = ev.clientX
+          d.oy = ev.clientY
+        }
+      } else {
+        const id = hitTest(ev.clientX, ev.clientY)
+        setHovered((prev) => (prev === id ? prev : id))
+      }
+    }
+    const onPointerUp = () => {
+      dragRef.current.active = false
+      setDragging(false)
+    }
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault()
+      const rect = canvas.getBoundingClientRect()
+      const mx = ev.clientX - rect.left
+      const my = ev.clientY - rect.top
+      const factor = ev.deltaY < 0 ? 1.12 : 0.89
+      const v = viewRef.current
+      const w = screenToWorld(mx, my)
+      const nextScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, v.scale * factor))
+      const s = nextScale / v.scale
+      viewRef.current = {
+        scale: nextScale,
+        tx: (v.tx - w.x * v.scale) * s + w.x * nextScale,
+        ty: (v.ty - w.y * v.scale) * s + w.y * nextScale,
+      }
+    }
+    const resetView = () => {
+      viewRef.current = { tx: 0, ty: 0, scale: 1 }
     }
     const onClick = (ev: MouseEvent) => {
+      if (dragRef.current.moved) return
       const id = hitTest(ev.clientX, ev.clientY)
       if (!id) return
       const n = nodes.find((x) => x.id === id)
@@ -300,16 +379,38 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
       else if (n.type === 'skill') onSelectSkill(n.label)
       else if (n.skill) onSelectSkill(n.skill)
     }
-    canvas.addEventListener('mousemove', onMove)
+
+    canvas.addEventListener('pointerdown', onPointerDown)
+    canvas.addEventListener('pointermove', onPointerMove)
+    canvas.addEventListener('pointerup', onPointerUp)
+    canvas.addEventListener('wheel', onWheel, { passive: false })
     canvas.addEventListener('click', onClick)
+    canvas.addEventListener('dblclick', resetView)
 
     return () => {
       cancelAnimationFrame(raf)
       ro.disconnect()
-      canvas.removeEventListener('mousemove', onMove)
+      canvas.removeEventListener('pointerdown', onPointerDown)
+      canvas.removeEventListener('pointermove', onPointerMove)
+      canvas.removeEventListener('pointerup', onPointerUp)
+      canvas.removeEventListener('wheel', onWheel)
       canvas.removeEventListener('click', onClick)
+      canvas.removeEventListener('dblclick', resetView)
     }
   }, [nodes, edges, onSelectSkill, selectedSkill])
+
+  const resetView = () => {
+    viewRef.current = { tx: 0, ty: 0, scale: 1 }
+  }
+
+  const zoomIn = () => {
+    const v = viewRef.current
+    viewRef.current = { ...v, scale: Math.min(ZOOM_MAX, v.scale * 1.2) }
+  }
+  const zoomOut = () => {
+    const v = viewRef.current
+    viewRef.current = { ...v, scale: Math.max(ZOOM_MIN, v.scale / 1.2) }
+  }
 
   return (
     <div
@@ -317,14 +418,18 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
       style={{
         position: 'relative',
         width: '100%',
-        height: 460,
+        height: 520,
         borderRadius: 12,
         border: `1px solid ${NEURAL_COLORS.border}`,
         background: `radial-gradient(circle at 50% 50%, #16222e 0%, ${NEURAL_COLORS.bg} 70%)`,
         overflow: 'hidden',
+        touchAction: 'none',
       }}
     >
-      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', cursor: 'pointer' }} />
+      <canvas
+        ref={canvasRef}
+        style={{ display: 'block', width: '100%', height: '100%', cursor: dragging ? 'grabbing' : 'grab' }}
+      />
       <div style={{ position: 'absolute', top: 12, left: 14, pointerEvents: 'none' }}>
         <Space size={4}>
           <Tag color="cyan" style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}>
@@ -334,6 +439,29 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
             {skillList.length} 技能 · {nodes.length - skillList.length - 1} 术语
           </Tag>
         </Space>
+      </div>
+      <div style={{ position: 'absolute', top: 12, right: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <Button
+          size="small"
+          icon={<FullscreenOutlined />}
+          onClick={resetView}
+          style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}`, color: NEURAL_COLORS.text }}
+          title="重置视图（双击画布也可重置）"
+        />
+        <Button
+          size="small"
+          onClick={zoomIn}
+          style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}`, color: NEURAL_COLORS.text }}
+        >
+          +
+        </Button>
+        <Button
+          size="small"
+          onClick={zoomOut}
+          style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}`, color: NEURAL_COLORS.text }}
+        >
+          −
+        </Button>
       </div>
       <div style={{ position: 'absolute', bottom: 12, left: 14, right: 14, pointerEvents: 'none' }}>
         <Space wrap>
@@ -370,7 +498,7 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
           <div
             style={{
               position: 'absolute',
-              top: 12,
+              top: 60,
               right: 14,
               maxWidth: 260,
               padding: '8px 12px',
