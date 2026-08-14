@@ -507,7 +507,7 @@ interface LongTermMemory {
 }
 
 interface TrajectoryNode {
-  kind: 'context_injection' | 'user_message' | 'tool_call' | 'assistant_reply'
+  kind: 'context_injection' | 'user_message' | 'tool_call' | 'assistant_reply' | 'compaction'
   seq: number
   request_id?: string | null
   source?: string
@@ -523,6 +523,14 @@ interface TrajectoryNode {
   duration_ms?: number | null
   degraded?: boolean
   tool_count?: number
+  compaction_id?: string
+  summary?: string
+  fold_from?: number
+  fold_to?: number
+  folded_count?: number
+  reason?: string
+  status?: string
+  source_event_seqs?: number[]
 }
 
 interface TrajectoryData {
@@ -530,6 +538,15 @@ interface TrajectoryData {
   title?: string | null
   event_count: number
   nodes: TrajectoryNode[]
+  compactions?: {
+    compaction_id?: string
+    summary?: string
+    fold_from?: number
+    fold_to?: number
+    reason?: string
+    status?: string
+    source_event_seqs?: number[]
+  }[]
   overview?: {
     request_id: string
     seq_from: number
@@ -543,6 +560,10 @@ interface TrajectoryData {
     model?: string | null
     duration_ms?: number | null
     degraded?: boolean
+    compaction?: boolean
+    summary?: string
+    folded_count?: number
+    reason?: string
   }[]
 }
 
@@ -765,6 +786,33 @@ export default function AIAssistantWidget() {
   const openTrajectory = () => {
     setTrajectoryOpen(true)
     void loadTrajectory()
+  }
+
+  // 手动压缩（对齐 DSH /compact 人类命令）：折叠最早一段历史为摘要
+  const [compacting, setCompacting] = useState(false)
+  const handleCompactSession = async () => {
+    if (!sessionId) {
+      message.info('当前尚无会话')
+      return
+    }
+    setCompacting(true)
+    try {
+      const res: any = await api.post(`/api/v1/chat/compact/${encodeURIComponent(sessionId)}`)
+      if (res?.folded) {
+        message.success(`已压缩 ${res.folded_count || res.source_event_seqs?.length || ''} 个历史事件`)
+      } else if (res?.status === 'nothing_to_fold') {
+        message.info('历史已足够精简，无需压缩')
+      } else if (res?.status === 'busy') {
+        message.warning('已有压缩进行中（未闭合）')
+      } else {
+        message.info('没有可压缩的历史')
+      }
+      await loadTrajectory()
+    } catch {
+      // 拦截器已提示
+    } finally {
+      setCompacting(false)
+    }
   }
 
   // 头像/画像缩写（取工号首字母作为后端 profile 兜底展示）
@@ -2682,9 +2730,22 @@ export default function AIAssistantWidget() {
                         )}
                         {trajectory && (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                            <Text type="secondary" style={{ fontSize: 12 }}>
-                              共 {trajectory.event_count} 个事件 · {trajectory.overview?.length || 0} 次请求
-                            </Text>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                共 {trajectory.event_count} 个事件 · {trajectory.overview?.length || 0} 次请求
+                              </Text>
+                              <Button
+                                size="small"
+                                type="primary"
+                                ghost
+                                loading={compacting}
+                                disabled={compacting}
+                                onClick={handleCompactSession}
+                                style={{ marginLeft: 'auto', fontSize: 11 }}
+                              >
+                                压缩历史（/compact）
+                              </Button>
+                            </div>
                             <Tabs
                               size="small"
                               items={[
@@ -2701,9 +2762,22 @@ export default function AIAssistantWidget() {
                                           <div style={{ flex: 1, minWidth: 0 }}>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                                               <Tag color="geekblue" style={{ flexShrink: 0, marginInlineEnd: 0 }}>#{stage.seq_from}–{stage.seq_to}</Tag>
-                                              <Text strong style={{ fontSize: 12 }}>{stage.user_message || '（附件消息）'}</Text>
+                                              {stage.compaction ? (
+                                                <>
+                                                  <Text strong style={{ fontSize: 12 }}>摘要折叠</Text>
+                                                  <Tag color="blue" style={{ fontSize: 10 }}>{stage.folded_count} 个事件</Tag>
+                                                </>
+                                              ) : (
+                                                <Text strong style={{ fontSize: 12 }}>{stage.user_message || '（附件消息）'}</Text>
+                                              )}
                                               {stage.degraded && <Tag color="red" style={{ fontSize: 10 }}>降级</Tag>}
                                             </div>
+                                            {stage.compaction && stage.summary && (
+                                              <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#f0f7ff', padding: 8, borderRadius: 6, borderLeft: '3px solid #1677ff' }}>
+                                                {stage.summary}
+                                              </pre>
+                                            )}
+                                            {!stage.compaction && (<>
                                             <div style={{ marginTop: 3, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
                                               {(stage.injections || []).map((inj, idx) => (
                                                 <Tag key={`${inj.source}-${idx}`} color={inj.source === 'guidance' ? 'purple' : inj.source === 'profile' ? 'blue' : inj.source === 'preferences' ? 'green' : 'default'} style={{ fontSize: 10 }}>{inj.label}</Tag>
@@ -2724,6 +2798,7 @@ export default function AIAssistantWidget() {
                                               {stage.duration_ms != null && <span>耗时 {Math.round(stage.duration_ms)}ms</span>}
                                               {!stage.model && stage.duration_ms == null && <span>阶段完成</span>}
                                             </div>
+                                            </>)}
                                           </div>
                                         </List.Item>
                                       )}
@@ -2741,11 +2816,13 @@ export default function AIAssistantWidget() {
                                         const color = node.kind === 'context_injection' ? 'purple'
                                           : node.kind === 'tool_call' ? 'orange'
                                           : node.kind === 'assistant_reply' ? 'green'
+                                          : node.kind === 'compaction' ? 'blue'
                                           : 'default'
                                         const title = node.kind === 'context_injection'
                                           ? `${node.label}（注入 · ${node.source}）`
                                           : node.kind === 'user_message' ? '用户消息'
                                           : node.kind === 'tool_call' ? `工具调用：${node.tool}`
+                                          : node.kind === 'compaction' ? `摘要折叠（${node.folded_count || node.source_event_seqs?.length || 0} 个事件）`
                                           : 'AI 回复'
                                         return (
                                           <List.Item style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
@@ -2784,6 +2861,19 @@ export default function AIAssistantWidget() {
                                                     {node.duration_ms != null && <span>耗时 {Math.round(node.duration_ms)}ms</span>}
                                                   </div>
                                                   <div style={{ marginTop: 2 }}>{node.reply}</div>
+                                                </div>
+                                              )}
+                                              {node.kind === 'compaction' && (
+                                                <div style={{ marginTop: 4, fontSize: 12 }}>
+                                                  <Tag color="blue" style={{ fontSize: 10 }}>
+                                                    折叠 seq {node.fold_from}—{node.fold_to}
+                                                    {node.reason && ` · ${node.reason === 'manual' ? '手动' : '压力自动'}`}
+                                                  </Tag>
+                                                  {node.summary && (
+                                                    <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#f0f7ff', padding: 8, borderRadius: 6, borderLeft: '3px solid #1677ff' }}>
+                                                      {node.summary}
+                                                    </pre>
+                                                  )}
                                                 </div>
                                               )}
                                             </div>

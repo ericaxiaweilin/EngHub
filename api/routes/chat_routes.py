@@ -1775,6 +1775,21 @@ async def _handle_kernel_chat(
     )
     session_id = session.id
 
+    # ── 自动压缩压力（对齐 DSH after-call compaction pressure）──
+    # 会话事件数超阈值且可折叠事件超 keep_recent 时，趁本请求事务空闲折叠旧历史，
+    # 避免事件流无限增长。失败仅告警，不阻塞请求。
+    try:
+        from api.services import chat_persistence_service as _cp
+        await _cp.compact_session_events(
+            db,
+            session_id,
+            user=current_user,
+            factory_id=factory_id,
+            reason="pressure",
+        )
+    except Exception:  # noqa: BLE001
+        _logger.debug("[chat-kernel] 自动压缩跳过（无压力或无权限）", exc_info=True)
+
     # ── 用户长期记忆（跨会话）：加载用户维度的已记事实，注入 system prompt ──
     from api.services import chat_memory_service as mem
     from database.models import Role as RoleModel
@@ -3324,6 +3339,33 @@ async def chat_trajectory(
             user=current_user,
             factory_id=_chat_factory_id(http_request, current_user),
         )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.post("/compact/{session_id}")
+async def chat_compact(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """手动压缩会话事件流（DSH compaction：/compact 人类命令）。
+
+    折叠最早一段历史为摘要，保留最近 keep_recent 个事件。
+    返回折叠结果（含 source_event_seqs 与摘要）；busy 表示已有未闭合压缩。
+    """
+    from api.services.chat_persistence_service import ChatSessionAccessError, compact_session_events
+    try:
+        result = await compact_session_events(
+            db,
+            session_id,
+            user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+            reason="manual",
+        )
+        await db.commit()
+        return result
     except ChatSessionAccessError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 

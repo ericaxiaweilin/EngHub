@@ -18,6 +18,12 @@ from database.models import (
 
 HISTORY_LIMIT = 50
 
+# 自动压缩压力阈值：会话普通事件数超过该值且可折叠事件数超过 COMPACTION_KEEP_RECENT 时，
+# 新请求进入前自动折叠旧历史（对齐 DSH after-call compaction pressure）。
+COMPACTION_PRESSURE_EVENTS = 40
+# 每次压缩保留的最近普通事件数（未折叠的尾部）。
+COMPACTION_KEEP_RECENT = 8
+
 
 class ChatSessionAccessError(PermissionError):
     """会话不存在或不属于当前用户/工厂。"""
@@ -480,6 +486,194 @@ async def _session_last_seq(db: AsyncSession, session_id: str) -> int:
     return int(row) if row else 0
 
 
+async def compact_session_events(
+    db: AsyncSession,
+    session_id: str,
+    *,
+    user: Any = None,
+    factory_id: Optional[str] = None,
+    compaction_id: Optional[str] = None,
+    fold_from: Optional[int] = None,
+    fold_to: Optional[int] = None,
+    keep_recent: int = COMPACTION_KEEP_RECENT,
+    reason: str = "manual",
+) -> Dict[str, Any]:
+    """折叠一段历史事件为一条摘要（对齐 DSH compaction bracket）。
+
+    落库三个事件（同一 compaction_id，atomic）：
+      compaction_start  → {compaction_id, fold_from, fold_to, reason}
+      compaction_summary→ {compaction_id, summary, source_event_seqs}
+      compaction_end    → {compaction_id, status, replacement_checkpoint}
+
+    锁：存在尚未闭合的 compaction_start（无对端 compaction_end）时拒绝（busy）。
+    幂等：同一 compaction_id 已应用则直接返回已有结果。
+    source_event_seqs 记录被折叠的每个源事件 seq，供 replay 校验替换覆盖全部来源。
+    """
+    session = await _get_session(db, session_id)
+    if session is None:
+        raise ChatSessionAccessError("会话不存在")
+    if user is not None:
+        user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
+        if (
+            session.user_id != user_id
+            or (factory_id is not None and session.factory_id != factory_id)
+        ):
+            raise ChatSessionAccessError("无权操作该会话")
+
+    rows = (await db.execute(
+        select(ChatSessionEvent)
+        .where(ChatSessionEvent.session_id == session_id)
+        .order_by(ChatSessionEvent.seq.asc())
+    )).scalars().all()
+
+    compaction_id = compaction_id or generate_uuid()
+
+    # 幂等：同一 compaction_id 已存在则返回其结果
+    existing = [e for e in rows if e.request_id == compaction_id]
+    if existing:
+        return {
+            "folded": True,
+            "compaction_id": compaction_id,
+            "status": "exists",
+            "seq_from": existing[0].seq,
+            "seq_to": existing[-1].seq,
+        }
+
+    # 锁：存在尚未闭合的 compaction_start（无对端 compaction_end）时拒绝
+    pending = {e.request_id for e in rows if e.event_type == "compaction_start"}
+    closed = {e.request_id for e in rows if e.event_type == "compaction_end"}
+    open_locks = pending - closed
+    if open_locks:
+        return {
+            "folded": False,
+            "compaction_id": compaction_id,
+            "status": "busy",
+            "lock_compaction_id": sorted(open_locks)[0],
+        }
+
+    # 折叠区间：普通（非 compaction_*）事件，按 seq 升序。
+    if fold_from is None or fold_to is None:
+        plain_rows = [e for e in rows if e.event_type not in (
+            "compaction_start", "compaction_summary", "compaction_end",
+        )]
+        # 自动压力门槛：仅当会话普通事件足够多时才压力折叠（对齐 DSH 阈值触发），
+        # 避免小会话因 keep_recent 而过早折叠可读历史。
+        if reason == "pressure" and len(plain_rows) < COMPACTION_PRESSURE_EVENTS:
+            return {
+                "folded": False,
+                "compaction_id": compaction_id,
+                "status": "no_pressure",
+                "total_events": len(plain_rows),
+                "pressure_threshold": COMPACTION_PRESSURE_EVENTS,
+            }
+        # 已被先前折叠引用的事件不再重复折叠
+        already_folded = set()
+        for e in rows:
+            if e.event_type == "compaction_summary":
+                already_folded.update(e.data.get("source_event_seqs") or ())
+        foldable = [e for e in plain_rows if e.seq not in already_folded]
+        if len(foldable) <= keep_recent:
+            return {
+                "folded": False,
+                "compaction_id": compaction_id,
+                "status": "nothing_to_fold",
+                "foldable": len(foldable),
+                "keep_recent": keep_recent,
+            }
+        cut = foldable[-keep_recent - 1]
+        fold_from = foldable[0].seq
+        fold_to = cut.seq
+
+    folded = [e for e in rows if fold_from <= e.seq <= fold_to]
+    source_event_seqs = [e.seq for e in folded]
+    if not source_event_seqs:
+        return {
+            "folded": False,
+            "compaction_id": compaction_id,
+            "status": "empty_range",
+            "fold_from": fold_from,
+            "fold_to": fold_to,
+        }
+
+    summary = _build_compaction_summary(folded)
+    replacement_checkpoint = (folded[-1].seq if folded else fold_from) + 1
+
+    await append_session_events(db, session_id=session_id, request_id=compaction_id, events=[
+        {
+            "type": "compaction_start",
+            "data": {
+                "compaction_id": compaction_id,
+                "fold_from": fold_from,
+                "fold_to": fold_to,
+                "reason": reason,
+            },
+        },
+        {
+            "type": "compaction_summary",
+            "data": {
+                "compaction_id": compaction_id,
+                "summary": summary,
+                "source_event_seqs": source_event_seqs,
+            },
+        },
+        {
+            "type": "compaction_end",
+            "data": {
+                "compaction_id": compaction_id,
+                "status": "ok",
+                "replacement_checkpoint": replacement_checkpoint,
+            },
+        },
+    ])
+    return {
+        "folded": True,
+        "compaction_id": compaction_id,
+        "status": "ok",
+        "fold_from": fold_from,
+        "fold_to": fold_to,
+        "folded_count": len(source_event_seqs),
+        "source_event_seqs": source_event_seqs,
+        "summary": summary,
+    }
+
+
+def _build_compaction_summary(events: List[ChatSessionEvent]) -> str:
+    """本地降级摘要：把被折叠事件折叠为简洁要点（LLM 摘要失败时兜底）。
+
+    按 request 分组：用户消息 → 工具序列 → 回复要点。
+    """
+    by_request: Dict[str, List[str]] = {}
+    order: List[str] = []
+    for evt in events:
+        data = evt.data or {}
+        rid = evt.request_id or "-"
+        if rid not in by_request:
+            by_request[rid] = []
+            order.append(rid)
+        if evt.event_type == "user_message":
+            content = (data.get("content") or "").strip()
+            by_request[rid].append(f"问：{content[:60]}" if content else "问：（图片/附件）")
+        elif evt.event_type == "tool_call":
+            tool = data.get("tool") or data.get("label") or ""
+            ok = data.get("success", True)
+            by_request[rid].append(f"工具[{tool}]{'✓' if ok else '✗'}")
+        elif evt.event_type == "assistant_reply":
+            reply = (data.get("reply") or "").strip()
+            by_request[rid].append(f"答：{reply[:60]}" if reply else "")
+        elif evt.event_type == "context_injection":
+            src = data.get("source") or "context"
+            by_request[rid].append(f"注入({src})")
+    lines = []
+    for rid in order:
+        seg = "；".join([p for p in by_request[rid] if p])
+        if seg:
+            lines.append(seg)
+    if not lines:
+        return f"已折叠 {len(events)} 个事件"
+    summary = "；".join(lines)
+    return summary[:2000]
+
+
 async def get_trajectory(
     db: AsyncSession,
     session_id: str,
@@ -512,10 +706,52 @@ async def get_trajectory(
         .order_by(ChatSessionEvent.seq.asc())
     )).scalars().all()
 
-    nodes: List[Dict[str, Any]] = []
-    context_requests: Dict[str, Dict[str, Any]] = {}
+    # DSH compaction：识别 compaction_start/summary/end 三元组，
+    # 把被折叠的源事件（source_event_seqs 并集）从节点流中移除，
+    # 折叠为一条 compaction 节点（含摘要）。
+    compactions: List[Dict[str, Any]] = []
+    active: Optional[Dict[str, Any]] = None
     for evt in rows:
         data = evt.data or {}
+        if evt.event_type == "compaction_start":
+            active = {
+                "kind": "compaction",
+                "seq": evt.seq,
+                "request_id": evt.request_id,
+                "compaction_id": data.get("compaction_id"),
+                "fold_from": data.get("fold_from"),
+                "fold_to": data.get("fold_to"),
+                "reason": data.get("reason"),
+                "summary": "",
+                "source_event_seqs": [],
+                "folded_count": 0,
+                "status": "started",
+            }
+            compactions.append(active)
+        elif evt.event_type == "compaction_summary" and active is not None:
+            active["summary"] = data.get("summary") or ""
+            active["source_event_seqs"] = data.get("source_event_seqs") or []
+            active["folded_count"] = len(active["source_event_seqs"])
+            active["status"] = "summarized"
+        elif evt.event_type == "compaction_end" and active is not None:
+            active["status"] = "ok"
+            active["replacement_checkpoint"] = data.get("replacement_checkpoint")
+            active = None
+        elif evt.event_type in ("compaction_start", "compaction_summary", "compaction_end"):
+            active = None
+
+    # 被折叠的源事件 = 全部 compaction 的 source_event_seqs 并集
+    compacted_seqs: set = set()
+    for c in compactions:
+        compacted_seqs.update(c.get("source_event_seqs") or [])
+
+    nodes: List[Dict[str, Any]] = []
+    context_requests: Dict[str, Dict[str, Any]] = {}
+    next_compaction = 0
+    for evt in rows:
+        data = evt.data or {}
+        if evt.seq in compacted_seqs:
+            continue
         if evt.event_type == "context_injection":
             node = {
                 "kind": "context_injection",
@@ -559,6 +795,15 @@ async def get_trajectory(
                 "degraded": data.get("degraded", False),
                 "tool_count": data.get("tool_count", 0),
             })
+        elif evt.event_type == "compaction_start":
+            if (
+                next_compaction < len(compactions)
+                and compactions[next_compaction]["source_event_seqs"]
+            ):
+                nodes.append(compactions[next_compaction])
+                next_compaction += 1
+        elif evt.event_type in ("compaction_summary", "compaction_end"):
+            pass
 
     return {
         "session_id": session.id,
@@ -567,6 +812,7 @@ async def get_trajectory(
         "event_count": len(rows),
         "nodes": nodes,
         "injection_requests": context_requests,
+        "compactions": compactions,
         "overview": _trajectory_overview(nodes),
     }
 
@@ -620,6 +866,13 @@ def _trajectory_overview(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             stage["model"] = node.get("model")
             stage["duration_ms"] = node.get("duration_ms")
             stage["degraded"] = node.get("degraded", False)
+        elif kind == "compaction":
+            stage["compaction"] = True
+            stage["summary"] = node.get("summary")
+            stage["fold_from"] = node.get("fold_from")
+            stage["fold_to"] = node.get("fold_to")
+            stage["folded_count"] = len(node.get("source_event_seqs") or [])
+            stage["reason"] = node.get("reason")
 
     out = [by_request[r] for r in order]
     # 工具序列简化为名称列表（前端可直接展示），保留完整数组供展开。
