@@ -27,6 +27,7 @@ import {
   ArrowLeftOutlined,
   BookOutlined,
   CheckCircleOutlined,
+  CompassOutlined,
   ReloadOutlined,
   RocketOutlined,
   TrophyOutlined,
@@ -409,6 +410,173 @@ const ReviewTab: React.FC<{ positionCode: string; factoryId: string }> = ({ posi
   )
 }
 
+const LEVEL_DESC: Record<number, string> = {
+  1: '基础判断 · 真实销售订单，判断评审结论',
+  2: '缺料决策 · 真实工单缺料，选择处置动作',
+  3: '综合排程 · 订单交期 × 系统缺料，综合决策',
+}
+
+const DrillsTab: React.FC<{ positionCode: string; factoryId: string }> = ({ positionCode, factoryId }) => {
+  const [level, setLevel] = useState<number>(1)
+  const [data, setData] = useState<any>(null)
+  const [answers, setAnswers] = useState<Record<string, string[]>>({})
+  const [result, setResult] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    setAnswers({})
+    setResult(null)
+    try {
+      const res: any = await api.get('/api/v1/trainer/drills', {
+        params: { position_code: positionCode, factory_id: factoryId, level, limit: 3 },
+      })
+      setData(res)
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || '实操演练加载失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [positionCode, factoryId, level])
+
+  useEffect(() => { load() }, [load])
+
+  const drills: any[] = data?.drills || []
+  const answeredCount = drills.filter((d) => (answers[d.id] || []).length > 0).length
+
+  const submit = async () => {
+    if (!drills.length) {
+      message.warning('当前没有实操题')
+      return
+    }
+    if (answeredCount < drills.length) {
+      message.warning(`还有 ${drills.length - answeredCount} 道未作答`)
+      return
+    }
+    setSubmitting(true)
+    try {
+      const res: any = await api.post('/api/v1/trainer/drills/attempts', {
+        position_code: positionCode,
+        factory_id: factoryId,
+        level,
+        answers,
+      })
+      setResult(res)
+      message.success(res.passed ? '实操演练通过' : '请查看正确处置原则')
+    } catch {
+      message.error('提交失败')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Card
+      size="small"
+      title={<Space><CompassOutlined style={{ color: '#13c2c2' }} />实操演练 · 真实数据驱动</Space>}
+      extra={<Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新题目</Button>}
+    >
+      <Alert
+        type="info"
+        showIcon
+        message="题目基于系统真实业务数据生成，不念经"
+        description={data?.mission || '销售订单 / 工单缺料 / 库存 实时场景。'}
+        style={{ marginBottom: 14 }}
+      />
+      <Space style={{ marginBottom: 14 }} align="center">
+        <Text strong>难度梯度</Text>
+        <Segmented
+          value={level}
+          onChange={(v) => setLevel(Number(v))}
+          options={[
+            { label: 'L1 基础', value: 1 },
+            { label: 'L2 缺料', value: 2 },
+            { label: 'L3 综合', value: 3 },
+          ]}
+        />
+        <Text type="secondary">{LEVEL_DESC[level]}</Text>
+      </Space>
+
+      {loading && <Card><Spin tip="生成真实场景题" /></Card>}
+      {!loading && error && <Alert type="error" showIcon message={error} action={<Button onClick={load}>重试</Button>} />}
+      {!loading && !error && (
+        <>
+          {drills.map((drill, index) => (
+            <div key={`${drill.scene}-${index}`} style={{ padding: '10px 12px', marginBottom: 12, borderRadius: 8, border: '1px solid var(--color-border)' }}>
+              <Space align="start" wrap style={{ width: '100%' }}>
+                <Tag color="cyan">{drill.type === 'order_review' ? '订单评审' : drill.type === 'shortage_action' ? '缺料处置' : '排程决策'}</Tag>
+                <Text strong>{drill.scene}</Text>
+              </Space>
+              <div style={{ margin: '8px 0 4px', paddingLeft: 6 }}>
+                {drill.type === 'order_review' && (
+                  <Space wrap>
+                    <Tag>{drill.data.product}</Tag>
+                    <Tag>数量 {drill.data.qty}</Tag>
+                    <Tag color="red">RDD {drill.data.rdd}</Tag>
+                    <Tag color={drill.data.priority === 'high' ? 'red' : 'blue'}>优先级 {drill.data.priority}</Tag>
+                    <Tag>{drill.data.material_ready}</Tag>
+                    <Tag>状态 {drill.data.status}</Tag>
+                  </Space>
+                )}
+                {drill.type === 'shortage_action' && (
+                  <Space wrap>
+                    <Tag>{drill.data.material}</Tag>
+                    <Tag>需 {drill.data.required}</Tag>
+                    <Tag color="green">可用 {drill.data.available}</Tag>
+                    <Tag color="red">缺口 {drill.data.shortage}</Tag>
+                  </Space>
+                )}
+                {drill.type === 'schedule_priority' && (
+                  <Space wrap>
+                    <Tag>{drill.data.product}</Tag>
+                    <Tag>数量 {drill.data.qty}</Tag>
+                    <Tag color="red">RDD {drill.data.rdd}</Tag>
+                    <Tag color={drill.data.priority === 'high' ? 'red' : 'blue'}>优先级 {drill.data.priority}</Tag>
+                    {(drill.data.system_shortages || []).map((s: string) => <Tag color="red" key={s}>{s}</Tag>)}
+                  </Space>
+                )}
+              </div>
+              <div style={{ margin: '6px 0 10px', paddingLeft: 6 }}>
+                <Text strong>{index + 1}. {drill.prompt}</Text>
+              </div>
+              <Radio.Group
+                value={(answers[drill.id] || [])[0]}
+                onChange={(e) => setAnswers((cur) => ({ ...cur, [drill.id]: [e.target.value] }))}
+              >
+                <Space direction="vertical">
+                  {(drill.options || []).map((opt: any) => <Radio key={opt.value} value={opt.value}>{opt.label}</Radio>)}
+                </Space>
+              </Radio.Group>
+              {result && (
+                <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 6, background: 'var(--color-fill-secondary)' }}>
+                  {(() => {
+                    const detail = result.details?.find((x: any) => x.id === drill.id)
+                    return (
+                      <Space direction="vertical" size={4}>
+                        <Tag color={detail?.correct ? 'green' : 'red'}>{detail?.correct ? '✓ 正确' : '✗ 不正确'}</Tag>
+                        {!detail?.correct && <Text>正确答案：{detail?.answer?.join('、')}</Text>}
+                        <Text type="secondary">{drill.explanation}</Text>
+                      </Space>
+                    )
+                  })()}
+                </div>
+              )}
+            </div>
+          ))}
+          <Space wrap>
+            <Text type="secondary">已作答 {answeredCount}/{drills.length}</Text>
+            <Button type="primary" icon={<CheckCircleOutlined />} loading={submitting} onClick={submit}>提交演练</Button>
+            <Button icon={<ReloadOutlined />} onClick={() => { setAnswers({}); setResult(null) }}>重新作答</Button>
+          </Space>
+        </>
+      )}
+    </Card>
+  )
+}
+
 const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) => {
   const navigate = useNavigate()
   const factoryId = getActiveFactoryId()
@@ -552,6 +720,11 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
               key: 'review',
               label: <Space><BookOutlined />错题本</Space>,
               children: <ReviewTab positionCode={positionCode} factoryId={factoryId} />,
+            },
+            {
+              key: 'drills',
+              label: <Space><CompassOutlined />实操演练</Space>,
+              children: <DrillsTab positionCode={positionCode} factoryId={factoryId} />,
             },
           ]}
         />

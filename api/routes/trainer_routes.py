@@ -42,6 +42,7 @@ POSITION_CODE_MAP = {
 class TrainingAttemptRequest(BaseModel):
     position_code: str = Field(..., description="职位训练编码，例如 pmc")
     factory_id: Optional[str] = None
+    level: Optional[int] = Field(1, description="实操演练难度: 1基础/2缺料/3综合")
     answers: Dict[str, List[str]] = Field(default_factory=dict)
 
 
@@ -477,6 +478,317 @@ async def get_mastery(
             "practice": "需要练习（正确率 60%-80%）",
             "solid": "掌握扎实（正确率≥80%）",
         },
+    }
+
+
+@router.get("/drills", summary="实操演练：真实业务数据场景题（难度梯度）")
+async def get_drills(
+    position_code: str = Query("pmc", description="职位训练编码"),
+    factory_id: Optional[str] = Query(None),
+    level: int = Query(1, description="难度梯度: 1基础/2缺料/3综合"),
+    limit: int = Query(3, ge=1, le=10),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """从真实数据(销售订单/工单缺料/库存)生成场景判断题，答案来自系统真实状态。"""
+    position = _position_summary(position_code)
+    canonical_code = position["code"]
+    fid = _factory_id(current_user, factory_id)
+
+    level = int(level)
+    if level not in {1, 2, 3}:
+        raise HTTPException(status_code=400, detail="level 仅支持 1/2/3")
+
+    drills: List[Dict[str, Any]] = []
+
+    if level == 1:
+        # L1: 真实销售订单 -> 判断该订单的核心风险/评审关注点
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT order_code, product_name, quantity, delivery_date,
+                           priority, status, material_ready, review_status, risk_level
+                    FROM sales_orders
+                    WHERE factory_id = :factory_id OR :factory_id IS NULL
+                    ORDER BY delivery_date NULLS LAST
+                    LIMIT :limit
+                    """
+                ),
+                {"factory_id": fid, "limit": limit},
+            )
+        ).mappings().all()
+        for row in rows:
+            order = dict(row)
+            rdd = order.get("delivery_date")
+            review = order.get("review_status")
+            risk = order.get("risk_level")
+            approved = review == "approved"
+            conditional = review == "conditional"
+            # 标准答案基于真实评审状态
+            if conditional:
+                answer = "conditional"
+                correct_label = "条件承诺（存在风险，需跟踪缺口与责任人后再承诺）"
+            elif approved:
+                answer = "approved"
+                correct_label = "评审通过，可正常纳入排程"
+            elif risk in ("high", "critical"):
+                answer = "block"
+                correct_label = "阻塞（高风险订单，不得直接承诺交期）"
+            else:
+                answer = "pending"
+                correct_label = "待评审（先核对BOM/版本/物料与产能证据）"
+            drills.append(
+                {
+                    "id": order['order_code'],
+                    "level": 1,
+                    "type": "order_review",
+                    "scene": f"销售订单 {order['order_code']}",
+                    "data": {
+                        "product": order.get("product_name"),
+                        "qty": order.get("quantity"),
+                        "rdd": str(rdd) if rdd else "未定",
+                        "priority": order.get("priority"),
+                        "status": order.get("status"),
+                        "material_ready": "已齐套" if order.get("material_ready") else "未齐套",
+                    },
+                    "prompt": "该订单应采取的评审结论是？",
+                    "options": [
+                        {"value": "approved", "label": "评审通过，正常纳入排程"},
+                        {"value": "conditional", "label": "条件承诺，跟踪缺口后承诺"},
+                        {"value": "block", "label": "阻塞，不得直接承诺交期"},
+                        {"value": "pending", "label": "待评审，先核对证据"},
+                    ],
+                    "answer": [answer],
+                    "explanation": f"真实评审状态={review or '未评审'}，风险={risk or '未知'}。{correct_label}。",
+                    "skill": "订单评审",
+                    "reference_terms": ["订单评审", "RDD", "条件承诺"],
+                }
+            )
+
+    elif level == 2:
+        # L2: 真实工单缺料 -> 选择正确处置动作
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT wom.work_order_id,
+                           wom.material_code, wom.material_name,
+                           wom.required_qty, wom.available_qty, wom.shortage_qty
+                    FROM work_order_materials wom
+                    WHERE wom.shortage_qty > 0
+                    ORDER BY wom.shortage_qty DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": limit},
+            )
+        ).mappings().all()
+        for row in rows:
+            mat = dict(row)
+            drills.append(
+                {
+                    "id": f"{mat['work_order_id']}|{mat['material_code']}",
+                    "level": 2,
+                    "type": "shortage_action",
+                    "scene": f"工单 {mat['work_order_id']}",
+                    "data": {
+                        "material": f"{mat.get('material_code')} {mat.get('material_name')}",
+                        "required": mat.get("required_qty"),
+                        "available": mat.get("available_qty"),
+                        "shortage": mat.get("shortage_qty"),
+                    },
+                    "prompt": "该物料缺料时，PMC 的正确处置顺序是？",
+                    "options": [
+                        {"value": "a", "label": "先Pull In/替代料追料，追不上就调整生产计划，绝不让线上等料"},
+                        {"value": "b", "label": "产线停下来等料到齐"},
+                        {"value": "c", "label": "直接取消该工单"},
+                        {"value": "d", "label": "不通知生产，自己默默处理"},
+                    ],
+                    "answer": ["a"],
+                    "explanation": (
+                        f"真实缺口={mat['shortage_qty']}件（需求{mat['required_qty']}/可用{mat['available_qty']}）。"
+                        "先追料（Pull In/替代），追不上调整计划前后置换，保证产能不空转。"
+                    ),
+                    "skill": "物料短缺控制",
+                    "reference_terms": ["欠料", "Pull In", "替代料"],
+                }
+            )
+
+    else:
+        # L3: 综合排程 —— 近交期的真实订单 + 缺料情况，选择最优排程
+        so_rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT order_code, product_name, quantity, delivery_date, priority
+                    FROM sales_orders
+                    WHERE delivery_date IS NOT NULL
+                    ORDER BY delivery_date
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": limit},
+            )
+        ).mappings().all()
+        shortage_rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT material_code, material_name, SUM(shortage_qty) AS total_shortage
+                    FROM work_order_materials
+                    WHERE shortage_qty > 0
+                    GROUP BY material_code, material_name
+                    ORDER BY total_shortage DESC
+                    LIMIT 5
+                    """
+                ),
+            )
+        ).mappings().all()
+        for row in so_rows:
+            order = dict(row)
+            has_shortage = len(shortage_rows) > 0
+            shortage_desc = [
+                f"{m['material_code']}缺口{m['total_shortage']}" for m in shortage_rows[:3]
+            ] if has_shortage else []
+            drills.append(
+                {
+                    "id": order['order_code'],
+                    "level": 3,
+                    "type": "schedule_priority",
+                    "scene": f"排程决策 {order['order_code']}",
+                    "data": {
+                        "product": order.get("product_name"),
+                        "qty": order.get("quantity"),
+                        "rdd": str(order.get("delivery_date")),
+                        "priority": order.get("priority"),
+                        "system_shortages": shortage_desc,
+                    },
+                    "prompt": "面对该订单交期与系统内已知缺料，PMC 应优先做什么？",
+                    "options": [
+                        {"value": "a", "label": "先核对缺料对这张单的影响，缺料涉及则升级并调整排程优先级"},
+                        {"value": "b", "label": "先排最近交期的单，缺料后补"},
+                        {"value": "c", "label": "先承诺客户交期，再想办法"},
+                        {"value": "d", "label": "只按优先级排序，不查缺料"},
+                    ],
+                    "answer": ["a"],
+                    "explanation": (
+                        f"该单RDD={order['delivery_date']}，优先级={order['priority']}；"
+                        f"系统已知缺料：{'、'.join(shortage_desc) if shortage_desc else '暂无'}。"
+                        "排程必须先把缺料与交期对齐——缺料会拖交期，先承诺后补救是错的。"
+                    ),
+                    "skill": "综合排程",
+                    "reference_terms": ["排程", "缺料", "RDD", "优先级"],
+                }
+            )
+
+    return {
+        "position": position,
+        "factory_id": fid,
+        "level": level,
+        "level_label": {1: "基础判断", 2: "缺料决策", 3: "综合排程"}[level],
+        "drills": drills,
+        "mission": "以下场景来自系统真实数据（销售订单/工单缺料），答案依据真实评审状态与实操原则判定。",
+    }
+
+
+@router.post("/drills/attempts", summary="提交实操演练答案")
+async def submit_drill_attempt(
+    payload: TrainingAttemptRequest = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """实操演练答案提交：复用题库评分逻辑（single 类型）。"""
+    position = _position_summary(payload.position_code)
+    canonical_code = position["code"]
+    if not payload.answers:
+        raise HTTPException(status_code=400, detail="至少回答一道题")
+
+    # 从销售订单/工单缺料中取场景题答案进行评分（只取单题答案的 first）
+    level = payload.level or 1
+    # L1 按真实订单评审状态推导；L2/L3 按固定标准答案(a)
+    if level != 1:
+        review_map: Dict[str, Dict[str, Any]] = {}
+    else:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT order_code, review_status, risk_level
+                    FROM sales_orders
+                    WHERE order_code = ANY(:codes)
+                    """
+                ),
+                {"codes": list(payload.answers.keys())},
+            )
+        ).mappings().all()
+        review_map = {row["order_code"]: dict(row) for row in rows}
+
+    total = 0
+    earned = 0
+    details: List[Dict[str, Any]] = []
+    for code, answer_list in payload.answers.items():
+        selected = sorted(str(v) for v in (answer_list or []))
+        actual = selected[0] if selected else ""
+        review = review_map.get(code)
+        if level == 1 and review:
+            if review["review_status"] == "conditional":
+                expected = "conditional"
+            elif review["review_status"] == "approved":
+                expected = "approved"
+            elif review["risk_level"] in ("high", "critical"):
+                expected = "block"
+            else:
+                expected = "pending"
+        else:
+            # 非订单码题目(L2缺料/L3排程)按固定标准答案 a
+            expected = "a"
+        correct = actual == expected
+        total += 1
+        earned += 1 if correct else 0
+        details.append(
+            {
+                "id": code,
+                "correct": correct,
+                "selected": [actual] if actual else [],
+                "answer": [expected],
+            }
+        )
+
+    score = round(earned / total * 100, 1) if total else 0
+    attempt_id = str(uuid4())
+    await db.execute(
+        text(
+            """
+            INSERT INTO position_training_attempts
+                (id, position_code, user_id, factory_id, answers, score,
+                 earned_points, total_points, details)
+            VALUES (:id, :position_code, :user_id, :factory_id,
+                    CAST(:answers AS JSONB), :score, :earned_points,
+                    :total_points, CAST(:details AS JSONB))
+            """
+        ),
+        {
+            "id": attempt_id,
+            "position_code": canonical_code,
+            "user_id": _user_id(current_user),
+            "factory_id": _factory_id(current_user, payload.factory_id),
+            "answers": json.dumps(payload.answers, ensure_ascii=False),
+            "score": score,
+            "earned_points": earned,
+            "total_points": total,
+            "details": json.dumps(details, ensure_ascii=False),
+        },
+    )
+    await db.commit()
+    return {
+        "attempt_id": attempt_id,
+        "position_code": canonical_code,
+        "score": score,
+        "earned_points": earned,
+        "total_points": total,
+        "passed": score >= 80,
+        "details": details,
     }
 
 
