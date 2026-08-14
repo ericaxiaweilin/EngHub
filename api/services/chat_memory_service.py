@@ -155,18 +155,29 @@ def build_user_profile(
     return profile
 
 
-def build_memory_block(
+def build_context_pieces(
     facts: Dict[str, str],
     *,
     profile: Optional[Dict[str, Any]] = None,
     include_guidance: bool = True,
-) -> str:
-    """把记忆事实拼成可注入 system prompt 的文本块（无事实则返回空串）。
+) -> List[Dict[str, Any]]:
+    """生成可注入的上下文条目列表（DSH inject() 对齐：每条带 source 溯源）。
 
-    注入结构：画像(身份/岗位/部门) → 用户偏好 → 其他事实 → 个性化指引。
+    对齐 DeepSeek Harness 的上下文注入模型：注入内容不是一段无来源的文本，
+    而是若干条独立上下文，每条声明 source（生产者）+ label（展示名）+ content。
+
+    source 取值：
+      guidance    记忆使用指引（header + 个性化）
+      profile     个人画像（身份/岗位/部门/工序组，来自 User 行 + 已学事实）
+      preferences 用户沟通偏好（单独一条，前端更醒目）
+      facts       其他已记住事实
+
+    空事实且无画像时返回 []。返回顺序即注入 system prompt 的顺序。
     """
     if not facts and not profile:
-        return ""
+        return []
+    pieces: List[Dict[str, Any]] = []
+
     lines: List[str] = []
     if profile:
         identity = profile.get("identity") or {}
@@ -178,20 +189,49 @@ def build_memory_block(
                 parts.append(f"{k}：{v}")
         if parts:
             lines.append("- " + "；".join(parts))
+    if lines:
+        pieces.append({"source": "profile", "label": "个人画像", "content": "\n".join(lines)})
+
     prefs = facts.get("preferences")
     if prefs:
-        lines.append(f"- 工作偏好：{prefs}")
+        pieces.append({"source": "preferences", "label": "用户偏好", "content": f"- 工作偏好：{prefs}"})
+
     other_keys = {"display_name", "full_name", "role", "department", "preferences", "work_center", "username"}
     other = {k: v for k, v in facts.items() if k not in other_keys}
-    for key, value in other.items():
-        lines.append(f"- {key}：{value}")
-    if not lines:
+    if other:
+        other_lines = [f"- {key}：{value}" for key, value in other.items()]
+        pieces.append({"source": "facts", "label": "其他已记住事实", "content": "\n".join(other_lines)})
+
+    if pieces and include_guidance:
+        guidance = CROSS_SESSION_SYSTEM_GUIDANCE + "\n" + PERSONALIZATION_MEMORY_GUIDANCE
+        pieces.insert(0, {"source": "guidance", "label": "记忆使用指引", "content": guidance})
+
+    return pieces
+
+
+def build_memory_block(
+    facts: Dict[str, str],
+    *,
+    profile: Optional[Dict[str, Any]] = None,
+    include_guidance: bool = True,
+) -> str:
+    """把记忆事实拼成可注入 system prompt 的文本块（无事实则返回空串）。
+
+    与 build_context_pieces 同一来源：block = 各 context piece 顺序拼接，
+    保证注入 system prompt 的文本与前端展示的溯源结构一致。
+    """
+    pieces = build_context_pieces(
+        facts,
+        profile=profile,
+        include_guidance=include_guidance,
+    )
+    if not pieces:
         return ""
-    header = CROSS_SESSION_SYSTEM_GUIDANCE if include_guidance else "【用户长期记忆】"
-    block = header + "\n" + "\n".join(lines) + "\n"
-    if include_guidance:
-        block += "\n" + PERSONALIZATION_MEMORY_GUIDANCE + "\n"
-    return block
+    if include_guidance and pieces and pieces[0]["source"] == "guidance":
+        header = CROSS_SESSION_SYSTEM_GUIDANCE
+        body = "\n".join(p["content"] for p in pieces[1:])
+        return header + "\n" + body + "\n\n" + PERSONALIZATION_MEMORY_GUIDANCE + "\n"
+    return "【用户长期记忆】\n" + "\n".join(p["content"] for p in pieces) + "\n"
 
 
 # ──────────────────────────────────────────────

@@ -338,6 +338,7 @@ async def chat_memory(
         "profile": user_profile,
         "facts": memory_rows,
         "injected_block": mem.build_memory_block(memory_facts, profile=user_profile),
+        "context_pieces": mem.build_context_pieces(memory_facts, profile=user_profile),
     }
 
 
@@ -2047,6 +2048,7 @@ async def _handle_kernel_chat(
         memory={
             "profile": user_profile,
             "injected_block": memory_block,
+            "context_pieces": mem.build_context_pieces(memory_facts, profile=user_profile),
             "facts": [
                 {"key": k, "value": v}
                 for k, v in memory_facts.items()

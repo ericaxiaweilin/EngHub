@@ -499,6 +499,11 @@ interface LongTermMemory {
   }
   facts?: MemoryFactRow[]
   injected_block?: string
+  context_pieces?: {
+    source: string
+    label: string
+    content: string
+  }[]
 }
 
 // ---------- 快捷指令（后端不可用时的本地兜底） ----------
@@ -2523,17 +2528,39 @@ export default function AIAssistantWidget() {
                                 )}
                               />
                             </div>
-                            {/* 本次注入上下文 */}
-                            {longTerm.injected_block && (
+                            {/* 本次注入上下文（DSH 对齐：按 source 溯源披露） */}
+                            {(longTerm.context_pieces?.length || longTerm.injected_block) && (
                               <div>
-                                <Text strong style={{ fontSize: 13 }}>本次注入上下文（system prompt 头部记忆块）</Text>
-                                <pre style={{
-                                  background: '#fafafa', border: '1px solid #eee', borderRadius: 8,
-                                  padding: '10px 12px', fontSize: 11, lineHeight: 1.6,
-                                  maxHeight: 180, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                                }}>{longTerm.injected_block}</pre>
+                                <Text strong style={{ fontSize: 13 }}>
+                                  本次注入上下文（{longTerm.context_pieces?.length || 1} 条，按来源）
+                                </Text>
+                                {(longTerm.context_pieces || []).map((piece, idx) => (
+                                  <div key={`${piece.source}-${idx}`} style={{
+                                    background: '#fafafa', border: '1px solid #eee', borderRadius: 8,
+                                    padding: '8px 12px', marginTop: 8,
+                                  }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                                      <Text strong style={{ fontSize: 12 }}>{piece.label}</Text>
+                                      <Tag color={piece.source === 'guidance' ? 'purple' : piece.source === 'profile' ? 'blue' : piece.source === 'preferences' ? 'green' : 'default'} style={{ fontSize: 10, marginInlineEnd: 0 }}>
+                                        {piece.source}
+                                      </Tag>
+                                    </div>
+                                    <pre style={{
+                                      margin: 0, fontSize: 11, lineHeight: 1.6,
+                                      whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                    }}>{piece.content}</pre>
+                                  </div>
+                                ))}
+                                {!longTerm.context_pieces?.length && longTerm.injected_block && (
+                                  <pre style={{
+                                    background: '#fafafa', border: '1px solid #eee', borderRadius: 8,
+                                    padding: '10px 12px', fontSize: 11, lineHeight: 1.6,
+                                    maxHeight: 180, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                    marginTop: 8,
+                                  }}>{longTerm.injected_block}</pre>
+                                )}
                                 <Text type="secondary" style={{ fontSize: 11 }}>
-                                  记忆通过 /chat/memory 读取；每次对话系统会自动注入此记忆块供模型参考，也可遗忘不需要的事实。
+                                  每次对话系统会自动注入上述上下文供模型参考（来源标注如 profile / preferences / facts / guidance），也可遗忘不需要的事实。
                                 </Text>
                               </div>
                             )}
