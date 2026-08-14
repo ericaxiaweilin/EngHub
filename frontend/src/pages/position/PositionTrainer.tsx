@@ -12,6 +12,7 @@ import {
   Progress,
   Radio,
   Row,
+  Segmented,
   Select,
   Space,
   Spin,
@@ -48,6 +49,7 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
   const factoryId = getActiveFactoryId()
   const [positions, setPositions] = useState<TrainingPosition[]>([])
   const [positionCode, setPositionCode] = useState('pmc')
+  const [mode, setMode] = useState<'focus' | 'idle'>('focus')
   const [pack, setPack] = useState<any>(null)
   const [answers, setAnswers] = useState<Record<string, string[]>>({})
   const [result, setResult] = useState<any>(null)
@@ -71,7 +73,7 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
     setResult(null)
     try {
       const data: any = await api.get('/api/v1/trainer/pack', {
-        params: { position_code: positionCode, factory_id: factoryId },
+        params: { position_code: positionCode, factory_id: factoryId, mode },
       })
       setPack(data)
     } catch (err: any) {
@@ -80,7 +82,7 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
     } finally {
       setLoading(false)
     }
-  }, [factoryId, positionCode])
+  }, [factoryId, positionCode, mode])
 
   useEffect(() => {
     loadPositions()
@@ -111,6 +113,7 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
       const data: any = await api.post('/api/v1/trainer/attempts', {
         position_code: positionCode,
         factory_id: factoryId,
+        mode,
         answers,
       })
       setResult(data)
@@ -156,6 +159,14 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
                 loading={!positions.length}
               />
               <Text type="secondary">工厂：{factoryId || '-'}</Text>
+              <Segmented
+                value={mode}
+                onChange={(value) => setMode(value as 'focus' | 'idle')}
+                options={[
+                  { label: '专注答题', value: 'focus' },
+                  { label: '空闲答题', value: 'idle' },
+                ]}
+              />
               <Button icon={<ReloadOutlined />} onClick={loadPack} loading={loading}>刷新训练包</Button>
             </Space>
             {pack?.position && (
@@ -199,7 +210,12 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
           <Card
             size="small"
             title={<Space><TrophyOutlined style={{ color: '#1677ff' }} />{pack?.quiz?.title || '职位小测试'}</Space>}
-            extra={<Tag>{questions.length} 题 / 通过线 {passScore} 分</Tag>}
+            extra={
+                  <Space>
+                    <Tag color={mode === 'focus' ? 'blue' : 'green'}>{pack?.mode_label || (mode === 'focus' ? '专注答题' : '空闲答题')}</Tag>
+                    <Tag>{questions.length} 题 / 通过线 {passScore} 分</Tag>
+                  </Space>
+                }
           >
             <Alert
               type="info"

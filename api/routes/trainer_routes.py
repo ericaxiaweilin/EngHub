@@ -25,6 +25,9 @@ from database.models import User
 router = APIRouter(prefix="/api/v1/trainer", tags=["职位训练器"])
 
 
+_IDLE_QUESTION_LIMIT = 10  # 空闲答题模式随机抽取题数
+
+
 POSITION_CODE_MAP = {
     "pmc": "pmc_planner",
     "pmc_planner": "pmc_planner",
@@ -93,32 +96,61 @@ async def list_training_positions(
 async def get_training_pack(
     position_code: str = Query("pmc", description="职位训练编码"),
     factory_id: Optional[str] = Query(None),
+    mode: str = Query("focus", description="答题模式: focus 专注(全量) / idle 空闲(随机抽题)"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    mode = (mode or "focus").strip().lower()
+    if mode not in {"focus", "idle"}:
+        raise HTTPException(status_code=400, detail="mode 仅支持 focus(专注) / idle(空闲)")
     position = _position_summary(position_code)
     canonical_code = position["code"]
-    rows = (
-        await db.execute(
-            text(
-                """
-                SELECT id, question_code, skill, difficulty, question_type,
-                       prompt, options, reference_terms, points
-                FROM position_training_questions
-                WHERE position_code = :position_code AND is_active = true
-                ORDER BY difficulty, question_code
-                """
-            ),
-            {"position_code": canonical_code},
-        )
-    ).mappings().all()
 
+    if mode == "idle":
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT id, question_code, skill, difficulty, question_type,
+                           prompt, options, reference_terms, points
+                    FROM position_training_questions
+                    WHERE position_code = :position_code AND is_active = true
+                    ORDER BY random()
+                    LIMIT :limit
+                    """
+                ),
+                {"position_code": canonical_code, "limit": _IDLE_QUESTION_LIMIT},
+            )
+        ).mappings().all()
+    else:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT id, question_code, skill, difficulty, question_type,
+                           prompt, options, reference_terms, points
+                    FROM position_training_questions
+                    WHERE position_code = :position_code AND is_active = true
+                    ORDER BY difficulty, question_code
+                    """
+                ),
+                {"position_code": canonical_code},
+            )
+        ).mappings().all()
+
+    mode_label = "专注答题" if mode == "focus" else "空闲答题"
     return {
         "position": position,
         "factory_id": _factory_id(current_user, factory_id),
-        "mission": "先按职位流程核对输入、判断标准和交付物，再进入岗位小测试。",
+        "mode": mode,
+        "mode_label": mode_label,
+        "mission": (
+            "先按职位流程核对输入、判断标准和交付物，再进入岗位小测试。"
+            if mode == "focus"
+            else "空闲模式随机抽取题目，适合碎片时间快速练习。"
+        ),
         "quiz": {
-            "title": f"{position['title']}快速上岗小测试",
+            "title": f"{position['title']}{'专注学习' if mode == 'focus' else '空闲快测'}",
             "pass_score": 80,
             "total": len(rows),
             "questions": [dict(row) for row in rows],
