@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -140,7 +141,7 @@ async def submit_training_attempt(
         await db.execute(
             text(
                 """
-                SELECT id, question_code, skill, prompt, answer, explanation, points
+                SELECT id, question_code, skill, question_type, prompt, answer, explanation, points
                 FROM position_training_questions
                 WHERE position_code = :position_code AND is_active = true
                   AND id = ANY(:ids)
@@ -156,10 +157,29 @@ async def submit_training_attempt(
     earned_points = 0
     details: List[Dict[str, Any]] = []
     for row in rows:
-        expected = sorted(str(value) for value in (row["answer"] or []))
-        actual = sorted(str(value) for value in (payload.answers.get(row["id"]) or []))
+        expected_raw = [str(value) for value in (row["answer"] or [])]
+        actual_raw = [str(value) for value in (payload.answers.get(row["id"]) or [])]
+        qtype = (row["question_type"] or "single").lower()
         points = int(row["points"] or 1)
-        correct = expected == actual
+        if qtype == "order":
+            correct = actual_raw == expected_raw
+        elif qtype == "fill":
+            norm = lambda v: re.sub(r"\s+", "", v).lower().strip()
+            correct = any(norm(a) == norm(e) for a in actual_raw for e in expected_raw)
+        elif qtype == "calc":
+            def _num(v):
+                try:
+                    return float(re.sub(r"[^0-9.+-]", "", v))
+                except (ValueError, TypeError):
+                    return None
+            correct = bool(actual_raw) and any(
+                _num(a) is not None and abs(_num(a) - _num(e)) < 1e-6
+                for a in actual_raw for e in expected_raw
+            )
+        else:
+            expected = sorted(expected_raw)
+            actual = sorted(actual_raw)
+            correct = expected == actual
         total_points += points
         earned_points += points if correct else 0
         details.append(
@@ -168,8 +188,8 @@ async def submit_training_attempt(
                 "question_code": row["question_code"],
                 "skill": row["skill"],
                 "correct": correct,
-                "selected": actual,
-                "answer": expected,
+                "selected": actual_raw,
+                "answer": expected_raw,
                 "explanation": row["explanation"],
                 "points": points,
             }

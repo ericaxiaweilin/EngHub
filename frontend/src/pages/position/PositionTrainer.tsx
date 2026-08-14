@@ -6,6 +6,8 @@ import {
   Checkbox,
   Col,
   Divider,
+  Input,
+  InputNumber,
   List,
   Progress,
   Radio,
@@ -35,7 +37,7 @@ interface TrainingQuestion {
   question_code: string
   skill: string
   difficulty: number
-  question_type: 'single' | 'multi'
+  question_type: 'single' | 'multi' | 'multiple' | 'true_false' | 'fill' | 'calc' | 'order'
   prompt: string
   options: Array<{ value: string; label: string }>
   points: number
@@ -214,7 +216,46 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
                     <Text strong>{index + 1}. {question.prompt}</Text>
                   </Space>
                   <div style={{ marginTop: 9, paddingLeft: 8 }}>
-                    {question.question_type === 'multi' ? (
+                    {question.question_type === 'order' ? (
+                      <Space direction="vertical" style={{ width: '100%' }}>
+                        <Text type="secondary">点击选项按正确顺序排列（可重置）</Text>
+                        <Space wrap>
+                          {(question.options || []).map((option) => {
+                            if ((answers[question.id] || []).includes(option.value)) return null
+                            return (
+                              <Button key={option.value} size="small" onClick={() => setAnswer(question, [...(answers[question.id] || []), option.value])}>
+                                {option.label}
+                              </Button>
+                            )
+                          })}
+                        </Space>
+                        {(answers[question.id] || []).length > 0 && (
+                          <div>
+                            <Space size={[4, 4]} wrap style={{ marginBottom: 8 }}>
+                              {(answers[question.id] || []).map((value, idx) => {
+                                const option = (question.options || []).find((o) => o.value === value)
+                                return <Tag key={value} color="blue">{idx + 1}. {option?.label || value}</Tag>
+                              })}
+                            </Space>
+                            <Button size="small" type="link" onClick={() => setAnswer(question, [])}>重置顺序</Button>
+                          </div>
+                        )}
+                      </Space>
+                    ) : question.question_type === 'fill' ? (
+                      <Input
+                        style={{ maxWidth: 420 }}
+                        placeholder="请输入答案"
+                        value={(answers[question.id] || [])[0] || ''}
+                        onChange={(event) => setAnswer(question, [event.target.value])}
+                      />
+                    ) : question.question_type === 'calc' ? (
+                      <InputNumber
+                        style={{ minWidth: 180 }}
+                        placeholder="请输入计算结果"
+                        value={(answers[question.id] || [])[0] ? Number((answers[question.id] || [])[0]) : undefined}
+                        onChange={(value) => setAnswer(question, value === null || value === undefined ? [] : [String(value)])}
+                      />
+                    ) : question.question_type === 'multi' || question.question_type === 'multiple' ? (
                       <Checkbox.Group value={answers[question.id] || []} onChange={(values) => setAnswer(question, values.map(String))}>
                         <Space direction="vertical">
                           {(question.options || []).map((option) => <Checkbox key={option.value} value={option.value}>{option.label}</Checkbox>)}
