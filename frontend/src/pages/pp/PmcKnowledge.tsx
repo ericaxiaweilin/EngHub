@@ -16,6 +16,7 @@ const PmcKnowledge: React.FC = () => {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
+  const [themeFilter, setThemeFilter] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -72,9 +73,15 @@ const PmcKnowledge: React.FC = () => {
                 </Space>
                 <Paragraph style={{ margin: 0, color: NEURAL_COLORS.textDim }}>{position?.duties || '负责订单、物料、产能、交期和异常闭环。'}</Paragraph>
                 <Text style={{ color: NEURAL_COLORS.textDim, fontSize: 12 }}>
-                  悬停节点查看关系，点击技能节点或底部标签下钻该技能题目，中心节点重置视图。
+                  悬停节点查看关系，点击技能节点或底部标签下钻该技能题目，中心节点重置视图，顶部标签按主题快速筛选连接。
                 </Text>
-                <PmcKnowledgeGraph pack={pack} onSelectSkill={setSelectedSkill} selectedSkill={selectedSkill} />
+                <PmcKnowledgeGraph
+                  pack={pack}
+                  onSelectSkill={setSelectedSkill}
+                  selectedSkill={selectedSkill}
+                  themeFilter={themeFilter}
+                  onThemeChange={(theme) => { setThemeFilter(theme); setSelectedSkill(null) }}
+                />
               </Space>
             </Card>
 

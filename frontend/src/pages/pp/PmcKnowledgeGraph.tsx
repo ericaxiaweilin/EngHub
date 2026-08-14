@@ -63,10 +63,51 @@ const skillColor = (i: number): string => {
   return palette[i % palette.length]
 }
 
+/** PMC 技能 → 主题分组：用于神经连接快速主题筛选 */
+export const THEME_GROUPS: Array<{ key: string; label: string; color: string; skills: string[] }> = [
+  {
+    key: 'schedule',
+    label: '计划排程',
+    color: '#4facfe',
+    skills: ['MPS排程', '序列优化', '交期倒排', '插单仲裁', '产能规划', '产能约束', '产能判断', 'S&OP协同', 'RCCP与CRP', '日常优先级', '发货优先级', '工单释放'],
+  },
+  {
+    key: 'material',
+    label: '物料与MRP',
+    color: '#00d4aa',
+    skills: ['MRP净需求', 'MRP例外处理', 'MRP参数', 'MRP参数校验', 'ATP计算', '齐套检查', '备料齐套', '物料红线', '库存DOH'],
+  },
+  {
+    key: 'shortage',
+    label: '缺料与呆滞',
+    color: '#fbbf24',
+    skills: ['缺料预警', '欠料处置', '呆滞处置', '呆滞认定'],
+  },
+  {
+    key: 'delivery',
+    label: '交期与出货',
+    color: '#a78bfa',
+    skills: ['交期基础', '交期红线', 'CTP交期承诺', '出货前置', 'OTD出货'],
+  },
+  {
+    key: 'closure',
+    label: '异常闭环',
+    color: '#f87171',
+    skills: ['异常升级', '日报闭环'],
+  },
+]
+
+const themeOf = (skill: string): string => {
+  const hit = THEME_GROUPS.find((g) => g.skills.includes(skill))
+  return hit?.key ?? 'schedule'
+}
+
 interface PmcKnowledgeGraphProps {
   pack: PackData
   onSelectSkill: (skill: string | null) => void
   selectedSkill: string | null
+  themeFilter?: string | null
+  onThemeChange?: (theme: string | null) => void
 }
 
 const ZOOM_MIN = 0.35
@@ -78,7 +119,7 @@ interface Viewport {
   scale: number
 }
 
-const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSkill, selectedSkill }) => {
+const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSkill, selectedSkill, themeFilter = null, onThemeChange }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [hovered, setHovered] = useState<string | null>(null)
@@ -141,8 +182,20 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         })
       })
     })
+
+    if (themeFilter) {
+      const keepSkills = new Set(skills.filter((s) => themeOf(s) === themeFilter))
+      const kept = nodes.filter((n) => {
+        if (n.type === 'root') return true
+        if (n.type === 'skill') return keepSkills.has(n.label)
+        return n.skill ? keepSkills.has(n.skill) : false
+      })
+      const keptIds = new Set(kept.map((n) => n.id))
+      const keptEdges = edges.filter((e) => keptIds.has(e.source) && keptIds.has(e.target))
+      return { nodes: kept, edges: keptEdges, skillList: skills.filter((s) => keepSkills.has(s)) }
+    }
     return { nodes, edges, skillList: skills }
-  }, [pack])
+  }, [pack, themeFilter])
 
   useEffect(() => {
     hoveredRef.current = hovered
@@ -438,7 +491,39 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         ref={canvasRef}
         style={{ display: 'block', width: '100%', height: '100%', cursor: dragging ? 'grabbing' : 'grab' }}
       />
-      <div style={{ position: 'absolute', top: 12, left: 14, pointerEvents: 'none' }}>
+      <div style={{ position: 'absolute', top: 12, left: 14, right: 120, display: 'flex', alignItems: 'center', gap: 6, pointerEvents: 'none' }}>
+        <Text style={{ color: NEURAL_COLORS.textMuted, fontSize: 12, whiteSpace: 'nowrap' }}>主题筛选</Text>
+        <Space size={4} wrap>
+          <Tag
+            style={{
+              background: !themeFilter ? NEURAL_COLORS.accent + '33' : 'rgba(15, 25, 35, 0.7)',
+              border: `1px solid ${!themeFilter ? NEURAL_COLORS.accent : NEURAL_COLORS.border}`,
+              color: !themeFilter ? NEURAL_COLORS.accent : NEURAL_COLORS.textDim,
+              cursor: 'pointer',
+              pointerEvents: 'auto',
+            }}
+            onClick={() => onThemeChange?.(null)}
+          >
+            全部
+          </Tag>
+          {THEME_GROUPS.map((g) => (
+            <Tag
+              key={g.key}
+              style={{
+                background: themeFilter === g.key ? g.color + '33' : 'rgba(15, 25, 35, 0.7)',
+                border: `1px solid ${themeFilter === g.key ? g.color : NEURAL_COLORS.border}`,
+                color: themeFilter === g.key ? g.color : NEURAL_COLORS.textDim,
+                cursor: 'pointer',
+                pointerEvents: 'auto',
+              }}
+              onClick={() => onThemeChange?.(themeFilter === g.key ? null : g.key)}
+            >
+              {g.label}
+            </Tag>
+          ))}
+        </Space>
+      </div>
+      <div style={{ position: 'absolute', top: 40, left: 14, pointerEvents: 'none' }}>
         <Space size={4}>
           <Tag color="cyan" style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}>
             知识图谱 · 神经蛛网
