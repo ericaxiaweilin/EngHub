@@ -172,8 +172,8 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
             id: tId,
             label: term,
             type: 'term',
-            radius: 4,
-            color: NEURAL_COLORS.textDim,
+            radius: 5,
+            color: skillColor(i),
             angle: angle + (k * 0.35 + m * 0.12) * (k % 2 === 0 ? 1 : -1),
             ring: 2,
             skill,
@@ -230,8 +230,8 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
     // 世界坐标以画布中心为原点；屏幕坐标 = (世界坐标 * scale) + (中心 + offset)
     const cx = () => width / 2
     const cy = () => height / 2
-    const r1 = () => Math.min(width, height) * 0.36
-    const r2 = () => r1() * 0.58
+    const r1 = () => Math.min(width, height) * 0.30
+    const r2 = () => Math.min(width, height) * 0.52
 
     const pos = (angle: number, ring: number): { x: number; y: number } => {
       const r = ring === 0 ? 0 : ring === 1 ? r1() : r2()
@@ -283,7 +283,7 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         ctx.beginPath()
         ctx.moveTo(ps.x, ps.y)
         ctx.lineTo(pe.x, pe.y)
-        ctx.strokeStyle = active ? edge.color : selected ? edge.color + 'cc' : edge.color + '55'
+        ctx.strokeStyle = active ? edge.color : selected ? edge.color + 'cc' : edge.color + '66'
         ctx.lineWidth = (active ? 2.2 : 1.3) / v.scale
         ctx.stroke()
       })
@@ -308,9 +308,9 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
         ctx.fill()
         if (n.type === 'term') {
           ctx.beginPath()
-          ctx.arc(p.x, p.y, radius + 1.5 / v.scale, 0, Math.PI * 2)
+          ctx.arc(p.x, p.y, radius + 2 / v.scale, 0, Math.PI * 2)
           ctx.strokeStyle = (active ? '#ffffff' : n.color) + 'aa'
-          ctx.lineWidth = 1 / v.scale
+          ctx.lineWidth = 1.2 / v.scale
           ctx.stroke()
         }
         if (active || selected || n.type === 'skill') {
@@ -326,6 +326,16 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
           ctx.textAlign = 'center'
           ctx.textBaseline = 'top'
           ctx.fillText(n.label, p.x, p.y + radius + 6 / v.scale)
+        }
+        if (n.type === 'term') {
+          const showLabel = !!themeFilter || v.scale >= 1.3 || active || selected
+          if (showLabel) {
+            ctx.font = `500 ${9 / v.scale}px system-ui, sans-serif`
+            ctx.fillStyle = (active || selected ? n.color : NEURAL_COLORS.textDim) + (active ? '' : 'cc')
+            ctx.textAlign = 'center'
+            ctx.textBaseline = 'top'
+            ctx.fillText(n.label, p.x, p.y + radius + 4 / v.scale)
+          }
         }
       })
 
@@ -605,7 +615,7 @@ const PmcKnowledgeGraph: React.FC<PmcKnowledgeGraphProps> = ({ pack, onSelectSki
             <Text style={{ color: n.color, fontWeight: 600, fontSize: 12 }}>{n.label}</Text>
             <div>
               <Text style={{ color: NEURAL_COLORS.textDim, fontSize: 11 }}>
-                {n.type === 'root' ? '岗位知识中心' : n.type === 'skill' ? `技能 · ${n.qcount} 题` : '知识术语'}
+                {n.type === 'root' ? '岗位知识中心' : n.type === 'skill' ? `技能 · ${n.qcount} 题 · 双击连线以观察子知识点` : `术语 · 归属 ${n.skill}`}
               </Text>
             </div>
           </div>
