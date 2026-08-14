@@ -15,7 +15,7 @@ import {
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
   PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
   CarryOutOutlined, InfoCircleOutlined,
-  SaveOutlined, FileExcelOutlined, SearchOutlined,
+  SaveOutlined, FileExcelOutlined, SearchOutlined, IdcardOutlined,
 } from '@ant-design/icons'
 
 // 任务中心（嵌入 chatbot 浮窗第三个 tab）
@@ -478,6 +478,29 @@ interface ChatMemoryResult {
   files: ChatMemoryFile[]
 }
 
+// ---------- 长期记忆 / 个人画像（跨会话，luaguage 记忆体系 → Harness Kernel 适配） ----------
+interface MemoryFactRow {
+  key: string
+  value: string
+  confidence: number
+  source?: string
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+interface LongTermMemory {
+  user_id?: string
+  factory_id?: string
+  profile?: {
+    identity?: Record<string, string>
+    role?: Record<string, string>
+    work?: Record<string, string>
+    preferences?: Record<string, string>
+  }
+  facts?: MemoryFactRow[]
+  injected_block?: string
+}
+
 // ---------- 快捷指令（后端不可用时的本地兜底） ----------
 const FALLBACK_QUICK_COMMANDS = [
   '今天生产情况怎么样？',
@@ -615,6 +638,10 @@ export default function AIAssistantWidget() {
   const [memoryQuery, setMemoryQuery] = useState('')
   const [memoryLoading, setMemoryLoading] = useState(false)
   const [memoryResults, setMemoryResults] = useState<ChatMemoryResult>({ sessions: [], messages: [], files: [] })
+  // 长期记忆 / 个人画像：跨会话记住的事实 + 本次注入上下文
+  const [longTermOpen, setLongTermOpen] = useState(false)
+  const [longTerm, setLongTerm] = useState<LongTermMemory | null>(null)
+  const [longTermLoading, setLongTermLoading] = useState(false)
 
   const searchChatMemory = useCallback(async (query?: string) => {
     const nextQuery = (query ?? memoryQuery).trim()
@@ -640,6 +667,37 @@ export default function AIAssistantWidget() {
     setMemoryOpen(true)
     void searchChatMemory(memoryQuery)
   }
+
+  // 长期记忆 / 画像：加载后端持久化的事实与画像，展示本次注入上下文
+  const loadLongTermMemory = useCallback(async () => {
+    setLongTermLoading(true)
+    try {
+      const res: any = await api.get('/api/v1/chat/memory')
+      setLongTerm(res as LongTermMemory)
+    } catch {
+      // api 拦截器已提示；保留旧数据
+    } finally {
+      setLongTermLoading(false)
+    }
+  }, [])
+
+  const openLongTermMemory = () => {
+    setLongTermOpen(true)
+    void loadLongTermMemory()
+  }
+
+  const forgetMemoryKey = async (key: string) => {
+    try {
+      await api.delete(`/api/v1/chat/memory/${encodeURIComponent(key)}`)
+      message.success(`已遗忘「${key}」`)
+      await loadLongTermMemory()
+    } catch {
+      // 拦截器已提示
+    }
+  }
+
+  // 头像/画像缩写（取工号首字母作为后端 profile 兜底展示）
+  const profileInitials = (user?.full_name || user?.username || 'AI').slice(0, 1)
 
   const openMemorySession = async (item: ChatMemoryResult['sessions'][number]) => {
     setMemoryLoading(true)
@@ -1202,6 +1260,7 @@ export default function AIAssistantWidget() {
             } else if (eventType === 'done') {
               degraded = !!data.degraded
               if (data.session_id) setSessionId(data.session_id)
+              if (data.memory) setLongTerm(data.memory as LongTermMemory)
               applyUpdate()
             } else if (eventType === 'error') {
               accContent += data.message || '服务异常'
@@ -1827,6 +1886,15 @@ export default function AIAssistantWidget() {
                   onClick={openChatMemory}
                 />
               </Tooltip>
+              <Tooltip title="长期记忆与个人画像（跨会话记住的事实）">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<IdcardOutlined />}
+                  style={{ color: '#fff' }}
+                  onClick={openLongTermMemory}
+                />
+              </Tooltip>
               {/* 工厂指挥官开关 */}
               <Tooltip title={commanderOn ? '指挥官已开启：AI正在主动接管您的工作（点击关闭）' : '开启工厂指挥官：AI主动接管生产调度（点击开启）'}>
                 <Button
@@ -2396,6 +2464,82 @@ export default function AIAssistantWidget() {
                           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={memoryQuery ? '没有找到匹配记录' : '暂无历史记录'} />
                         )}
                       </div>
+                    </Modal>
+                    {/* 长期记忆 / 个人画像：展示跨会话记住的事实 + 本次注入上下文 */}
+                    <Modal
+                      title="长期记忆与个人画像"
+                      open={longTermOpen}
+                      onCancel={() => setLongTermOpen(false)}
+                      footer={null}
+                      width={560}
+                    >
+                      <Spin spinning={longTermLoading}>
+                        {!longTermLoading && !longTerm && (
+                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无记忆" />
+                        )}
+                        {longTerm && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                            {/* 画像卡 */}
+                            <div style={{ display: 'flex', gap: 12, alignItems: 'center', background: '#f5f8ff', borderRadius: 10, padding: '12px 14px' }}>
+                              <Avatar style={{ background: '#1677ff' }}>{profileInitials}</Avatar>
+                              <div>
+                                <Text strong>{longTerm.profile?.identity?.称呼 || longTerm.profile?.identity?.全名 || user?.full_name || user?.username || '用户'}</Text>
+                                <div>
+                                  {Object.entries({ ...(longTerm.profile?.identity || {}), ...(longTerm.profile?.role || {}), ...(longTerm.profile?.work || {}) }).map(([k, v]) => (
+                                    <Tag key={k} style={{ marginTop: 4 }}>{k}：{v}</Tag>
+                                  ))}
+                                </div>
+                                {Object.keys(longTerm.profile?.preferences || {}).length > 0 && (
+                                  <Text type="secondary" style={{ fontSize: 12 }}>
+                                    {Object.entries(longTerm.profile!.preferences!).map(([k, v]) => `${k}：${v}`).join('；')}
+                                  </Text>
+                                )}
+                              </div>
+                            </div>
+                            {/* 已记住的事实 */}
+                            <div>
+                              <Text strong style={{ fontSize: 13 }}>已记住的事实（{(longTerm.facts || []).length}）</Text>
+                              <List
+                                size="small"
+                                dataSource={longTerm.facts || []}
+                                locale={{ emptyText: '暂无已记住的事实' }}
+                                renderItem={fact => (
+                                  <List.Item
+                                    actions={[
+                                      <Popconfirm
+                                        key="forget"
+                                        title={`确定遗忘「${fact.key}」？`}
+                                        onConfirm={() => void forgetMemoryKey(fact.key)}
+                                      >
+                                        <Button type="link" size="small" danger icon={<DeleteOutlined />}>遗忘</Button>
+                                      </Popconfirm>,
+                                    ]}
+                                  >
+                                    <List.Item.Meta
+                                      title={<Text style={{ fontSize: 12 }}>{fact.key}</Text>}
+                                      description={<Text style={{ fontSize: 12 }}>{fact.value}</Text>}
+                                    />
+                                  </List.Item>
+                                )}
+                              />
+                            </div>
+                            {/* 本次注入上下文 */}
+                            {longTerm.injected_block && (
+                              <div>
+                                <Text strong style={{ fontSize: 13 }}>本次注入上下文（system prompt 头部记忆块）</Text>
+                                <pre style={{
+                                  background: '#fafafa', border: '1px solid #eee', borderRadius: 8,
+                                  padding: '10px 12px', fontSize: 11, lineHeight: 1.6,
+                                  maxHeight: 180, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                }}>{longTerm.injected_block}</pre>
+                                <Text type="secondary" style={{ fontSize: 11 }}>
+                                  记忆通过 /chat/memory 读取；每次对话系统会自动注入此记忆块供模型参考，也可遗忘不需要的事实。
+                                </Text>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </Spin>
                     </Modal>
                     {/* 输入区 */}
                     <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>

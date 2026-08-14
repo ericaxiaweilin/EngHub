@@ -245,6 +245,7 @@ class ChatResponse(BaseModel):
     tables: List[Dict[str, Any]] = Field(default_factory=list)
     session_id: Optional[str] = None  # Chat V2：供前端带入下一轮
     request_id: Optional[str] = None  # Chat V2：Trace 锚点
+    memory: Optional[Dict[str, Any]] = None  # 记忆/画像载荷：profile + 注入块 + facts（供前端展示）
 
 
 @router.get("/health")
@@ -304,6 +305,56 @@ async def chat_tools():
         ],
         "workflows": list_workflows(),
     }
+
+
+@router.get("/memory")
+async def chat_memory(
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """返回当前用户的个人画像与长期记忆事实（供前端「记忆/画像」面板展示）。"""
+    from api.services import chat_memory_service as mem
+    from database.models import Role as RoleModel
+    factory_id = _chat_factory_id(http_request, current_user)
+    user_identity = str(current_user.id) or str(current_user.username) or "anonymous"
+    memory_facts = await mem.load_user_memory(
+        db, user_id=user_identity, factory_id=factory_id,
+    )
+    memory_rows = await mem.load_user_memory_rows(
+        db, user_id=user_identity, factory_id=factory_id,
+    )
+    if not memory_facts:
+        memory_facts = mem.memory_from_user_row(current_user)
+    role_obj = None
+    if getattr(current_user, "role_id", None):
+        role_obj = (await db.execute(
+            select(RoleModel).where(RoleModel.id == current_user.role_id)
+        )).scalars().first()
+    user_profile = mem.build_user_profile(current_user, memory_facts, role_obj=role_obj)
+    return {
+        "user_id": user_identity,
+        "factory_id": factory_id,
+        "profile": user_profile,
+        "facts": memory_rows,
+        "injected_block": mem.build_memory_block(memory_facts, profile=user_profile),
+    }
+
+
+@router.delete("/memory/{key}")
+async def chat_memory_forget(
+    key: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """遗忘一条记忆（从当前用户的记忆中删除该 key）。"""
+    from api.services import chat_memory_service as mem
+    factory_id = _chat_factory_id(http_request, current_user)
+    user_identity = str(current_user.id) or str(current_user.username) or "anonymous"
+    await mem.forget(db, user_id=user_identity, key=key)
+    await db.commit()
+    return {"ok": True, "key": key}
 
 
 async def _resolve_model_route(
@@ -1721,13 +1772,20 @@ async def _handle_kernel_chat(
 
     # ── 用户长期记忆（跨会话）：加载用户维度的已记事实，注入 system prompt ──
     from api.services import chat_memory_service as mem
+    from database.models import Role as RoleModel
     user_identity = str(current_user.id) or str(current_user.username) or "anonymous"
     memory_facts = await mem.load_user_memory(
         db, user_id=user_identity, factory_id=factory_id,
     )
     if not memory_facts:
         memory_facts = mem.memory_from_user_row(current_user)
-    memory_block = mem.build_memory_block(memory_facts)
+    role_obj = None
+    if getattr(current_user, "role_id", None):
+        role_obj = (await db.execute(
+            select(RoleModel).where(RoleModel.id == current_user.role_id)
+        )).scalars().first()
+    user_profile = mem.build_user_profile(current_user, memory_facts, role_obj=role_obj)
+    memory_block = mem.build_memory_block(memory_facts, profile=user_profile)
 
     # 附件加载与 V1 一致
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
@@ -1986,6 +2044,14 @@ async def _handle_kernel_chat(
         ),
         session_id=session_id,
         request_id=result.request_id,
+        memory={
+            "profile": user_profile,
+            "injected_block": memory_block,
+            "facts": [
+                {"key": k, "value": v}
+                for k, v in memory_facts.items()
+            ],
+        },
     )
 
 
@@ -2925,6 +2991,7 @@ async def chat_stream(
                 "degraded": result.degraded,
                 "session_id": result.session_id,
                 "request_id": result.request_id or request_id,
+                "memory": getattr(result, "memory", None),
             })
         except Exception as exc:  # noqa: BLE001
             _logger.exception("[chat-stream-kernel] failed request=%s", request_id)
