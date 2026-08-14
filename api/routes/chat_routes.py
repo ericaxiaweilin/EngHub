@@ -1719,6 +1719,16 @@ async def _handle_kernel_chat(
     )
     session_id = session.id
 
+    # ── 用户长期记忆（跨会话）：加载用户维度的已记事实，注入 system prompt ──
+    from api.services import chat_memory_service as mem
+    user_identity = str(current_user.id) or str(current_user.username) or "anonymous"
+    memory_facts = await mem.load_user_memory(
+        db, user_id=user_identity, factory_id=factory_id,
+    )
+    if not memory_facts:
+        memory_facts = mem.memory_from_user_row(current_user)
+    memory_block = mem.build_memory_block(memory_facts)
+
     # 附件加载与 V1 一致
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
@@ -1881,6 +1891,12 @@ async def _handle_kernel_chat(
             rounds=len(response.actions),
             success=not response.degraded,
         )
+        # 记忆：从本轮用户消息规则提取新事实并落库（用户明确告知才记）
+        for fact in mem.learn_from_text(last_user or ""):
+            await mem.remember(
+                db, user_id=user_identity, key=fact["key"], value=fact["value"],
+                factory_id=factory_id, confidence=fact.get("confidence", 2),
+            )
         # StreamingResponse cleanup happens after the body is consumed. Commit
         # here so the shared Kernel path never leaves the request transaction
         # idle while the client or proxy is still holding the response open.
@@ -1898,7 +1914,8 @@ async def _handle_kernel_chat(
         write_tools=frozenset(WRITE_TOOLS),
         sim_tools=frozenset(SIM_TOOLS),
         tool_definitions=tool_definitions,
-        system_prompt=SYSTEM_PROMPT + _attachment_analysis_context(
+        system_prompt=(memory_block + "\n" + SYSTEM_PROMPT if memory_block else SYSTEM_PROMPT)
+        + _attachment_analysis_context(
             bool(spreadsheet_tables), bound_workbook_id,
         ) + workbook_context,
         final_grounding_prompt=FINAL_GROUNDING_PROMPT,

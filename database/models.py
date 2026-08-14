@@ -2577,3 +2577,24 @@ class ChatEvalCase(Base):
     factory_id = Column(String(32), default="F01")
     enabled = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ChatMemory(Base):
+    """Chat 用户长期记忆（跨会话）：按 user_id(+factory) 维度持久事实。
+
+    由 Harness Kernel 在请求前置入 system prompt 记忆块；请求结束后
+    由规则提取器把用户明确告知的事实（如姓名/工号/偏好）写入。
+    confidence: 1=模型推断, 2=用户明确告知。
+    """
+    __tablename__ = "chat_memories"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), nullable=False, index=True)
+    factory_id = Column(String(32), nullable=True)
+    key = Column(String(64), nullable=False)
+    value = Column(Text, nullable=False)
+    confidence = Column(Integer, nullable=False, default=2)
+    source = Column(String(32), nullable=False, default="chat")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
