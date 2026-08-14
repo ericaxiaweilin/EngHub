@@ -792,8 +792,8 @@ async def calculate_mrp(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"MRP计算失败：产品[{product_name}]未配置BOM（物料清单）。"
-                f"MRP需要：计划→产品→BOM→库存数据，请先为基础数据中的产品维护BOM。"
+                f"MRP计算失败：计划[{p.plan_code}]关联的产品[{product_name}]没有关联BOM（物料清单）。"
+                f"请先在基础数据中为该产品维护BOM，再重新执行MRP。"
             ),
         )
     
