@@ -766,6 +766,8 @@ export default function AIAssistantWidget() {
   const [trajectory, setTrajectory] = useState<TrajectoryData | null>(null)
   const [trajectoryLoading, setTrajectoryLoading] = useState(false)
   const [trajectoryOpen, setTrajectoryOpen] = useState(false)
+  // 账本本地 inspector：点选记录行后展开完整 payload/耗时（DSH 设计）
+  const [ledgerInspector, setLedgerInspector] = useState<TrajectoryNode | null>(null)
 
   const loadTrajectory = useCallback(async () => {
     if (!sessionId) {
@@ -2746,6 +2748,41 @@ export default function AIAssistantWidget() {
                                 压缩历史（/compact）
                               </Button>
                             </div>
+                            {/* 时序 Overview（DSH ledger 对齐）：按耗时把记录投射为横向条，
+                                无耗时记录等宽中性展示；hover 查看阶段详情 */}
+                            {(() => {
+                              const stages = trajectory.overview || []
+                              if (stages.length === 0) return null
+                              const haveDur = stages.some(s => s.duration_ms != null)
+                              const maxDur = Math.max(1, ...stages.map(s => s.duration_ms || 0))
+                              return (
+                                <div>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                                    <ThunderboltOutlined style={{ fontSize: 11, color: '#999' }} />
+                                    <Text type="secondary" style={{ fontSize: 10 }}>时序概览（按回复耗时，hover 查看）</Text>
+                                  </div>
+                                  <div style={{ display: 'flex', gap: 2, height: 14 }}>
+                                    {stages.map((s, idx) => {
+                                      const w = s.duration_ms != null ? Math.max(4, Math.round((s.duration_ms / maxDur) * 100)) : 18
+                                      const bg = s.compaction ? '#1677ff'
+                                        : s.degraded ? '#cf1322'
+                                        : (haveDur ? (s.duration_ms != null ? '#52c41a' : '#d9d9d9') : '#91caff')
+                                      const label = s.compaction
+                                        ? `压缩 ${s.folded_count} 事件`
+                                        : (s.user_message || '附件消息')
+                                      return (
+                                        <Tooltip
+                                          key={`${s.request_id}-${idx}`}
+                                          title={`#${s.seq_from}-${s.seq_to} ${label}${s.duration_ms != null ? ` · ${Math.round(s.duration_ms)}ms` : ''}${s.tool_count > 0 ? ` · ${s.tool_count} 工具` : ''}`}
+                                        >
+                                          <div style={{ width: `${w}%`, minWidth: 3, height: '100%', background: bg, borderRadius: 2, cursor: 'help' }} />
+                                        </Tooltip>
+                                      )
+                                    })}
+                                  </div>
+                                </div>
+                              )
+                            })()}
                             <Tabs
                               size="small"
                               items={[
@@ -2807,80 +2844,143 @@ export default function AIAssistantWidget() {
                                 },
                                 {
                                   key: 'events',
-                                  label: '事件流（逐节点）',
+                                  label: '事件流（紧凑账本）',
                                   children: (
-                                    <List
-                                      size="small"
-                                      dataSource={trajectory.nodes}
-                                      renderItem={node => {
-                                        const color = node.kind === 'context_injection' ? 'purple'
-                                          : node.kind === 'tool_call' ? 'orange'
-                                          : node.kind === 'assistant_reply' ? 'green'
-                                          : node.kind === 'compaction' ? 'blue'
-                                          : 'default'
-                                        const title = node.kind === 'context_injection'
-                                          ? `${node.label}（注入 · ${node.source}）`
-                                          : node.kind === 'user_message' ? '用户消息'
-                                          : node.kind === 'tool_call' ? `工具调用：${node.tool}`
-                                          : node.kind === 'compaction' ? `摘要折叠（${node.folded_count || node.source_event_seqs?.length || 0} 个事件）`
-                                          : 'AI 回复'
-                                        return (
-                                          <List.Item style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                                            <Tag color={color} style={{ flexShrink: 0, marginTop: 2 }}>#{node.seq}</Tag>
-                                            <div style={{ flex: 1, minWidth: 0 }}>
-                                              <Text strong style={{ fontSize: 12 }}>{title}</Text>
-                                              {node.kind === 'context_injection' && (
-                                                <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{node.content}</pre>
-                                              )}
-                                              {node.kind === 'user_message' && (
-                                                <div style={{ marginTop: 2, fontSize: 12 }}>{node.content}</div>
-                                              )}
-                                              {node.kind === 'tool_call' && (
-                                                <div style={{ marginTop: 2, fontSize: 11 }}>
-                                                  {node.is_write && <Tag color="red" style={{ fontSize: 10 }}>写</Tag>}
-                                                  <span style={{ color: node.success ? undefined : '#cf1322' }}>
-                                                    {node.success ? '成功' : '失败'}
-                                                  </span>
-                                                  {node.args ? (
-                                                    <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                                                      参数：{typeof node.args === 'string' ? node.args : JSON.stringify(node.args)}
-                                                    </pre>
-                                                  ) : null}
-                                                  {node.result ? (
-                                                    <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 120, overflowY: 'auto' }}>
-                                                      结果：{typeof node.result === 'string' ? node.result : JSON.stringify(node.result).slice(0, 1200)}
-                                                    </pre>
-                                                  ) : null}
+                                    <>
+                                      <div style={{ marginBottom: 6, fontSize: 11, color: '#999' }}>
+                                        点击记录行查看完整载荷 · 虚线分隔为 request 边界
+                                      </div>
+                                      <List
+                                        size="small"
+                                        dataSource={trajectory.nodes}
+                                        renderItem={(node, idx) => {
+                                          const prev = idx > 0 ? trajectory.nodes[idx - 1] : undefined
+                                          const newRequest = !prev || prev.request_id !== node.request_id
+                                          const colorHex = node.kind === 'context_injection' ? '#722ed1'
+                                            : node.kind === 'tool_call' ? (node.success === false ? '#cf1322' : '#fa8c16')
+                                            : node.kind === 'assistant_reply' ? '#52c41a'
+                                            : node.kind === 'compaction' ? '#1677ff'
+                                            : '#bfbfbf'
+                                          const kindLabel = node.kind === 'context_injection' ? '注入'
+                                            : node.kind === 'user_message' ? '用户'
+                                            : node.kind === 'tool_call' ? '工具'
+                                            : node.kind === 'compaction' ? '压缩'
+                                            : '回复'
+                                          const preview = node.kind === 'context_injection' ? (node.content || '')
+                                            : node.kind === 'user_message' ? (node.content || '')
+                                            : node.kind === 'tool_call' ? `${node.tool} · ${node.success === false ? '失败' : '成功'}${node.is_write ? '（写）' : ''}`
+                                            : node.kind === 'compaction' ? `折叠 ${node.folded_count || node.source_event_seqs?.length || 0} 个事件：${(node.summary || '').slice(0, 60)}`
+                                            : (node.reply || '')
+                                          const isSelected = ledgerInspector?.seq === node.seq
+                                          return (
+                                            <div key={`${node.seq}-${node.kind}`}>
+                                              {newRequest && (
+                                                <div style={{ margin: '4px 0', borderTop: '1px dashed #d9d9d9', paddingTop: 2, fontSize: 10, color: '#bbb', fontFamily: 'monospace' }}>
+                                                  ↳ request {node.request_id}
                                                 </div>
                                               )}
-                                              {node.kind === 'assistant_reply' && (
-                                                <div style={{ marginTop: 2, fontSize: 12 }}>
-                                                  <div style={{ color: '#666', fontSize: 11 }}>
-                                                    {node.model && <Tag style={{ fontSize: 10 }}>{node.model}</Tag>}
-                                                    {node.tool_count != null && node.tool_count > 0 && <Tag color="blue" style={{ fontSize: 10 }}>{node.tool_count} 次工具</Tag>}
-                                                    {node.duration_ms != null && <span>耗时 {Math.round(node.duration_ms)}ms</span>}
+                                              <div
+                                                onClick={() => setLedgerInspector(isSelected ? null : node)}
+                                                style={{
+                                                  display: 'flex', gap: 8, alignItems: 'flex-start',
+                                                  padding: '4px 4px', borderRadius: 4, cursor: 'pointer',
+                                                  background: isSelected ? '#f5f8ff' : undefined,
+                                                  borderLeft: isSelected ? '2px solid #1677ff' : '2px solid transparent',
+                                                }}
+                                              >
+                                                <div style={{ width: 26, flexShrink: 0, textAlign: 'center', color: '#999', fontSize: 10, fontFamily: 'monospace', paddingTop: 1 }}>{node.seq}</div>
+                                                <div style={{ width: 6, flexShrink: 0, alignSelf: 'stretch', borderRadius: 2, background: colorHex, marginTop: 3, minHeight: 14 }} />
+                                                <div style={{ flex: 1, minWidth: 0 }}>
+                                                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                                                    <Text strong style={{ fontSize: 11 }}>{kindLabel}</Text>
+                                                    {node.kind === 'tool_call' && node.tool && <span style={{ fontSize: 10, color: '#555', fontFamily: 'monospace' }}>{node.tool}</span>}
+                                                    {node.kind === 'assistant_reply' && node.model && <span style={{ fontSize: 10, color: '#999' }}>{node.model}</span>}
+                                                    {node.kind === 'assistant_reply' && node.duration_ms != null && <span style={{ fontSize: 10, color: '#999' }}>{Math.round(node.duration_ms)}ms</span>}
                                                   </div>
-                                                  <div style={{ marginTop: 2 }}>{node.reply}</div>
+                                                  <div style={{ fontSize: 11, color: '#555', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 1 }}>{preview}</div>
                                                 </div>
-                                              )}
-                                              {node.kind === 'compaction' && (
-                                                <div style={{ marginTop: 4, fontSize: 12 }}>
-                                                  <Tag color="blue" style={{ fontSize: 10 }}>
-                                                    折叠 seq {node.fold_from}—{node.fold_to}
-                                                    {node.reason && ` · ${node.reason === 'manual' ? '手动' : '压力自动'}`}
-                                                  </Tag>
-                                                  {node.summary && (
-                                                    <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#f0f7ff', padding: 8, borderRadius: 6, borderLeft: '3px solid #1677ff' }}>
-                                                      {node.summary}
-                                                    </pre>
-                                                  )}
-                                                </div>
-                                              )}
+                                              </div>
                                             </div>
-                                          </List.Item>
-                                        )
-                                      }}
-                                    />
+                                          )
+                                        }}
+                                      />
+                                      {ledgerInspector && (
+                                        <div style={{ border: '1px solid #91caff', borderRadius: 6, padding: 8, marginTop: 6, background: '#f5f8ff' }}>
+                                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                                            <Text strong style={{ fontSize: 12 }}>
+                                              记录 #{ledgerInspector.seq}
+                                              {ledgerInspector.request_id && <span style={{ fontSize: 10, color: '#999', marginLeft: 6, fontFamily: 'monospace' }}>{ledgerInspector.request_id}</span>}
+                                            </Text>
+                                            <Button size="small" type="text" icon={<CloseOutlined />} onClick={() => setLedgerInspector(null)} />
+                                          </div>
+                                          {ledgerInspector.kind === 'context_injection' && (
+                                            <>
+                                              <div style={{ fontSize: 11, color: '#999' }}>source · {ledgerInspector.source} — {ledgerInspector.label}</div>
+                                              <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 160, overflowY: 'auto' }}>{ledgerInspector.content}</pre>
+                                            </>
+                                          )}
+                                          {ledgerInspector.kind === 'user_message' && (
+                                            <div style={{ fontSize: 12 }}>{ledgerInspector.content}</div>
+                                          )}
+                                          {ledgerInspector.kind === 'tool_call' && (
+                                            <>
+                                              <div style={{ fontSize: 11 }}>
+                                                <Tag color={ledgerInspector.success === false ? 'red' : 'orange'} style={{ fontSize: 10 }}>{ledgerInspector.success === false ? '失败' : '成功'}</Tag>
+                                                {ledgerInspector.is_write && <Tag color="red" style={{ fontSize: 10 }}>写操作</Tag>}
+                                                <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{ledgerInspector.tool}</span>
+                                              </div>
+                                              {ledgerInspector.args != null && (
+                                                <div style={{ marginTop: 4 }}>
+                                                  <Text type="secondary" style={{ fontSize: 10 }}>参数</Text>
+                                                  <pre style={{ margin: '2px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 160, overflowY: 'auto' }}>
+                                                    {typeof ledgerInspector.args === 'string' ? ledgerInspector.args : JSON.stringify(ledgerInspector.args, null, 2)}
+                                                  </pre>
+                                                </div>
+                                              )}
+                                              {ledgerInspector.result != null && (
+                                                <div style={{ marginTop: 4 }}>
+                                                  <Text type="secondary" style={{ fontSize: 10 }}>结果</Text>
+                                                  <pre style={{ margin: '2px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
+                                                    {typeof ledgerInspector.result === 'string' ? ledgerInspector.result : JSON.stringify(ledgerInspector.result, null, 2)}
+                                                  </pre>
+                                                </div>
+                                              )}
+                                            </>
+                                          )}
+                                          {ledgerInspector.kind === 'assistant_reply' && (
+                                            <>
+                                              <div style={{ fontSize: 11, color: '#666' }}>
+                                                {ledgerInspector.model && <Tag style={{ fontSize: 10 }}>{ledgerInspector.model}</Tag>}
+                                                {ledgerInspector.tool_count != null && ledgerInspector.tool_count > 0 && <Tag color="blue" style={{ fontSize: 10 }}>{ledgerInspector.tool_count} 次工具</Tag>}
+                                                {ledgerInspector.duration_ms != null && <span>耗时 {Math.round(ledgerInspector.duration_ms)}ms</span>}
+                                                {ledgerInspector.degraded && <Tag color="red" style={{ fontSize: 10 }}>降级</Tag>}
+                                              </div>
+                                              <div style={{ marginTop: 4, fontSize: 12, maxHeight: 240, overflowY: 'auto' }}>{ledgerInspector.reply}</div>
+                                            </>
+                                          )}
+                                          {ledgerInspector.kind === 'compaction' && (
+                                            <>
+                                              <div style={{ fontSize: 11 }}>
+                                                <Tag color="blue" style={{ fontSize: 10 }}>折叠 seq {ledgerInspector.fold_from}—{ledgerInspector.fold_to}</Tag>
+                                                {ledgerInspector.folded_count != null && <span style={{ fontSize: 10, color: '#999' }}>{ledgerInspector.folded_count} 个事件</span>}
+                                                {ledgerInspector.reason && <span style={{ fontSize: 10, color: '#999' }}> · {ledgerInspector.reason === 'manual' ? '手动' : '压力自动'}</span>}
+                                              </div>
+                                              {ledgerInspector.summary && (
+                                                <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#fff', padding: 6, borderRadius: 4 }}>{ledgerInspector.summary}</pre>
+                                              )}
+                                              {ledgerInspector.source_event_seqs && ledgerInspector.source_event_seqs.length > 0 && (
+                                                <div style={{ marginTop: 4 }}>
+                                                  <Text type="secondary" style={{ fontSize: 10 }}>source_event_seqs（{ledgerInspector.source_event_seqs.length}）</Text>
+                                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, marginTop: 2 }}>
+                                                    {ledgerInspector.source_event_seqs.map(s => <Tag key={s} style={{ fontSize: 9 }}>{s}</Tag>)}
+                                                  </div>
+                                                </div>
+                                              )}
+                                            </>
+                                          )}
+                                        </div>
+                                      )}
+                                    </>
                                   ),
                                 },
                               ]}

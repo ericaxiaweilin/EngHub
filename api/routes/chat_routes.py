@@ -2004,7 +2004,8 @@ async def _handle_kernel_chat(
                 "data": {
                     "reply": response.reply,
                     "model": response.model,
-                    "duration_ms": getattr(response, "duration_ms", None),
+                    "duration_ms": (getattr(response, "duration_ms", None)
+                                    or None),
                     "degraded": response.degraded,
                     "tool_count": len(response.actions),
                 },

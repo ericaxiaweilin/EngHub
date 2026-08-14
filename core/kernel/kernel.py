@@ -38,6 +38,7 @@ class KernelResponse:
     diagrams: List[Dict[str, Any]] = field(default_factory=list)
     tables: List[Dict[str, Any]] = field(default_factory=list)
     request_id: str = ""
+    duration_ms: float = 0.0
     telemetry: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -133,6 +134,7 @@ class HarnessKernel:
     async def handle(self, ctx: KernelContext) -> KernelResponse:
         request_id = ctx.request_id
         self._active_ctx = ctx
+        started = time.monotonic()
         try:
             with self._telemetry.timed(request_id, "total") as _timer:
                 # Clear, deterministic business intents (for example PMC control
@@ -189,6 +191,7 @@ class HarnessKernel:
                     actions=loop_result.actions,
                     diagrams=loop_result.diagrams,
                     request_id=request_id,
+                    duration_ms=(time.monotonic() - started) * 1000,
                 )
                 if review_result is not None:
                     response.telemetry["review"] = review_result.to_dict()
@@ -212,6 +215,7 @@ class HarnessKernel:
                 reply=f"Chat V2 处理失败（{type(exc).__name__}）",
                 model=ctx.model_route.get("gateway_model", ""),
                 degraded=True,
+                duration_ms=(time.monotonic() - started) * 1000,
                 request_id=request_id,
             )
 
