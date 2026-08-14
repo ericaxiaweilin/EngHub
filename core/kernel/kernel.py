@@ -268,7 +268,7 @@ class HarnessKernel:
             return {"error": gate_error, "permission_denied": True}
 
         if self._skill_registry is not None:
-            if self._skill_registry.has_tool(tool_name):
+            if self._skill_registry.has_tool(tool_name, scope=active.factory_id if active else None):
                 operator = active.operator if active else "ai_assistant"
                 factory_id = active.factory_id if active else None
                 result = await self._skill_registry.execute(

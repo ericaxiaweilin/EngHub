@@ -2563,6 +2563,25 @@ class ChatTelemetry(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class ChatSessionEvent(Base):
+    """Chat 会话事件流（DSH SessionEvent 对齐）——append-only 轨迹。
+
+    一个会话维护一段连续事件流（type/seq/time/data），Trajectory 视图从
+    该事件流组装读模型（注入 / 用户消息 / 工具调用 / 回复成节点），
+    不再维护第二条独立历史源。seq 在会话内单调递增。
+    """
+    __tablename__ = "chat_session_events"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    session_id = Column(String(36), ForeignKey("chat_sessions.id"), index=True)
+    request_id = Column(String(64), index=True)
+    seq = Column(Integer, nullable=False)
+    event_type = Column(String(32), nullable=False)   # context_injection/user_message/tool_call/assistant_reply
+    data = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class ChatEvalCase(Base):
     """Chat 批量评估用例（Phase 6 Engineering Surface）。"""
     __tablename__ = "chat_eval_cases"

@@ -163,6 +163,7 @@ _ONLINE_WORKBOOK_TOOL_NAMES = frozenset({
 
 def _chat_tool_definitions(
     *, has_spreadsheet_attachment: bool, workbook_id: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """选择本轮模型工具，并把表格附件绑定到唯一工作簿。
 
@@ -171,7 +172,7 @@ def _chat_tool_definitions(
     读取公式、修改单元格并导出原工作簿。
     """
     try:
-        tool_catalog = _get_skill_registry().all_tool_definitions()
+        tool_catalog = _get_skill_registry().all_tool_definitions(scope=scope)
     except Exception:  # noqa: BLE001
         # Import/startup fallback only; normal requests always use the registry.
         tool_catalog = TOOL_DEFINITIONS
@@ -1477,6 +1478,7 @@ async def _legacy_chat_disabled(
     tool_definitions = _chat_tool_definitions(
         has_spreadsheet_attachment=bool(spreadsheet_tables),
         workbook_id=bound_workbook_id,
+        scope=factory_id,
     )
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
     messages: List[Dict[str, Any]] = [{
@@ -1870,6 +1872,7 @@ async def _handle_kernel_chat(
     tool_definitions = _chat_tool_definitions(
         has_spreadsheet_attachment=bool(spreadsheet_tables),
         workbook_id=bound_workbook_id,
+        scope=factory_id,
     )
 
     async def deterministic_handler(ctx, execute, action_factory):
@@ -1931,7 +1934,7 @@ async def _handle_kernel_chat(
         )
 
     async def persist_after(ctx, response):
-        """Phase 3：请求结束后落库（消息 + 遥测）。"""
+        """Phase 3：请求结束后落库（消息 + 遥测 + 事件流）。"""
         from api.services import chat_persistence_service as cp
         last_user = ctx.last_user_content
         await cp.persist_round(
@@ -1950,6 +1953,50 @@ async def _handle_kernel_chat(
             rounds=len(response.actions),
             success=not response.degraded,
         )
+        # 事件流（DSH SessionEvent 对齐）：注入上下文 → 用户消息 → 工具调用 → 回复。
+        try:
+            pieces = mem.build_context_pieces(memory_facts, profile=user_profile)
+            events: List[Dict[str, Any]] = []
+            for piece in pieces:
+                events.append({
+                    "type": "context_injection",
+                    "data": {
+                        "source": piece.get("source"),
+                        "label": piece.get("label"),
+                        "content": piece.get("content"),
+                    },
+                })
+            events.append({
+                "type": "user_message",
+                "data": {"content": last_user or "（图片/附件消息）"},
+            })
+            for action in response.actions:
+                events.append({
+                    "type": "tool_call",
+                    "data": {
+                        "tool": action.tool,
+                        "label": getattr(action, "label", action.tool),
+                        "args": getattr(action, "arguments", None),
+                        "result": getattr(action, "result", None),
+                        "success": getattr(action, "success", True),
+                        "is_write": getattr(action, "is_write", False),
+                    },
+                })
+            events.append({
+                "type": "assistant_reply",
+                "data": {
+                    "reply": response.reply,
+                    "model": response.model,
+                    "duration_ms": getattr(response, "duration_ms", None),
+                    "degraded": response.degraded,
+                    "tool_count": len(response.actions),
+                },
+            })
+            await cp.append_session_events(
+                db, session_id=session_id, request_id=ctx.request_id, events=events,
+            )
+        except Exception:  # noqa: BLE001
+            _logger.exception("[chat-kernel] 事件流写入失败 request=%s", ctx.request_id)
         # 记忆：从本轮用户消息规则提取新事实并落库（用户明确告知才记）
         for fact in mem.learn_from_text(last_user or ""):
             await mem.remember(
@@ -2764,6 +2811,7 @@ async def _legacy_stream_disabled(
         tool_definitions = _chat_tool_definitions(
             has_spreadsheet_attachment=bool(spreadsheet_tables),
             workbook_id=bound_workbook_id,
+            scope=factory_id,
         )
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
         messages: List[Dict[str, Any]] = [{
@@ -3209,6 +3257,26 @@ async def chat_replay(
             db,
             None,
             session_id=session_id,
+            user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/trajectory/{session_id}")
+async def chat_trajectory(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """会话轨迹（DSH Trajectory 对齐）：从事件流组装注入/消息/工具/回复节点。"""
+    from api.services.chat_persistence_service import ChatSessionAccessError, get_trajectory
+    try:
+        return await get_trajectory(
+            db,
+            session_id,
             user=current_user,
             factory_id=_chat_factory_id(http_request, current_user),
         )

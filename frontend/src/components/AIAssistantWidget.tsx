@@ -506,6 +506,32 @@ interface LongTermMemory {
   }[]
 }
 
+interface TrajectoryNode {
+  kind: 'context_injection' | 'user_message' | 'tool_call' | 'assistant_reply'
+  seq: number
+  request_id?: string | null
+  source?: string
+  label?: string
+  content?: string
+  tool?: string
+  args?: unknown
+  result?: unknown
+  success?: boolean
+  is_write?: boolean
+  reply?: string
+  model?: string | null
+  duration_ms?: number | null
+  degraded?: boolean
+  tool_count?: number
+}
+
+interface TrajectoryData {
+  session_id: string
+  title?: string | null
+  event_count: number
+  nodes: TrajectoryNode[]
+}
+
 // ---------- 快捷指令（后端不可用时的本地兜底） ----------
 const FALLBACK_QUICK_COMMANDS = [
   '今天生产情况怎么样？',
@@ -699,6 +725,32 @@ export default function AIAssistantWidget() {
     } catch {
       // 拦截器已提示
     }
+  }
+
+  // 会话轨迹（DSH Trajectory 对齐）：按事件流展示注入/消息/工具/回复节点
+  const [trajectory, setTrajectory] = useState<TrajectoryData | null>(null)
+  const [trajectoryLoading, setTrajectoryLoading] = useState(false)
+  const [trajectoryOpen, setTrajectoryOpen] = useState(false)
+
+  const loadTrajectory = useCallback(async () => {
+    if (!sessionId) {
+      message.info('当前尚无会话，先发送一条消息后即可查看轨迹')
+      return
+    }
+    setTrajectoryLoading(true)
+    try {
+      const res: any = await api.get(`/api/v1/chat/trajectory/${encodeURIComponent(sessionId)}`)
+      setTrajectory(res as TrajectoryData)
+    } catch {
+      // 拦截器已提示；保留旧数据
+    } finally {
+      setTrajectoryLoading(false)
+    }
+  }, [sessionId])
+
+  const openTrajectory = () => {
+    setTrajectoryOpen(true)
+    void loadTrajectory()
   }
 
   // 头像/画像缩写（取工号首字母作为后端 profile 兜底展示）
@@ -1900,6 +1952,15 @@ export default function AIAssistantWidget() {
                   onClick={openLongTermMemory}
                 />
               </Tooltip>
+              <Tooltip title="会话轨迹（注入上下文 / 工具调用事件流）">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<UnorderedListOutlined />}
+                  style={{ color: '#fff' }}
+                  onClick={openTrajectory}
+                />
+              </Tooltip>
               {/* 工厂指挥官开关 */}
               <Tooltip title={commanderOn ? '指挥官已开启：AI正在主动接管您的工作（点击关闭）' : '开启工厂指挥官：AI主动接管生产调度（点击开启）'}>
                 <Button
@@ -2564,6 +2625,84 @@ export default function AIAssistantWidget() {
                                 </Text>
                               </div>
                             )}
+                          </div>
+                        )}
+                      </Spin>
+                    </Modal>
+                    {/* 会话轨迹（DSH Trajectory 对齐）：注入/消息/工具/回复事件流 */}
+                    <Modal
+                      title="会话轨迹"
+                      open={trajectoryOpen}
+                      onCancel={() => setTrajectoryOpen(false)}
+                      footer={null}
+                      width={640}
+                    >
+                      <Spin spinning={trajectoryLoading}>
+                        {!trajectoryLoading && !trajectory && (
+                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无轨迹数据" />
+                        )}
+                        {trajectory && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                            <Text type="secondary" style={{ fontSize: 12 }}>
+                              共 {trajectory.event_count} 个事件 · 按会话事件流顺序展示（每个节点带 seq 序号与来源）
+                            </Text>
+                            <List
+                              size="small"
+                              dataSource={trajectory.nodes}
+                              renderItem={node => {
+                                const color = node.kind === 'context_injection' ? 'purple'
+                                  : node.kind === 'tool_call' ? 'orange'
+                                  : node.kind === 'assistant_reply' ? 'green'
+                                  : 'default'
+                                const title = node.kind === 'context_injection'
+                                  ? `${node.label}（注入 · ${node.source}）`
+                                  : node.kind === 'user_message' ? '用户消息'
+                                  : node.kind === 'tool_call' ? `工具调用：${node.tool}`
+                                  : 'AI 回复'
+                                return (
+                                  <List.Item style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                                    <Tag color={color} style={{ flexShrink: 0, marginTop: 2 }}>#{node.seq}</Tag>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                      <Text strong style={{ fontSize: 12 }}>{title}</Text>
+                                      {node.kind === 'context_injection' && (
+                                        <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{node.content}</pre>
+                                      )}
+                                      {node.kind === 'user_message' && (
+                                        <div style={{ marginTop: 2, fontSize: 12 }}>{node.content}</div>
+                                      )}
+                                      {node.kind === 'tool_call' && (
+                                        <div style={{ marginTop: 2, fontSize: 11 }}>
+                                          {node.is_write && <Tag color="red" style={{ fontSize: 10 }}>写</Tag>}
+                                          <span style={{ color: node.success ? undefined : '#cf1322' }}>
+                                            {node.success ? '成功' : '失败'}
+                                          </span>
+                                          {node.args ? (
+                                            <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                              参数：{typeof node.args === 'string' ? node.args : JSON.stringify(node.args)}
+                                            </pre>
+                                          ) : null}
+                                          {node.result ? (
+                                            <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 120, overflowY: 'auto' }}>
+                                              结果：{typeof node.result === 'string' ? node.result : JSON.stringify(node.result).slice(0, 1200)}
+                                            </pre>
+                                          ) : null}
+                                        </div>
+                                      )}
+                                      {node.kind === 'assistant_reply' && (
+                                        <div style={{ marginTop: 2, fontSize: 12 }}>
+                                          <div style={{ color: '#666', fontSize: 11 }}>
+                                            {node.model && <Tag style={{ fontSize: 10 }}>{node.model}</Tag>}
+                                            {node.tool_count != null && node.tool_count > 0 && <Tag color="blue" style={{ fontSize: 10 }}>{node.tool_count} 次工具</Tag>}
+                                            {node.duration_ms != null && <span>耗时 {Math.round(node.duration_ms)}ms</span>}
+                                          </div>
+                                          <div style={{ marginTop: 2 }}>{node.reply}</div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </List.Item>
+                                )
+                              }}
+                            />
                           </div>
                         )}
                       </Spin>

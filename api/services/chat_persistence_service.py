@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import (
-    ChatMessage, ChatMessageAttachment, ChatSession, ChatTelemetry, FileRecord, generate_uuid,
+    ChatMessage, ChatMessageAttachment, ChatSession, ChatSessionEvent, ChatTelemetry, FileRecord, generate_uuid,
 )
 
 HISTORY_LIMIT = 50
@@ -423,4 +423,148 @@ def _action_to_json(action: Any) -> Dict[str, Any]:
         "arguments": getattr(action, "arguments", None),
         "result": getattr(action, "result", None),
         "success": getattr(action, "success", True),
+    }
+
+
+# ──────────────────────────────────────────────
+# Chat 会话事件流（DSH SessionEvent 对齐）
+# ──────────────────────────────────────────────
+#
+# 一个会话维护一段连续事件流（type/seq/time/data）。Trajectory 视图
+# 从该事件流组装读模型（注入 / 用户消息 / 工具调用 / 回复成节点），
+# 不再维护第二条独立历史源。
+
+async def append_session_events(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    request_id: str,
+    events: List[Dict[str, Any]],
+) -> None:
+    """把本次请求产生的事件追加进会话事件流。
+
+    events: [{"type": ..., "data": {...}}, ...]，seq 在会话内自增。
+    幂等：同一 request_id 已存在事件时跳过，避免 persist_hook 重放。
+    """
+    if not events:
+        return
+    existing = await db.execute(
+        select(ChatSessionEvent.request_id)
+        .where(ChatSessionEvent.request_id == request_id)
+        .limit(1)
+    )
+    if existing.scalar_one_or_none() is not None:
+        return
+    last_seq = await _session_last_seq(db, session_id)
+    for evt in events:
+        seq = last_seq + 1
+        last_seq = seq
+        db.add(ChatSessionEvent(
+            id=generate_uuid(),
+            session_id=session_id,
+            request_id=request_id,
+            seq=seq,
+            event_type=evt.get("type", "generic"),
+            data=evt.get("data") or {},
+        ))
+    await db.flush()
+
+
+async def _session_last_seq(db: AsyncSession, session_id: str) -> int:
+    row = (await db.execute(
+        select(ChatSessionEvent.seq)
+        .where(ChatSessionEvent.session_id == session_id)
+        .order_by(ChatSessionEvent.seq.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    return int(row) if row else 0
+
+
+async def get_trajectory(
+    db: AsyncSession,
+    session_id: str,
+    *,
+    user: Any = None,
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """组装会话 Trajectory：按 seq 从事件流读取，并重放为节点序列。
+
+    对齐 DSH Trajectory view：事件流是唯一来源，读模型按业务折叠——
+      context_injection → 注入节点（source/label/content）
+      user_message     → 用户消息节点
+      tool_call        → 工具调用节点（tool/arguments/result 摘要）
+      assistant_reply  → 回复节点（reply/模型名/耗时）
+    """
+    session = await _get_session(db, session_id)
+    if session is None:
+        raise ChatSessionAccessError("会话不存在")
+    if user is not None:
+        user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
+        if (
+            session.user_id != user_id
+            or (factory_id is not None and session.factory_id != factory_id)
+        ):
+            raise ChatSessionAccessError("无权访问该会话轨迹")
+
+    rows = (await db.execute(
+        select(ChatSessionEvent)
+        .where(ChatSessionEvent.session_id == session_id)
+        .order_by(ChatSessionEvent.seq.asc())
+    )).scalars().all()
+
+    nodes: List[Dict[str, Any]] = []
+    context_requests: Dict[str, Dict[str, Any]] = {}
+    for evt in rows:
+        data = evt.data or {}
+        if evt.event_type == "context_injection":
+            node = {
+                "kind": "context_injection",
+                "seq": evt.seq,
+                "request_id": evt.request_id,
+                "source": data.get("source") or "unknown",
+                "label": data.get("label") or "上下文",
+                "content": data.get("content") or "",
+            }
+            nodes.append(node)
+            context_requests.setdefault(evt.request_id, {})["injections"] = (
+                context_requests.get(evt.request_id, {}).get("injections", 0) + 1
+            )
+        elif evt.event_type == "user_message":
+            nodes.append({
+                "kind": "user_message",
+                "seq": evt.seq,
+                "request_id": evt.request_id,
+                "content": data.get("content") or "",
+            })
+        elif evt.event_type == "tool_call":
+            nodes.append({
+                "kind": "tool_call",
+                "seq": evt.seq,
+                "request_id": evt.request_id,
+                "tool": data.get("tool") or "",
+                "label": data.get("label") or data.get("tool") or "",
+                "args": data.get("args"),
+                "result": data.get("result"),
+                "success": data.get("success", True),
+                "is_write": data.get("is_write", False),
+            })
+        elif evt.event_type == "assistant_reply":
+            nodes.append({
+                "kind": "assistant_reply",
+                "seq": evt.seq,
+                "request_id": evt.request_id,
+                "reply": data.get("reply") or "",
+                "model": data.get("model"),
+                "duration_ms": data.get("duration_ms"),
+                "degraded": data.get("degraded", False),
+                "tool_count": data.get("tool_count", 0),
+            })
+
+    return {
+        "session_id": session.id,
+        "factory_id": session.factory_id,
+        "title": session.title,
+        "event_count": len(rows),
+        "nodes": nodes,
+        "injection_requests": context_requests,
     }
