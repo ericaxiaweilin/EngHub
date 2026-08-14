@@ -4,9 +4,8 @@
 - 发现：get(name) / get_skill_for_tool(tool_name) / all_tool_definitions
 - 执行：execute(tool_name, args, *, db, operator, factory_id, ctx)
   按工具名路由到所属 Skill，未找到返回 {"error": "未知工具"}。
-- 针对未迁移完成的工具：skill 可返回特殊哨兵 _LEGACY_FALLBACK，
-  registry.execute 返回该哨兵，由调用方决定回退到旧 execute_tool ——
-  保证渐进迁移过程中行为零漂移。
+- 兼容边界：所有尚未拆分的工具由 compatibility Skill 显式注册，
+  不再由 Kernel 隐式持有第二条 legacy 执行路径。
 - 自动发现：autodiscover() 扫描 core/skills/<dir>/skill.py
 """
 
@@ -21,7 +20,7 @@ from core.skills.base import BaseSkill
 
 _logger = logging.getLogger("engflow_skills")
 
-# 哨兵：指示某工具尚未在本 Skill 迁移完成，需回退到 legacy chat_tools_service。
+# 旧技能在拆分期间仍可返回此哨兵；新入口会把它视为明确的迁移缺口。
 LEGACY_FALLBACK = {"_legacy_fallback": True}
 
 
@@ -86,11 +85,18 @@ class SkillRegistry:
         return list(self._skills.values())
 
     def all_tool_definitions(self) -> List[Dict[str, Any]]:
-        """聚合所有技能的 OpenAI 工具定义。"""
-        defs: List[Dict[str, Any]] = []
+        """聚合所有技能的 OpenAI 工具定义并按工具名去重。
+
+        Compatibility Skill 先注册完整目录，已迁移领域 Skill 后注册并
+        覆盖执行映射；工具描述也以最后注册的 Skill 为准。
+        """
+        by_name: Dict[str, Dict[str, Any]] = {}
         for skill in self._skills.values():
-            defs.extend(skill.get_tool_definitions())
-        return defs
+            for definition in skill.get_tool_definitions():
+                name = (definition.get("function") or {}).get("name")
+                if name:
+                    by_name[name] = definition
+        return list(by_name.values())
 
     # ── 执行 ──
 

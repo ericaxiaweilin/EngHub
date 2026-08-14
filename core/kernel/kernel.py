@@ -36,6 +36,7 @@ class KernelResponse:
     degraded: bool = False
     actions: List[Any] = field(default_factory=list)
     diagrams: List[Dict[str, Any]] = field(default_factory=list)
+    tables: List[Dict[str, Any]] = field(default_factory=list)
     request_id: str = ""
     telemetry: Dict[str, Any] = field(default_factory=dict)
 
@@ -84,10 +85,12 @@ class HarnessKernel:
         checkpoint_manager: Optional[CheckpointManager] = None,
         checkpoint_session_factory: Optional[Callable[[], Any]] = None,
         checkpoint_persistence_enabled: bool = False,
+        deterministic_handler: Optional[Callable[..., Awaitable[Optional[KernelResponse]]]] = None,
     ) -> None:
         self.db = db
         self._active_ctx = None
         self._persist_hook = persist_hook
+        self._deterministic_handler = deterministic_handler
         self._permission_gate = permission_gate
         self._model_reviewer = model_reviewer
         self._resolve_model_route = resolve_model_route
@@ -103,9 +106,12 @@ class HarnessKernel:
             persistence_enabled=checkpoint_persistence_enabled,
         )
         self._skill_registry = skill_registry
-        # execute_tool 统一走 _skill_execute_tool：始终先做权限门控，
-        # 再有 Skill → legacy 回退（skill_registry 可空）。
-        self._legacy_execute_tool = legacy_execute_tool or execute_tool
+        self._make_tool_action = make_tool_action
+        self._execute_tool_without_registry = execute_tool
+        # execute_tool 统一走 _skill_execute_tool：始终先做权限门控。
+        # 当注册表存在时，所有已注册工具都必须经过 Skill；旧执行器只在
+        # 调用方显式传入 legacy_execute_tool 时作为迁移期兼容层存在。
+        self._legacy_execute_tool = legacy_execute_tool
         self._loop = AgentLoop(
             call_llm=call_llm,
             execute_tool=self._skill_execute_tool,
@@ -127,6 +133,23 @@ class HarnessKernel:
         self._active_ctx = ctx
         try:
             with self._telemetry.timed(request_id, "total") as _timer:
+                # Clear, deterministic business intents (for example PMC control
+                # tower facts) can bypass an unnecessary model round while still
+                # using the exact same permission, persistence and response path.
+                if self._deterministic_handler is not None:
+                    direct_response = await self._deterministic_handler(
+                        ctx, self._skill_execute_tool, self._make_tool_action,
+                    )
+                    if direct_response is not None:
+                        if self._persist_hook is not None:
+                            try:
+                                await self._persist_hook(ctx, direct_response)
+                            except Exception:  # noqa: BLE001
+                                _logger.exception(
+                                    "[kernel] persist hook failed for %s", request_id,
+                                )
+                        return direct_response
+
                 # 1) 构建 payload（含 system prompt / 工具定义 / 路由）
                 payload = self._build_payload(ctx)
 
@@ -234,8 +257,8 @@ class HarnessKernel:
 
         - 权限门控：不通过 → 返回拒绝结果（不执行）
         - 注册表有该工具 → 走 Skill
-        - Skill 返回 LEGACY_FALLBACK 哨兵 → 回退 legacy
-        - 注册表无该工具 → 直接回退 legacy
+        - Skill 返回 LEGACY_FALLBACK 哨兵 → 仅在显式配置时回退 legacy
+        - 注册表无该工具 → 返回未知工具；不再暗中穿透到旧执行器
         """
         from core.skills.registry import is_legacy_fallback
 
@@ -244,20 +267,25 @@ class HarnessKernel:
         if gate_error:
             return {"error": gate_error, "permission_denied": True}
 
-        if self._skill_registry is not None and self._skill_registry.has_tool(tool_name):
-            operator = active.operator if active else "ai_assistant"
-            factory_id = active.factory_id if active else None
-            result = await self._skill_registry.execute(
-                tool_name, arguments,
-                db=self.db, operator=operator,
-                factory_id=factory_id,
-                ctx=active,
-            )
-            if not is_legacy_fallback(result):
-                return result
+        if self._skill_registry is not None:
+            if self._skill_registry.has_tool(tool_name):
+                operator = active.operator if active else "ai_assistant"
+                factory_id = active.factory_id if active else None
+                result = await self._skill_registry.execute(
+                    tool_name, arguments,
+                    db=self.db, operator=operator,
+                    factory_id=factory_id,
+                    ctx=active,
+                )
+                if not is_legacy_fallback(result):
+                    return result
+            else:
+                return {"error": f"未知工具：{tool_name}"}
         if self._legacy_execute_tool is not None:
             return await self._legacy_execute_tool(tool_name, arguments)
-        return {"error": f"未知工具：{tool_name}"}
+        if self._skill_registry is None:
+            return await self._execute_tool_without_registry(tool_name, arguments)
+        return {"error": f"工具尚未迁移：{tool_name}"}
 
     def _check_permission(
         self, tool_name: str, arguments: Dict[str, Any], ctx: Optional[KernelContext],
@@ -297,6 +325,7 @@ class HarnessKernel:
         session_id: Optional[str] = None,
         permissions: Optional[set] = None,
         prompt_tokens: int = 1000,
+        resolve_route: bool = True,
     ) -> KernelContext:
         """路由层构建 KernelContext（含模型路由解析）。"""
         request_id = f"req-{uuid.uuid4().hex[:12]}"
@@ -305,7 +334,20 @@ class HarnessKernel:
             and any(getattr(a, "content_type", "").startswith("image/") for a in attachments)
         )
         task_id = self._vision_task_id if has_images else self._chat_task_id
-        route = await self._resolve_model_route(task_id, prompt_tokens=prompt_tokens)
+        if resolve_route:
+            route = await self._resolve_model_route(task_id, prompt_tokens=prompt_tokens)
+        else:
+            # Deterministic handlers (and parser-only attachment responses) do
+            # not need a model route.  Keeping a shape-compatible route lets
+            # them use the same KernelContext/telemetry/persistence contract
+            # while remaining available during a cold or unavailable gateway.
+            route = {
+                "task_id": task_id,
+                "provider": "deterministic",
+                "gateway_model": "",
+                "request_timeout": 0.0,
+                "max_completion_tokens": 1,
+            }
         # 若调用方未显式传入权限集，则由用户角色推导（Phase 4）
         if not permissions:
             try:

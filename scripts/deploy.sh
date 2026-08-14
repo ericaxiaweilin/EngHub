@@ -196,6 +196,16 @@ mkdir -p "$REMOTE_DIR/frontend_dist"
 cp -r "$RELEASE_DIR/frontend_dist/." "$REMOTE_DIR/frontend_dist/"
 chmod -R 755 "$REMOTE_DIR/frontend_dist"
 
+# The production container is normally hot-deployed from a volume.  Ensure
+# the full Excel-compatible recalculation engine exists even when the image
+# predates the Dockerfile change; this is idempotent and only runs once per
+# container image.
+if ! docker exec "$CONTAINER" sh -lc 'command -v soffice >/dev/null 2>&1 || command -v libreoffice >/dev/null 2>&1'; then
+  echo "安装 LibreOffice Calc 公式引擎"
+  docker exec -u root "$CONTAINER" sh -lc \
+    'apt-get update -qq && apt-get install -y --no-install-recommends libreoffice-calc >/dev/null && rm -rf /var/lib/apt/lists/*'
+fi
+
 docker restart "$CONTAINER" >/dev/null
 
 healthy=0

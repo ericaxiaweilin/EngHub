@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import (
-    ChatMessage, ChatSession, ChatTelemetry, generate_uuid,
+    ChatMessage, ChatMessageAttachment, ChatSession, ChatTelemetry, FileRecord, generate_uuid,
 )
 
 HISTORY_LIMIT = 50
@@ -134,6 +134,7 @@ async def append_message(
     tokens_used: int = 0,
     duration_ms: float = 0,
     request_id: Optional[str] = None,
+    attachment_ids: Optional[List[str]] = None,
 ) -> ChatMessage:
     """追加一条消息（user/assistant/tool/system）。"""
     msg = ChatMessage(
@@ -150,6 +151,21 @@ async def append_message(
     )
     db.add(msg)
     await db.flush()
+    for ordinal, file_id in enumerate(dict.fromkeys(str(v) for v in (attachment_ids or []) if v)):
+        file_record = (
+            await db.execute(select(FileRecord).where(FileRecord.id == file_id))
+        ).scalar_one_or_none()
+        if file_record is None:
+            continue
+        db.add(ChatMessageAttachment(
+            message_id=msg.id,
+            session_id=session_id,
+            file_id=file_id,
+            kind="image" if (file_record.content_type or "").startswith("image/") else "file",
+            ordinal=ordinal,
+        ))
+    if attachment_ids:
+        await db.flush()
     # 会话 touched → 前端会话栏排序
     session = await _get_session(db, session_id)
     if session is not None:
@@ -164,6 +180,7 @@ async def get_history(
     limit: int = HISTORY_LIMIT,
     include_tools: bool = True,
     include_tool_calls: bool = True,
+    include_attachments: bool = True,
 ) -> List[Dict[str, Any]]:
     """按时间序返回历史（OpenAI messages 风格）。
 
@@ -199,6 +216,32 @@ async def get_history(
             messages.append(entry)
             continue
         entry["content"] = m.content or ""
+        if include_attachments:
+            attachment_rows = (
+                await db.execute(
+                    select(ChatMessageAttachment, FileRecord)
+                    .join(FileRecord, FileRecord.id == ChatMessageAttachment.file_id)
+                    .where(ChatMessageAttachment.message_id == m.id)
+                    .order_by(ChatMessageAttachment.ordinal.asc())
+                )
+            ).all()
+            if attachment_rows:
+                entry["attachments"] = [
+                    {
+                        "file_id": link.file_id,
+                        "filename": file.filename,
+                        "content_type": file.content_type,
+                        "size": file.size,
+                        "kind": link.kind or (
+                            "image" if (file.content_type or "").startswith("image/") else "file"
+                        ),
+                        "is_image": (file.content_type or "").startswith("image/"),
+                        "download_url": f"/api/v1/files/{file.id}",
+                        "preview_url": f"/api/v1/files/{file.id}"
+                        if (file.content_type or "").startswith("image/") else None,
+                    }
+                    for link, file in attachment_rows
+                ]
         if include_tool_calls and m.tool_calls:
             entry["tool_calls"] = m.tool_calls
         messages.append(entry)
@@ -344,6 +387,7 @@ async def persist_round(
     actions: Optional[List[Any]] = None,
     request_id: Optional[str] = None,
     duration_ms: float = 0,
+    attachment_ids: Optional[List[str]] = None,
 ) -> None:
     """一次请求的完整落库：user 消息 + assistant 回复（含工具动作轨迹）。"""
     if request_id:
@@ -359,7 +403,7 @@ async def persist_round(
             return
     await append_message(
         db, session_id=session_id, role="user", content=user_content,
-        request_id=request_id,
+        request_id=request_id, attachment_ids=attachment_ids,
     )
     tool_trace = [_action_to_json(a) for a in (actions or [])] if actions else None
     await append_message(

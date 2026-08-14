@@ -12,11 +12,13 @@ Chatbot MES 工具服务（Tool Calling）
 from __future__ import annotations
 
 import csv
+import asyncio
 import io
 import json
 import re
 import uuid
 from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,7 +40,16 @@ from core.sim_erp.models import (
     ActionType, EnvironmentSnapshot, PhysicalInput, WorkContext,
 )
 from core.sim_erp.plugins.registry import build_default_registry
-from api.services.workbook_service import apply_workbook_operations, build_pivot_summary, snapshot_to_table, workbook_snapshot_to_xlsx
+from api.services.workbook_service import (
+    apply_workbook_operations,
+    build_pivot_summary,
+    recalculate_workbook_file,
+    scan_formula_dependencies,
+    snapshot_to_table,
+    workbook_export_basename,
+    xlsx_to_workbook_snapshot,
+    workbook_snapshot_to_xlsx,
+)
 
 
 # ==================== Sim-ERP 仿真引擎（模块级单例，直连引擎不走 HTTP） ====================
@@ -450,8 +461,23 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "scan_online_workbook",
+            "description": "扫描在线工作簿全部工作表、任意位置的公式，并返回跨工作表/跨区域引用、依赖关系、被依赖单元格、动态引用和计算引擎状态。公式函数即使暂不被服务器计算，也必须被扫描和关联；不要只扫描前100行或前50列。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workbook_id": {"type": "string", "description": "当前在线工作簿ID；系统会在当前会话上下文中提供"},
+                    "sheet_name": {"type": "string", "description": "限定某个工作表，可选；不传扫描全部工作表"},
+                },
+                "required": ["workbook_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_online_workbook",
-            "description": "读取当前绑定的在线工作簿内容，返回指定工作表的表头、行数据和公式单元格数量。用户询问当前在线表格内容、公式或数据时使用。只能读取当前用户工厂的工作簿。",
+            "description": "读取当前绑定的在线工作簿内容，返回指定工作表的表头、行数据、任意位置公式数量和最近计算状态。用户询问当前在线表格内容、公式或数据时使用。只能读取当前用户工厂的工作簿。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -465,8 +491,37 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "recalculate_online_workbook",
+            "description": "按当前在线工作簿中的全部数据和公式重新计算并把结果写回自己的工作簿快照；不回退、不覆盖用户数据。优先使用真实 Excel 兼容计算引擎，失败时保留公式和原缓存值并返回原因。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workbook_id": {"type": "string", "description": "当前在线工作簿ID；系统会在当前会话上下文中提供"},
+                    "sheet_name": {"type": "string", "description": "重算后返回的工作表名称，可选"},
+                },
+                "required": ["workbook_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reload_online_workbook",
+            "description": "从当前在线工作簿绑定的原始上传 XLSX 重新加载全部工作表、公式和数据，恢复为上传文件版本；这是明确的回滚/重载动作，只在用户明确要求重新加载原始文件时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workbook_id": {"type": "string", "description": "当前在线工作簿ID；系统会在当前会话上下文中提供"},
+                },
+                "required": ["workbook_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_online_workbook",
-            "description": "按用户明确要求修改当前在线工作簿。支持 set_cell/set_formula/clear_cell/append_rows/flash_fill；修改后立即保存。也可输入 VLOOKUP、XLOOKUP、SUMIFS 等公式。涉及批量改动、公式改写或删除数据时，只执行用户明确指定的操作。",
+            "description": "按用户明确要求修改当前在线工作簿任意工作表、任意单元格。支持 set_cell/set_formula/clear_cell/append_rows/flash_fill；修改后立即保存并重算全部公式，公式文本和跨表引用保留。公式函数不设白名单，用户给出的 Excel 公式原样写入；涉及批量改动、公式改写或删除数据时，只执行用户明确指定的操作。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -493,8 +548,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                             "required": ["type", "sheet"],
                         },
                     },
+                    "edits": {
+                        "type": "array",
+                        "description": "兼容旧版调用的单元格编辑列表；没有 type/sheet 时默认按 set_cell 和第一张工作表处理",
+                        "items": {"type": "object"},
+                    },
+                    "name": {"type": "string", "description": "可选：修改在线工作簿显示名称/导出文件名"},
                 },
-                "required": ["workbook_id", "operations"],
+                "required": ["workbook_id"],
             },
         },
     },
@@ -1824,10 +1885,123 @@ async def _tool_query_online_workbook(
         return {"error": f"工作簿不存在: {workbook_id}"}
     if factory_id and record.factory_id and record.factory_id != factory_id:
         return {"error": "无权访问其他工厂的工作簿"}
-    table = snapshot_to_table(record.snapshot or {}, args.get("sheet_name"))
+    requested_sheet = args.get("sheet_name")
+    try:
+        table = snapshot_to_table(record.snapshot or {}, requested_sheet)
+    except ValueError:
+        if not requested_sheet:
+            raise
+        table = snapshot_to_table(record.snapshot or {}, None)
+        table["sheet_fallback"] = {
+            "requested": requested_sheet,
+            "used": table.get("sheet_name"),
+        }
     table["workbook_id"] = record.id
     table["workbook_name"] = record.name
     return {"success": True, "workbook_id": record.id, "workbook_name": record.name, "table": table}
+
+
+async def _get_workbook_source_path(db: AsyncSession, record: WorkbookRecord) -> Optional[Path]:
+    if not record.source_file_id:
+        return None
+    source = (
+        await db.execute(select(FileRecord).where(FileRecord.id == record.source_file_id))
+    ).scalar_one_or_none()
+    if not source or not source.storage_path:
+        return None
+    path = Path(source.storage_path)
+    return path if path.is_file() else None
+
+
+async def _tool_scan_online_workbook(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    workbook_id = str(args.get("workbook_id") or "").strip()
+    if not workbook_id:
+        return {"error": "未提供 workbook_id；请先在在线表格中保存并绑定工作簿"}
+    record = (await db.execute(select(WorkbookRecord).where(WorkbookRecord.id == workbook_id))).scalar_one_or_none()
+    if not record:
+        return {"error": f"工作簿不存在: {workbook_id}"}
+    if factory_id and record.factory_id and record.factory_id != factory_id:
+        return {"error": "无权访问其他工厂的工作簿"}
+    graph = scan_formula_dependencies(record.snapshot or {}, args.get("sheet_name"))
+    return {
+        "success": True,
+        "workbook_id": record.id,
+        "workbook_name": record.name,
+        "formula_count": graph["formula_cells"],
+        "formula_graph": graph,
+    }
+
+
+async def _tool_recalculate_online_workbook(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    workbook_id = str(args.get("workbook_id") or "").strip()
+    if not workbook_id:
+        return {"error": "未提供 workbook_id；请先在在线表格中保存并绑定工作簿"}
+    record = (await db.execute(select(WorkbookRecord).where(WorkbookRecord.id == workbook_id))).scalar_one_or_none()
+    if not record:
+        return {"error": f"工作簿不存在: {workbook_id}"}
+    if factory_id and record.factory_id and record.factory_id != factory_id:
+        return {"error": "无权修改其他工厂的工作簿"}
+    source_path = await _get_workbook_source_path(db, record)
+    try:
+        snapshot, _ = await asyncio.to_thread(
+            apply_workbook_operations, record.snapshot or {}, [], source_path,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    record.snapshot = snapshot
+    record.updated_by = operator
+    await db.commit()
+    table = snapshot_to_table(snapshot, args.get("sheet_name"))
+    table["workbook_id"] = record.id
+    table["workbook_name"] = record.name
+    return {
+        "success": True,
+        "workbook_id": record.id,
+        "workbook_name": record.name,
+        "calculation": snapshot.get("calculation"),
+        "table": table,
+    }
+
+
+async def _tool_reload_online_workbook(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    workbook_id = str(args.get("workbook_id") or "").strip()
+    if not workbook_id:
+        return {"error": "未提供 workbook_id；请先在在线表格中保存并绑定工作簿"}
+    record = (await db.execute(select(WorkbookRecord).where(WorkbookRecord.id == workbook_id))).scalar_one_or_none()
+    if not record:
+        return {"error": f"工作簿不存在: {workbook_id}"}
+    if factory_id and record.factory_id and record.factory_id != factory_id:
+        return {"error": "无权修改其他工厂的工作簿"}
+    source_path = await _get_workbook_source_path(db, record)
+    if not source_path:
+        return {"error": "当前工作簿没有可重新加载的原始上传文件"}
+    try:
+        snapshot = await asyncio.to_thread(xlsx_to_workbook_snapshot, source_path)
+        snapshot, _ = await asyncio.to_thread(
+            apply_workbook_operations, snapshot, [], source_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"重新加载 XLSX 失败：{exc}"}
+    record.snapshot = snapshot
+    record.updated_by = operator
+    await db.commit()
+    table = snapshot_to_table(snapshot)
+    table["workbook_id"] = record.id
+    table["workbook_name"] = record.name
+    return {
+        "success": True,
+        "workbook_id": record.id,
+        "workbook_name": record.name,
+        "message": "已从原始上传 XLSX 重新加载，当前编辑内容已回退到原文件版本",
+        "calculation": snapshot.get("calculation"),
+        "table": table,
+    }
 
 
 async def _tool_edit_online_workbook(
@@ -1841,17 +2015,74 @@ async def _tool_edit_online_workbook(
         return {"error": f"工作簿不存在: {workbook_id}"}
     if factory_id and record.factory_id and record.factory_id != factory_id:
         return {"error": "无权修改其他工厂的工作簿"}
+    source_path = await _get_workbook_source_path(db, record)
+    raw_operations = args.get("operations")
+    if raw_operations is None:
+        raw_operations = args.get("edits")
+    if not isinstance(raw_operations, list) or not raw_operations:
+        return {"error": "未提供有效的 operations/edits；请至少指定一个单元格操作"}
+    sheets = record.snapshot.get("sheets") or {}
+    order = record.snapshot.get("sheetOrder") or list(sheets.keys())
+    first_sheet = next((sheets.get(sheet_id) for sheet_id in order if sheets.get(sheet_id)), None)
+    known_sheets = {
+        str(value)
+        for sheet in sheets.values()
+        for value in ((sheet or {}).get("id"), (sheet or {}).get("name"))
+        if value
+    }
+    operations: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    requested_default = args.get("sheet_name")
+    default_sheet = requested_default if str(requested_default or "") in known_sheets else (
+        (first_sheet or {}).get("name") or (first_sheet or {}).get("id")
+    )
+    if requested_default and str(requested_default) not in known_sheets and default_sheet:
+        warnings.append(f"工作表“{requested_default}”不存在，已使用第一张工作表“{default_sheet}”")
+    for raw in raw_operations[:500]:
+        if not isinstance(raw, dict):
+            continue
+        operation = dict(raw)
+        if not operation.get("type") and not operation.get("op"):
+            operation["type"] = "set_formula" if operation.get("formula") else "set_cell"
+        requested = operation.get("sheet") or operation.get("sheet_name")
+        if not requested:
+            operation["sheet"] = default_sheet
+        elif str(requested) not in known_sheets and default_sheet:
+            operation["sheet"] = default_sheet
+            if f"工作表“{requested}”不存在，已使用第一张工作表“{default_sheet}”" not in warnings:
+                warnings.append(f"工作表“{requested}”不存在，已使用第一张工作表“{default_sheet}”")
+        operations.append(operation)
+    if not operations:
+        return {"error": "未提供有效的 operations/edits；请至少指定一个单元格操作"}
     try:
-        snapshot, changed = apply_workbook_operations(record.snapshot or {}, args.get("operations") or [])
+        snapshot, changed = await asyncio.to_thread(
+            apply_workbook_operations, record.snapshot or {}, operations, source_path,
+        )
     except ValueError as exc:
         return {"error": str(exc)}
     record.snapshot = snapshot
+    if args.get("name"):
+        record.name = str(args["name"])[:255]
+    else:
+        derived_name = workbook_export_basename(record.name, snapshot)
+        if derived_name != Path(record.name or "").stem:
+            record.name = derived_name
     record.updated_by = operator
     await db.commit()
-    table = snapshot_to_table(snapshot, args.get("sheet_name"))
+    table = snapshot_to_table(snapshot, default_sheet)
     table["workbook_id"] = record.id
     table["workbook_name"] = record.name
-    return {"success": True, "workbook_id": record.id, "workbook_name": record.name, "changed": changed, "table": table}
+    response = {
+        "success": True,
+        "workbook_id": record.id,
+        "workbook_name": record.name,
+        "changed": changed,
+        "calculation": snapshot.get("calculation"),
+        "table": table,
+    }
+    if warnings:
+        response["warnings"] = warnings
+    return response
 
 
 async def _tool_export_online_workbook(
@@ -1866,11 +2097,16 @@ async def _tool_export_online_workbook(
     if factory_id and record.factory_id and record.factory_id != factory_id:
         return {"error": "无权导出其他工厂的工作簿"}
     file_id = str(uuid.uuid4())
-    safe_name = re.sub(r'[\\/:*?"<>|]+', "_", record.name or "workbook").strip() or "workbook"
+    export_basename = workbook_export_basename(record.name, record.snapshot or {})
+    safe_name = re.sub(r'[\\/:*?"<>|]+', "_", export_basename).strip() or "workbook"
     filename = f"{safe_name}.xlsx"
     storage_path = UPLOAD_DIR / f"{file_id}_{filename}"
+    source_path = await _get_workbook_source_path(db, record)
     try:
-        workbook_snapshot_to_xlsx(record.snapshot or {}, storage_path)
+        await asyncio.to_thread(
+            workbook_snapshot_to_xlsx, record.snapshot or {}, storage_path, source_path,
+        )
+        await asyncio.to_thread(recalculate_workbook_file, storage_path)
     except Exception as exc:  # noqa: BLE001
         storage_path.unlink(missing_ok=True)
         return {"error": f"XLSX 导出失败: {exc}"}
@@ -2512,7 +2748,10 @@ _TOOL_EXECUTORS = {
     "get_work_order_form": _tool_get_work_order_form,
     "get_inspection_form": _tool_get_inspection_form,
     "export_report_file": _tool_export_report_file,
+    "scan_online_workbook": _tool_scan_online_workbook,
     "query_online_workbook": _tool_query_online_workbook,
+    "recalculate_online_workbook": _tool_recalculate_online_workbook,
+    "reload_online_workbook": _tool_reload_online_workbook,
     "edit_online_workbook": _tool_edit_online_workbook,
     "export_online_workbook": _tool_export_online_workbook,
     "create_online_pivot": _tool_create_online_pivot,
@@ -2746,6 +2985,8 @@ WRITE_TOOLS = {
     "edit_online_workbook",
     "export_online_workbook",
     "create_online_pivot",
+    "recalculate_online_workbook",
+    "reload_online_workbook",
     "acknowledge_alert", "run_alert_patrol",
     "create_followup_task",
 }
@@ -2784,7 +3025,10 @@ TOOL_LABELS = {
     "get_work_order_form": "工单表单",
     "get_inspection_form": "检验单表单",
     "export_report_file": "导出报告",
+    "scan_online_workbook": "扫描全部公式依赖",
     "query_online_workbook": "读取在线工作簿",
+    "recalculate_online_workbook": "重算在线工作簿",
+    "reload_online_workbook": "重新加载原始工作簿",
     "edit_online_workbook": "修改在线工作簿",
     "export_online_workbook": "导出在线工作簿",
     "create_online_pivot": "生成在线透视汇总",
@@ -3314,6 +3558,8 @@ async def execute_tool(
             # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "edit_online_workbook":
+            return await executor(db, arguments, operator=operator, factory_id=factory_id)
+        if tool_name in {"recalculate_online_workbook", "reload_online_workbook"}:
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "export_online_workbook":
             return await executor(db, arguments, operator=operator, factory_id=factory_id)

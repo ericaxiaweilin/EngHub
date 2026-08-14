@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,11 +33,22 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(100 * 1024 * 1024)))
 
 
-def _ensure_same_factory(file: FileRecord, user: User) -> None:
+def _effective_factory_id(request: Optional[Request], user: User) -> Optional[str]:
+    """Use the same active-factory precedence as Chat and workbook APIs."""
+    return (
+        (request.headers.get("x-factory-id") if request else None)
+        or getattr(user, "active_factory_id", None)
+        or getattr(user, "factory_id", None)
+    )
+
+
+def _ensure_same_factory(
+    file: FileRecord, user: User, factory_id: Optional[str] = None,
+) -> None:
     """多工厂隔离：普通用户不可访问其他工厂的文件（超管例外）。"""
     if user.is_superuser:
         return
-    if file.factory_id and user.factory_id and file.factory_id != user.factory_id:
+    if file.factory_id and factory_id and file.factory_id != factory_id:
         raise HTTPException(status_code=403, detail="无权访问其他工厂的文件")
 
 
@@ -46,6 +57,7 @@ async def upload_file(
     file: UploadFile = File(...),
     related_type: Optional[str] = Form(None),
     related_id: Optional[str] = Form(None),
+    http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -60,6 +72,7 @@ async def upload_file(
     storage_path = UPLOAD_DIR / f"{file_id}_{safe_name}"
     storage_path.write_bytes(content)
 
+    factory_id = _effective_factory_id(http_request, current_user)
     record = FileRecord(
         id=file_id,
         filename=file.filename or "file",
@@ -67,7 +80,7 @@ async def upload_file(
         size=len(content),
         storage_path=str(storage_path),
         uploaded_by=current_user.username,
-        factory_id=current_user.factory_id,
+        factory_id=factory_id,
         related_type=related_type,
         related_id=related_id,
     )
@@ -84,6 +97,7 @@ async def upload_file(
 @router.get("/{file_id}")
 async def download_file(
     file_id: str,
+    http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -91,7 +105,7 @@ async def download_file(
     record = (await db.execute(select(FileRecord).where(FileRecord.id == file_id))).scalar_one_or_none()
     if not record:
         raise HTTPException(status_code=404, detail="文件不存在")
-    _ensure_same_factory(record, current_user)
+    _ensure_same_factory(record, current_user, _effective_factory_id(http_request, current_user))
     if not Path(record.storage_path).is_file():
         raise HTTPException(status_code=404, detail="文件实体缺失")
     return FileResponse(
@@ -106,13 +120,15 @@ async def list_files(
     related_type: Optional[str] = Query(None),
     related_id: Optional[str] = Query(None),
     limit: int = Query(50, le=200),
+    http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """按业务对象列附件（按当前工厂隔离）。"""
     stmt = select(FileRecord).order_by(FileRecord.created_at.desc()).limit(limit)
-    if not current_user.is_superuser and current_user.factory_id:
-        stmt = stmt.where(FileRecord.factory_id == current_user.factory_id)
+    factory_id = _effective_factory_id(http_request, current_user)
+    if not current_user.is_superuser and factory_id:
+        stmt = stmt.where(FileRecord.factory_id == factory_id)
     if related_type:
         stmt = stmt.where(FileRecord.related_type == related_type)
     if related_id:

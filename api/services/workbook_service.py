@@ -8,6 +8,11 @@ formulas into their calculated values.
 from __future__ import annotations
 
 import json
+import ast
+import os
+import shutil
+import subprocess
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -18,24 +23,35 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import coordinate_from_string
+from openpyxl.workbook.properties import CalcProperties
 import re
 
 
-MAX_SHEETS = 50
-MAX_ROWS = 5000
-MAX_COLS = 200
+# These are Excel's worksheet limits.  The old 5,000 x 200 bridge silently
+# dropped formulas/data outside that rectangle, which made an uploaded
+# workbook impossible to round-trip faithfully.
+MAX_SHEETS = 255
+MAX_ROWS = 1_048_576
+MAX_COLS = 16_384
 
 
 def _safe_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _cell_to_univer(cell) -> Dict[str, Any]:
+def _cell_to_univer(cell, cached_cell=None) -> Dict[str, Any]:
     item: Dict[str, Any] = {}
     if cell.value is not None:
         if isinstance(cell.value, str) and cell.value.startswith("="):
             item["f"] = cell.value
-            item["v"] = ""
+            # ``data_only=False`` is required to preserve the formula text,
+            # while Excel's cached result lives in a separate data-only view.
+            # Keep both so the chatbot can explain the formula and its last
+            # calculated value without flattening the workbook.
+            cached_value = cached_cell.value if cached_cell is not None else None
+            if cached_value is not None and hasattr(cached_value, "isoformat"):
+                cached_value = cached_value.isoformat()
+            item["v"] = cached_value if cached_value is not None else ""
         elif cell.data_type == TYPE_ERROR:
             item["v"] = str(cell.value)
         elif cell.is_date and hasattr(cell.value, "isoformat"):
@@ -62,18 +78,21 @@ def _cell_to_univer(cell) -> Dict[str, Any]:
     return item
 
 
-def _sheet_to_univer(ws) -> Dict[str, Any]:
+def _sheet_to_univer(ws, cached_ws=None) -> Dict[str, Any]:
     max_row = min(max(ws.max_row or 1, 1), MAX_ROWS)
     max_col = min(max(ws.max_column or 1, 1), MAX_COLS)
     cell_data: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        row_data: Dict[str, Dict[str, Any]] = {}
-        for cell in row:
-            item = _cell_to_univer(cell)
-            if item:
-                row_data[str(cell.column - 1)] = item
-        if row_data:
-            cell_data[str(row[0].row - 1)] = row_data
+    # Do not use iter_rows over max_row/max_column here.  A workbook can have
+    # one formula at XFD1048576; iterating the whole rectangle would allocate
+    # billions of empty cells.  openpyxl keeps populated/styled cells in the
+    # sparse _cells map, which is exactly what we need for a formula bridge.
+    for cell in (getattr(ws, "_cells", {}) or {}).values():
+        if cell.row > MAX_ROWS or cell.column > MAX_COLS:
+            continue
+        cached_cell = cached_ws.cell(row=cell.row, column=cell.column) if cached_ws is not None else None
+        item = _cell_to_univer(cell, cached_cell)
+        if item:
+            cell_data.setdefault(str(cell.row - 1), {})[str(cell.column - 1)] = item
     freeze = ws.freeze_panes
     if freeze:
         if isinstance(freeze, str):
@@ -89,17 +108,34 @@ def _sheet_to_univer(ws) -> Dict[str, Any]:
         "rowCount": max(max_row + 50, 100),
         "columnCount": max(max_col + 5, 20),
         "cellData": cell_data,
-        "rowData": {str(i): {"h": float(ws.row_dimensions[i + 1].height)} for i in range(max_row) if ws.row_dimensions[i + 1].height},
-        "columnData": {str(i): {"w": float(ws.column_dimensions[get_column_letter(i + 1)].width)} for i in range(max_col) if ws.column_dimensions[get_column_letter(i + 1)].width},
+        "rowData": {
+            str(int(key) - 1): {"h": float(dim.height)}
+            for key, dim in ws.row_dimensions.items()
+            if str(key).isdigit() and 1 <= int(key) <= MAX_ROWS and dim.height
+        },
+        "columnData": {
+            str(column_index_from_string(str(key).upper()) - 1): {"w": float(dim.width)}
+            for key, dim in ws.column_dimensions.items()
+            if re.fullmatch(r"[A-Za-z]{1,3}", str(key))
+            and column_index_from_string(str(key).upper()) <= MAX_COLS
+            and dim.width
+        },
         "freeze": {"xSplit": freeze_x, "ySplit": freeze_y} if freeze else None,
     }
 
 
 def xlsx_to_workbook_snapshot(path: Path) -> Dict[str, Any]:
     """Read all worksheets and preserve formulas, basic styles, dimensions and freezes."""
-    wb = load_workbook(path, read_only=False, data_only=False, keep_vba=path.suffix.lower() == ".xlsm")
+    keep_vba = path.suffix.lower() == ".xlsm"
+    wb = load_workbook(path, read_only=False, data_only=False, keep_vba=keep_vba)
+    # A formula workbook and a cached-value workbook are complementary views
+    # of the same XLSX.  Loading both is what lets us persist ``f`` and ``v``.
+    cached_wb = load_workbook(path, read_only=False, data_only=True, keep_vba=keep_vba)
     try:
-        sheets = [_sheet_to_univer(ws) for ws in wb.worksheets[:MAX_SHEETS]]
+        sheets = [
+            _sheet_to_univer(ws, cached_wb[ws.title] if ws.title in cached_wb.sheetnames else None)
+            for ws in wb.worksheets[:MAX_SHEETS]
+        ]
         return {
             "id": "workbook-import",
             "name": path.stem,
@@ -110,6 +146,33 @@ def xlsx_to_workbook_snapshot(path: Path) -> Dict[str, Any]:
         }
     finally:
         wb.close()
+        cached_wb.close()
+
+
+def workbook_export_basename(name: str, snapshot: Dict[str, Any]) -> str:
+    """Return a stable export name, following a month changed in sheet A1.
+
+    Imported KPI workbooks commonly keep the original month in their filename
+    while the report title in A1 is edited for a new reporting month.  Export
+    should reflect the edited workbook instead of silently returning the old
+    month in the download name.
+    """
+    base = Path(name or "workbook").stem
+    sheets = snapshot.get("sheets") or {}
+    order = snapshot.get("sheetOrder") or list(sheets.keys())
+    first_sheet = next((sheets.get(sheet_id) for sheet_id in order if sheets.get(sheet_id)), None)
+    a1 = (((first_sheet or {}).get("cellData") or {}).get("0") or {}).get("0") or {}
+    title = str(a1.get("v") or "")
+    month_match = re.search(r"(\d{1,2})\s*月份", title) or re.search(r"(\d{1,2})\s*月", title)
+    if month_match:
+        month = month_match.group(1)
+        base = re.sub(
+            r"(\d{4}年)\d{1,2}月",
+            lambda match: f"{match.group(1)}{month}月",
+            base,
+            count=1,
+        )
+    return base or "workbook"
 
 
 def _snapshot_sheets(snapshot: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
@@ -151,14 +214,14 @@ def _apply_style(cell, style: Any) -> None:
 
 def _write_snapshot_sheet(ws, sheet: Dict[str, Any]) -> None:
     cell_data = sheet.get("cellData") or {}
-    for row_key, row in list(cell_data.items())[:MAX_ROWS]:
+    for row_key, row in cell_data.items():
         try:
             row_idx = int(row_key) + 1
         except (TypeError, ValueError):
             continue
         if not isinstance(row, dict):
             continue
-        for col_key, item in list(row.items())[:MAX_COLS]:
+        for col_key, item in row.items():
             try:
                 col_idx = int(col_key) + 1
             except (TypeError, ValueError):
@@ -179,6 +242,18 @@ def _write_snapshot_sheet(ws, sheet: Dict[str, Any]) -> None:
                         pass
                 cell.value = value
             _apply_style(cell, item.get("s"))
+    # A source-backed workbook starts from the uploaded file.  Keep explicit
+    # tombstones so chatbot clear_cell operations do not reappear on export.
+    for row_key, cols in (sheet.get("deletedCells") or {}).items():
+        try:
+            row_idx = int(row_key) + 1
+        except (TypeError, ValueError):
+            continue
+        for col_key in (cols or {}):
+            try:
+                ws.cell(row=row_idx, column=int(col_key) + 1).value = None
+            except (TypeError, ValueError):
+                continue
     for key, meta in (sheet.get("rowData") or {}).items():
         if isinstance(meta, dict) and meta.get("h"):
             ws.row_dimensions[int(key) + 1].height = float(meta["h"])
@@ -190,25 +265,163 @@ def _write_snapshot_sheet(ws, sheet: Dict[str, Any]) -> None:
         ws.freeze_panes = ws.cell(row=int(freeze.get("ySplit", 0)) + 1, column=int(freeze.get("xSplit", 0)) + 1)
 
 
-def workbook_snapshot_to_xlsx(snapshot: Dict[str, Any], output: Path) -> None:
-    """Export a Univer snapshot to XLSX, preserving formulas as formulas."""
-    wb = Workbook()
+def workbook_snapshot_to_xlsx(
+    snapshot: Dict[str, Any], output: Path, source_path: Optional[Path] = None,
+) -> None:
+    """Export a snapshot, using the uploaded XLSX as a preservation base when available."""
+    output = Path(output)
+    source_path = Path(source_path) if source_path else None
+    keep_vba = bool(source_path and source_path.suffix.lower() == ".xlsm")
+    if source_path and source_path.is_file():
+        shutil.copy2(source_path, output)
+        wb = load_workbook(output, read_only=False, data_only=False, keep_vba=keep_vba)
+    else:
+        wb = Workbook()
     # Univer stores the formula text but does not provide Excel's cached
     # calculation result.  Tell Excel/LibreOffice to recalculate on open so
     # exported MRP/DOH/负荷 formulas do not appear stale.
-    wb.calculation.fullCalcOnLoad = True
-    wb.calculation.forceFullCalc = True
-    wb.calculation.calcMode = "auto"
+    calculation = wb.calculation
+    if calculation is None:
+        calculation = CalcProperties()
+        wb.calculation = calculation
+    calculation.fullCalcOnLoad = True
+    calculation.forceFullCalc = True
+    calculation.calcMode = "auto"
     first = True
     for sheet in _snapshot_sheets(snapshot):
         name = _safe_text(sheet.get("name") or "Sheet1")[:31] or "Sheet1"
-        ws = wb.active if first else wb.create_sheet()
+        existing_ws = wb[name] if name in wb.sheetnames else None
+        ws = existing_ws or (wb.active if first else wb.create_sheet())
         first = False
         ws.title = name
         _write_snapshot_sheet(ws, sheet)
     if first:
         wb.active.title = "Sheet1"
     wb.save(output)
+
+
+def _libreoffice_binary() -> Optional[str]:
+    configured = os.getenv("ENGHUB_LIBREOFFICE_BIN", "").strip()
+    candidates = [configured] if configured else []
+    candidates.extend(["soffice", "libreoffice"])
+    for candidate in candidates:
+        if candidate and shutil.which(candidate):
+            return candidate
+    return None
+
+
+def _recalculate_xlsx_file(path: Path, timeout: int = 90) -> bool:
+    """Recalculate a workbook with LibreOffice Calc when the engine is installed."""
+    binary = _libreoffice_binary()
+    if not binary or not path.is_file():
+        return False
+    with tempfile.TemporaryDirectory(prefix="enghub-lo-") as work_dir:
+        work = Path(work_dir)
+        out_dir = work / "out"
+        out_dir.mkdir()
+        profile = work / "profile"
+        profile.mkdir()
+        try:
+            completed = subprocess.run(
+                [
+                    binary, "--headless", "--nologo", "--nodefault", "--nofirststartwizard",
+                    f"-env:UserInstallation={profile.as_uri()}",
+                    "--convert-to", "xlsx", "--outdir", str(out_dir), str(path),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+                env={**os.environ, "HOME": str(work / "home")},
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        converted = out_dir / f"{path.stem}.xlsx"
+        if completed.returncode != 0 or not converted.is_file():
+            return False
+        shutil.copy2(converted, path)
+        return True
+
+
+def recalculate_workbook_file(path: Path, timeout: int = 90) -> bool:
+    """Public wrapper used by import/export routes and the chatbot."""
+    return _recalculate_xlsx_file(Path(path), timeout=timeout)
+
+
+def _snapshot_formula_cells(snapshot: Dict[str, Any]):
+    for sheet in _snapshot_sheets(snapshot):
+        for row_key, row in (sheet.get("cellData") or {}).items():
+            if not str(row_key).isdigit():
+                continue
+            for col_key, item in (row or {}).items():
+                if not str(col_key).isdigit() or not isinstance(item, dict) or not item.get("f"):
+                    continue
+                yield sheet, int(row_key), int(col_key), item
+
+
+def _update_snapshot_cached_values(snapshot: Dict[str, Any], path: Path) -> int:
+    """Copy Calc's cached results back without replacing formula text/styles."""
+    formula_wb = load_workbook(path, read_only=False, data_only=False, keep_vba=path.suffix.lower() == ".xlsm")
+    cached_wb = load_workbook(path, read_only=False, data_only=True, keep_vba=path.suffix.lower() == ".xlsm")
+    changed = 0
+    try:
+        for sheet, row, col, item in _snapshot_formula_cells(snapshot):
+            name = str(sheet.get("name") or "")
+            if name not in formula_wb.sheetnames or name not in cached_wb.sheetnames:
+                continue
+            formula_cell = formula_wb[name].cell(row=row + 1, column=col + 1)
+            cached_cell = cached_wb[name].cell(row=row + 1, column=col + 1)
+            if not formula_cell.value or not str(formula_cell.value).startswith("="):
+                continue
+            value = cached_cell.value
+            if hasattr(value, "isoformat"):
+                value = value.isoformat()
+            if value != item.get("v"):
+                item["v"] = "" if value is None else value
+                changed += 1
+    finally:
+        formula_wb.close()
+        cached_wb.close()
+    return changed
+
+
+def _is_formula_error(value: Any) -> bool:
+    """Return whether a spreadsheet engine returned an error token."""
+    return isinstance(value, str) and value.startswith("#")
+
+
+def _repair_formula_error_values(snapshot: Dict[str, Any]) -> int:
+    """Use the built-in evaluator for engine errors it explicitly supports.
+
+    LibreOffice versions available in deployment images do not all implement
+    newer Excel functions such as XLOOKUP.  Keep LibreOffice as the primary
+    calculator, but repair its error tokens when our safe evaluator can
+    calculate the formula.  Unknown functions remain visible as errors rather
+    than being silently replaced with a guessed value.
+    """
+    repaired = 0
+    for _ in range(5):
+        changed = False
+        for sheet in _snapshot_sheets(snapshot):
+            sheet_name = str(sheet.get("name") or sheet.get("id") or "")
+            for row in (sheet.get("cellData") or {}).values():
+                for item in (row or {}).values():
+                    formula = item.get("f") if isinstance(item, dict) else None
+                    if not formula or not _is_formula_error(item.get("v")):
+                        continue
+                    try:
+                        value = _evaluate_formula(snapshot, sheet_name, formula)
+                    except (ValueError, TypeError, ZeroDivisionError, SyntaxError, NameError):
+                        continue
+                    if _is_formula_error(value):
+                        continue
+                    item["v"] = value
+                    repaired += 1
+                    changed = True
+        if not changed:
+            break
+    return repaired
 
 
 def snapshot_json(snapshot: Dict[str, Any]) -> str:
@@ -223,6 +436,457 @@ def parse_snapshot(raw: str) -> Dict[str, Any]:
 
 
 _CELL_RE = re.compile(r"^([A-Za-z]{1,3})([1-9][0-9]*)$")
+_FORMULA_RANGE_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_. -]*))!)?"
+    r"(\$?[A-Z]{1,3}\$?[1-9][0-9]*):(\$?[A-Z]{1,3}\$?[1-9][0-9]*)",
+    re.IGNORECASE,
+)
+_FORMULA_CELL_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_. -]*))!)?"
+    r"(\$?[A-Z]{1,3}\$?[1-9][0-9]*)",
+    re.IGNORECASE,
+)
+
+
+def _sheet_by_ref(snapshot: Dict[str, Any], sheet_ref: Optional[str]) -> Optional[Dict[str, Any]]:
+    for sheet in _snapshot_sheets(snapshot):
+        if not sheet_ref or sheet.get("id") == sheet_ref or sheet.get("name") == sheet_ref:
+            return sheet
+    return None
+
+
+def _formula_cell_value(
+    snapshot: Dict[str, Any], sheet_ref: str, cell_ref: str,
+) -> Any:
+    sheet = _sheet_by_ref(snapshot, sheet_ref)
+    if not sheet:
+        return 0
+    row, col = _cell_coordinate(cell_ref)
+    item = ((sheet.get("cellData") or {}).get(str(row)) or {}).get(str(col)) or {}
+    value = item.get("v")
+    return 0 if value is None else value
+
+
+def _flatten_formula_values(value: Any) -> List[Any]:
+    if isinstance(value, (list, tuple)):
+        flattened: List[Any] = []
+        for item in value:
+            flattened.extend(_flatten_formula_values(item))
+        return flattened
+    return [value]
+
+
+def _formula_number(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    return float(value)
+
+
+def _formula_sum(*values: Any) -> float:
+    return sum(_formula_number(item) for value in values for item in _flatten_formula_values(value))
+
+
+def _formula_average(*values: Any) -> Any:
+    numbers = [
+        _formula_number(item)
+        for value in values
+        for item in _flatten_formula_values(value)
+        if item not in (None, "")
+    ]
+    return sum(numbers) / len(numbers) if numbers else 0
+
+
+def _formula_min(*values: Any) -> Any:
+    items = [item for value in values for item in _flatten_formula_values(value) if item not in (None, "")]
+    return min(items) if items else 0
+
+
+def _formula_max(*values: Any) -> Any:
+    items = [item for value in values for item in _flatten_formula_values(value) if item not in (None, "")]
+    return max(items) if items else 0
+
+
+def _formula_count(*values: Any) -> int:
+    return sum(
+        1
+        for value in values
+        for item in _flatten_formula_values(value)
+        if isinstance(item, (int, float)) and not isinstance(item, bool)
+    )
+
+
+def _formula_matrix(snapshot: Dict[str, Any], ref: tuple[str, str]) -> List[List[Any]]:
+    sheet_ref, range_ref = ref
+    start, end = range_ref.split(":", 1)
+    start_row, start_col = _cell_coordinate(start.replace("$", ""))
+    end_row, end_col = _cell_coordinate(end.replace("$", ""))
+    return [
+        [
+            _formula_cell_value(
+                snapshot,
+                sheet_ref,
+                f"{get_column_letter(col + 1)}{row + 1}",
+            )
+            for col in range(min(start_col, end_col), max(start_col, end_col) + 1)
+        ]
+        for row in range(min(start_row, end_row), max(start_row, end_row) + 1)
+    ]
+
+
+def _formula_vlookup(
+    snapshot: Dict[str, Any], lookup: Any, ref: tuple[str, str], index: Any, approximate: Any = False,
+) -> Any:
+    matrix = _formula_matrix(snapshot, ref)
+    column = max(int(index) - 1, 0)
+    matches = [row for row in matrix if row and row[0] == lookup]
+    if matches and column < len(matches[0]):
+        return matches[0][column]
+    if approximate:
+        candidates = [row for row in matrix if row and row[0] <= lookup]
+        if candidates and column < len(candidates[-1]):
+            return candidates[-1][column]
+    return "#N/A"
+
+
+def _formula_xlookup(
+    snapshot: Dict[str, Any], lookup: Any, lookup_ref: tuple[str, str],
+    return_ref: tuple[str, str], not_found: Any = "",
+) -> Any:
+    lookup_values = [item for row in _formula_matrix(snapshot, lookup_ref) for item in row]
+    return_values = [item for row in _formula_matrix(snapshot, return_ref) for item in row]
+    for index, value in enumerate(lookup_values):
+        if value == lookup and index < len(return_values):
+            return return_values[index]
+    return not_found
+
+
+def _formula_criteria_match(value: Any, criteria: Any) -> bool:
+    if not isinstance(criteria, str):
+        return value == criteria
+    for operator in (">=", "<=", "<>", ">", "<", "="):
+        if criteria.startswith(operator):
+            target = criteria[len(operator):]
+            try:
+                left, right = float(value), float(target)
+            except (TypeError, ValueError):
+                left, right = str(value), target
+            return {
+                ">=": left >= right, "<=": left <= right, "<>": left != right,
+                ">": left > right, "<": left < right, "=": left == right,
+            }[operator]
+    return str(value) == criteria
+
+
+def _formula_sumifs(snapshot: Dict[str, Any], sum_ref: tuple[str, str], *criteria_pairs: Any) -> float:
+    sums = [item for row in _formula_matrix(snapshot, sum_ref) for item in row]
+    criteria_data = []
+    for index in range(0, len(criteria_pairs) - 1, 2):
+        ref = criteria_pairs[index]
+        criteria = criteria_pairs[index + 1]
+        values = [item for row in _formula_matrix(snapshot, ref) for item in row]
+        criteria_data.append((values, criteria))
+    total = 0.0
+    for index, value in enumerate(sums):
+        if all(index < len(values) and _formula_criteria_match(values[index], criteria) for values, criteria in criteria_data):
+            total += _formula_number(value)
+    return total
+
+
+def _formula_if(condition: Any, when_true: Any, when_false: Any = False) -> Any:
+    return when_true if condition else when_false
+
+
+def _formula_iferror(value: Any, fallback: Any = "") -> Any:
+    return value
+
+
+_FORMULA_ALLOWED_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
+    ast.Call, ast.Name, ast.Load, ast.Constant, ast.List, ast.Tuple,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.USub,
+    ast.UAdd, ast.And, ast.Or, ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
+    ast.Gt, ast.GtE,
+)
+
+
+def _formula_expression(
+    snapshot: Dict[str, Any], sheet_name: str, formula: str,
+) -> str:
+    expression = str(formula or "").strip()
+    if expression.startswith("="):
+        expression = expression[1:]
+    expression = expression.replace("^", "**").replace("<>", "!=")
+    expression = re.sub(r"(?<![<>=])=(?!=)", "==", expression)
+    expression = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"(\1/100)", expression)
+    expression = re.sub(r"\bTRUE\b", "True", expression, flags=re.IGNORECASE)
+    expression = re.sub(r"\bFALSE\b", "False", expression, flags=re.IGNORECASE)
+
+    placeholders: Dict[str, str] = {}
+
+    def replace_range(match: re.Match[str]) -> str:
+        sheet_ref = match.group(1) or match.group(2) or sheet_name
+        token = f"__FORMULA_RANGE_{len(placeholders)}__"
+        placeholders[token] = repr(
+            (
+                sheet_ref,
+                f"{match.group(3).replace('$', '').upper()}:{match.group(4).replace('$', '').upper()}",
+            ),
+        )
+        return token
+
+    expression = _FORMULA_RANGE_RE.sub(replace_range, expression)
+
+    def replace_cell(match: re.Match[str]) -> str:
+        sheet_ref = match.group(1) or match.group(2) or sheet_name
+        token = f"__FORMULA_CELL_{len(placeholders)}__"
+        placeholders[token] = repr((sheet_ref, match.group(3).replace("$", "").upper()))
+        return token
+
+    expression = _FORMULA_CELL_RE.sub(replace_cell, expression)
+    for token, value in placeholders.items():
+        expression = expression.replace(token, value)
+
+    for name in (
+        "SUM", "AVERAGE", "MIN", "MAX", "COUNT", "IF", "IFERROR",
+        "VLOOKUP", "XLOOKUP", "SUMIFS",
+    ):
+        expression = re.sub(rf"\b{name}\s*\(", f"_{name.lower()}(", expression, flags=re.IGNORECASE)
+    return expression
+
+
+def _evaluate_formula(snapshot: Dict[str, Any], sheet_name: str, formula: str) -> Any:
+    expression = _formula_expression(snapshot, sheet_name, formula)
+
+    def cell(ref: tuple[str, str]) -> Any:
+        return _formula_cell_value(snapshot, ref[0], ref[1])
+
+    def range_values(ref: tuple[str, str]) -> List[Any]:
+        return [item for row in _formula_matrix(snapshot, ref) for item in row]
+
+    def coerce_formula_arg(value: Any) -> Any:
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], str):
+            if ":" in value[1]:
+                return range_values(value)
+            return cell(value)
+        return value
+
+    environment = {
+        "__builtins__": {},
+        "_formula_cell": cell,
+        "_formula_range": range_values,
+        "_sum": lambda *values: _formula_sum(*(coerce_formula_arg(value) for value in values)),
+        "_average": lambda *values: _formula_average(*(coerce_formula_arg(value) for value in values)),
+        "_min": lambda *values: _formula_min(*(coerce_formula_arg(value) for value in values)),
+        "_max": lambda *values: _formula_max(*(coerce_formula_arg(value) for value in values)),
+        "_count": lambda *values: _formula_count(*(coerce_formula_arg(value) for value in values)),
+        "_if": lambda condition, when_true, when_false=False: _formula_if(
+            coerce_formula_arg(condition), coerce_formula_arg(when_true), coerce_formula_arg(when_false),
+        ),
+        "_vlookup": lambda lookup, ref, index, approximate=False: _formula_vlookup(snapshot, lookup, ref, index, approximate),
+        "_xlookup": lambda lookup, lookup_ref, return_ref, not_found="": _formula_xlookup(snapshot, lookup, lookup_ref, return_ref, not_found),
+        "_sumifs": lambda sum_ref, *pairs: _formula_sumifs(snapshot, sum_ref, *pairs),
+        "_iferror": _formula_iferror,
+    }
+    expression = re.sub(r"\('([^']+)', '([A-Z]{1,3}[1-9][0-9]*)'\)", r"_formula_cell(('\1', '\2'))", expression)
+    tree = ast.parse(expression, mode="eval")
+    if any(type(node) not in _FORMULA_ALLOWED_NODES for node in ast.walk(tree)):
+        raise ValueError("公式包含暂不支持的表达式")
+    return eval(compile(tree, "<workbook-formula>", "eval"), environment, {})
+
+
+_FORMULA_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:(?P<sheet>'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_. -]*)!)?"
+    r"(?P<start>\$?[A-Z]{1,3}\$?[1-9][0-9]*)"
+    r"(?:\s*:\s*(?P<end>\$?[A-Z]{1,3}\$?[1-9][0-9]*))?",
+    re.IGNORECASE,
+)
+_FORMULA_FUNCTION_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
+
+
+def _normalise_formula_sheet_ref(value: Optional[str], default: str) -> str:
+    if not value:
+        return default
+    value = str(value)
+    if value.startswith("'") and value.endswith("'"):
+        value = value[1:-1].replace("''", "'")
+    # External-book references are reported as unresolved rather than being
+    # mistaken for a local sheet.
+    if "]" in value:
+        value = value.split("]", 1)[-1]
+    return value
+
+
+def _formula_address(row: int, col: int) -> str:
+    return f"{get_column_letter(col + 1)}{row + 1}"
+
+
+def _formula_reference_record(
+    snapshot: Dict[str, Any], default_sheet: str, match: re.Match[str],
+) -> Dict[str, Any]:
+    sheet_name = _normalise_formula_sheet_ref(match.group("sheet"), default_sheet)
+    start = match.group("start").replace("$", "").upper()
+    end = match.group("end")
+    if end:
+        end = end.replace("$", "").upper()
+    target = _sheet_by_ref(snapshot, sheet_name)
+    record: Dict[str, Any] = {
+        "sheet": sheet_name,
+        "cell": start,
+        "resolved": target is not None,
+    }
+    if end:
+        record.update({"type": "range", "range": f"{start}:{end}", "end_cell": end})
+    else:
+        record["type"] = "cell"
+    return record
+
+
+def scan_formula_dependencies(
+    snapshot: Dict[str, Any], sheet_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Scan every formula cell and build a cross-sheet dependency index.
+
+    This is intentionally independent of the calculation engine.  Unknown or
+    newer Excel functions still have their A1 references and dependents
+    indexed, while volatile/dynamic references are called out explicitly.
+    """
+    formula_cells: List[Dict[str, Any]] = []
+    dependencies: List[Dict[str, Any]] = []
+    dependents: Dict[str, List[str]] = {}
+    range_dependents: List[Dict[str, Any]] = []
+    selected = _sheet_by_ref(snapshot, sheet_ref) if sheet_ref else None
+    for sheet in _snapshot_sheets(snapshot):
+        if selected is not None and sheet is not selected:
+            continue
+        sheet_name = str(sheet.get("name") or sheet.get("id") or "")
+        for row_key, row in (sheet.get("cellData") or {}).items():
+            if not str(row_key).isdigit():
+                continue
+            for col_key, item in (row or {}).items():
+                if not str(col_key).isdigit() or not isinstance(item, dict) or not item.get("f"):
+                    continue
+                cell = _formula_address(int(row_key), int(col_key))
+                formula = str(item.get("f") or "")
+                refs = [
+                    _formula_reference_record(snapshot, sheet_name, match)
+                    for match in _FORMULA_REFERENCE_RE.finditer(formula)
+                ]
+                # Preserve order but remove duplicate references created by
+                # expressions such as SUM(A1:A3,A1:A3).
+                unique_refs = []
+                seen_refs = set()
+                for ref in refs:
+                    key = (ref.get("sheet"), ref.get("type"), ref.get("cell"), ref.get("range"))
+                    if key not in seen_refs:
+                        seen_refs.add(key)
+                        unique_refs.append(ref)
+                functions = sorted({m.group(1).upper() for m in _FORMULA_FUNCTION_RE.finditer(formula)})
+                dynamic = bool(re.search(r"\b(?:INDIRECT|OFFSET)\s*\(|\[[^]]+\]|#(?:REF|SPILL|N/A)!?", formula, re.I))
+                source_key = f"{sheet_name}!{cell}"
+                detail = {
+                    "sheet": sheet_name,
+                    "cell": cell,
+                    "formula": formula,
+                    "value": item.get("v"),
+                    "functions": functions,
+                    "references": unique_refs,
+                    "dynamic_reference": dynamic,
+                }
+                formula_cells.append(detail)
+                for ref in unique_refs:
+                    target_key = f"{ref['sheet']}!{ref['cell']}"
+                    dependencies.append({"from": source_key, "to": target_key, "type": ref["type"], "range": ref.get("range")})
+                    if ref["type"] == "cell":
+                        dependents.setdefault(target_key, []).append(source_key)
+                    else:
+                        try:
+                            start_row, start_col = _cell_coordinate(ref["cell"])
+                            end_row, end_col = _cell_coordinate(ref["end_cell"])
+                            area = (abs(end_row - start_row) + 1) * (abs(end_col - start_col) + 1)
+                        except ValueError:
+                            area = 0
+                        if 0 < area <= 10_000:
+                            for target_row in range(min(start_row, end_row), max(start_row, end_row) + 1):
+                                for target_col in range(min(start_col, end_col), max(start_col, end_col) + 1):
+                                    target_key = f"{ref['sheet']}!{_formula_address(target_row, target_col)}"
+                                    dependents.setdefault(target_key, []).append(source_key)
+                        else:
+                            range_dependents.append({"range": f"{ref['sheet']}!{ref['range']}", "dependent": source_key})
+    for values in dependents.values():
+        values[:] = sorted(set(values))
+    return {
+        "formula_cells": len(formula_cells),
+        "formulas": formula_cells,
+        "dependencies": dependencies,
+        "dependents": dependents,
+        "range_dependents": range_dependents,
+        "calculation": snapshot.get("calculation") or {"engine": "cached", "full_recalculation": False},
+    }
+
+
+def _recalculate_snapshot_formulas(
+    snapshot: Dict[str, Any], source_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Recalculate all formula cells with LibreOffice, then use the safe
+    built-in evaluator only when a real spreadsheet engine is unavailable."""
+    formula_count = sum(1 for _ in _snapshot_formula_cells(snapshot))
+    if formula_count:
+        with tempfile.TemporaryDirectory(prefix="enghub-formula-") as work_dir:
+            source = Path(source_path) if source_path else None
+            # LibreOffice writes xlsx output and openpyxl can read it back.  A
+            # source-backed xlsx is copied first so charts/names/etc. survive
+            # the cell edit/recalc round trip as far as the installed engine
+            # permits.
+            input_path = Path(work_dir) / "workbook.xlsx"
+            workbook_snapshot_to_xlsx(
+                snapshot,
+                input_path,
+                source_path=source if source and source.suffix.lower() == ".xlsx" else None,
+            )
+            if _recalculate_xlsx_file(input_path):
+                updated = _update_snapshot_cached_values(snapshot, input_path)
+                repaired = _repair_formula_error_values(snapshot)
+                result = {
+                    "engine": "libreoffice",
+                    "full_recalculation": True,
+                    "formula_cells": formula_count,
+                    "cached_updates": updated + repaired,
+                }
+                snapshot["calculation"] = result
+                return result
+
+    # Fallback used by local unit tests and minimal installations.  It never
+    # overwrites a cached value for a formula it cannot understand.
+    for _ in range(5):
+        changed = False
+        for sheet in _snapshot_sheets(snapshot):
+            sheet_name = str(sheet.get("name") or sheet.get("id") or "")
+            for row in (sheet.get("cellData") or {}).values():
+                for item in (row or {}).values():
+                    formula = item.get("f") if isinstance(item, dict) else None
+                    if not formula:
+                        continue
+                    try:
+                        value = _evaluate_formula(snapshot, sheet_name, formula)
+                    except (ValueError, TypeError, ZeroDivisionError, SyntaxError, NameError):
+                        continue
+                    if value != item.get("v"):
+                        item["v"] = value
+                        changed = True
+        if not changed:
+            break
+    result = {
+        "engine": "builtin_fallback",
+        "full_recalculation": False,
+        "formula_cells": formula_count,
+        "cached_updates": 0,
+        "message": "未检测到 LibreOffice；已保留原公式和缓存值，打开/导出时由 Excel 重新计算",
+    }
+    snapshot["calculation"] = result
+    return result
 
 
 def _cell_coordinate(value: str) -> tuple[int, int]:
@@ -248,19 +912,36 @@ def _set_snapshot_cell(sheet: Dict[str, Any], cell_ref: str, value: Any = None, 
     row_data = cell_data.setdefault(str(row), {})
     if value in (None, "") and not formula:
         row_data.pop(str(col), None)
+        sheet.setdefault("deletedCells", {}).setdefault(str(row), {})[str(col)] = True
         return
     inferred_formula = formula
     if not inferred_formula and isinstance(value, str) and value.startswith("="):
         inferred_formula = value
         value = ""
-    item: Dict[str, Any] = {"v": "" if inferred_formula else value}
+    existing = row_data.get(str(col)) or {}
+    normalized_formula = (
+        str(inferred_formula)
+        if inferred_formula and str(inferred_formula).startswith("=")
+        else (f"={inferred_formula}" if inferred_formula else None)
+    )
+    cached_value = (
+        existing.get("v", "")
+        if normalized_formula and existing.get("f") == normalized_formula
+        else ""
+    )
+    item: Dict[str, Any] = {"v": cached_value if inferred_formula else value}
     if inferred_formula:
-        item["f"] = inferred_formula if str(inferred_formula).startswith("=") else f"={inferred_formula}"
+        item["f"] = normalized_formula
     row_data[str(col)] = item
+    deleted_row = (sheet.get("deletedCells") or {}).get(str(row))
+    if deleted_row:
+        deleted_row.pop(str(col), None)
+        if not deleted_row:
+            (sheet.get("deletedCells") or {}).pop(str(row), None)
 
 
 def apply_workbook_operations(
-    snapshot: Dict[str, Any], operations: List[Dict[str, Any]],
+    snapshot: Dict[str, Any], operations: List[Dict[str, Any]], source_path: Optional[Path] = None,
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Apply explicit cell edits used by the chatbot and return an audit list."""
     changed: List[Dict[str, Any]] = []
@@ -292,6 +973,17 @@ def apply_workbook_operations(
             changed.append(_apply_flash_fill(sheet, operation))
         else:
             raise ValueError(f"不支持的表格操作: {kind}")
+    _recalculate_snapshot_formulas(snapshot, source_path=source_path)
+    for item in changed:
+        cell = item.get("cell")
+        sheet_name = item.get("sheet")
+        if not cell or not sheet_name:
+            continue
+        sheet = _find_sheet(snapshot, sheet_name)
+        row, col = _cell_coordinate(cell)
+        current = ((sheet.get("cellData") or {}).get(str(row)) or {}).get(str(col)) or {}
+        if current.get("f"):
+            item["computed_value"] = current.get("v")
     return snapshot, changed
 
 
@@ -300,6 +992,7 @@ def snapshot_to_table(snapshot: Dict[str, Any], sheet_ref: Optional[str] = None,
     sheet = _find_sheet(snapshot, sheet_ref)
     cell_data = sheet.get("cellData") or {}
     rows: List[List[Any]] = []
+    formula_details: List[Dict[str, Any]] = []
     row_keys = sorted((key for key in cell_data if str(key).isdigit()), key=lambda key: int(key))[:max_rows]
     max_seen_col = max(
         (int(col_key) for row_key in row_keys for col_key in (cell_data.get(row_key) or {}) if str(col_key).isdigit()),
@@ -310,7 +1003,19 @@ def snapshot_to_table(snapshot: Dict[str, Any], sheet_ref: Optional[str] = None,
         values: List[Any] = []
         for col in range(min(max_seen_col + 1, max_cols)):
             item = row.get(str(col)) or {}
-            values.append(item.get("v", "") if not item.get("f") else item.get("f"))
+            formula = item.get("f")
+            if formula:
+                formula_details.append({
+                    "cell": f"{get_column_letter(col + 1)}{int(row_key) + 1}",
+                    "formula": formula,
+                    "value": item.get("v"),
+                })
+            formula_value = item.get("v")
+            values.append(
+                item.get("v", "")
+                if not formula
+                else (formula_value if formula_value not in (None, "") else formula)
+            )
         rows.append(values)
     headers = rows[0] if rows else []
     table_rows = [
@@ -325,6 +1030,8 @@ def snapshot_to_table(snapshot: Dict[str, Any], sheet_ref: Optional[str] = None,
         "rows": table_rows,
         "row_count": max(0, len(rows) - 1),
         "formula_cells": sum(1 for row in cell_data.values() for item in (row or {}).values() if isinstance(item, dict) and item.get("f")),
+        "formula_details": formula_details,
+        "calculation": snapshot.get("calculation") or {"engine": "cached", "full_recalculation": False},
     }
 
 

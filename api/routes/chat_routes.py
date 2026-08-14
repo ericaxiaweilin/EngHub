@@ -27,11 +27,20 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from database.models import FileRecord, User, ChatTelemetry, ChatEvalCase
+from database.models import (
+    ChatEvalCase,
+    ChatMessage as ChatMessageRecord,
+    ChatMessageAttachment,
+    ChatSession,
+    ChatTelemetry,
+    FileRecord,
+    User,
+    WorkbookRecord,
+)
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
     TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
@@ -39,6 +48,7 @@ from api.services.chat_tools_service import (
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
 )
+from api.services.workbook_service import apply_workbook_operations, xlsx_to_workbook_snapshot
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 _logger = logging.getLogger("enghub.chat")
@@ -135,36 +145,62 @@ def _workbook_context_prompt(workbook_id: Optional[str]) -> str:
     return (
         "\n【当前在线工作簿】用户当前绑定的 Univer 在线工作簿 ID 是 "
         f"{workbook_id}。用户询问或要求修改当前在线表格时，必须优先调用 "
-        "query_online_workbook 或 edit_online_workbook，并把该 workbook_id 传入；"
+        "scan_online_workbook/query_online_workbook/edit_online_workbook，并把该 workbook_id 传入；"
         "不得只在文字中假装已经修改。修改类操作必须只执行用户明确指定的单元格、公式或行。\n"
     )
 
 
 _ONLINE_WORKBOOK_TOOL_NAMES = frozenset({
+    "scan_online_workbook",
     "query_online_workbook",
+    "recalculate_online_workbook",
+    "reload_online_workbook",
     "edit_online_workbook",
     "export_online_workbook",
     "create_online_pivot",
 })
 
 
-def _chat_tool_definitions(*, has_spreadsheet_attachment: bool) -> List[Dict[str, Any]]:
-    """选择本轮模型工具；上传表格时隔离旧的在线工作簿上下文。"""
+def _chat_tool_definitions(
+    *, has_spreadsheet_attachment: bool, workbook_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """选择本轮模型工具，并把表格附件绑定到唯一工作簿。
+
+    有 XLSX 附件时只开放在线工作簿工具，避免模型把附件文件名误当成
+    MES 业务实体调用 search_entity；但不再关闭表格工具，这样同一轮可以
+    读取公式、修改单元格并导出原工作簿。
+    """
+    try:
+        tool_catalog = _get_skill_registry().all_tool_definitions()
+    except Exception:  # noqa: BLE001
+        # Import/startup fallback only; normal requests always use the registry.
+        tool_catalog = TOOL_DEFINITIONS
     if not has_spreadsheet_attachment:
-        return TOOL_DEFINITIONS
+        return tool_catalog
+    if not workbook_id:
+        return []
     return [
-        definition for definition in TOOL_DEFINITIONS
-        if definition.get("function", {}).get("name") not in _ONLINE_WORKBOOK_TOOL_NAMES
+        definition for definition in tool_catalog
+        if definition.get("function", {}).get("name") in _ONLINE_WORKBOOK_TOOL_NAMES
     ]
 
 
-def _attachment_analysis_context(has_spreadsheet_attachment: bool) -> str:
+def _attachment_analysis_context(
+    has_spreadsheet_attachment: bool, workbook_id: Optional[str] = None,
+) -> str:
     if not has_spreadsheet_attachment:
         return ""
+    bound = (
+        f"已绑定在线工作簿 ID 为 {workbook_id}。"
+        if workbook_id else
+        "当前附件尚未生成可编辑工作簿，不能执行写操作。"
+    )
     return (
-        "\n【本轮附件分析模式】系统已经成功读取用户上传的表格，并把真实摘要追加在最后一条用户消息中。"
-        "本轮必须只根据这份附件的真实内容回答；不要调用业务检索工具、在线工作簿工具或 search_entity，"
+        "\n【本轮 XLSX 附件工作簿模式】系统已经成功读取用户上传的表格，并把真实摘要追加在最后一条用户消息中。"
+        f"{bound} 本轮必须只根据这份附件/绑定工作簿回答；不要调用 MES 业务检索工具或 search_entity，"
         "不要把文件名当成业务实体，也不要说无法访问用户电脑上的文件。"
+        "用户明确要求扫描公式、查看依赖、修改、写公式、重算、重新加载、追加行、透视或导出时，必须调用对应的在线工作簿工具，"
+        "并使用绑定的 workbook_id；没有明确修改要求时只读取和分析。"
     )
 
 
@@ -206,6 +242,7 @@ class ChatResponse(BaseModel):
     degraded: bool = False
     actions: List[ToolAction] = Field(default_factory=list)
     diagrams: List[Dict[str, Any]] = Field(default_factory=list)
+    tables: List[Dict[str, Any]] = Field(default_factory=list)
     session_id: Optional[str] = None  # Chat V2：供前端带入下一轮
     request_id: Optional[str] = None  # Chat V2：Trace 锚点
 
@@ -250,6 +287,10 @@ async def chat_health():
 async def chat_tools():
     """返回当前可用的 MES 工具清单与工作流清单（供前端展示能力/快捷指令）。"""
     from api.services.workflow_service import list_workflows  # 懒加载，避免循环导入
+    try:
+        tool_catalog = _get_skill_registry().all_tool_definitions()
+    except Exception:  # noqa: BLE001
+        tool_catalog = TOOL_DEFINITIONS
     return {
         "tools": [
             {
@@ -259,7 +300,7 @@ async def chat_tools():
                 "is_write": t["function"]["name"] in WRITE_TOOLS,
                 "is_sim": t["function"]["name"] in SIM_TOOLS,
             }
-            for t in TOOL_DEFINITIONS
+            for t in tool_catalog
         ],
         "workflows": list_workflows(),
     }
@@ -829,6 +870,102 @@ def _is_spreadsheet_record(rec: FileRecord) -> bool:
     return fn.endswith((".xlsx", ".xlsm", ".xls", ".csv")) or ct in _SPREADSHEET_CONTENT_TYPES
 
 
+async def _ensure_attachment_workbooks(
+    db: AsyncSession,
+    records: List[FileRecord],
+    *,
+    operator: str,
+    factory_id: Optional[str],
+) -> Dict[str, WorkbookRecord]:
+    """把本轮 XLSX 附件绑定为唯一在线工作簿。
+
+    /files/upload 先保存原文件；这里复用同一个文件路径创建 Univer 快照，
+    因而不会生成只含计算结果的副本。重复发送同一个附件时复用原工作簿，
+    也把 workbook_id 写回 files.related_id 作为稳定绑定。
+    """
+    bound: Dict[str, WorkbookRecord] = {}
+    dirty = False
+    for rec in records:
+        if not _is_spreadsheet_record(rec):
+            continue
+        suffix = Path(rec.filename or "").suffix.lower()
+        if suffix not in {".xlsx", ".xlsm"}:
+            continue
+
+        workbook: Optional[WorkbookRecord] = None
+        if rec.related_id:
+            workbook = (
+                await db.execute(
+                    select(WorkbookRecord).where(WorkbookRecord.id == rec.related_id)
+                )
+            ).scalar_one_or_none()
+        if workbook is None:
+            workbook = (
+                await db.execute(
+                    select(WorkbookRecord)
+                    .where(WorkbookRecord.source_file_id == rec.id)
+                    .order_by(WorkbookRecord.updated_at.desc())
+                )
+            ).scalars().first()
+
+        if workbook is not None:
+            if factory_id and workbook.factory_id and workbook.factory_id != factory_id:
+                _logger.warning(
+                    "[xlsx] skip cross-factory workbook binding file=%s workbook=%s",
+                    rec.id, workbook.id,
+                )
+                continue
+            if rec.related_type != "workbook" or rec.related_id != workbook.id:
+                rec.related_type = "workbook"
+                rec.related_id = workbook.id
+                dirty = True
+            bound[str(rec.id)] = workbook
+            continue
+
+        source_path = Path(rec.storage_path)
+        if not source_path.is_file():
+            _logger.warning("[xlsx] attachment source missing file=%s path=%s", rec.id, source_path)
+            continue
+        try:
+            snapshot = await asyncio.to_thread(xlsx_to_workbook_snapshot, source_path)
+            snapshot, _ = await asyncio.to_thread(
+                apply_workbook_operations, snapshot, [], source_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("[xlsx] workbook binding failed file=%s error=%s", rec.id, type(exc).__name__)
+            continue
+
+        workbook = WorkbookRecord(
+            id=str(uuid.uuid4()),
+            name=(Path(rec.filename or "workbook.xlsx").stem or "上传工作簿")[:255],
+            factory_id=factory_id or rec.factory_id,
+            snapshot=snapshot,
+            source_file_id=rec.id,
+            created_by=operator,
+            updated_by=operator,
+        )
+        rec.related_type = "workbook"
+        rec.related_id = workbook.id
+        db.add(workbook)
+        dirty = True
+        bound[str(rec.id)] = workbook
+        formula_count = sum(
+            1
+            for sheet in (snapshot.get("sheets") or {}).values()
+            for row in (sheet.get("cellData") or {}).values()
+            for item in (row or {}).values()
+            if isinstance(item, dict) and item.get("f")
+        )
+        _logger.info(
+            "[xlsx] attachment bound file=%s workbook=%s formula_cells=%s",
+            rec.id, workbook.id, formula_count,
+        )
+
+    if dirty:
+        await db.commit()
+    return bound
+
+
 def _parse_spreadsheet_record(
     rec: FileRecord, max_rows: int = 100, max_cols: int = 20,
 ) -> Optional[Dict[str, Any]]:
@@ -852,13 +989,43 @@ def _parse_spreadsheet_record(
                         break
         elif fn.endswith((".xlsx", ".xlsm")) or "spreadsheetml" in ct:
             from openpyxl import load_workbook
-            wb = load_workbook(path, read_only=True, data_only=True)
+            wb = load_workbook(path, read_only=True, data_only=False)
+            cached_wb = load_workbook(path, read_only=True, data_only=True)
+            formula_details: List[Dict[str, Any]] = []
             try:
                 ws = wb.active
-                for row in ws.iter_rows(values_only=True, max_row=max_rows + 1):
-                    grid.append(list(row))
+                cached_ws = cached_wb[ws.title] if ws.title in cached_wb.sheetnames else None
+                formula_rows = ws.iter_rows(max_row=max_rows + 1, max_col=max_cols)
+                cached_rows = (
+                    cached_ws.iter_rows(max_row=max_rows + 1, max_col=max_cols)
+                    if cached_ws is not None else None
+                )
+                for row in formula_rows:
+                    cached_row = next(cached_rows, None) if cached_rows is not None else None
+                    values: List[Any] = []
+                    for index, cell in enumerate(row):
+                        cached_cell = (
+                            cached_row[index]
+                            if cached_row is not None and index < len(cached_row)
+                            else None
+                        )
+                        if isinstance(cell.value, str) and cell.value.startswith("="):
+                            formula_details.append({
+                                "cell": cell.coordinate,
+                                "formula": cell.value,
+                                "value": cached_cell.value if cached_cell is not None else None,
+                            })
+                            values.append(
+                                cached_cell.value
+                                if cached_cell is not None and cached_cell.value is not None
+                                else cell.value
+                            )
+                        else:
+                            values.append(cell.value)
+                    grid.append(values)
             finally:
                 wb.close()
+                cached_wb.close()
         else:
             return None  # .xls 等暂不支持的格式 → 退化为普通文件提示
 
@@ -878,13 +1045,22 @@ def _parse_spreadsheet_record(
                 f"c{i}": ("" if i >= len(raw) or raw[i] is None else str(raw[i]))
                 for i in range(len(header))
             })
-        return {"title": rec.filename or "上传表格", "columns": columns, "rows": rows}
+        is_xlsx = fn.endswith((".xlsx", ".xlsm")) or "spreadsheetml" in ct
+        return {
+            "title": rec.filename or "上传表格",
+            "columns": columns,
+            "rows": rows,
+            "formula_cells": len(formula_details) if is_xlsx else 0,
+            "formula_details": formula_details if is_xlsx else [],
+        }
     except Exception:  # noqa: BLE001
         return None
 
 
 async def _load_spreadsheet_tables(
     records: List[FileRecord],
+    *,
+    workbooks: Optional[Dict[str, WorkbookRecord]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """在线程池中解析表格附件，避免 openpyxl 阻塞 FastAPI 事件循环。
 
@@ -898,6 +1074,11 @@ async def _load_spreadsheet_tables(
     async def load_one(rec: FileRecord):
         started = time.monotonic()
         table = await asyncio.to_thread(_parse_spreadsheet_record, rec)
+        workbook = (workbooks or {}).get(str(rec.id))
+        if table and workbook:
+            table["workbook_id"] = workbook.id
+            table["workbook_name"] = workbook.name
+            table["source_file_id"] = rec.id
         _logger.info(
             "[xlsx] parsed file=%s rows=%s cols=%s elapsed_ms=%.0f",
             rec.filename,
@@ -963,6 +1144,16 @@ def _spreadsheet_to_summary(table: Dict[str, Any], sample_rows: int = 30) -> str
         f"共 {total_rows} 行 × {len(cols)} 列",
         "列信息：\n" + "\n".join(col_stats),
     ]
+    formula_details = table.get("formula_details") or []
+    if formula_details:
+        formula_lines = [
+            f"- {item.get('cell')}: {item.get('formula')}；最近计算结果={item.get('value')}"
+            for item in formula_details[:100]
+        ]
+        parts.append(
+            f"公式单元格共 {table.get('formula_cells', len(formula_details))} 个（公式已保留）：\n"
+            + "\n".join(formula_lines)
+        )
     if sample_lines:
         header = (
             "全部数据如下（请严格基于这些真实数据分析，禁止编造表中不存在的行或数值）："
@@ -1053,7 +1244,17 @@ async def chat(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
-    """转发对话到 litellm 网关，支持 tool calling 循环执行 MES 操作。"""
+    """统一 Chat 入口；V1 保持兼容，但实际执行只走 HarnessKernel。"""
+    return await _handle_kernel_chat(request, http_request, db, current_user)
+
+
+async def _legacy_chat_disabled(
+    request: ChatRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatResponse:
+    """已停用的旧内联编排，仅保留在历史提交中，不能被路由访问。"""
     operator = current_user.username or current_user.id
     factory_id = (http_request.headers.get("x-factory-id") if http_request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
 
@@ -1066,9 +1267,21 @@ async def chat(
     att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
+    non_image_records = [r for r in att_records if not _is_image_record(r)]
+    has_spreadsheet_attachment = any(_is_spreadsheet_record(r) for r in non_image_records)
+    attachment_workbooks = await _ensure_attachment_workbooks(
+        db,
+        non_image_records,
+        operator=operator,
+        factory_id=factory_id,
+    )
 
     # 这组 PMC 管理问题必须有确定性事实答复；不让模型自行决定是否查数。
-    direct_intent = resolve_intent(last_user) if request.enable_tools and not image_records else None
+    direct_intent = (
+        resolve_intent(last_user)
+        if request.enable_tools and not image_records and not has_spreadsheet_attachment
+        else None
+    )
     if direct_intent and direct_intent.get("tool") == "query_pmc_control_tower":
         arguments = direct_intent.get("args") or {}
         result = await execute_tool(db, "query_pmc_control_tower", arguments, operator=operator, factory_id=factory_id)
@@ -1167,8 +1380,10 @@ async def chat(
             import logging as _lg
             _lg.getLogger("chat").debug(f"parallel orchestrator skip: {_orch_err}")
 
-    non_image_records = [r for r in att_records if not _is_image_record(r)]
-    spreadsheet_tables = await _load_spreadsheet_tables(non_image_records)
+    spreadsheet_tables = await _load_spreadsheet_tables(
+        non_image_records,
+        workbooks=attachment_workbooks,
+    )
     non_image_note = _attachment_text_note(
         non_image_records,
         spreadsheet_tables=spreadsheet_tables,
@@ -1199,17 +1414,24 @@ async def chat(
 
     # 有本轮表格附件时，模型只基于附件回答；不能把浏览器里残留的在线工作簿
     # ID 注入进来，否则会把“上传文件”和“在线工作簿”混成两条数据链路。
-    workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
-    attachment_analysis = bool(spreadsheet_tables) and _is_attachment_analysis_request(last_user)
-    tool_definitions = (
-        [] if attachment_analysis else _chat_tool_definitions(
-            has_spreadsheet_attachment=bool(spreadsheet_tables),
-        )
+    bound_workbook_id = next(
+        (workbook.id for workbook in attachment_workbooks.values()),
+        None,
+    )
+    workbook_context = (
+        _workbook_context_prompt(bound_workbook_id)
+        if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
+    )
+    tool_definitions = _chat_tool_definitions(
+        has_spreadsheet_attachment=bool(spreadsheet_tables),
+        workbook_id=bound_workbook_id,
     )
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
     messages: List[Dict[str, Any]] = [{
         "role": "system",
-        "content": SYSTEM_PROMPT + _attachment_analysis_context(attachment_analysis) + workbook_context,
+        "content": SYSTEM_PROMPT + _attachment_analysis_context(
+            bool(spreadsheet_tables), bound_workbook_id,
+        ) + workbook_context,
     }]
     # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
     if request.agent_key:
@@ -1422,6 +1644,7 @@ async def _build_chat_history(
         limit=50,
         include_tools=False,
         include_tool_calls=False,
+        include_attachments=False,
     )
     if not persisted:
         return client_history
@@ -1467,18 +1690,17 @@ def _inject_chat_attachments(
         })
 
 
-@router.post("/v2", response_model=ChatResponse)
-async def chat_v2(
+async def _handle_kernel_chat(
     request: ChatRequest,
     http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatResponse:
-    """Chat V2（Harness Kernel 链路）。与 V1 行为等价，返回结构相同。
+    """统一 Harness Kernel 请求处理器，供 V1/V2/SSE 共用。
 
     Phase 3：会话持久化——无 session_id 自动建会话，请求结束落库消息+遥测。
     """
-    from core.kernel import HarnessKernel
+    from core.kernel import HarnessKernel, KernelResponse
 
     operator = current_user.username or current_user.id
     factory_id = _chat_factory_id(http_request, current_user)
@@ -1502,7 +1724,16 @@ async def chat_v2(
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
     non_image_records = [r for r in att_records if not _is_image_record(r)]
-    spreadsheet_tables = await _load_spreadsheet_tables(non_image_records)
+    attachment_workbooks = await _ensure_attachment_workbooks(
+        db,
+        non_image_records,
+        operator=operator,
+        factory_id=factory_id,
+    )
+    spreadsheet_tables = await _load_spreadsheet_tables(
+        non_image_records,
+        workbooks=attachment_workbooks,
+    )
     non_image_note = _attachment_text_note(
         non_image_records,
         spreadsheet_tables=spreadsheet_tables,
@@ -1511,14 +1742,6 @@ async def chat_v2(
         non_image_records,
         spreadsheet_tables,
     )
-    if unsupported_attachment and _is_attachment_analysis_request(last_user):
-        return ChatResponse(
-            reply=unsupported_attachment,
-            model="attachment-parser",
-            degraded=False,
-            actions=[],
-            session_id=session_id,
-        )
 
     # 历史消息注入附件（图片 → 多模态 content；非图片 → 文字摘要）
     history = await _build_chat_history(
@@ -1551,7 +1774,7 @@ async def chat_v2(
             is_write=is_write, is_sim=is_sim, success=success,
         )
 
-    # Chat V2 Kernel；启用 Skill 优先（未迁移工具自动回退 legacy execute_tool）。
+    # 所有工具都通过显式 SkillRegistry 边界执行。
     skill_registry = _get_skill_registry()
 
     # Phase 4：权限门控（基于用户权限集 + 数据作用域）
@@ -1567,13 +1790,76 @@ async def chat_v2(
             MODEL_COLD_START_RETRY_TIMEOUT if spreadsheet_tables else 60.0
         ),
     )
-    workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
-    attachment_analysis = bool(spreadsheet_tables) and _is_attachment_analysis_request(last_user)
-    tool_definitions = (
-        [] if attachment_analysis else _chat_tool_definitions(
-            has_spreadsheet_attachment=bool(spreadsheet_tables),
-        )
+    bound_workbook_id = next(
+        (workbook.id for workbook in attachment_workbooks.values()),
+        None,
     )
+    workbook_context = (
+        _workbook_context_prompt(bound_workbook_id)
+        if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
+    )
+    tool_definitions = _chat_tool_definitions(
+        has_spreadsheet_attachment=bool(spreadsheet_tables),
+        workbook_id=bound_workbook_id,
+    )
+
+    async def deterministic_handler(ctx, execute, action_factory):
+        """Handle facts that already have a stable server-side intent mapping.
+
+        This remains inside HarnessKernel so direct PMC/order answers receive
+        the same permission, telemetry and persistence treatment as model-led
+        tool calls.
+        """
+        if unsupported_attachment and _is_attachment_analysis_request(last_user):
+            return KernelResponse(
+                reply=unsupported_attachment,
+                model="attachment-parser",
+                request_id=ctx.request_id,
+            )
+        if (
+            not request.enable_tools
+            or image_records
+            or spreadsheet_tables
+        ):
+            return None
+        intent = resolve_intent(ctx.last_user_content)
+        if not intent:
+            return None
+        tool_name = intent.get("tool")
+        if tool_name not in {
+            "query_pmc_control_tower",
+            "query_order_work_order_status",
+        }:
+            return None
+        arguments = intent.get("args") or {}
+        result = await execute(tool_name, arguments)
+        action = None
+        if action_factory is not None:
+            action = action_factory(
+                tool_name,
+                TOOL_LABELS.get(tool_name, tool_name),
+                arguments,
+                result,
+                tool_name in WRITE_TOOLS,
+                tool_name in SIM_TOOLS,
+                "error" not in result,
+            )
+        tables = []
+        table_data = _extract_table_data(tool_name, result)
+        if table_data:
+            tables.append(table_data)
+        return KernelResponse(
+            reply=_direct_tool_reply(tool_name, result),
+            model=(
+                "pmc-control-tower"
+                if tool_name == "query_pmc_control_tower"
+                else "order-work-order-status"
+            ),
+            degraded="error" in result,
+            actions=[action] if action is not None else [],
+            tables=tables,
+            request_id=ctx.request_id,
+        )
 
     async def persist_after(ctx, response):
         """Phase 3：请求结束后落库（消息 + 遥测）。"""
@@ -1586,6 +1872,7 @@ async def chat_v2(
             model=response.model,
             actions=response.actions,
             request_id=ctx.request_id,
+            attachment_ids=[str(record.id) for record in att_records],
         )
         await cp.save_telemetry(
             db, request_id=ctx.request_id, session_id=session_id,
@@ -1594,6 +1881,10 @@ async def chat_v2(
             rounds=len(response.actions),
             success=not response.degraded,
         )
+        # StreamingResponse cleanup happens after the body is consumed. Commit
+        # here so the shared Kernel path never leaves the request transaction
+        # idle while the client or proxy is still holding the response open.
+        await db.commit()
 
     kernel = HarnessKernel(
         db=db,
@@ -1607,19 +1898,33 @@ async def chat_v2(
         write_tools=frozenset(WRITE_TOOLS),
         sim_tools=frozenset(SIM_TOOLS),
         tool_definitions=tool_definitions,
-        system_prompt=SYSTEM_PROMPT + _attachment_analysis_context(attachment_analysis) + workbook_context,
+        system_prompt=SYSTEM_PROMPT + _attachment_analysis_context(
+            bool(spreadsheet_tables), bound_workbook_id,
+        ) + workbook_context,
         final_grounding_prompt=FINAL_GROUNDING_PROMPT,
         chat_task_id=MODEL_STACK_CHAT_TASK_ID,
         vision_task_id=MODEL_STACK_VISION_TASK_ID,
         max_tool_rounds=MAX_TOOL_ROUNDS,
         skill_registry=skill_registry,
-        legacy_execute_tool=bound_execute,
         persist_hook=persist_after,
         permission_gate=permission_gate,
         model_reviewer=model_reviewer,
+        deterministic_handler=deterministic_handler,
         **_checkpoint_options(),
     )
 
+    deterministic_intent = (
+        resolve_intent(last_user)
+        if request.enable_tools and not image_records and not spreadsheet_tables
+        else None
+    )
+    route_not_required = bool(
+        (unsupported_attachment and _is_attachment_analysis_request(last_user))
+        or (deterministic_intent and deterministic_intent.get("tool") in {
+            "query_pmc_control_tower",
+            "query_order_work_order_status",
+        })
+    )
     ctx = await kernel.build_context(
         factory_id=factory_id,
         user=current_user,
@@ -1630,6 +1935,7 @@ async def chat_v2(
         temperature=request.temperature,
         session_id=session_id,
         prompt_tokens=prompt_tokens,
+        resolve_route=not route_not_required,
     )
     result = await kernel.handle(ctx)
 
@@ -1638,10 +1944,43 @@ async def chat_v2(
         model=result.model,
         degraded=result.degraded,
         actions=result.actions,
-        diagrams=result.diagrams,
+        diagrams=(
+            list(result.diagrams)
+            + [
+                diagram
+                for action in result.actions
+                if (diagram := _extract_diagram_data(
+                    getattr(action, "tool", ""),
+                    getattr(action, "result", {}) or {},
+                ))
+            ]
+        ),
+        tables=(
+            list(spreadsheet_tables.values())
+            + list(result.tables)
+            + [
+                table
+                for action in result.actions
+                if (table := _extract_table_data(
+                    getattr(action, "tool", ""),
+                    getattr(action, "result", {}) or {},
+                ))
+            ]
+        ),
         session_id=session_id,
         request_id=result.request_id,
     )
+
+
+@router.post("/v2", response_model=ChatResponse)
+async def chat_v2(
+    request: ChatRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatResponse:
+    """兼容入口；与 V1 共用同一个 HarnessKernel 处理器。"""
+    return await _handle_kernel_chat(request, http_request, db, current_user)
 
 
 def _degraded_message(reason: str) -> str:
@@ -1769,7 +2108,10 @@ def _extract_table_data(tool_name: str, result: Dict[str, Any]) -> Optional[Dict
 
     返回 {title, columns: [{key, label}], rows: [{...}]} 或 None（不适用表格的工具）。
     """
-    if tool_name in {"query_online_workbook", "edit_online_workbook", "create_online_pivot"}:
+    if tool_name in {
+        "query_online_workbook", "edit_online_workbook", "recalculate_online_workbook",
+        "reload_online_workbook", "create_online_pivot",
+    }:
         table = result.get("table")
         if isinstance(table, dict) and table.get("columns"):
             return table
@@ -2106,8 +2448,7 @@ def _merge_stream_tool_calls(
             target["function"]["arguments"] += function_delta["arguments"]
 
 
-@router.post("/stream")
-async def chat_stream(
+async def _legacy_stream_disabled(
     request: ChatRequest,
     http_request: Request = None,
     db: AsyncSession = Depends(get_db),
@@ -2132,6 +2473,9 @@ async def chat_stream(
     session_id = session.id
     round_started = time.monotonic()
     stream_request_id = f"req-{uuid.uuid4().hex[:12]}"
+    # 生成器在首个 status 帧之后才真正开始执行；先初始化，保证客户端在冷启动/断开
+    # 时进入 finally 也不会因为附件变量尚未赋值而跳过整轮落库。
+    att_records: List[FileRecord] = []
 
     async def generate():
         actions: List[ToolAction] = []
@@ -2160,6 +2504,7 @@ async def chat_stream(
                     actions=actions,
                     request_id=stream_request_id,
                     duration_ms=(time.monotonic() - round_started) * 1000,
+                    attachment_ids=[str(record.id) for record in att_records],
                 )
                 await save_telemetry(
                     db,
@@ -2170,8 +2515,19 @@ async def chat_stream(
                     rounds=len(actions),
                     success=not stream_degraded,
                 )
-            except Exception:  # noqa: BLE001
-                pass
+                # StreamingResponse 的依赖清理发生在响应结束后；如果只依赖 get_db
+                # 的 finally commit，客户端断开/代理超时会留下 idle-in-transaction，
+                # 后续同一会话的 updated_at 全部被锁住。每轮落库后立即提交，确保
+                # 历史检索可见并释放连接锁。
+                await db.commit()
+            except Exception as exc:  # noqa: BLE001
+                _logger.exception(
+                    "[chat-stream-persist] failed session=%s request=%s error=%s",
+                    session_id,
+                    stream_request_id,
+                    type(exc).__name__,
+                )
+                await db.rollback()
 
         # 先发状态帧，避免大一点的表格解析期间代理/浏览器误判连接空闲。
         yield _sse("status", {"message": "正在读取表格附件…"})
@@ -2181,14 +2537,28 @@ async def chat_stream(
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
         non_image_records = [r for r in att_records if not _is_image_record(r)]
-        spreadsheet_tables = await _load_spreadsheet_tables(non_image_records)
+        has_spreadsheet_attachment = any(_is_spreadsheet_record(r) for r in non_image_records)
+        attachment_workbooks = await _ensure_attachment_workbooks(
+            db,
+            non_image_records,
+            operator=operator,
+            factory_id=factory_id,
+        )
+        spreadsheet_tables = await _load_spreadsheet_tables(
+            non_image_records,
+            workbooks=attachment_workbooks,
+        )
         non_image_note = _attachment_text_note(
             non_image_records,
             spreadsheet_tables=spreadsheet_tables,
         )
 
         # Stream 是前端主链路；PMC九类问题在这里直接执行统一事实工具，保证不依赖模型是否正确选工具。
-        direct_intent = resolve_intent(last_user) if request.enable_tools and not image_records else None
+        direct_intent = (
+            resolve_intent(last_user)
+            if request.enable_tools and not image_records and not has_spreadsheet_attachment
+            else None
+        )
         if direct_intent and direct_intent.get("tool") == "query_pmc_control_tower":
             arguments = direct_intent.get("args") or {}
             result = await execute_tool(db, "query_pmc_control_tower", arguments, operator=operator, factory_id=factory_id)
@@ -2298,17 +2668,24 @@ async def chat_stream(
                 if tbl:
                     yield _sse("table", tbl)
 
-        workbook_context = "" if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
-        attachment_analysis = bool(spreadsheet_tables) and _is_attachment_analysis_request(last_user)
-        tool_definitions = (
-            [] if attachment_analysis else _chat_tool_definitions(
-                has_spreadsheet_attachment=bool(spreadsheet_tables),
-            )
+        bound_workbook_id = next(
+            (workbook.id for workbook in attachment_workbooks.values()),
+            None,
+        )
+        workbook_context = (
+            _workbook_context_prompt(bound_workbook_id)
+            if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
+        )
+        tool_definitions = _chat_tool_definitions(
+            has_spreadsheet_attachment=bool(spreadsheet_tables),
+            workbook_id=bound_workbook_id,
         )
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
         messages: List[Dict[str, Any]] = [{
             "role": "system",
-            "content": SYSTEM_PROMPT + _attachment_analysis_context(attachment_analysis) + workbook_context,
+            "content": SYSTEM_PROMPT + _attachment_analysis_context(
+                bool(spreadsheet_tables), bound_workbook_id,
+            ) + workbook_context,
         }]
         # ---- 智能体调度：指定 agent 时注入其职责提示词，并记录监督心跳 ----
         if request.agent_key:
@@ -2496,6 +2873,217 @@ async def chat_stream(
     )
 
 
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Kernel-backed SSE adapter.
+
+    The browser event contract remains status/action/table/diagram/delta/done;
+    execution and persistence are owned by the same Kernel path as /chat and
+    /chat/v2.  The final reply is emitted as one delta when Kernel completes.
+    """
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
+
+    async def generate():
+        yield _sse("status", {"message": "正在由统一 Chat Kernel 处理…"})
+        try:
+            result = await _handle_kernel_chat(
+                request, http_request, db, current_user,
+            )
+            for action in result.actions:
+                payload = action.model_dump() if hasattr(action, "model_dump") else action
+                yield _sse("action", payload)
+            for table in result.tables:
+                yield _sse("table", table)
+            for diagram in result.diagrams:
+                yield _sse("diagram", diagram)
+            if result.reply:
+                yield _sse("delta", {"content": result.reply})
+            yield _sse("done", {
+                "model": result.model,
+                "degraded": result.degraded,
+                "session_id": result.session_id,
+                "request_id": result.request_id or request_id,
+            })
+        except Exception as exc:  # noqa: BLE001
+            _logger.exception("[chat-stream-kernel] failed request=%s", request_id)
+            yield _sse("delta", {
+                "content": _degraded_message(
+                    f"统一 Chat Kernel 失败 ({type(exc).__name__})",
+                ),
+            })
+            yield _sse("done", {
+                "model": MODEL_STACK_CHAT_TASK_ID,
+                "degraded": True,
+                "session_id": request.session_id,
+                "request_id": request_id,
+            })
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# =================================================================
+# 快速检索：用户自己的会话、文件、照片和历史引用
+# =================================================================
+
+@router.get("/search")
+async def chat_search(
+    q: str = "",
+    kind: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = 20,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Search the current user's chat memory without exposing another tenant.
+
+    A blank query returns recent items.  Text searches cover session titles,
+    message content, uploaded filenames and attachment usage, so the frontend
+    can let the user quote/reuse a previous photo or file in one click.
+    """
+    user_id = str(getattr(current_user, "id", "")) or current_user.username or "anonymous"
+    factory_id = _chat_factory_id(http_request, current_user)
+    query = (q or "").strip()
+    pattern = f"%{query}%" if query else None
+    page_limit = max(1, min(int(limit or 20), 100))
+    session_filter = []
+    if session_id:
+        session_filter.append(ChatSession.id == session_id)
+
+    session_stmt = (
+        select(ChatSession)
+        .where(
+            ChatSession.user_id == user_id,
+            ChatSession.factory_id == factory_id,
+            *session_filter,
+        )
+        .order_by(ChatSession.updated_at.desc())
+        .limit(page_limit)
+    )
+    if pattern:
+        matching_message_sessions = select(ChatMessageRecord.session_id).where(
+            ChatMessageRecord.content.ilike(pattern)
+        )
+        session_stmt = session_stmt.where(or_(
+            ChatSession.title.ilike(pattern),
+            ChatSession.id.in_(matching_message_sessions),
+        ))
+    sessions = (await db.execute(session_stmt)).scalars().all()
+
+    message_stmt = (
+        select(ChatMessageRecord, ChatSession)
+        .join(ChatSession, ChatSession.id == ChatMessageRecord.session_id)
+        .where(
+            ChatSession.user_id == user_id,
+            ChatSession.factory_id == factory_id,
+            *([ChatSession.id == session_id] if session_id else []),
+        )
+        .order_by(ChatMessageRecord.created_at.desc(), ChatMessageRecord.id.desc())
+        .limit(page_limit)
+    )
+    if pattern:
+        message_stmt = message_stmt.where(ChatMessageRecord.content.ilike(pattern))
+    message_rows = (await db.execute(message_stmt)).all()
+
+    file_scope = [FileRecord.uploaded_by == current_user.username]
+    if not current_user.is_superuser:
+        file_scope.append(FileRecord.factory_id == factory_id)
+    file_stmt = (
+        select(FileRecord)
+        .where(*file_scope)
+        .order_by(FileRecord.created_at.desc())
+        .limit(page_limit)
+    )
+    if kind in {"image", "file"}:
+        if kind == "image":
+            file_stmt = file_stmt.where(FileRecord.content_type.ilike("image/%"))
+        else:
+            file_stmt = file_stmt.where(~FileRecord.content_type.ilike("image/%"))
+    if pattern:
+        file_stmt = file_stmt.where(or_(
+            FileRecord.filename.ilike(pattern),
+            FileRecord.content_type.ilike(pattern),
+        ))
+    if session_id:
+        linked_files = select(ChatMessageAttachment.file_id).where(
+            ChatMessageAttachment.session_id == session_id
+        )
+        file_stmt = file_stmt.where(FileRecord.id.in_(linked_files))
+    files = (await db.execute(file_stmt)).scalars().all()
+
+    file_ids = [str(item.id) for item in files]
+    usage_by_file: Dict[str, List[Dict[str, Any]]] = {file_id: [] for file_id in file_ids}
+    if file_ids:
+        usage_stmt = (
+            select(ChatMessageAttachment, ChatMessageRecord, ChatSession)
+            .join(ChatMessageRecord, ChatMessageRecord.id == ChatMessageAttachment.message_id)
+            .join(ChatSession, ChatSession.id == ChatMessageAttachment.session_id)
+            .where(
+                ChatMessageAttachment.file_id.in_(file_ids),
+                ChatSession.user_id == user_id,
+                ChatSession.factory_id == factory_id,
+            )
+        )
+        if session_id:
+            usage_stmt = usage_stmt.where(ChatSession.id == session_id)
+        for link, message, linked_session in (await db.execute(usage_stmt)).all():
+            usage_by_file.setdefault(str(link.file_id), []).append({
+                "session_id": linked_session.id,
+                "session_title": linked_session.title or "新会话",
+                "message_id": message.id,
+                "message_excerpt": (message.content or "")[:160],
+                "created_at": message.created_at.isoformat() if message.created_at else None,
+            })
+
+    def file_item(record: FileRecord) -> Dict[str, Any]:
+        is_image = (record.content_type or "").startswith("image/")
+        return {
+            **record.to_dict(),
+            "kind": "image" if is_image else "file",
+            "is_image": is_image,
+            "download_url": f"/api/v1/files/{record.id}",
+            "preview_url": f"/api/v1/files/{record.id}" if is_image else None,
+            "used_in": usage_by_file.get(str(record.id), []),
+        }
+
+    return {
+        "query": query,
+        "kind": kind,
+        "session_id": session_id,
+        "sessions": [
+            {
+                "session_id": item.id,
+                "title": item.title or "新会话",
+                "factory_id": item.factory_id,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+            }
+            for item in sessions
+        ],
+        "messages": [
+            {
+                "message_id": message.id,
+                "session_id": session.id,
+                "session_title": session.title or "新会话",
+                "role": message.role,
+                "content": message.content or "",
+                "created_at": message.created_at.isoformat() if message.created_at else None,
+            }
+            for message, session in message_rows
+        ],
+        "files": [file_item(record) for record in files],
+    }
+
+
 # =================================================================
 # Phase 6 — Engineering Surface（Trace / Replay / Eval / Plugins /
 #           Version / Model-Compare / Failures）
@@ -2586,9 +3174,11 @@ async def chat_version():
     from core.agent import event_bus as event_bus_mod
     return {
         "harness": harness_version,
-        "api": "/api/v1/chat/v2",
+        "api": "/api/v1/chat (and /v2, /stream)",
         "phases": [1, 2, 3, 4, 5, 6],
         "event_bus": event_bus_mod.__file__,
+        "execution": "HarnessKernel",
+        "skill_registry": len(_get_skill_registry().all_tool_definitions()),
     }
 
 

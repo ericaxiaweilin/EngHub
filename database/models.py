@@ -2521,6 +2521,29 @@ class ChatMessage(Base):
     session = relationship("ChatSession", backref="messages")
 
 
+class ChatMessageAttachment(Base):
+    """Stable link between a chat message and an uploaded file/photo.
+
+    FileRecord remains the canonical file store.  This table makes attachment
+    reuse/search independent from the transient request payload and keeps
+    session/factory authorization queryable with normal indexes.
+    """
+    __tablename__ = "chat_message_attachments"
+    __table_args__ = (
+        Index("idx_chat_msg_att_session", "session_id", "created_at"),
+        Index("idx_chat_msg_att_file", "file_id", "created_at"),
+        Index("idx_chat_msg_att_message", "message_id", "ordinal"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    message_id = Column(String(36), ForeignKey("chat_messages.id", ondelete="CASCADE"), nullable=False)
+    session_id = Column(String(36), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    file_id = Column(String(36), ForeignKey("files.id", ondelete="CASCADE"), nullable=False)
+    kind = Column(String(16), nullable=True)       # image | file
+    ordinal = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
 class ChatTelemetry(Base):
     """Chat 请求遥测——一次 handle() 一个 telemetry 事件（Trace 的骨架）。"""
     __tablename__ = "chat_telemetry"

@@ -15,7 +15,7 @@ import {
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
   PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
   CarryOutOutlined, InfoCircleOutlined,
-  SaveOutlined, FileExcelOutlined,
+  SaveOutlined, FileExcelOutlined, SearchOutlined,
 } from '@ant-design/icons'
 
 // 任务中心（嵌入 chatbot 浮窗第三个 tab）
@@ -202,11 +202,15 @@ interface TableData {
   columns: { key: string; label: string }[]
   rows: Record<string, any>[]
   type?: string
+  formula_cells?: number
+  formula_details?: { cell: string; formula: string; value?: any }[]
   work_order_code?: string
   pmc_options?: Record<string, any>
   pmc_option_schema?: PmcOptionDefinition[]
   pmc_result?: any
   workbook_id?: string
+  workbook_name?: string
+  source_file_id?: string
 }
 
 interface PmcOptionDefinition {
@@ -457,6 +461,23 @@ interface ChatMsg {
   diagrams?: FlowDiagram[]
 }
 
+interface ChatMemoryFile {
+  id: string
+  filename: string
+  content_type?: string
+  size?: number
+  kind: 'image' | 'file'
+  is_image?: boolean
+  preview_url?: string | null
+  used_in?: { session_id: string; session_title: string; message_excerpt: string; created_at?: string | null }[]
+}
+
+interface ChatMemoryResult {
+  sessions: { session_id: string; title: string; updated_at?: string | null; created_at?: string | null }[]
+  messages: { message_id: string; session_id: string; session_title: string; role: string; content: string; created_at?: string | null }[]
+  files: ChatMemoryFile[]
+}
+
 // ---------- 快捷指令（后端不可用时的本地兜底） ----------
 const FALLBACK_QUICK_COMMANDS = [
   '今天生产情况怎么样？',
@@ -589,6 +610,90 @@ export default function AIAssistantWidget() {
   const uploadingRef = useRef(false)
   const previewUrlsRef = useRef<Set<string>>(new Set())
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // 历史记忆：检索当前用户的会话、文件和照片，并支持一键恢复/引用。
+  const [memoryOpen, setMemoryOpen] = useState(false)
+  const [memoryQuery, setMemoryQuery] = useState('')
+  const [memoryLoading, setMemoryLoading] = useState(false)
+  const [memoryResults, setMemoryResults] = useState<ChatMemoryResult>({ sessions: [], messages: [], files: [] })
+
+  const searchChatMemory = useCallback(async (query?: string) => {
+    const nextQuery = (query ?? memoryQuery).trim()
+    setMemoryQuery(nextQuery)
+    setMemoryLoading(true)
+    try {
+      const result: any = await api.get('/api/v1/chat/search', {
+        params: { q: nextQuery, limit: 30 },
+      })
+      setMemoryResults({
+        sessions: Array.isArray(result?.sessions) ? result.sessions : [],
+        messages: Array.isArray(result?.messages) ? result.messages : [],
+        files: Array.isArray(result?.files) ? result.files : [],
+      })
+    } catch {
+      // api 拦截器已给出错误提示；保留上一次结果，避免检索面板闪空。
+    } finally {
+      setMemoryLoading(false)
+    }
+  }, [memoryQuery])
+
+  const openChatMemory = () => {
+    setMemoryOpen(true)
+    void searchChatMemory(memoryQuery)
+  }
+
+  const openMemorySession = async (item: ChatMemoryResult['sessions'][number]) => {
+    setMemoryLoading(true)
+    try {
+      const trace: any = await api.get(`/api/v1/chat/replay/${item.session_id}`)
+      const restored: ChatMsg[] = (Array.isArray(trace?.messages) ? trace.messages : [])
+        .filter((m: any) => m.role === 'user' || m.role === 'assistant')
+        .map((m: any, index: number) => ({
+          id: m.id || `${item.session_id}-${index}`,
+          role: m.role,
+          content: m.content || '',
+          time: m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : now(),
+          actions: m.role === 'assistant' && Array.isArray(m.tool_calls) ? m.tool_calls : [],
+          attachments: Array.isArray(m.attachments) ? m.attachments.map((att: any) => ({
+            file_id: att.file_id,
+            filename: att.filename,
+            content_type: att.content_type,
+            is_image: att.is_image ?? (att.kind === 'image' || (att.content_type || '').startsWith('image/')),
+            size: att.size,
+            preview_url: att.preview_url || (att.kind === 'image' ? `/api/v1/files/${att.file_id}` : undefined),
+          })) : [],
+        }))
+      setSessionId(trace?.session_id || item.session_id)
+      setMessages(restored)
+      setMemoryOpen(false)
+      setTab('ai')
+      message.success(`已打开会话：${item.title || '新会话'}`)
+    } catch {
+      message.error('历史会话加载失败')
+    } finally {
+      setMemoryLoading(false)
+    }
+  }
+
+  const reuseMemoryFile = (file: ChatMemoryFile) => {
+    const exists = pendingAttachmentsRef.current.some(item => item.file_id === file.id)
+    if (exists) {
+      message.info('该文件已经在待发送附件中')
+      return
+    }
+    const attachment: MsgAttachment = {
+      file_id: file.id,
+      filename: file.filename,
+      content_type: file.content_type,
+      is_image: file.is_image ?? file.kind === 'image',
+      size: file.size,
+      preview_url: file.preview_url || undefined,
+    }
+    const nextAttachments = [...pendingAttachmentsRef.current, attachment]
+    pendingAttachmentsRef.current = nextAttachments
+    setPendingAttachments(nextAttachments)
+    setMemoryOpen(false)
+    message.success(`已引用：${file.filename}`)
+  }
   // 可用工作流清单（从 /chat/tools 拉取，供快捷指令区展示）
   const [workflows, setWorkflows] = useState<{ name: string; label: string; needs_params: boolean }[]>([])
   // 智能体调度：可选 agent 列表 + 当前选中（auto = 由模型自动调度）
@@ -631,14 +736,25 @@ export default function AIAssistantWidget() {
   const [sheetTable, setSheetTable] = useState<TableData | null>(null)
   const sheetRef = useRef<SpreadsheetEditorHandle>(null)
   const [sheetWorkbookId, setSheetWorkbookId] = useState<string | null>(null)
+  const [sheetWorkbookSnapshot, setSheetWorkbookSnapshot] = useState<Record<string, any> | null>(null)
+  const [sheetWorkbookLoading, setSheetWorkbookLoading] = useState(false)
   const [sheetWorkbookSaving, setSheetWorkbookSaving] = useState(false)
-  const openSheetTable = (table: TableData) => {
-    // The chatbot table is a bounded view.  Start a separate workbook for
-    // manual edits so saving it cannot accidentally replace other sheets in
-    // the source workbook; natural-language edits still target the bound
-    // workbook through the backend tools.
-    setSheetWorkbookId(null)
+  const openSheetTable = async (table: TableData) => {
+    setSheetWorkbookId(table.workbook_id || null)
+    setSheetWorkbookSnapshot(null)
     setSheetTable(table)
+    if (!table.workbook_id) return
+    setSheetWorkbookLoading(true)
+    try {
+      const result: any = await api.get(`/api/v1/workbooks/${table.workbook_id}`)
+      setSheetWorkbookSnapshot(result?.snapshot || null)
+      localStorage.setItem('enghub-active-workbook-id', table.workbook_id)
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '绑定工作簿加载失败')
+      setSheetTable(null)
+    } finally {
+      setSheetWorkbookLoading(false)
+    }
   }
   // 工厂指挥官开关
   const [commanderOn, setCommanderOn] = useState(false)
@@ -1074,7 +1190,11 @@ export default function AIAssistantWidget() {
               accActions = [...accActions, data]
               applyUpdate()
             } else if (eventType === 'table') {
-              accTables = [...accTables, data as TableData]
+              const table = data as TableData
+              if (table.workbook_id) {
+                localStorage.setItem('enghub-active-workbook-id', table.workbook_id)
+              }
+              accTables = [...accTables, table]
               applyUpdate()
             } else if (eventType === 'diagram') {
               accDiagrams = [...accDiagrams, data as FlowDiagram]
@@ -1354,8 +1474,12 @@ export default function AIAssistantWidget() {
   const downloadSystemFile = async (fileId: string, filename?: string) => {
     try {
       const token = localStorage.getItem('token')
+      const factoryId = localStorage.getItem('active_factory_id')
       const resp = await fetch(`/api/v1/files/${fileId}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(factoryId ? { 'X-Factory-Id': factoryId } : {}),
+        },
       })
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
       const blob = await resp.blob()
@@ -1694,6 +1818,15 @@ export default function AIAssistantWidget() {
               <Text strong style={{ color: '#fff' }}>EngHub 智能助手</Text>
             </Space>
             <Space size={6}>
+              <Tooltip title="检索历史会话、文件和照片">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<SearchOutlined />}
+                  style={{ color: '#fff' }}
+                  onClick={openChatMemory}
+                />
+              </Tooltip>
               {/* 工厂指挥官开关 */}
               <Tooltip title={commanderOn ? '指挥官已开启：AI正在主动接管您的工作（点击关闭）' : '开启工厂指挥官：AI主动接管生产调度（点击开启）'}>
                 <Button
@@ -2176,6 +2309,94 @@ export default function AIAssistantWidget() {
                         点击命令即可直接发送给对应智能体；新增命令后系统会自动归类到对应智能体。
                       </Text>
                     </Modal>
+                    {/* 历史记忆：会话可恢复，文件/照片可直接引用到当前问题 */}
+                    <Modal
+                      title="历史记忆：会话、文件、照片"
+                      open={memoryOpen}
+                      onCancel={() => setMemoryOpen(false)}
+                      footer={null}
+                      width={520}
+                    >
+                      <Input.Search
+                        value={memoryQuery}
+                        onChange={e => setMemoryQuery(e.target.value)}
+                        onSearch={value => void searchChatMemory(value)}
+                        allowClear
+                        enterButton="检索"
+                        placeholder="搜文件名、会话标题或历史问题"
+                        loading={memoryLoading}
+                        style={{ marginBottom: 10 }}
+                      />
+                      <div style={{ maxHeight: 420, overflowY: 'auto' }}>
+                        {memoryResults.sessions.length > 0 && (
+                          <div style={{ marginBottom: 12 }}>
+                            <Text strong style={{ fontSize: 12 }}>会话（{memoryResults.sessions.length}）</Text>
+                            <List
+                              size="small"
+                              dataSource={memoryResults.sessions}
+                              renderItem={item => (
+                                <List.Item
+                                  actions={[<Button key="open" type="link" size="small" onClick={() => void openMemorySession(item)}>打开</Button>]}
+                                >
+                                  <List.Item.Meta
+                                    title={<Text ellipsis style={{ maxWidth: 320, display: 'inline-block' }}>{item.title || '新会话'}</Text>}
+                                    description={item.updated_at || item.created_at || ''}
+                                  />
+                                </List.Item>
+                              )}
+                            />
+                          </div>
+                        )}
+                        {memoryResults.files.length > 0 && (
+                          <div style={{ marginBottom: 12 }}>
+                            <Text strong style={{ fontSize: 12 }}>文件 / 照片（{memoryResults.files.length}）</Text>
+                            <List
+                              size="small"
+                              dataSource={memoryResults.files}
+                              renderItem={file => (
+                                <List.Item
+                                  actions={[
+                                    <Button key="reuse" type="link" size="small" onClick={() => reuseMemoryFile(file)}>引用</Button>,
+                                    <Button key="download" type="link" size="small" icon={<DownloadOutlined />} onClick={() => downloadSystemFile(file.id, file.filename)} />,
+                                  ]}
+                                >
+                                  <List.Item.Meta
+                                    avatar={file.kind === 'image' ? (
+                                      <img src={file.preview_url || `/api/v1/files/${file.id}`} alt={file.filename} style={{ width: 36, height: 36, objectFit: 'cover', borderRadius: 4 }} />
+                                    ) : <FileOutlined style={{ fontSize: 22, color: '#1677ff', marginTop: 8 }} />}
+                                    title={<Text ellipsis style={{ maxWidth: 240, display: 'inline-block' }}>{file.filename}</Text>}
+                                    description={`${file.content_type || '未知格式'}${file.size ? ` · ${file.size} 字节` : ''}`}
+                                  />
+                                </List.Item>
+                              )}
+                            />
+                          </div>
+                        )}
+                        {memoryResults.messages.length > 0 && (
+                          <div>
+                            <Text strong style={{ fontSize: 12 }}>历史消息（{memoryResults.messages.length}）</Text>
+                            <List
+                              size="small"
+                              dataSource={memoryResults.messages}
+                              renderItem={item => (
+                                <List.Item
+                                  actions={[<Button key="open" type="link" size="small" onClick={() => void openMemorySession({ session_id: item.session_id, title: item.session_title })}>打开会话</Button>]}
+                                >
+                                  <List.Item.Meta
+                                    avatar={<Tag color={item.role === 'user' ? 'blue' : 'purple'}>{item.role === 'user' ? '我' : 'AI'}</Tag>}
+                                    title={<Text ellipsis style={{ maxWidth: 260, display: 'inline-block' }}>{item.content || '（附件消息）'}</Text>}
+                                    description={`${item.session_title || '新会话'} · ${item.created_at ? new Date(item.created_at).toLocaleString('zh-CN') : ''}`}
+                                  />
+                                </List.Item>
+                              )}
+                            />
+                          </div>
+                        )}
+                        {!memoryLoading && memoryResults.sessions.length === 0 && memoryResults.files.length === 0 && memoryResults.messages.length === 0 && (
+                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={memoryQuery ? '没有找到匹配记录' : '暂无历史记录'} />
+                        )}
+                      </div>
+                    </Modal>
                     {/* 输入区 */}
                     <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
                       {replyingTo && (
@@ -2228,6 +2449,13 @@ export default function AIAssistantWidget() {
                           disabled={loading}
                           title="新对话（开启新会话，历史自动保存）"
                           style={{ borderRadius: '8px 0 0 8px' }}
+                        />
+                        <Button
+                          icon={<SearchOutlined />}
+                          onClick={openChatMemory}
+                          disabled={loading}
+                          title="检索历史会话、文件和照片"
+                          style={{ borderRadius: 0 }}
                         />
                         <Button
                           icon={<PaperClipOutlined />}
@@ -2786,14 +3014,19 @@ export default function AIAssistantWidget() {
       >
         {sheetTable && (
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48 }}><Spin tip="加载电子表格组件..." /></div>}>
-            <SpreadsheetEditor
-              ref={sheetRef}
-              key={sheetTable.title}
-              headers={sheetTable.columns.map(c => c.label)}
-              initialData={sheetTable.rows.map(r => sheetTable.columns.map(c => r[c.key] ?? ''))}
-              height={Math.min(520, Math.max(280, sheetTable.rows.length * 28 + 80))}
-              sheetName={sheetTable.title}
-            />
+            {sheetWorkbookLoading ? (
+              <div style={{ textAlign: 'center', padding: 48 }}><Spin tip="加载绑定工作簿..." /></div>
+            ) : (
+              <SpreadsheetEditor
+                ref={sheetRef}
+                key={`${sheetTable.title}-${sheetWorkbookId || 'table'}-${sheetWorkbookSnapshot ? 'bound' : 'raw'}`}
+                headers={sheetTable.columns.map(c => c.label)}
+                initialData={sheetTable.rows.map(r => sheetTable.columns.map(c => r[c.key] ?? ''))}
+                initialWorkbook={sheetWorkbookSnapshot || undefined}
+                height={Math.min(520, Math.max(280, sheetTable.rows.length * 28 + 80))}
+                sheetName={sheetTable.title}
+              />
+            )}
           </Suspense>
         )}
       </Modal>
