@@ -27,6 +27,7 @@ from sqlalchemy import select, func, text
 from database.models import (
     WorkOrder, ProductionReport, Station, Equipment, Product,
     Inventory, DefectRecord, User, Routing, FileRecord, QualityInspection, WorkbookRecord,
+    BomItem,
 )
 from core.mes.work_order_coding import (
     generate_master_work_order_code,
@@ -949,6 +950,50 @@ TOOL_DEFINITIONS.extend([
                     "keyword": {"type": "string", "description": "搜索关键词（编码或名称片段）"},
                 },
                 "required": ["keyword"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_product_bom",
+            "description": "查询产品BOM配置情况：返回产品已关联的BOM物料行（物料编码/名称/用量），以及该产品是否缺少BOM。用于'产品有没有BOM/查A-50-04-F的BOM/MRP为什么失败/缺物料清单'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {"type": "string", "description": "产品ID或编码"},
+                },
+                "required": ["product_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_product_bom",
+            "description": "为产品补录BOM物料清单（写bom_items表）。支持两种方式：a) items数组逐项指定 material_code/material_name/qty_per_unit；b) copy_from_product 从参考产品复制整张BOM（含用量、版本）。用于'帮我补齐BOM/给A-50-04-F建BOM/MRP缺BOM'类请求。执行前若参考产品存在则推荐复制以保持一致性。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {"type": "string", "description": "需要补BOM的产品ID"},
+                    "factory_id": {"type": "string", "description": "工厂ID，默认FAC_MECH_001"},
+                    "bom_version": {"type": "string", "description": "BOM版本，默认CURRENT"},
+                    "copy_from_product": {"type": "string", "description": "参考产品ID：从该产品复制BOM行（推荐用于同系列产品）"},
+                    "items": {
+                        "type": "array",
+                        "description": "逐项补录的BOM行",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "material_code": {"type": "string", "description": "物料编码"},
+                                "material_name": {"type": "string", "description": "物料名称"},
+                                "qty_per_unit": {"type": "number", "description": "单台用量"},
+                            },
+                            "required": ["material_code", "qty_per_unit"],
+                        },
+                    },
+                },
+                "required": ["product_id"],
             },
         },
     },
@@ -2957,6 +3002,123 @@ async def _tool_query_collaboration(db: AsyncSession, args: Dict[str, Any], fact
 _TOOL_EXECUTORS["query_collaboration"] = _tool_query_collaboration
 
 
+async def _tool_query_product_bom(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """查询产品BOM配置：列出已关联物料行，判断是否缺BOM。"""
+    product_ref = str(args.get("product_id") or "").strip()
+    if not product_ref:
+        return {"error": "缺少产品ID"}
+    prod = (await db.execute(select(Product).where(Product.id == product_ref))).scalar()
+    if not prod:
+        prod = (await db.execute(select(Product).where(Product.product_code == product_ref))).scalar()
+    product_name = prod.product_name if prod else product_ref
+    rows = (await db.execute(
+        select(BomItem).where(BomItem.product_id == product_ref)
+    )).scalars().all()
+    if not rows:
+        rows = (await db.execute(
+            select(BomItem).where(BomItem.product_sap_code == product_ref)
+        )).scalars().all()
+    items = [
+        {
+            "material_code": str(getattr(r, "material_code", "") or r.part_number or ""),
+            "material_name": getattr(r, "material_name", None) or r.description or "",
+            "qty_per_unit": float(getattr(r, "qty_per_unit", 1) or 1),
+            "bom_version": getattr(r, "bom_version", None),
+        }
+        for r in rows
+    ]
+    return {
+        "product_id": product_ref,
+        "product_name": product_name,
+        "has_bom": len(items) > 0,
+        "bom_item_count": len(items),
+        "items": items,
+        "hint": "没有BOM时，可以用 create_product_bom 从参考产品复制或逐项补录物料。",
+    }
+
+
+async def _tool_create_product_bom(db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """为产品补录BOM：从参考产品复制，或逐项写入 items。"""
+    product_id = str(args.get("product_id") or "").strip()
+    if not product_id:
+        return {"error": "缺少产品ID"}
+    bom_version = str(args.get("bom_version") or "CURRENT")
+    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+
+    existing = (await db.execute(
+        select(BomItem).where(BomItem.product_id == product_id)
+    )).scalars().all()
+    if existing:
+        return {
+            "error": f"产品[{product_id}]已存在{len(existing)}行BOM，无需重复创建。可用 query_product_bom 查看。",
+        }
+
+    copy_from = str(args.get("copy_from_product") or "").strip()
+    items: List[Dict[str, Any]] = []
+    if copy_from:
+        ref_rows = (await db.execute(
+            select(BomItem).where(BomItem.product_id == copy_from)
+        )).scalars().all()
+        if not ref_rows:
+            return {"error": f"参考产品[{copy_from}]没有BOM可复制"}
+        for r in ref_rows:
+            items.append({
+                "material_code": str(getattr(r, "material_code", "") or r.part_number or ""),
+                "material_name": getattr(r, "material_name", None) or r.description or "",
+                "qty_per_unit": float(getattr(r, "qty_per_unit", 1) or 1),
+            })
+        source_desc = f"从参考产品[{copy_from}]复制"
+    else:
+        items = list(args.get("items") or [])
+        source_desc = "逐项补录"
+
+    items = [it for it in items if it.get("material_code")]
+    if not items:
+        return {"error": "没有可写入的BOM行：请提供 items 或 copy_from_product"}
+
+    from sqlalchemy import func as sa_func
+    max_row = (await db.execute(select(sa_func.max(BomItem.row_id)))).scalar()
+    row_id = int(max_row or 0)
+    now = datetime.utcnow()
+    created = []
+    for it in items:
+        row_id += 1
+        row = BomItem(
+            row_id=row_id,
+            company_id="ENG",
+            product_sap_code=product_id,
+            product_id=product_id,
+            factory_id=fid,
+            bom_version=bom_version,
+            material_code=str(it.get("material_code") or ""),
+            material_name=str(it.get("material_name") or ""),
+            qty_per_unit=float(it.get("qty_per_unit") or 1),
+            quantity=float(it.get("qty_per_unit") or 1),
+            level=1,
+            part_number=str(it.get("material_code") or ""),
+            description=str(it.get("material_name") or ""),
+            unit="PCS",
+            id=str(uuid.uuid4()),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        created.append({
+            "material_code": row.material_code,
+            "material_name": row.material_name,
+            "qty_per_unit": row.qty_per_unit,
+        })
+    await db.commit()
+    return {
+        "success": True,
+        "message": f"已为产品[{product_id}]补录BOM（{source_desc}），共{len(created)}行物料。",
+        "product_id": product_id,
+        "bom_version": bom_version,
+        "factory_id": fid,
+        "items": created,
+    }
+
+
 async def _tool_create_followup_task(db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None) -> Dict[str, Any]:
     """挂账跟进任务：写入任务中心，由后台扫描器按频率定期跟进。"""
     from api.services import followup_task_service as followup_svc
@@ -2974,6 +3136,8 @@ async def _tool_create_followup_task(db: AsyncSession, args: Dict[str, Any], ope
 
 
 _TOOL_EXECUTORS["create_followup_task"] = _tool_create_followup_task
+_TOOL_EXECUTORS["query_product_bom"] = _tool_query_product_bom
+_TOOL_EXECUTORS["create_product_bom"] = _tool_create_product_bom
 
 # 写操作工具（需要记录操作人）
 WRITE_TOOLS = {
@@ -2989,6 +3153,7 @@ WRITE_TOOLS = {
     "reload_online_workbook",
     "acknowledge_alert", "run_alert_patrol",
     "create_followup_task",
+    "create_product_bom",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
@@ -3051,6 +3216,8 @@ TOOL_LABELS = {
     "get_virtual_factory_status": "虚拟工厂状态",
     "run_virtual_factory_pulse": "虚拟工厂脉搏",
     "create_followup_task": "挂账跟进任务",
+    "query_product_bom": "查询产品BOM",
+    "create_product_bom": "补录产品BOM",
 }
 
 
@@ -3301,6 +3468,21 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "职位流程", "工作流程是什么", "每天做什么",
             # 责任归属
             "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
+        ],
+    },
+    {
+        "tool": "query_product_bom",
+        "keywords": [
+            "产品有没有BOM", "产品BOM", "BOM清单", "物料清单", "BOM配置",
+            "查BOM", "查看BOM", "BOM是什么", "有没有BOM", "缺BOM",
+            "MRP为什么失败", "MRP失败", "MRP计算失败",
+        ],
+    },
+    {
+        "tool": "create_product_bom",
+        "keywords": [
+            "帮我处理", "补齐BOM", "补BOM", "创建BOM", "新建BOM", "建立BOM",
+            "维护BOM", "补录BOM", "给.*建BOM", "复制BOM", "补全BOM",
         ],
     },
 ]
