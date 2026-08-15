@@ -852,11 +852,21 @@ async def get_plan_dict(db: AsyncSession, plan_id: str) -> Optional[Dict[str, An
 async def _plan_items(db: AsyncSession, plan_id: str) -> List[Dict[str, Any]]:
     rows = (await db.execute(text("""
         SELECT id, title, agent_key, agent_name, status, progress_pct,
-               plan_seq, follow_count, last_follow_note
+               plan_seq, follow_count, last_follow_note,
+               blocked_by, block_category, next_follow_at
         FROM followup_tasks WHERE plan_id = :pid
         ORDER BY plan_seq ASC NULLS LAST, created_at ASC
     """), {"pid": plan_id})).fetchall()
-    return [dict(r._mapping) for r in rows]
+    items = []
+    for r in rows:
+        item = dict(r._mapping)
+        # roadmap：从标题提取工单号（工作流阶段映射用）
+        import re as _re3
+        m = _re3.search(r"(WO-[\w\-]+)", item.get("title") or "")
+        if m:
+            item["work_order_code"] = m.group(1)
+        items.append(item)
+    return items
 
 
 async def list_plans(

@@ -88,6 +88,9 @@ interface PlanItem {
   plan_seq?: number
   follow_count: number
   last_follow_note?: string
+  blocked_by?: string
+  block_category?: string
+  work_order_code?: string
 }
 
 interface CommanderPlan {
@@ -518,28 +521,55 @@ const TaskCenter: React.FC = () => {
       expandable={{
         rowExpandable: (p: CommanderPlan) => (p.items?.length || 0) > 0,
         expandedRowRender: (p: CommanderPlan) => (
-          <List
-            size="small"
-            dataSource={p.items}
-            renderItem={(it: PlanItem) => {
-              const sm = STATUS_META[it.status] || { color: 'default', label: it.status }
-              return (
-                <List.Item style={{ padding: '6px 12px' }}>
-                  <Space size={8} style={{ width: '100%', justifyContent: 'space-between' }}>
-                    <Space size={6}>
-                      <Tag color="blue">{it.plan_seq ?? '-'}</Tag>
-                      <Text>{it.title}</Text>
-                      {it.agent_name && <Tag>{it.agent_name}</Tag>}
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            {/* 计划 roadmap：目标 → 各子任务流转状态 */}
+            <Alert type="info" showIcon icon={<RobotOutlined />} message="计划处理地图（Roadmap）"
+              description={
+                <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                  <Text>目标：{p.objective}</Text>
+                  <Text type="secondary">模式 {PLAN_MODE_META[p.mode || '']?.label || p.mode || '-'} · 总进度 {p.progress_pct || 0}% · {p.items?.length || 0} 个子任务</Text>
+                </Space>
+              } />
+            <Timeline
+              items={(p.items || []).map((it: PlanItem) => {
+                const sm = STATUS_META[it.status] || { color: 'default', label: it.status }
+                const blocked = it.status === 'blocked'
+                return {
+                  color: it.status === 'done' ? 'green' : blocked ? 'red' : 'blue',
+                  children: (
+                    <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                      <Space size={6} wrap>
+                        <Tag color="blue">步骤 {it.plan_seq ?? '-'}</Tag>
+                        <Text strong>{it.title}</Text>
+                        {it.agent_name && <Tag>{it.agent_name}</Tag>}
+                        <Tag color={sm.color}>{sm.label}</Tag>
+                        {it.status === 'done' && <Tag color="green">✓</Tag>}
+                        {blocked && <Tag color="red">⛔</Tag>}
+                      </Space>
+                      <Space size={8} wrap>
+                        <Progress percent={it.progress_pct || 0} size="small" style={{ width: 120, marginBottom: 0 }} />
+                        {it.follow_count > 0 && <Text type="secondary" style={{ fontSize: 12 }}>跟进 {it.follow_count} 次</Text>}
+                      </Space>
+                      {blocked && (
+                        <Space size={6} wrap>
+                          {it.blocked_by && <Tag color="orange">卡在：{it.blocked_by}</Tag>}
+                          {it.block_category && (
+                            <Tag color={(BLOCK_CATEGORY_META[it.block_category] || {}).color}>
+                              {(BLOCK_CATEGORY_META[it.block_category] || { label: it.block_category }).label}
+                            </Tag>
+                          )}
+                          {it.work_order_code && <Text type="secondary" style={{ fontSize: 12 }}>{it.work_order_code}</Text>}
+                        </Space>
+                      )}
+                      {it.last_follow_note && !blocked && (
+                        <Text type="secondary" style={{ fontSize: 12 }} ellipsis>{it.last_follow_note}</Text>
+                      )}
                     </Space>
-                    <Space size={8}>
-                      <Tag color={sm.color}>{sm.label}</Tag>
-                      <Progress percent={it.progress_pct || 0} size="small" style={{ width: 100, marginBottom: 0 }} />
-                    </Space>
-                  </Space>
-                </List.Item>
-              )
-            }}
-          />
+                  ),
+                }
+              })}
+            />
+          </Space>
         ),
       }}
     />
