@@ -804,6 +804,45 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         blocked_by = ""
         block_category = ""
 
+    # ── 智能体 → RCC：任务受阻时自动向 RCC 资源调度中心提交调度申请 ──
+    # 缺料→资源调度(material)、设备→equipment、审批→approval；已有该任务的 RCC 申请则不重复。
+    if new_status == "blocked":
+        try:
+            from sqlalchemy import text as _rt
+            # 查 RCC 组织（当前工厂）
+            rcc_org = (await db.execute(_rt(
+                "SELECT ou.id FROM org_units ou WHERE ou.factory_id = :f AND ou.code LIKE 'RCC-%' LIMIT 1"
+            ), {"f": factory_id})).mappings().first()
+            if rcc_org:
+                org_id = str(rcc_org["id"])
+                # 查是否已有该任务的 RCC 申请
+                exist = (await db.execute(_rt(
+                    "SELECT count(*) FROM rcc_tasks WHERE request_context->>'followup_task_id' = :tid AND status IN ('pending','approved','executing')"
+                ), {"tid": task_id})).scalar_one()
+                if not exist:
+                    task_type = {"material": "resource_allocation", "supplier": "supplier_followup",
+                                 "equipment": "equipment_maintenance", "approval": "approval",
+                                 "staff": "manpower", "data": "data_fix"}.get(block_category, "resource_allocation")
+                    rcc_code = f"RCC-{str(uuid.uuid4())[:8].upper()}"
+                    rcc_task_id = str(uuid.uuid4())
+                    await db.execute(_rt(
+                        "INSERT INTO rcc_tasks (id, task_code, org_unit_id, task_type, title, description, "
+                        "affected_params, affected_entities, expected_impact_summary, status, requested_by, "
+                        "request_context, created_at, updated_at) "
+                        "VALUES (:id, :code, :org, :tt, :title, :desc, '[]'::jsonb, :ents, :impact, 'pending', "
+                        ":req, :ctx, NOW(), NOW())"
+                    ), {
+                        "id": rcc_task_id, "code": rcc_code, "org": org_id, "tt": task_type,
+                        "title": f"[任务受阻] {task['title'][:80]}",
+                        "desc": str(conclusion.get("note") or "")[:500],
+                        "ents": json.dumps([{"type": "followup_task", "id": task_id}], ensure_ascii=False),
+                        "impact": f"任务受阻于 {blocked_by or '未知'}（{block_category}），需 RCC 调度资源解决",
+                        "req": "followup_agent", "ctx": json.dumps({"followup_task_id": task_id}, ensure_ascii=False),
+                    })
+                    await db.commit()
+        except Exception:
+            pass  # RCC 提交失败不影响任务主体流程
+
     await db.execute(text("""
         UPDATE followup_tasks
         SET status = :st, progress_pct = :pct, last_follow_at = NOW(), last_follow_note = :note,

@@ -71,13 +71,13 @@ async def create_rcc_task(payload: Dict[str, Any], db: AsyncSession = Depends(ge
 
 
 @router.post("/tasks/{task_id}/approve", summary="审批通过RCC任务")
-async def approve_rcc_task(task_id: str, comment: str = "", db: AsyncSession = Depends(get_db)):
-    """审批通过RCC任务"""
+async def approve_rcc_task(task_id: str, comment: str = "", approver_id: str = "current_user", db: AsyncSession = Depends(get_db)):
+    """审批通过RCC任务（approver_id 默认 current_user，可显式传）"""
     from core.rcc.services import RCCTaskService
 
     service = RCCTaskService(db)
     try:
-        task = await service.approve_task(task_id, approver_id="current_user", comment=comment)
+        task = await service.approve_task(task_id, approver_id=approver_id, comment=comment)
         return {"success": True, "data": {"id": task.id, "status": task.status}}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -86,13 +86,13 @@ async def approve_rcc_task(task_id: str, comment: str = "", db: AsyncSession = D
 
 
 @router.post("/tasks/{task_id}/reject", summary="拒绝RCC任务")
-async def reject_rcc_task(task_id: str, reason: str, db: AsyncSession = Depends(get_db)):
-    """拒绝RCC任务"""
+async def reject_rcc_task(task_id: str, reason: str, approver_id: str = "current_user", db: AsyncSession = Depends(get_db)):
+    """拒绝RCC任务（approver_id 默认 current_user，可显式传）"""
     from core.rcc.services import RCCTaskService
 
     service = RCCTaskService(db)
     try:
-        task = await service.reject_task(task_id, approver_id="current_user", reason=reason)
+        task = await service.reject_task(task_id, approver_id=approver_id, reason=reason)
         return {"success": True, "data": {"id": task.id, "status": task.status}}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

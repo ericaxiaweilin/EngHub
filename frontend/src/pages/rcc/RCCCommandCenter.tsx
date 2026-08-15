@@ -7,7 +7,7 @@ import { Layout, Menu, Space, Tag, Badge, Select, Button, message, Spin, Tooltip
 import {
   DashboardOutlined, TeamOutlined, ToolOutlined, ThunderboltOutlined,
   FundOutlined, ReloadOutlined, ApiOutlined, ClockCircleOutlined,
-  AlertOutlined, SettingOutlined, RadarChartOutlined
+  AlertOutlined, SettingOutlined, RadarChartOutlined, CarryOutOutlined
 } from '@ant-design/icons'
 import axios from 'axios'
 import { useSearchParams } from 'react-router-dom'
@@ -16,6 +16,7 @@ import RCCResourceBoard from './RCCResourceBoard'
 import RCCDecisionHub from './RCCDecisionHub'
 import RCCAnalysis from './RCCAnalysis'
 import RCCOrgBubbles from './RCCOrgBubbles'
+import RCCDispatchCenter from './RCCDispatchCenter'
 
 const API_BASE = '/api/v1/rcc'
 const { Sider, Content, Header } = Layout
@@ -60,7 +61,7 @@ export { COLORS }
 export default function RCCCommandCenter() {
   const [searchParams, setSearchParams] = useSearchParams()
   const initialView = searchParams.get('view') || 'overview'
-  const [activeView, setActiveView] = useState(['overview', 'org-bubbles', 'resources', 'decisions', 'analysis'].includes(initialView) ? initialView : 'overview')
+  const [activeView, setActiveView] = useState(['overview', 'org-bubbles', 'resources', 'decisions', 'analysis', 'dispatch'].includes(initialView) ? initialView : 'overview')
   const [factoryId, setFactoryId] = useState(() => localStorage.getItem('active_factory_id') || 'FAC_ELEC_DEMO_2026')
   const [baseline, setBaseline] = useState<any>({})
   const [decisions, setDecisions] = useState<any>({})
@@ -110,6 +111,7 @@ export default function RCCCommandCenter() {
     { key: 'org-bubbles', icon: <TeamOutlined />, label: '任务智慧中心' },
     { key: 'resources', icon: <RadarChartOutlined />, label: '资源调度' },
     { key: 'decisions', icon: <ThunderboltOutlined />, label: '决策中心' },
+    { key: 'dispatch', icon: <CarryOutOutlined />, label: '调度任务' },
     { key: 'analysis', icon: <FundOutlined />, label: '瓶颈分析' },
   ]
 
@@ -200,6 +202,7 @@ export default function RCCCommandCenter() {
               {activeView === 'resources' && <RCCResourceBoard />}
               {activeView === 'decisions' && <RCCDecisionHub />}
               {activeView === 'analysis' && <RCCAnalysis />}
+              {activeView === 'dispatch' && <RCCDispatchCenter />}
             </Spin>
           </Content>
         </Layout>

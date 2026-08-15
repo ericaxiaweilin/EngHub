@@ -78,6 +78,22 @@ class RCCTaskService:
         
         await self.db.commit()
         await self.db.refresh(task)
+
+        # ── RCC 审批 → 回写任务中心：批准后解除关联 followup 任务阻塞，触发重新跟进 ──
+        try:
+            from sqlalchemy import text as _rt
+            ctx = task.request_context or {}
+            ftid = ctx.get("followup_task_id") if isinstance(ctx, dict) else None
+            if ftid:
+                await self.db.execute(_rt(
+                    "UPDATE followup_tasks SET status='open', progress_pct=LEAST(progress_pct + 10, 90), "
+                    "blocked_by=NULL, block_category=NULL, next_follow_at=NOW(), "
+                    "last_follow_note=COALESCE(last_follow_note || '；', '') || :note, updated_at=NOW() "
+                    "WHERE id = :tid AND status = 'blocked'"
+                ), {"tid": str(ftid), "note": f"RCC 调度审批通过（{approver_id}），已解除阻塞重新跟进"})
+                await self.db.commit()
+        except Exception:
+            pass
         return task
     
     async def reject_task(self, task_id: str, approver_id: str, reason: str) -> Any:
