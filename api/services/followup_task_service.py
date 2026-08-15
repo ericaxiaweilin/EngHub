@@ -594,8 +594,10 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                         arguments = json.loads(fn.get("arguments") or "{}")
                     except (json.JSONDecodeError, TypeError):
                         arguments = {}
+                    # 数字员工身份闭环：采购智能体以 procurement 账户身份执行工具
+                    follow_operator = "procurement" if task.get("agent_key") == "procurement_agent" else "task_center"
                     result = await execute_tool(db, tool_name, arguments,
-                                                operator="task_center", factory_id=factory_id)
+                                                operator=follow_operator, factory_id=factory_id)
                 messages.append({
                     "role": "tool", "tool_call_id": tc.get("id", ""),
                     "content": json.dumps(result, ensure_ascii=False, default=str)[:4000],
@@ -648,13 +650,19 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
     await _append_log(db, task_id, factory_id, trigger_type,
                       conclusion["note"], new_status, conclusion["progress_pct"], "system")
 
-    # 状态推进 / 完成 / 受阻 → 通知任务所有人
+    # 状态推进 / 完成 / 受阻 → 通知任务所有人（含数字员工账户）
     if new_status == "done":
         await _notify(db, factory_id, task["created_by"],
                       f"任务已完成：{task['title']}", conclusion["note"], "info")
+        if task.get("agent_key") == "procurement_agent":
+            await _notify(db, factory_id, "procurement",
+                          f"任务已完成：{task['title']}", conclusion["note"], "info")
     elif new_status == "blocked":
         await _notify(db, factory_id, task["created_by"],
                       f"任务跟进受阻：{task['title']}", conclusion["note"], "warning")
+        if task.get("agent_key") == "procurement_agent":
+            await _notify(db, factory_id, "procurement",
+                          f"任务跟进受阻：{task['title']}", conclusion["note"], "warning")
     await db.commit()
     return {"task_id": task_id, "status": new_status,
             "progress_pct": conclusion["progress_pct"], "note": conclusion["note"]}
