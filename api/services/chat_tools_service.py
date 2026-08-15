@@ -2863,6 +2863,186 @@ async def _tool_query_my_tasks(db: AsyncSession, args: Dict[str, Any], factory_i
     except Exception as exc:  # noqa: BLE001
         return {"error": f"任务查询失败: {type(exc).__name__}: {exc}"}
 
+async def _tool_query_purchase_pipeline(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """采购管道全景：PR/PO/供应商报价，按物料过滤。"""
+    fid = factory_id or "FAC_MECH_001"
+    mat = str(args.get("material_code") or "").strip()
+    status = str(args.get("status") or "").strip()
+    limit = max(1, min(int(args.get("limit") or 10), 30))
+    cond = "factory_id = :fid"
+    params: Dict[str, Any] = {"fid": fid, "limit": limit}
+    if mat:
+        cond += " AND material_code = :mat"
+        params["mat"] = mat
+    if status:
+        cond += " AND status = :st"
+        params["st"] = status
+    prs = (await db.execute(text(
+        f"SELECT id, pr_code, material_code, material_name, qty, unit, status, supplier_id, lead_time_days, source, created_at "
+        f"FROM purchase_requisitions WHERE {cond} ORDER BY created_at DESC LIMIT :limit"
+    ), params)).mappings().all()
+    pos = (await db.execute(text(
+        f"SELECT po_code, pr_id, supplier_name, material_code, qty, unit_price, status, expected_date, actual_date "
+        f"FROM purchase_orders WHERE {cond} ORDER BY order_date DESC LIMIT :limit"
+    ), params)).mappings().all()
+    return {
+        "type": "purchase_pipeline",
+        "factory_id": fid,
+        "material_filter": mat or "(全部)",
+        "purchase_requests_count": len(prs),
+        "purchase_orders_count": len(pos),
+        "purchase_requests": [dict(r) for r in prs],
+        "purchase_orders": [dict(r) for r in pos],
+        "note": "PR=采购申请(purchase_requisitions 正表, PENDING→指派供应商→converted)，PO=采购订单(已下单待到货)。",
+    }
+
+
+async def _tool_create_purchase_requisition(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """创建采购申请（确定性，写 purchase_requisitions 正表）：同物料已有 PENDING PR 则更新数量，否则新建。"""
+    fid = factory_id or "FAC_MECH_001"
+    mat = str(args.get("material_code") or "").strip()
+    qty = float(args.get("required_qty") or 0)
+    if not mat or qty <= 0:
+        return {"error": "缺少物料编码或数量不合法"}
+    name = str(args.get("material_name") or mat)
+    exist = (await db.execute(text(
+        "SELECT id, qty FROM purchase_requisitions WHERE factory_id=:f AND material_code=:m AND status='PENDING' LIMIT 1"
+    ), {"f": fid, "m": mat})).mappings().first()
+    if exist:
+        new_qty = float(exist["qty"]) + qty
+        await db.execute(text(
+            "UPDATE purchase_requisitions SET qty=:q, updated_at=NOW() WHERE id=:id"
+        ), {"q": new_qty, "id": exist["id"]})
+        await db.commit()
+        return {"type": "purchase_requisition", "action": "updated", "pr_id": exist["id"],
+                "material_code": mat, "requested_qty": new_qty, "status": "PENDING"}
+    pr_id = str(uuid.uuid4())
+    pr_code = f"PR-{mat}-{str(uuid.uuid4())[:6].upper()}"
+    await db.execute(text(
+        "INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, material_code, material_name, "
+        "qty, unit, status, auto_approved, created_by, created_at, updated_at) "
+        "VALUES (:id, :f, :pc, 'procurement_agent', :m, :n, :q, 'PCS', 'PENDING', FALSE, :src, NOW(), NOW())"
+    ), {"id": pr_id, "f": fid, "pc": pr_code, "m": mat, "n": name, "q": qty, "src": operator or "procurement_agent"})
+    await db.commit()
+    return {"type": "purchase_requisition", "action": "created", "pr_id": pr_id, "pr_code": pr_code,
+            "material_code": mat, "material_name": name, "requested_qty": qty, "status": "PENDING"}
+
+
+async def _tool_assign_supplier_to_pr(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """比价指派供应商：优先 supplier_prices 最低价，无价格表则按供应商评分/是否批准。"""
+    fid = factory_id or "FAC_MECH_001"
+    pr_id = str(args.get("pr_id") or "").strip()
+    if not pr_id:
+        return {"error": "缺少 pr_id"}
+    pr = (await db.execute(text(
+        "SELECT id, material_code, qty, status FROM purchase_requisitions WHERE id=:id AND factory_id=:f"
+    ), {"id": pr_id, "f": fid})).mappings().first()
+    if not pr:
+        return {"error": f"采购申请 {pr_id} 不存在"}
+    prefer = str(args.get("prefer_supplier_id") or "").strip()
+    supplier = None
+    if prefer:
+        supplier = (await db.execute(text(
+            "SELECT id, supplier_code, supplier_name, rating, on_time_rate, avg_lead_days FROM suppliers WHERE id=:id AND factory_id=:f"
+        ), {"id": prefer, "f": fid})).mappings().first()
+    else:
+        prices = (await db.execute(text(
+            "SELECT sp.supplier_id, sp.unit_price, sp.lead_days, s.supplier_name, s.rating, s.avg_lead_days "
+            "FROM supplier_prices sp JOIN suppliers s ON s.id = sp.supplier_id "
+            "WHERE sp.material_code=:m AND sp.is_active=TRUE AND s.factory_id=:f "
+            "ORDER BY sp.unit_price ASC, s.rating DESC LIMIT 1"
+        ), {"m": pr["material_code"], "f": fid})).mappings().first()
+        if prices:
+            supplier = prices
+        else:
+            supplier = (await db.execute(text(
+                "SELECT id, supplier_code, supplier_name, rating, on_time_rate, avg_lead_days FROM suppliers "
+                "WHERE factory_id=:f AND is_approved=TRUE ORDER BY rating DESC, on_time_rate DESC LIMIT 1"
+            ), {"f": fid})).mappings().first()
+    if not supplier:
+        return {"error": "无可用供应商（需先在 suppliers 注册）"}
+    await db.execute(text(
+        "UPDATE purchase_requisitions SET supplier_id=:s, lead_time_days=:ld, updated_at=NOW() WHERE id=:id"
+    ), {"s": supplier["id"], "ld": supplier.get("avg_lead_days") or 7, "id": pr_id})
+    await db.commit()
+    return {"type": "supplier_assignment", "action": "assigned", "pr_id": pr_id,
+            "material_code": pr["material_code"],
+            "supplier_id": supplier["id"], "supplier_name": supplier.get("supplier_name") or supplier.get("supplier_code"),
+            "price": float(supplier.get("unit_price") or 0) if supplier.get("unit_price") is not None else None,
+            "lead_days": supplier.get("lead_days"),
+            "status": "assigned"}
+
+
+async def _tool_create_purchase_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """转采购订单：PR(assigned) → PO(ordered)。"""
+    fid = factory_id or "FAC_MECH_001"
+    pr_id = str(args.get("pr_id") or "").strip()
+    if not pr_id:
+        return {"error": "缺少 pr_id"}
+    pr = (await db.execute(text(
+        "SELECT id, material_code, material_name, qty, unit, supplier_id, status, lead_time_days FROM purchase_requisitions "
+        "WHERE id=:id AND factory_id=:f"
+    ), {"id": pr_id, "f": fid})).mappings().first()
+    if not pr:
+        return {"error": f"采购申请 {pr_id} 不存在"}
+    if str(pr["status"]).upper() not in ("ASSIGNED", "PENDING") or not pr["supplier_id"]:
+        return {"error": f"采购申请 {pr_id} 尚未指派供应商（请先 assign_supplier_to_pr）"}
+    sup = (await db.execute(text(
+        "SELECT id, supplier_name, avg_lead_days FROM suppliers WHERE id=:id"
+    ), {"id": pr["supplier_id"]})).mappings().first()
+    if not sup:
+        return {"error": "供应商不存在"}
+    lead = int(args.get("expected_days") or pr.get("lead_time_days") or sup.get("avg_lead_days") or 7)
+    price_row = (await db.execute(text(
+        "SELECT unit_price FROM supplier_prices WHERE supplier_id=:s AND material_code=:m AND is_active=TRUE LIMIT 1"
+    ), {"s": pr["supplier_id"], "m": pr["material_code"]})).mappings().first()
+    price = float(price_row["unit_price"]) if price_row else None
+    po_code = f"PO-{pr['material_code']}-{str(uuid.uuid4())[:6].upper()}"
+    po_id = str(uuid.uuid4())
+    await db.execute(text(
+        "INSERT INTO purchase_orders (id, factory_id, po_code, pr_id, supplier_id, supplier_name, "
+        "material_code, material_name, qty, unit_price, total_amount, currency, order_date, expected_date, status, auto_generated, created_at, updated_at) "
+        "VALUES (:id, :f, :po, :pr, :s, :sn, :m, :mn, :q, :p, :t, 'CNY', CURRENT_DATE, CURRENT_DATE + CAST(:lead AS integer), 'ordered', TRUE, NOW(), NOW())"
+    ), {"id": po_id, "f": fid, "po": po_code, "pr": pr_id, "s": pr["supplier_id"], "sn": sup["supplier_name"],
+        "m": pr["material_code"], "mn": pr["material_name"] or pr["material_code"], "q": pr["qty"],
+        "p": price, "t": float(price * pr["qty"]) if price else None, "lead": lead})
+    await db.execute(text(
+        "UPDATE purchase_requisitions SET status='converted', purchase_code=:pc, updated_at=NOW() WHERE id=:id"
+    ), {"id": pr_id, "pc": po_code})
+    await db.commit()
+    return {"type": "purchase_order", "action": "created", "po_id": po_id, "po_code": po_code,
+            "pr_id": pr_id, "material_code": pr["material_code"], "qty": float(pr["qty"]),
+            "supplier_name": sup["supplier_name"], "unit_price": price,
+            "expected_date": f"+{lead}天", "status": "ordered",
+            "note": "采购订单已下单，进入跟催阶段。"}
+
+
+async def _tool_query_purchase_order_progress(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """跟催 PO：未到货的采购订单列表。"""
+    fid = factory_id or "FAC_MECH_001"
+    status = str(args.get("status") or "").strip()
+    limit = max(1, min(int(args.get("limit") or 10), 30))
+    cond = "factory_id = :f"
+    params: Dict[str, Any] = {"f": fid, "limit": limit}
+    if status:
+        cond += " AND status = :st"
+        params["st"] = status
+    else:
+        cond += " AND status NOT IN ('arrived', 'completed', 'cancelled')"
+    rows = (await db.execute(text(
+        f"SELECT po_code, supplier_name, material_code, material_name, qty, status, order_date, expected_date, actual_date "
+        f"FROM purchase_orders WHERE {cond} ORDER BY expected_date ASC LIMIT :limit"
+    ), params)).mappings().all()
+    import datetime as _dt
+    overdue = sum(1 for r in rows if r["expected_date"] and str(r["status"]) not in ("arrived", "completed") and r["expected_date"] < _dt.date.today())
+    return {"type": "purchase_order_progress", "factory_id": fid, "pending_po_count": len(rows),
+            "overdue_count": overdue,
+            "purchase_orders": [dict(r) for r in rows],
+            "note": "跟催对象：未到货 PO（按期望交期排序，逾期优先）。",
+    }
+
+
+
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
     "query_order_work_order_status": _tool_query_order_work_order_status,
@@ -3369,6 +3549,11 @@ async def _tool_query_sales_order_detail(db: AsyncSession, args: Dict[str, Any],
 
 
 _TOOL_EXECUTORS["create_followup_task"] = _tool_create_followup_task
+_TOOL_EXECUTORS["query_purchase_pipeline"] = _tool_query_purchase_pipeline
+_TOOL_EXECUTORS["create_purchase_requisition"] = _tool_create_purchase_requisition
+_TOOL_EXECUTORS["assign_supplier_to_pr"] = _tool_assign_supplier_to_pr
+_TOOL_EXECUTORS["create_purchase_order"] = _tool_create_purchase_order
+_TOOL_EXECUTORS["query_purchase_order_progress"] = _tool_query_purchase_order_progress
 _TOOL_EXECUTORS["query_product_bom"] = _tool_query_product_bom
 _TOOL_EXECUTORS["create_product_bom"] = _tool_create_product_bom
 _TOOL_EXECUTORS["query_sales_order_detail"] = _tool_query_sales_order_detail

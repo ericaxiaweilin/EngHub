@@ -42,7 +42,7 @@ AGENT_KEYWORD_RULES: List[tuple] = [
 # 各智能体在 chatbot 会话中的工具偏好（用于调度提示词）
 AGENT_TOOL_HINTS: Dict[str, str] = {
     "dispatch_agent": "query_work_orders / get_work_order_detail / release_work_order / query_skill_matrix",
-    "procurement_agent": "query_inventory / query_shortage_alerts / run_workflow",
+    "procurement_agent": "query_purchase_pipeline / create_purchase_requisition / assign_supplier_to_pr / create_purchase_order / query_purchase_order_progress / query_inventory / query_shortage_alerts",
     "quality_agent": "query_defects / query_spc_anomalies / query_ocap_tasks / get_inspection_form",
     "delivery_agent": "query_work_orders / get_production_summary / query_alert_reviews",
     "escalation_agent": "get_pending_alerts / acknowledge_alert / run_alert_patrol",
@@ -123,6 +123,17 @@ def build_agent_system_prompt(agent_key: str) -> Optional[str]:
     agent = AGENTS.get(agent_key)
     if not agent:
         return None
+    if agent_key == "procurement_agent":
+        return (
+            "你是采购智能体（procurement_agent），职责是 MRP→比价→下单→跟催的完整采购动作链。\n"
+            "跟进任务时请按动作链推进，而不是只查询状态：\n"
+            "1) query_purchase_pipeline 查采购管道（PR/PO/供应商）；\n"
+            "2) 有缺料且无在途采购 → create_purchase_requisition 生成采购申请；\n"
+            "3) assign_supplier_to_pr 为申请比价指派供应商；\n"
+            "4) create_purchase_order 转采购订单（下单）；\n"
+            "5) query_purchase_order_progress 跟催未到货 PO（逾期优先）。\n"
+            "每次跟进至少推进一个动作，并在结论中说明本次执行的动作与下一步。"
+        )
     hints = AGENT_TOOL_HINTS.get(agent_key, "")
     return (
         f"【智能体调度】用户已指定由「{agent['name']}」处理本次会话。"
