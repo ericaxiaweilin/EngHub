@@ -901,6 +901,20 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_my_tasks",
+            "description": "查询任务中心的任务：我的任务（指派给我的/我创建的）、受阻任务、进行中任务，支持按状态过滤。用于'我的任务''有哪些任务在跟进''指派给我的任务''任务中心有什么''哪些任务受阻了'类请求。返回任务列表（标题/状态/跟进次数/进度/负责人）。",            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "description": "查询范围：mine(指派给我或我创建的，默认)/all(全部)/blocked(仅受阻)/open(进行中)/done(已完成)"},
+                    "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
+                    "agent_key": {"type": "string", "description": "按负责智能体过滤（可选）"},
+                },
+            },
+        },
+    },
 ]
 
 TOOL_DEFINITIONS.extend([
@@ -2782,6 +2796,54 @@ async def _tool_run_virtual_factory_pulse(
 
 
 # 执行器注册表
+
+
+async def _tool_query_my_tasks(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
+    """查询任务中心任务（我的/全部/受阻/进行中/已完成），供 chatbot 承担智能中心角色。"""
+    from sqlalchemy import text
+
+    scope = str(args.get("scope") or "mine").strip().lower()
+    limit = max(1, min(int(args.get("limit") or 10), 30))
+    agent_key = str(args.get("agent_key") or "").strip()
+    factory_id = factory_id or "FAC_MECH_001"
+    status_map = {"blocked": "blocked", "open": "open", "done": "done", "cancelled": "cancelled"}
+
+    conds = ["factory_id = :fid"]
+    params = {"fid": factory_id, "lim": limit}
+    if scope in status_map:
+        conds.append("status = :st")
+        params["st"] = status_map[scope]
+    elif scope in ("mine", "my"):
+        conds.append("(created_by = :me OR assigned_to = :me)")
+        params["me"] = operator or ""
+    if agent_key:
+        conds.append("agent_key = :ak")
+        params["ak"] = agent_key
+
+    try:
+        sql = f"""
+            SELECT id, title, status, progress_pct, follow_count, max_follows,
+                   agent_key, created_by, assigned_to, next_follow_at, updated_at,
+                   left(COALESCE(last_follow_note, ''), 200) AS last_note
+            FROM followup_tasks
+            WHERE {' AND '.join(conds)}
+            ORDER BY CASE status WHEN 'blocked' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
+                     updated_at DESC
+            LIMIT :lim
+        """
+        rows = (await db.execute(text(sql), params)).mappings().all()
+        items = [dict(r) for r in rows]
+        return {
+            "type": "task_center",
+            "factory_id": factory_id,
+            "scope": scope,
+            "count": len(items),
+            "tasks": items,
+            "note": "任务中心实时数据（followup_tasks）。blocked=受阻待处理/冷却中自动重试，open=跟进中，done=已完成。",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"任务查询失败: {type(exc).__name__}: {exc}"}
+
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
     "query_order_work_order_status": _tool_query_order_work_order_status,
@@ -2816,6 +2878,7 @@ _TOOL_EXECUTORS = {
     "create_online_pivot": _tool_create_online_pivot,
     "get_pending_alerts": _tool_get_pending_alerts,
     "query_ocap_tasks": _tool_query_ocap_tasks,  # OCAP待办任务查询（chatbot集成）
+    "query_my_tasks": _tool_query_my_tasks,  # 任务中心查询（chatbot集成）
     "query_alert_reviews": _tool_query_alert_reviews,
     "acknowledge_alert": _tool_acknowledge_alert,
     "run_alert_patrol": _tool_run_alert_patrol,
