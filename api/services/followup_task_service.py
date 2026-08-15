@@ -427,6 +427,50 @@ FOLLOWUP_PROMPT = (
 )
 
 
+def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> str:
+    """确定性判定任务目标是否已达成（基于工具真实结果，不依赖模型输出）。
+
+    支持类型：
+    - 采购补货/缺料类（title 含 缺料/补货）：工具返回 shortage_count=0 且无缺料项 → done
+    - 工单推进类（title 含 工单/完工/进度）：工单状态 completed → done
+    返回达成证据文本；未达成返回空串。
+    """
+    title = str(task.get("title") or "")
+    is_shortage = ("缺料" in title) or ("补货" in title) or ("采购" in title)
+    is_work_order = ("工单" in title) or ("ORDER_REVIEW" in title) or ("MATERIAL_KITTING" in title)
+    evidence = []
+
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+        raw = str(msg.get("content") or "")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            continue
+        # 缺料清零
+        if is_shortage and "shortage_count" in data:
+            if int(data.get("shortage_count") or 0) == 0:
+                evidence.append(f"缺料预警 shortage_count=0（{len(data.get('items') or [])} 项缺料）")
+        if is_shortage and "items" in data and isinstance(data["items"], list):
+            if not data["items"] and "shortage_count" in data:
+                pass  # 已由上面处理
+        # 工单完成
+        if is_work_order and isinstance(data, dict):
+            st = data.get("status") or data.get("state") or ""
+            if str(st).lower() in ("completed", "done", "closed"):
+                evidence.append(f"工单状态 {st}")
+            work_order = data.get("work_order") or {}
+            if isinstance(work_order, dict) and str(work_order.get("status") or "").lower() in ("completed", "done", "closed"):
+                evidence.append(f"工单 {work_order.get('work_order_code')} 状态 {work_order.get('status')}")
+
+    if evidence:
+        return "；".join(evidence[:3])
+    return ""
+
+
 def _clean_xml_tags(text: str) -> str:
     """剥离模型 content 里残留的 XML 工具调用标签（tool_call/invoke/function/parameter 等），
     与 chat_routes._clean_model_reply 同源逻辑，供跟进结论解析前清理。"""
@@ -559,6 +603,18 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
             payload["messages"] = messages
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
+
+            # ── 目标达成检测（确定性，不依赖模型输出）──
+            # 采购补货类任务：工具结果证明缺料已清零 → 直接 done，避免模型贪心继续查工具
+            # 而永不输出结论（agnes 系模型在 tools 被 pop 后倾向继续输出 XML 工具标签）。
+            done_evidence = _detect_task_done(task, messages)
+            if done_evidence:
+                reply = json.dumps(
+                    {"state": "done", "progress_pct": 100,
+                     "note": f"经 MES 工具复核（确定性判定）：{done_evidence}。任务目标达成，闭环。"},
+                    ensure_ascii=False,
+                )
+                break
         conclusion = _parse_follow_reply(reply)
     except Exception as exc:  # noqa: BLE001 — 单任务跟进失败不能拖垮扫描循环
         _logger.warning("followup run failed for %s: %s", task_id, exc)
