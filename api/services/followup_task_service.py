@@ -892,6 +892,33 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                             "blocked_by": "供应商", "block_category": "supplier",
                         }, ensure_ascii=False)
                     break
+
+        # ── 采购任务确定性终判（模型没调工具/无结论时兜底）──
+        # 模型直接输出结论但未调工具 → 循环空转，这里按 DB 真实状态终判
+        if task.get("agent_key") == "procurement_agent":
+            _title = str(task.get("title") or "")
+            _tm = (re.search(r"缺料[:：\s]*([\w\-]+)", _title)
+                   or re.search(r"物料[:：\s]*([\w\-]+)\s*缺料", _title)
+                   or re.search(r"物料\s+([\w\-]+)\s*缺料", _title)
+                   or re.search(r"缺料\s+([\w\-]+)", _title))
+            if _tm and "done" not in str(reply):
+                _inv3 = (await db.execute(text(
+                    "SELECT COALESCE(SUM(available_qty), 0) AS avail FROM inventory WHERE material_code = :m"
+                ), {"m": _tm.group(1)})).mappings().first()
+                if _inv3 and float(_inv3["avail"] or 0) > 0:
+                    reply = json.dumps({
+                        "state": "done", "progress_pct": 100,
+                        "note": f"确定性判定：物料 {_tm.group(1)} 库存 {_inv3['avail']} 已补齐，"
+                                f"任务目标达成，闭环。",
+                    }, ensure_ascii=False)
+                else:
+                    # 仍缺料 → 纯 DB 结论 blocked（在途PO/待补货），触发 RCC 调度申请
+                    reply = json.dumps({
+                        "state": "blocked", "progress_pct": min(90, int(task.get("progress_pct") or 0) + 10),
+                        "note": f"确定性判定：物料 {_tm.group(1)} 库存仍不足（{_inv3['avail']}），"
+                                f"等待采购/到货解决，保持受阻并已提交 RCC 资源调度。",
+                        "blocked_by": "供应商", "block_category": "supplier",
+                    }, ensure_ascii=False)
         conclusion = _parse_follow_reply(reply)
     except Exception as exc:  # noqa: BLE001 — 单任务跟进失败不能拖垮扫描循环
         _logger.warning("followup run failed for %s: %s", task_id, exc)
@@ -907,7 +934,8 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         try:
             _t = str(task.get("title") or "")
             if ("缺料" in _t) and "可用" in _t and "<" in _t and "需求" in _t:
-                _m = re.search(r"缺料[:：]\s*([\w\-]+)", _t)
+                _m = (re.search(r"缺料[:：]\s*([\w\-]+)", _t)
+                      or re.search(r"物料[:：]\s*([\w\-]+)\s*缺料", _t))
                 _nums = re.findall(r"(\d+(?:\.\d+)?)", _t)
                 if _m and len(_nums) >= 2:
                     _need = float(_nums[1])
@@ -941,6 +969,14 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                     )
         except Exception:
             pass
+
+    # 审批守卫：标题含"审批/待批准"且任务初始 blocked → 保持 blocked（审批未完成前不放行）
+    if new_status != "blocked":
+        _t2 = str(task.get("title") or "")
+        if ("审批" in _t2 or "待批准" in _t2 or "待审批" in _t2) and task.get("status") == "blocked":
+            new_status = "blocked"
+            conclusion["state"] = "blocked"
+            conclusion["note"] = "审批未完成：任务等待审批人批准，保持受阻并已提交 RCC 审批升级。"
     reached_limit = follow_count >= int(task.get("max_follows") or 60) and new_status not in {"done"}
     if reached_limit:
         new_status = "blocked"
