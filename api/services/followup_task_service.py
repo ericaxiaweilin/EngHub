@@ -758,6 +758,12 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         for _ in range(FOLLOW_MAX_TOOL_ROUNDS):
             # 超时钳制：模型栈路由默认 30s 对工具链跟进太紧（ReadTimeout 频发），下限 90s
             resp = await _call_llm(payload, request_timeout=max(90.0, route["request_timeout"]))
+            # 429 限流 → 退避重试（最多3次，限流是暂时的，重试可恢复）
+            for _retry in range(3):
+                if resp.status_code != 429:
+                    break
+                await asyncio.sleep(3 * (_retry + 1))
+                resp = await _call_llm(payload, request_timeout=max(90.0, route["request_timeout"]))
             if resp.status_code >= 400:
                 reply = f"网关返回 {resp.status_code}，本次跟进未获结论"
                 break
@@ -915,6 +921,24 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                             f"缺料确认：物料 {_m.group(1)} 库存 {float(_inv['avail'] or 0)} < 需求 {_need}，"
                             f"仍未补齐，保持受阻并已提交 RCC 资源调度申请。"
                         )
+        except Exception:
+            pass
+
+    # 设备故障守卫：设备智能体任务标题含设备号 → 查设备 broken/fault → 强制 blocked（触发 RCC 维修调度）
+    if new_status != "blocked" and task.get("agent_key") == "equipment_agent":
+        try:
+            _em = re.search(r"(EQ-[\w\-]+)", str(task.get("title") or ""))
+            if _em:
+                _eq = (await db.execute(text(
+                    "SELECT status FROM equipment WHERE equipment_code = :ec"
+                ), {"ec": _em.group(1)})).mappings().first()
+                if _eq and _eq["status"] in ("broken", "fault", "maintenance"):
+                    new_status = "blocked"
+                    conclusion["state"] = "blocked"
+                    conclusion["note"] = (
+                        f"设备故障确认：{_em.group(1)} 状态 {_eq['status']}，未恢复，"
+                        f"保持受阻并已提交 RCC 维修调度。"
+                    )
         except Exception:
             pass
     reached_limit = follow_count >= int(task.get("max_follows") or 60) and new_status not in {"done"}
