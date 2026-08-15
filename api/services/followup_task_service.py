@@ -816,6 +816,29 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
 
     new_status = "done" if conclusion["state"] == "done" else conclusion["state"]
     follow_count = int(task.get("follow_count") or 0) + 1
+
+    # 缺料确认守卫：标题声明缺料且 DB 校验真实仍缺（可用 < 需求）→ 强制 blocked，
+    # 不因模型"无结论/open"而放行；blocked 会触发 RCC 资源调度申请。
+    if new_status != "blocked":
+        try:
+            _t = str(task.get("title") or "")
+            if ("缺料" in _t) and "可用" in _t and "<" in _t and "需求" in _t:
+                _m = re.search(r"缺料[:：]\s*([\w\-]+)", _t)
+                _nums = re.findall(r"(\d+(?:\.\d+)?)", _t)
+                if _m and len(_nums) >= 2:
+                    _need = float(_nums[1])
+                    _inv = (await db.execute(text(
+                        "SELECT COALESCE(SUM(available_qty), 0) AS avail FROM inventory WHERE material_code = :m"
+                    ), {"m": _m.group(1)})).mappings().first()
+                    if _inv and float(_inv["avail"] or 0) < _need:
+                        new_status = "blocked"
+                        conclusion["state"] = "blocked"
+                        conclusion["note"] = (
+                            f"缺料确认：物料 {_m.group(1)} 库存 {float(_inv['avail'] or 0)} < 需求 {_need}，"
+                            f"仍未补齐，保持受阻并已提交 RCC 资源调度申请。"
+                        )
+        except Exception:
+            pass
     reached_limit = follow_count >= int(task.get("max_follows") or 60) and new_status not in {"done"}
     if reached_limit:
         new_status = "blocked"
