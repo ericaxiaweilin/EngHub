@@ -11,6 +11,7 @@ RCC资源决策引擎 — 基于基线数据生成资源调度决策
 - process_response: 工艺参数偏离时的决策
 """
 
+import json
 import uuid
 from datetime import datetime, timezone, date, timedelta
 from typing import Optional, List, Dict, Any
@@ -136,6 +137,55 @@ class RCCResourceDecisionEngine:
                             "risk": "交期风险" if w["priority"] == "urgent" else "关注",
                         })
             result["affected_work_orders"] = affected_work_orders
+
+            # 缺勤率≥10%（critical）→ 自动生成 RCC 调度任务（人力借调申请），数字员工闭环
+            for station in stations:
+                if station["leave_rate_pct"] >= 10:
+                    # 查是否已有该工位的人力调度申请（幂等）
+                    exists = await self.db.execute(sql_text("""
+                        SELECT 1 FROM rcc_tasks
+                        WHERE task_type = 'manpower'
+                          AND title ILIKE '%' || :st || '%缺勤%'
+                          AND status IN ('pending','approved','executing')
+                        LIMIT 1
+                    """), {"st": station["station"]})
+                    if not exists.mappings().first():
+                        trans = next((t for t in result["suggested_transfers"]
+                                      if t.get("to_station") == station["station"]), None)
+                        source = trans["from_station"] if trans else "其他工位"
+                        count = trans["suggested_count"] if trans else station["on_leave"]
+                        await self.db.execute(sql_text("""
+                            INSERT INTO rcc_tasks
+                              (id, task_code, org_unit_id, task_type, title, description,
+                               status, requested_by, expected_impact_summary, request_context, created_at, updated_at)
+                            VALUES
+                              (gen_random_uuid()::text,
+                               'RCC-' || upper(substr(md5(random()::text), 1, 8)),
+                               :org_id, 'manpower', :title, :desc,
+                               'pending', 'RCCResourceDecisionEngine',
+                               :impact,
+                               CAST(:ctx AS jsonb),
+                               NOW(), NOW())
+                        """), {
+                            "org_id": "fb8337eb-c1d3-58af-842f-cf56d29e3f98",
+                            "title": f"[人力调度] {station['station']} 缺勤 {station['leave_rate_pct']}%（{station['on_leave']}人请假），需借调支援",
+                            "desc": f"{station['station']} 工位缺勤率 {station['leave_rate_pct']}% 大于等于 10%，"
+                                    f"影响喷涂工单（WO-VF-0809-E987C urgent 等），需从 {source} 借调 {count} 人。",
+                            "impact": f"从 {source} 借调 {count} 人支援，避免喷涂工单交期风险",
+                            "ctx": json.dumps({
+                                "source": "people-assignment",
+                                "station": station["station"],
+                                "leave_rate": station["leave_rate_pct"],
+                                "suggested_transfer": source,
+                                "suggested_count": count,
+                            }, ensure_ascii=False),
+                        })
+                        await self.db.commit()
+                        result["created_rcc_task"] = {
+                            "station": station["station"],
+                            "title": f"[人力调度] {station['station']} 缺勤 {station['leave_rate_pct']}%",
+                            "transfer": f"{source} → {station['station']} × {count}人",
+                        }
 
             # 找出低出勤率的工位，建议从其他工位调剂
             for station in stations:
