@@ -421,8 +421,11 @@ FOLLOWUP_PROMPT = (
     "你是 EngHub MES 任务中心的跟进执行器。下面是一个此前无法一次完成、挂账跟进的任务。\n"
     "请调用工具核实当前最新状态，然后只输出 JSON（不要多余文字）：\n"
     '{"progress_pct": 0-100 整数, "state": "open|blocked|done", '
-    '"note": "本次跟进结论（150字内，说明当前进展/仍受阻原因/完成依据）"}\n'
-    "判定规则：任务目标已达成→done；仍在等待外部条件（物料/审批/设备/供应商）→blocked；"
+    '"note": "本次跟进结论（150字内，说明当前进展/仍受阻原因/完成依据）", '
+    '"blocked_by": "卡在谁那里（责任人/部门/供应商/环节名，如：供应商A、采购部、设备维修组、计划员张三；无则空串）", '
+    '"block_category": "受阻原因类别（material=缺料/物料、supplier=供应商交付、approval=待审批、equipment=设备、staff=人员、data=数据异常、other=其他；无则空串）"}\n'
+    "判定规则：任务目标已达成→done；仍在等待外部条件（物料/审批/设备/供应商）→blocked，"
+    "**blocked 时必须给出 blocked_by 和 block_category，像人类员工汇报一样说清楚卡在谁那里、什么原因**；"
     "有进展但未完成→open。note 必须基于工具返回的真实数据，禁止编造。"
 )
 
@@ -507,8 +510,17 @@ def _parse_follow_reply(reply: str) -> Dict[str, Any]:
                 state = "open"
             pct = max(0, min(100, int(data.get("progress_pct") or 0)))
             note = str(data.get("note") or "").strip()[:1000]
+            blocked_by = str(data.get("blocked_by") or "").strip()[:100]
+            block_category = str(data.get("block_category") or "").strip().lower()[:30]
+            if block_category not in {"material", "supplier", "approval", "equipment", "staff", "data", "other"}:
+                block_category = ""
+            out = {"state": state, "progress_pct": pct, "note": note}
+            if blocked_by:
+                out["blocked_by"] = blocked_by
+            if block_category:
+                out["block_category"] = block_category
             if note:
-                return {"state": state, "progress_pct": pct, "note": note}
+                return out
     except (ValueError, TypeError, json.JSONDecodeError):
         pass
     return {"state": "open", "progress_pct": 0, "note": (reply or "跟进无有效结论").strip()[:1000]}
@@ -632,10 +644,18 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         # 让 scanner 重新接管，避免"卡死到天荒地老只等人工"。人工也可随时解锁。
         conclusion["note"] += "（已达最大跟进次数，进入冷却期，将自动恢复重试）"
 
+    # 受阻归因：blocked 时记录卡点（卡在谁那里 + 原因类别），像人类员工汇报一样
+    blocked_by = conclusion.get("blocked_by", "") if new_status == "blocked" else ""
+    block_category = conclusion.get("block_category", "") if new_status == "blocked" else ""
+    if new_status != "blocked":
+        blocked_by = ""
+        block_category = ""
+
     await db.execute(text("""
         UPDATE followup_tasks
         SET status = :st, progress_pct = :pct, last_follow_at = NOW(), last_follow_note = :note,
             follow_count = :fc, updated_at = NOW(),
+            blocked_by = :bb, block_category = :bc,
             next_follow_at = CASE WHEN :active
                 THEN NOW() + make_interval(mins => :retry_min) ELSE NULL END,
             result_summary = CASE WHEN :done THEN :note ELSE result_summary END,
@@ -646,6 +666,7 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         "fc": follow_count, "active": new_status in ("open", "blocked") and not (reached_limit and new_status != "blocked"),
         "retry_min": _BLOCKED_RETRY_MINUTES if reached_limit else int(task.get("follow_interval_minutes") or 30),
         "done": new_status == "done", "id": task_id,
+        "bb": blocked_by, "bc": block_category,
     })
     await _append_log(db, task_id, factory_id, trigger_type,
                       conclusion["note"], new_status, conclusion["progress_pct"], "system")
