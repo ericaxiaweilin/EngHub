@@ -269,6 +269,121 @@ async def get_followup_task_logs(
     return {"logs": await svc.get_task_logs(db, task_id)}
 
 
+@router.get("/tasks/{task_id}/map")
+async def get_followup_task_map(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """任务处理地图：把任务的完整处理路径结构化（生命周期节点 + 跟进步骤 + 卡点归因），
+    像人类员工的项目汇报一样直观展示：从挂账 → 智能体接管 → 每轮跟进 → 受阻卡点 → 闭环。"""
+    from sqlalchemy import text
+    from api.services import followup_task_service as svc
+
+    row = (await db.execute(text("""
+        SELECT id, factory_id, created_by, title, description, agent_key, agent_name,
+               status, block_reason, blocked_by, block_category, conversation_hint,
+               follow_interval_minutes, last_follow_note, follow_count, max_follows,
+               progress_pct, item_type, assigned_to, ai_summary, ai_suggestion,
+               result_summary, due_at, created_at, updated_at, closed_at
+        FROM followup_tasks WHERE id = :tid
+    """), {"tid": task_id})).mappings().first()
+    if not row:
+        return {"error": "任务不存在"}
+
+    logs = await svc.get_task_logs(db, task_id, limit=100)
+    t = dict(row)
+
+    # ── 生命周期节点 ──
+    nodes = []
+
+    # 节点1：挂账
+    nodes.append({
+        "stage": "created", "label": "任务挂账", "status": "done",
+        "at": t.get("created_at"), "by": t.get("created_by"),
+        "note": f"任务创建，由 {t.get('agent_name') or t.get('agent_key') or '系统'} 负责跟进"
+                + (f"，指派给 {t['assigned_to']}" if t.get("assigned_to") else ""),
+    })
+
+    # 节点2：智能体接管（agent 字段存在即视为接管）
+    nodes.append({
+        "stage": "handoff", "label": "智能体接管", "status": "done",
+        "at": t.get("created_at"), "by": t.get("agent_name") or t.get("agent_key"),
+        "note": f"{t.get('agent_name') or t.get('agent_key')} 接管任务"
+                + (f"（{t.get('follow_interval_minutes')} 分钟/次跟进）" if t.get("follow_interval_minutes") else ""),
+    })
+
+    # 节点3：跟进步骤（从 logs 反序 = 时间正序）
+    follow_nodes = []
+    for log in reversed(logs):
+        note = str(log.get("note") or "")
+        # 跳过纯状态标记
+        if note in ("任务已挂入任务中心，每 60 分钟跟进一次",
+                    "任务已挂入任务中心，每 120 分钟跟进一次") or "挂入任务中心" in note and len(note) < 40:
+            continue
+        st = log.get("status_after") or ""
+        follow_nodes.append({
+            "stage": "follow", "label": f"跟进 #{len(follow_nodes) + 1}",
+            "status": "done" if st == "done" else "blocked" if st == "blocked" else "active" if st == "open" else "done",
+            "at": log.get("created_at"), "by": log.get("trigger_type"),
+            "pct": log.get("progress_pct"),
+            "note": note[:300],
+        })
+    nodes.extend(follow_nodes)
+
+    # 节点4：卡点（blocked 时）
+    if t.get("status") == "blocked":
+        nodes.append({
+            "stage": "blocked", "label": "受阻卡点", "status": "blocked",
+            "at": t.get("updated_at"),
+            "blocked_by": t.get("blocked_by") or "未归因",
+            "block_category": t.get("block_category") or "",
+            "note": (t.get("last_follow_note") or t.get("block_reason") or "任务受阻，等待外部条件")[:300],
+        })
+    # 节点5：闭环（done 时）
+    if t.get("status") == "done":
+        nodes.append({
+            "stage": "closed", "label": "任务闭环", "status": "done",
+            "at": t.get("closed_at") or t.get("updated_at"),
+            "note": (t.get("result_summary") or t.get("last_follow_note") or "任务已完成")[:300],
+        })
+
+    # ── 卡点归因（blocked 时给醒目提示）──
+    block_attribution = None
+    if t.get("status") == "blocked":
+        block_attribution = {
+            "blocked_by": t.get("blocked_by") or "未归因",
+            "block_category": t.get("block_category") or "",
+            "note": (t.get("last_follow_note") or "任务受阻")[:300],
+            "next_retry_at": None,
+        }
+        try:
+            from sqlalchemy import text as _t2
+            nr = (await db.execute(_t2(
+                "SELECT next_follow_at FROM followup_tasks WHERE id=:tid"
+            ), {"tid": task_id})).mappings().first()
+            if nr and nr["next_follow_at"]:
+                block_attribution["next_retry_at"] = nr["next_follow_at"]
+        except Exception:
+            pass
+
+    return {
+        "task_id": task_id,
+        "title": t.get("title"),
+        "status": t.get("status"),
+        "progress_pct": t.get("progress_pct"),
+        "agent_name": t.get("agent_name") or t.get("agent_key"),
+        "follow_count": t.get("follow_count"),
+        "max_follows": t.get("max_follows"),
+        "block_attribution": block_attribution,
+        "nodes": nodes,
+        "stats": {
+            "follow_steps": len(follow_nodes),
+            "blocked_count": sum(1 for n in nodes if n["status"] == "blocked"),
+        },
+    }
+
+
 @router.post("/tasks/{task_id}/follow-now")
 async def follow_now(
     task_id: str,
