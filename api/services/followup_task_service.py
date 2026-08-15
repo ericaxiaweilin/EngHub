@@ -481,6 +481,11 @@ async def _detect_task_done(db: AsyncSession, task: Dict[str, Any], messages: Li
         m = re.search(r"缺料[:：]\s*([\w\-]+)", title)
         if m:
             target_material = m.group(1).strip()
+        # 也支持"缺料 X，请处理/加急"格式（无数字比较）
+        if not target_material:
+            m2 = re.search(r"缺料\s+([\w\-]+)", title)
+            if m2:
+                target_material = m2.group(1).strip()
 
     for msg in messages:
         if msg.get("role") != "tool":
@@ -825,7 +830,23 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
             # 查管道 → 为缺料物料建采购申请 → 指派供应商 → 转采购订单 → 跟催。
             # 动作链是确定性动作，执行后直接生成结论（不再依赖模型输出，避免
             # agnes 在 tools 被 pop 后输出 XML 导致"无有效结论"）。
-            if task.get("agent_key") == "procurement_agent" and await _is_procurement_shortage(db, task, messages, factory_id):
+            if task.get("agent_key") == "procurement_agent":
+                # 双向确定性判定：
+                # ① 物料已补齐（库存≥需求）→ 直接 done 闭环（模型无结论也不卡）
+                # ② 仍缺料 → 执行采购动作链推进
+                if not await _is_procurement_shortage(db, task, messages, factory_id):
+                    _tm = re.search(r"缺料[:：\s]*([\w\-]+)", str(task.get("title") or ""))
+                    if _tm:
+                        _inv2 = (await db.execute(text(
+                            "SELECT COALESCE(SUM(available_qty),0) AS avail FROM inventory WHERE material_code=:m"
+                        ), {"m": _tm.group(1)})).mappings().first()
+                        if _inv2 and float(_inv2["avail"] or 0) > 0:
+                            reply = json.dumps({
+                                "state": "done", "progress_pct": 100,
+                                "note": f"确定性判定：物料 {_tm.group(1)} 库存 {_inv2['avail']} 已补齐"
+                                        f"（在途PO到货/加急处理完成），任务目标达成，闭环。",
+                            }, ensure_ascii=False)
+                            break
                 action_log = await _run_procurement_action_chain(db, factory_id)
                 if action_log:
                     messages.append({
