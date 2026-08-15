@@ -67,5 +67,6 @@
     "pwdMismatch": "Hai mật khẩu không khớp",
     "pwdSuccess": "Đổi mật khẩu thành công. Vui lòng dùng mật khẩu mới ở lần đăng nhập sau",
     "pwdFail": "Thay đổi thất bại"
-  }
+  },
+  "搜索订单号/客户/产品": "Tìm đơn hàng / khách hàng / sản phẩm"
 }

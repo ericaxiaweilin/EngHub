@@ -94,15 +94,23 @@ class OrderDecompositionService:
         return {"id": so["id"], "order_code": so["order_code"], "status": "pending"}
 
     async def list_sales_orders(
-        self, factory_id: str, status: Optional[str] = None, limit: int = 50
+        self, factory_id: str, status: Optional[str] = None, limit: int = 200,
+        search: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """销售订单列表"""
+        """销售订单列表（支持按订单号/客户/产品搜索）"""
         from sqlalchemy import text
         query = "SELECT * FROM sales_orders WHERE factory_id = :fid"
         params: Dict[str, Any] = {"fid": factory_id}
         if status:
             query += " AND status = :status"
             params["status"] = status
+        if search:
+            kw = f"%{search.strip()}%"
+            query += (
+                " AND (order_code ILIKE :kw OR customer_name ILIKE :kw"
+                " OR customer_code ILIKE :kw OR product_id ILIKE :kw)"
+            )
+            params["kw"] = kw
         query += " ORDER BY created_at DESC LIMIT :lim"
         params["lim"] = limit
 
