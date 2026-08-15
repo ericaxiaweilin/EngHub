@@ -27,8 +27,8 @@ class RCCOrganization(Base):
     approval_threshold_pct = Column(Float, default=80.0)
     last_sync_at = Column(DateTime)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.utcnow())
+    updated_at = Column(DateTime, default=lambda: datetime.utcnow(), onupdate=lambda: datetime.utcnow())
     
     # relationships
     org_unit = None  # 继承 org_units
@@ -66,8 +66,8 @@ class RCCTask(Base):
     request_context = Column(JSON, default=dict)
     source_ticket_id = Column(String(36))
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow(), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.utcnow(), onupdate=lambda: datetime.utcnow(), nullable=False)
 
 
 class RccApprovalRecord(Base):
@@ -79,7 +79,7 @@ class RccApprovalRecord(Base):
     approver_role = Column(String(50), nullable=False)
     approver_name = Column(String(100))
     decision = Column(String(20), nullable=False)
-    decision_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    decision_at = Column(DateTime, default=lambda: datetime.utcnow())
     comment = Column(Text)
     escalation_level = Column(Integer, default=0)
 
@@ -99,7 +99,7 @@ class GlobalAdjustableParam(Base):
     param_type = Column(String(20), nullable=False)
     default_value = Column(String)
     current_value = Column(String)
-    effective_from = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    effective_from = Column(DateTime, default=lambda: datetime.utcnow())
     target_value = Column(String)
     
     min_value = Column(Float)
@@ -117,8 +117,8 @@ class GlobalAdjustableParam(Base):
     change_reason = Column(Text)
     previous_value = Column(String)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow(), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.utcnow(), onupdate=lambda: datetime.utcnow(), nullable=False)
 
 
 class ParameterChangeAudit(Base):
@@ -130,7 +130,7 @@ class ParameterChangeAudit(Base):
     from_value = Column(String)
     to_value = Column(String)
     changed_by = Column(String(50))
-    changed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    changed_at = Column(DateTime, default=lambda: datetime.utcnow())
     reason = Column(Text)
     approval_required = Column(Boolean, default=False)
     approval_status = Column(String(20), default="auto_approved")
@@ -173,8 +173,8 @@ class ChatbotTicket(Base):
     resolution = Column(Text)
     resolved_at = Column(DateTime)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow(), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.utcnow(), onupdate=lambda: datetime.utcnow(), nullable=False)
 
 
 class ChatbotTicketApprovalFlow(Base):
@@ -209,8 +209,8 @@ class DeterministicLogicChain(Base):
     enabled = Column(Boolean, default=True)
     execution_order = Column(Integer, default=0)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow(), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.utcnow(), onupdate=lambda: datetime.utcnow(), nullable=False)
 
 
 class LogicChainExecutionLog(Base):
@@ -224,4 +224,4 @@ class LogicChainExecutionLog(Base):
     conditions_matched = Column(Boolean, default=True)
     actions_executed = Column(JSON, default=list)
     action_results = Column(JSON, default=list)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow(), nullable=False)

@@ -431,7 +431,7 @@ FOLLOWUP_PROMPT = (
 )
 
 
-def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> str:
+async def _detect_task_done(db: AsyncSession, task: Dict[str, Any], messages: List[Dict[str, Any]]) -> str:
     """确定性判定任务目标是否已达成（基于工具真实结果，不依赖模型输出）。
 
     支持类型：
@@ -443,6 +443,23 @@ def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> s
     is_shortage = ("缺料" in title) or ("补货" in title) or ("采购" in title)
     is_work_order = ("工单" in title) or ("ORDER_REVIEW" in title) or ("MATERIAL_KITTING" in title)
     evidence = []
+
+    # 标题带"可用 X < 在制需求 Y" → 提取物料号，DB 校验真实库存仍缺才不 done
+    # （库存已补足则允许按正常逻辑判定；库存仍缺则保持 blocked）
+    if is_shortage and "可用" in title and "<" in title and "需求" in title:
+        try:
+            m_mat = re.search(r"缺料[:：]\s*([\w\-]+)", title)
+            m_num = re.findall(r"(\d+(?:\.\d+)?)", title)
+            if m_mat and len(m_num) >= 2:
+                need = float(m_num[1])
+                row_inv = (await db.execute(text(
+                    "SELECT COALESCE(SUM(available_qty), 0) AS avail FROM inventory "
+                    "WHERE material_code = :m"
+                ), {"m": m_mat.group(1)})).mappings().first()
+                if row_inv and float(row_inv["avail"] or 0) < need:
+                    return ""
+        except Exception:
+            pass
 
     # 缺料类任务：先从标题提取目标物料号，后续判定必须针对该物料真实库存
     target_material = ""
@@ -472,14 +489,23 @@ def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> s
             continue
         # 缺料类：物料级校验（必须证明目标物料真实可用）
         if is_shortage:
-            # 1) inventory 结果：目标物料 available_qty > 0 才算补上
+            # 1) inventory 结果：目标物料可用量必须 >= 标题需求数量才算补上
+            #    （"可用 X < 在制需求 Y" 的 Y；无需求信息时按 >0）
             inv = data.get("inventory") if isinstance(data.get("inventory"), list) else None
             if inv and target_material:
+                need_qty = None
+                m_need = re.search(r"在制需求\s*([\d.]+)", title)
+                if m_need:
+                    need_qty = float(m_need.group(1))
                 for item in inv:
                     if str(item.get("material_code") or "") == target_material:
                         avail = float(item.get("available_qty") or 0)
-                        if avail > 0:
-                            evidence.append(f"物料 {target_material} 库存可用 {avail}")
+                        if need_qty is not None:
+                            if avail >= need_qty:
+                                evidence.append(f"物料 {target_material} 库存可用 {avail}（需求 {need_qty}）")
+                        else:
+                            if avail > 0:
+                                evidence.append(f"物料 {target_material} 库存可用 {avail}")
                         break
             # 2) 采购到货/PO 入库证据：material 字段匹配目标物料
             items = data.get("items") if isinstance(data.get("items"), list) else None
@@ -742,7 +768,7 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
             # ── 目标达成检测（确定性，不依赖模型输出）──
             # 采购补货类任务：工具结果证明缺料已清零 → 直接 done，避免模型贪心继续查工具
             # 而永不输出结论（agnes 系模型在 tools 被 pop 后倾向继续输出 XML 工具标签）。
-            done_evidence = _detect_task_done(task, messages)
+            done_evidence = await _detect_task_done(db, task, messages)
             if done_evidence:
                 reply = json.dumps(
                     {"state": "done", "progress_pct": 100,

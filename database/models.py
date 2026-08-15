@@ -2617,3 +2617,21 @@ class ChatMemory(Base):
     source = Column(String(32), nullable=False, default="chat")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class OrgUnit(Base):
+    """组织单元（RCC 资源指挥中心等）。表已存在但模型缺失，
+    导致 core/rcc/models.py 的 FK 解析失败（NoReferencedTableError）。
+    补齐后 RCC 写操作（ORM 路径）可用。"""
+    __tablename__ = "org_units"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True)
+    code = Column(String(50))
+    name = Column(String(200))
+    parent_id = Column(String(36))
+    level_type = Column(String(20), default="operational")
+    factory_id = Column(String(50))
+    metadata_ = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

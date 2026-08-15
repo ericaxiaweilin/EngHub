@@ -65,7 +65,7 @@ class RCCTaskService:
         
         task.status = "approved"
         task.approved_by = approver_id
-        task.approved_at = datetime.now(timezone.utc)
+        task.approved_at = datetime.utcnow()
         
         # 创建审批记录
         record = RccApprovalRecord(
@@ -107,6 +107,7 @@ class RCCTaskService:
         task.status = "rejected"
         task.rejected_by = approver_id
         task.rejection_reason = reason
+        # naive UTC（表列无时区）
         
         record = RccApprovalRecord(
             rcc_task_id=task.id,
@@ -493,7 +494,7 @@ class ChatbotTicketService:
         ticket.status = "resolved"
         ticket.resolved_by = resolved_by
         ticket.resolution = resolution
-        ticket.resolved_at = datetime.now(timezone.utc)
+        ticket.resolved_at = datetime.utcnow()
         await self.db.commit()
         await self.db.refresh(ticket)
         return ticket
