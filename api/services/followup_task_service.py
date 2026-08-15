@@ -407,8 +407,33 @@ FOLLOWUP_PROMPT = (
 )
 
 
+def _clean_xml_tags(text: str) -> str:
+    """剥离模型 content 里残留的 XML 工具调用标签（tool_call/invoke/function/parameter 等），
+    与 chat_routes._clean_model_reply 同源逻辑，供跟进结论解析前清理。"""
+    if not text:
+        return text
+    import re as _re
+    t = text
+    # 1) 完整块
+    t = _re.sub(r"<tool_call\b[^>]*>.*?</tool_call>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
+    t = _re.sub(r"<(?:antml:)?invoke\b[^>]*>.*?</(?:antml:)?invoke>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
+    t = _re.sub(r"<antml:parameter\b[^>]*>.*?</antml:parameter>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
+    # 2) 残留单标签
+    t = _re.sub(r"</?tool_call\b[^>]*>", " ", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"</?(?:antml:)?invoke\b[^>]*>", " ", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"</?function\b[^>]*>", " ", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"</?parameter\b[^>]*>", " ", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"<parameter=[^>]*>.*?</parameter>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
+    t = _re.sub(r"<result>.*?</result>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
+    # 3) 清理多余空白
+    t = _re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _parse_follow_reply(reply: str) -> Dict[str, Any]:
     """从模型回复中提取跟进结论 JSON，解析失败时降级为纯文本结论。"""
+    if reply:
+        reply = _clean_xml_tags(reply)
     try:
         start, end = reply.find("{"), reply.rfind("}")
         if start >= 0 and end > start:
