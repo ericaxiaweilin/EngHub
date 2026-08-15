@@ -441,7 +441,11 @@ async def _call_llm(
     *,
     request_timeout: Optional[float] = None,
 ) -> httpx.Response:
-    """通过模型底座网关调用控制面下发的 provider。"""
+    """通过模型底座网关调用控制面下发的 provider。
+
+    健壮性：ReadTimeout 是间歇性网关慢（实测偶发），重试一次（延长超时）大概率成功，
+    避免把偶发超时直接转成对用户的"服务不可用"报错。
+    """
     headers = {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
@@ -449,12 +453,38 @@ async def _call_llm(
     }
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
-    async with httpx.AsyncClient(timeout=request_timeout or REQUEST_TIMEOUT) as client:
-        return await client.post(
-            f"{GATEWAY_URL}/v1/chat/completions",
-            json=payload,
-            headers=headers,
-        )
+    base_timeout = request_timeout or REQUEST_TIMEOUT
+    timeouts = (base_timeout, max(base_timeout, MODEL_COLD_START_RETRY_TIMEOUT))
+    last_exc: Optional[BaseException] = None
+    for attempt, read_timeout in enumerate(timeouts, start=1):
+        try:
+            timeout = httpx.Timeout(
+                read=read_timeout,
+                connect=min(10.0, read_timeout),
+                write=min(30.0, read_timeout),
+                pool=min(10.0, read_timeout),
+            )
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                return await client.post(
+                    f"{GATEWAY_URL}/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+        except httpx.ReadTimeout as exc:
+            last_exc = exc
+            if attempt >= len(timeouts):
+                break
+            _logger.warning(
+                "[model-call] read timeout %ss; retrying with %ss",
+                read_timeout, timeouts[1],
+            )
+            await asyncio.sleep(0.25)
+    if last_exc is not None:
+        raise last_exc
+    raise httpx.ReadTimeout(
+        "LLM call timed out after retries",
+        request=httpx.Request("POST", f"{GATEWAY_URL}/v1/chat/completions"),
+    )
 
 
 async def _warm_model_once(reason: str = "interval") -> bool:
@@ -627,6 +657,34 @@ def _format_orchestration_reply(orch_result) -> str:
             parts.append("\n⚠️ LLM不可用，以上为各智能体原始数据")
 
     return "\n".join(parts)
+
+
+def _summarize_actions(actions: List[ToolAction]) -> str:
+    """模型无正文输出时，用已执行的工具结果生成摘要回复（确定性兜底）。"""
+    parts: List[str] = []
+    for a in actions:
+        if a.tool == "run_virtual_factory_pulse":
+            continue  # 噪音
+        label = a.label or TOOL_LABELS.get(a.tool, a.tool)
+        r = a.result or {}
+        if "error" in r:
+            parts.append(f"❌ {label}：{r['error']}")
+            continue
+        direct = _direct_tool_reply(a.tool, r)
+        if direct and not direct.startswith(f"{label}执行失败"):
+            parts.append(direct)
+            continue
+        # 通用摘要：列出关键字段
+        summary = []
+        for k, v in list(r.items())[:6]:
+            if isinstance(v, (dict, list)):
+                continue
+            summary.append(f"{k}={v}")
+        parts.append(f"{label}：{'，'.join(summary) if summary else '查询完成'}")
+    if not parts:
+        return ""
+    body = "\n".join(parts)
+    return f"已为您查询到以下结果：\n\n{body}"
 
 
 def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
@@ -1605,6 +1663,18 @@ async def _legacy_chat_disabled(
             if not tool_calls:
                 reply = _clean_model_reply(message.get("content") or "")
                 if not reply:
+                    # 模型没输出正文但执行过工具：用工具结果生成摘要兜底，
+                    # 而不是报"服务不可用"（用户有真实数据可看）。
+                    if actions:
+                        reply = _summarize_actions(actions)
+                    if reply:
+                        return ChatResponse(
+                            reply=reply,
+                            model=route["task_id"],
+                            degraded=False,
+                            actions=actions,
+                            diagrams=_collect_diagrams(actions),
+                        )
                     return ChatResponse(
                         reply=_degraded_message("网关无有效回复"),
                         model=route["task_id"], degraded=True, actions=actions,
@@ -2215,9 +2285,11 @@ async def chat_v2(
 
 
 def _degraded_message(reason: str) -> str:
+    """服务降级时的用户提示：不暴露内部技术细节，给出业务向的引导。"""
     return (
-        f"AI 服务暂不可用（{reason}）。\n\n"
-        "模型任务未能由模型底座正常下发，请检查控制面与模型网关状态。"
+        f"抱歉，回答服务暂时没有响应（{reason}）。\n\n"
+        "这是服务端偶发波动，不影响您的数据。请稍等片刻后重试，"
+        "或者换个问法再试一次；如果持续出现，可联系系统管理员处理。"
     )
 
 
