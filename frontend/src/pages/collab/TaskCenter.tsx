@@ -374,6 +374,18 @@ const TaskCenter: React.FC = () => {
       },
     },
     {
+      title: '创建人',
+      dataIndex: 'created_by',
+      key: 'created_by',
+      width: 110,
+      render: (v?: string, r?: FollowupTask) => (
+        <Space size={4} wrap>
+          <Tag>{v || '-'}</Tag>
+          {r?.assigned_to && <Tag icon={<UserSwitchOutlined />} color="geekblue">→{r.assigned_to}</Tag>}
+        </Space>
+      ),
+    },
+    {
       title: '智能体',
       dataIndex: 'agent_name',
       key: 'agent_name',
