@@ -367,10 +367,79 @@ async def get_followup_task_map(
         except Exception:
             pass
 
+    # ── 对接工作流引擎：工单生命周期流转映射 ──
+    workflow = None
+    try:
+        from api.services.process_knowledge_service import WORK_ORDER_FLOW, RACI_MATRIX
+        import re as _re2
+        # 从任务标题提取工单号
+        wo_code = None
+        m_wo = _re2.search(r"(WO-[\w\-]+)", t.get("title") or "")
+        if m_wo:
+            wo_code = m_wo.group(1)
+        # 查工单真实状态
+        wo_row = None
+        if wo_code:
+            wo_row = (await db.execute(text(
+                "SELECT work_order_code, status, current_routing_step FROM work_orders WHERE work_order_code = :c LIMIT 1"
+            ), {"c": wo_code})).mappings().first()
+        # 当前阶段：优先按 current_routing_step，否则按工单状态匹配
+        current_stage_idx = None
+        wo_status = (wo_row["status"] if wo_row else None) or ""
+        if wo_row and wo_row.get("current_routing_step") is not None:
+            current_stage_idx = max(0, min(int(wo_row["current_routing_step"]) - 1, len(WORK_ORDER_FLOW) - 1))
+        else:
+            for i, st in enumerate(WORK_ORDER_FLOW):
+                if st.get("status") == wo_status:
+                    current_stage_idx = i
+                    break
+        # 卡点阶段：blocked 时按 block_category 映射阶段
+        block_stage_idx = None
+        if t.get("status") == "blocked":
+            cat = (t.get("block_category") or "").lower()
+            cat_stage = {
+                "material": "执行", "supplier": "审批/下达", "approval": "审批/下达",
+                "equipment": "执行", "staff": "派工", "data": "报工",
+            }.get(cat)
+            if cat_stage:
+                for i, st in enumerate(WORK_ORDER_FLOW):
+                    if st.get("stage") == cat_stage:
+                        block_stage_idx = i
+                        break
+        # RACI owner（当前阶段）
+        owner_info = None
+        if current_stage_idx is not None:
+            stage_name = WORK_ORDER_FLOW[current_stage_idx].get("stage", "")
+            raci = RACI_MATRIX.get(stage_name, {})
+            responsible = [r for r, v in raci.items() if "R" in v]
+            accountable = [r for r, v in raci.items() if "A" in v]
+            owner_info = {
+                "stage": stage_name,
+                "responsible": responsible,
+                "accountable": accountable,
+            }
+        workflow = {
+            "title": "生产工单全生命周期",
+            "stages": [
+                {"stage": s.get("stage", ""), "status": s.get("status", ""),
+                 "role": s.get("role", ""), "actions": (s.get("actions") or "")[:120],
+                 "blockpoint": (s.get("blockpoint") or "")[:120]}
+                for s in WORK_ORDER_FLOW
+            ],
+            "work_order_code": wo_code,
+            "work_order_status": wo_status,
+            "current_stage_idx": current_stage_idx,
+            "block_stage_idx": block_stage_idx,
+            "owner": owner_info,
+        }
+    except Exception as _wexc:  # 工作流映射失败不阻塞地图主体
+        workflow = None
+
     return {
         "task_id": task_id,
         "title": t.get("title"),
         "status": t.get("status"),
+        "workflow": workflow,
         "progress_pct": t.get("progress_pct"),
         "agent_name": t.get("agent_name") or t.get("agent_key"),
         "follow_count": t.get("follow_count"),

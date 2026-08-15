@@ -10,7 +10,7 @@ import React, { useCallback, useEffect, useState } from 'react'
 import {
   Alert, Badge, Button, Card, Col, DatePicker, Drawer, Form, Input, InputNumber,
   List, Modal, Popconfirm, Progress, Row, Select, Space, Statistic, Table, Tabs,
-  Tag, Timeline, Tooltip, Typography, Divider, message,
+  Steps, Tag, Timeline, Tooltip, Typography, Divider, message,
 } from 'antd'
 import {
   BellOutlined, CarryOutOutlined, ClockCircleOutlined, DeleteOutlined,
@@ -817,6 +817,47 @@ const TaskCenter: React.FC = () => {
                   <Col span={8}><Card size="small"><Statistic title="跟进次数" value={taskMap.follow_count || 0} suffix={`/ ${taskMap.max_follows || 0}`} valueStyle={{ fontSize: 18 }} /></Card></Col>
                 </Row>
                 {taskMap.agent_name && <Text type="secondary">负责智能体：{taskMap.agent_name}</Text>}
+
+                {/* 工作流流程条：工单生命周期 8 阶段，当前高亮，卡点红标 */}
+                {taskMap.workflow && taskMap.workflow.stages && (
+                  <>
+                    <Divider style={{ margin: '4px 0' }}>工单流转工作流</Divider>
+                    {taskMap.workflow.work_order_code && (
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        工单 {taskMap.workflow.work_order_code}
+                        {taskMap.workflow.work_order_status && ` · 状态 ${taskMap.workflow.work_order_status}`}
+                      </Text>
+                    )}
+                    <Steps
+                      direction="vertical" size="small" responsive={false}
+                      current={taskMap.workflow.current_stage_idx ?? 0}
+                      status={taskMap.workflow.block_stage_idx != null ? 'error' : 'process'}
+                      items={taskMap.workflow.stages.map((s: any, i: number) => ({
+                        title: (
+                          <Space size={4} wrap>
+                            <Text strong style={{ fontSize: 13 }}>{s.stage}</Text>
+                            {s.role && <Tag color="blue" style={{ fontSize: 11 }}>{s.role}</Tag>}
+                            {i === taskMap.workflow.current_stage_idx && <Tag color="green">当前</Tag>}
+                            {i === taskMap.workflow.block_stage_idx && <Tag color="red">卡点</Tag>}
+                          </Space>
+                        ),
+                        description: (
+                          <Space direction="vertical" size={0} style={{ width: '100%' }}>
+                            <Text style={{ fontSize: 12 }}>{s.actions}</Text>
+                            {i === taskMap.workflow.block_stage_idx && s.blockpoint && (
+                              <Text type="warning" style={{ fontSize: 12 }}>⚠ {s.blockpoint}</Text>
+                            )}
+                          </Space>
+                        ),
+                      }))}
+                    />
+                    {taskMap.workflow.owner && (
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        当前阶段责任：{[...(taskMap.workflow.owner.responsible || []), ...(taskMap.workflow.owner.accountable || [])].filter((v: string, i: number, a: string[]) => a.indexOf(v) === i).join(' / ') || '-'}
+                      </Text>
+                    )}
+                  </>
+                )}
 
                 {/* 受阻卡点醒目提示 */}
                 {taskMap.block_attribution && (
