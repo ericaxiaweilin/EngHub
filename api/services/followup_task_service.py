@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -443,6 +444,13 @@ def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> s
     is_work_order = ("工单" in title) or ("ORDER_REVIEW" in title) or ("MATERIAL_KITTING" in title)
     evidence = []
 
+    # 缺料类任务：先从标题提取目标物料号，后续判定必须针对该物料真实库存
+    target_material = ""
+    if is_shortage:
+        m = re.search(r"缺料[:：]\s*([\w\-]+)", title)
+        if m:
+            target_material = m.group(1).strip()
+
     for msg in messages:
         if msg.get("role") != "tool":
             continue
@@ -453,13 +461,6 @@ def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> s
             data = {}
         if not isinstance(data, dict):
             continue
-        # 缺料清零
-        if is_shortage and "shortage_count" in data:
-            if int(data.get("shortage_count") or 0) == 0:
-                evidence.append(f"缺料预警 shortage_count=0（{len(data.get('items') or [])} 项缺料）")
-        if is_shortage and "items" in data and isinstance(data["items"], list):
-            if not data["items"] and "shortage_count" in data:
-                pass  # 已由上面处理
         # 工单完成
         if is_work_order and isinstance(data, dict):
             st = data.get("status") or data.get("state") or ""
@@ -468,7 +469,27 @@ def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> s
             work_order = data.get("work_order") or {}
             if isinstance(work_order, dict) and str(work_order.get("status") or "").lower() in ("completed", "done", "closed"):
                 evidence.append(f"工单 {work_order.get('work_order_code')} 状态 {work_order.get('status')}")
-
+            continue
+        # 缺料类：物料级校验（必须证明目标物料真实可用）
+        if is_shortage:
+            # 1) inventory 结果：目标物料 available_qty > 0 才算补上
+            inv = data.get("inventory") if isinstance(data.get("inventory"), list) else None
+            if inv and target_material:
+                for item in inv:
+                    if str(item.get("material_code") or "") == target_material:
+                        avail = float(item.get("available_qty") or 0)
+                        if avail > 0:
+                            evidence.append(f"物料 {target_material} 库存可用 {avail}")
+                        break
+            # 2) 采购到货/PO 入库证据：material 字段匹配目标物料
+            items = data.get("items") if isinstance(data.get("items"), list) else None
+            if items and target_material:
+                for item in items:
+                    code = str(item.get("material_code") or item.get("code") or item.get("material_id") or "")
+                    if code == target_material:
+                        if str(item.get("status") or "").lower() in ("received", "arrived", "completed", "in_stock"):
+                            evidence.append(f"物料 {target_material} 已到货入库")
+                        break
     if evidence:
         return "；".join(evidence[:3])
     return ""
