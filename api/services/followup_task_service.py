@@ -103,7 +103,20 @@ async def get_task_logs(db: AsyncSession, task_id: str, limit: int = 50) -> List
         ORDER BY created_at DESC
         LIMIT :limit
     """), {"tid": task_id, "limit": limit})
-    return [dict(r._mapping) for r in result.fetchall()]
+    items = []
+    for r in result.fetchall():
+        item = dict(r._mapping)
+        # 清洗 note：JSON 原文 → 人类可读（防前端泄漏 {"progress_pct":75,...}）
+        raw = str(item.get("note") or "")
+        if raw.strip().startswith("{") and raw.rstrip().endswith("}"):
+            try:
+                d = json.loads(raw)
+                if isinstance(d, dict) and d.get("note"):
+                    item["note"] = str(d["note"]).strip()[:300]
+            except Exception:
+                pass
+        items.append(item)
+    return items
 
 
 async def create_task(

@@ -270,6 +270,35 @@ async def get_followup_task_logs(
 
 
 @router.get("/tasks/{task_id}/map")
+def _humanize_note(raw) -> str:
+    """把跟进记录清洗成人类可读文本：
+    - 若 note 是 JSON（如 {"progress_pct":75,"state":"blocked","note":"..."}）→ 提取其中的 note 字段
+    - 去掉残留 XML 标签 / 系统代码痕迹
+    """
+    import json as _j, re as _re
+    text = str(raw or "").strip()
+    if not text:
+        return text
+    # 若整体是 JSON → 提取可读字段
+    if text.startswith("{") and text.rstrip().endswith("}"):
+        try:
+            d = _j.loads(text)
+            if isinstance(d, dict):
+                note = d.get("note") or ""
+                state = d.get("state") or ""
+                if note:
+                    text = str(note).strip()
+                    if state:
+                        state_label = {"blocked": "受阻", "done": "已完成", "open": "跟进中"}.get(state, state)
+                        text = f"{text}"
+        except Exception:
+            pass
+    # 去掉 XML 工具标签残留
+    text = _re.sub(r"<tool_call>|</tool_call>|<function=[^>]*>|</function>|<parameter[^>]*>|</parameter>", "", text)
+    text = _re.sub(r"\s+", " ", text).strip()
+    return text[:300]
+
+
 async def get_followup_task_map(
     task_id: str,
     db: AsyncSession = Depends(get_db),
@@ -314,18 +343,25 @@ async def get_followup_task_map(
     })
 
     # 节点3：跟进步骤（从 logs 反序 = 时间正序）
+    _TRIGGER_LABELS = {
+        "schedule": "定期扫描", "manual": "手动跟进", "manual_test": "手动跟进",
+        "manual_loop": "手动跟进", "manual_loop_pmc": "手动跟进", "manual_boundary": "手动跟进",
+        "manual_e2e": "手动跟进", "manual_full": "手动跟进", "status": "状态变更",
+        "auto": "自动", "system": "系统", "commander": "指挥官",
+    }
     follow_nodes = []
     for log in reversed(logs):
-        note = str(log.get("note") or "")
+        note = _humanize_note(log.get("note") or "")
         # 跳过纯状态标记
         if note in ("任务已挂入任务中心，每 60 分钟跟进一次",
                     "任务已挂入任务中心，每 120 分钟跟进一次") or "挂入任务中心" in note and len(note) < 40:
             continue
         st = log.get("status_after") or ""
+        trig = str(log.get("trigger_type") or "")
         follow_nodes.append({
             "stage": "follow", "label": f"跟进 #{len(follow_nodes) + 1}",
             "status": "done" if st == "done" else "blocked" if st == "blocked" else "active" if st == "open" else "done",
-            "at": log.get("created_at"), "by": log.get("trigger_type"),
+            "at": log.get("created_at"), "by": _TRIGGER_LABELS.get(trig, trig or "系统"),
             "pct": log.get("progress_pct"),
             "note": note[:300],
         })
@@ -338,7 +374,7 @@ async def get_followup_task_map(
             "at": t.get("updated_at"),
             "blocked_by": t.get("blocked_by") or "未归因",
             "block_category": t.get("block_category") or "",
-            "note": (t.get("last_follow_note") or t.get("block_reason") or "任务受阻，等待外部条件")[:300],
+            "note": _humanize_note(t.get("last_follow_note") or t.get("block_reason") or "任务受阻，等待外部条件"),
         })
     # 节点5：闭环（done 时）
     if t.get("status") == "done":

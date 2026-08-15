@@ -21,6 +21,21 @@ import api from '../../services/api'
 
 const { Text, Paragraph } = Typography
 
+// 清洗跟进记录：JSON 原文 → 人类可读（防系统代码泄漏）
+function humanizeNote(raw?: string): string {
+  if (!raw) return '-'
+  let text = raw.trim()
+  if (text.startsWith('{') && text.endsWith('}')) {
+    try {
+      const d = JSON.parse(text)
+      if (d && typeof d === 'object' && d.note) text = String(d.note).trim()
+    } catch { /* keep raw */ }
+  }
+  // 去 XML 残留
+  text = text.replace(/<tool_call>|<\/tool_call>|<function=[^>]*>|<\/function>|<parameter[^>]*>|<\/parameter>/g, '')
+  return text || '-'
+}
+
 interface FollowupTask {
   id: string
   title: string
@@ -925,7 +940,7 @@ const TaskCenter: React.FC = () => {
                           {n.blocked_by && <Tag color="orange">卡在：{n.blocked_by}</Tag>}
                           {typeof n.pct === 'number' && n.pct !== null && <Text type="secondary">{n.pct}%</Text>}
                         </Space>
-                        {n.note && <Text style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{n.note}</Text>}
+                        {n.note && <Text style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{humanizeNote(n.note)}</Text>}
                         {n.at && <Text type="secondary" style={{ fontSize: 12 }}>{fmtTime(n.at)}{n.by ? ` · ${n.by}` : ''}</Text>}
                       </Space>
                     ),
@@ -943,15 +958,15 @@ const TaskCenter: React.FC = () => {
                   children: (
                     <Space direction="vertical" size={0}>
                       <Space size={6}>
-                        <Tag color={l.trigger_type === 'schedule' ? 'blue' : l.trigger_type === 'manual' ? 'purple' : 'default'}>
-                          {l.trigger_type === 'schedule' ? '定期扫描' : l.trigger_type === 'manual' ? '手动跟进' : '状态变更'}
+                        <Tag color={l.trigger_type === 'schedule' ? 'blue' : (l.trigger_type || '').startsWith('manual') ? 'purple' : 'default'}>
+                          {l.trigger_type === 'schedule' ? '定期扫描' : (l.trigger_type || '').startsWith('manual') ? '手动跟进' : l.trigger_type === 'status' ? '状态变更' : '系统'}
                         </Tag>
                         {l.status_after && (
                           <Tag color={(STATUS_META[l.status_after] || {}).color}>{(STATUS_META[l.status_after] || { label: l.status_after }).label}</Tag>
                         )}
                         {typeof l.progress_pct === 'number' && <Text type="secondary">{l.progress_pct}%</Text>}
                       </Space>
-                      <Text>{l.note || '-'}</Text>
+                      <Text>{humanizeNote(l.note)}</Text>
                       <Text type="secondary" style={{ fontSize: 12 }}>{fmtTime(l.created_at)} · {l.created_by || 'system'}</Text>
                     </Space>
                   ),
