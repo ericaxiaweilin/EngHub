@@ -138,6 +138,24 @@ async def create_task(
         classified = await classify_command(f"{title} {description}".strip())
         agent_key = classified.get("agent_key")
 
+    # 多租户校正：从工单号探测真实归属厂区（防止调用方传错厂区导致任务挂错厂）
+    if factory_id:
+        import re as _re
+        _m = _re.search(r"(WO-[\w\-]+)", title or "")
+        if _m:
+            try:
+                _row = (await db.execute(text(
+                    "SELECT factory_id FROM work_orders WHERE work_order_code = :c LIMIT 1"
+                ), {"c": _m.group(1)})).mappings().first()
+                if _row and _row["factory_id"] and str(_row["factory_id"]) != str(factory_id):
+                    _logger.info(
+                        "[followup] 任务厂区校正 %s -> %s (工单 %s 真实归属)",
+                        factory_id, _row["factory_id"], _m.group(1),
+                    )
+                    factory_id = str(_row["factory_id"])
+            except Exception:
+                pass
+
     task_id = _gen_id()
     await db.execute(text("""
         INSERT INTO followup_tasks (id, factory_id, created_by, title, description,

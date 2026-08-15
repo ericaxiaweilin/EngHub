@@ -1196,18 +1196,9 @@ async def _tool_query_order_work_order_status(
 
 async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     code = args.get("work_order_code", "")
-    stmt = select(WorkOrder).where(WorkOrder.work_order_code == code)
-    if factory_id:
-        stmt = stmt.where(WorkOrder.factory_id == factory_id)
-    wo = (await db.execute(stmt)).scalar_one_or_none()
+    wo = await _resolve_work_order(db, code, factory_id)
     if not wo:
-        # 模糊匹配
-        stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code}%")).limit(1)
-        if factory_id:
-            stmt = stmt.where(WorkOrder.factory_id == factory_id)
-        wo = (await db.execute(stmt)).scalar_one_or_none()
-    if not wo:
-        return {"error": f"未找到工单 {code}"}
+        return {"error": f"未找到工单 {code}（已跨厂区探测，两个厂区均无此工单）"}
 
     pname = ""
     if wo.product_id:
@@ -1223,6 +1214,12 @@ async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any], fa
         "actual_start": wo.actual_start.strftime("%Y-%m-%d %H:%M") if wo.actual_start else None,
         "remark": wo.remark,
     })
+    # 多租户提示：工单归属厂区与查询厂区不一致时显式标注（模型据此向用户说明）
+    if factory_id and wo.factory_id and str(wo.factory_id) != str(factory_id):
+        detail["cross_factory_hint"] = (
+            f"该工单属于 {wo.factory_id} 厂区，不在当前查询厂区 {factory_id} 下。"
+            f"已按实际归属厂区返回真实数据。"
+        )
     return detail
 
 
@@ -1483,7 +1480,13 @@ async def _tool_create_production_report(db: AsyncSession, args: Dict[str, Any],
 # ==================== 仿真 / 扩展操作 工具执行器 ====================
 
 async def _resolve_work_order(db: AsyncSession, code_or_id: str, factory_id: Optional[str] = None) -> Optional[WorkOrder]:
-    """按 ID 或工单号（支持模糊）定位工单。"""
+    """按 ID 或工单号（支持模糊）定位工单。
+
+    多租户升级：优先当前 factory_id 精确查；当前厂区查不到时自动跨厂区探测
+    （不带 factory_id 全库查）。这样把"数据在另一厂区"与"数据不存在"区分开：
+    返回的工单自带真实 factory_id，调用方用 wo.factory_id 展示归属即可，
+    不再因调用方传错厂区而误报"未找到"。
+    """
     if not code_or_id:
         return None
     # WorkOrder.id 为 uuid, 仅当入参形似 UUID 时才按 id 查, 否则传编码会抛 invalid UUID 异常
@@ -1502,10 +1505,25 @@ async def _resolve_work_order(db: AsyncSession, code_or_id: str, factory_id: Opt
     wo = (await db.execute(stmt)).scalar_one_or_none()
     if wo:
         return wo
+    # ── 跨厂区探测：当前厂区没有，全库找（区分"别厂区"与"不存在"）──
+    if factory_id:
+        stmt = select(WorkOrder).where(WorkOrder.work_order_code == code_or_id)
+        wo = (await db.execute(stmt)).scalar_one_or_none()
+        if wo:
+            return wo
     stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code_or_id}%")).limit(1)
     if factory_id:
         stmt = stmt.where(WorkOrder.factory_id == factory_id)
-    return (await db.execute(stmt)).scalar_one_or_none()
+    wo = (await db.execute(stmt)).scalar_one_or_none()
+    if wo:
+        return wo
+    # 跨厂区模糊探测
+    if factory_id:
+        stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code_or_id}%")).limit(1)
+        wo = (await db.execute(stmt)).scalar_one_or_none()
+        if wo:
+            return wo
+    return None
 
 
 async def _get_user_by_name(db: AsyncSession, operator: str) -> Optional[User]:
