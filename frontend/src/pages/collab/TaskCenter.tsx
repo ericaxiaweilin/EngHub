@@ -192,6 +192,7 @@ const TaskCenter: React.FC = () => {
   const [agents, setAgents] = useState<AgentOption[]>([])
   const [loading, setLoading] = useState(false)
   const [activeTab, setActiveTab] = useState('all')
+  const [ownerFilter, setOwnerFilter] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [ingestOpen, setIngestOpen] = useState(false)
   const [ingesting, setIngesting] = useState(false)
@@ -231,9 +232,15 @@ const TaskCenter: React.FC = () => {
   const doneCount = tasks.filter(t => t.status === 'done').length
   const typeCount = (t: string) => tasks.filter(x => x.item_type === t).length
 
-  const visibleTasks = activeTab === 'all'
+  const visibleTasks = (activeTab === 'all'
     ? tasks
     : tasks.filter(t => t.item_type === activeTab)
+  ).filter(t => {
+    if (!ownerFilter) return true
+    const owner = ownerFilter.toLowerCase()
+    return (t.created_by || '').toLowerCase().includes(owner)
+      || (t.assigned_to || '').toLowerCase().includes(owner)
+  })
 
   const handleCreate = async () => {
     const values = await createForm.validateFields()
@@ -719,6 +726,16 @@ const TaskCenter: React.FC = () => {
           </Space>
         }
       >
+        <Space style={{ marginBottom: 8 }} wrap>
+          <Input.Search
+            placeholder="按归属人筛选（创建人/指派对象，如 vf_mec_pmc_01 / procurement）"
+            allowClear
+            style={{ width: 380 }}
+            onSearch={v => setOwnerFilter(v.trim())}
+            onChange={e => !e.target.value && setOwnerFilter('')}
+          />
+          {ownerFilter && <Tag closable onClose={() => setOwnerFilter('')} color="blue">归属人：{ownerFilter}</Tag>}
+        </Space>
         <Tabs activeKey={activeTab} onChange={setActiveTab} items={tabItems} />
       </Card>
 
