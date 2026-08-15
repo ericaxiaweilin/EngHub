@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
@@ -579,11 +580,40 @@ async def _run_procurement_action_chain(db: AsyncSession, factory_id: Optional[s
                                            "qty": 10})
         for mat in shortage_materials:
             code, name, qty = mat["code"], mat["name"], mat["qty"]
-            # 2) 查管道：已有在途采购则跳过
+            # 2) 查管道：已有在途采购 → 对比交期是否来得及（交期冲突=生死线）
             pipe = await _exec(db, "query_purchase_pipeline", {"material_code": code},
                                operator="procurement", factory_id=fid)
             if pipe.get("purchase_orders_count", 0) > 0:
-                actions.append({"step": "skip", "material": code, "reason": "已有在途PO"})
+                # 在途 PO 交期 vs 需求日期（任务关联工单的 planned_start，无则取今天+3天兜底）
+                need_date = datetime.utcnow().date() + timedelta(days=3)
+                try:
+                    _wo = (await db.execute(text(
+                        "SELECT MIN(planned_start) AS need_dt FROM work_orders "
+                        "WHERE status IN ('in_progress','pending') AND planned_start IS NOT NULL"
+                    ))).mappings().first()
+                    if _wo and _wo["need_dt"]:
+                        need_date = _wo["need_dt"].date() if hasattr(_wo["need_dt"], "date") else _wo["need_dt"]
+                except Exception:
+                    pass
+                # 检查在途 PO 交期
+                conflict = False
+                po_eta = None
+                for po in (pipe.get("purchase_orders") or []):
+                    eta = po.get("expected_date")
+                    if eta:
+                        try:
+                            eta_d = eta.date() if hasattr(eta, "date") else eta
+                            if eta_d > need_date:
+                                conflict = True
+                                po_eta = eta_d
+                                break
+                        except Exception:
+                            continue
+                if conflict:
+                    actions.append({"step": "conflict", "material": code,
+                                    "reason": f"在途PO交期 {po_eta} 晚于需求 {need_date}（交期冲突，需升级RCC）"})
+                else:
+                    actions.append({"step": "skip", "material": code, "reason": "已有在途PO且交期满足"})
                 continue
             # 3) 建申请
             pr = await _exec(db, "create_purchase_requisition",
@@ -791,6 +821,7 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                                               ensure_ascii=False)[:4000],
                     })
                     steps = []
+                    has_conflict = False
                     for a in action_log:
                         if a.get("step") == "requisition":
                             steps.append(f"物料 {a.get('material')} 生成采购申请(PR {str(a.get('pr_id'))[:8]}…)")
@@ -800,15 +831,26 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                             steps.append(f"转采购订单 {a.get('po_code')}")
                         elif a.get("step") == "skip":
                             steps.append(f"{a.get('material')} 已有在途采购，不重复下单")
+                        elif a.get("step") == "conflict":
+                            has_conflict = True
+                            steps.append(f"⚠ {a.get('material')} 交期冲突：{a.get('reason')}")
                     pct = min(90, int(task.get("progress_pct") or 0) + 15)
                     # 等待 PO 到货 = 受阻于供应商交付 → blocked（触发 RCC 调度申请），
                     # 不是 open：open 不会进入 RCC 资源调度流，数字员工闭环断在采购环节。
-                    reply = json.dumps({
-                        "state": "blocked", "progress_pct": pct,
-                        "note": "采购动作链已推进：" + ("；".join(steps) if steps else "核实缺料并执行采购动作")
-                                + "。PO 已下单，等待到货后自动闭环（受阻于供应商交付）。",
-                        "blocked_by": "供应商", "block_category": "supplier",
-                    }, ensure_ascii=False)
+                    if has_conflict:
+                        reply = json.dumps({
+                            "state": "blocked", "progress_pct": pct,
+                            "note": "采购动作链发现交期冲突：" + ("；".join(steps) if steps else "")
+                                    + "。在途 PO 无法满足需求日期，已升级 RCC 资源调度（需重新排产或加急采购）。",
+                            "blocked_by": "计划/生产", "block_category": "approval",
+                        }, ensure_ascii=False)
+                    else:
+                        reply = json.dumps({
+                            "state": "blocked", "progress_pct": pct,
+                            "note": "采购动作链已推进：" + ("；".join(steps) if steps else "核实缺料并执行采购动作")
+                                    + "。PO 已下单，等待到货后自动闭环（受阻于供应商交付）。",
+                            "blocked_by": "供应商", "block_category": "supplier",
+                        }, ensure_ascii=False)
                     break
         conclusion = _parse_follow_reply(reply)
     except Exception as exc:  # noqa: BLE001 — 单任务跟进失败不能拖垮扫描循环
