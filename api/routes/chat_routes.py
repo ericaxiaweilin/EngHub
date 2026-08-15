@@ -2026,6 +2026,27 @@ async def _handle_kernel_chat(
         # idle while the client or proxy is still holding the response open.
         await db.commit()
 
+    async def overflow_handler(_session_id: str, detail: str) -> bool:
+        """provider 确认 CONTEXT_WINDOW_EXCEEDED 时：强制压缩该会话旧历史。
+
+        返回是否发生了折叠；kernel 在折叠后重试一次。保留原始错误除非
+        压缩证明有进展（对齐 DSH capacity-independent overflow recovery）。
+        """
+        from api.services.chat_persistence_service import compact_session_events
+        try:
+            result = await compact_session_events(
+                db,
+                _session_id,
+                user=current_user,
+                factory_id=factory_id,
+                reason="overflow",
+                keep_recent=2,
+            )
+            return bool(result.get("folded"))
+        except Exception:  # noqa: BLE001
+            _logger.debug("[chat-kernel] overflow 压缩失败", exc_info=True)
+            return False
+
     kernel = HarnessKernel(
         db=db,
         call_llm=_call_llm,
@@ -2052,6 +2073,7 @@ async def _handle_kernel_chat(
         permission_gate=permission_gate,
         model_reviewer=model_reviewer,
         deterministic_handler=deterministic_handler,
+        overflow_handler=overflow_handler,
         **_checkpoint_options(),
     )
 

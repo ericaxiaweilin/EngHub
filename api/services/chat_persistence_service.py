@@ -556,16 +556,26 @@ async def compact_session_events(
         plain_rows = [e for e in rows if e.event_type not in (
             "compaction_start", "compaction_summary", "compaction_end",
         )]
-        # 自动压力门槛：仅当会话普通事件足够多时才压力折叠（对齐 DSH 阈值触发），
-        # 避免小会话因 keep_recent 而过早折叠可读历史。
-        if reason == "pressure" and len(plain_rows) < COMPACTION_PRESSURE_EVENTS:
-            return {
-                "folded": False,
-                "compaction_id": compaction_id,
-                "status": "no_pressure",
-                "total_events": len(plain_rows),
-                "pressure_threshold": COMPACTION_PRESSURE_EVENTS,
-            }
+        # 自动压力门槛（对齐 DSH token-meter + threshold ratio）：
+        # 会话事件流 token 压力达到容量阈值才触发，避免小会话过早折叠可读历史。
+        if reason == "pressure":
+            from api.services.token_meter import (
+                DEFAULT_CONTEXT_WINDOW,
+                PRESSURE_THRESHOLD_RATIO,
+                measure_session_events,
+            )
+            measured = measure_session_events(plain_rows)
+            pressure_tokens = measured["total_tokens"]
+            threshold_tokens = int(DEFAULT_CONTEXT_WINDOW * PRESSURE_THRESHOLD_RATIO)
+            if pressure_tokens < threshold_tokens:
+                return {
+                    "folded": False,
+                    "compaction_id": compaction_id,
+                    "status": "no_pressure",
+                    "total_tokens": pressure_tokens,
+                    "pressure_threshold_tokens": threshold_tokens,
+                    "log_revision": measured["log_revision"],
+                }
         # 已被先前折叠引用的事件不再重复折叠
         already_folded = set()
         for e in rows:
@@ -598,6 +608,22 @@ async def compact_session_events(
     summary = _build_compaction_summary(folded)
     replacement_checkpoint = (folded[-1].seq if folded else fold_from) + 1
 
+    # 非缩小摘要拒绝（对齐 DSH non-shrinking-summary rejection）：
+    # 摘要 token 不得大于被折叠区间的 token 压力，否则压缩没有意义。
+    from api.services.token_meter import estimate_text, measure_session_events
+    folded_measured = measure_session_events(folded)
+    summary_tokens = estimate_text(summary)
+    if summary_tokens > folded_measured["surface_tokens"]:
+        return {
+            "folded": False,
+            "compaction_id": compaction_id,
+            "status": "not_shrinking",
+            "fold_from": fold_from,
+            "fold_to": fold_to,
+            "folded_tokens": folded_measured["surface_tokens"],
+            "summary_tokens": summary_tokens,
+        }
+
     await append_session_events(db, session_id=session_id, request_id=compaction_id, events=[
         {
             "type": "compaction_start",
@@ -606,6 +632,7 @@ async def compact_session_events(
                 "fold_from": fold_from,
                 "fold_to": fold_to,
                 "reason": reason,
+                "folded_tokens": folded_measured["surface_tokens"],
             },
         },
         {
@@ -614,6 +641,7 @@ async def compact_session_events(
                 "compaction_id": compaction_id,
                 "summary": summary,
                 "source_event_seqs": source_event_seqs,
+                "summary_tokens": summary_tokens,
             },
         },
         {
@@ -634,6 +662,8 @@ async def compact_session_events(
         "folded_count": len(source_event_seqs),
         "source_event_seqs": source_event_seqs,
         "summary": summary,
+        "folded_tokens": folded_measured["surface_tokens"],
+        "summary_tokens": summary_tokens,
     }
 
 

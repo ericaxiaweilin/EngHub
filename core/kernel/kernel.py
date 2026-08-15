@@ -22,6 +22,29 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from core.kernel.context import KernelContext
 from core.kernel.agent_loop import AgentLoop, LoopResult
 from core.kernel.checkpoint import CheckpointManager
+
+# provider 确认的上下文窗口溢出信号（对齐 DSH CONTEXT_WINDOW_EXCEEDED）。
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context window",
+    "context_window",
+    "contextwindow",
+    "maximum context",
+    "too many tokens",
+    "prompt is too long",
+    "context length exceeded",
+    "max context",
+    "token limit",
+    "exceeds the model",
+    "CONTEXT_WINDOW_EXCEEDED",
+    "input is too long",
+)
+
+
+def _is_context_overflow(detail: str) -> bool:
+    if not detail:
+        return False
+    low = detail.lower()
+    return any(marker in low for marker in _CONTEXT_OVERFLOW_MARKERS)
 from core.kernel.telemetry import Telemetry
 
 _logger = logging.getLogger("engflow_kernel")
@@ -88,11 +111,13 @@ class HarnessKernel:
         checkpoint_session_factory: Optional[Callable[[], Any]] = None,
         checkpoint_persistence_enabled: bool = False,
         deterministic_handler: Optional[Callable[..., Awaitable[Optional[KernelResponse]]]] = None,
+        overflow_handler: Optional[Callable[[str, Dict[str, Any]], Awaitable[bool]]] = None,
     ) -> None:
         self.db = db
         self._active_ctx = None
         self._persist_hook = persist_hook
         self._deterministic_handler = deterministic_handler
+        self._overflow_handler = overflow_handler
         self._permission_gate = permission_gate
         self._model_reviewer = model_reviewer
         self._resolve_model_route = resolve_model_route
@@ -172,6 +197,26 @@ class HarnessKernel:
                 )
                 if loop_result.restored_from_checkpoint:
                     ctx.metadata["checkpoint_restored"] = True
+
+                # 3.5) 上下文溢出恢复（对齐 DSH context-overflow recovery）：
+                # provider 确认 CONTEXT_WINDOW_EXCEEDED → 先压缩旧历史再重试一次；
+                # 重试仍失败则保留原始 provider 错误（不吞错误）。
+                if (
+                    loop_result.status == "gateway_error"
+                    and _is_context_overflow(loop_result.error_detail or "")
+                    and self._overflow_handler is not None
+                ):
+                    compacted = await self._overflow_handler(session_id=ctx.session_id, detail=loop_result.error_detail)
+                    ctx.metadata["context_overflow"] = True
+                    ctx.metadata["context_overflow_compacted"] = bool(compacted)
+                    if compacted:
+                        loop_result = await self._loop.run(
+                            payload,
+                            request_id=request_id,
+                            checkpoint=self._checkpoints,
+                        )
+                        ctx.metadata["context_overflow_retried"] = True
+                        ctx.metadata["context_overflow_retry_status"] = loop_result.status
 
                 # 4) 组装响应（可选 ModelReview 替换草稿）
                 reply = loop_result.reply

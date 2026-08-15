@@ -30,6 +30,7 @@ class LoopResult:
     diagrams: List[Dict[str, Any]] = field(default_factory=list)
     status: str = "complete"  # complete | no_reply | max_rounds | gateway_error | exception
     error: Optional[str] = None
+    error_detail: Optional[str] = None
     checkpoint_key: Optional[str] = None
     restored_from_checkpoint: bool = False
 
@@ -116,12 +117,18 @@ class AgentLoop:
             resp = await self._call_llm(payload)
 
             if resp.status_code >= 400:
+                body_text = ""
+                try:
+                    body_text = resp.text or ""
+                except Exception:  # noqa: BLE001
+                    body_text = ""
                 return LoopResult(
                     model=model,
                     degraded=True,
                     rounds_used=round_no + 1,
                     status="gateway_error",
                     error=f"gateway returned {resp.status_code}",
+                    error_detail=body_text[:4000],
                 )
 
             data = resp.json()
