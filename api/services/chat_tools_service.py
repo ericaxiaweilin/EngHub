@@ -3012,7 +3012,7 @@ async def _tool_create_purchase_requisition(db: AsyncSession, args: Dict[str, An
     """创建采购申请（确定性，写 purchase_requisitions 正表）：同物料已有 PENDING PR 则更新数量，否则新建。"""
     fid = factory_id or "FAC_MECH_001"
     mat = str(args.get("material_code") or "").strip()
-    qty = float(args.get("required_qty") or 0)
+    qty = float(args.get("required_qty") or args.get("qty") or args.get("quantity") or 0)
     if not mat or qty <= 0:
         return {"error": "缺少物料编码或数量不合法"}
     name = str(args.get("material_name") or mat)
@@ -3058,7 +3058,7 @@ async def _tool_assign_supplier_to_pr(db: AsyncSession, args: Dict[str, Any], fa
         ), {"id": prefer, "f": fid})).mappings().first()
     else:
         prices = (await db.execute(text(
-            "SELECT sp.supplier_id, sp.unit_price, sp.lead_days, s.supplier_name, s.rating, s.avg_lead_days "
+            "SELECT sp.supplier_id, s.id AS supplier_id_pk, sp.unit_price, sp.lead_days, s.supplier_name, s.rating, s.avg_lead_days "
             "FROM supplier_prices sp JOIN suppliers s ON s.id = sp.supplier_id "
             "WHERE sp.material_code=:m AND sp.is_active=TRUE AND s.factory_id=:f "
             "ORDER BY sp.unit_price ASC, s.rating DESC LIMIT 1"
@@ -3072,13 +3072,14 @@ async def _tool_assign_supplier_to_pr(db: AsyncSession, args: Dict[str, Any], fa
             ), {"f": fid})).mappings().first()
     if not supplier:
         return {"error": "无可用供应商（需先在 suppliers 注册）"}
+    sid = supplier.get("supplier_id_pk") or supplier.get("id") or supplier.get("supplier_id")
     await db.execute(text(
         "UPDATE purchase_requisitions SET supplier_id=:s, lead_time_days=:ld, updated_at=NOW() WHERE id=:id"
-    ), {"s": supplier["id"], "ld": supplier.get("avg_lead_days") or 7, "id": pr_id})
+    ), {"s": sid, "ld": supplier.get("avg_lead_days") or 7, "id": pr_id})
     await db.commit()
     return {"type": "supplier_assignment", "action": "assigned", "pr_id": pr_id,
             "material_code": pr["material_code"],
-            "supplier_id": supplier["id"], "supplier_name": supplier.get("supplier_name") or supplier.get("supplier_code"),
+            "supplier_id": sid, "supplier_name": supplier.get("supplier_name") or supplier.get("supplier_code"),
             "price": float(supplier.get("unit_price") or 0) if supplier.get("unit_price") is not None else None,
             "lead_days": supplier.get("lead_days"),
             "status": "assigned"}
@@ -3116,7 +3117,7 @@ async def _tool_create_purchase_order(db: AsyncSession, args: Dict[str, Any], fa
         "VALUES (:id, :f, :po, :pr, :s, :sn, :m, :mn, :q, :p, :t, 'CNY', CURRENT_DATE, CURRENT_DATE + CAST(:lead AS integer), 'ordered', TRUE, NOW(), NOW())"
     ), {"id": po_id, "f": fid, "po": po_code, "pr": pr_id, "s": pr["supplier_id"], "sn": sup["supplier_name"],
         "m": pr["material_code"], "mn": pr["material_name"] or pr["material_code"], "q": pr["qty"],
-        "p": price, "t": float(price * pr["qty"]) if price else None, "lead": lead})
+        "p": price, "t": float(price) * float(pr["qty"]) if price else None, "lead": lead})
     await db.execute(text(
         "UPDATE purchase_requisitions SET status='converted', purchase_code=:pc, updated_at=NOW() WHERE id=:id"
     ), {"id": pr_id, "pc": po_code})
