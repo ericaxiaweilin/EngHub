@@ -3051,6 +3051,14 @@ async def _legacy_stream_disabled(
                 ]
                 if not tool_calls:
                     if not streamed_content:
+                        # 模型没输出正文但执行过工具：用工具结果摘要兜底（不报"服务不可用"）
+                        summary = _summarize_actions(actions) if actions else ""
+                        if summary:
+                            acc_reply = summary
+                            yield _sse("delta", {"content": summary})
+                            yield _sse("done", {"model": route["task_id"], "degraded": False,
+                                                "session_id": session_id, "request_id": stream_request_id})
+                            return
                         stream_degraded = True
                         acc_reply = _degraded_message("网关无有效回复")
                         yield _sse("delta", {"content": acc_reply})
