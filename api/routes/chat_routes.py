@@ -424,6 +424,9 @@ async def _resolve_model_route(
         or runtime_policy.get("max_completion_tokens")
         or max_completion_tokens
     )
+    # 中文业务答复（订单概览/预警简报等多段表格）在 1024 tokens 下会被截断，
+    # 模型栈默认给 1024（enghub.advisor.chat runtime_policy），后端钳制下限 2048。
+    completion_limit = max(2048, int(completion_limit))
     return {
         "task_id": str(route.get("dispatch_scenario") or task_id),
         "provider": provider,

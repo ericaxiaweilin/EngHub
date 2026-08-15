@@ -997,6 +997,20 @@ TOOL_DEFINITIONS.extend([
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_sales_order_detail",
+            "description": "查询销售订单详情：订单头（状态/数量/交期/优先级/产品/客户）+ 关联生产计划 + 关联工单。支持按订单号或订单ID查询，订单表无记录时自动从关联工单聚合（演示订单兼容）。用于'查这个销售订单/看订单详情/判断订单评审结论/RDD能不能保证'类请求。order_ref 传 'all' 时返回订单统计（总数+按状态分布+最近订单），用于'有多少个订单/订单总数/订单概览'类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_ref": {"type": "string", "description": "销售订单号（如 SO-2026-0022）或订单ID"},
+                },
+                "required": ["order_ref"],
+            },
+        },
+    },
 ])
 
 
@@ -3135,9 +3149,147 @@ async def _tool_create_followup_task(db: AsyncSession, args: Dict[str, Any], ope
     )
 
 
+async def _tool_query_sales_order_detail(db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """查询销售订单详情：订单头 + 关联生产计划 + 关联工单（演示订单兼容）。"""
+    order_ref = str(args.get("order_ref") or "").strip()
+    if not order_ref:
+        return {"error": "缺少 order_ref 参数（销售订单号或ID）"}
+
+    from sqlalchemy import text
+
+    # order_ref=all → 订单统计（模型问"有多少个订单"时避免误用工单数）
+    if order_ref.lower() == "all":
+        try:
+            factory_id = factory_id or "FAC_MECH_001"
+            stats = await db.execute(
+                text(
+                    "SELECT count(*) AS total, "
+                    "count(*) FILTER (WHERE status='pending') AS pending, "
+                    "count(*) FILTER (WHERE status='confirmed') AS confirmed, "
+                    "count(*) FILTER (WHERE status IN ('released','in_progress','in_production')) AS in_progress, "
+                    "count(*) FILTER (WHERE status='completed') AS completed, "
+                    "count(*) FILTER (WHERE status='cancelled') AS cancelled "
+                    "FROM sales_orders WHERE factory_id = :fid"
+                ),
+                {"fid": factory_id},
+            )
+            s = stats.mappings().first()
+            recent = await db.execute(
+                text(
+                    "SELECT order_code, status, product_id, quantity, delivery_date, priority, customer_name "
+                    "FROM sales_orders WHERE factory_id = :fid "
+                    "ORDER BY created_at DESC LIMIT 10"
+                ),
+                {"fid": factory_id},
+            )
+            rows = [dict(r) for r in recent.mappings().all()]
+            return {
+                "order_count": int(s["total"] or 0),
+                "by_status": {
+                    "pending": int(s["pending"] or 0),
+                    "confirmed": int(s["confirmed"] or 0),
+                    "in_progress": int(s["in_progress"] or 0),
+                    "completed": int(s["completed"] or 0),
+                    "cancelled": int(s["cancelled"] or 0),
+                },
+                "recent_orders": rows,
+                "note": "以上为销售订单统计（sales_orders 表），不是工单统计。",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"订单统计失败: {type(exc).__name__}: {exc}"}
+
+    order = None
+    result = await db.execute(
+        text("SELECT * FROM sales_orders WHERE order_code = :ref OR id = :ref"),
+        {"ref": order_ref},
+    )
+    row = result.mappings().first()
+    if row is not None:
+        order = dict(row)
+    source = "sales_orders" if order else "work_orders"
+
+    wo_result = await db.execute(
+        text("SELECT * FROM work_orders WHERE sales_order_id = :ref ORDER BY created_at DESC"),
+        {"ref": order_ref},
+    )
+    work_orders = [dict(r) for r in wo_result.mappings().all()]
+
+    plan_result = await db.execute(
+        text("SELECT * FROM plans WHERE sales_order_id = :ref ORDER BY created_at DESC"),
+        {"ref": order_ref},
+    )
+    plans = [dict(r) for r in plan_result.mappings().all()]
+
+    if not order and not work_orders and not plans:
+        return {"error": f"未找到销售订单：{order_ref}"}
+
+    if not order and work_orders:
+        first = work_orders[0]
+        order = {
+            "id": order_ref,
+            "order_code": order_ref,
+            "factory_id": first.get("factory_id"),
+            "product_id": first.get("product_id"),
+            "product_name": None,
+            "customer_name": None,
+            "customer_code": None,
+            "quantity": sum((w.get("planned_qty") or 0) for w in work_orders),
+            "unit": first.get("unit") or "pcs",
+            "delivery_date": None,
+            "priority": "medium",
+            "status": "demo",
+            "decomposed": True,
+            "material_ready": None,
+            "total_amount": None,
+            "currency": "CNY",
+            "remark": "演示订单（未在销售订单主档登记，信息由关联工单聚合）",
+            "created_at": first.get("created_at"),
+        }
+
+    # 关键字段转成可读字符串，避免暴露超长/二进制值
+    def _fmt_date(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    order_out = dict(order)
+    for k, v in list(order_out.items()):
+        if hasattr(v, "isoformat"):
+            order_out[k] = v.isoformat()
+
+    return {
+        "order": order_out,
+        "source": source,
+        "work_order_count": len(work_orders),
+        "work_orders": [
+            {
+                "id": w.get("id"),
+                "work_order_code": w.get("work_order_code"),
+                "status": w.get("status"),
+                "wo_type": w.get("wo_type"),
+                "planned_qty": w.get("planned_qty"),
+                "completed_qty": w.get("completed_qty"),
+                "product_id": w.get("product_id"),
+                "created_at": _fmt_date(w.get("created_at")),
+            }
+            for w in work_orders
+        ],
+        "plan_count": len(plans),
+        "plans": [
+            {
+                "id": pl.get("id"),
+                "plan_code": pl.get("plan_code") or pl.get("code") or pl.get("plan_no"),
+                "status": pl.get("status"),
+                "quantity": pl.get("quantity") or pl.get("planned_qty"),
+                "created_at": _fmt_date(pl.get("created_at")),
+            }
+            for pl in plans
+        ],
+    }
+
+
 _TOOL_EXECUTORS["create_followup_task"] = _tool_create_followup_task
 _TOOL_EXECUTORS["query_product_bom"] = _tool_query_product_bom
 _TOOL_EXECUTORS["create_product_bom"] = _tool_create_product_bom
+_TOOL_EXECUTORS["query_sales_order_detail"] = _tool_query_sales_order_detail
 
 # 写操作工具（需要记录操作人）
 WRITE_TOOLS = {
@@ -3217,6 +3369,7 @@ TOOL_LABELS = {
     "run_virtual_factory_pulse": "虚拟工厂脉搏",
     "create_followup_task": "挂账跟进任务",
     "query_product_bom": "查询产品BOM",
+    "query_sales_order_detail": "销售订单详情",
     "create_product_bom": "补录产品BOM",
 }
 
@@ -3468,6 +3621,14 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "职位流程", "工作流程是什么", "每天做什么",
             # 责任归属
             "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
+        ],
+    },
+    {
+        "tool": "query_sales_order_detail",
+        "keywords": [
+            "查这个销售订单", "查一下销售订单", "销售订单详情", "订单详情",
+            "看这个订单", "看下这个订单", "这个订单什么情况", "订单评审结论",
+            "RDD能不能保证", "订单交期", "查订单数据",
         ],
     },
     {
