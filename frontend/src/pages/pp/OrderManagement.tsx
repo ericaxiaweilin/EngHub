@@ -109,7 +109,7 @@ const OrderManagement: React.FC = () => {
       else rows = rows.filter(o => o.risk_level === riskFilter)
     }
     return rows
-  }, [orders, priorityFilter, riskFilter])
+  }, [orders, searchText, priorityFilter, riskFilter])
 
   const handleCreate = async () => {
     try {
