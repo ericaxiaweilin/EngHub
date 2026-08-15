@@ -6,6 +6,7 @@ EngHub MES Application Entry Point
 import os
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -208,6 +209,26 @@ async def _periodic_scheduler():
                             _logger.warning(f"[scheduler] 日报生成失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 日报任务异常: {e}")
+
+        # ── ILM 信息生命周期管理：每日 03:00 归档/清理消息数据 ──
+        # 150账户×50组织×50条/天 ≈ 1W+条/天 → 磁盘治理（归档摘要+删除过期）
+        try:
+            import time as _t_ilm
+            _cur_ilm = datetime.now()
+            if not hasattr(_periodic_scheduler, "_last_ilm"):
+                _periodic_scheduler._last_ilm = 0
+            if (_cur_ilm.hour == 3 and _t_ilm.time() - _periodic_scheduler._last_ilm > 3600) or \
+               (_periodic_scheduler._last_ilm == 0 and _t_ilm.time() - _periodic_scheduler._last_ilm > 86400):
+                _periodic_scheduler._last_ilm = _t_ilm.time()
+                try:
+                    from api.services.ilm_service import run_ilm, format_report
+                    async with db_config.session_factory() as db:
+                        report = await run_ilm(db)
+                        _logger.info(f"[scheduler] ILM: {format_report(report)}")
+                except Exception as ex:
+                    _logger.warning(f"[scheduler] ILM 执行失败: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] ILM 调度异常: {e}")
 
         # 自动排产默认关闭：APS 版本必须由计划员明确生成/确认/下达，
         # 防止后台每 8 小时制造无法解释的草案并污染版本审计。
