@@ -135,10 +135,18 @@ class AgentLoop:
             choice = (data.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             tool_calls = message.get("tool_calls") or []
+            content = message.get("content") or ""
+
+            # 模型（agnes-2.5-flash 等 Anthropic 系）偶发在 content 里输出
+            # Claude XML 工具调用标签（<tool_call>/<function=call:tools>/<parameter=...>）
+            # 而非 OpenAI 协议 tool_calls 字段。识别并转换为真实 tool_calls 执行，
+            # 避免 XML 标签被当作最终回复返回给用户（前端刷屏）。
+            if not tool_calls:
+                tool_calls = _parse_xml_tool_calls(content)
 
             # 无工具调用 → 最终回复
             if not tool_calls:
-                reply = self._clean_reply(message.get("content") or "")
+                reply = self._clean_reply(content)
                 if not reply:
                     return LoopResult(
                         model=model,
@@ -262,3 +270,64 @@ class AgentLoop:
             return json.loads(raw or "{}")
         except (json.JSONDecodeError, TypeError):
             return {}
+
+
+def _parse_xml_tool_calls(content: str):
+    """解析模型 content 中混入的 Claude XML 工具调用标签，返回 OpenAI tool_calls 列表。
+
+    支持形态（agnes-2.5-flash 实测）：
+      <tool_call>
+        <function=call:tools>
+          <parameter=tool_name>query_sales_order_detail</parameter>
+          <parameter=so_numbers>[...]</parameter>
+        </function>
+        <parameter=tool_inputs>{"so_numbers": [...]}</parameter>
+      </tool_call>
+    以及简化形态 <tool_call><function=...>...</function></tool_call>。
+    解析失败/无有效调用返回空列表。
+    """
+    if not content or "<tool_call" not in content:
+        return []
+    import json
+    import re
+
+    results = []
+    # 逐块提取 <tool_call>...</tool_call>
+    pattern = re.compile(r"<tool_call\b[^>]*>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
+    for m in pattern.finditer(content):
+        block = m.group(1)
+        # 工具名：<parameter=tool_name>xxx</parameter>
+        tm = re.search(r"<parameter=tool_name>\s*(.*?)\s*</parameter>", block, re.DOTALL | re.IGNORECASE)
+        if not tm:
+            continue
+        tool_name = tm.group(1).strip()
+        if not tool_name:
+            continue
+        arguments = {}
+        # 优先 tool_inputs（完整 JSON）
+        im = re.search(r"<parameter=tool_inputs>\s*(.*?)\s*</parameter>", block, re.DOTALL | re.IGNORECASE)
+        if im:
+            raw = im.group(1).strip()
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    arguments = parsed
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+        # 其余 <parameter=name>value</parameter> 键值
+        if not arguments:
+            for pm in re.finditer(r"<parameter=([a-zA-Z_][a-zA-Z0-9_]*)>\s*(.*?)\s*</parameter>", block, re.DOTALL | re.IGNORECASE):
+                key = pm.group(1)
+                if key in ("tool_name", "tool_inputs"):
+                    continue
+                val = pm.group(2).strip()
+                try:
+                    arguments[key] = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    arguments[key] = val
+        results.append({
+            "id": f"xml_call_{len(results)}",
+            "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps(arguments, ensure_ascii=False)},
+        })
+    return results

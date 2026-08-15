@@ -527,14 +527,50 @@ async def model_warmup_loop() -> None:
 
 
 def _clean_model_reply(content: str) -> str:
-    """清除模型协议中误混入 content 的推理区块，不改变最终答案语义."""
+    """清除模型协议中误混入 content 的推理/工具调用区块，不改变最终答案语义.
+
+    覆盖两类泄漏：
+    1) <think>...</think> 推理区块；
+    2) Claude XML 工具调用标签（<tool_call>/<function=call:tools>/<parameter=...>，
+       agnes-2.5-flash 等 Anthropic 系模型偶发输出）。标签被 AgentLoop 解析为
+       tool_calls 后不应残留进最终回复；未解析成功的兜底也要剥离，避免刷屏。
+    """
     reply = (content or "").strip()
-    return re.sub(
+    reply = re.sub(
         r"<think>.*?</think>",
         "",
         reply,
         flags=re.DOTALL | re.IGNORECASE,
-    ).strip()
+    )
+    # 剥离完整 XML 工具调用块（含嵌套），再剥离孤立的开/闭标签
+    reply = re.sub(
+        r"<tool_call\b.*?</tool_call>",
+        "",
+        reply,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    reply = re.sub(
+        r"<function(?:\s*=\s*[\w.:-]+)?\b.*?</function>",
+        "",
+        reply,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    reply = re.sub(
+        r"<parameter\s*=\s*[\w.:-]+>.*?</parameter>",
+        "",
+        reply,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # 孤立残留标签（不闭合的 <tool_call> / </tool_call> 等）
+    reply = re.sub(
+        r"</?(?:tool_call|function|parameter)\b[^>]*>",
+        "",
+        reply,
+        flags=re.IGNORECASE,
+    )
+    # 清理剥离后产生的多余空行
+    reply = re.sub(r"\n{3,}", "\n\n", reply)
+    return reply.strip()
 
 
 def _grounded_tool_result(result: Dict[str, Any]) -> str:
@@ -864,8 +900,20 @@ async def _verify_grounded_reply(
 
 async def _load_attachment_records(
     db: AsyncSession, attachments: List[Attachment], user: User,
+    factory_id: Optional[str] = None,
 ) -> List[FileRecord]:
-    """按 file_id 加载附件记录（做工厂隔离：普通用户不可引用其他工厂文件）。"""
+    """按 file_id 加载附件记录（做工厂隔离：普通用户不可引用其他工厂文件）。
+
+    有效工厂与上传/下载口径一致（x-factory-id → active_factory_id → factory_id）；
+    同时放行用户归属工厂的历史附件，避免激活工厂与归属工厂不一致时照片被误丢弃。
+    """
+    allowed_factories = {
+        f for f in (
+            factory_id,
+            getattr(user, "active_factory_id", None),
+            getattr(user, "factory_id", None),
+        ) if f
+    }
     records: List[FileRecord] = []
     for att in attachments:
         rec = (await db.execute(
@@ -873,8 +921,8 @@ async def _load_attachment_records(
         )).scalar_one_or_none()
         if not rec:
             continue
-        if not user.is_superuser and rec.factory_id and user.factory_id \
-                and rec.factory_id != user.factory_id:
+        if not user.is_superuser and rec.factory_id and allowed_factories \
+                and rec.factory_id not in allowed_factories:
             continue  # 跨工厂附件直接忽略，避免越权
         records.append(rec)
     return records
@@ -1317,7 +1365,7 @@ async def _legacy_chat_disabled(
     actions: List[ToolAction] = []
 
     # ---- 加载本轮附件（工厂隔离）：图片走多模态 vision，非图片以文字摘要告知 ----
-    att_records = await _load_attachment_records(db, request.attachments, current_user) \
+    att_records = await _load_attachment_records(db, request.attachments, current_user, factory_id=factory_id) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
     non_image_records = [r for r in att_records if not _is_image_record(r)]
@@ -1808,7 +1856,7 @@ async def _handle_kernel_chat(
     memory_block = mem.build_memory_block(memory_facts, profile=user_profile)
 
     # 附件加载与 V1 一致
-    att_records = await _load_attachment_records(db, request.attachments, current_user) \
+    att_records = await _load_attachment_records(db, request.attachments, current_user, factory_id=factory_id) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
     non_image_records = [r for r in att_records if not _is_image_record(r)]
@@ -2706,7 +2754,7 @@ async def _legacy_stream_disabled(
         yield _sse("status", {"message": "正在读取表格附件…"})
 
         # ---- 加载附件 ----
-        att_records = await _load_attachment_records(db, request.attachments, current_user) \
+        att_records = await _load_attachment_records(db, request.attachments, current_user, factory_id=factory_id) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
         non_image_records = [r for r in att_records if not _is_image_record(r)]
