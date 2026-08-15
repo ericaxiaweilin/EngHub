@@ -3,7 +3,7 @@
  * 视图：气泡面板/指挥总览/AI调度/资源负荷/资源调度板/决策中心/瓶颈分析/任务队列/图连接矩阵/逻辑链/调度日志
  * 布局：左 rail（视图导航+资源维度+智能体）| 中 main | 右 rail 固定（管理者 Action Center）
  */
-import { useEffect, useMemo, useState, createContext, useContext } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Tag, Button, Space, Progress, Tooltip, Input, Badge, Select, message, InputNumber } from 'antd'
 import {
   ThunderboltOutlined, FundOutlined, CarryOutOutlined, FileTextOutlined,
@@ -12,6 +12,7 @@ import {
   ControlOutlined, FireOutlined, DashboardOutlined, AppstoreOutlined,
 } from '@ant-design/icons'
 import axios from 'axios'
+import { RccContext } from './rcc_theme'
 import { useSearchParams } from 'react-router-dom'
 import RCCOrgBubbles from './RCCOrgBubbles'
 import RCCOverview from './RCCOverview'
@@ -30,16 +31,8 @@ const C = {
   danger: '#D64545', dangerSoft: '#FBEAEA', warn: '#B36A12', warnSoft: '#FBF0DA',
   success: '#157C4F', successSoft: '#E5F6EE',
 }
-// 旧子组件兼容（深色系）
-export const COLORS = {
-  bg: '#0f1923', bgCard: '#1a2733', bgHover: '#243442', border: '#2a3f50',
-  accent: '#00d4aa', accentBlue: '#4facfe', accentPurple: '#a78bfa',
-  warning: '#fbbf24', danger: '#f87171', success: '#34d399',
-  text: '#e2e8f0', textDim: '#94a3b8', textMuted: '#64748b',
-}
-const _RccCtx = createContext<any>({ baseline: {}, decisions: {}, factoryId: 'FAC_MECH_001', loading: false, lastSync: null, refresh: () => {} })
-export const useRcc = () => useContext(_RccCtx)
-export const RccContext = _RccCtx
+// 旧子组件兼容（从独立 theme 文件导入，打破循环依赖）
+export { COLORS, useRcc, RccContext } from './rcc_theme'
 
 const TYPE_META: Record<string, { label: string; color: string; soft: string }> = {
   resource_allocation: { label: '资源分配', color: C.brand, soft: C.brandSoft },
@@ -205,6 +198,7 @@ export default function RCCCommandCenter() {
 
         {/* 中 main */}
         <main style={{ padding: '14px 16px 30px', minWidth: 0, overflow: 'auto', maxHeight: 'calc(100vh - 106px)' }}>
+          <RccContext.Provider value={{ baseline, decisions: { full: tasks, pending, approved: tasks.filter((t: any) => t.status === 'approved') }, factoryId, loading, lastSync: new Date().toISOString(), refresh: loadAll }}>
           {activeTab === 'bubbles' && <RCCOrgBubbles factoryId={factoryId} />}
           {activeTab === 'overview' && <RCCOverview />}
           {activeTab === 'resources' && <RCCResourceBoard />}
@@ -354,6 +348,7 @@ export default function RCCCommandCenter() {
               </div>
             </div>
           )}
+          </RccContext.Provider>
         </main>
 
         {/* 右 rail：管理者 Action Center（固定右边框，不折叠） */}
