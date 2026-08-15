@@ -471,17 +471,29 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         }
         reply = ""
         for _ in range(FOLLOW_MAX_TOOL_ROUNDS):
-            resp = await _call_llm(payload, request_timeout=route["request_timeout"])
+            # 超时钳制：模型栈路由默认 30s 对工具链跟进太紧（ReadTimeout 频发），下限 90s
+            resp = await _call_llm(payload, request_timeout=max(90.0, route["request_timeout"]))
             if resp.status_code >= 400:
                 reply = f"网关返回 {resp.status_code}，本次跟进未获结论"
                 break
             data = resp.json()
             message = (data.get("choices", [{}])[0] or {}).get("message", {}) or {}
             tool_calls = message.get("tool_calls") or []
+            content_text = message.get("content") or ""
+            # XML 兜底：模型（agnes 系）间歇性把工具调用写成 XML 标签而非 tool_calls 字段，
+            # 复用 AgentLoop 的解析器转成真实调用，否则 XML 当文本 → 结论被污染 → 反复跟进无结论。
+            if not tool_calls and content_text:
+                try:
+                    from core.kernel.agent_loop import _parse_xml_tool_calls
+                    xml_calls = _parse_xml_tool_calls(content_text)
+                    if xml_calls:
+                        tool_calls = xml_calls
+                except Exception:
+                    tool_calls = []
             if not tool_calls:
-                reply = message.get("content") or ""
+                reply = content_text
                 break
-            messages.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": tool_calls})
+            messages.append({"role": "assistant", "content": content_text, "tool_calls": tool_calls})
             for tc in tool_calls:
                 fn = tc.get("function", {}) or {}
                 tool_name = fn.get("name", "")
