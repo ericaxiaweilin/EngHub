@@ -33,6 +33,8 @@ SCAN_BATCH_SIZE = 5
 FOLLOW_MAX_TOOL_ROUNDS = 4
 
 FOLLOWUP_STATUSES = {"open", "blocked", "done", "cancelled"}
+# blocked 冷却重试间隔（分钟）：达 max_follows 后隔这么久自动恢复跟进，避免永久卡死
+_BLOCKED_RETRY_MINUTES = max(30, int(os.getenv("FOLLOWUP_BLOCKED_RETRY_MINUTES", "360")))
 # 统一待办条目类型：AI跟进 / 他人指派 / 会议纪要 / 邮件 / 备忘
 ITEM_TYPES = {"followup", "assigned", "meeting", "email", "note"}
 
@@ -550,20 +552,23 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
     reached_limit = follow_count >= int(task.get("max_follows") or 60) and new_status not in {"done"}
     if reached_limit:
         new_status = "blocked"
-        conclusion["note"] += "（已达最大跟进次数，暂停自动跟进，请人工处理）"
+        # 冷却后自动恢复（BLOCKED_RETRY_MINUTES 默认 360=6h）：不清空计数，但重排 next_follow_at，
+        # 让 scanner 重新接管，避免"卡死到天荒地老只等人工"。人工也可随时解锁。
+        conclusion["note"] += "（已达最大跟进次数，进入冷却期，将自动恢复重试）"
 
     await db.execute(text("""
         UPDATE followup_tasks
         SET status = :st, progress_pct = :pct, last_follow_at = NOW(), last_follow_note = :note,
             follow_count = :fc, updated_at = NOW(),
             next_follow_at = CASE WHEN :active
-                THEN NOW() + make_interval(mins => follow_interval_minutes) ELSE NULL END,
+                THEN NOW() + make_interval(mins => :retry_min) ELSE NULL END,
             result_summary = CASE WHEN :done THEN :note ELSE result_summary END,
             closed_at = CASE WHEN :done THEN NOW() ELSE closed_at END
         WHERE id = :id
     """), {
         "st": new_status, "pct": conclusion["progress_pct"], "note": conclusion["note"],
-        "fc": follow_count, "active": new_status == "open" and not reached_limit,
+        "fc": follow_count, "active": new_status in ("open", "blocked") and not (reached_limit and new_status != "blocked"),
+        "retry_min": _BLOCKED_RETRY_MINUTES if reached_limit else int(task.get("follow_interval_minutes") or 30),
         "done": new_status == "done", "id": task_id,
     })
     await _append_log(db, task_id, factory_id, trigger_type,
@@ -593,7 +598,7 @@ async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:
                last_follow_note, follow_count, max_follows, progress_pct,
                item_type, assigned_to, ai_summary, ai_suggestion, payload
         FROM followup_tasks
-        WHERE status = 'open' AND next_follow_at IS NOT NULL AND next_follow_at <= NOW()
+        WHERE status IN ('open', 'blocked') AND next_follow_at IS NOT NULL AND next_follow_at <= NOW()
         ORDER BY next_follow_at ASC
         LIMIT :batch
         FOR UPDATE SKIP LOCKED
