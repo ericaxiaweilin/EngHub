@@ -279,7 +279,7 @@ class FactoryCommander:
     # Per-user 指挥官管理
     # ═══════════════════════════════════════════════════════════
 
-    def enable_for_user(self, user_id: str, factory_id: str, scope: Optional[Dict] = None, username: Optional[str] = None):
+    async def enable_for_user(self, user_id: str, factory_id: str, scope: Optional[Dict] = None, username: Optional[str] = None):
         """为用户开启指挥官（自动接管其工作范围）。开关持久化到 commander_sessions，
         服务重启后 watch_loop 仍能从 DB 恢复启用状态（对齐 luaguage commander_prefs）。"""
         self._user_commanders[user_id] = {
@@ -292,37 +292,62 @@ class FactoryCommander:
         _logger.info(f"[commander] 用户 {user_id} 开启指挥官 | scope={scope}")
         try:
             from sqlalchemy import text as _t
-            self.db.execute(_t(
+            await self.db.execute(_t(
                 "INSERT INTO commander_sessions (user_id, factory_id, enabled, scope, username, enabled_at, updated_at) "
                 "VALUES (:uid, :fid, TRUE, CAST(:scope AS jsonb), :uname, NOW(), NOW()) "
                 "ON CONFLICT (user_id, factory_id) DO UPDATE SET "
                 "enabled=TRUE, scope=EXCLUDED.scope, username=EXCLUDED.username, enabled_at=NOW(), updated_at=NOW()"
             ), {"uid": str(user_id), "fid": factory_id, "scope": _json_dumps(scope or {}), "uname": username or str(user_id)})
-            self.db.commit()
+            await self.db.commit()
         except Exception as exc:  # noqa: BLE001
             _logger.warning(f"[commander] 持久化开关失败(不影响内存): {exc}")
 
-    def disable_for_user(self, user_id: str):
+    async def disable_for_user(self, user_id: str):
         """关闭用户指挥官（持久化到 commander_sessions）"""
         if user_id in self._user_commanders:
             self._user_commanders[user_id]["enabled"] = False
         try:
             from sqlalchemy import text as _t
-            self.db.execute(_t(
+            await self.db.execute(_t(
                 "UPDATE commander_sessions SET enabled=FALSE, updated_at=NOW() WHERE user_id=:uid"
             ), {"uid": str(user_id)})
-            self.db.commit()
+            await self.db.commit()
         except Exception as exc:  # noqa: BLE001
             _logger.warning(f"[commander] 持久化关闭失败: {exc}")
 
-    def get_user_status(self, user_id: str) -> Dict[str, Any]:
-        """获取用户指挥官状态"""
+    async def get_user_status(self, user_id: str) -> Dict[str, Any]:
+        """获取用户指挥官状态（DB 优先，重启后仍能查到）"""
+        try:
+            from sqlalchemy import text as _t
+            row = (await self.db.execute(_t(
+                "SELECT enabled, factory_id, scope, username, enabled_at FROM commander_sessions WHERE user_id=:uid"
+            ), {"uid": str(user_id)})).mappings().first()
+            if row is not None:
+                return {
+                    "enabled": bool(row["enabled"]),
+                    "factory_id": row["factory_id"] or "FAC_MECH_001",
+                    "scope": dict(row["scope"] or {}),
+                    "username": row["username"] or user_id,
+                    "enabled_at": row["enabled_at"].isoformat() if row["enabled_at"] else None,
+                    "message": "指挥官运行中" if row["enabled"] else "指挥官已暂停",
+                }
+        except Exception:
+            pass
         cfg = self._user_commanders.get(user_id)
         if not cfg:
             return {"enabled": False, "message": "指挥官未开启"}
         return {**cfg, "message": "指挥官运行中" if cfg["enabled"] else "指挥官已暂停"}
 
-    def is_enabled(self, user_id: str) -> bool:
+    async def is_enabled(self, user_id: str) -> bool:
+        try:
+            from sqlalchemy import text as _t
+            row = (await self.db.execute(_t(
+                "SELECT enabled FROM commander_sessions WHERE user_id=:uid"
+            ), {"uid": str(user_id)})).mappings().first()
+            if row is not None:
+                return bool(row["enabled"])
+        except Exception:
+            pass
         cfg = self._user_commanders.get(user_id)
         return bool(cfg and cfg.get("enabled"))
 
@@ -408,7 +433,7 @@ class FactoryCommander:
             self._history = self._history[-self._history_max:]
         try:
             from sqlalchemy import text as _t
-            self.db.execute(_t(
+            await self.db.execute(_t(
                 "INSERT INTO commander_cycles (factory_id, mode, cycle, created_by, created_at) "
                 "VALUES (:fid, :mode, CAST(:cycle AS jsonb), :cb, NOW())"
             ), {
@@ -417,7 +442,7 @@ class FactoryCommander:
                 "cycle": _json_dumps(report.to_dict()),
                 "cb": created_by or "",
             })
-            self.db.commit()
+            await self.db.commit()
         except Exception as exc:  # noqa: BLE001
             _logger.warning(f"[commander] 持久化 cycle 快照失败: {exc}")
 
@@ -1112,14 +1137,14 @@ class FactoryCommander:
         """手动 override 订单模式（None=自动判断）"""
         self._mode_override[factory_id] = mode
 
-    def get_status(self, factory_id: str) -> Dict[str, Any]:
+    async def get_status(self, factory_id: str) -> Dict[str, Any]:
         """获取指挥官当前状态（total_cycles 优先从 DB 统计，重启后不归零）"""
         db_total = None
         try:
             from sqlalchemy import text as _t
-            db_total = int(self.db.execute(_t(
+            db_total = int((await self.db.execute(_t(
                 "SELECT COUNT(*) FROM commander_cycles WHERE factory_id=:fid"
-            ), {"fid": factory_id}).scalar() or 0)
+            ), {"fid": factory_id})).scalar() or 0)
         except Exception:
             db_total = None
         recent = [r for r in self._history if r.factory_id == factory_id]
@@ -1133,17 +1158,17 @@ class FactoryCommander:
             "history_count": len(recent),
         }
 
-    def get_history(self, factory_id: str, limit: int = 10) -> Dict[str, Any]:
+    async def get_history(self, factory_id: str, limit: int = 10) -> Dict[str, Any]:
         # 优先读 DB（重启后仍有历史）；DB 不可用时回退内存
         try:
             from sqlalchemy import text as _t
-            rows = self.db.execute(_t(
+            rows = (await self.db.execute(_t(
                 "SELECT cycle, created_at FROM commander_cycles "
                 "WHERE factory_id=:fid ORDER BY id DESC LIMIT :lim"
-            ), {"fid": factory_id, "lim": max(1, min(int(limit), 50))}).mappings().all()
-            total = self.db.execute(_t(
+            ), {"fid": factory_id, "lim": max(1, min(int(limit), 50))})).mappings().all()
+            total = (await self.db.execute(_t(
                 "SELECT COUNT(*) FROM commander_cycles WHERE factory_id=:fid"
-            ), {"fid": factory_id}).scalar() or 0
+            ), {"fid": factory_id})).scalar() or 0
             records = []
             for r in rows:
                 item = dict(r["cycle"] or {})

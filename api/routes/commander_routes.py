@@ -52,7 +52,7 @@ async def commander_status(
     """获取指挥官当前状态"""
     from api.services.factory_commander import FactoryCommander
     commander = FactoryCommander(None)
-    return commander.get_status(factory_id)
+    return await commander.get_status(factory_id)
 
 
 @router.get("/history")
@@ -64,7 +64,7 @@ async def commander_history(
     """获取指挥官决策历史"""
     from api.services.factory_commander import FactoryCommander
     commander = FactoryCommander(None)
-    return commander.get_history(factory_id, limit)
+    return await commander.get_history(factory_id, limit)
 
 
 @router.post("/mode")
@@ -92,10 +92,10 @@ async def toggle_commander(
     factory_id = req.factory_id or getattr(current_user, "active_factory_id", None) or "FAC_MECH_001"
 
     if req.enabled:
-        commander.enable_for_user(user_id, factory_id, req.scope, username=current_user.username)
+        await commander.enable_for_user(user_id, factory_id, req.scope, username=current_user.username)
         return {"enabled": True, "user_id": user_id, "factory_id": factory_id, "message": "指挥官已开启，将自动接管您工作范围内的生产调度、接单、排产、交期管理"}
     else:
-        commander.disable_for_user(user_id)
+        await commander.disable_for_user(user_id)
         return {"enabled": False, "user_id": user_id, "message": "指挥官已关闭，恢复手动模式"}
 
 
@@ -106,4 +106,4 @@ async def my_commander_status(
     """获取我的指挥官状态"""
     from api.services.factory_commander import FactoryCommander
     commander = FactoryCommander(None)
-    return commander.get_user_status(str(current_user.id))
+    return await commander.get_user_status(str(current_user.id))
