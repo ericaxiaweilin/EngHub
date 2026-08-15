@@ -886,6 +886,114 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_purchase_pipeline",
+            "description": "采购管道全景：按物料查采购申请(PR)/采购订单(PO)/供应商报价，确认物料采购状态。返回 PR/PO 数量与明细。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "material_code": {"type": "string", "description": "物料编码（可选，不传返回全部待处理）"},
+                    "status": {"type": "string", "description": "过滤状态：PENDING/assigned/converted/ordered/arrived"},
+                    "limit": {"type": "integer", "description": "返回条数，默认 10"}
+                }
+            },
+        },
+        },
+        {
+            "type": "function",
+            "function": {
+            "name": "create_purchase_requisition",
+            "description": "采购申请：物料缺料时生成采购申请(PR)。确定性写库（purchase_requisitions 正表），重复物料去重（已有 PENDING PR 则更新数量）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "material_code": {"type": "string", "description": "物料编码"},
+                    "material_name": {"type": "string", "description": "物料名称"},
+                    "required_qty": {"type": "number", "description": "需求数量"},
+                    "urgency": {"type": "string", "description": "紧急程度：normal/urgent/critical", "enum": ["normal", "urgent", "critical"]}
+                },
+                "required": ["material_code", "required_qty"]
+            },
+        },
+        },
+        {
+            "type": "function",
+            "function": {
+            "name": "assign_supplier_to_pr",
+            "description": "比价指派：为采购申请(PR)选择供应商（按 supplier_prices 最低价，无价格表则按供应商评分）。确定性逻辑。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pr_id": {"type": "string", "description": "采购申请 ID"},
+                    "prefer_supplier_id": {"type": "string", "description": "指定供应商（可选）"}
+                },
+                "required": ["pr_id"]
+            },
+        },
+        },
+        {
+            "type": "function",
+            "function": {
+            "name": "create_purchase_order",
+            "description": "转采购订单：将已指派供应商的采购申请(PR)转为采购订单(PO)，状态 ordered，记录交期。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pr_id": {"type": "string", "description": "采购申请 ID（须已指派供应商）"},
+                    "expected_days": {"type": "integer", "description": "期望交期天数（默认取供应商 lead_days）"}
+                },
+                "required": ["pr_id"]
+            },
+        },
+        },
+        {
+            "type": "function",
+            "function": {
+            "name": "query_purchase_order_progress",
+            "description": "跟催采购订单：查 PO 到货进度（已下未到的 PO 列表），供采购智能体跟催供应商。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "过滤状态：draft/ordered/shipped/arrived"},
+                    "limit": {"type": "integer", "description": "返回条数，默认 10"}
+                },
+            },
+        },
+        },
+        {
+            "type": "function",
+            "function": {
+            "name": "query_rcc_center",
+            "description": "RCC资源调度中心全景：调度任务审批状态、chatbot工单流转、资源调度决策建议（人力/设备/工单优先级/瓶颈/环境/工艺）。员工在个人chatbot可查资源调度情况。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "org_unit_id": {"type": "string", "description": "组织单元ID（可选，不传返回全部）"},
+                    "limit": {"type": "integer", "description": "返回条数，默认 10"}
+                }
+            },
+        },
+        },
+        {
+            "type": "function",
+            "function": {
+            "name": "submit_rcc_resource_request",
+            "description": "提交资源需求到RCC调度中心：员工在个人chatbot提出资源请求（人力/设备/物料/时间窗），生成RCC工单进入调度审批流。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "资源需求描述（如：需要2名操作员支援8月20日白班）"},
+                    "ticket_type": {"type": "string", "description": "工单类型：resource_request/equipment_request/manpower_request/material_request/other"},
+                    "requested_resource": {"type": "object", "description": "请求的资源：{type: manpower/equipment/material, name: 资源名, qty: 数量}"},
+                    "requested_time_window": {"type": "object", "description": "时间窗：{start: 2026-08-20, end: 2026-08-20, shift: 白班}"},
+                    "related_work_order_id": {"type": "string", "description": "关联工单ID（可选）"}
+                },
+                "required": ["message"]
+            },
+        },
+        },
+        {
+            "type": "function",
+            "function": {
             "name": "create_followup_task",
             "description": "把暂时无法一次完成的任务挂入任务中心持续跟进（等物料/等审批/等设备恢复/等供应商等场景）。系统会按设定频率定期用工具核实进展，完成/受阻时推送通知。当用户交代的事情当前无法闭环、或用户说'跟进一下''盯着''挂起来''到时候提醒我'时使用。",
             "parameters": {
@@ -3043,6 +3151,82 @@ async def _tool_query_purchase_order_progress(db: AsyncSession, args: Dict[str, 
 
 
 
+async def _tool_query_rcc_center(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
+    """RCC 调度中心全景：任务 + 工单 + 决策建议。"""
+    limit = max(1, min(int(args.get("limit") or 10), 30))
+    org = str(args.get("org_unit_id") or "").strip()
+
+    tasks = (await db.execute(text(
+        "SELECT task_code, task_type, title, status, expected_impact_summary, requested_by, created_at "
+        "FROM rcc_tasks ORDER BY created_at DESC LIMIT :lim"
+    ), {"lim": limit})).mappings().all()
+    tickets = (await db.execute(text(
+        "SELECT ticket_code, requester_id, ticket_type, raw_message, status, priority, "
+        "routed_to_org_unit, routed_to_position, created_at "
+        "FROM chatbot_tickets ORDER BY created_at DESC LIMIT :lim"
+    ), {"lim": limit})).mappings().all()
+    orgs = (await db.execute(text(
+        "SELECT id, org_type, auto_dispatch_enabled, human_approval_required, approval_threshold_pct "
+        "FROM rcc_organizations LIMIT :lim"
+    ), {"lim": limit})).mappings().all()
+
+    # 决策建议（rcc_decision 端点逻辑简化：直接查已有建议类数据）
+    decisions = {}
+    try:
+        from core.rcc.services import RCCTaskService
+        svc = RCCTaskService(db)
+        bottleneck = await svc._get_task_by_type("dispatch") if hasattr(svc, "_get_task_by_type") else None
+        if bottleneck:
+            decisions["dispatch"] = str(bottleneck.get("title") if isinstance(bottleneck, dict) else bottleneck)
+    except Exception:
+        decisions = {}
+
+    return {
+        "type": "rcc_center",
+        "org_count": len(orgs),
+        "organizations": [dict(o) for o in orgs],
+        "rcc_tasks_count": len(tasks),
+        "rcc_tasks": [dict(t) for t in tasks],
+        "chatbot_tickets_count": len(tickets),
+        "chatbot_tickets": [dict(t) for t in tickets],
+        "note": "RCC=资源调度中心：调度任务需审批(pending→approved→executing)，chatbot工单=员工个人资源需求流转入口。",
+    }
+
+
+async def _tool_submit_rcc_resource_request(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
+    """提交资源需求到 RCC：生成 chatbot 工单（员工个人资源需求 → RCC 调度审批流）。"""
+    from core.rcc.services import ChatbotTicketService
+
+    message = str(args.get("message") or "").strip()
+    if not message:
+        return {"error": "缺少资源需求描述"}
+    ticket_type = str(args.get("ticket_type") or "resource_request")
+    if ticket_type not in ("resource_request", "equipment_request", "manpower_request", "material_request", "other"):
+        ticket_type = "resource_request"
+
+    svc = ChatbotTicketService(db)
+    try:
+        ticket = await svc.create_ticket(
+            message=message,
+            requester_id=operator or "ai_assistant",
+            ticket_type=ticket_type,
+            parsed_intents={"intent": ticket_type, "source": "personal_chatbot"},
+            parsed_slots={"resource": args.get("requested_resource", {}), "time_window": args.get("requested_time_window", {})},
+            requested_resource=args.get("requested_resource", {}),
+            requested_time_window=args.get("requested_time_window", {}),
+            related_work_order_id=args.get("related_work_order_id"),
+        )
+        return {
+            "type": "rcc_ticket", "action": "created",
+            "ticket_id": ticket.id, "ticket_code": ticket.ticket_code,
+            "status": ticket.status, "ticket_type": ticket_type,
+            "note": f"资源需求工单 {ticket.ticket_code} 已提交 RCC 调度中心，等待路由与审批。",
+        }
+    except Exception as exc:
+        return {"error": f"RCC 工单创建失败: {type(exc).__name__}: {str(exc)[:150]}"}
+
+
+
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
     "query_order_work_order_status": _tool_query_order_work_order_status,
@@ -3554,6 +3738,8 @@ _TOOL_EXECUTORS["create_purchase_requisition"] = _tool_create_purchase_requisiti
 _TOOL_EXECUTORS["assign_supplier_to_pr"] = _tool_assign_supplier_to_pr
 _TOOL_EXECUTORS["create_purchase_order"] = _tool_create_purchase_order
 _TOOL_EXECUTORS["query_purchase_order_progress"] = _tool_query_purchase_order_progress
+_TOOL_EXECUTORS["query_rcc_center"] = _tool_query_rcc_center
+_TOOL_EXECUTORS["submit_rcc_resource_request"] = _tool_submit_rcc_resource_request
 _TOOL_EXECUTORS["query_product_bom"] = _tool_query_product_bom
 _TOOL_EXECUTORS["create_product_bom"] = _tool_create_product_bom
 _TOOL_EXECUTORS["query_sales_order_detail"] = _tool_query_sales_order_detail

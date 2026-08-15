@@ -425,29 +425,36 @@ class ChatbotTicketService:
         requested_resource: Optional[Dict[str, Any]] = None,
         requested_time_window: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """创建Chatbot工单"""
-        from core.rcc.models import ChatbotTicket
-        
+        """创建Chatbot工单（raw SQL 插入，绕开 org_units 模型缺失的 FK 解析 bug：
+        requester_org_unit 的 ForeignKey 指向 org_units.id，但 database.models 未定义 OrgUnit
+        模型 → ORM flush 报 PendingRollbackError。requester_org_unit 非必填，置空。）"""
+        from sqlalchemy import text as _text
+        import json as _json
+
+        ticket_id = str(uuid.uuid4())
         ticket_code = f"CBT-{requester_id[:6].upper()}-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
-        
-        ticket = ChatbotTicket(
-            ticket_code=ticket_code,
-            requester_id=requester_id,
-            ticket_type=ticket_type,
-            raw_message=message,
-            parsed_intents=parsed_intents or {},
-            parsed_slots=parsed_slots or {},
-            related_param_id=related_param_id,
-            related_rcc_task_id=related_rcc_task_id,
-            related_work_order_id=related_work_order_id,
-            requested_resource=requested_resource or {},
-            requested_time_window=requested_time_window or {},
-            status="open",
-        )
-        
-        self.db.add(ticket)
+
+        await self.db.execute(_text(
+            "INSERT INTO chatbot_tickets (id, ticket_code, requester_id, requester_org_unit, ticket_type, "
+            "raw_message, parsed_intents, parsed_slots, requested_resource, requested_time_window, "
+            "related_param_id, related_rcc_task_id, related_work_order_id, status, priority, created_at, updated_at) "
+            "VALUES (:id, :tc, :rq, NULL, :tt, :msg, CAST(:pi AS jsonb), CAST(:ps AS jsonb), "
+            "CAST(:rr AS jsonb), CAST(:tw AS jsonb), "
+            ":rp, :rt, :wo, 'open', 'medium', NOW(), NOW())"
+        ), {
+            "id": ticket_id, "tc": ticket_code, "rq": requester_id, "tt": ticket_type,
+            "msg": message,
+            "pi": _json.dumps(parsed_intents or {}, ensure_ascii=False),
+            "ps": _json.dumps(parsed_slots or {}, ensure_ascii=False),
+            "rr": _json.dumps(requested_resource or {}, ensure_ascii=False),
+            "tw": _json.dumps(requested_time_window or {}, ensure_ascii=False),
+            "rp": related_param_id, "rt": related_rcc_task_id, "wo": related_work_order_id,
+        })
         await self.db.commit()
-        await self.db.refresh(ticket)
+
+        # 返回轻量对象
+        from types import SimpleNamespace
+        ticket = SimpleNamespace(id=ticket_id, ticket_code=ticket_code, status="open")
         return ticket
     
     async def route_ticket(self, ticket_id: str, target_org_unit: str, target_position: str) -> Any:
