@@ -152,6 +152,17 @@ async def _periodic_scheduler():
     from api.services.report_generator_service import ReportGeneratorService
 
     await asyncio.sleep(30)  # 启动后 30s 再开始，等 DB 就绪
+    # 单实例守卫：双 worker 下只有一个进程跑本循环（pg_try_advisory_lock）
+    _owns = False
+    try:
+        from sqlalchemy import text as _t
+        async with db_config.session_factory() as _ldb:
+            _owns = bool((await _ldb.execute(_t("SELECT pg_try_advisory_lock(:k)"), {"k": 0xE56B01})).scalar())
+    except Exception:
+        _owns = True
+    if not _owns:
+        _logger.info("[scheduler] 周期调度器单实例锁未获得，本 worker 跳过（由另一 worker 运行）")
+        return
     while True:
         try:
             async with db_config.session_factory() as db:
@@ -407,14 +418,35 @@ async def _start_scheduler():
     from scripts.seed_skills_startup import run_skill_seed
     asyncio.create_task(run_skill_seed())
 
-    # 任务中心定期扫描：到期待办任务自动跟进（FOLLOWUP_SCANNER_ENABLED=0 可关）
-    from api.services.followup_task_service import followup_scanner_loop
-    asyncio.create_task(followup_scanner_loop())
+    # ── 后台循环单实例守卫 ──────────────────────────────────────────
+    # uvicorn --workers 2 会启动两个进程，各自执行 startup → 后台循环会跑两份
+    # （日报重复生成、指挥官重复巡检）。用 PG advisory lock 保证全容器只有一个
+    # 实例运行后台循环：抢到锁的 worker 才跑，另一个跳过（HTTP 请求不受影响）。
+    _loop_owner = False
+    try:
+        from sqlalchemy import text as _t
+        _lk = db_config.session_factory
+        _owns = False
+        try:
+            async with _lk() as _ldb:
+                _row = (await _ldb.execute(_t("SELECT pg_try_advisory_lock(:k)"), {"k": 0xE56B00})).scalar()
+                _owns = bool(_row)
+        except Exception:
+            _owns = False
+        _loop_owner = _owns
+        _logger.info("[scheduler] 后台循环单实例锁: %s", "获得（本 worker 运行循环）" if _owns else "未获得（本 worker 只服务 HTTP，循环由另一 worker 运行）")
+    except Exception as exc:
+        _logger.warning("[scheduler] 单实例锁检查失败，按无锁模式运行: %s", exc)
+        _loop_owner = True
+    if _loop_owner:
+        # 任务中心定期扫描：到期待办任务自动跟进（FOLLOWUP_SCANNER_ENABLED=0 可关）
+        from api.services.followup_task_service import followup_scanner_loop
+        asyncio.create_task(followup_scanner_loop())
 
-    # 工厂指挥官持续盯办：为已开启指挥官的用户定期巡检，把新决策挂入任务中心
-    # （COMMANDER_WATCH_ENABLED=0 可关；COMMANDER_WATCH_INTERVAL_SECONDS 调间隔）
-    from api.services.factory_commander import commander_watch_loop
-    asyncio.create_task(commander_watch_loop())
+        # 工厂指挥官持续盯办：为已开启指挥官的用户定期巡检，把新决策挂入任务中心
+        # （COMMANDER_WATCH_ENABLED=0 可关；COMMANDER_WATCH_INTERVAL_SECONDS 调间隔）
+        from api.services.factory_commander import commander_watch_loop
+        asyncio.create_task(commander_watch_loop())
 
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------
