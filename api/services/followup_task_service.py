@@ -495,8 +495,8 @@ def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> s
     return ""
 
 
-def _is_procurement_shortage(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> bool:
-    """判断采购任务当前是否有真实缺料（基于工具结果，确定性）。"""
+async def _is_procurement_shortage(db: AsyncSession, task: Dict[str, Any], messages: List[Dict[str, Any]], factory_id: Optional[str] = None) -> bool:
+    """判断采购任务当前是否有真实缺料（基于工具结果 + DB 零库存兜底，确定性）。"""
     for msg in messages:
         if msg.get("role") != "tool":
             continue
@@ -514,7 +514,14 @@ def _is_procurement_shortage(task: Dict[str, Any], messages: List[Dict[str, Any]
             for item in inv:
                 if float(item.get("available_qty") or 0) <= 0:
                     return True
-    return False
+    # 兜底：DB 直查零库存物料（缺料预警可能因在途PO而消失，但任务未闭环时仍算缺料场景）
+    try:
+        zero = (await db.execute(text(
+            "SELECT count(*) FROM inventory WHERE factory_id = :f AND available_qty <= 0"
+        ), {"f": factory_id})).scalar_one()
+        return zero > 0
+    except Exception:
+        return False
 
 
 async def _run_procurement_action_chain(db: AsyncSession, factory_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -533,14 +540,17 @@ async def _run_procurement_action_chain(db: AsyncSession, factory_id: Optional[s
             if code:
                 shortage_materials.append({"code": code, "name": it.get("material_name") or code,
                                            "qty": float(it.get("shortage_qty") or it.get("required_qty") or 1)})
-        # 缺料工具无明细时，直接查库存为 0 的物料兜底
+        # 缺料工具无明细时，DB 直查库存为 0 的物料兜底（确定性）
         if not shortage_materials:
-            inv = await _exec(db, "query_inventory", {"min_qty": 0, "limit": 5}, operator="procurement", factory_id=fid)
-            for item in (inv.get("inventory") or [])[:3]:
-                if float(item.get("available_qty") or 0) <= 0:
-                    shortage_materials.append({"code": item.get("material_code") or item.get("material_id"),
-                                               "name": item.get("material_name") or item.get("material_code"),
-                                               "qty": float(item.get("required_qty") or item.get("on_hand") or 10)})
+            zero_rows = (await db.execute(text(
+                "SELECT material_code, material_name, available_qty FROM inventory "
+                "WHERE factory_id = :f AND available_qty <= 0 "
+                "GROUP BY material_code, material_name, available_qty "
+                "ORDER BY available_qty ASC LIMIT 3"
+            ), {"f": fid})).mappings().all()
+            for r in zero_rows:
+                shortage_materials.append({"code": r["material_code"], "name": r["material_name"] or r["material_code"],
+                                           "qty": 10})
         for mat in shortage_materials:
             code, name, qty = mat["code"], mat["name"], mat["qty"]
             # 2) 查管道：已有在途采购则跳过
@@ -744,9 +754,9 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
             # ── 采购动作链确定性推进（自主规划，不依赖模型）──
             # 采购补货类任务且工具结果显示真实缺料 → 自动执行动作链：
             # 查管道 → 为缺料物料建采购申请 → 指派供应商 → 转采购订单 → 跟催。
-            # 这样采购智能体每次跟进都在推进采购流程，而不是只查状态后报"无结论"。
-            if task.get("agent_key") == "procurement_agent" and _is_procurement_shortage(task, messages):
-                from api.services.chat_tools_service import execute_tool as _exec
+            # 动作链是确定性动作，执行后直接生成结论（不再依赖模型输出，避免
+            # agnes 在 tools 被 pop 后输出 XML 导致"无有效结论"）。
+            if task.get("agent_key") == "procurement_agent" and await _is_procurement_shortage(db, task, messages, factory_id):
                 action_log = await _run_procurement_action_chain(db, factory_id)
                 if action_log:
                     messages.append({
@@ -754,9 +764,24 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                         "content": json.dumps({"type": "procurement_action_chain", "actions": action_log},
                                               ensure_ascii=False)[:4000],
                     })
-                    payload["messages"] = messages
-                    # 动作链已推进 → 给模型一次机会基于动作结果输出结论（tools 已无，模型会直接答）
-                    continue
+                    steps = []
+                    for a in action_log:
+                        if a.get("step") == "requisition":
+                            steps.append(f"物料 {a.get('material')} 生成采购申请(PR {str(a.get('pr_id'))[:8]}…)")
+                        elif a.get("step") == "assign":
+                            steps.append(f"指派供应商 {a.get('supplier')}")
+                        elif a.get("step") == "purchase_order":
+                            steps.append(f"转采购订单 {a.get('po_code')}")
+                        elif a.get("step") == "skip":
+                            steps.append(f"{a.get('material')} 已有在途采购，不重复下单")
+                    pct = min(90, int(task.get("progress_pct") or 0) + 15)
+                    reply = json.dumps({
+                        "state": "open", "progress_pct": pct,
+                        "note": "采购动作链已推进：" + ("；".join(steps) if steps else "核实缺料并执行采购动作")
+                                + "。PO 已下单，等待到货后自动闭环。",
+                        "blocked_by": "供应商", "block_category": "supplier",
+                    }, ensure_ascii=False)
+                    break
         conclusion = _parse_follow_reply(reply)
     except Exception as exc:  # noqa: BLE001 — 单任务跟进失败不能拖垮扫描循环
         _logger.warning("followup run failed for %s: %s", task_id, exc)
