@@ -495,6 +495,85 @@ def _detect_task_done(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> s
     return ""
 
 
+def _is_procurement_shortage(task: Dict[str, Any], messages: List[Dict[str, Any]]) -> bool:
+    """判断采购任务当前是否有真实缺料（基于工具结果，确定性）。"""
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+        raw = str(msg.get("content") or "")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if "shortage_count" in data and int(data.get("shortage_count") or 0) > 0:
+            return True
+        inv = data.get("inventory") if isinstance(data.get("inventory"), list) else None
+        if inv:
+            for item in inv:
+                if float(item.get("available_qty") or 0) <= 0:
+                    return True
+    return False
+
+
+async def _run_procurement_action_chain(db: AsyncSession, factory_id: Optional[str]) -> List[Dict[str, Any]]:
+    """采购动作链确定性执行：查管道 → 对缺料物料建申请 → 指派供应商 → 转PO。
+    返回动作日志（最多处理 3 个缺料物料，避免一次跑太多）。"""
+    from api.services.chat_tools_service import execute_tool as _exec
+    fid = factory_id or "FAC_MECH_001"
+    actions: List[Dict[str, Any]] = []
+    try:
+        # 1) 缺料清单（shortage_alerts）
+        alerts = await _exec(db, "query_shortage_alerts", {"limit": 3}, operator="procurement", factory_id=fid)
+        items = alerts.get("items") or []
+        shortage_materials = []
+        for it in items[:3]:
+            code = it.get("material_code") or it.get("material_id") or ""
+            if code:
+                shortage_materials.append({"code": code, "name": it.get("material_name") or code,
+                                           "qty": float(it.get("shortage_qty") or it.get("required_qty") or 1)})
+        # 缺料工具无明细时，直接查库存为 0 的物料兜底
+        if not shortage_materials:
+            inv = await _exec(db, "query_inventory", {"min_qty": 0, "limit": 5}, operator="procurement", factory_id=fid)
+            for item in (inv.get("inventory") or [])[:3]:
+                if float(item.get("available_qty") or 0) <= 0:
+                    shortage_materials.append({"code": item.get("material_code") or item.get("material_id"),
+                                               "name": item.get("material_name") or item.get("material_code"),
+                                               "qty": float(item.get("required_qty") or item.get("on_hand") or 10)})
+        for mat in shortage_materials:
+            code, name, qty = mat["code"], mat["name"], mat["qty"]
+            # 2) 查管道：已有在途采购则跳过
+            pipe = await _exec(db, "query_purchase_pipeline", {"material_code": code},
+                               operator="procurement", factory_id=fid)
+            if pipe.get("purchase_orders_count", 0) > 0:
+                actions.append({"step": "skip", "material": code, "reason": "已有在途PO"})
+                continue
+            # 3) 建申请
+            pr = await _exec(db, "create_purchase_requisition",
+                             {"material_code": code, "material_name": name, "required_qty": qty, "urgency": "critical"},
+                             operator="procurement", factory_id=fid)
+            pr_id = pr.get("pr_id")
+            actions.append({"step": "requisition", "material": code, "qty": qty, "pr_id": str(pr_id) if pr_id else None})
+            if not pr_id:
+                continue
+            # 4) 指派供应商
+            assign = await _exec(db, "assign_supplier_to_pr", {"pr_id": str(pr_id)},
+                                 operator="procurement", factory_id=fid)
+            actions.append({"step": "assign", "supplier": assign.get("supplier_name"), "status": assign.get("status")})
+            if assign.get("error"):
+                continue
+            # 5) 转PO
+            po = await _exec(db, "create_purchase_order", {"pr_id": str(pr_id)},
+                             operator="procurement", factory_id=fid)
+            actions.append({"step": "purchase_order", "po_code": po.get("po_code"), "status": po.get("status"),
+                            "supplier": po.get("supplier_name")})
+        return actions
+    except Exception as exc:  # noqa: BLE001
+        actions.append({"step": "error", "detail": f"{type(exc).__name__}: {str(exc)[:100]}"})
+        return actions
+
+
 def _clean_xml_tags(text: str) -> str:
     """剥离模型 content 里残留的 XML 工具调用标签（tool_call/invoke/function/parameter 等），
     与 chat_routes._clean_model_reply 同源逻辑，供跟进结论解析前清理。"""
@@ -619,8 +698,19 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
             for tc in tool_calls:
                 fn = tc.get("function", {}) or {}
                 tool_name = fn.get("name", "")
-                # 定期跟进只做核实，不做写操作（写操作必须由用户在对话里明确触发）
-                if tool_name in WRITE_TOOLS:
+                # 定期跟进只做核实，不做写操作（写操作必须由用户在对话里明确触发）。
+                # 例外：采购智能体的采购动作链（建申请/指派供应商/转PO/跟催）是本职动作，
+                # 允许自主推进——否则采购智能体永远只能查状态，无法自主规划采购流程。
+                PROCUREMENT_ACTION_TOOLS = {
+                    "create_purchase_requisition", "assign_supplier_to_pr",
+                    "create_purchase_order", "query_purchase_pipeline",
+                    "query_purchase_order_progress",
+                }
+                is_procurement_action = (
+                    task.get("agent_key") == "procurement_agent"
+                    and tool_name in PROCUREMENT_ACTION_TOOLS
+                )
+                if tool_name in WRITE_TOOLS and not is_procurement_action:
                     result: Dict[str, Any] = {"error": "任务中心定期跟进为只读核实，不执行写操作"}
                 else:
                     try:
@@ -650,6 +740,23 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                     ensure_ascii=False,
                 )
                 break
+
+            # ── 采购动作链确定性推进（自主规划，不依赖模型）──
+            # 采购补货类任务且工具结果显示真实缺料 → 自动执行动作链：
+            # 查管道 → 为缺料物料建采购申请 → 指派供应商 → 转采购订单 → 跟催。
+            # 这样采购智能体每次跟进都在推进采购流程，而不是只查状态后报"无结论"。
+            if task.get("agent_key") == "procurement_agent" and _is_procurement_shortage(task, messages):
+                from api.services.chat_tools_service import execute_tool as _exec
+                action_log = await _run_procurement_action_chain(db, factory_id)
+                if action_log:
+                    messages.append({
+                        "role": "tool", "tool_call_id": f"auto-{len(messages)}",
+                        "content": json.dumps({"type": "procurement_action_chain", "actions": action_log},
+                                              ensure_ascii=False)[:4000],
+                    })
+                    payload["messages"] = messages
+                    # 动作链已推进 → 给模型一次机会基于动作结果输出结论（tools 已无，模型会直接答）
+                    continue
         conclusion = _parse_follow_reply(reply)
     except Exception as exc:  # noqa: BLE001 — 单任务跟进失败不能拖垮扫描循环
         _logger.warning("followup run failed for %s: %s", task_id, exc)
