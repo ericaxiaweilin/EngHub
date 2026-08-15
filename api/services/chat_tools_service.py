@@ -2948,11 +2948,14 @@ async def _tool_query_my_tasks(db: AsyncSession, args: Dict[str, Any], factory_i
 
     try:
         sql = f"""
-            SELECT id, title, status, progress_pct, follow_count, max_follows,
-                   agent_key, created_by, assigned_to, next_follow_at, updated_at,
-                   blocked_by, block_category,
-                   left(COALESCE(last_follow_note, ''), 200) AS last_note
-            FROM followup_tasks
+            SELECT ft.id, ft.title, ft.status, ft.progress_pct, ft.follow_count, ft.max_follows,
+                   ft.agent_key, ft.created_by, ft.assigned_to, ft.next_follow_at, ft.updated_at,
+                   ft.blocked_by, ft.block_category,
+                   left(COALESCE(ft.last_follow_note, ''), 200) AS last_note,
+                   (SELECT rcc.status FROM rcc_tasks rcc
+                    WHERE rcc.request_context->>'followup_task_id' = ft.id::text
+                    ORDER BY rcc.created_at DESC LIMIT 1) AS rcc_status
+            FROM followup_tasks ft
             WHERE {' AND '.join(conds)}
             ORDER BY CASE status WHEN 'blocked' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
                      updated_at DESC
@@ -2966,7 +2969,7 @@ async def _tool_query_my_tasks(db: AsyncSession, args: Dict[str, Any], factory_i
             "scope": scope,
             "count": len(items),
             "tasks": items,
-            "note": "任务中心实时数据（followup_tasks）。blocked=受阻（blocked_by=卡在谁那里，block_category=原因类别：material/supplier/approval/equipment/staff/data/other），open=跟进中，done=已完成。",
+            "note": "任务中心实时数据（followup_tasks）。blocked=受阻（blocked_by=卡在谁那里，block_category=原因类别：material/supplier/approval/equipment/staff/data/other），open=跟进中，done=已完成。rcc_status=关联RCC调度申请状态（pending=已提交待审批/approved=已批准/executing=执行中），空=未提交RCC。",
         }
     except Exception as exc:  # noqa: BLE001
         return {"error": f"任务查询失败: {type(exc).__name__}: {exc}"}
