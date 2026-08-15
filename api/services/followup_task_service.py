@@ -801,10 +801,12 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                         elif a.get("step") == "skip":
                             steps.append(f"{a.get('material')} 已有在途采购，不重复下单")
                     pct = min(90, int(task.get("progress_pct") or 0) + 15)
+                    # 等待 PO 到货 = 受阻于供应商交付 → blocked（触发 RCC 调度申请），
+                    # 不是 open：open 不会进入 RCC 资源调度流，数字员工闭环断在采购环节。
                     reply = json.dumps({
-                        "state": "open", "progress_pct": pct,
+                        "state": "blocked", "progress_pct": pct,
                         "note": "采购动作链已推进：" + ("；".join(steps) if steps else "核实缺料并执行采购动作")
-                                + "。PO 已下单，等待到货后自动闭环。",
+                                + "。PO 已下单，等待到货后自动闭环（受阻于供应商交付）。",
                         "blocked_by": "供应商", "block_category": "supplier",
                     }, ensure_ascii=False)
                     break
