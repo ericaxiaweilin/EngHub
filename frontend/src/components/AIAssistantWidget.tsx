@@ -817,9 +817,6 @@ export default function AIAssistantWidget() {
     }
   }
 
-  // 头像/画像缩写（取工号首字母作为后端 profile 兜底展示）
-  const profileInitials = (user?.full_name || user?.username || 'AI').slice(0, 1)
-
   const openMemorySession = async (item: ChatMemoryResult['sessions'][number]) => {
     setMemoryLoading(true)
     try {
@@ -940,6 +937,8 @@ export default function AIAssistantWidget() {
   const [commanderLoading, setCommanderLoading] = useState(false)
 
   const user = getStoredUser()
+  // 头像/画像缩写（取工号首字母作为后端 profile 兜底展示）
+  const profileInitials = (user?.full_name || user?.username || 'AI').slice(0, 1)
   const activeFactoryId = () => localStorage.getItem('active_factory_id') || user?.factory_id || 'FAC_ELEC_DEMO_2026'
   const infoStorageKey = `enghub-info:${user?.username || 'anonymous'}:${localStorage.getItem('active_factory_id') || 'default'}`
 
