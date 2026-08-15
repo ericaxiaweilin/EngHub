@@ -2183,6 +2183,7 @@ async def _handle_kernel_chat(
         clean_reply=_clean_model_reply,
         ground_tool_result=_grounded_tool_result,
         verify_reply=_verify_grounded_reply,
+        summarize_actions=_summarize_actions,
         make_tool_action=make_tool_action,
         on_tool_event=on_event,
         write_tools=frozenset(WRITE_TOOLS),
@@ -3653,6 +3654,7 @@ async def chat_eval_run(
         clean_reply=_clean_model_reply,
         ground_tool_result=_grounded_tool_result,
         verify_reply=None,
+        summarize_actions=_summarize_actions,
         make_tool_action=lambda tool, label, args, res, is_w, is_s, ok: {
             "tool": tool, "success": ok,
         },

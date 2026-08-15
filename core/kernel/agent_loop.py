@@ -69,6 +69,7 @@ class AgentLoop:
         clean_reply: CleanReplyFn,
         ground_tool_result: GroundToolResultFn,
         verify_reply: Optional[VerifyReplyFn] = None,
+        summarize_actions: Optional[Callable[[List[Any]], str]] = None,
         make_tool_action: Optional[MakeToolActionFn] = None,
         on_tool_event: Optional[ToolEventFn] = None,
         write_tools: Optional[frozenset] = None,
@@ -81,6 +82,7 @@ class AgentLoop:
         self._clean_reply = clean_reply
         self._ground_tool_result = ground_tool_result
         self._verify_reply = verify_reply
+        self._summarize_actions = summarize_actions
         self._make_tool_action = make_tool_action
         self._on_tool_event = on_tool_event
         self._write_tools = write_tools or frozenset()
@@ -148,6 +150,19 @@ class AgentLoop:
             if not tool_calls:
                 reply = self._clean_reply(content)
                 if not reply:
+                    # 模型没输出正文但执行过工具：用工具结果摘要兜底，不报"服务不可用"
+                    if self._summarize_actions is not None and actions:
+                        reply = self._summarize_actions(actions)
+                    if reply:
+                        return LoopResult(
+                            reply=reply,
+                            model=model,
+                            degraded=False,
+                            rounds_used=round_no + 1,
+                            actions=actions,
+                            diagrams=diagrams,
+                            status="complete",
+                        )
                     return LoopResult(
                         model=model,
                         degraded=True,
