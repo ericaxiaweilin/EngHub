@@ -47,11 +47,12 @@ async def run_commander_cycle(
 @router.get("/status")
 async def commander_status(
     factory_id: str = Query(default="FAC_MECH_001"),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """获取指挥官当前状态"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(None)
+    commander = FactoryCommander(db)
     return await commander.get_status(factory_id)
 
 
@@ -59,11 +60,12 @@ async def commander_status(
 async def commander_history(
     factory_id: str = Query(default="FAC_MECH_001"),
     limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """获取指挥官决策历史"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(None)
+    commander = FactoryCommander(db)
     return await commander.get_history(factory_id, limit)
 
 
@@ -83,11 +85,12 @@ async def set_commander_mode(
 @router.post("/toggle")
 async def toggle_commander(
     req: CommanderToggleRequest,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """开启/关闭当前用户的指挥官（开启后自动接管工作范围内事务）"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(None)
+    commander = FactoryCommander(db)
     user_id = str(current_user.id)
     factory_id = req.factory_id or getattr(current_user, "active_factory_id", None) or "FAC_MECH_001"
 
@@ -101,9 +104,10 @@ async def toggle_commander(
 
 @router.get("/my-status")
 async def my_commander_status(
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """获取我的指挥官状态"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(None)
+    commander = FactoryCommander(db)
     return await commander.get_user_status(str(current_user.id))
