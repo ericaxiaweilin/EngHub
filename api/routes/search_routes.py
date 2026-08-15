@@ -67,6 +67,12 @@ SEARCH_MODULES = [
         "from": "users",
         "fields": ["username", "full_name", "email"],
     },
+    {
+        "source": "sales_order", "label": "销售订单", "route": "/orders",
+        "select": "so.id, so.order_code, so.status, so.product_id, so.quantity, so.delivery_date, so.priority, so.customer_name, so.total_amount",
+        "from": "sales_orders so",
+        "fields": ["so.order_code", "so.customer_name", "so.customer_code", "so.product_id", "so.status"],
+    },
 ]
 
 

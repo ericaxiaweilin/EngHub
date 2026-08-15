@@ -28,6 +28,7 @@ const sourceIcons: Record<string, React.ReactNode> = {
   station: <HomeOutlined />,
   warehouse: <InboxOutlined />,
   employee: <TeamOutlined />,
+  sales_order: <FileTextOutlined />,
 }
 
 const sourceColors: Record<string, string> = {
@@ -38,6 +39,7 @@ const sourceColors: Record<string, string> = {
   station: 'purple',
   warehouse: 'geekblue',
   employee: 'magenta',
+  sales_order: 'blue',
 }
 
 export default function GlobalSearch() {
