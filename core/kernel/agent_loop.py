@@ -286,7 +286,7 @@ def _parse_xml_tool_calls(content: str):
     以及简化形态 <tool_call><function=...>...</function></tool_call>。
     解析失败/无有效调用返回空列表。
     """
-    if not content or "<tool_call" not in content:
+    if not content or not any(tag in content for tag in ("<tool_call", "<invoke", "antml:invoke")):
         return []
     import json
     import re
@@ -330,4 +330,34 @@ def _parse_xml_tool_calls(content: str):
             "type": "function",
             "function": {"name": tool_name, "arguments": json.dumps(arguments, ensure_ascii=False)},
         })
+    # Anthropic 标准格式：<invoke name="tool_name">...</invoke>（可能带 antml: 前缀）
+    if not results and ("<invoke" in content or "antml:invoke" in content):
+        invoke_pattern = re.compile(
+            r'<(?:antml:)?invoke\s+name\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</(?:antml:)?invoke>',
+            re.DOTALL | re.IGNORECASE,
+        )
+        for m in invoke_pattern.finditer(content):
+            tool_name = m.group(1).strip()
+            if not tool_name:
+                continue
+            block = m.group(2)
+            arguments = {}
+            # <parameter name="arg">value</parameter> 或 <antml:parameter name="arg">value</antml:parameter>
+            param_pattern = re.compile(
+                r'<(?:antml:)?parameter\s+name\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</(?:antml:)?parameter>',
+                re.DOTALL | re.IGNORECASE,
+            )
+            for pm in param_pattern.finditer(block):
+                key = pm.group(1).strip()
+                val = pm.group(2).strip()
+                try:
+                    arguments[key] = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    arguments[key] = val
+            results.append({
+                "id": f"xml_invoke_{len(results)}",
+                "type": "function",
+                "function": {"name": tool_name, "arguments": json.dumps(arguments, ensure_ascii=False)},
+            })
     return results
+

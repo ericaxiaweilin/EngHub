@@ -561,9 +561,16 @@ def _clean_model_reply(content: str) -> str:
         reply,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    # 孤立残留标签（不闭合的 <tool_call> / </tool_call> 等）
+    # Anthropic 标准 invoke 块：<invoke name="...">...</invoke> / <antml:invoke ...>...</antml:invoke>
     reply = re.sub(
-        r"</?(?:tool_call|function|parameter)\b[^>]*>",
+        r"<(?:antml:)?invoke\b[^>]*>.*?</(?:antml:)?invoke>",
+        "",
+        reply,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # 孤立残留标签（不闭合的 <tool_call> / </tool_call> / <invoke> 等）
+    reply = re.sub(
+        r"</?(?:tool_call|function|parameter|invoke|antml:invoke|antml:parameter)\b[^>]*>",
         "",
         reply,
         flags=re.IGNORECASE,
