@@ -75,7 +75,8 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
   const firstLevel = Math.min(...nodes.map(node => node.level))
   // 有 parent_id 的节点归属到父节点下（如 SMT线长 → hr_sup 人力）
   const withParent = new Set(nodes.filter(n => n.parent_id && byId.has(n.parent_id)).map(n => n.id))
-  const roots = nodes.filter(n => !withParent.has(n.id) && n.level === firstLevel)
+  // 顶层 = 无 parent 的节点（level 1 线长归 hr_sup 后，hr_sup/质量/设备/仓储/生产经理都是顶层）
+  const roots = nodes.filter(n => !withParent.has(n.id))
 
   const buildNode = (node: BubbleNode, visited: Set<string>): BubbleNode => {
     if (visited.has(node.id)) return { ...node, children: [] }  // 防环
