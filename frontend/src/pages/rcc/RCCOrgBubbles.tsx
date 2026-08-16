@@ -77,24 +77,26 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
   const withParent = new Set(nodes.filter(n => n.parent_id && byId.has(n.parent_id)).map(n => n.id))
   // 顶层 = 无 parent 的节点（level 1 线长归 hr_sup 后，hr_sup/质量/设备/仓储/生产经理都是顶层）
   const roots = nodes.filter(n => !withParent.has(n.id))
+  const rootIds = new Set(roots.map(n => n.id))
 
   const buildNode = (node: BubbleNode, visited: Set<string>): BubbleNode => {
     if (visited.has(node.id)) return { ...node, children: [] }  // 防环
     const nextVisited = new Set(visited).add(node.id)
     // 1) 优先按 parent_id 挂子节点（组织归属）
     const directChildren = nodes.filter(c => c.parent_id === node.id)
-    // 2) 其次按 level 层级连（信号传导链，排除已归属其他父的）
+    // 2) 其次按 level 层级连（信号传导链，排除已归属其他父的 AND 顶层节点——避免重复挂载）
     const nextLevel = node.level + 1
     const linkedIds = new Set<string>()
     edges.forEach(edge => {
       const candidateId = edge.source === node.id ? edge.target : edge.target === node.id ? edge.source : null
-      if (candidateId && byId.get(candidateId)?.level === nextLevel && !withParent.has(candidateId)) linkedIds.add(candidateId)
+      if (candidateId && byId.get(candidateId)?.level === nextLevel
+          && !withParent.has(candidateId) && !rootIds.has(candidateId)) linkedIds.add(candidateId)
     })
     const childIds = directChildren.length > 0
       ? [...directChildren.map(c => c.id), ...linkedIds]
       : linkedIds.size > 0
         ? [...linkedIds]
-        : nodes.filter(candidate => candidate.level === nextLevel && !withParent.has(candidate.id)).map(candidate => candidate.id)
+        : nodes.filter(candidate => candidate.level === nextLevel && !withParent.has(candidate.id) && !rootIds.has(candidate.id)).map(candidate => candidate.id)
 
     return {
       ...node,
