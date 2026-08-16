@@ -3317,9 +3317,52 @@ async def _tool_reschedule_work_order(db: AsyncSession, args: Dict[str, Any], fa
         INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
         VALUES (gen_random_uuid()::text, :f, 'reschedule', 'work_order', :c, :b, :a, :r, :i, :cb)
     """), {"f": fid, "c": wo_code, "b": old_due, "a": new_due, "r": reason, "i": impact, "cb": operator})
+
+    # ── RCC 动作信号：改期写入事件总线 → RCC 感知 → 信号（风险判定+相关岗位通知）──
+    from datetime import datetime as _dt2
+    try:
+        new_dt = _dt2.strptime(new_due, "%Y-%m-%d").date()
+        old_dt = _dt2.strptime(old_due, "%Y-%m-%d").date() if old_due else None
+        days_shift = (new_dt - old_dt).days if old_dt else 0
+        # 提前 = 风险信号（物料/产能可能来不及）→ RCC 调度任务；推迟 = 释放信号
+        risk = "critical" if days_shift < 0 and abs(days_shift) >= 3 else ("warning" if days_shift < 0 else "info")
+        await db.execute(text("""
+            INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
+            VALUES (:eid, :f, 'order_reschedule', 'pmc_agent',
+                    CAST(:d AS jsonb), NOW())
+        """), {"eid": str(uuid.uuid4()), "f": fid,
+               "d": json.dumps({"work_order_code": wo_code, "product_id": wo["product_id"],
+                                "old_due": old_due, "new_due": new_due, "days_shift": days_shift,
+                                "risk": risk, "reason": reason, "by": operator})})
+        if risk in ("critical", "warning"):
+            # 提前交期 → RCC 调度任务（需重新排产确认）
+            await db.execute(text("""
+                INSERT INTO rcc_tasks (id, task_code, org_unit_id, task_type, title, description, status, requested_by, created_at, updated_at)
+                VALUES (:tid, :tc, :org, 'schedule_change',
+                        :title, :desc, 'pending', :cb, NOW(), NOW())
+            """), {"tid": str(uuid.uuid4()), "tc": f"RCC-{str(uuid.uuid4())[:7].upper()}",
+                   "org": "fb8337eb-c1d3-58af-842f-cf56d29e3f98",
+                   "title": f"[交期变更] {wo_code} 交期提前 {abs(days_shift)} 天至 {new_due}，需重新排产确认",
+                   "desc": f"原交期 {old_due} → 新交期 {new_due}，原因：{reason or '客户要求'}。需评估物料齐套与产线产能，必要时安排加急。",
+                   "cb": operator})
+        # 通知相关岗位（采购：物料日期变化；生产：负荷变化）
+        await db.execute(text("""
+            INSERT INTO notifications (id, factory_id, recipient, category, title, content, severity, is_read, created_at)
+            VALUES (gen_random_uuid()::text, :f, 'procurement', 'pmc_change', :t1, :c1, 'warning', false, NOW()),
+                   (gen_random_uuid()::text, :f, 'production', 'pmc_change', :t2, :c2, 'warning', false, NOW())
+        """), {"f": fid, "t1": f"[交期变更] {wo_code} 改期至 {new_due}",
+               "c1": f"物料需求日期随工单变更，请检查 {wo['product_id']} 相关采购到货是否匹配（原 {old_due} → 新 {new_due}）",
+               "t2": f"[交期变更] {wo_code} 改期至 {new_due}",
+               "c2": f"产线排程需调整，请确认负荷（{impact}）"})
+    except Exception:
+        pass  # 信号链路失败不阻塞改期主流程
     await db.commit()
     return {"type": "reschedule", "work_order": wo_code, "old_due": old_due, "new_due": new_due,
-            "impact": impact, "message": f"工单 {wo_code} 交期已改为 {new_due}"}
+            "impact": impact,
+            "rcc_signal": {"event_type": "order_reschedule", "risk": risk,
+                           "rcc_task": "created" if risk in ("critical", "warning") else "none",
+                           "notified": ["procurement", "production"]},
+            "message": f"工单 {wo_code} 交期已改为 {new_due}"}
 
 
 async def _tool_rush_insert_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:

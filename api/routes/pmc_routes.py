@@ -688,3 +688,82 @@ def _hammer_summary(rows: List[Dict]) -> str:
     else:
         parts.append("排程稳健")
     return "，".join(parts)
+
+
+@router.get("/personal-plan", summary="个人工作任务计划表：按人聚合今日工作")
+async def personal_plan(
+    person: str = "",
+    date: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    """按人聚合今日工作任务计划表：
+    - 我的工单（assigned_to 或产线工位）
+    - 我的跟进任务（followup_tasks assigned_to）
+    - 待我审批（rcc_tasks approved_by 或岗位）
+    - 需我跟催（采购 PO/群消息）
+    """
+    fid = "FAC_MECH_001"
+    person = person.strip() or "eric"
+    from datetime import datetime as _dt
+    today = _dt.strptime(date, "%Y-%m-%d").date() if date else _dt.now().date()
+
+    # 1) 我的工单（今天有排程/交期的）
+    wos = (await db.execute(text("""
+        SELECT work_order_code, product_id, planned_qty, planned_due, status, priority
+        FROM work_orders
+        WHERE factory_id=:f AND assigned_to=:p AND status IN ('pending','released','in_progress')
+        ORDER BY planned_due LIMIT 20
+    """), {"f": fid, "p": person})).mappings().all()
+
+    # 2) 我的跟进任务
+    tasks = (await db.execute(text("""
+        SELECT id, title, status, progress_pct, next_follow_at
+        FROM followup_tasks
+        WHERE assigned_to=:p AND status NOT IN ('done','cancelled')
+        ORDER BY next_follow_at LIMIT 20
+    """), {"p": person})).mappings().all()
+
+    # 3) 待我审批（RCC 调度 + 我的岗位收到的通知）
+    approvals = (await db.execute(text("""
+        SELECT task_code, task_type, title, status, created_at
+        FROM rcc_tasks
+        WHERE status='pending'
+        ORDER BY created_at DESC LIMIT 10
+    """), {})).mappings().all()
+
+    # 4) 我的通知
+    notifs = (await db.execute(text("""
+        SELECT title, category, content, created_at, is_read
+        FROM notifications
+        WHERE recipient=:p AND is_read=false
+        ORDER BY created_at DESC LIMIT 10
+    """), {"p": person})).mappings().all()
+
+    # 5) 今日变更（pmc_changes 影响我的）
+    changes = (await db.execute(text("""
+        SELECT change_type, target_code, before_value, after_value, reason, created_at
+        FROM pmc_changes
+        WHERE factory_id=:f AND created_at::date=:t
+        ORDER BY created_at DESC LIMIT 10
+    """), {"f": fid, "t": today})).mappings().all()
+
+    return {
+        "person": person, "date": str(today),
+        "summary": {
+            "work_orders": len(wos), "tasks": len(tasks),
+            "approvals": len(approvals), "notifications": len(notifs),
+            "changes_today": len(changes),
+        },
+        "work_orders": [{"code": w["work_order_code"], "product": w["product_id"],
+                         "qty": w["planned_qty"], "due": str(w["planned_due"])[:10],
+                         "status": w["status"], "priority": w["priority"]} for w in wos],
+        "tasks": [{"id": t["id"], "title": t["title"], "status": t["status"],
+                   "progress": str(t["progress_pct"]), "next_follow": str(t["next_follow_at"])[:16] if t["next_follow_at"] else ""} for t in tasks],
+        "approvals": [{"code": a["task_code"], "type": a["task_type"], "title": a["title"],
+                       "created": str(a["created_at"])[:16]} for a in approvals],
+        "notifications": [{"title": n["title"], "category": n["category"],
+                           "content": (n["content"] or "")[:100], "at": str(n["created_at"])[:16]} for n in notifs],
+        "changes": [{"type": c["change_type"], "target": c["target_code"],
+                     "change": f"{c['before_value']} → {c['after_value']}",
+                     "reason": c["reason"], "at": str(c["created_at"])[:16]} for c in changes],
+    }
