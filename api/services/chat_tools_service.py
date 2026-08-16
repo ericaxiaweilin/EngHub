@@ -962,8 +962,38 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         {
             "type": "function",
             "function": {
-            "name": "query_rcc_center",
-            "description": "RCC资源调度中心全景：调度任务审批状态、chatbot工单流转、资源调度决策建议（人力/设备/工单优先级/瓶颈/环境/工艺）。员工在个人chatbot可查资源调度情况。",
+                "name": "send_group_message",
+                    "description": "群协同发消息：向指定群发送文本消息（如 @PMC 确认补货、@采购 加急催货）。群成员（PMC/采购/生产等岗位）可在 Chatbot 群内对话。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "group_name": {"type": "string", "description": "群名称关键词（如 仓储采购协同群 / RCC指挥调度群），模糊匹配"},
+                            "content": {"type": "string", "description": "消息内容（可用 @岗位名 提及）"}
+                        },
+                        "required": ["group_name", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_group_messages",
+                    "description": "查群消息：查看指定群的最近对话（岗位间沟通记录）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "group_name": {"type": "string", "description": "群名称关键词，模糊匹配"},
+                            "limit": {"type": "integer", "description": "返回条数，默认 10"}
+                        },
+                        "required": ["group_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_rcc_center",
+                    "description": "RCC资源调度中心全景：调度任务审批状态、chatbot工单流转、资源调度决策建议（人力/设备/工单优先级/瓶颈/环境/工艺）。员工在个人chatbot可查资源调度情况。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3155,6 +3185,51 @@ async def _tool_query_purchase_order_progress(db: AsyncSession, args: Dict[str, 
 
 
 
+async def _tool_send_group_message(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
+    """群协同发消息：模糊匹配群名，以 operator 身份发送。"""
+    fid = factory_id or "FAC_MECH_001"
+    gname = str(args.get("group_name") or "").strip()
+    content = str(args.get("content") or "").strip()
+    if not gname or not content:
+        return {"error": "缺少群名称或消息内容"}
+    group = (await db.execute(text(
+        "SELECT id, name FROM im_groups WHERE factory_id=:f AND name ILIKE :n AND is_active=TRUE ORDER BY created_at DESC LIMIT 1"
+    ), {"f": fid, "n": f"%{gname}%"})).mappings().first()
+    if not group:
+        groups = (await db.execute(text(
+            "SELECT name FROM im_groups WHERE factory_id=:f AND is_active=TRUE LIMIT 10"
+        ), {"f": fid})).mappings().all()
+        return {"error": f"群 '{gname}' 未找到", "available_groups": [g["name"] for g in groups]}
+    msg_id = str(uuid.uuid4())
+    await db.execute(text("""
+        INSERT INTO im_messages (id, group_id, sender_id, sender_name, msg_type, content, created_at)
+        VALUES (:id, :gid, :sender, :sender_name, 'text', :content, NOW())
+    """), {"id": msg_id, "gid": group["id"], "sender": operator, "sender_name": operator, "content": content[:1000]})
+    await db.commit()
+    return {"type": "group_message", "action": "sent", "group": group["name"],
+            "sender": operator, "content": content[:100], "msg_id": msg_id}
+
+
+async def _tool_query_group_messages(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
+    """查群消息：模糊匹配群名，返回最近对话。"""
+    fid = factory_id or "FAC_MECH_001"
+    gname = str(args.get("group_name") or "").strip()
+    limit = min(int(args.get("limit") or 10), 50)
+    group = (await db.execute(text(
+        "SELECT id, name FROM im_groups WHERE factory_id=:f AND name ILIKE :n AND is_active=TRUE ORDER BY created_at DESC LIMIT 1"
+    ), {"f": fid, "n": f"%{gname}%"})).mappings().first()
+    if not group:
+        return {"error": f"群 '{gname}' 未找到"}
+    msgs = (await db.execute(text(
+        "SELECT sender_name, msg_type, content, created_at FROM im_messages "
+        "WHERE group_id=:gid ORDER BY created_at DESC LIMIT :lim"
+    ), {"gid": group["id"], "lim": limit})).mappings().all()
+    return {"type": "group_messages", "group": group["name"], "count": len(msgs),
+            "messages": [{"sender": m["sender_name"], "msg_type": m["msg_type"],
+                          "content": str(m["content"] or "")[:200],
+                          "at": str(m["created_at"])[:19]} for m in msgs]}
+
+
 async def _tool_query_rcc_center(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     """RCC 调度中心全景：任务 + 工单 + 决策建议。"""
     limit = max(1, min(int(args.get("limit") or 10), 30))
@@ -3743,6 +3818,8 @@ _TOOL_EXECUTORS["assign_supplier_to_pr"] = _tool_assign_supplier_to_pr
 _TOOL_EXECUTORS["create_purchase_order"] = _tool_create_purchase_order
 _TOOL_EXECUTORS["query_purchase_order_progress"] = _tool_query_purchase_order_progress
 _TOOL_EXECUTORS["query_rcc_center"] = _tool_query_rcc_center
+_TOOL_EXECUTORS["send_group_message"] = _tool_send_group_message
+_TOOL_EXECUTORS["query_group_messages"] = _tool_query_group_messages
 _TOOL_EXECUTORS["submit_rcc_resource_request"] = _tool_submit_rcc_resource_request
 _TOOL_EXECUTORS["query_product_bom"] = _tool_query_product_bom
 _TOOL_EXECUTORS["create_product_bom"] = _tool_create_product_bom
@@ -4367,6 +4444,9 @@ async def execute_tool(
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name in WRITE_TOOLS:
             return await executor(db, arguments, operator)
+        if tool_name in {"send_group_message", "query_group_messages"}:
+            # 群消息工具需要 operator（发送者身份）
+            return await executor(db, arguments, operator=operator, factory_id=factory_id)
         return await executor(db, arguments, factory_id)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"工具执行失败：{type(exc).__name__}: {exc}"}
