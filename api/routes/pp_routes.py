@@ -14,12 +14,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from core.auth.security import get_current_user, require_permission
+from core.auth.security import enforce_tenant, get_current_user, require_permission
 from database.models import User, Plan, Product, BomItem, Inventory, Station, WorkOrder, WorkOrderMaterial
 from core.pp.plan import MPSService
 from core.pp.mrp import MRPService
 
-router = APIRouter(prefix="/api/v1", tags=["pp"])
+router = APIRouter(prefix="/api/v1", tags=["pp"], dependencies=[Depends(enforce_tenant)])
 
 
 # --- Pydantic Models for Validation ---

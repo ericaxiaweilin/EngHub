@@ -20,9 +20,9 @@ from api.services.mes_services import (
     RoutingService,
 )
 from api.services.dispatch_service import dispatch_operations, advance_flow
-from core.auth.security import get_current_user
+from core.auth.security import enforce_tenant, get_current_user
 
-router = APIRouter(prefix="/api/v1", tags=["mes"])
+router = APIRouter(prefix="/api/v1", tags=["mes"], dependencies=[Depends(enforce_tenant)])
 
 
 # --- Request/Response Models ---

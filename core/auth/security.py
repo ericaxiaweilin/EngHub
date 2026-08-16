@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 from typing import Optional, List
 from jose import JWTError, jwt
-from fastapi import Depends, HTTPException, status, Request
+from fastapi import Depends, HTTPException, status, Request, Request
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.db_config import get_db
@@ -123,16 +123,19 @@ async def get_current_active_superuser(
 
 
 async def enforce_tenant(
+    request: Request,
     factory_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
 ) -> str:
     """多租户隔离依赖 (改进自 engflow TenantContext)。
 
-    作为路由级依赖挂到业务 router：
-    - 普通用户：强制锁定自身 factory_id，客户端传入不一致的厂区直接 403；
-    - 超管(is_superuser)：可跨厂区，传什么用什么，不传则用自身。
-    返回生效的 factory_id (供需要的端点复用)。
+    factory_id 来源优先级：函数参数 > X-Factory-Id 请求头 > 用户自身。
+    普通用户强制锁定自身厂区，传不一致直接 403；超管可跨厂区。
     """
+    if request is not None:
+        header_fid = request.headers.get("X-Factory-Id") or request.headers.get("x-factory-id")
+        if header_fid and not factory_id:
+            factory_id = header_fid
     if current_user.is_superuser:
         return factory_id or current_user.factory_id
     if not current_user.factory_id:

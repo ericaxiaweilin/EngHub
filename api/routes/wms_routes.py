@@ -10,7 +10,7 @@ from datetime import date
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from core.auth.security import get_current_user
+from core.auth.security import enforce_tenant, get_current_user
 from database.models import User
 from api.services.wms_service import (
     WarehouseService,
@@ -19,7 +19,7 @@ from api.services.wms_service import (
     WmsService,
 )
 
-router = APIRouter(prefix="/api/v1", tags=["wms"])
+router = APIRouter(prefix="/api/v1", tags=["wms"], dependencies=[Depends(enforce_tenant)])
 
 
 # --- Request/Response Models ---

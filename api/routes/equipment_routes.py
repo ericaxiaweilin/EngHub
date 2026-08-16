@@ -11,9 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_async_session
 from database.models import Equipment
-from core.auth.security import get_current_user
+from core.auth.security import enforce_tenant, get_current_user
 
-router = APIRouter(prefix="/api/v1/equipment", tags=["Equipment & TPM"])
+router = APIRouter(prefix="/api/v1/equipment", tags=["Equipment & TPM"], dependencies=[Depends(enforce_tenant)])
 
 
 # ==================== OEE Endpoints ====================

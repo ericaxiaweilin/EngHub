@@ -10,13 +10,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.auth.security import get_current_user
+from core.auth.security import enforce_tenant, get_current_user
 from database.db_config import get_db
 from database.models import User
 from api.services.pmc_control_tower_service import PmcControlTowerService
 from api.services.pmc_work_matrix_service import PmcWorkMatrixService
 
-router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
+router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"], dependencies=[Depends(enforce_tenant)])
 
 
 PMC_DATA_CONTRACT = [

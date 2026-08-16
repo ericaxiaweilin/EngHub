@@ -2,6 +2,7 @@
 BOM Routes - EngHub BOM 对接 EngFlow 数据接口
 """
 from fastapi import APIRouter, Depends, Query, BackgroundTasks
+from core.auth.security import enforce_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
@@ -9,7 +10,7 @@ from database.db_config import get_db
 from api.services.bom_service import BomService
 from api.services.bom_sync_service import BomSyncService
 
-router = APIRouter(prefix="/api/v1/bom", tags=["BOM"])
+router = APIRouter(prefix="/api/v1/bom", tags=["BOM"], dependencies=[Depends(enforce_tenant)])
 
 
 @router.get("/models")

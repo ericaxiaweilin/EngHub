@@ -11,11 +11,11 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from core.auth.security import get_current_user
+from core.auth.security import enforce_tenant, get_current_user
 from database.models import User, QualityInspection, DefectRecord, Qms8dReport
 from api.services.qms_service import QMSService as QmsService
 
-router = APIRouter(prefix="/api/v1", tags=["qms"])
+router = APIRouter(prefix="/api/v1", tags=["qms"], dependencies=[Depends(enforce_tenant)])
 
 
 # --- Inspection Endpoints ---
