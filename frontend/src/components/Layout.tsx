@@ -43,6 +43,7 @@ import {
   ColumnHeightOutlined,
   FundOutlined,
   DeploymentUnitOutlined,
+  CheckCircleOutlined,
 } from '@ant-design/icons'
 import { getStoredUser, fetchMe, logout } from '../services/auth'
 import { isTestMode } from '../services/testSwitch'
@@ -103,9 +104,9 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/ie/lean-metrics': <FundOutlined />,
   '/ie/action-studies': <ExperimentOutlined />,
   '/ie/method-studies': <ThunderboltOutlined />,
-  '/ie/work-cells': <LineChartOutlined />,
-  '/ie/kanbans': <LineChartOutlined />,
-  '/ie/5s-audits': <LineChartOutlined />,
+  '/ie/work-cells': <AppstoreOutlined />,
+  '/ie/kanbans': <LayoutOutlined />,
+  '/ie/5s-audits': <CheckCircleOutlined />,
 }
 
 // 将后端 menu_items 转换为 Ant Design Menu 格式（label 优先取 i18n 翻译，缺失时回退后端原文）
