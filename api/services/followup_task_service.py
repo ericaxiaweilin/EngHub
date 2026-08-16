@@ -1041,6 +1041,9 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
             closed_at = CASE WHEN :done THEN NOW() ELSE closed_at END
         WHERE id = :id
     """), {
+        # 注意：同一命名参数禁止跨类型上下文复用（:st 赋值 varchar 列 vs 与 text 字面量比较），
+        # asyncpg 会报 AmbiguousParameterError 并毒化事务（实测任务中心每分钟报错 2270+ 次）。
+        # 状态比较一律用布尔参数 :done，不与 :st 复用。
         "st": new_status, "pct": conclusion["progress_pct"], "note": conclusion["note"],
         "fc": follow_count, "active": new_status in ("open", "blocked") and not (reached_limit and new_status != "blocked"),
         "retry_min": _BLOCKED_RETRY_MINUTES if reached_limit else int(task.get("follow_interval_minutes") or 30),
@@ -1387,6 +1390,12 @@ async def followup_scanner_loop() -> None:
                     if _ai.get("handled"):
                         _logger.info("[ai-engine] AI 处理 %s 个任务，自动闭环 %s", len(_ai["handled"]), _ai.get("auto_closed"))
                 except Exception as _aie:
+                    # 必须回滚：AI 引擎与下方 scan_due_tasks 共用同一会话，
+                    # 事务毒化会导致后续每轮扫描全部 InFailedSQLTransaction 报错
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
                     _logger.warning(f"[ai-engine] 异常: {_aie}")
                 result = await scan_due_tasks(db)
                 if result["scanned"]:

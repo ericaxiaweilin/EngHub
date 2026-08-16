@@ -469,6 +469,11 @@ async def _start_scheduler():
         from api.services.factory_commander import commander_watch_loop
         asyncio.create_task(commander_watch_loop())
 
+        # 数据治理循环：追加型表保留策略（天数+硬上限）+ 业务去重扫描，
+        # 防止无去重周期写入拖垮数据库（DATA_GOVERNANCE_ENABLED=0 可关）
+        from api.services.data_governance_service import data_governance_loop
+        asyncio.create_task(data_governance_loop())
+
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------
 FRONTEND_DIST = Path(os.environ.get("FRONTEND_DIST", str(Path(__file__).parent / "frontend_dist")))
