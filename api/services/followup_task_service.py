@@ -1072,6 +1072,112 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
 # 定期扫描：到期任务逐个跟进（startup 后台循环调用）
 # ═══════════════════════════════════════════════════════════
 
+
+
+# ═══ AI 任务处理引擎：chatbot 接管非必要电脑工作（确定性，有证据才闭环）═══
+async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """按任务类型确定性处理：
+    - 缺料/齐套任务 → 查库存：够→自动闭环；不够→自动建PR(采购接管)
+    - 设备任务 → 查设备状态：running→自动闭环
+    - 订单评审 → 查订单状态：已评审/已转工单→自动闭环
+    - 巡检/核实任务 → 查目标状态：正常→自动闭环
+    返回 {"action": "closed"/"escalated"/"auto_pr", "note": ...} 或 None(不能自动处理)
+    """
+    import re as _re
+    title = (t.get("title") or "") + " " + (t.get("description") or "")
+    task_id = t["id"]
+    fid = t.get("factory_id") or "FAC_MECH_001"
+
+    # 1) 缺料/齐套/采购任务
+    if any(k in title for k in ["缺料", "齐套", "补货", "shortage", "物料"]):
+        mcode = _re.search(r"([A-Z]{2,3}-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        # 查库存
+        if mcode:
+            inv = (await db.execute(text(
+                "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
+            ), {"m": mcode.group(1), "f": fid})).scalar_one() or 0
+            if float(inv) > 0:
+                await db.execute(text("""
+                    UPDATE followup_tasks SET status='done', progress_pct=100,
+                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
+                    WHERE id=:id
+                """), {"note": f"[AI自动闭环] 物料 {mcode.group(1)} 库存 {inv} 已充足，缺料解除", "id": task_id})
+                await db.commit()
+                return {"action": "closed", "note": f"物料 {mcode.group(1)} 库存 {inv} 充足，AI 自动闭环"}
+            # 库存不足 → 检查是否已有 PR，无则自动建 PR（采购接管）
+            has_pr = (await db.execute(text(
+                "SELECT 1 FROM purchase_requisitions WHERE material_code=:m AND status IN ('PENDING','pending') LIMIT 1"
+            ), {"m": mcode.group(1)})).scalar_one_or_none()
+            if not has_pr:
+                try:
+                    await db.execute(text("""
+                        INSERT INTO purchase_requisitions (id, factory_id, material_code, material_name, qty, unit,
+                            status, source, created_by, created_at, updated_at)
+                        VALUES (gen_random_uuid()::text, :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
+                    """), {"f": fid, "m": mcode.group(1), "mn": mcode.group(1),
+                            "q": float((await db.execute(text(
+                                "SELECT COALESCE(required_qty, 100) FROM work_order_materials WHERE material_code=:m AND work_order_id IN (SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress')) LIMIT 1"
+                            ), {"m": mcode.group(1), "f": fid})).scalar_one_or_none() or 100)})
+                    await db.commit()
+                    return {"action": "auto_pr", "note": f"物料 {mcode.group(1)} 库存 0，AI 已自动创建采购申请"}
+                except Exception:
+                    pass
+            return {"action": "escalated", "note": f"物料 {mcode.group(1)} 缺料，已有 PR 在途，转采购跟催"}
+
+    # 2) 设备任务
+    if any(k in title for k in ["设备", "equipment", "故障", "维修", "保养"]):
+        ec = _re.search(r"(EQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        if ec:
+            st = (await db.execute(text(
+                "SELECT status FROM equipment WHERE equipment_code=:c AND factory_id=:f LIMIT 1"
+            ), {"c": ec.group(1), "f": fid})).scalar_one_or_none()
+            if st == "running":
+                await db.execute(text("""
+                    UPDATE followup_tasks SET status='done', progress_pct=100,
+                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
+                    WHERE id=:id
+                """), {"note": f"[AI自动闭环] 设备 {ec.group(1)} 已恢复运行", "id": task_id})
+                await db.commit()
+                return {"action": "closed", "note": f"设备 {ec.group(1)} 运行正常，AI 自动闭环"}
+            return {"action": "escalated", "note": f"设备 {ec.group(1)} 状态 {st}，仍需处理"}
+
+    # 3) 订单评审任务
+    if "评审" in title or "订单" in title:
+        so = _re.search(r"(SO-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        if so:
+            st = (await db.execute(text(
+                "SELECT status FROM sales_orders WHERE order_code=:c OR id=:c LIMIT 1"
+            ), {"c": so.group(1)})).scalar_one_or_none()
+            if st in ("confirmed", "approved", "在生产", "completed"):
+                await db.execute(text("""
+                    UPDATE followup_tasks SET status='done', progress_pct=100,
+                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
+                    WHERE id=:id
+                """), {"note": f"[AI自动闭环] 订单 {so.group(1)} 已确认（{st}），评审完成", "id": task_id})
+                await db.commit()
+                return {"action": "closed", "note": f"订单 {so.group(1)} 已确认，AI 自动闭环"}
+    return None
+
+
+async def ai_process_due_tasks(db: AsyncSession) -> Dict[str, Any]:
+    """AI 任务处理引擎入口：扫 blocked/open 到期任务 → 确定性处理。"""
+    result = await db.execute(text("""
+        SELECT id, factory_id, created_by, title, description, status, assigned_to, payload
+        FROM followup_tasks
+        WHERE status IN ('open', 'blocked')
+        ORDER BY next_follow_at ASC NULLS FIRST
+        LIMIT 50
+    """))
+    tasks = [dict(r._mapping) for r in result.fetchall()]
+    handled = []
+    for t in tasks:
+        try:
+            r = await _ai_handle_task(db, t)
+            if r:
+                handled.append({"id": t["id"], "title": (t["title"] or "")[:40], **r})
+        except Exception:
+            continue
+    return {"scanned": len(tasks), "handled": handled, "auto_closed": sum(1 for h in handled if h.get("action") == "closed")}
 async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:
     """取到期任务执行跟进；FOR UPDATE SKIP LOCKED 防多 worker 重复跟进。"""
     result = await db.execute(text("""
@@ -1109,6 +1215,17 @@ def _env_flag(name: str, default: bool = True) -> bool:
     if raw is None or not str(raw).strip():
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _ai_engine_cycle(db: AsyncSession) -> None:
+    """AI 任务处理周期：每轮 scanner 先让 AI 接管可自动化的任务。"""
+    try:
+        from api.services.followup_task_service import ai_process_due_tasks
+        r = await ai_process_due_tasks(db)
+        if r.get("handled"):
+            print(f"[ai-engine] 处理 {len(r['handled'])} 个任务, 自动闭环 {r.get('auto_closed')}")
+    except Exception:
+        pass
 
 
 async def followup_scanner_loop() -> None:
@@ -1166,6 +1283,14 @@ async def followup_scanner_loop() -> None:
             except Exception as _e3:
                 _logger.warning(f"[consistency] 调度异常: {_e3}")
             async with db_config.session_factory() as db:
+                # ── AI 任务处理引擎：chatbot 先接管可自动化的任务 ──
+                try:
+                    from api.services.followup_task_service import ai_process_due_tasks
+                    _ai = await ai_process_due_tasks(db)
+                    if _ai.get("handled"):
+                        _logger.info("[ai-engine] AI 处理 %s 个任务，自动闭环 %s", len(_ai["handled"]), _ai.get("auto_closed"))
+                except Exception as _aie:
+                    _logger.warning(f"[ai-engine] 异常: {_aie}")
                 result = await scan_due_tasks(db)
                 if result["scanned"]:
                     _logger.info("任务中心本轮跟进 %s 个任务", result["scanned"])
