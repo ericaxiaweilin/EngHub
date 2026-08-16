@@ -136,10 +136,114 @@ class RCCTaskService:
                             "UPDATE work_orders SET priority=:p, updated_at=NOW() WHERE id=:id"
                         ), {"p": prio, "id": wo_row["id"]})
                         executed = True
+                elif action == "rush_insert" and target:
+                    # 插单：目标工单提为 urgent 并释放到产线（pending→released）
+                    wo_row = (await self.db.execute(_tex(
+                        "SELECT id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
+                    ), {"t": target})).mappings().first()
+                    if wo_row:
+                        await self.db.execute(_tex(
+                            "UPDATE work_orders SET priority='urgent', "
+                            "status=CASE WHEN status='pending' THEN 'released' ELSE status END, "
+                            "updated_at=NOW() WHERE id=:id"
+                        ), {"id": wo_row["id"]})
+                        executed = True
+                elif action == "reschedule" and target:
+                    # 改期：更新目标工单交期（params 支持 new_due/planned_due/due）
+                    _new_due = None
+                    if isinstance(params, dict):
+                        _new_due = params.get("new_due") or params.get("planned_due") or params.get("due")
+                    wo_row = (await self.db.execute(_tex(
+                        "SELECT id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
+                    ), {"t": target})).mappings().first()
+                    if wo_row and _new_due:
+                        # asyncpg 拒收字符串日期参数，必须先解析为 date（实测 str 报 DataError）
+                        from datetime import date as _date_t
+                        try:
+                            _d = _date_t.fromisoformat(str(_new_due)[:10])
+                        except ValueError:
+                            _d = None
+                        if _d:
+                            await self.db.execute(_tex(
+                                "UPDATE work_orders SET planned_due=:d, updated_at=NOW() WHERE id=:id"
+                            ), {"d": _d, "id": wo_row["id"]})
+                            executed = True
+                elif action == "cancel_order" and target:
+                    # 撤单：优先撤采购订单，无则撤工单（已到终态的单据不动）
+                    po_row = (await self.db.execute(_tex(
+                        "SELECT id FROM purchase_orders WHERE (id=:t OR po_code=:t) "
+                        "AND status NOT IN ('received','completed','cancelled') LIMIT 1"
+                    ), {"t": target})).mappings().first()
+                    if po_row:
+                        await self.db.execute(_tex(
+                            "UPDATE purchase_orders SET status='cancelled', updated_at=NOW() WHERE id=:id"
+                        ), {"id": po_row["id"]})
+                        executed = True
+                    else:
+                        wo_row = (await self.db.execute(_tex(
+                            "SELECT id FROM work_orders WHERE (id=:t OR work_order_code=:t) "
+                            "AND status NOT IN ('completed','cancelled') LIMIT 1"
+                        ), {"t": target})).mappings().first()
+                        if wo_row:
+                            await self.db.execute(_tex(
+                                "UPDATE work_orders SET status='cancelled', updated_at=NOW() WHERE id=:id"
+                            ), {"id": wo_row["id"]})
+                            executed = True
+                elif action == "place_order" and target:
+                    # 下单：PR → 定供应商 → 创建 PO（复用采购工具同构字段）
+                    pr_row = (await self.db.execute(_tex(
+                        "SELECT id, factory_id, material_code, material_name, qty, supplier_id "
+                        "FROM purchase_requisitions WHERE (id=:t OR pr_code=:t) "
+                        "AND status IN ('pending','assigned') LIMIT 1"
+                    ), {"t": target})).mappings().first()
+                    if pr_row:
+                        sup_id = (params.get("supplier_id") if isinstance(params, dict) else None) or pr_row["supplier_id"]
+                        if not sup_id:
+                            _sup = (await self.db.execute(_tex(
+                                "SELECT id FROM suppliers WHERE is_active=TRUE ORDER BY rating DESC NULLS LAST LIMIT 1"
+                            ))).mappings().first()
+                            sup_id = _sup["id"] if _sup else None
+                        if sup_id:
+                            sup_row = (await self.db.execute(_tex(
+                                "SELECT supplier_name FROM suppliers WHERE id=:s"
+                            ), {"s": sup_id})).mappings().first()
+                            import uuid as _u2
+                            _po_code = f"PO-{pr_row['material_code']}-{_u2.uuid4().hex[:6].upper()}"
+                            await self.db.execute(_tex(
+                                "INSERT INTO purchase_orders (id, factory_id, po_code, pr_id, supplier_id, supplier_name, "
+                                "material_code, material_name, qty, order_date, expected_date, status, auto_generated, created_at, updated_at) "
+                                "VALUES (gen_random_uuid()::text, :f, :po, :pr, :s, :sn, :m, :mn, :q, "
+                                "CURRENT_DATE, CURRENT_DATE + 7, 'ordered', TRUE, NOW(), NOW())"
+                            ), {"f": pr_row["factory_id"], "po": _po_code, "pr": pr_row["id"],
+                                "s": sup_id, "sn": (sup_row["supplier_name"] if sup_row else ""),
+                                "m": pr_row["material_code"],
+                                "mn": pr_row["material_name"] or pr_row["material_code"],
+                                "q": pr_row["qty"]})
+                            await self.db.execute(_tex(
+                                "UPDATE purchase_requisitions SET status='converted', supplier_id=:s, "
+                                "purchase_code=:pc, updated_at=NOW() WHERE id=:id"
+                            ), {"s": sup_id, "pc": _po_code, "id": pr_row["id"]})
+                            executed = True
+                elif action == "reject_order" and target:
+                    # 拒单：取消采购订单并释放关联 PR 回待指派（可重新选供应商）
+                    po_row = (await self.db.execute(_tex(
+                        "SELECT id, pr_id FROM purchase_orders WHERE (id=:t OR po_code=:t) "
+                        "AND status IN ('ordered','partial','pending') LIMIT 1"
+                    ), {"t": target})).mappings().first()
+                    if po_row:
+                        await self.db.execute(_tex(
+                            "UPDATE purchase_orders SET status='cancelled', updated_at=NOW() WHERE id=:id"
+                        ), {"id": po_row["id"]})
+                        if po_row["pr_id"]:
+                            await self.db.execute(_tex(
+                                "UPDATE purchase_requisitions SET status='pending', supplier_id=NULL, "
+                                "updated_at=NOW() WHERE id=:id AND status='converted'"
+                            ), {"id": po_row["pr_id"]})
+                        executed = True
                 # 审计事件
-                # 工厂推导：从目标工单或任务上下文
-                fid = None
-                if target:
+                # 工厂推导：优先任务自身 factory_id，其次目标工单，最后默认机械厂
+                fid = getattr(task, "factory_id", None)
+                if not fid and target:
                     _r = await self.db.execute(_tex(
                         "SELECT factory_id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
                     ), {"t": target})
@@ -160,8 +264,16 @@ class RCCTaskService:
                     task.status = "executed"
                     task.executed_at = datetime.utcnow()
                 await self.db.commit()  # 执行器落库（工单优先级 + 任务状态 + 审计）
-        except Exception:
-            pass  # 执行失败不阻塞审批主流程（审计已尽力写入）
+        except Exception as _ee:
+            # 执行失败不阻塞审批主流程，但必须留痕+回滚，否则卡单无从排查
+            # （实测：reschedule 传字符串日期被 asyncpg 拒收，静默吞掉卡 approved）
+            import logging as _lg
+            _lg.getLogger("rcc").warning(
+                f"[approve_task] action={action} target={target} 执行失败: {_ee}")
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
         return task
     
     async def reject_task(self, task_id: str, approver_id: str, reason: str) -> Any:
