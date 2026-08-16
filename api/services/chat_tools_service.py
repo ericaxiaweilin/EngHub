@@ -3080,6 +3080,12 @@ async def _tool_create_rfq(db: AsyncSession, args: Dict[str, Any], factory_id: O
             SELECT supplier_id FROM supplier_materials WHERE material_code=:m LIMIT 6
         """), {"m": mcode})).mappings().all()
         sids = [r["supplier_id"] for r in rows]
+    if not sids:
+        # 兜底：物料无供应商关联时向全部供应商询价（最小循环不断链）
+        rows = (await db.execute(text("""
+            SELECT id FROM suppliers WHERE supplier_code IS NOT NULL LIMIT 5
+        """))).mappings().all()
+        sids = [r["id"] for r in rows]
     await db.commit()
     return {"type": "rfq", "action": "created", "rfq_id": rfq_id, "rfq_code": code,
             "material": mcode, "qty": qty, "suppliers_targeted": len(sids),

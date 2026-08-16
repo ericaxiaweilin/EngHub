@@ -1090,7 +1090,7 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
 
     # 1) 缺料/齐套/采购任务
     if any(k in title for k in ["缺料", "齐套", "补货", "shortage", "物料"]):
-        mcode = _re.search(r"([A-Z]{2,3}-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        mcode = _re.search(r"([A-Z0-9]{2,4}-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
         # 查库存
         if mcode:
             inv = (await db.execute(text(
@@ -1141,7 +1141,24 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
                 return {"action": "closed", "note": f"设备 {ec.group(1)} 运行正常，AI 自动闭环"}
             return {"action": "escalated", "note": f"设备 {ec.group(1)} 状态 {st}，仍需处理"}
 
-    # 3) 订单评审任务
+    # 3) 交期风险任务：查工单状态 → 已完工/已取消 → 自动闭环
+    if "交期风险" in title or "延期" in title or "delay" in title.lower():
+        wcode = _re.search(r"(WO-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        if wcode:
+            st = (await db.execute(text(
+                "SELECT status FROM work_orders WHERE work_order_code=:c AND factory_id=:f LIMIT 1"
+            ), {"c": wcode.group(1), "f": fid})).scalar_one_or_none()
+            if st in ("completed", "done", "cancelled"):
+                await db.execute(text("""
+                    UPDATE followup_tasks SET status='done', progress_pct=100,
+                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
+                    WHERE id=:id
+                """), {"note": f"[AI自动闭环] 工单 {wcode.group(1)} 已{st}，交期风险解除", "id": task_id})
+                await db.commit()
+                return {"action": "closed", "note": f"工单 {wcode.group(1)} 已{st}，AI 自动闭环"}
+            return {"action": "escalated", "note": f"工单 {wcode.group(1)} 状态 {st}，交期风险仍在，转PMC处理"}
+
+    # 4) 订单评审任务
     if "评审" in title or "订单" in title:
         so = _re.search(r"(SO-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
         if so:
