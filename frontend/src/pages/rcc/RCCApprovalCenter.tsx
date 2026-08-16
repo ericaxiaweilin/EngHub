@@ -43,7 +43,7 @@ export default function RCCApprovalCenter({ onApproved }: { onApproved?: () => v
   const load = async () => {
     setLoading(true)
     try {
-      const r = await axios.get(`${API}/rcc/tasks`, { params: { status: 'pending', page_size: 200 } })
+      const r = await axios.get(`${API}/rcc/tasks`, { params: { status: 'pending', page_size: 100 } })
       setTasks(r.data?.items || [])
     } finally { setLoading(false) }
   }
