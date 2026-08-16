@@ -42,7 +42,7 @@ AGENT_KEYWORD_RULES: List[tuple] = [
 # 各智能体在 chatbot 会话中的工具偏好（用于调度提示词）
 AGENT_TOOL_HINTS: Dict[str, str] = {
     "dispatch_agent": "query_work_orders / get_work_order_detail / release_work_order / query_skill_matrix",
-    "procurement_agent": "query_purchase_pipeline / create_purchase_requisition / assign_supplier_to_pr / create_purchase_order / query_purchase_order_progress / query_inventory / query_shortage_alerts",
+    "procurement_agent": "query_purchase_pipeline / create_purchase_requisition / assign_supplier_to_pr / create_rfq / collect_quotations / select_best_quote / create_purchase_order / goods_receipt / invoice_matching_check / arrival_tracking / supplier_evaluation / query_supplier_rank / query_purchase_order_progress / query_inventory / query_shortage_alerts",
     "quality_agent": "query_defects / query_spc_anomalies / query_ocap_tasks / get_inspection_form",
     "delivery_agent": "query_work_orders / get_production_summary / query_alert_reviews",
     "escalation_agent": "get_pending_alerts / acknowledge_alert / run_alert_patrol",

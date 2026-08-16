@@ -135,7 +135,128 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "run_mrp_calculation",
+            "name": "create_rfq",
+                    "description": "发起询价(RFQ)：为缺料/PR物料向多家供应商发出询价请求，收集报价。返回RFQ编号与状态。用于'向供应商询价''发RFQ''这料问几家报价'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "material_code": {"type": "string", "description": "物料编码"},
+                            "quantity": {"type": "number", "description": "询价数量"},
+                            "supplier_ids": {"type": "array", "items": {"type": "string"}, "description": "候选供应商ID列表（默认取该物料全部供应商）"}
+                        },
+                        "required": ["material_code", "quantity"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "collect_quotations",
+                    "description": "收集/提交供应商报价：为RFQ录入供应商报价（单价/交期/付款条件），或查询已有报价。用于'供应商报价来了''记录报价''比价'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "rfq_id": {"type": "string", "description": "RFQ编号或ID"},
+                            "supplier_id": {"type": "string", "description": "报价供应商ID（录入报价时）"},
+                            "unit_price": {"type": "number", "description": "报价单价（录入时）"},
+                            "lead_time_days": {"type": "integer", "description": "交期天数（录入时）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "select_best_quote",
+                    "description": "比价选优：对RFQ的多个报价按价格/交期/供应商绩效综合评分选出最优，标记 selected。用于'哪家报价最好''选哪个供应商''比价结果'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "rfq_id": {"type": "string", "description": "RFQ编号或ID"}
+                        },
+                        "required": ["rfq_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "goods_receipt",
+                    "description": "采购收货(GR)：PO到货登记收货单，记录收货数量/合格数/不良数，触发IQC质检状态。用于'货到了收货''PO到货登记''这批到货怎么样'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "po_code": {"type": "string", "description": "采购订单编号"},
+                            "quantity": {"type": "number", "description": "到货数量"},
+                            "qty_accepted": {"type": "number", "description": "合格数量"},
+                            "qty_rejected": {"type": "number", "description": "不良数量（默认0）"}
+                        },
+                        "required": ["po_code", "quantity", "qty_accepted"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "supplier_evaluation",
+                    "description": "供应商绩效评估：按订单交付/质量/价格计算供应商评分(0-100)与等级(A/B/C/D)，含OTIF率。用于'供应商表现怎么样''评估供应商''哪家供应商靠谱'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "period": {"type": "string", "description": "评估周期 YYYY-MM（默认当前月）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "invoice_matching_check",
+                    "description": "发票校验(三单匹配)：发票金额 vs PO金额 vs 收货金额核对，标记 matched/mismatch。用于'对账''发票核对''三单匹配'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "po_code": {"type": "string", "description": "采购订单编号"},
+                            "invoice_amount": {"type": "number", "description": "发票金额"}
+                        },
+                        "required": ["po_code", "invoice_amount"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "arrival_tracking",
+                    "description": "到货跟踪：查询采购到货计划（在途/已到/延迟），ETA与运输方式。用于'货到哪了''在途多久到''到货计划'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string", "description": "过滤：scheduled/in_transit/arrived/delayed（可选）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_supplier_rank",
+                    "description": "供应商排名：按绩效总分/OTIF率/价格水平给供应商排名，返回TOP供应商与需淘汰供应商。用于'供应商排名''哪家供应商最好''换供应商'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer", "description": "返回数量（默认10）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_mrp_calculation",
                     "description": "运行 MRP 计算（毛需求→净需求→批量→提前期）：按产品/工单展开 BOM 计算物料需求，返回需求明细与缺料清单。用于'帮我跑一下MRP''这个产品物料需求多少''哪些料需要采购'类请求。",
                     "parameters": {
                         "type": "object",
@@ -2822,6 +2943,273 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _tool_create_rfq(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """发起询价(RFQ)：为物料向候选供应商发出询价。"""
+    fid = factory_id or "FAC_MECH_001"
+    mcode = str(args.get("material_code") or "").strip()
+    qty = float(args.get("quantity") or 0)
+    if not mcode or qty <= 0:
+        return {"error": "缺少 material_code/quantity"}
+    import uuid
+    rfq_id = str(uuid.uuid4())
+    code = f"RFQ-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    await db.execute(text("""
+        INSERT INTO rfqs (id, rfq_code, factory_id, material_code, material_name, quantity, required_date, status, created_by)
+        VALUES (:id, :code, :f, :m, :mn, :q, CURRENT_DATE + 7, 'open', :cb)
+    """), {"id": rfq_id, "code": code, "f": fid, "m": mcode,
+           "mn": (await db.execute(text("SELECT material_name FROM materials WHERE material_code=:m"), {"m": mcode})).scalar() or mcode,
+           "q": qty, "cb": operator})
+    # 候选供应商
+    sids = args.get("supplier_ids") or []
+    if not sids:
+        rows = (await db.execute(text("""
+            SELECT supplier_id FROM supplier_materials WHERE material_code=:m LIMIT 6
+        """), {"m": mcode})).mappings().all()
+        sids = [r["supplier_id"] for r in rows]
+    await db.commit()
+    return {"type": "rfq", "action": "created", "rfq_id": rfq_id, "rfq_code": code,
+            "material": mcode, "qty": qty, "suppliers_targeted": len(sids),
+            "message": f"RFQ {code} 已发出，向 {len(sids)} 家供应商询价"}
+
+
+async def _tool_collect_quotations(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """收集报价：录入或查询。"""
+    fid = factory_id or "FAC_MECH_001"
+    rfq = str(args.get("rfq_id") or "").strip()
+    if not rfq:
+        return {"error": "缺少 rfq_id"}
+    # 支持 rfq_code 或 id
+    row = (await db.execute(text(
+        "SELECT id, rfq_code, material_code, quantity, status FROM rfqs WHERE rfq_code=:r OR id=:r"
+    ), {"r": rfq})).mappings().first()
+    if not row:
+        return {"error": f"RFQ {rfq} 不存在"}
+    sid = str(args.get("supplier_id") or "").strip()
+    if sid:
+        price = float(args.get("unit_price") or 0)
+        lead = int(args.get("lead_time_days") or 0)
+        if price <= 0 or lead <= 0:
+            return {"error": "报价需 unit_price>0 且 lead_time_days>0"}
+        srow = (await db.execute(text(
+            "SELECT supplier_name FROM suppliers WHERE id=:s OR supplier_code=:s"
+        ), {"s": sid})).mappings().first()
+        await db.execute(text("""
+            INSERT INTO quotations (id, rfq_id, supplier_id, supplier_name, unit_price, lead_time_days, delivery_date, payment_terms, status, created_at)
+            VALUES (gen_random_uuid()::text, :rfq, :sid, :sn, :price, :lead, (CURRENT_DATE + (:lead_days || ' days')::interval)::date, '月结30天', 'received', NOW())
+        """), {"rfq": row["id"], "sid": sid, "sn": srow["supplier_name"] if srow else sid,
+               "price": price, "lead": lead, "lead_days": str(lead)})
+        await db.execute(text("UPDATE rfqs SET status='quoting' WHERE id=:id"), {"id": row["id"]})
+        await db.commit()
+        return {"type": "quotation", "action": "recorded", "rfq_code": row["rfq_code"],
+                "supplier": sid, "price": price, "lead_days": lead}
+    # 查询已有报价
+    quotes = (await db.execute(text("""
+        SELECT supplier_id, supplier_name, unit_price, lead_time_days, status FROM quotations
+        WHERE rfq_id=:rid ORDER BY unit_price
+    """), {"rid": row["id"]})).mappings().all()
+    return {"type": "quotations", "rfq_code": row["rfq_code"], "material": row["material_code"],
+            "qty": row["quantity"], "count": len(quotes),
+            "quotations": [{"supplier": q["supplier_name"] or q["supplier_id"],
+                            "price": float(q["unit_price"]), "lead_days": q["lead_time_days"],
+                            "status": q["status"]} for q in quotes]}
+
+
+async def _tool_select_best_quote(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """比价选优：价格 60% + 交期 20% + 供应商绩效 20%。"""
+    fid = factory_id or "FAC_MECH_001"
+    rfq = str(args.get("rfq_id") or "").strip()
+    if not rfq:
+        return {"error": "缺少 rfq_id"}
+    row = (await db.execute(text(
+        "SELECT id, rfq_code, material_code, quantity FROM rfqs WHERE rfq_code=:r OR id=:r"
+    ), {"r": rfq})).mappings().first()
+    if not row:
+        return {"error": f"RFQ {rfq} 不存在"}
+    quotes = (await db.execute(text("""
+        SELECT q.id, q.supplier_id, q.supplier_name, q.unit_price, q.lead_time_days,
+               COALESCE(se.total_score, 70) AS score
+        FROM quotations q
+        LEFT JOIN supplier_evaluations se ON se.supplier_id=q.supplier_id AND se.period=to_char(NOW(), 'YYYY-MM')
+        WHERE q.rfq_id=:rid AND q.status='received'
+    """), {"rid": row["id"]})).mappings().all()
+    if not quotes:
+        return {"error": "暂无报价可比较（先 collect_quotations）"}
+    if len(quotes) == 1:
+        best = quotes[0]
+    else:
+        prices = [float(q["unit_price"]) for q in quotes]
+        pmin, pmax = min(prices), max(prices)
+        def _score(q):
+            pscore = 100 if pmax == pmin else 100 - (float(q["unit_price"]) - pmin) / (pmax - pmin) * 40
+            lscore = max(0, 100 - (float(q["lead_time_days"]) - 1) * 10)
+            return 0.6 * pscore + 0.2 * lscore + 0.2 * float(q["score"])
+        best = max(quotes, key=_score)
+    await db.execute(text("""
+        UPDATE quotations SET status='selected', selected_by=:cb, selected_at=NOW() WHERE id=:id
+    """), {"id": best["id"], "cb": operator})
+    await db.execute(text("""
+        UPDATE quotations SET status='rejected' WHERE rfq_id=:rid AND id != :id
+    """), {"rid": row["id"], "id": best["id"]})
+    await db.execute(text("UPDATE rfqs SET status='selected' WHERE id=:id"), {"id": row["id"]})
+    await db.commit()
+    return {"type": "best_quote", "rfq_code": row["rfq_code"], "selected_supplier": best["supplier_name"] or best["supplier_id"],
+            "unit_price": float(best["unit_price"]), "lead_days": best["lead_time_days"],
+            "score": round(float(best["score"]), 1), "message": "已选定最优供应商，可转PO"}
+
+
+async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """采购收货(GR)：登记到货，触发 IQC 质检状态。"""
+    fid = factory_id or "FAC_MECH_001"
+    po_code = str(args.get("po_code") or "").strip()
+    qty = float(args.get("quantity") or 0)
+    accepted = float(args.get("qty_accepted") or 0)
+    rejected = float(args.get("qty_rejected") or 0)
+    if not po_code or qty <= 0:
+        return {"error": "缺少 po_code/quantity"}
+    po = (await db.execute(text(
+        "SELECT id, material_code, supplier_id, qty FROM purchase_orders WHERE po_code=:c OR id=:c"
+    ), {"c": po_code})).mappings().first()
+    if not po:
+        return {"error": f"PO {po_code} 不存在"}
+    import uuid
+    gr_id = str(uuid.uuid4())
+    gr_code = f"GR-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    await db.execute(text("""
+        INSERT INTO goods_receipts (id, gr_code, factory_id, po_id, material_code, supplier_id,
+                                    quantity, qty_accepted, qty_rejected, iqc_status, warehouse, received_by, received_at)
+        VALUES (:id, :code, :f, :po, :m, :sup, :q, :acc, :rej, 'pending', 'MAIN', :cb, NOW())
+    """), {"id": gr_id, "code": gr_code, "f": fid, "po": po["id"], "m": po["material_code"],
+           "sup": po["supplier_id"], "q": qty, "acc": accepted, "rej": rejected, "cb": operator})
+    # 更新 PO 状态 + 库存（合格入账）
+    await db.execute(text("""
+        UPDATE purchase_orders SET status='received', actual_date=CURRENT_DATE WHERE id=:id
+    """), {"id": po["id"]})
+    await db.execute(text("""
+        UPDATE inventory SET available_qty=available_qty+:acc WHERE material_code=:m AND factory_id=:f
+    """), {"acc": accepted, "m": po["material_code"], "f": fid})
+    await db.commit()
+    return {"type": "goods_receipt", "action": "received", "gr_code": gr_code, "po_code": po_code,
+            "qty": qty, "accepted": accepted, "rejected": rejected,
+            "iqc_status": "pending", "message": f"收货 {gr_code} 登记完成，合格 {accepted} 待IQC检验"}
+
+
+async def _tool_supplier_evaluation(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """供应商绩效评估：OTIF率/价格/质量 → 总分+等级。"""
+    fid = factory_id or "FAC_MECH_001"
+    period = str(args.get("period") or "").strip() or datetime.now().strftime("%Y-%m")
+    # 按供应商聚合 PO 交付数据
+    rows = (await db.execute(text("""
+        SELECT po.supplier_id, s.supplier_name, COUNT(*) AS order_cnt,
+               COUNT(CASE WHEN po.status IN ('received','closed') THEN 1 END) AS done_cnt,
+               COALESCE(SUM(CASE WHEN po.status='received' THEN po.qty ELSE 0 END),0) AS recv_qty, COALESCE(SUM(po.qty),1) AS total_qty,
+               AVG(COALESCE(sp.unit_price, 100)) AS avg_price
+        FROM purchase_orders po
+        LEFT JOIN suppliers s ON s.id = po.supplier_id OR s.supplier_code = po.supplier_id
+        LEFT JOIN supplier_prices sp ON sp.supplier_id = po.supplier_id AND sp.material_code = po.material_code
+        WHERE po.factory_id=:f AND po.supplier_id IS NOT NULL AND po.supplier_id != ''
+        GROUP BY po.supplier_id, s.supplier_name
+        ORDER BY order_cnt DESC LIMIT 10
+    """), {"f": fid})).mappings().all()
+    if not rows:
+        return {"error": "无 PO 数据可评估"}
+    results = []
+    for r in rows:
+        otif = (float(r["recv_qty"]) / float(r["total_qty"]) * 100) if float(r["total_qty"]) > 0 else 0
+        s_price = 100 if not r["avg_price"] else max(0, 100 - float(r["avg_price"]) / 10)
+        s_delivery = otif
+        s_quality = 90.0  # 默认（无不良数据）
+        total = round(0.4 * s_price + 0.4 * s_delivery + 0.2 * s_quality, 1)
+        grade = "A" if total >= 90 else "B" if total >= 75 else "C" if total >= 60 else "D"
+        await db.execute(text("""
+            INSERT INTO supplier_evaluations (id, factory_id, supplier_id, supplier_name, period,
+                score_price, score_delivery, score_quality, total_score, grade,
+                order_count, on_time_count, otif_rate)
+            VALUES (gen_random_uuid()::text, :f, :sid, :sn, :p, :sp, :sd, :sq, :tt, :g, :oc, :dc, :otif)
+            ON CONFLICT (factory_id, supplier_id, period) DO UPDATE SET
+                score_price=EXCLUDED.score_price, score_delivery=EXCLUDED.score_delivery,
+                score_quality=EXCLUDED.score_quality, total_score=EXCLUDED.total_score,
+                grade=EXCLUDED.grade, order_count=EXCLUDED.order_count,
+                on_time_count=EXCLUDED.on_time_count, otif_rate=EXCLUDED.otif_rate, updated_at=NOW()
+        """), {"f": fid, "sid": r["supplier_id"] or "UNKNOWN", "sn": r["supplier_name"] or r["supplier_id"] or "UNKNOWN",
+               "p": period, "sp": round(s_price, 1), "sd": round(s_delivery, 1), "sq": s_quality,
+               "tt": total, "g": grade, "oc": int(r["order_cnt"]), "dc": int(r["done_cnt"]),
+               "otif": round(otif, 1)})
+        results.append({"supplier": r["supplier_name"] or r["supplier_id"], "orders": int(r["order_cnt"]),
+                        "otif": round(otif, 1), "price_score": round(s_price, 1),
+                        "delivery_score": round(s_delivery, 1), "total": total, "grade": grade})
+    await db.commit()
+    return {"type": "supplier_evaluation", "period": period, "count": len(results),
+            "results": sorted(results, key=lambda x: -x["total"])}
+
+
+async def _tool_invoice_matching_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """发票校验（三单匹配）：发票 vs PO vs 收货。"""
+    fid = factory_id or "FAC_MECH_001"
+    po_code = str(args.get("po_code") or "").strip()
+    inv_amt = float(args.get("invoice_amount") or 0)
+    if not po_code:
+        return {"error": "缺少 po_code"}
+    po = (await db.execute(text(
+        "SELECT id, po_code, total_amount, material_code, supplier_id, qty FROM purchase_orders WHERE po_code=:c OR id=:c"
+    ), {"c": po_code})).mappings().first()
+    if not po:
+        return {"error": f"PO {po_code} 不存在"}
+    po_amt = float(po["total_amount"] or 0)
+    gr = (await db.execute(text(
+        "SELECT COALESCE(SUM(qty_accepted),0) FROM goods_receipts WHERE po_id=:pid"
+    ), {"pid": po["id"]})).scalar_one() or 0
+    gr_amt = po_amt * (float(gr) / float(po.get("qty") or 1)) if po.get("qty") else 0
+    diff = inv_amt - po_amt
+    status = "matched" if abs(diff) <= max(1.0, po_amt * 0.01) else "mismatch"
+    await db.execute(text("""
+        INSERT INTO invoice_matching (id, factory_id, po_code, gr_code, supplier_id, invoice_amount,
+                                      po_amount, gr_amount, diff_amount, status, match_type, checked_by, checked_at)
+        VALUES (gen_random_uuid()::text, :f, :po, :gr, :sup, :inv, :pa, :ga, :diff, :st, 'PO_INVOICE', :cb, NOW())
+    """), {"f": fid, "po": po_code, "gr": "", "sup": po["supplier_id"], "inv": inv_amt,
+           "pa": po_amt, "ga": round(gr_amt, 2), "diff": round(diff, 2), "st": status, "cb": operator})
+    await db.commit()
+    return {"type": "invoice_matching", "po_code": po_code, "invoice_amount": inv_amt,
+            "po_amount": po_amt, "gr_amount": round(gr_amt, 2), "diff": round(diff, 2),
+            "status": status, "message": "三单匹配一致，可付款" if status == "matched" else "发票与PO金额不符，需人工复核"}
+
+
+async def _tool_arrival_tracking(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """到货跟踪：查询到货计划/在途状态。"""
+    fid = factory_id or "FAC_MECH_001"
+    status = str(args.get("status") or "").strip()
+    # 从 PO + 到货计划汇总
+    sql = """SELECT po.po_code, po.material_code, po.supplier_id, po.qty, po.expected_date AS eta,
+                    CASE WHEN po.status IN ('received','closed') THEN 'arrived'
+                         WHEN po.status='ordered' AND po.expected_date < CURRENT_DATE THEN 'delayed'
+                         ELSE 'in_transit' END AS status
+             FROM purchase_orders po WHERE po.factory_id=:f AND po.status NOT IN ('draft','cancelled')"""
+    params = {"f": fid}
+    if status:
+        sql += " AND (CASE WHEN po.status IN ('received','closed') THEN 'arrived' WHEN po.status='ordered' AND po.expected_date < CURRENT_DATE THEN 'delayed' ELSE 'in_transit' END) = :s"
+        params["s"] = status
+    sql += " ORDER BY po.expected_date LIMIT 15"
+    rows = (await db.execute(text(sql), params)).mappings().all()
+    return {"type": "arrival_tracking", "count": len(rows),
+            "arrivals": [{"po_code": r["po_code"], "material": r["material_code"],
+                          "supplier": r["supplier_id"], "qty": float(r["qty"] or 0),
+                          "eta": str(r["eta"])[:10] if r["eta"] else "?", "status": r["status"]} for r in rows]}
+
+
+async def _tool_query_supplier_rank(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
+    """供应商排名：按绩效总分/OTIF。"""
+    fid = factory_id or "FAC_MECH_001"
+    limit = int(args.get("limit") or 10)
+    rows = (await db.execute(text("""
+        SELECT supplier_name, total_score, grade, otif_rate, order_count FROM supplier_evaluations
+        WHERE factory_id=:f
+        ORDER BY total_score DESC LIMIT :lim
+    """), {"f": fid, "lim": limit})).mappings().all()
+    return {"type": "supplier_rank", "count": len(rows),
+            "ranking": [{"supplier": r["supplier_name"], "score": float(r["total_score"] or 0),
+                         "grade": r["grade"], "otif": float(r["otif_rate"] or 0),
+                         "orders": int(r["order_count"] or 0)} for r in rows]}
+
+
 async def _tool_run_mrp_calculation(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
     """运行 MRP（确定性，直查 DB 不走权限墙）：
     计划 → BOM 展开毛需求 → 扣库存/在途 → 净需求 → 缺料清单 + 采购建议。"""
@@ -3547,6 +3935,14 @@ _TOOL_EXECUTORS = {
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
     "pmc_hammer_matrix": _tool_pmc_hammer_matrix,
     "run_mrp_calculation": _tool_run_mrp_calculation,
+    "create_rfq": _tool_create_rfq,
+    "collect_quotations": _tool_collect_quotations,
+    "select_best_quote": _tool_select_best_quote,
+    "goods_receipt": _tool_goods_receipt,
+    "supplier_evaluation": _tool_supplier_evaluation,
+    "invoice_matching_check": _tool_invoice_matching_check,
+    "arrival_tracking": _tool_arrival_tracking,
+    "query_supplier_rank": _tool_query_supplier_rank,
     "create_shipment": _tool_create_shipment,
     "query_shipment_status": _tool_query_shipment_status,
     "pmc_backward_schedule": _tool_pmc_backward_schedule,
