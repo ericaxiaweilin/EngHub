@@ -10,7 +10,7 @@ import {
   ThunderboltOutlined, TeamOutlined, ToolOutlined, ApartmentOutlined,
   ClockCircleOutlined, UserOutlined, SearchOutlined,
 } from '@ant-design/icons'
-import axios from 'axios'
+import axios from '../../services/api'
 
 const API = '/api/v1'
 const C = {
@@ -44,7 +44,7 @@ export default function RCCApprovalCenter({ onApproved }: { onApproved?: () => v
     setLoading(true)
     try {
       const r = await axios.get(`${API}/rcc/tasks`, { params: { status: 'pending', page_size: 100 } })
-      setTasks(r.data?.items || [])
+      setTasks((r as any)?.items || [])
     } finally { setLoading(false) }
   }
   useEffect(() => { load() }, [])

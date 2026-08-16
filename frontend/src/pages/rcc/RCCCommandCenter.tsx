@@ -11,7 +11,7 @@ import {
   RobotOutlined, ApartmentOutlined, TeamOutlined,
   ControlOutlined, FireOutlined, DashboardOutlined, AppstoreOutlined, ClockCircleOutlined,
 } from '@ant-design/icons'
-import axios from 'axios'
+import axios from '../../services/api'
 import { RccContext } from './rcc_theme'
 import { useSearchParams } from 'react-router-dom'
 import RCCOverview from './RCCOverview'
@@ -54,7 +54,7 @@ const TASK_STATUS: Record<string, { label: string; color: string; soft: string }
 
 export default function RCCCommandCenter() {
   const [searchParams, setSearchParams] = useSearchParams()
-  const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'bubbles')
+  const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'overview')
   const [factoryId, setFactoryId] = useState(localStorage.getItem('active_factory_id') || 'FAC_MECH_001')
   const [tasks, setTasks] = useState<any[]>([])
   const [baseline, setBaseline] = useState<any>({})
@@ -71,9 +71,9 @@ export default function RCCCommandCenter() {
         axios.get(`${API}/rcc/data`, { params: { factory_id: factoryId, mode: 'single' } }),
         axios.get(`${API}/task-center/inbox`, { params: {}, headers: { 'X-Factory-Id': factoryId } }),
       ])
-      if (t.status === 'fulfilled') setTasks(t.value.data?.items || [])
-      if (d.status === 'fulfilled') setBaseline(d.value.data?.baseline || {})
-      if (ib.status === 'fulfilled') setInbox(ib.value.data || {})
+      if (t.status === 'fulfilled') setTasks((t.value as any)?.items || [])
+      if (d.status === 'fulfilled') setBaseline((d.value as any)?.baseline || {})
+      if (ib.status === 'fulfilled') setInbox((ib.value as any) || {})
     } finally { setLoading(false) }
   }
   useEffect(() => { loadAll() }, [factoryId])
@@ -413,7 +413,7 @@ export default function RCCCommandCenter() {
 function LogicChainView() {
   const [chains, setChains] = useState<any[]>([])
   useEffect(() => {
-    axios.get(`${API}/rcc/logic-chains`).then(r => setChains(r.data?.items || r.data?.chains || [])).catch(() => {})
+    axios.get(`${API}/rcc/logic-chains`).then(r => setChains((r as any)?.items || (r as any)?.chains || [])).catch(() => {})
   }, [])
   const [editing, setEditing] = useState<any>(null)
   return (
@@ -440,21 +440,30 @@ function LogStream() {
   const [logs, setLogs] = useState<any[]>([])
   useEffect(() => {
     axios.get(`${API}/rcc/tasks`, { params: { page_size: 20 } }).then(r => {
-      const items = r.data?.items || []
-      setLogs(items.map((t: any) => ({ time: (t.created_at || '').slice(11, 19), agent: t.requested_by || '系统', msg: `${t.title}（${t.task_type}）`, result: t.status })))
+      const items = (r as any)?.items || []
+      setLogs(items.map((t: any) => ({ time: (t.created_at || '').slice(11, 19), code: t.task_code || '-', agent: t.requested_by || '系统', msg: `${t.title}（${t.task_type}）`, result: t.status })))
     }).catch(() => {})
   }, [])
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 14, padding: '4px 14px 10px' }}>
       {logs.length === 0 && <div style={{ padding: 40, textAlign: 'center', color: C.text3, fontSize: 12 }}>暂无调度日志</div>}
-      {logs.slice(0, 30).map((l: any, i: number) => (
-        <div key={i} style={{ display: 'grid', gridTemplateColumns: '72px 110px 1fr 90px', gap: 10, padding: '9px 2px', borderBottom: `1px solid ${C.border}`, fontSize: 11, alignItems: 'center' }}>
-          <span style={{ fontFamily: 'monospace', fontSize: 10, color: C.text3 }}>{l.time}</span>
-          <span style={{ fontWeight: 750, color: C.cyan }}>{l.agent}</span>
-          <span style={{ color: C.text2 }}>{l.msg}</span>
-          <span style={{ textAlign: 'right' }}><span style={{ fontSize: 10, fontWeight: 800, padding: '2px 6px', borderRadius: 8, background: l.result === 'approved' ? C.successSoft : l.result === 'pending' ? C.warnSoft : C.cyanSoft, color: l.result === 'approved' ? C.success : l.result === 'pending' ? C.warn : C.cyan }}>{l.result}</span></span>
-        </div>
-      ))}
+      {/* 表头行（多维表格式：列定义清晰、可扫读） */}
+      <div style={{ display: 'grid', gridTemplateColumns: '58px 118px 96px 1fr 78px', gap: 10, padding: '8px 2px 6px', borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 800, color: C.text3, letterSpacing: .4 }}>
+        <span>时间</span><span>单号</span><span>发起方</span><span>事项</span><span style={{ textAlign: 'right' }}>状态</span>
+      </div>
+      {logs.slice(0, 30).map((l: any, i: number) => {
+        const stColor = l.result === 'approved' ? C.success : l.result === 'rejected' ? C.danger : l.result === 'pending' ? C.warn : C.cyan
+        const stSoft = l.result === 'approved' ? C.successSoft : l.result === 'rejected' ? C.dangerSoft : l.result === 'pending' ? C.warnSoft : C.cyanSoft
+        return (
+          <div key={i} style={{ display: 'grid', gridTemplateColumns: '58px 118px 96px 1fr 78px', gap: 10, padding: '8px 2px', borderBottom: `1px solid ${C.border}`, fontSize: 11, alignItems: 'center' }}>
+            <span style={{ fontFamily: 'monospace', fontSize: 10, color: C.text3 }}>{l.time}</span>
+            <span style={{ fontFamily: 'monospace', fontSize: 10, color: C.brand2, fontWeight: 700 }}>{l.code}</span>
+            <span style={{ fontWeight: 750, color: C.cyan, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{l.agent}</span>
+            <span style={{ color: C.text2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{l.msg}</span>
+            <span style={{ textAlign: 'right' }}><span style={{ fontSize: 10, fontWeight: 800, padding: '2px 6px', borderRadius: 8, background: stSoft, color: stColor }}>{l.result}</span></span>
+          </div>
+        )
+      })}
     </div>
   )
 }

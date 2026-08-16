@@ -14,7 +14,7 @@ import {
   TeamOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
-import axios from 'axios'
+import axios from '../../services/api'
 import { COLORS } from './RCCCommandCenter'
 
 const API_BASE = '/api/v1/rcc'
@@ -215,7 +215,7 @@ export default function RCCOrgBubbles({ factoryId = 'FAC_ELEC_DEMO_2026' }: RCCO
     setError(null)
     try {
       const response = await axios.get(`${API_BASE}/org-bubbles`, { params: { factory_id: factoryId } })
-      const data = response.data
+      const data = response as any
       const rawNodes: BubbleNode[] = (data.nodes || []).map((node: Omit<BubbleNode, 'children'>) => ({
         ...node,
         children: [],

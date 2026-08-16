@@ -4,7 +4,7 @@
 import { useEffect, useState } from 'react'
 import { Spin, Progress, Tag } from 'antd'
 import { DashboardOutlined } from '@ant-design/icons'
-import axios from 'axios'
+import axios from '../../services/api'
 
 const API = '/api/v1'
 
@@ -18,7 +18,7 @@ export default function ResourceIndexCard({ factoryId = 'FAC_MECH_001' }: { fact
 
   useEffect(() => {
     axios.get(`${API}/rcc/resource-index`, { params: { date: new Date().toISOString().slice(0, 10) } })
-      .then(r => setData(r.data))
+      .then(r => setData(r as any))
       .finally(() => setLoading(false))
   }, [factoryId])
 

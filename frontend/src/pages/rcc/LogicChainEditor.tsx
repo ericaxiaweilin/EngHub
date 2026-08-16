@@ -17,7 +17,7 @@ import {
 } from '@ant-design/icons'
 import { Graph } from '@antv/x6'
 import { register } from '@antv/x6-react-shape'
-import axios from 'axios'
+import axios from '../../services/api'
 import { COLORS } from './RCCCommandCenter'
 
 const { Text } = Typography

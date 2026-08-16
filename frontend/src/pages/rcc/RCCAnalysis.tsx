@@ -10,7 +10,7 @@ import {
   ExperimentOutlined, ControlOutlined, HistoryOutlined, ApiOutlined,
   PlusOutlined, EditOutlined, DeleteOutlined,
 } from '@ant-design/icons'
-import axios from 'axios'
+import axios from '../../services/api'
 import { useRcc, COLORS } from './RCCCommandCenter'
 
 const LogicChainEditor = lazy(() => import('./LogicChainEditor'))
@@ -125,7 +125,7 @@ export default function RCCAnalysis() {
   const loadChains = async () => {
     try {
       const res = await axios.get(`${API_BASE}/logic-chains`)
-      setLogicChains(res.data?.items || [])
+      setLogicChains((res as any)?.items || [])
     } catch (e) { /* ignore */ }
   }
 
@@ -146,8 +146,8 @@ export default function RCCAnalysis() {
           axios.get(`${API_BASE}/params`),
           axios.get(`${API_BASE}/logic-chains`),
         ])
-        if (paramRes.status === 'fulfilled') setParams(paramRes.value.data?.items || [])
-        if (chainRes.status === 'fulfilled') setLogicChains(chainRes.value.data?.items || [])
+        if (paramRes.status === 'fulfilled') setParams((paramRes.value as any)?.items || [])
+        if (chainRes.status === 'fulfilled') setLogicChains((chainRes.value as any)?.items || [])
       } catch (e) { /* ignore */ }
       finally { setLoadingParams(false) }
     }

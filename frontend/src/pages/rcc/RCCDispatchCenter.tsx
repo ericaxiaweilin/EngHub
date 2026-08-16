@@ -5,7 +5,7 @@
 import { useEffect, useState } from 'react'
 import { Card, Table, Tag, Button, Space, message, Timeline, Badge, Input, Popconfirm, Statistic } from 'antd'
 import { CheckOutlined, CloseOutlined, RobotOutlined, CarryOutOutlined, ReloadOutlined } from '@ant-design/icons'
-import axios from 'axios'
+import axios from '../../services/api'
 import { COLORS } from './RCCCommandCenter'
 
 const API = '/api/v1/rcc'
@@ -46,8 +46,8 @@ export default function RCCDispatchCenter() {
         axios.get(`${API}/tasks`),
         axios.get(`${API}/chatbot/tickets`),
       ])
-      if (t.status === 'fulfilled') setTasks(t.value.data?.items || t.value.data || [])
-      if (tk.status === 'fulfilled') setTickets(tk.value.data?.items || tk.value.data || [])
+      if (t.status === 'fulfilled') setTasks((t.value as any)?.items || (t.value as any) || [])
+      if (tk.status === 'fulfilled') setTickets((tk.value as any)?.items || (tk.value as any) || [])
     } finally { setLoading(false) }
   }
 

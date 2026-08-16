@@ -5,7 +5,7 @@
 import { useEffect, useState } from 'react'
 import { Spin, Progress, Tag, Button, message } from 'antd'
 import { CarryOutOutlined } from '@ant-design/icons'
-import axios from 'axios'
+import axios from '../../services/api'
 
 const API = '/api/v1'
 
@@ -16,7 +16,7 @@ export default function TaskHealthCard({ factoryId = 'FAC_MECH_001' }: { factory
   const load = () => {
     setLoading(true)
     axios.get(`${API}/rcc/task-health`)
-      .then(r => setData(r.data))
+      .then(r => setData(r as any))
       .finally(() => setLoading(false))
   }
   useEffect(load, [factoryId])
