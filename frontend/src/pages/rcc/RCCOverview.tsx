@@ -13,6 +13,7 @@ import {
 import { useRcc, COLORS } from './RCCCommandCenter'
 import TraceabilityDrawer from '../../components/TraceabilityDrawer'
 import OrgBubbleDrillDown from '../../components/OrgBubbleDrillDown'
+import RCCOrgBubbles from './RCCOrgBubbles'
 
 // ==================== KPI 卡片组件 ====================
 function KpiCard({ icon, label, value, suffix, sub, trend, color, onClick }: {
@@ -186,6 +187,19 @@ export default function RCCOverview() {
 
   return (
     <div>
+
+      {/* 组织气泡图（融入总览：组织→智能体→协同链拓扑） */}
+      <div style={{ background: COLORS.bgCard, border: `1px solid ${COLORS.border}`, borderRadius: 12, padding: "18px 20px", marginBottom: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: COLORS.text }}>组织气泡 · 协同网络</span>
+            <span style={{ fontSize: 11, color: COLORS.textDim }}>组织层级 → 智能体 → 协同链 · 点击下钻</span>
+          </div>
+          <span style={{ fontSize: 10.5, color: COLORS.textDim }}>LIVE 实时</span>
+        </div>
+        <RCCOrgBubbles factoryId={factoryId} />
+      </div>
+
       {/* 告警横幅 */}
       <AlertBanner alerts={metrics.alerts} />
 

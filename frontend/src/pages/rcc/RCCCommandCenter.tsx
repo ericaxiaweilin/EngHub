@@ -8,13 +8,12 @@ import { Tag, Button, Space, Progress, Tooltip, Input, Badge, Select, message, I
 import {
   ThunderboltOutlined, FundOutlined, CarryOutOutlined, FileTextOutlined,
   ReloadOutlined, SearchOutlined, CheckOutlined, CloseOutlined,
-  RobotOutlined, ClusterOutlined, ApartmentOutlined, TeamOutlined,
+  RobotOutlined, ApartmentOutlined, TeamOutlined,
   ControlOutlined, FireOutlined, DashboardOutlined, AppstoreOutlined, ClockCircleOutlined,
 } from '@ant-design/icons'
 import axios from 'axios'
 import { RccContext } from './rcc_theme'
 import { useSearchParams } from 'react-router-dom'
-import RCCOrgBubbles from './RCCOrgBubbles'
 import RCCOverview from './RCCOverview'
 import RCCResourceBoard from './RCCResourceBoard'
 import RCCDecisionHub from './RCCDecisionHub'
@@ -116,7 +115,6 @@ export default function RCCCommandCenter() {
 
   // 视图导航（找回全部页面）
   const views = [
-    { key: 'bubbles', label: '组织气泡图', icon: <ClusterOutlined /> },
     { key: 'overview', label: '指挥总览', icon: <DashboardOutlined /> },
     { key: 'ai', label: 'AI 调度', icon: <ThunderboltOutlined />, badge: pending.length },
     { key: 'approvals', label: '审批中心', icon: <CheckOutlined />, badge: pending.length },
@@ -223,7 +221,6 @@ export default function RCCCommandCenter() {
               </button>
             ))}
           </div>
-          {activeTab === 'bubbles' && <RCCOrgBubbles factoryId={factoryId} />}
           {activeTab === 'overview' && <RCCOverview />}
           {activeTab === 'resources' && <RCCResourceBoard />}
           {activeTab === 'decisions' && <RCCDecisionHub />}
