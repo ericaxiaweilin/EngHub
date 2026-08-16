@@ -34,6 +34,7 @@ import api from '../../services/api'
 import { getWorkOrders, type WorkOrder } from '../../services/mes'
 import { getActiveFactoryId } from '../../utils/factory'
 import RushOrderApprovals from './RushOrderApprovals'
+import PmcHammerMatrix from './PmcHammerMatrix'
 
 const { Text, Title, Paragraph } = Typography
 
@@ -348,6 +349,8 @@ export default function PmcWorkbench() {
           </div>
 
           {!!(matrix.risk_flags || []).length && <Alert type="warning" showIcon icon={<WarningOutlined />} message="当前风险与假设" description={<Space direction="vertical" size={2}>{matrix.risk_flags.map((item: string, index: number) => <Text key={index}>• {item}</Text>)}</Space>} style={{ marginBottom: 16 }} />}
+
+          <PmcHammerMatrix factoryId={factoryId} />
 
           <Card
             size="small"

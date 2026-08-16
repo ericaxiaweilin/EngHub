@@ -449,3 +449,140 @@ async def pmc_backward_to_plan(payload: Dict[str, Any], db: AsyncSession = Depen
     await db.commit()
     return {"success": True, "plan_id": plan_id, "plan_code": plan_code, "status": "draft",
             "message": "生产计划草案已生成，可在计划列表确认/下达"}
+
+
+@router.post("/work-matrix/hammer", summary="PMC 锤子图：工单 × 开关影响矩阵（y轴工单, x轴参数开关）")
+async def pmc_hammer_matrix(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """
+    返回每个工单在基准 + 各开关切换下的交期偏移矩阵。
+    y 轴 = 工单（默认待排/在制 TOP 12）
+    x 轴 = 参数开关（时间锤/物料锤/生产锤/出货锤/紧急锤）
+    单元格 = 该开关对工单交期的影响（偏移天数 + 风险等级）
+    """
+    from datetime import datetime, timedelta
+
+    fid = payload.get("factory_id") or "FAC_MECH_001"
+    wocodes = payload.get("work_order_codes") or []
+    limit = int(payload.get("limit") or 12)
+
+    # 1) 取工单（默认待排/在制，按交期排序）
+    if not wocodes:
+        wo_rows = (await db.execute(text("""
+            SELECT work_order_code, product_id, planned_qty, planned_due, status, priority
+            FROM work_orders
+            WHERE factory_id=:f AND status IN ('pending','in_progress','released')
+            ORDER BY planned_due LIMIT :lim
+        """), {"f": fid, "lim": limit})).mappings().all()
+    else:
+        wo_rows = (await db.execute(text("""
+            SELECT work_order_code, product_id, planned_qty, planned_due, status, priority
+            FROM work_orders
+            WHERE factory_id=:f AND work_order_code = ANY(:codes)
+        """), {"f": fid, "codes": wocodes})).mappings().all()
+
+    # 2) 开关定义（与 scenario 一致，用"切换后"语义）
+    switches = [
+        {"key": "shift_mode", "label": "时间锤·双班", "value": "double", "desc": "单班→双班(10h→20h)"},
+        {"key": "iqc_mode", "label": "物料锤·抽检", "value": "sampling", "desc": "免检→抽检(+4h)"},
+        {"key": "iqc_mode", "label": "物料锤·全检", "value": "full", "desc": "免检→全检(+8h)"},
+        {"key": "line_occupancy", "label": "生产锤·共享线", "value": "shared_50", "desc": "独占→共享(50%)"},
+        {"key": "customs_mode", "label": "出货锤·海关抽查", "value": "random", "desc": "免查验→抽查(+24h)"},
+        {"key": "yield_rate", "label": "生产锤·良率降", "value": 0.92, "desc": "良率97%→92%"},
+        {"key": "enable_air_freight", "label": "紧急锤·空运", "value": True, "desc": "海运→空运"},
+    ]
+
+    # 3) 逐工单算基准 + 各开关影响（ETA 缺失时用兜底产能估算，保证锤子图可看）
+    from api.services.pmc_work_matrix_service import PmcWorkMatrixService
+    svc = PmcWorkMatrixService(db)
+    rows = []
+    for wo in wo_rows:
+        base_opts = {"shift_mode": "single", "iqc_mode": "exempt",
+                     "line_occupancy": "exclusive", "customs_mode": "none",
+                     "yield_rate": 0.97, "enable_air_freight": False}
+        try:
+            base = await svc.build(fid, wo["work_order_code"], base_opts)
+        except Exception:
+            base = {}
+        base_eta = str(base.get("estimated_eta") or "")[:10]
+        base_days = _date_delta(base.get("estimated_eta"), wo["planned_due"])
+        # 兜底：build 无 ETA（缺 routing/产能）时，用 默认UPH 12 × 工时 估算
+        if base_days is None:
+            base_days = _fallback_eta_days(wo, base_opts)
+            base_eta = _fallback_eta(wo, base_opts)
+
+        cells = []
+        for sw in switches:
+            opts = {**base_opts, sw["key"]: sw["value"]}
+            try:
+                res = await svc.build(fid, wo["work_order_code"], opts)
+            except Exception:
+                res = {}
+            eta = str(res.get("estimated_eta") or "")[:10]
+            days = _date_delta(res.get("estimated_eta"), wo["planned_due"])
+            if days is None:
+                days = _fallback_eta_days(wo, opts)
+                eta = _fallback_eta(wo, opts)
+            offset = (days - base_days) if (days is not None and base_days is not None) else None
+            level = "danger" if (offset or 0) > 2 else ("warning" if (offset or 0) > 0 else "ok")
+            cells.append({"switch": sw["key"], "label": sw["label"], "offset_days": offset,
+                          "level": level, "eta": eta, "desc": sw["desc"]})
+
+        rows.append({
+            "work_order_code": wo["work_order_code"],
+            "product_id": wo["product_id"],
+            "qty": wo["planned_qty"],
+            "due": str(wo["planned_due"])[:10],
+            "status": wo["status"],
+            "priority": wo["priority"],
+            "base_eta": base_eta,
+            "base_offset_days": base_days,
+            "cells": cells,
+        })
+
+    return {"success": True, "factory_id": fid, "switches": switches,
+            "rows": rows, "count": len(rows)}
+
+
+def _date_delta(eta, due) -> Optional[float]:
+    """ETA 相对交期的偏移天数（正=延后，负=提前）。None 无法计算。"""
+    if not eta:
+        return None
+    try:
+        from datetime import datetime
+        eta_dt = datetime.strptime(str(eta)[:10], "%Y-%m-%d")
+        due_dt = datetime.strptime(str(due)[:10], "%Y-%m-%d")
+        return round((eta_dt - due_dt).total_seconds() / 86400, 1)
+    except Exception:
+        return None
+
+
+
+def _fallback_production_days(wo, opts) -> float:
+    """兜底生产天数：量 ÷ (UPH 12 × 每日工时 × 班次系数 × 良率)。"""
+    qty = float(wo["planned_qty"] or 0)
+    uph = 12.0
+    hours_day = 20.0 if (opts or {}).get("shift_mode") == "double" else 10.0
+    yield_rate = float((opts or {}).get("yield_rate") or 0.97)
+    line_share = 0.5 if (opts or {}).get("line_occupancy") == "shared_50" else 1.0
+    iqc_h = 4.0 if (opts or {}).get("iqc_mode") == "sampling" else 8.0 if (opts or {}).get("iqc_mode") == "full" else 0.0
+    customs_h = 24.0 if (opts or {}).get("customs_mode") == "random" else 0.0
+    if qty <= 0 or uph <= 0:
+        return 0.0
+    prod_h = qty / yield_rate / (uph * line_share)
+    total_h = prod_h + iqc_h + customs_h
+    return total_h / (hours_day * line_share) if hours_day > 0 else 1.0
+
+
+def _fallback_eta_days(wo, opts) -> Optional[float]:
+    """兜底 ETA 相对交期偏移（正=延后）：从今天起算生产天数 → ETA 与交期比。"""
+    from datetime import datetime, date
+    due = datetime.strptime(str(wo["planned_due"])[:10], "%Y-%m-%d")
+    days = _fallback_production_days(wo, opts)
+    eta = datetime.combine(date.today(), datetime.min.time()) + timedelta(days=days)
+    return round((eta - due).total_seconds() / 86400, 1)
+
+
+def _fallback_eta(wo, opts) -> str:
+    from datetime import datetime, date
+    days = _fallback_production_days(wo, opts)
+    return str((datetime.combine(date.today(), datetime.min.time()) + timedelta(days=days)).date())
