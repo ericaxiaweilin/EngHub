@@ -135,18 +135,51 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "query_pmc_material_supply",
-            "description": "PMC供应证据查询：把库存、库存最后流动/账龄、BOM可复用产品、未收货PO、在途数量、PO编号、供应商和ETA关联起来。用于回答‘库存多少、在途多少、PO编号多少、哪些180天呆滞料还能被BOM使用、物料LT/ETA’等问题；只返回真实数据，缺少采购表时明确标记。",
+            "name": "pmc_backward_schedule",
+            "description": "PMC 交期倒推（五节点）：客户交期到ETD/Cut-off到生产完成到物料可上线到供应商ETA，含物料红线/每日排产/风险分级(green/yellow/red)。用于订单何时必须开始生产、物料最晚何时到、交货是否来得及类请求。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "material_keyword": {"type": "string", "description": "物料编码或名称关键词，可选"},
-                    "days": {"type": "integer", "description": "呆滞阈值，默认180天", "default": 180},
-                    "only_stagnant": {"type": "boolean", "description": "只返回超过阈值的呆滞料，可选", "default": False},
-                    "limit": {"type": "integer", "description": "返回条数，默认50", "default": 50},
+                    "product_id": {"type": "string", "description": "产品编码（如 FG-TREAD-001）"},
+                    "qty": {"type": "number", "description": "订单数量"},
+                    "delivery": {"type": "string", "description": "客户要求交期 YYYY-MM-DD"},
+                    "sea_days": {"type": "number", "description": "海运天数（默认12）"}
                 },
-            },
-        },
+                "required": ["product_id", "qty", "delivery"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pmc_backward_to_plan",
+            "description": "交期倒推结果生成生产计划草案（PMB-），确认/下达走正常流程。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {"type": "string", "description": "产品编码"},
+                    "qty": {"type": "number", "description": "数量"},
+                    "delivery": {"type": "string", "description": "交期 YYYY-MM-DD"}
+                },
+                "required": ["product_id", "qty", "delivery"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_pmc_material_supply",
+            "description": "PMC供应证据查询：把库存、库存最后流动/账龄、BOM可复用产品、未收货PO、在途数量、PO编号、供应商和ETA关联起来。用于回答库存多少、在途多少、PO编号多少、哪些180天呆滞料还能被BOM使用、物料LT/ETA等问题；只返回真实数据，缺少采购表时明确标记。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "查询天数窗口（默认180）"},
+                    "only_stagnant": {"type": "boolean", "description": "只看呆滞料"},
+                    "material_code": {"type": "string", "description": "物料编码（可选）"}
+                },
+                "required": []
+            }
+        }
     },
     {
         "type": "function",
@@ -2727,6 +2760,24 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _tool_pmc_backward_schedule(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """交期倒推：HTTP 调自身端点。"""
+    import httpx
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post("http://127.0.0.1:18888/api/v1/pmc/backward-schedule",
+                              json={**args, "factory_id": factory_id or "FAC_MECH_001"})
+        return r.json() if r.status_code == 200 else {"error": f"倒推失败 {r.status_code}: {r.text[:100]}"}
+
+
+async def _tool_pmc_backward_to_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """倒推→计划：HTTP 调自身端点。"""
+    import httpx
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post("http://127.0.0.1:18888/api/v1/pmc/backward-to-plan",
+                              json={**args, "factory_id": factory_id or "FAC_MECH_001"})
+        return r.json() if r.status_code == 200 else {"error": f"生成计划失败 {r.status_code}: {r.text[:100]}"}
+
+
 async def _tool_query_pmc_material_supply(
     db: AsyncSession,
     args: Dict[str, Any],
@@ -3313,6 +3364,8 @@ _TOOL_EXECUTORS = {
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
+    "pmc_backward_schedule": _tool_pmc_backward_schedule,
+    "pmc_backward_to_plan": _tool_pmc_backward_to_plan,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
     "query_defects": _tool_query_defects,
     "query_equipment": _tool_query_equipment,

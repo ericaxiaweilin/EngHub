@@ -1,9 +1,12 @@
 """PMC 工作矩阵接口。"""
 
+import uuid
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth.security import get_current_user
@@ -302,3 +305,147 @@ async def get_pmc_capabilities(
 
 
 __all__ = ["router"]
+
+
+@router.post("/backward-schedule", summary="PMC 交期倒推（五节点+物料红线+每日排产+风险分级）")
+async def pmc_backward_schedule(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """
+    交期倒推五节点：
+    ① Customer Required Date → ② ETD/Cut-off → ③ FG Ready 生产完成 → ④ Material Ready → ⑤ Supplier ETA
+    返回：五节点时间轴 + 物料红线 + 每日排产 + 风险 green/yellow/red
+    """
+    import math
+    from datetime import datetime, timedelta
+
+    fid = payload.get("factory_id") or "FAC_MECH_001"
+    product_id = (payload.get("product_id") or "").strip()
+    qty = float(payload.get("qty") or 0)
+    delivery = (payload.get("delivery") or "").strip()
+    if not product_id or qty <= 0 or not delivery:
+        return {"error": "缺少 product_id/qty/delivery"}
+    try:
+        due = datetime.strptime(delivery, "%Y-%m-%d").date()
+    except Exception:
+        return {"error": f"delivery 格式应为 YYYY-MM-DD: {delivery}"}
+
+    # 参数（可覆盖）
+    sea_days = int(payload.get("sea_days") or 12)          # 海运
+    cut_off_hours = int(payload.get("cut_off_hours") or 12)  # Cut-off 提前量(小时)
+    pack_hours = float(payload.get("pack_hours") or 2)      # Packing+FG入库
+    iqc_hours = float(payload.get("iqc_hours") or 2)        # IQC+入库+发料
+    work_hours_day = float(payload.get("work_hours_day") or 10)  # 每日有效工时
+    upH = float(payload.get("uph") or 0)                    # UPH
+
+    # ① 客户交期 → ② ETD（海运倒推）—— 统一用 datetime 计算（date 不能减 hours）
+    due_dt = datetime.combine(due, datetime.min.time())
+    etd = due_dt - timedelta(days=sea_days)
+    # ② ETD → ③ 生产完成（Cut-off 提前 + 报关装柜 1 天）
+    fg_ready = etd - timedelta(days=1) - timedelta(hours=cut_off_hours / 24)
+    fg_ready = fg_ready.replace(hour=18, minute=0, second=0)
+
+    # 产能：UPH 从工艺/历史推断
+    if upH <= 0:
+        # UPH 优先从工艺（routing_template_steps.standard_hours 反推），兜底 12/h
+        up_row = (await db.execute(text("""
+            SELECT rt.standard_hours FROM routing_template_steps rt
+            JOIN routing_templates r ON r.id = rt.template_id
+            WHERE r.factory_id = :f AND rt.standard_hours > 0 LIMIT 1
+        """), {"f": fid})).mappings().first()
+        if up_row and float(up_row["standard_hours"] or 0) > 0:
+            upH = 1.0 / float(up_row["standard_hours"])  # 单件工时 → UPH
+        if upH <= 0:
+            upH = 12.0  # 兜底 12 台/时（跑步机装配线常规）
+    prod_hours = qty / upH if upH > 0 else 0
+    prod_days_needed = math.ceil(prod_hours / work_hours_day) if prod_hours > 0 else 0
+
+    # ③ 生产完成 → ④ 物料可上线（生产开始时间）
+    # 生产从 fg_ready 往前推 prod_days_needed 天
+    prod_start = fg_ready - timedelta(days=prod_days_needed)
+    mat_ready = prod_start  # 物料最晚可上线 = 生产开始
+
+    # ⑤ 供应商 ETA（物料可上线 - IQC 处理）
+    supplier_eta_limit = mat_ready - timedelta(hours=iqc_hours)
+
+    # 物料红线：查该产品 BOM 物料库存/在途
+    mat_rows = (await db.execute(text("""
+        SELECT b.material_code, b.material_name, b.qty_per_unit,
+               COALESCE(i.available_qty, 0) AS available
+        FROM bom_items b
+        LEFT JOIN inventory i ON i.material_code = b.material_code AND i.factory_id = :f
+        WHERE b.product_id = :p
+        LIMIT 8
+    """), {"f": fid, "p": product_id})).mappings().all()
+    materials = []
+    for m in mat_rows:
+        need = float(m["qty_per_unit"] or 0) * qty
+        avail = m["available"]
+        status = "ok" if avail >= need else ("red" if avail <= 0 else "yellow")
+        materials.append({
+            "material_code": m["material_code"], "material_name": m["material_name"],
+            "need_qty": need, "available": avail, "shortage": max(0, need - avail),
+            "status": status,
+            "latest_eta": str(supplier_eta_limit) if status != "ok" else None,
+        })
+
+    # 每日排产
+    daily = []
+    if prod_days_needed > 0:
+        for i in range(prod_days_needed):
+            day_start = prod_start + timedelta(days=i)
+            day_plan = min(work_hours_day, max(0, prod_hours - i * work_hours_day))
+            daily.append({"date": str(day_start.date()), "hours": round(day_plan, 1),
+                          "qty": round(day_plan * upH) if upH > 0 else 0})
+
+    # 风险判定
+    risks = []
+    has_red = False
+    for m in materials:
+        if m["status"] == "red":
+            risks.append({"level": "red", "msg": f"{m['material_code']} 缺料{int(m['shortage'])} 且无 ETA（最危险）"})
+            has_red = True
+        elif m["status"] == "yellow":
+            risks.append({"level": "yellow", "msg": f"{m['material_code']} 库存不足，需在 {m['latest_eta']} 前到厂（减 IQC 2h）"})
+    if prod_days_needed > 2 and not has_red:
+        risks.append({"level": "yellow", "msg": f"生产需 {prod_days_needed} 天，建议加班/提前开工"})
+    if prod_days_needed > 4:
+        risks.append({"level": "red", "msg": f"产能排不下（{prod_days_needed} 天 > 4 天窗口），需换线/加线或与客户协商"})
+        has_red = True
+
+    return {
+        "product_id": product_id, "qty": qty, "delivery": str(due),
+        "nodes": {
+            "customer_required": str(due),
+            "etd": str(etd.date()),
+            "cut_off": str((etd - timedelta(days=1)).date()),
+            "fg_ready": str(fg_ready.date()),
+            "prod_start": str(prod_start.date()),
+            "mat_ready": str(mat_ready.date()),
+            "supplier_eta_limit": str(supplier_eta_limit.date()),
+        },
+        "capacity": {"uph": upH, "prod_hours": round(prod_hours, 1), "days_needed": prod_days_needed},
+        "materials": materials,
+        "daily_plan": daily,
+        "risks": risks,
+        "grade": "red" if has_red else ("yellow" if any(r["level"] == "yellow" for r in risks) else "green"),
+    }
+
+
+@router.post("/backward-to-plan", summary="交期倒推 → 生成生产计划草案")
+async def pmc_backward_to_plan(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
+    """倒推结果 → 建 PMB- 计划草案（确认/下达走正常流程）。"""
+    fid = payload.get("factory_id") or "FAC_MECH_001"
+    product_id = (payload.get("product_id") or "").strip()
+    qty = float(payload.get("qty") or 0)
+    due = (payload.get("delivery") or "").strip()
+    if not product_id or qty <= 0 or not due:
+        return {"error": "缺少 product_id/qty/delivery"}
+    plan_code = f"PMB-{datetime.now().strftime('%Y%m%d%H%M')}"
+    plan_id = str(uuid.uuid4())
+    await db.execute(text("""
+        INSERT INTO plans (id, plan_code, factory_id, product_id, planned_qty, planned_start, planned_end, status, priority, created_by, created_at, updated_at)
+        VALUES (:id, :code, :f, :p, :q, CURRENT_DATE, :due, 'draft', 'high', :cb, NOW(), NOW())
+    """), {"id": plan_id, "code": plan_code, "f": fid, "p": product_id, "q": qty,
+           "due": datetime.strptime(due, "%Y-%m-%d").date(), "cb": "pmc_agent"})
+    await db.commit()
+    return {"success": True, "plan_id": plan_id, "plan_code": plan_code, "status": "draft",
+            "message": "生产计划草案已生成，可在计划列表确认/下达"}
