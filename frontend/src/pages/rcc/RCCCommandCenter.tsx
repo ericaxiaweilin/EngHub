@@ -225,6 +225,7 @@ export default function RCCCommandCenter() {
           {activeTab === 'overview' && (
             <>
               <ResourceIndexCard />
+              <TaskHealthCard />
               <RCCOverview />
             </>
           )}

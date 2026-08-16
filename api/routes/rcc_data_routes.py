@@ -341,3 +341,119 @@ async def resource_index(
             key=lambda x: x[1])[0],
         "message": "任一维为 0 → 整体产能为 0（缺料停产/设备坏停线/人不够降速/无班次停工）",
     }
+
+
+@router.get("/task-health", summary="RCC 任务健康指数：任务域抓手（闭环率×及时率×AI接管率）")
+async def task_health(
+    db: AsyncSession = Depends(get_db),
+):
+    """非生产部门（PMC/采购/质量）核心抓手：不是效率（一人干多少件），而是每个任务处理好。
+    - 闭环率：完成任务 / 总任务（任务有没有善终）
+    - 及时率：按时完成 / 已完成（是否拖延）
+    - 接管率：AI/智能体处理任务占比（chatbot 能接管多少任务）
+    乘法模型：任一维低 → 任务域不健康（积压/烂尾/人工依赖）
+    """
+    from sqlalchemy import text as sql_text
+    fid = "FAC_MECH_001"
+
+    # ① 总量/闭环
+    t = (await db.execute(sql_text("""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE status='done') AS done,
+               COUNT(*) FILTER (WHERE status='blocked') AS blocked,
+               COUNT(*) FILTER (WHERE assigned_to IS NULL OR assigned_to='') AS unassigned
+        FROM followup_tasks WHERE factory_id=:f
+    """), {"f": fid})).mappings().first()
+    total = t["total"] or 0
+    closed_pct = round(t["done"] / total * 100, 1) if total else 0
+
+    # ② 及时率：done 且 无超时（next_follow_at 未过期 或 完成早于计划）
+    timely = (await db.execute(sql_text("""
+        SELECT COUNT(*) AS timely FROM followup_tasks
+        WHERE factory_id=:f AND status='done'
+          AND (next_follow_at IS NULL OR next_follow_at >= NOW())
+    """), {"f": fid})).scalar_one_or_none() or 0
+    timely_pct = round(timely / (t["done"] or 1) * 100, 1)
+
+    # ③ 接管率：AI/智能体创建的任务
+    ai = (await db.execute(sql_text("""
+        SELECT COUNT(*) FROM followup_tasks
+        WHERE factory_id=:f AND (created_by ILIKE '%agent%' OR created_by ILIKE '%ai%')
+    """), {"f": fid})).scalar_one_or_none() or 0
+    takeover_pct = round(ai / total * 100, 1) if total else 0
+
+    # 指数 = 闭环率 × 及时率 × 接管率（非生产部门健康度）
+    idx = round((closed_pct/100) * (timely_pct/100) * (takeover_pct/100) * 100, 1)
+    level = "green" if idx >= 60 else ("warning" if idx >= 30 else "danger")
+
+    # 卡点分布
+    blockers = (await db.execute(sql_text("""
+        SELECT COALESCE(NULLIF(blocked_by,''),'未标注') AS who, COUNT(*) AS n
+        FROM followup_tasks WHERE factory_id=:f AND status='blocked'
+        GROUP BY who ORDER BY n DESC LIMIT 6
+    """), {"f": fid})).mappings().all()
+
+    # 每人负载（含未分配）
+    loads = (await db.execute(sql_text("""
+        SELECT COALESCE(NULLIF(assigned_to,''),'未分配') AS who, COUNT(*) AS n,
+               COUNT(*) FILTER (WHERE status='blocked') AS blocked,
+               COUNT(*) FILTER (WHERE status='done') AS done
+        FROM followup_tasks WHERE factory_id=:f
+        GROUP BY assigned_to ORDER BY n DESC LIMIT 8
+    """), {"f": fid})).mappings().all()
+
+    return {
+        "factory_id": fid, "index": idx, "level": level,
+        "formula": f"闭环率{closed_pct}% × 及时率{timely_pct}% × 接管率{takeover_pct}% = {idx}%",
+        "metrics": {
+            "total": total, "done": t["done"], "blocked": t["blocked"],
+            "unassigned": t["unassigned"],
+            "closed_rate": closed_pct, "timely_rate": timely_pct, "takeover_rate": takeover_pct,
+        },
+        "message": "非生产部门核心不是效率（一人干多少件），而是每个任务处理好（闭环/及时/可接管）",
+        "blockers": [{"who": b["who"], "count": b["n"]} for b in blockers],
+        "loads": [{"who": l["who"], "total": l["n"], "blocked": l["blocked"], "done": l["done"]} for l in loads],
+    }
+
+
+@router.post("/claim-tasks", summary="未分配任务认领：任务落到具体人（每个人都任务计划表的前提）")
+async def claim_tasks(
+    payload: Dict[str, Any],
+    db: AsyncSession = Depends(get_db),
+):
+    """把未分配任务按岗位规则认领到人：
+    - 采购部/供应商卡点 → procurement
+    - 计划部/PMC 卡点 → pmc
+    - 设备/维修卡点 → equipment
+    - 其余 → 对应负责人
+    """
+    from sqlalchemy import text as sql_text
+    fid = "FAC_MECH_001"
+    rules = [
+        ("采购", "procurement"), ("供应商", "procurement"), ("物料", "procurement"),
+        ("计划", "pmc"), ("PMC", "pmc"),
+        ("设备", "equipment"), ("维修", "equipment"),
+        ("仓储", "warehouse"), ("质检", "quality"),
+    ]
+    claimed = 0
+    # 取未分配 + 有卡点的任务
+    rows = (await db.execute(sql_text("""
+        SELECT id, title, COALESCE(NULLIF(blocked_by,''),'') AS bb FROM followup_tasks
+        WHERE factory_id=:f AND (assigned_to IS NULL OR assigned_to='') AND status='blocked'
+        LIMIT 100
+    """), {"f": fid})).mappings().all()
+    for r in rows:
+        owner = None
+        text_blob = (r["bb"] + " " + r["title"])
+        for kw, who in rules:
+            if kw in text_blob:
+                owner = who
+                break
+        if not owner:
+            owner = "pmc"  # 默认 PMC 兜底
+        await db.execute(sql_text(
+            "UPDATE followup_tasks SET assigned_to=:w WHERE id=:id"
+        ), {"w": owner, "id": r["id"]})
+        claimed += 1
+    await db.commit()
+    return {"claimed": claimed, "message": f"已按卡点规则认领 {claimed} 个未分配任务到具体岗位"}
