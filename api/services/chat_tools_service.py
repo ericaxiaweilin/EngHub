@@ -321,6 +321,37 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             {
                 "type": "function",
                 "function": {
+                    "name": "fifo_check",
+                    "description": "库存 FIFO 检查（先进先出管控）：按物料查库龄分布（<30/30-90/90-180/>180天）、呆滞占比、FIFO 执行风险（老库存占比高=发料没按先进先出）。用于'FIFO检查''库龄分布''先进先出执行得怎么样''哪些料库存老化'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "material_code": {"type": "string", "description": "物料编码（可选，不传查全厂TOP老化）"},
+                            "limit": {"type": "integer", "description": "返回条数（默认10）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "eat_check",
+                    "description": "EAT 检查（物料最早可用时间/Earliest Available Time）：对物料或工单，计算库存可覆盖到哪天、在途PO何时到货，得出最早可用时间，判断需求日期前能否齐套。用于'这料什么时候能到齐''需求日之前能用吗''EAT检查''齐套时间'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "material_code": {"type": "string", "description": "物料编码"},
+                            "work_order_code": {"type": "string", "description": "工单号（可选，按工单需求检查）"},
+                            "required_date": {"type": "string", "description": "需求日期 YYYY-MM-DD（可选，默认工单交期）"}
+                        },
+                        "required": ["material_code"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "reschedule_work_order",
                     "description": "工单改期（PMC 高频）：修改工单交期/计划完成日期，自动做变更影响分析（该工单前后关联、同产线负荷、物料齐套），写入变更日志。用于'这单改到X号''交期推迟/提前''改期'类请求。",
                     "parameters": {
@@ -3567,6 +3598,122 @@ async def _tool_query_supplier_rank(db: AsyncSession, args: Dict[str, Any], fact
                          "orders": int(r["order_count"] or 0)} for r in rows]}
 
 
+async def _tool_fifo_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """FIFO 检查：库龄分布 + 呆滞占比 + FIFO 执行风险。"""
+    fid = factory_id or "FAC_MECH_001"
+    mcode = str(args.get("material_code") or "").strip()
+    limit = int(args.get("limit") or 10)
+    cond = "factory_id=:f"
+    params: Dict[str, Any] = {"f": fid, "lim": limit}
+    if mcode:
+        cond += " AND material_code=:m"
+        params["m"] = mcode
+    # 库龄分布（按 last_movement_at 距今天数）
+    rows = (await db.execute(text(f"""
+        SELECT material_code, material_name,
+               COUNT(*) AS batches,
+               COALESCE(SUM(total_qty),0) AS total_qty,
+               COALESCE(SUM(CASE WHEN last_movement_at < NOW() - interval '180 days' THEN total_qty ELSE 0 END),0) AS aged_180,
+               COALESCE(SUM(CASE WHEN last_movement_at < NOW() - interval '90 days' THEN total_qty ELSE 0 END),0) AS aged_90,
+               COALESCE(SUM(CASE WHEN last_movement_at IS NULL THEN total_qty ELSE 0 END),0) AS never_moved
+        FROM inventory WHERE {cond}
+        GROUP BY material_code, material_name
+        ORDER BY aged_180 DESC, total_qty DESC LIMIT :lim
+    """), params)).mappings().all()
+    items = []
+    for r in rows:
+        total = float(r["total_qty"] or 0)
+        aged = float(r["aged_180"] or 0)
+        stale_pct = round(aged / total * 100, 1) if total else 0
+        items.append({
+            "material_code": r["material_code"], "material_name": r["material_name"] or r["material_code"],
+            "batches": r["batches"], "total_qty": total,
+            "aged_180_pct": stale_pct, "aged_90_pct": round(float(r["aged_90"] or 0) / total * 100, 1) if total else 0,
+            "never_moved_qty": float(r["never_moved"] or 0),
+            "fifo_risk": "high" if stale_pct > 50 else ("medium" if stale_pct > 20 else "low"),
+            "suggestion": "库存老化严重，需按 FIFO 优先消耗老批次/转呆滞处理" if stale_pct > 50 else "FIFO 执行良好" if stale_pct < 20 else "建议关注老批次消耗",
+        })
+    return {"type": "fifo_check", "count": len(items), "items": items,
+            "note": "FIFO 风险：>180天库龄占比高 = 发料未按先进先出（老库存积压）"}
+
+
+async def _tool_eat_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """EAT 检查：最早可用时间（库存覆盖 + 在途到货 → 需求日前能否齐套）。"""
+    fid = factory_id or "FAC_MECH_001"
+    mcode = str(args.get("material_code") or "").strip()
+    wo_code = str(args.get("work_order_code") or "").strip()
+    if not mcode:
+        return {"error": "缺少 material_code"}
+    from datetime import datetime as _dt, date as _date
+    # 需求日期：工单交期 or 参数 or 默认今天+7
+    req_date = None
+    need_qty = 0.0
+    if wo_code:
+        wo = (await db.execute(text(
+            "SELECT planned_due, planned_qty FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
+        ), {"c": wo_code, "f": fid})).mappings().first()
+        if wo:
+            req_date = wo["planned_due"] or _date.today()
+            # 该料需求量（BOM 单耗 × 数量）
+            bq = (await db.execute(text(
+                "SELECT quantity FROM bom_items WHERE material_code=:m AND factory_id=:f LIMIT 1"
+            ), {"m": mcode, "f": fid})).scalar_one_or_none() or 1
+            need_qty = float(bq) * float(wo["planned_qty"] or 0)
+    if args.get("required_date"):
+        try:
+            req_date = _dt.strptime(str(args["required_date"]), "%Y-%m-%d").date()
+        except Exception:
+            pass
+    if req_date is None:
+        req_date = _date.today() + __import__('datetime').timedelta(days=7)
+
+    # 库存可用量
+    inv = (await db.execute(text(
+        "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
+    ), {"m": mcode, "f": fid})).scalar_one() or 0
+    # 在途 PO（expected_date 在需求前）
+    po_rows = (await db.execute(text("""
+        SELECT COALESCE(SUM(qty),0) AS qty, MIN(expected_date) AS earliest
+        FROM purchase_orders
+        WHERE material_code=:m AND factory_id=:f AND status IN ('ordered','confirmed','shipped')
+          AND expected_date IS NOT NULL AND expected_date <= :rd
+    """), {"m": mcode, "f": fid, "rd": req_date})).mappings().first()
+    po_qty = float(po_rows["qty"] or 0)
+    po_eta = po_rows["earliest"]
+    # 库存覆盖天数（按需求速率估算：需求/7天）
+    daily_need = need_qty / 7 if need_qty else 0
+    cover_days = round(float(inv) / daily_need, 1) if daily_need > 0 else None
+    # 最早可用时间 = 库存耗尽日 + 在途到货
+    total_available = float(inv) + po_qty
+    eat = "now" if float(inv) >= need_qty and need_qty > 0 else None
+    if eat is None:
+        if cover_days is not None and po_eta:
+            # 库存耗尽日
+            deplete = _date.today() + __import__('datetime').timedelta(days=int(cover_days))
+            eat = str(max(deplete, po_eta))[:10] if po_eta else str(deplete)[:10]
+        elif po_eta:
+            eat = str(po_eta)[:10]
+        elif cover_days is not None:
+            deplete = _date.today() + __import__('datetime').timedelta(days=int(cover_days))
+            eat = str(deplete)[:10]
+        else:
+            eat = "未知（无需求速率可估）"
+    if need_qty > 0:
+        ok = float(inv) + po_qty >= need_qty
+        conclusion = f"需求日 {req_date} 前 {'可以齐套' if ok else '无法齐套'}（库存{float(inv)} + 在途{po_qty} = {round(total_available,1)}，需求 {need_qty}）"
+    else:
+        ok = None
+        conclusion = f"无明确需求量（未指定工单/需求日），库存 {float(inv)} 可用，建议按工单维度检查"
+    return {"type": "eat_check", "material_code": mcode, "required_date": str(req_date),
+            "required_qty": need_qty if need_qty else None,
+            "inventory_available": float(inv), "on_order_qty": po_qty,
+            "on_order_eta": str(po_eta)[:10] if po_eta else None,
+            "total_available": round(total_available, 1),
+            "earliest_available": eat,
+            "feasible": ok,
+            "conclusion": conclusion}
+
+
 async def _tool_reschedule_work_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
     """工单改期 + 影响分析 + 变更日志。"""
     fid = factory_id or "FAC_MECH_001"
@@ -4510,6 +4657,8 @@ _TOOL_EXECUTORS = {
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
     "pmc_hammer_matrix": _tool_pmc_hammer_matrix,
     "run_mrp_calculation": _tool_run_mrp_calculation,
+    "fifo_check": _tool_fifo_check,
+    "eat_check": _tool_eat_check,
     "reschedule_work_order": _tool_reschedule_work_order,
     "rush_insert_order": _tool_rush_insert_order,
     "change_priority": _tool_change_priority,

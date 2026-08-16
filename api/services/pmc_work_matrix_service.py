@@ -579,15 +579,24 @@ class PmcWorkMatrixService:
         if only_stagnant:
             candidate_limit = min(max(limit * 3, limit), 200)
             cutoff = datetime.utcnow() - timedelta(days=days_threshold)
-            inventory_stmt = inventory_stmt.where(
-                Inventory.available_qty > 0,
-                Inventory.last_movement_at.is_not(None),
-                Inventory.last_movement_at <= cutoff,
-            ).order_by(Inventory.last_movement_at.asc())
+            # distinct + order_by 列不在 select 列表 → PG 报错；用子查询排序再 distinct
+            sub = (
+                select(Inventory.material_code)
+                .where(
+                    Inventory.factory_id == factory_id,
+                    Inventory.available_qty > 0,
+                    Inventory.last_movement_at.is_not(None),
+                    Inventory.last_movement_at <= cutoff,
+                )
+                .order_by(Inventory.last_movement_at.asc())
+                .limit(candidate_limit * 4)
+                .subquery()
+            )
+            inventory_stmt = select(sub.c.material_code).distinct()
         else:
             inventory_stmt = inventory_stmt.order_by(Inventory.material_code.asc())
 
-        material_result = await self.db.execute(inventory_stmt.distinct().limit(candidate_limit))
+        material_result = await self.db.execute(inventory_stmt.limit(candidate_limit))
         material_codes = {str(code) for code in material_result.scalars().all() if code}
 
         # Include PO-only materials so the PMC can see a purchase that has not arrived yet.
