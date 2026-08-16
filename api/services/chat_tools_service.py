@@ -5495,6 +5495,14 @@ WRITE_TOOLS = {
     "acknowledge_alert", "run_alert_patrol",
     "create_followup_task",
     "create_product_bom",
+    # 采购执行链路写工具（统一门禁）
+    "create_purchase_requisition", "create_purchase_order", "create_rfq",
+    "collect_quotations", "select_best_quote", "assign_supplier_to_pr",
+    "goods_receipt", "purchase_return", "payment_request",
+    "create_supplier_profile", "manage_supplier_status",
+    "fifo_check", "eat_check",
+    # PMC 变更写工具
+    "reschedule_work_order", "rush_insert_order", "change_priority", "cancel_work_order",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）

@@ -734,7 +734,26 @@ class InventoryService:
             location_id=location_id,
             unit_cost=unit_cost,
         )
-        
+
+        # ── 采购入库回写：PO 状态 + 工单物料 received_qty（页面入库同样闭环齐套）──
+        try:
+            from sqlalchemy import text as _text
+            if inbound_type.lower() == "purchase" and material_code:
+                if purchase_order_id:
+                    await self.db.execute(_text(
+                        "UPDATE purchase_orders SET status='received', actual_date=CURRENT_DATE WHERE id=:id"
+                    ), {"id": purchase_order_id})
+                # 回写工单物料已收量（所有在制/待排工单该物料）
+                await self.db.execute(_text(
+                    """UPDATE work_order_materials SET received_qty=received_qty+:q,
+                       shortage_qty=GREATEST(required_qty-received_qty-:q, 0)
+                       WHERE material_code=:m AND work_order_id IN (
+                           SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress','pending')
+                       )"""
+                ), {"q": quantity, "m": material_code, "f": factory_id})
+        except Exception:
+            pass  # 回写失败不阻塞入库主流程
+
         await self.db.commit()
         await self.db.refresh(inbound)
         

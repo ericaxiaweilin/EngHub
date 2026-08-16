@@ -938,6 +938,19 @@ async def calculate_mrp(
     p.mrp_status = "calculated"
     p.updated_at = calculated_at
     await db.commit()
+    # ── MRP→PR 自动闭环（REST 路径同样生效）：净需求>0 自动生成采购申请 ──
+    try:
+        shortage_items = [i for i in items if i["net_qty"] > 0]
+        if shortage_items:
+            from api.services.procurement_service import ProcurementService
+            ps = ProcurementService(db)
+            await ps.auto_pr_from_mrp(p.factory_id, [
+                {"material_code": i["material_code"], "material_name": i["material_name"],
+                 "net_requirement": i["net_qty"], "plan_id": p.id,
+                 "lead_days": 7} for i in shortage_items
+            ])
+    except Exception:
+        pass  # 自动 PR 失败不阻塞 MRP 结果返回
 
     mrp_result = {
         "id": mrp_result_id,

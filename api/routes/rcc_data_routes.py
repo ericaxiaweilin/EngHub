@@ -11,6 +11,8 @@ RCC = Resource Control Center — 全局统筹人/物/工单计算
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.db_config import get_db
+from core.auth.security import get_current_user
+from database.models import User
 import json
 from typing import Optional, Dict, Any
 
@@ -29,6 +31,7 @@ async def get_rcc_data(
     factory_id: Optional[str] = Query(None, description="工厂ID"),
     mode: str = Query("single", description="single|global"),
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """
     综合数据层接口：从上游业务模块直接汇总人/设备/工单/环境/工艺真实基线、
@@ -154,6 +157,7 @@ async def get_rcc_data(
 async def get_full_baseline(
     factory_id: str = Query(..., description="工厂ID"),
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """全量RCC基线，汇总人/设备/工单/环境/工艺五维数据"""
     from core.rcc.calculator import RCCResourceCalculator
@@ -217,6 +221,7 @@ async def get_process_baseline(factory_id: str = Query(...), db: AsyncSession = 
 async def trigger_calculation(
     payload: Dict[str, Any] = Body(default={}),
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """
     触发全量RCC统筹计算。
@@ -263,6 +268,7 @@ async def trigger_calculation(
 async def sync_baseline(
     payload: Dict[str, Any] = Body(default={}),
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """
     强制同步：将当前所有真实DB数据重新汇总到RCC基线。
@@ -283,6 +289,7 @@ async def sync_baseline(
 async def resource_index(
     date: str = "",
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """RCC 核心抓手：可用产能 = 可用人力 × 可用设备 × 可用物料 × 可用时间。
     任一维为 0 → 整体产能 0（缺料停产/设备坏停线/人不够降速/无班次停工）。
@@ -347,6 +354,7 @@ async def resource_index(
 @router.get("/task-health", summary="RCC 任务健康指数：任务域抓手（闭环率×及时率×AI接管率）")
 async def task_health(
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """非生产部门（PMC/采购/质量）核心抓手：不是效率（一人干多少件），而是每个任务处理好。
     - 闭环率：完成任务 / 总任务（任务有没有善终）
@@ -421,6 +429,7 @@ async def task_health(
 async def claim_tasks(
     payload: Dict[str, Any],
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """把未分配任务按岗位规则认领到人：
     - 采购部/供应商卡点 → procurement
@@ -467,6 +476,7 @@ async def agent_work_log(
     ref: str = "",
     limit: int = 20,
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     """按智能体/动作/关联单据查询工作记录，支持追溯：
     - 某岗位今天干了什么（agent=pmc_agent/procurement_agent）
@@ -500,6 +510,7 @@ async def agent_work_log(
 async def log_agent_work(
     payload: Dict[str, Any],
     db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
 ):
     from sqlalchemy import text as sql_text
     import uuid

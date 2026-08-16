@@ -8,6 +8,7 @@ v2.6 - RCC API Routes
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
+from database.models import User
 
 from database.db_config import get_db
 from core.auth.security import get_current_user
@@ -393,85 +394,86 @@ async def delete_logic_chain(chain_id: str, db: AsyncSession = Depends(get_db)):
 # ==================== 组织泡泡图（任务智慧中心） ====================
 
 @router.get("/org-bubbles", summary="组织泡泡图数据 - 任务智慧中心")
-async def org_bubbles(factory_id: str = Query("F01")):
-    """聚合 org_panel 节点 + 逻辑链，生成力导向泡泡图数据
-    
-    每个节点 = 一个组织泡泡（大小=负荷，颜色=健康度）
-    每条链 = 泡泡间连线（信号传导关系）
+async def org_bubbles(factory_id: str = Query("F01"), db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    """组织泡泡图数据：真实组织（hr_employees 部门聚合）优先，presets 仿真兜底。
+
+    节点 = 组织单元（部门/岗位），大小=负荷（人力占比），颜色=健康度（离岗率）。
+    链 = 组织层级 parent 关系（真实）或仿真信号链（兜底）。
     """
-    from core.org_panel.presets import build_electronics_factory
+    from sqlalchemy import text as _sqlt
     from core.org_panel.signals import SignalType
 
-    # 获取引擎单例（复用 org_panel 的实例）
-    from core.org_panel.api_adapter import get_engine
-    engine = get_engine()
-
     nodes = []
-    for nid, node in engine.nodes.items():
-        # 计算健康度：有无 violations + 关键信号判断
-        health = "normal"  # normal / warning / danger
-        if node.violations:
-            health = "danger"
-        else:
-            # 检查关键输出信号是否越界
-            outputs = node.output_signals
-            escalation = outputs.get(SignalType.ESCALATION_LEVEL, 0)
-            if escalation >= 2:
-                health = "danger"
-            elif escalation >= 1:
-                health = "warning"
-            # 设备可用率低 → warning
-            avail = outputs.get(SignalType.AVAILABILITY, 1.0)
-            if avail < 0.85:
-                health = "warning" if health == "normal" else health
-
-        # 负荷 = 输出信号数量 + 参数数量 的综合（归一化到 0-1）
-        load_score = min(1.0, (len(node.output_signals) * 0.08 + len(node.parameters) * 0.05 + len(node.violations) * 0.2))
-
-        nodes.append({
-            "id": nid,
-            "name": node.name,
-            "parent_id": getattr(node, "parent_id", None),
-            "level": node.level,
-            "scope": node.scope,
-            "health": health,
-            "load": round(load_score, 3),
-            "violations": node.violations,
-            "key_outputs": {
-                k.label: round(v, 4)
-                for k, v in list(node.output_signals.items())[:6]
-            },
-            "param_count": len(node.parameters),
-            "capability_count": len(node.capabilities),
-        })
-
     edges = []
-    for chain in engine.chains:
-        for link in chain.links:
-            source_node = engine.nodes.get(link.source_node_id)
-            current_value = None
-            if source_node and link.source_signal in source_node.output_signals:
-                current_value = round(source_node.output_signals[link.source_signal], 4)
-            edges.append({
-                "source": link.source_node_id,
-                "target": link.target_node_id,
-                "signal": link.source_signal.label,
-                "target_signal": link.target_signal.label,
-                "label": link.label or f"{link.source_signal.label}→{link.target_signal.label}",
-                "chain_name": chain.name,
-                "value": current_value,
-                "latency_h": link.latency_hours,
+    real_data = False
+    try:
+        # 主数据源：hr_employees 部门聚合（真实组织 = 员工部门结构）
+        emp_rows = (await db.execute(_sqlt("""
+            SELECT department, COUNT(*) AS headcount,
+                   SUM(CASE WHEN status='leave' THEN 1 ELSE 0 END) AS leave_cnt
+            FROM hr_employees WHERE factory_id=:f AND department IS NOT NULL AND department != ''
+            GROUP BY department ORDER BY headcount DESC
+        """), {"f": factory_id})).mappings().all()
+        if emp_rows:
+            real_data = True
+            max_hc = max(int(r["headcount"] or 1) for r in emp_rows)
+            for idx, r in enumerate(emp_rows):
+                headcount = int(r["headcount"] or 0)
+                leave = int(r["leave_cnt"] or 0)
+                leave_rate = leave / max(headcount, 1)
+                health = "danger" if leave_rate > 0.2 else ("warning" if leave_rate > 0.1 else "normal")
+                nodes.append({
+                    "id": f"dept_{r['department']}", "name": r["department"],
+                    "parent_id": None, "level": 1,
+                    "scope": f"部门 {r['department']} · 人力 {headcount}（离岗 {leave}）",
+                    "health": health,
+                    "load": round(min(1.0, headcount / max(max_hc, 1)), 3),
+                    "violations": [] if leave_rate <= 0.2 else [f"离岗率 {round(leave_rate*100,1)}%"],
+                    "key_outputs": {"人力": headcount, "离岗": leave},
+                })
+    except Exception:
+        pass
+
+    if not real_data:
+        # ── 兜底：presets 仿真引擎 ──
+        from core.org_panel.presets import build_electronics_factory
+        from core.org_panel.api_adapter import get_engine
+        engine = get_engine()
+        for nid, node in engine.nodes.items():
+            health = "normal"
+            if node.violations:
+                health = "danger"
+            else:
+                outputs = node.output_signals
+                if outputs.get(SignalType.ESCALATION_LEVEL, 0) >= 2:
+                    health = "danger"
+                elif outputs.get(SignalType.ESCALATION_LEVEL, 0) >= 1:
+                    health = "warning"
+                if outputs.get(SignalType.AVAILABILITY, 1.0) < 0.85:
+                    health = "warning" if health == "normal" else health
+            load_score = min(1.0, (len(node.output_signals) * 0.08 + len(node.parameters) * 0.05 + len(node.violations) * 0.2))
+            nodes.append({
+                "id": nid, "name": node.name, "parent_id": getattr(node, "parent_id", None),
+                "level": node.level, "scope": node.scope, "health": health,
+                "load": round(load_score, 3), "violations": node.violations,
+                "key_outputs": {str(k): v for k, v in node.output_signals.items()},
             })
+        # 仿真信号链（引擎 _outgoing: source_id -> [ChainLink]）
+        for source_id, links in getattr(engine, "_outgoing", {}).items():
+            for link in links:
+                edges.append({"source": source_id, "target": getattr(link, "target_id", None) or getattr(link, "target", ""),
+                              "signal_type": getattr(link, "signal_type", None), "strength": 1.0})
 
     return {
         "success": True,
         "factory_id": factory_id,
+        "data_source": "real_org" if real_data else "preset_sim",
         "nodes": nodes,
         "edges": edges,
         "meta": {
             "total_nodes": len(nodes),
             "total_edges": len(edges),
-            "chains": [c.name for c in engine.chains],
+            "note": "真实组织数据（org_units+hr_employees）" if real_data else "预设仿真（无真实组织数据兜底）",
         },
     }
 
