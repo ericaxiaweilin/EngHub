@@ -2827,21 +2827,28 @@ async def _tool_run_mrp_calculation(db: AsyncSession, args: Dict[str, Any], fact
     计划 → BOM 展开毛需求 → 扣库存/在途 → 净需求 → 缺料清单 + 采购建议。"""
     fid = factory_id or "FAC_MECH_001"
     product_id = str(args.get("product_id") or "").strip()
-    # 1) 找计划（指定产品或最新 released）
+    # 1) 找需求源：released 计划 UNION 在制/待排工单（都 JOIN BOM 确保可算）
     if product_id:
         rows = (await db.execute(text("""
-            SELECT id, plan_code, product_id, planned_qty, required_date FROM plans
-            WHERE factory_id=:f AND product_id=:p AND status='released'
-            ORDER BY created_at DESC LIMIT 3
-        """), {"f": fid, "p": product_id})).mappings().all()
+            SELECT wo.work_order_code AS plan_code, wo.product_id, wo.planned_qty, wo.planned_due AS required_date
+            FROM work_orders wo
+            JOIN bom_items b ON b.product_id = wo.product_id AND b.factory_id = wo.factory_id
+            WHERE wo.factory_id=:f AND wo.product_id=:pid
+              AND wo.status IN ('released','in_progress','pending')
+            GROUP BY wo.work_order_code, wo.product_id, wo.planned_qty, wo.planned_due
+            ORDER BY wo.planned_due LIMIT 3
+        """), {"f": fid, "pid": product_id})).mappings().all()
     else:
         rows = (await db.execute(text("""
-            SELECT id, plan_code, product_id, quantity AS planned_qty, required_date FROM plans
-            WHERE factory_id=:f AND status='released'
-            ORDER BY created_at DESC LIMIT 3
+            SELECT wo.work_order_code AS plan_code, wo.product_id, wo.planned_qty, wo.planned_due AS required_date
+            FROM work_orders wo
+            JOIN bom_items b ON b.product_id = wo.product_id AND b.factory_id = wo.factory_id
+            WHERE wo.factory_id=:f AND wo.status IN ('released','in_progress','pending')
+            GROUP BY wo.work_order_code, wo.product_id, wo.planned_qty, wo.planned_due
+            ORDER BY wo.planned_due LIMIT 3
         """), {"f": fid})).mappings().all()
     if not rows:
-        return {"error": "无 released 计划可运行 MRP（需先创建并确认计划）"}
+        return {"error": "无可运行 MRP 的需求（无 released/在制工单，或产品未维护 BOM）"}
 
     results = []
     for plan in rows:
