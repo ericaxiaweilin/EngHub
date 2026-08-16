@@ -1897,6 +1897,9 @@ async def _tool_create_production_report(db: AsyncSession, args: Dict[str, Any],
 
     await db.commit()
     await db.refresh(report)
+    await _report_rcc_action(db, wo.factory_id, "production_report", wo.work_order_code,
+                             f"报工 良品{good_qty} 不良{defect_qty}（工位 {station.station_name}）",
+                             detail=operator, operator=operator, risk="info")
     return {
         "success": True,
         "message": f"报工成功",
@@ -3022,6 +3025,38 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+# ── RCC 总资源调度中心：统一动作上报（所有业务动作必须进 RCC）──
+async def _report_rcc_action(db, factory_id: str, action_type: str, target: str,
+                             summary: str, detail: str = "", operator: str = "system",
+                             rcc_task_type: Optional[str] = None, risk: str = "info") -> None:
+    """每个业务动作执行后上报 RCC：
+    1) agent_events 写 resource_action（RCC 感知全部动作流）
+    2) 资源相关动作（人力/设备/物料/交期）→ rcc_tasks 登记调度
+    3) 相关岗位通知
+    失败不阻塞业务主流程。
+    """
+    import uuid as _uuid
+    try:
+        await db.execute(text("""
+            INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
+            VALUES (:eid, :f, 'resource_action', :agent, CAST(:d AS jsonb), NOW())
+        """), {"eid": str(_uuid.uuid4()), "f": factory_id, "agent": operator,
+               "d": json.dumps({"action_type": action_type, "target": target,
+                                "summary": summary, "detail": detail,
+                                "risk": risk, "by": operator}, ensure_ascii=False)})
+        if rcc_task_type:
+            await db.execute(text("""
+                INSERT INTO rcc_tasks (id, task_code, org_unit_id, task_type, title, description, status, requested_by, created_at, updated_at)
+                VALUES (:tid, :tc, :org, :tt, :title, :desc, 'pending', :cb, NOW(), NOW())
+            """), {"tid": str(_uuid.uuid4()), "tc": f"RCC-{str(_uuid.uuid4())[:7].upper()}",
+                   "org": "fb8337eb-c1d3-58af-842f-cf56d29e3f98", "tt": rcc_task_type,
+                   "title": f"[{action_type}] {target} {summary}",
+                   "desc": detail or summary, "cb": operator})
+        await db.commit()
+    except Exception:
+        pass
+
+
 async def _tool_create_rfq(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
     """发起询价(RFQ)：为物料向候选供应商发出询价。"""
     fid = factory_id or "FAC_MECH_001"
@@ -3166,6 +3201,10 @@ async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id
     await db.execute(text("""
         UPDATE inventory SET available_qty=available_qty+:acc WHERE material_code=:m AND factory_id=:f
     """), {"acc": accepted, "m": po["material_code"], "f": fid})
+    await _report_rcc_action(db, fid, "goods_receipt", gr_code,
+                             f"PO {po_code} 收货 {int(accepted)} 合格/{int(rejected)} 不良，已入库存",
+                             detail=f"供应商 {po['supplier_id']} 物料 {po['material_code']}", operator=operator,
+                             risk="info")
     await db.commit()
     return {"type": "goods_receipt", "action": "received", "gr_code": gr_code, "po_code": po_code,
             "qty": qty, "accepted": accepted, "rejected": rejected,
@@ -3246,6 +3285,11 @@ async def _tool_invoice_matching_check(db: AsyncSession, args: Dict[str, Any], f
         VALUES (gen_random_uuid()::text, :f, :po, :gr, :sup, :inv, :pa, :ga, :diff, :st, 'PO_INVOICE', :cb, NOW())
     """), {"f": fid, "po": po_code, "gr": "", "sup": po["supplier_id"], "inv": inv_amt,
            "pa": po_amt, "ga": round(gr_amt, 2), "diff": round(diff, 2), "st": status, "cb": operator})
+    await _report_rcc_action(db, fid, "invoice_matching", po_code,
+                             f"三单匹配 {status}（发票 {inv_amt} vs PO {po_amt}）",
+                             detail=f"差额 {round(diff, 2)}", operator=operator,
+                             rcc_task_type="approval" if status == "mismatch" else None,
+                             risk="warning" if status == "mismatch" else "info")
     await db.commit()
     return {"type": "invoice_matching", "po_code": po_code, "invoice_amount": inv_amt,
             "po_amount": po_amt, "gr_amount": round(gr_amt, 2), "diff": round(diff, 2),
@@ -3400,6 +3444,10 @@ async def _tool_rush_insert_order(db: AsyncSession, args: Dict[str, Any], factor
         VALUES (gen_random_uuid()::text, :f, 'rush_insert', 'work_order', :c, '', :p, :r, :i, :cb)
     """), {"f": fid, "c": code, "p": f"{prod}×{int(qty)} @{due} [{prio}]",
            "r": "紧急插单", "i": impact, "cb": operator})
+    await _report_rcc_action(db, fid, "rush_insert", code,
+                             f"紧急插单 {prod}×{int(qty)} 交期{due}，{len(affected)} 在制单受影响",
+                             detail=f"受影响工单: {','.join(affected[:8])}", operator=operator,
+                             rcc_task_type="scheduling", risk="critical")
     await db.commit()
     return {"type": "rush_insert", "work_order_code": code, "product": prod, "qty": qty,
             "due": due, "priority": prio, "affected_work_orders": affected,
@@ -3429,6 +3477,11 @@ async def _tool_change_priority(db: AsyncSession, args: Dict[str, Any], factory_
     """), {"f": fid, "c": wo_code, "b": old_p, "a": prio, "r": reason,
            "i": f"优先级 {old_p} → {prio}；{'排程提前，同产线后续让位' if prio in ('urgent','high') else '排程后移'}",
            "cb": operator})
+    await _report_rcc_action(db, fid, "priority_change", wo_code,
+                             f"优先级 {old_p} → {prio}",
+                             detail=reason, operator=operator,
+                             rcc_task_type="scheduling" if prio == "urgent" else None,
+                             risk="warning" if prio in ("urgent", "high") else "info")
     await db.commit()
     return {"type": "priority_change", "work_order": wo_code, "old_priority": old_p, "new_priority": prio,
             "message": f"工单 {wo_code} 优先级 {old_p} → {prio}"}
@@ -3455,6 +3508,10 @@ async def _tool_cancel_work_order(db: AsyncSession, args: Dict[str, Any], factor
         INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
         VALUES (gen_random_uuid()::text, :f, 'cancel', 'work_order', :c, :b, 'cancelled', :r, '释放产能与物料，同产线可接收新单', :cb)
     """), {"f": fid, "c": wo_code, "b": wo["status"], "r": reason, "cb": operator})
+    await _report_rcc_action(db, fid, "cancel_order", wo_code,
+                             f"撤单（原状态 {wo['status']}），产能物料释放",
+                             detail=reason, operator=operator,
+                             rcc_task_type="scheduling", risk="warning")
     await db.commit()
     return {"type": "cancel", "work_order": wo_code, "old_status": wo["status"], "status": "cancelled",
             "message": f"工单 {wo_code} 已取消，产能与物料释放"}
@@ -3541,6 +3598,10 @@ async def _tool_run_mrp_calculation(db: AsyncSession, args: Dict[str, Any], fact
         results.append({"plan_code": plan["plan_code"], "product_id": plan["product_id"],
                         "qty": qty, "materials": needs,
                         "summary": f"{len(needs)} 项物料，{shortage_count} 项缺料"})
+    await _report_rcc_action(db, fid, "mrp_run", "MRP",
+                             f"MRP 计算 {len(results)} 个需求源",
+                             detail=json.dumps([{"plan": r["plan_code"], "summary": r.get("summary", "")} for r in results[:5]], ensure_ascii=False),
+                             operator=operator, risk="info")
     return {"type": "mrp_result", "count": len(results), "results": results}
 
 
@@ -3568,6 +3629,10 @@ async def _tool_create_shipment(db: AsyncSession, args: Dict[str, Any], factory_
         INSERT INTO shipment_items (id, shipment_id, product_id, product_name, quantity, packed_qty)
         VALUES (gen_random_uuid()::text, :sid, :p, :p, :q, 0)
     """), {"sid": ship_id, "p": prod, "q": qty})
+    await _report_rcc_action(db, fid, "shipment_created", code,
+                             f"出货单创建 {cust} {prod}×{int(qty)} ETD {etd}",
+                             detail=f"柜数 {int(args.get('container_count') or 1)}", operator=operator,
+                             risk="info")
     await db.commit()
     return {"type": "shipment", "action": "created", "shipment_code": code, "status": "planned",
             "customer": cust, "qty": qty, "etd": etd, "shipment_id": ship_id}
@@ -4041,6 +4106,9 @@ async def _tool_create_purchase_order(db: AsyncSession, args: Dict[str, Any], fa
     await db.execute(text(
         "UPDATE purchase_requisitions SET status='converted', purchase_code=:pc, updated_at=NOW() WHERE id=:id"
     ), {"id": pr_id, "pc": po_code})
+    await _report_rcc_action(db, fid, "purchase_order", po_code,
+                             f"PO 创建 {pr['material_code']}×{pr['qty']} 供应商 {sup['supplier_name']} ETA +{lead}天",
+                             detail=f"PR {pr_id} 单价 {price}", operator=operator, risk="info")
     await db.commit()
     return {"type": "purchase_order", "action": "created", "po_id": po_id, "po_code": po_code,
             "pr_id": pr_id, "material_code": pr["material_code"], "qty": float(pr["qty"]),
