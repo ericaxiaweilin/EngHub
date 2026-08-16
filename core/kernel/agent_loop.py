@@ -264,12 +264,16 @@ class AgentLoop:
                     actions_count=len(actions),
                 )
 
-        # 超过最大轮次
+        # 超过最大轮次：模型可能一直在输出工具标签未收尾 → 用工具结果摘要兜底
+        reply = ""
+        if self._summarize_actions is not None and actions:
+            reply = self._summarize_actions(actions)
         return LoopResult(
             model=model,
-            degraded=True,
+            degraded=not bool(reply),
             rounds_used=self.max_rounds,
             actions=actions,
+            reply=reply,
             status="max_rounds",
             checkpoint_key=last_checkpoint_key,
         )
