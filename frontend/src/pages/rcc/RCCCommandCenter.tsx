@@ -159,8 +159,8 @@ export default function RCCCommandCenter() {
         ))}
       </div>
 
-      {/* 三栏 shell：rail 240 | main 1fr | right 340 固定 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '240px minmax(0,1fr) 340px', minHeight: 'calc(100vh - 106px)' }}>
+      {/* 两栏 shell：rail 240 | main（审批中心等全部视图在主栏） */}
+      <div style={{ display: 'grid', gridTemplateColumns: '240px minmax(0,1fr)', minHeight: 'calc(100vh - 106px)' }}>
 
         {/* 左 rail：资源维度 + 智能体 */}
         <aside style={{ background: C.surface, borderRight: `1px solid ${C.border}`, padding: '14px 12px', overflow: 'auto', maxHeight: 'calc(100vh - 106px)' }}>
@@ -201,6 +201,22 @@ export default function RCCCommandCenter() {
         {/* 中 main */}
         <main style={{ padding: '14px 16px 30px', minWidth: 0, overflow: 'auto', maxHeight: 'calc(100vh - 106px)' }}>
           <RccContext.Provider value={{ baseline, decisions: { full: tasks, pending, approved: tasks.filter((t: any) => t.status === 'approved') }, factoryId, loading, lastSync: new Date().toISOString(), refresh: loadAll }}>
+          {/* 调度闭环统计条（主栏顶部，替代右栏） */}
+          <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+            {[
+              ['AI 提议', tasks.length, C.brand, C.brandSoft],
+              ['已审批', tasks.filter((t: any) => t.status === 'approved').length, C.success, C.successSoft],
+              ['人工驳回', tasks.filter((t: any) => t.status === 'rejected').length, C.danger, C.dangerSoft],
+              ['待审批', pending.length, C.warn, C.warnSoft],
+            ].map(([k, v, color, soft]) => (
+              <button key={k as string} onClick={() => { if (k === '待审批') { setActiveTab('approvals'); setSearchParams({ tab: 'approvals' }) } }}
+                style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.surface, padding: '8px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, textAlign: 'left' }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: color as string }} />
+                <span style={{ fontSize: 11, color: C.text3, fontWeight: 700 }}>{k}</span>
+                <b style={{ fontSize: 15, fontFamily: 'monospace', color: color as string }}>{v}</b>
+              </button>
+            ))}
+          </div>
           {activeTab === 'bubbles' && <RCCOrgBubbles factoryId={factoryId} />}
           {activeTab === 'overview' && <RCCOverview />}
           {activeTab === 'resources' && <RCCResourceBoard />}
@@ -354,33 +370,7 @@ export default function RCCCommandCenter() {
           </RccContext.Provider>
         </main>
 
-        {/* 右 rail：管理者 Action Center（轻量提示 + 跳转审批中心） */}
-        <aside style={{ background: C.surface, borderLeft: `1px solid ${C.border}`, padding: '14px 13px 28px', overflow: 'auto', maxHeight: 'calc(100vh - 106px)', minWidth: 0 }}>
-          <div style={{ fontSize: 10.5, fontWeight: 800, color: C.text3, letterSpacing: .7, textTransform: 'uppercase', margin: '4px 9px 8px' }}>管理者 Action Center</div>
-          {/* 待审批状态卡 */}
-          <div style={{ border: pending.length > 0 ? '1px solid #F0B7B7' : `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 12, background: pending.length > 0 ? C.dangerSoft : C.surface }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <div style={{ width: 34, height: 34, borderRadius: 9, background: pending.length > 0 ? C.danger : C.successSoft, color: pending.length > 0 ? '#fff' : C.success, display: 'grid', placeItems: 'center', fontSize: 15 }}>
-                {pending.length > 0 ? <ClockCircleOutlined /> : <CheckOutlined />}
-              </div>
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 850, fontFamily: 'monospace', color: C.text }}>{pending.length}</div>
-                <div style={{ fontSize: 10.5, color: C.text3 }}>{pending.length > 0 ? '项待审批调度申请' : '审批队列已清空'}</div>
-              </div>
-            </div>
-            <button onClick={() => { setActiveTab('approvals'); setSearchParams({ tab: 'approvals' }) }}
-              style={{ width: '100%', marginTop: 12, height: 32, borderRadius: 8, border: 'none', background: C.brand, color: '#fff', fontSize: 11.5, fontWeight: 800, cursor: 'pointer' }}>
-              进入审批中心 →
-            </button>
-          </div>
-          {/* 今日调度闭环 */}
-          <div style={{ marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 13 }}>
-            <div style={{ fontSize: 10.5, fontWeight: 800, color: C.text3, letterSpacing: .7, textTransform: 'uppercase', margin: '0 0 8px' }}>今日调度闭环</div>
-            {[['AI 提议', tasks.length], ['已审批', tasks.filter((t: any) => t.status === 'approved').length], ['人工驳回', tasks.filter((t: any) => t.status === 'rejected').length], ['待审批', pending.length]].map(([k, v]) => (
-              <div key={k as string} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 8px', fontSize: 11, color: C.text2 }}><span>{k}</span><b style={{ fontWeight: 700, fontSize: 11, fontFamily: 'monospace', color: C.text }}>{v}</b></div>
-            ))}
-          </div>
-        </aside>
+
       </div>
     </div>
   )
