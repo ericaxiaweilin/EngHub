@@ -115,7 +115,7 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
     key_outputs: {},
     param_count: 0,
     capability_count: 0,
-    children: roots.map(buildNode),
+    children: roots.map(node => buildNode(node, new Set())),
   }
 }
 
