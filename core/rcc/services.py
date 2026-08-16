@@ -296,10 +296,33 @@ class ParamAdjustmentService:
         return param
     
     async def _sync_to_rcc_baseline(self, param: Any, old_value: str, new_value: str, reason: str):
-        """同步参数到RCC基线"""
-        # 这里只是占位逻辑，实际应该更新RCC的resource_pool或capacity_model
-        # 完整实现需要考虑资源池的一致性
-        pass
+        """同步参数到RCC基线：参数生效时间前移 + 审计事件落 agent_events（可经事件回放追溯）。
+
+        基线本身由 RCCResourceCalculator 从业务表实时计算，无需快照回写；
+        此方法确保参数变更"生效可追溯"：effective_from 标记生效时点，
+        rcc_param_synced 事件供监督引擎/调度日志消费。
+        """
+        import json as _json
+        from sqlalchemy import text as _tex
+
+        # 生效时点前移到当前（参数新值即刻生效）
+        param.effective_from = datetime.utcnow()
+
+        # 工厂推导：param_code 前缀为 factory_id（如 FAC_MECH_001_monthly_container_capacity）
+        code = param.param_code or ""
+        r = await self.db.execute(_tex("SELECT id FROM factories WHERE :c LIKE id || '%' LIMIT 1"), {"c": code})
+        factory_id = r.scalar_one_or_none() or "FAC_MECH_001"
+
+        # 审计事件：与 rcc_task_executed 同表同模式，保证调度日志可回放
+        await self.db.execute(_tex("""
+            INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
+            VALUES (gen_random_uuid()::text, :f, 'rcc_param_synced', 'rcc_baseline',
+                    CAST(:d AS jsonb), NOW())
+        """), {"f": factory_id,
+               "d": _json.dumps({"param_code": code,
+                                 "category": param.category,
+                                 "from_value": old_value, "to_value": new_value,
+                                 "reason": reason or ""}, ensure_ascii=False)})
     
     async def list_params(
         self,

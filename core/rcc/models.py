@@ -84,6 +84,21 @@ class RccApprovalRecord(Base):
     escalation_level = Column(Integer, default=0)
 
 
+class PositionCapability(Base):
+    """岗位能力定义（供 global_adjustable_params.position_cap_id 外键解析）"""
+    __tablename__ = "position_capabilities"
+
+    id = Column(String(36), primary_key=True)
+    cap_code = Column(String(50), unique=True)
+    cap_name = Column(String(200))
+    skill_level_min = Column(String(10))
+    skill_level_max = Column(String(10))
+    org_unit_id = Column(String(36))
+    description = Column(Text)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow())
+    updated_at = Column(DateTime, default=lambda: datetime.utcnow())
+
+
 class GlobalAdjustableParam(Base):
     """全局可调参数"""
     __tablename__ = "global_adjustable_params"
