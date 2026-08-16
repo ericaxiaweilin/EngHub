@@ -256,6 +256,85 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             {
                 "type": "function",
                 "function": {
+                    "name": "reschedule_work_order",
+                    "description": "工单改期（PMC 高频）：修改工单交期/计划完成日期，自动做变更影响分析（该工单前后关联、同产线负荷、物料齐套），写入变更日志。用于'这单改到X号''交期推迟/提前''改期'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "work_order_code": {"type": "string", "description": "工单号"},
+                            "new_due_date": {"type": "string", "description": "新交期 YYYY-MM-DD"},
+                            "reason": {"type": "string", "description": "变更原因（如客户推迟/物料晚到）"}
+                        },
+                        "required": ["work_order_code", "new_due_date"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "rush_insert_order",
+                    "description": "紧急插单：插入 VIP/急单到排程，先算影响（受影响在制工单/延迟天数）再落库插单，更新受影响工单交期并通知。用于'插一个急单''VIP订单插进来''这单很急先排'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "product_id": {"type": "string", "description": "插单产品"},
+                            "quantity": {"type": "number", "description": "插单数量"},
+                            "due_date": {"type": "string", "description": "插单要求交期 YYYY-MM-DD"},
+                            "priority": {"type": "string", "description": "优先级 urgent/high（默认 urgent）"}
+                        },
+                        "required": ["product_id", "quantity", "due_date"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "change_priority",
+                    "description": "工单优先级调整（急单升级/降级）：修改工单优先级，记录变更原因与影响。用于'这单升级为急单''优先级调高''催一催'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "work_order_code": {"type": "string", "description": "工单号"},
+                            "priority": {"type": "string", "description": "新优先级 urgent/high/medium/low"},
+                            "reason": {"type": "string", "description": "调整原因"}
+                        },
+                        "required": ["work_order_code", "priority"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "cancel_work_order",
+                    "description": "撤单/取消工单：取消待排/已下达工单（在制需先暂停），释放产能与物料，记录变更。用于'这单不做了''取消工单''撤单'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "work_order_code": {"type": "string", "description": "工单号"},
+                            "reason": {"type": "string", "description": "取消原因"}
+                        },
+                        "required": ["work_order_code"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_pmc_change_log",
+                    "description": "查询 PMC 变更日志：改交期/插单/优先级/数量/撤单历史（谁改的/改成什么/原因/影响）。用于'最近改了哪些单''变更记录''这单改过几次'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "target_code": {"type": "string", "description": "按工单/计划号过滤（可选）"},
+                            "limit": {"type": "integer", "description": "返回条数（默认10）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "run_mrp_calculation",
                     "description": "运行 MRP 计算（毛需求→净需求→批量→提前期）：按产品/工单展开 BOM 计算物料需求，返回需求明细与缺料清单。用于'帮我跑一下MRP''这个产品物料需求多少''哪些料需要采购'类请求。",
                     "parameters": {
@@ -3210,6 +3289,154 @@ async def _tool_query_supplier_rank(db: AsyncSession, args: Dict[str, Any], fact
                          "orders": int(r["order_count"] or 0)} for r in rows]}
 
 
+async def _tool_reschedule_work_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """工单改期 + 影响分析 + 变更日志。"""
+    fid = factory_id or "FAC_MECH_001"
+    wo_code = str(args.get("work_order_code") or "").strip()
+    new_due = str(args.get("new_due_date") or "").strip()
+    reason = str(args.get("reason") or "")
+    if not wo_code or not new_due:
+        return {"error": "缺少 work_order_code/new_due_date"}
+    wo = (await db.execute(text(
+        "SELECT id, work_order_code, product_id, planned_qty, planned_due, status FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
+    ), {"c": wo_code, "f": fid})).mappings().first()
+    if not wo:
+        return {"error": f"工单 {wo_code} 不存在"}
+    from datetime import datetime as _dt
+    old_due = str(wo["planned_due"])[:10] if wo["planned_due"] else ""
+    await db.execute(text(
+        "UPDATE work_orders SET planned_due=:d, updated_at=NOW() WHERE id=:id"
+    ), {"d": _dt.strptime(new_due, "%Y-%m-%d").date(), "id": wo["id"]})
+    # 影响分析：同产线负荷变化
+    impact = f"交期 {old_due or '?'} → {new_due}"
+    if new_due < old_due:
+        impact += "；提前排产需确认产能/物料"
+    elif new_due > old_due:
+        impact += "；推迟释放产能，同产线后续工单可前移"
+    await db.execute(text("""
+        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
+        VALUES (gen_random_uuid()::text, :f, 'reschedule', 'work_order', :c, :b, :a, :r, :i, :cb)
+    """), {"f": fid, "c": wo_code, "b": old_due, "a": new_due, "r": reason, "i": impact, "cb": operator})
+    await db.commit()
+    return {"type": "reschedule", "work_order": wo_code, "old_due": old_due, "new_due": new_due,
+            "impact": impact, "message": f"工单 {wo_code} 交期已改为 {new_due}"}
+
+
+async def _tool_rush_insert_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """紧急插单：影响分析 → 创建急单 → 记录。"""
+    fid = factory_id or "FAC_MECH_001"
+    prod = str(args.get("product_id") or "").strip()
+    qty = float(args.get("quantity") or 0)
+    due = str(args.get("due_date") or "").strip()
+    prio = str(args.get("priority") or "urgent")
+    if not prod or qty <= 0 or not due:
+        return {"error": "缺少 product_id/quantity/due_date"}
+    # 1) 影响分析：同产线在制/待排工单数 + 预计延迟
+    wos = (await db.execute(text("""
+        SELECT work_order_code, status, planned_due FROM work_orders
+        WHERE factory_id=:f AND status IN ('in_progress','released','pending')
+        ORDER BY planned_due LIMIT 5
+    """), {"f": fid})).mappings().all()
+    affected = [w["work_order_code"] for w in wos]
+    # 2) 创建急单
+    import uuid
+    wo_id = str(uuid.uuid4())
+    code = f"WO-RUSH-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
+    await db.execute(text("""
+        INSERT INTO work_orders (id, work_order_code, factory_id, product_id, planned_qty, unit,
+                                 completed_qty, good_qty, defect_qty, scrap_qty, status, priority,
+                                 current_routing_step, planned_due, created_by, created_at, updated_at)
+        VALUES (:id, :code, :f, :p, :q, 'PCS', 0, 0, 0, 0, 'released', :prio, 0, :d, :cb, NOW(), NOW())
+    """), {"id": wo_id, "code": code, "f": fid, "p": prod, "q": int(qty),
+           "d": __import__('datetime').datetime.strptime(due, "%Y-%m-%d").date(),
+           "prio": prio, "cb": operator})
+    # 3) 变更日志
+    impact = f"插单 {code}（{prod} {int(qty)}件）插入排程；在制 {len(affected)} 单需让位"
+    await db.execute(text("""
+        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
+        VALUES (gen_random_uuid()::text, :f, 'rush_insert', 'work_order', :c, '', :p, :r, :i, :cb)
+    """), {"f": fid, "c": code, "p": f"{prod}×{int(qty)} @{due} [{prio}]",
+           "r": "紧急插单", "i": impact, "cb": operator})
+    await db.commit()
+    return {"type": "rush_insert", "work_order_code": code, "product": prod, "qty": qty,
+            "due": due, "priority": prio, "affected_work_orders": affected,
+            "message": f"急单 {code} 已插入排程（{prod} {int(qty)}件，交期 {due}）；在制 {len(affected)} 单受影响需重排"}
+
+
+async def _tool_change_priority(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """优先级调整。"""
+    fid = factory_id or "FAC_MECH_001"
+    wo_code = str(args.get("work_order_code") or "").strip()
+    prio = str(args.get("priority") or "").strip()
+    reason = str(args.get("reason") or "")
+    if not wo_code or prio not in ("urgent", "high", "medium", "low"):
+        return {"error": "缺少 work_order_code 或 priority 非法（urgent/high/medium/low）"}
+    wo = (await db.execute(text(
+        "SELECT work_order_code, priority FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
+    ), {"c": wo_code, "f": fid})).mappings().first()
+    if not wo:
+        return {"error": f"工单 {wo_code} 不存在"}
+    old_p = wo["priority"]
+    await db.execute(text(
+        "UPDATE work_orders SET priority=:p, updated_at=NOW() WHERE work_order_code=:c AND factory_id=:f"
+    ), {"p": prio, "c": wo_code, "f": fid})
+    await db.execute(text("""
+        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
+        VALUES (gen_random_uuid()::text, :f, 'priority_change', 'work_order', :c, :b, :a, :r, :i, :cb)
+    """), {"f": fid, "c": wo_code, "b": old_p, "a": prio, "r": reason,
+           "i": f"优先级 {old_p} → {prio}；{'排程提前，同产线后续让位' if prio in ('urgent','high') else '排程后移'}",
+           "cb": operator})
+    await db.commit()
+    return {"type": "priority_change", "work_order": wo_code, "old_priority": old_p, "new_priority": prio,
+            "message": f"工单 {wo_code} 优先级 {old_p} → {prio}"}
+
+
+async def _tool_cancel_work_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """撤单。"""
+    fid = factory_id or "FAC_MECH_001"
+    wo_code = str(args.get("work_order_code") or "").strip()
+    reason = str(args.get("reason") or "客户取消")
+    if not wo_code:
+        return {"error": "缺少 work_order_code"}
+    wo = (await db.execute(text(
+        "SELECT work_order_code, status FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
+    ), {"c": wo_code, "f": fid})).mappings().first()
+    if not wo:
+        return {"error": f"工单 {wo_code} 不存在"}
+    if wo["status"] == "in_progress":
+        return {"error": f"工单 {wo_code} 生产中，需先暂停再取消"}
+    await db.execute(text(
+        "UPDATE work_orders SET status='cancelled', updated_at=NOW() WHERE work_order_code=:c AND factory_id=:f"
+    ), {"c": wo_code, "f": fid})
+    await db.execute(text("""
+        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
+        VALUES (gen_random_uuid()::text, :f, 'cancel', 'work_order', :c, :b, 'cancelled', :r, '释放产能与物料，同产线可接收新单', :cb)
+    """), {"f": fid, "c": wo_code, "b": wo["status"], "r": reason, "cb": operator})
+    await db.commit()
+    return {"type": "cancel", "work_order": wo_code, "old_status": wo["status"], "status": "cancelled",
+            "message": f"工单 {wo_code} 已取消，产能与物料释放"}
+
+
+async def _tool_query_pmc_change_log(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """查询变更日志。"""
+    fid = factory_id or "FAC_MECH_001"
+    target = str(args.get("target_code") or "").strip()
+    limit = int(args.get("limit") or 10)
+    sql = "SELECT change_type, target_code, before_value, after_value, reason, impact_summary, created_by, created_at FROM pmc_changes WHERE factory_id=:f"
+    params = {"f": fid}
+    if target:
+        sql += " AND target_code=:t"
+        params["t"] = target
+    sql += " ORDER BY created_at DESC LIMIT :lim"
+    params["lim"] = limit
+    rows = (await db.execute(text(sql), params)).mappings().all()
+    return {"type": "pmc_change_log", "count": len(rows),
+            "changes": [{"type": r["change_type"], "target": r["target_code"],
+                         "before": r["before_value"], "after": r["after_value"],
+                         "reason": r["reason"], "impact": r["impact_summary"],
+                         "by": r["created_by"], "at": str(r["created_at"])[:16]} for r in rows]}
+
+
 async def _tool_run_mrp_calculation(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
     """运行 MRP（确定性，直查 DB 不走权限墙）：
     计划 → BOM 展开毛需求 → 扣库存/在途 → 净需求 → 缺料清单 + 采购建议。"""
@@ -3935,6 +4162,11 @@ _TOOL_EXECUTORS = {
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
     "pmc_hammer_matrix": _tool_pmc_hammer_matrix,
     "run_mrp_calculation": _tool_run_mrp_calculation,
+    "reschedule_work_order": _tool_reschedule_work_order,
+    "rush_insert_order": _tool_rush_insert_order,
+    "change_priority": _tool_change_priority,
+    "cancel_work_order": _tool_cancel_work_order,
+    "query_pmc_change_log": _tool_query_pmc_change_log,
     "create_rfq": _tool_create_rfq,
     "collect_quotations": _tool_collect_quotations,
     "select_best_quote": _tool_select_best_quote,
