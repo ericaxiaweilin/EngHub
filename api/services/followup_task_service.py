@@ -1101,6 +1101,9 @@ async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:
     return {"scanned": len(due), "outcomes": outcomes}
 
 
+_AUDIT_LAST_RUN = 0.0
+
+
 def _env_flag(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
@@ -1141,6 +1144,27 @@ async def followup_scanner_loop() -> None:
                                 _logger.warning(f"[rcc-events] {fid} 处理异常: {_ex}")
             except Exception as _e2:
                 _logger.warning(f"[rcc-events] 调度异常: {_e2}")
+            # ── 数据一致性审查（自动对账，无需人肉）：每 15 分钟 ──
+            try:
+                import time as _t5
+                global _AUDIT_LAST_RUN
+                if _t5.time() - _AUDIT_LAST_RUN > 900:
+                    _AUDIT_LAST_RUN = _t5.time()
+                    from api.services.consistency_audit import audit_consistency, format_report
+                    async with db_config.session_factory() as db:
+                        for _fid in ("FAC_MECH_001", "FAC_ELEC_DEMO_2026"):
+                            try:
+                                _rep = await audit_consistency(db, _fid)
+                                _s = _rep["summary"]
+                                if _s["drift"] > 0 or _s["error"] > 0:
+                                    _logger.warning(f"[consistency] {_fid} 数据漂移! {_s['drift']} DRIFT {_s['error']} ERROR")
+                                else:
+                                    _logger.info(f"[consistency] {_fid} {_s['ok']}/{_s['total']} 一致 OK")
+                            except Exception as _ex3:
+                                await db.rollback()
+                                _logger.warning(f"[consistency] {_fid} 审查异常: {_ex3}")
+            except Exception as _e3:
+                _logger.warning(f"[consistency] 调度异常: {_e3}")
             async with db_config.session_factory() as db:
                 result = await scan_due_tasks(db)
                 if result["scanned"]:

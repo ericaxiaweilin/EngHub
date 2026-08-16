@@ -59,6 +59,22 @@ class FollowupTaskUpdate(BaseModel):
     due_at: Optional[str] = None
 
 
+@router.get("/consistency-audit", summary="数据一致性审查报告（设备/人/任务/工单/chatbot/RCC 自动对账）")
+async def get_consistency_audit(db: AsyncSession = Depends(get_db)):
+    """自动对账：六方数据自证一致，DRIFT/ERROR 一目了然。"""
+    from api.services.consistency_audit import audit_consistency
+    from database.db_config import db_config
+    results = []
+    async with db_config.session_factory() as sdb:
+        for fid in ("FAC_MECH_001", "FAC_ELEC_DEMO_2026"):
+            try:
+                results.append(await audit_consistency(sdb, fid))
+            except Exception as e:
+                await sdb.rollback()
+                results.append({"factory_id": fid, "error": str(e)[:100]})
+    return {"success": True, "reports": results}
+
+
 @router.get("/tasks")
 async def list_followup_tasks(
     request: Request,
