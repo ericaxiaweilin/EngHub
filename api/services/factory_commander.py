@@ -411,19 +411,21 @@ class FactoryCommander:
                     _tgt = str(getattr(d, "target", "") or "")
                     dup = (await self.db.execute(_t("""
                         SELECT 1 FROM rcc_tasks WHERE task_type=:tt
+                        AND factory_id=:fid
                         AND COALESCE(affected_params->>'target','') = :tgt
                         AND status IN ('pending','approved','in_progress')
                         AND created_at > NOW() - interval '24 hours' LIMIT 1
-                    """), {"tt": act_str, "tgt": _tgt})).scalar_one_or_none()
+                    """), {"tt": act_str, "tgt": _tgt, "fid": factory_id})).scalar_one_or_none()
                     if not dup:
                         await self.db.execute(_t("""
-                            INSERT INTO rcc_tasks (id, task_code, task_type, title, description,
+                            INSERT INTO rcc_tasks (id, task_code, factory_id, task_type, title, description,
                                 status, requested_by, affected_params, created_at, updated_at)
-                            VALUES (:id, :code, :tt, :title, :desc, 'pending', :by,
+                            VALUES (:id, :code, :fid, :tt, :title, :desc, 'pending', :by,
                                     CAST(:ap AS jsonb), NOW(), NOW())
                         """), {
                             "id": str(_uid.uuid4()),
                             "code": f"RCC-AI-{_uid.uuid4().hex[:6].upper()}",
+                            "fid": factory_id,
                             "tt": act_str,
                             "title": f"[AI决策] {getattr(d, 'reason', '')[:60]}",
                             "desc": f"AI 指挥官决策，需审批后执行。action={act_str} target={getattr(d, 'target', '')}",

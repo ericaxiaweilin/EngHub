@@ -3305,11 +3305,15 @@ async def _report_rcc_action(db, factory_id: str, action_type: str, target: str,
                "ev": json.dumps({"risk": risk, "by": operator, "summary": summary}, ensure_ascii=False),
                "result": "ok", "ref": target})
         if rcc_task_type:
+            # RCC 组织单元按厂归属查找（旧版硬编码机械厂 org id，跨厂任务会挂错组织）
+            _rcc_org = (await db.execute(text(
+                "SELECT id FROM org_units WHERE factory_id=:f AND code LIKE 'RCC-%' LIMIT 1"
+            ), {"f": factory_id})).scalar_one_or_none() or "fb8337eb-c1d3-58af-842f-cf56d29e3f98"
             await db.execute(text("""
-                INSERT INTO rcc_tasks (id, task_code, org_unit_id, task_type, title, description, status, requested_by, created_at, updated_at)
-                VALUES (:tid, :tc, :org, :tt, :title, :desc, 'pending', :cb, NOW(), NOW())
+                INSERT INTO rcc_tasks (id, task_code, org_unit_id, factory_id, task_type, title, description, status, requested_by, created_at, updated_at)
+                VALUES (:tid, :tc, :org, :fid, :tt, :title, :desc, 'pending', :cb, NOW(), NOW())
             """), {"tid": str(_uuid.uuid4()), "tc": f"RCC-{str(_uuid.uuid4())[:7].upper()}",
-                   "org": "fb8337eb-c1d3-58af-842f-cf56d29e3f98", "tt": rcc_task_type,
+                   "org": _rcc_org, "fid": factory_id, "tt": rcc_task_type,
                    "title": f"[{action_type}] {target} {summary}",
                    "desc": detail or summary, "cb": operator})
         await db.commit()
@@ -4067,12 +4071,15 @@ async def _tool_reschedule_work_order(db: AsyncSession, args: Dict[str, Any], fa
                                 "risk": risk, "reason": reason, "by": operator})})
         if risk in ("critical", "warning"):
             # 提前交期 → RCC 调度任务（需重新排产确认）
+            _rcc_org = (await db.execute(text(
+                "SELECT id FROM org_units WHERE factory_id=:f AND code LIKE 'RCC-%' LIMIT 1"
+            ), {"f": fid})).scalar_one_or_none() or "fb8337eb-c1d3-58af-842f-cf56d29e3f98"
             await db.execute(text("""
-                INSERT INTO rcc_tasks (id, task_code, org_unit_id, task_type, title, description, status, requested_by, created_at, updated_at)
-                VALUES (:tid, :tc, :org, 'schedule_change',
+                INSERT INTO rcc_tasks (id, task_code, org_unit_id, factory_id, task_type, title, description, status, requested_by, created_at, updated_at)
+                VALUES (:tid, :tc, :org, :fid, 'schedule_change',
                         :title, :desc, 'pending', :cb, NOW(), NOW())
             """), {"tid": str(uuid.uuid4()), "tc": f"RCC-{str(uuid.uuid4())[:7].upper()}",
-                   "org": "fb8337eb-c1d3-58af-842f-cf56d29e3f98",
+                   "org": _rcc_org, "fid": fid,
                    "title": f"[交期变更] {wo_code} 交期提前 {abs(days_shift)} 天至 {new_due}，需重新排产确认",
                    "desc": f"原交期 {old_due} → 新交期 {new_due}，原因：{reason or '客户要求'}。需评估物料齐套与产线产能，必要时安排加急。",
                    "cb": operator})

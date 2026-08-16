@@ -156,18 +156,19 @@ class RCCResourceDecisionEngine:
                         count = trans["suggested_count"] if trans else station["on_leave"]
                         await self.db.execute(sql_text("""
                             INSERT INTO rcc_tasks
-                              (id, task_code, org_unit_id, task_type, title, description,
+                              (id, task_code, org_unit_id, factory_id, task_type, title, description,
                                status, requested_by, expected_impact_summary, request_context, created_at, updated_at)
                             VALUES
                               (gen_random_uuid()::text,
                                'RCC-' || upper(substr(md5(random()::text), 1, 8)),
-                               :org_id, 'manpower', :title, :desc,
+                               :org_id, :fid, 'manpower', :title, :desc,
                                'pending', 'RCCResourceDecisionEngine',
                                :impact,
                                CAST(:ctx AS jsonb),
                                NOW(), NOW())
                         """), {
                             "org_id": "fb8337eb-c1d3-58af-842f-cf56d29e3f98",
+                            "fid": factory_id,
                             "title": f"[人力调度] {station['station']} 缺勤 {station['leave_rate_pct']}%（{station['on_leave']}人请假），需借调支援",
                             "desc": f"{station['station']} 工位缺勤率 {station['leave_rate_pct']}% 大于等于 10%，"
                                     f"影响喷涂工单（WO-VF-0809-E987C urgent 等），需从 {source} 借调 {count} 人。",

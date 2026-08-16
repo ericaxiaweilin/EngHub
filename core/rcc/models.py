@@ -44,6 +44,8 @@ class RCCTask(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     task_code = Column(String(50), unique=True, nullable=False)
     org_unit_id = Column(String(36), ForeignKey("org_units.id", ondelete="SET NULL"))
+    # 多工厂隔离：任务归属厂区（旧数据可能为空，查询需容错）
+    factory_id = Column(String(50))
     task_type = Column(String(30), nullable=False)
     title = Column(String(200), nullable=False)
     description = Column(Text)

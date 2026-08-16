@@ -1013,13 +1013,13 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                     rcc_code = f"RCC-{str(uuid.uuid4())[:8].upper()}"
                     rcc_task_id = str(uuid.uuid4())
                     await db.execute(_rt(
-                        "INSERT INTO rcc_tasks (id, task_code, org_unit_id, task_type, title, description, "
+                        "INSERT INTO rcc_tasks (id, task_code, org_unit_id, factory_id, task_type, title, description, "
                         "affected_params, affected_entities, expected_impact_summary, status, requested_by, "
                         "request_context, created_at, updated_at) "
-                        "VALUES (:id, :code, :org, :tt, :title, :desc, '[]'::jsonb, :ents, :impact, 'pending', "
+                        "VALUES (:id, :code, :org, :fid, :tt, :title, :desc, '[]'::jsonb, :ents, :impact, 'pending', "
                         ":req, :ctx, NOW(), NOW())"
                     ), {
-                        "id": rcc_task_id, "code": rcc_code, "org": org_id, "tt": task_type,
+                        "id": rcc_task_id, "code": rcc_code, "org": org_id, "fid": factory_id, "tt": task_type,
                         "title": f"[任务受阻] {task['title'][:80]}",
                         "desc": str(conclusion.get("note") or "")[:500],
                         "ents": json.dumps([{"type": "followup_task", "id": task_id}], ensure_ascii=False),

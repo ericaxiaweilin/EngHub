@@ -193,17 +193,21 @@ class RCCTaskService:
         self,
         status: Optional[str] = None,
         org_unit_id: Optional[str] = None,
+        factory_id: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> List[Any]:
-        """查询 RCC 任务列表"""
+        """查询 RCC 任务列表（factory_id 过滤时兼容旧数据：含 factory_id 为空的任务）"""
         from core.rcc.models import RCCTask
+        from sqlalchemy import or_
         
         query = select(RCCTask)
         if status:
             query = query.where(RCCTask.status == status)
         if org_unit_id:
             query = query.where(RCCTask.org_unit_id == org_unit_id)
+        if factory_id:
+            query = query.where(or_(RCCTask.factory_id == factory_id, RCCTask.factory_id.is_(None)))
         query = query.order_by(RCCTask.created_at.desc()).offset((page-1)*page_size).limit(page_size)
         
         return list((await self.db.execute(query)).scalars().all())

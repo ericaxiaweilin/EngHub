@@ -22,19 +22,21 @@ router = APIRouter(prefix="/api/v1/rcc", tags=["rcc - 资源控制中心"])
 async def list_rcc_tasks(
     status: Optional[str] = None,
     org_unit_id: Optional[str] = None,
+    factory_id: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    """查询RCC调度任务列表"""
+    """查询RCC调度任务列表（可按工厂过滤）"""
     from core.rcc.services import RCCTaskService
 
     service = RCCTaskService(db)
     try:
-        tasks = await service.list_tasks(status=status, org_unit_id=org_unit_id, page=page, page_size=page_size)
+        tasks = await service.list_tasks(status=status, org_unit_id=org_unit_id, factory_id=factory_id, page=page, page_size=page_size)
         return {"items": [
             {
                 "id": t.id, "task_code": t.task_code, "org_unit_id": t.org_unit_id,
+                "factory_id": getattr(t, "factory_id", None),
                 "task_type": t.task_type, "title": t.title, "description": t.description,
                 "affected_params": t.affected_params, "affected_entities": t.affected_entities,
                 "expected_impact_summary": t.expected_impact_summary,
