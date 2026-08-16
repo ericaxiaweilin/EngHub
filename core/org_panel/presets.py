@@ -346,6 +346,7 @@ def build_electronics_factory() -> OrgSimEngine:
         node_id="line_leader",
         name="SMT线长",
         level=1,
+        parent_id="hr_sup",
         scope="SMT产线日常调度：速度/班次/加班/物料协调",
         transfer_fn=line_leader_transfer,
         parameters=[

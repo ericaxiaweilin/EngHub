@@ -120,8 +120,10 @@ class OrgNode:
         parameters: Optional[List[ParameterDef]] = None,
         capabilities: Optional[List[CapabilityDef]] = None,
         constraints: Optional[List[Constraint]] = None,
+        parent_id: Optional[str] = None,
     ):
         self.node_id = node_id
+        self.parent_id = parent_id  # 组织归属（如 SMT线长 → hr_sup 人力）
         self.name = name
         self.level = level          # 1=现场 2=主管 3=经理 4=总监 5=高层
         self.scope = scope          # 职责范围描述

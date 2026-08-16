@@ -23,6 +23,7 @@ const ROOT_ID = '__rcc_root__'
 interface BubbleNode {
   id: string
   name: string
+  parent_id?: string | null
   level: number
   scope: string
   health: 'normal' | 'warning' | 'danger'
@@ -72,28 +73,29 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
 
   const byId = new Map(nodes.map(node => [node.id, node]))
   const firstLevel = Math.min(...nodes.map(node => node.level))
+  // 有 parent_id 的节点归属到父节点下（如 SMT线长 → hr_sup 人力）
+  const withParent = new Set(nodes.filter(n => n.parent_id && byId.has(n.parent_id)).map(n => n.id))
+  const roots = nodes.filter(n => !withParent.has(n.id))
 
   const buildNode = (node: BubbleNode): BubbleNode => {
+    // 1) 优先按 parent_id 挂子节点（组织归属）
+    const directChildren = nodes.filter(c => c.parent_id === node.id)
+    // 2) 其次按 level 层级连（信号传导链）
     const nextLevel = node.level + 1
     const linkedIds = new Set<string>()
-
     edges.forEach(edge => {
-      const candidateId = edge.source === node.id
-        ? edge.target
-        : edge.target === node.id
-          ? edge.source
-          : null
-      if (candidateId && byId.get(candidateId)?.level === nextLevel) linkedIds.add(candidateId)
+      const candidateId = edge.source === node.id ? edge.target : edge.target === node.id ? edge.source : null
+      if (candidateId && byId.get(candidateId)?.level === nextLevel && !withParent.has(candidateId)) linkedIds.add(candidateId)
     })
-
-    // RCC 图可能存在未连线的角色，仍让它进入下一层，避免点击后没有层级反馈。
-    const childIds = linkedIds.size > 0
-      ? [...linkedIds]
-      : nodes.filter(candidate => candidate.level === nextLevel).map(candidate => candidate.id)
+    const childIds = directChildren.length > 0
+      ? [...directChildren.map(c => c.id), ...linkedIds]
+      : linkedIds.size > 0
+        ? [...linkedIds]
+        : nodes.filter(candidate => candidate.level === nextLevel && !withParent.has(candidate.id)).map(candidate => candidate.id)
 
     return {
       ...node,
-      children: childIds
+      children: [...new Set(childIds)]
         .map(childId => byId.get(childId))
         .filter((child): child is BubbleNode => Boolean(child))
         .map(buildNode),
@@ -111,8 +113,8 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
     key_outputs: {},
     param_count: 0,
     capability_count: 0,
-    children: nodes
-      .filter(node => node.level === firstLevel)
+    children: roots
+      .filter(node => node.level <= firstLevel + 1)
       .map(buildNode),
   }
 }

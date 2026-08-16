@@ -431,6 +431,7 @@ async def org_bubbles(factory_id: str = Query("F01")):
         nodes.append({
             "id": nid,
             "name": node.name,
+            "parent_id": getattr(node, "parent_id", None),
             "level": node.level,
             "scope": node.scope,
             "health": health,
