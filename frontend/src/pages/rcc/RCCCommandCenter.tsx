@@ -9,7 +9,7 @@ import {
   ThunderboltOutlined, FundOutlined, CarryOutOutlined, FileTextOutlined,
   ReloadOutlined, SearchOutlined, CheckOutlined, CloseOutlined,
   RobotOutlined, ClusterOutlined, ApartmentOutlined, TeamOutlined,
-  ControlOutlined, FireOutlined, DashboardOutlined, AppstoreOutlined,
+  ControlOutlined, FireOutlined, DashboardOutlined, AppstoreOutlined, ClockCircleOutlined,
 } from '@ant-design/icons'
 import axios from 'axios'
 import { RccContext } from './rcc_theme'
@@ -21,6 +21,7 @@ import RCCDecisionHub from './RCCDecisionHub'
 import RCCAnalysis from './RCCAnalysis'
 import LogicChainEditor from './LogicChainEditor'
 import NeuralGraph from './RCCNeuralGraph'
+import RCCApprovalCenter from './RCCApprovalCenter'
 
 const API = '/api/v1'
 const C = {
@@ -112,6 +113,7 @@ export default function RCCCommandCenter() {
     { key: 'bubbles', label: '组织气泡图', icon: <ClusterOutlined /> },
     { key: 'overview', label: '指挥总览', icon: <DashboardOutlined /> },
     { key: 'ai', label: 'AI 调度', icon: <ThunderboltOutlined />, badge: pending.length },
+    { key: 'approvals', label: '审批中心', icon: <CheckOutlined />, badge: pending.length },
     { key: 'capacity', label: '资源负荷', icon: <FundOutlined /> },
     { key: 'resources', label: '资源调度板', icon: <AppstoreOutlined /> },
     { key: 'decisions', label: '决策中心', icon: <ControlOutlined /> },
@@ -206,6 +208,7 @@ export default function RCCCommandCenter() {
           {activeTab === 'analysis' && <RCCAnalysis />}
           {activeTab === 'logic' && <LogicChainView />}
           {activeTab === 'neural' && <NeuralGraph tasks={tasks} inbox={inbox} baseline={baseline} factoryId={factoryId} />}
+          {activeTab === 'approvals' && <RCCApprovalCenter onApproved={loadAll} />}
           {activeTab === 'logs' && <LogStream />}
 
           {/* AI 调度（设计稿排版：hero + 流水线 + 方案卡网格） */}
@@ -351,27 +354,26 @@ export default function RCCCommandCenter() {
           </RccContext.Provider>
         </main>
 
-        {/* 右 rail：管理者 Action Center（固定右边框，不折叠） */}
+        {/* 右 rail：管理者 Action Center（轻量提示 + 跳转审批中心） */}
         <aside style={{ background: C.surface, borderLeft: `1px solid ${C.border}`, padding: '14px 13px 28px', overflow: 'auto', maxHeight: 'calc(100vh - 106px)', minWidth: 0 }}>
           <div style={{ fontSize: 10.5, fontWeight: 800, color: C.text3, letterSpacing: .7, textTransform: 'uppercase', margin: '4px 9px 8px' }}>管理者 Action Center</div>
-          {pending.length === 0 && <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, color: C.text3, fontSize: 11, textAlign: 'center' }}>审批队列已清空 ✓</div>}
-          {pending.slice(0, 5).map((t: any) => {
-            const tm = TYPE_META[t.task_type] || { label: t.task_type, color: C.brand, soft: C.brandSoft }
-            return (
-              <div key={t.id} style={{ border: t.task_type === 'approval' ? '1px solid #F0B7B7' : `1px solid ${C.border}`, borderRadius: 12, padding: 12, marginBottom: 10, background: C.surface }}>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                  <div style={{ width: 29, height: 29, borderRadius: 8, background: tm.soft, color: tm.color, display: 'grid', placeItems: 'center', flex: '0 0 auto', fontSize: 13 }}><CarryOutOutlined /></div>
-                  <div><div style={{ fontSize: 12.5, fontWeight: 780, lineHeight: 1.35 }}>{t.title?.slice(0, 30)}{t.title?.length > 30 ? '…' : ''}</div><div style={{ marginTop: 3, fontSize: 10, color: C.text3, fontFamily: 'monospace' }}>{t.task_code} · {tm.label}</div></div>
-                </div>
-                <div style={{ fontSize: 11, color: C.text2, lineHeight: 1.5, margin: '9px 0' }}>{t.expected_impact_summary || t.description || '—'}</div>
-                <div style={{ borderLeft: `2px solid ${C.cyan}`, padding: '7px 8px', background: C.cyanSoft, color: '#24656C', fontSize: 10.5, lineHeight: 1.45, borderRadius: '0 7px 7px 0' }}><RobotOutlined /> {t.requested_by || '智能体'} 提交 · 审批后自动回写解除阻塞</div>
-                <div style={{ display: 'flex', gap: 6, marginTop: 9 }}>
-                  <button onClick={() => approve(t.id)} style={{ flex: 1, height: 29, borderRadius: 7, border: 'none', background: C.brand, color: '#fff', fontSize: 10.5, fontWeight: 800, cursor: 'pointer' }}><CheckOutlined /> 批准</button>
-                  <button onClick={() => reject(t.id)} style={{ flex: 1, height: 29, borderRadius: 7, border: `1px solid ${C.border}`, background: C.surface, color: C.text2, fontSize: 10.5, fontWeight: 800, cursor: 'pointer' }}><CloseOutlined /> 驳回</button>
-                </div>
+          {/* 待审批状态卡 */}
+          <div style={{ border: pending.length > 0 ? '1px solid #F0B7B7' : `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 12, background: pending.length > 0 ? C.dangerSoft : C.surface }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ width: 34, height: 34, borderRadius: 9, background: pending.length > 0 ? C.danger : C.successSoft, color: pending.length > 0 ? '#fff' : C.success, display: 'grid', placeItems: 'center', fontSize: 15 }}>
+                {pending.length > 0 ? <ClockCircleOutlined /> : <CheckOutlined />}
               </div>
-            )
-          })}
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 850, fontFamily: 'monospace', color: C.text }}>{pending.length}</div>
+                <div style={{ fontSize: 10.5, color: C.text3 }}>{pending.length > 0 ? '项待审批调度申请' : '审批队列已清空'}</div>
+              </div>
+            </div>
+            <button onClick={() => { setActiveTab('approvals'); setSearchParams({ tab: 'approvals' }) }}
+              style={{ width: '100%', marginTop: 12, height: 32, borderRadius: 8, border: 'none', background: C.brand, color: '#fff', fontSize: 11.5, fontWeight: 800, cursor: 'pointer' }}>
+              进入审批中心 →
+            </button>
+          </div>
+          {/* 今日调度闭环 */}
           <div style={{ marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 13 }}>
             <div style={{ fontSize: 10.5, fontWeight: 800, color: C.text3, letterSpacing: .7, textTransform: 'uppercase', margin: '0 0 8px' }}>今日调度闭环</div>
             {[['AI 提议', tasks.length], ['已审批', tasks.filter((t: any) => t.status === 'approved').length], ['人工驳回', tasks.filter((t: any) => t.status === 'rejected').length], ['待审批', pending.length]].map(([k, v]) => (
