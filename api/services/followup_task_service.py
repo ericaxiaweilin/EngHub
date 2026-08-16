@@ -1167,8 +1167,23 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
                 """), {"note": f"[AI自动闭环] 物料 {mcode.group(1)} 库存 {inv} >= 工单需求 {need_check}，真齐套，缺料解除", "id": task_id})
                 await db.commit()
                 return {"action": "closed", "note": f"物料 {mcode.group(1)} 库存 {inv} >= 需求 {need_check}，AI 验证后闭环"}
-            # 库存不足 = 不是假闭环，转采购
-            return {"action": "escalated", "note": f"物料 {mcode.group(1)} 库存 {inv} < 工单需求 {need_check}，缺口 {float(need_check)-float(inv)}，转采购补货"}
+            # 库存不足 = 不是假闭环 → 采购智能体接管：自动建 PR（缺多少补多少）
+            gap = float(need_check) - float(inv)
+            pr_exists = (await db.execute(text(
+                "SELECT 1 FROM purchase_requisitions WHERE material_code=:m AND status IN ('PENDING','pending') LIMIT 1"
+            ), {"m": mcode.group(1)})).scalar_one_or_none()
+            if not pr_exists:
+                try:
+                    await db.execute(text("""
+                        INSERT INTO purchase_requisitions (id, factory_id, material_code, material_name, qty, unit,
+                            status, source, created_by, created_at, updated_at)
+                        VALUES (gen_random_uuid()::text, :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
+                    """), {"f": fid, "m": mcode.group(1), "mn": mcode.group(1), "q": gap})
+                    await db.commit()
+                    return {"action": "auto_pr", "note": f"物料 {mcode.group(1)} 缺口 {round(gap,1)}，采购智能体已自动创建 PR（数量=缺口）"}
+                except Exception:
+                    pass
+            return {"action": "escalated", "note": f"物料 {mcode.group(1)} 库存 {inv} < 工单需求 {need_check}，缺口 {round(gap,1)}，已有 PR 在途转采购跟催"}
             # 库存不足 → 检查是否已有 PR，无则自动建 PR（采购接管）
             has_pr = (await db.execute(text(
                 "SELECT 1 FROM purchase_requisitions WHERE material_code=:m AND status IN ('PENDING','pending') LIMIT 1"

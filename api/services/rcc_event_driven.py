@@ -82,19 +82,30 @@ async def detect_changes(db, factory_id: str) -> Dict:
                      "qty": r["planned_qty"], "due": str(r["planned_due"])[:10]},
         })
 
-    # 4) 缺料：inventory 0 + 在制工单需要
+    # 4) 缺料：库存 < 在制/待排工单需求（真缺料，MRP 口径）
     mat_rows = (await db.execute(text("""
-        SELECT i.material_code, i.material_name,
-               (SELECT COUNT(*) FROM work_order_materials wom WHERE wom.material_code=i.material_code AND wom.shortage_qty > 0) AS affected_wos
-        FROM inventory i
-        WHERE i.factory_id=:f AND COALESCE(i.available_qty,0) <= 0
-        LIMIT 5
+        SELECT wom.material_code,
+               COALESCE((SELECT SUM(inv2.available_qty) FROM inventory inv2
+                         WHERE inv2.material_code=wom.material_code AND inv2.factory_id=:f), 0) AS avail,
+               SUM(wom.required_qty - wom.received_qty) AS need,
+               COUNT(DISTINCT wom.work_order_id) AS affected_wos
+        FROM work_order_materials wom
+        JOIN work_orders wo ON wo.id=wom.work_order_id
+        WHERE wo.factory_id=:f AND wo.status IN ('released','in_progress','pending')
+          AND wom.required_qty > wom.received_qty
+        GROUP BY wom.material_code
+        HAVING SUM(wom.required_qty - wom.received_qty) > COALESCE(
+            (SELECT SUM(inv2.available_qty) FROM inventory inv2
+             WHERE inv2.material_code=wom.material_code AND inv2.factory_id=:f), 0)
+        LIMIT 8
     """), {"f": factory_id})).mappings().all()
     for r in mat_rows:
         events.append({
             "event_type": "material_shortage",
             "agent_key": "warehouse_agent",
-            "data": {"material_code": r["material_code"], "material_name": r["material_name"],
+            "data": {"material_code": r["material_code"],
+                     "avail": float(r["avail"] or 0), "need": float(r["need"] or 0),
+                     "gap": round(float(r["need"] or 0) - float(r["avail"] or 0), 1),
                      "affected_wos": r["affected_wos"]},
         })
 
@@ -189,10 +200,25 @@ async def reconcile(db, factory_id: str) -> Dict:
 
         elif ev["event_type"] == "material_shortage":
             mcode = data.get("material_code")
-            decision["summary"] = f"缺料 {mcode}"
+            gap = data.get("gap")
+            decision["summary"] = f"缺料 {mcode}（缺口 {gap}）"
             await _notify(db, factory_id, "procurement",
-                          f"【缺料】{mcode} 库存为0，请采购处理",
-                          f"影响 {data.get('affected_wos')} 个在制工单，RCC 已升级", "critical")
+                          f"【缺料】{mcode} 缺口 {gap}，请采购处理",
+                          f"影响 {data.get('affected_wos')} 个在制工单，RCC 已升级并建任务", "critical")
+            # ── 自动建缺料任务（智能体接管：AI 引擎会验证→闭环/转采购）──
+            dup = (await db.execute(text("""
+                SELECT 1 FROM followup_tasks
+                WHERE factory_id=:f AND title LIKE :like AND status IN ('open','blocked') LIMIT 1
+            """), {"f": factory_id, "like": f"%{mcode}%"})).scalar_one_or_none()
+            if not dup:
+                await db.execute(text("""
+                    INSERT INTO followup_tasks (id, factory_id, created_by, title, description, status,
+                        agent_key, follow_interval_minutes, next_follow_at, max_follows, assigned_to, created_at, updated_at)
+                    VALUES (gen_random_uuid()::text, :f, 'rcc_events', :title, :desc, 'blocked',
+                        'procurement_agent', 30, NOW(), 10, 'procurement', NOW(), NOW())
+                """), {"f": factory_id,
+                       "title": f"缺料：{mcode} 可用 {data.get('avail')} < 在制需求 {data.get('need')}",
+                       "desc": f"RCC 检测到缺料，缺口 {gap}，影响 {data.get('affected_wos')} 个在制工单。AI 引擎将自动验证库存并处理。"})
 
         result["decisions"].append(decision)
         result["notified"].append(decision["summary"])
