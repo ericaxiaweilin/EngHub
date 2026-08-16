@@ -484,51 +484,86 @@ async def pmc_hammer_matrix(payload: Dict[str, Any], db: AsyncSession = Depends(
         """), {"f": fid, "codes": wocodes})).mappings().all()
 
     # 2) 开关定义（与 scenario 一致，用"切换后"语义）
-    switches = [
-        {"key": "shift_mode", "label": "时间锤·双班", "value": "double", "desc": "单班→双班(10h→20h)"},
-        {"key": "iqc_mode", "label": "物料锤·抽检", "value": "sampling", "desc": "免检→抽检(+4h)"},
-        {"key": "iqc_mode", "label": "物料锤·全检", "value": "full", "desc": "免检→全检(+8h)"},
-        {"key": "line_occupancy", "label": "生产锤·共享线", "value": "shared_50", "desc": "独占→共享(50%)"},
-        {"key": "customs_mode", "label": "出货锤·海关抽查", "value": "random", "desc": "免查验→抽查(+24h)"},
-        {"key": "yield_rate", "label": "生产锤·良率降", "value": 0.92, "desc": "良率97%→92%"},
-        {"key": "enable_air_freight", "label": "紧急锤·空运", "value": True, "desc": "海运→空运"},
+    # 参数维度（表头可调）：每个维度多档，前端下拉选择
+    dimensions = [
+        {"key": "shift_mode", "label": "时间锤·班次",
+         "options": [{"value": "single", "label": "单班(10h)", "desc": "每天 1 班 10 小时"},
+                     {"value": "double", "label": "双班(20h)", "desc": "每天 2 班 20 小时"},
+                     {"value": "triple", "label": "三班(24h)", "desc": "全天 3 班 24 小时"}],
+         "default": "single"},
+        {"key": "iqc_mode", "label": "物料锤·检验",
+         "options": [{"value": "exempt", "label": "免检(0h)", "desc": "供应商免检，来料直接上线"},
+                     {"value": "sampling", "label": "抽检(+4h)", "desc": "IQC 抽样检验 4 小时"},
+                     {"value": "full", "label": "全检(+8h)", "desc": "IQC 全数检验 8 小时"}],
+         "default": "exempt"},
+        {"key": "line_occupancy", "label": "生产锤·线体",
+         "options": [{"value": "exclusive", "label": "独占线", "desc": "本工单独占产线，UPH 100%"},
+                     {"value": "shared_50", "label": "共享线(50%)", "desc": "与别单共享产线，UPH 减半"},
+                     {"value": "shared_30", "label": "共享线(30%)", "desc": "多单挤占，UPH 只剩 30%"}],
+         "default": "exclusive"},
+        {"key": "yield_rate", "label": "生产锤·良率",
+         "options": [{"value": 0.97, "label": "良率97%", "desc": "正常良率"},
+                     {"value": 0.92, "label": "良率92%", "desc": "过程不良增多，工时放大"},
+                     {"value": 0.85, "label": "良率85%", "desc": "重大异常，工时放大明显"}],
+         "default": 0.97},
+        {"key": "customs_mode", "label": "出货锤·海关",
+         "options": [{"value": "none", "label": "免查验(0h)", "desc": "普货正常放行"},
+                     {"value": "random", "label": "抽查(+24h)", "desc": "海关随机抽查 24 小时"},
+                     {"value": "full", "label": "全查(+48h)", "desc": "海关全面查验 48 小时"}],
+         "default": "none"},
+        {"key": "enable_air_freight", "label": "紧急锤·运输",
+         "options": [{"value": False, "label": "海运(12天)", "desc": "标准海运"},
+                     {"value": True, "label": "空运(2天)", "desc": "紧急空运，成本高"}],
+         "default": False},
     ]
 
-    # 3) 逐工单算基准 + 各开关影响（ETA 缺失时用兜底产能估算，保证锤子图可看）
+    # 前端传入的参数组合（各维度当前档），未传用默认
+    params = payload.get("params") or {}
+    cur_opts = {d["key"]: params.get(d["key"], d["default"]) for d in dimensions}
+    base_opts = {"shift_mode": "single", "iqc_mode": "exempt",
+                 "line_occupancy": "exclusive", "customs_mode": "none",
+                 "yield_rate": 0.97, "enable_air_freight": False}
+    # 应用当前组合（保留非维度参数）
+    for k, v in cur_opts.items():
+        if v is not None:
+            base_opts[k] = v
+
+    # 3) 逐工单：基准 = 当前参数组合；单元格 = 各维度切到其他档的相对偏移
     from api.services.pmc_work_matrix_service import PmcWorkMatrixService
     svc = PmcWorkMatrixService(db)
     rows = []
     for wo in wo_rows:
-        base_opts = {"shift_mode": "single", "iqc_mode": "exempt",
-                     "line_occupancy": "exclusive", "customs_mode": "none",
-                     "yield_rate": 0.97, "enable_air_freight": False}
         try:
             base = await svc.build(fid, wo["work_order_code"], base_opts)
         except Exception:
             base = {}
         base_eta = str(base.get("estimated_eta") or "")[:10]
         base_days = _date_delta(base.get("estimated_eta"), wo["planned_due"])
-        # 兜底：build 无 ETA（缺 routing/产能）时，用 默认UPH 12 × 工时 估算
         if base_days is None:
             base_days = _fallback_eta_days(wo, base_opts)
             base_eta = _fallback_eta(wo, base_opts)
 
         cells = []
-        for sw in switches:
-            opts = {**base_opts, sw["key"]: sw["value"]}
-            try:
-                res = await svc.build(fid, wo["work_order_code"], opts)
-            except Exception:
-                res = {}
-            eta = str(res.get("estimated_eta") or "")[:10]
-            days = _date_delta(res.get("estimated_eta"), wo["planned_due"])
-            if days is None:
-                days = _fallback_eta_days(wo, opts)
-                eta = _fallback_eta(wo, opts)
-            offset = (days - base_days) if (days is not None and base_days is not None) else None
-            level = "danger" if (offset or 0) > 2 else ("warning" if (offset or 0) > 0 else "ok")
-            cells.append({"switch": sw["key"], "label": sw["label"], "offset_days": offset,
-                          "level": level, "eta": eta, "desc": sw["desc"]})
+        for dim in dimensions:
+            for opt in dim["options"]:
+                if opt["value"] == cur_opts.get(dim["key"]):
+                    continue  # 当前档不算偏移（基准）
+                opts = {**base_opts, dim["key"]: opt["value"]}
+                try:
+                    res = await svc.build(fid, wo["work_order_code"], opts)
+                except Exception:
+                    res = {}
+                eta = str(res.get("estimated_eta") or "")[:10]
+                days = _date_delta(res.get("estimated_eta"), wo["planned_due"])
+                if days is None:
+                    days = _fallback_eta_days(wo, opts)
+                    eta = _fallback_eta(wo, opts)
+                offset = (days - base_days) if (days is not None and base_days is not None) else None
+                level = "danger" if (offset or 0) > 2 else ("warning" if (offset or 0) > 0 else "ok")
+                cells.append({"switch": dim["key"], "dimension": dim["label"],
+                              "label": f"{dim['label']}·{opt['label']}",
+                              "option_value": opt["value"], "option_label": opt["label"],
+                              "offset_days": offset, "level": level, "eta": eta, "desc": opt["desc"]})
 
         rows.append({
             "work_order_code": wo["work_order_code"],
@@ -557,18 +592,19 @@ async def pmc_hammer_matrix(payload: Dict[str, Any], db: AsyncSession = Depends(
                 "worst_offset_days": round(max_off, 1),
                 "recommendation": _hammer_recommendation(r),
             })
-    for sw in switches:
+    # 风险维度：某维度任一切换档位导致多工单延后 → 该维度是全局风险点
+    for dim in dimensions:
         affected = [r["work_order_code"] for r in rows if any(
-            c["switch"] == sw["key"] and c["label"] == sw["label"] and (c["offset_days"] or 0) > 0
+            c["switch"] == dim["key"] and (c["offset_days"] or 0) > 0
             for c in r["cells"])]
         if len(affected) >= max(2, len(rows) * 0.3):
             risk_switches.append({
-                "label": sw["label"], "desc": sw["desc"],
+                "label": dim["label"], "desc": "该参数切换影响多工单",
                 "affected_count": len(affected), "affected_total": len(rows),
             })
 
-    return {"success": True, "factory_id": fid, "switches": switches,
-            "rows": rows, "count": len(rows),
+    return {"success": True, "factory_id": fid, "dimensions": dimensions,
+            "params": cur_opts, "rows": rows, "count": len(rows),
             "decision": {
                 "sensitive_work_orders": sorted(sensitive_wos, key=lambda x: -x["worst_offset_days"]),
                 "global_risk_switches": sorted(risk_switches, key=lambda x: -x["affected_count"]),
@@ -623,7 +659,7 @@ def _fallback_eta(wo, opts) -> str:
 
 
 def _hammer_recommendation(r: Dict) -> str:
-    """单工单推荐：找能改善的开关（负偏移）组合。"""
+    """单工单推荐：找能改善的档位（负偏移）与需避免的档位。"""
     good = [c for c in r["cells"] if (c["offset_days"] or 0) < 0]
     bad = [c for c in r["cells"] if (c["offset_days"] or 0) > 2]
     parts = []
