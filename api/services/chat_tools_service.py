@@ -2779,7 +2779,7 @@ async def _tool_pmc_hammer_matrix(db: AsyncSession, args: Dict[str, Any], factor
     """锤子图决策矩阵：HTTP 调自身端点。"""
     import httpx
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("http://127.0.0.1:18888/api/v1/pmc/work-matrix/hammer",
+        r = await client.post("http://127.0.0.1:8000/api/v1/pmc/work-matrix/hammer",
                               json={**args, "factory_id": factory_id or "FAC_MECH_001"})
         return r.json() if r.status_code == 200 else {"error": f"锤子图失败 {r.status_code}: {r.text[:100]}"}
 
@@ -2788,7 +2788,7 @@ async def _tool_pmc_backward_schedule(db: AsyncSession, args: Dict[str, Any], fa
     """交期倒推：HTTP 调自身端点。"""
     import httpx
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("http://127.0.0.1:18888/api/v1/pmc/backward-schedule",
+        r = await client.post("http://127.0.0.1:8000/api/v1/pmc/backward-schedule",
                               json={**args, "factory_id": factory_id or "FAC_MECH_001"})
         return r.json() if r.status_code == 200 else {"error": f"倒推失败 {r.status_code}: {r.text[:100]}"}
 
@@ -2797,7 +2797,7 @@ async def _tool_pmc_backward_to_plan(db: AsyncSession, args: Dict[str, Any], fac
     """倒推→计划：HTTP 调自身端点。"""
     import httpx
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("http://127.0.0.1:18888/api/v1/pmc/backward-to-plan",
+        r = await client.post("http://127.0.0.1:8000/api/v1/pmc/backward-to-plan",
                               json={**args, "factory_id": factory_id or "FAC_MECH_001"})
         return r.json() if r.status_code == 200 else {"error": f"生成计划失败 {r.status_code}: {r.text[:100]}"}
 
