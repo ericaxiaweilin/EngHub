@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, Field
@@ -539,8 +539,38 @@ async def pmc_hammer_matrix(payload: Dict[str, Any], db: AsyncSession = Depends(
             "cells": cells,
         })
 
+    # ── 决策推导层（AI 决策依据）：敏感工单 / 全局风险开关 / 推荐杠杆 ──
+    sensitive_wos = []
+    risk_switches = []
+    for r in rows:
+        max_off = max((c["offset_days"] or 0) for c in r["cells"]) if r["cells"] else 0
+        worst = max(r["cells"], key=lambda c: c["offset_days"] or 0) if r["cells"] else None
+        if max_off > 2:
+            sensitive_wos.append({
+                "work_order_code": r["work_order_code"],
+                "priority": r["priority"],
+                "due": r["due"],
+                "worst_switch": worst["label"] if worst else "",
+                "worst_offset_days": round(max_off, 1),
+                "recommendation": _hammer_recommendation(r),
+            })
+    for sw in switches:
+        affected = [r["work_order_code"] for r in rows if any(
+            c["switch"] == sw["key"] and c["label"] == sw["label"] and (c["offset_days"] or 0) > 0
+            for c in r["cells"])]
+        if len(affected) >= max(2, len(rows) * 0.3):
+            risk_switches.append({
+                "label": sw["label"], "desc": sw["desc"],
+                "affected_count": len(affected), "affected_total": len(rows),
+            })
+
     return {"success": True, "factory_id": fid, "switches": switches,
-            "rows": rows, "count": len(rows)}
+            "rows": rows, "count": len(rows),
+            "decision": {
+                "sensitive_work_orders": sorted(sensitive_wos, key=lambda x: -x["worst_offset_days"]),
+                "global_risk_switches": sorted(risk_switches, key=lambda x: -x["affected_count"]),
+                "summary": _hammer_summary(rows),
+            }}
 
 
 def _date_delta(eta, due) -> Optional[float]:
@@ -586,3 +616,36 @@ def _fallback_eta(wo, opts) -> str:
     from datetime import datetime, date
     days = _fallback_production_days(wo, opts)
     return str((datetime.combine(date.today(), datetime.min.time()) + timedelta(days=days)).date())
+
+
+
+def _hammer_recommendation(r: Dict) -> str:
+    """单工单推荐：找能改善的开关（负偏移）组合。"""
+    good = [c for c in r["cells"] if (c["offset_days"] or 0) < 0]
+    bad = [c for c in r["cells"] if (c["offset_days"] or 0) > 2]
+    parts = []
+    if good:
+        best = min(good, key=lambda c: c["offset_days"])
+        parts.append(f"优先{best['label']}（提前{abs(round(best['offset_days'], 1))}天）")
+    if bad:
+        worst = max(bad, key=lambda c: c["offset_days"])
+        parts.append(f"避免{worst['label']}（延后{round(worst['offset_days'], 1)}天）")
+    if not parts:
+        parts.append("当前排程较稳，无需大调整")
+    return "；".join(parts)
+
+
+def _hammer_summary(rows: List[Dict]) -> str:
+    """一句话决策摘要。"""
+    if not rows:
+        return "无工单数据"
+    urgent = [r for r in rows if r["priority"] == "urgent"]
+    sensitive = [r for r in rows if max((c["offset_days"] or 0) for c in r["cells"]) > 2]
+    parts = [f"{len(rows)} 个工单"]
+    if urgent:
+        parts.append(f"{len(urgent)} 个急单")
+    if sensitive:
+        parts.append(f"{len(sensitive)} 个排程敏感（需重点保障）")
+    else:
+        parts.append("排程稳健")
+    return "，".join(parts)

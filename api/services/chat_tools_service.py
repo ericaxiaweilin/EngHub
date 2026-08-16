@@ -135,6 +135,21 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "pmc_hammer_matrix",
+            "description": "PMC 锤子图决策矩阵：工单×开关影响分析，返回敏感工单（排程敏感需重点保障）、全局风险开关（多工单受影响）、每个工单的推荐杠杆（哪个开关能提前/避免延后）。用于这批工单怎么排最稳、哪个工单最敏感、排程风险在哪、怎么保交付类请求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "分析工单数（默认8）"},
+                    "work_order_codes": {"type": "array", "items": {"type": "string"}, "description": "指定工单（可选）"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "pmc_backward_schedule",
             "description": "PMC 交期倒推（五节点）：客户交期到ETD/Cut-off到生产完成到物料可上线到供应商ETA，含物料红线/每日排产/风险分级(green/yellow/red)。用于订单何时必须开始生产、物料最晚何时到、交货是否来得及类请求。",
             "parameters": {
@@ -2760,6 +2775,15 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _tool_pmc_hammer_matrix(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """锤子图决策矩阵：HTTP 调自身端点。"""
+    import httpx
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post("http://127.0.0.1:18888/api/v1/pmc/work-matrix/hammer",
+                              json={**args, "factory_id": factory_id or "FAC_MECH_001"})
+        return r.json() if r.status_code == 200 else {"error": f"锤子图失败 {r.status_code}: {r.text[:100]}"}
+
+
 async def _tool_pmc_backward_schedule(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
     """交期倒推：HTTP 调自身端点。"""
     import httpx
@@ -3364,6 +3388,7 @@ _TOOL_EXECUTORS = {
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
+    "pmc_hammer_matrix": _tool_pmc_hammer_matrix,
     "pmc_backward_schedule": _tool_pmc_backward_schedule,
     "pmc_backward_to_plan": _tool_pmc_backward_to_plan,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
