@@ -94,6 +94,67 @@ class RCCTaskService:
                 await self.db.commit()
         except Exception:
             pass
+
+        # ── AI→审批→执行 闭环：审批通过后按 affected_params.action 执行原决策 ──
+        try:
+            import json as _json
+            ap = getattr(task, "affected_params", None) or {}
+            if isinstance(ap, str):
+                ap = _json.loads(ap)
+            action = ap.get("action", "") if isinstance(ap, dict) else ""
+            target = ap.get("target", "") if isinstance(ap, dict) else ""
+            params = ap.get("params", {}) if isinstance(ap, dict) else {}
+            if action:
+                from sqlalchemy import text as _tex
+                executed = False
+                if action == "expedite" and target:
+                    # 加急：目标工单优先级提到 urgent + 记事件
+                    wo = await self.db.execute(_tex(
+                        "SELECT id, work_order_code FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
+                    ), {"t": target})
+                    wo_row = wo.mappings().first()
+                    if wo_row:
+                        await self.db.execute(_tex(
+                            "UPDATE work_orders SET priority='urgent', updated_at=NOW() WHERE id=:id"
+                        ), {"id": wo_row["id"]})
+                        executed = True
+                elif action == "change_priority" and target:
+                    prio = params.get("priority", "urgent") if isinstance(params, dict) else "urgent"
+                    wo = await self.db.execute(_tex(
+                        "SELECT id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
+                    ), {"t": target})
+                    wo_row = wo.mappings().first()
+                    if wo_row:
+                        await self.db.execute(_tex(
+                            "UPDATE work_orders SET priority=:p, updated_at=NOW() WHERE id=:id"
+                        ), {"p": prio, "id": wo_row["id"]})
+                        executed = True
+                # 审计事件
+                # 工厂推导：从目标工单或任务上下文
+                fid = None
+                if target:
+                    _r = await self.db.execute(_tex(
+                        "SELECT factory_id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
+                    ), {"t": target})
+                    fid = _r.scalar_one_or_none()
+                if not fid:
+                    fid = "FAC_MECH_001"
+                await self.db.execute(_tex("""
+                    INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
+                    VALUES (gen_random_uuid()::text, :f,
+                            'rcc_task_executed', 'rcc_approval',
+                            CAST(:d AS jsonb), NOW())
+                """), {"f": fid,
+                       "d": _json.dumps({"task_code": getattr(task, "task_code", ""),
+                                         "action": action, "target": target,
+                                         "executed": executed, "approver": approver_id},
+                                        ensure_ascii=False)})
+                if executed:
+                    task.status = "executed"
+                    task.executed_at = datetime.utcnow()
+                await self.db.commit()  # 执行器落库（工单优先级 + 任务状态 + 审计）
+        except Exception:
+            pass  # 执行失败不阻塞审批主流程（审计已尽力写入）
         return task
     
     async def reject_task(self, task_id: str, approver_id: str, reason: str) -> Any:
