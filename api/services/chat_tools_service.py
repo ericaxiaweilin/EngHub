@@ -321,6 +321,65 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             {
                 "type": "function",
                 "function": {
+                    "name": "demand_forecast",
+                    "description": "需求预测：按产品统计近期销售/订单趋势，估算未来需求（简单移动平均/趋势），输出预测需求表。用于'预测下月需求''这个产品需求趋势''需求计划'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "product_id": {"type": "string", "description": "产品编码（可选，不传按产品汇总TOP）"},
+                            "horizon_days": {"type": "integer", "description": "预测展望天数（默认30）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "rccp_check",
+                    "description": "粗能力计划 RCCP 检查：关键产线/瓶颈资源在未来窗口的粗负荷（需求工时 vs 可用工时），超负荷即预警。用于'产能够不够''粗能力检查''关键产线负荷''RCCP'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "horizon_days": {"type": "integer", "description": "展望天数（默认14）"},
+                            "threshold_pct": {"type": "number", "description": "超负荷阈值%（默认90）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "changeover_plan",
+                    "description": "换线管理：查产线换型计划（换线时间/换线产品/准备时长），评估换线对排程的影响。用于'换线计划''什么时候换型''换线影响'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "station_code": {"type": "string", "description": "工位/产线编码（可选）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "plan_achievement",
+                    "description": "计划达成率：MPS 计划数量 vs 实际产出（工单报工/完工），按产品/工单算达成率，识别欠产/超产。用于'计划达成率''完成率多少''MPS达成'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "period_days": {"type": "integer", "description": "统计窗口天数（默认7）"},
+                            "product_id": {"type": "string", "description": "产品过滤（可选）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "fifo_check",
                     "description": "库存 FIFO 检查（先进先出管控）：按物料查库龄分布（<30/30-90/90-180/>180天）、呆滞占比、FIFO 执行风险（老库存占比高=发料没按先进先出）。用于'FIFO检查''库龄分布''先进先出执行得怎么样''哪些料库存老化'类请求。",
                     "parameters": {
@@ -3598,6 +3657,142 @@ async def _tool_query_supplier_rank(db: AsyncSession, args: Dict[str, Any], fact
                          "orders": int(r["order_count"] or 0)} for r in rows]}
 
 
+async def _tool_demand_forecast(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """需求预测：近期订单趋势 → 移动平均预测。"""
+    fid = factory_id or "FAC_MECH_001"
+    prod = str(args.get("product_id") or "").strip()
+    horizon = int(args.get("horizon_days") or 30)
+    cond = "factory_id=:f"
+    params: Dict[str, Any] = {"f": fid, "h": horizon}
+    if prod:
+        cond += " AND product_id=:p"
+        params["p"] = prod
+    # 近 90 天订单按产品汇总
+    rows = (await db.execute(text(f"""
+        SELECT product_id, COUNT(*) AS order_count,
+               COALESCE(SUM(quantity),0) AS total_qty,
+               COUNT(*) FILTER (WHERE status IN ('confirmed','在生产','completed')) AS confirmed
+        FROM sales_orders WHERE {cond} AND created_at > NOW() - interval '90 days'
+        GROUP BY product_id ORDER BY total_qty DESC LIMIT 10
+    """), params)).mappings().all()
+    items = []
+    for r in rows:
+        # 移动平均：90 天量 / 3 = 月均 → 预测 horizon 天
+        daily = float(r["total_qty"]) / 90
+        forecast = round(daily * horizon, 1)
+        items.append({"product_id": r["product_id"], "orders_90d": r["order_count"],
+                      "qty_90d": float(r["total_qty"]), "confirmed": r["confirmed"],
+                      "daily_avg": round(daily, 1),
+                      "forecast_qty": forecast, "forecast_days": horizon,
+                      "trend": "上升" if forecast > daily * 15 else "平稳"})
+    return {"type": "demand_forecast", "horizon_days": horizon, "count": len(items), "items": items,
+            "note": "简单移动平均：近90天日均 × 展望天数。建议结合客户意向修正。"}
+
+
+async def _tool_rccp_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """粗能力计划 RCCP：关键产线未来窗口负荷检查。"""
+    fid = factory_id or "FAC_MECH_001"
+    horizon = int(args.get("horizon_days") or 14)
+    threshold = float(args.get("threshold_pct") or 90)
+    # 工位负荷：APS 任务窗口聚合（工时）
+    rows = (await db.execute(text("""
+        SELECT st.station_code, st.station_name,
+               COUNT(*) AS tasks,
+               COALESCE(SUM(t.setup_minutes + t.run_seconds / 60.0), 0) / 60.0 AS load_hours,
+               :h * 12 AS avail_hours
+        FROM aps_schedule_tasks t
+        LEFT JOIN stations st ON st.id = t.station_id
+        WHERE st.factory_id = :f AND t.planned_start BETWEEN CURRENT_DATE AND CURRENT_DATE + (:h || ' days')::interval
+        GROUP BY st.station_code, st.station_name
+        ORDER BY load_hours DESC LIMIT 10
+    """), {"f": fid, "h": horizon})).mappings().all()
+    items = []
+    for r in rows:
+        load = float(r["load_hours"] or 0)
+        avail = float(r["avail_hours"] or 0)
+        pct = round(load / avail * 100, 1) if avail else 0
+        items.append({"station": r["station_code"], "station_name": r["station_name"],
+                      "tasks": r["tasks"], "load_hours": round(load, 1),
+                      "available_hours": avail, "load_pct": pct,
+                      "level": "critical" if pct >= threshold else ("warning" if pct >= threshold * 0.8 else "ok"),
+                      "suggestion": f"负荷 {pct}% 超阈值 {threshold}%，需排程调整或加班" if pct >= threshold else "负荷正常"})
+    return {"type": "rccp_check", "horizon_days": horizon, "threshold_pct": threshold,
+            "count": len(items), "items": items,
+            "note": "粗能力：关键产线需求工时 vs 可用工时（12h/天），超阈值预警"}
+
+
+async def _tool_changeover_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """换线管理：查换型计划与影响。"""
+    fid = factory_id or "FAC_MECH_001"
+    station = str(args.get("station_code") or "").strip()
+    # 换线相关：APS 任务里换型记录或工单切换
+    cond = "wo.factory_id=:f"
+    params: Dict[str, Any] = {"f": fid}
+    if station:
+        cond += " AND st.station_code=:s"
+        params["s"] = station
+    rows = (await db.execute(text(f"""
+        SELECT st.station_code AS station, st.station_name,
+               wo.work_order_code, wo.product_id, wo.status,
+               wo.planned_due
+        FROM work_orders wo
+        LEFT JOIN stations st ON st.id = wo.assigned_station_id
+        WHERE {cond} AND wo.status IN ('pending','released')
+        ORDER BY wo.planned_due LIMIT 10
+    """), params)).mappings().all()
+    # 按工位分组，识别换型点（产品变化）
+    from collections import OrderedDict
+    stations: dict = OrderedDict()
+    for r in rows:
+        s = r["station"] or "未分配工位"
+        if s not in stations:
+            stations[s] = []
+        stations[s].append({"work_order": r["work_order_code"], "product": r["product_id"],
+                            "due": str(r["planned_due"])[:10], "status": r["status"]})
+    items = []
+    for s, wos in stations.items():
+        # 换型点：相邻工单产品不同
+        changeovers = sum(1 for i in range(1, len(wos)) if wos[i]["product"] != wos[i-1]["product"])
+        items.append({"station": s, "work_orders": len(wos), "changeovers": changeovers,
+                      "impact": f"{len(wos)} 个工单 {changeovers} 次换型，建议按产品归并减少换线" if changeovers > 1 else "排程连续，换线少"})
+    return {"type": "changeover_plan", "count": len(items), "items": items,
+            "note": "换线管理：同一工位产品切换 = 换型点，影响产出时间"}
+
+
+async def _tool_plan_achievement(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """计划达成率：MPS/工单计划 vs 实际报工。"""
+    fid = factory_id or "FAC_MECH_001"
+    days = int(args.get("period_days") or 7)
+    prod = str(args.get("product_id") or "").strip()
+    cond = "wo.factory_id=:f"
+    params: Dict[str, Any] = {"f": fid, "d": days}
+    if prod:
+        cond += " AND wo.product_id=:p"
+        params["p"] = prod
+    rows = (await db.execute(text(f"""
+        SELECT wo.product_id, wo.work_order_code, wo.planned_qty, wo.completed_qty,
+               wo.good_qty, wo.status, wo.planned_due
+        FROM work_orders wo
+        WHERE {cond} AND wo.created_at > NOW() - make_interval(days => :d)
+        ORDER BY wo.planned_due DESC LIMIT 15
+    """), params)).mappings().all()
+    items = []
+    for r in rows:
+        plan = float(r["planned_qty"] or 0)
+        done = float(r["completed_qty"] or 0)
+        ach = round(done / plan * 100, 1) if plan else 0
+        items.append({"work_order": r["work_order_code"], "product": r["product_id"],
+                      "planned": plan, "completed": done, "good": float(r["good_qty"] or 0),
+                      "achievement": ach, "status": r["status"],
+                      "level": "on_track" if ach >= 95 else ("behind" if ach >= 70 else "critical"),
+                      "due": str(r["planned_due"])[:10]})
+    # 汇总
+    avg = round(sum(i["achievement"] for i in items) / len(items), 1) if items else 0
+    return {"type": "plan_achievement", "period_days": days, "count": len(items),
+            "avg_achievement": avg, "items": items,
+            "note": f"近 {days} 天工单平均达成率 {avg}%（计划 vs 报工完成）"}
+
+
 async def _tool_fifo_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
     """FIFO 检查：库龄分布 + 呆滞占比 + FIFO 执行风险。"""
     fid = factory_id or "FAC_MECH_001"
@@ -4658,6 +4853,10 @@ _TOOL_EXECUTORS = {
     "pmc_hammer_matrix": _tool_pmc_hammer_matrix,
     "run_mrp_calculation": _tool_run_mrp_calculation,
     "fifo_check": _tool_fifo_check,
+    "demand_forecast": _tool_demand_forecast,
+    "rccp_check": _tool_rccp_check,
+    "changeover_plan": _tool_changeover_plan,
+    "plan_achievement": _tool_plan_achievement,
     "eat_check": _tool_eat_check,
     "reschedule_work_order": _tool_reschedule_work_order,
     "rush_insert_order": _tool_rush_insert_order,
