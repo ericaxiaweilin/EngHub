@@ -72,13 +72,15 @@ async def audit_consistency(db, factory_id: str = "FAC_MECH_001") -> Dict:
         calc = RCCResourceCalculator(db)
         bl = (await calc.full_baseline_sync(factory_id)).get("baseline", {})
         eq_bl = bl.get("equipment", {})
+        # 基线状态分布不含 broken 键时即“零故障”，按 0 处理（否则 None≠0 误报漂移）
+        bl_broken = (eq_bl.get("statuses", {}) or {}).get("broken") or 0
         checks.append(_check("设备1: 总数一致",
                              str(eq_bl.get("total")), eq["total"], eq_bl.get("total"),
                              ok_rule=lambda v, e: v == e,
                              drift="equipment 表总数与 RCC 基线不一致"))
         checks.append(_check("设备2: 故障数一致",
-                             f"broken={eq_bl.get('statuses', {}).get('broken')}", eq["broken"],
-                             eq_bl.get("statuses", {}).get("broken"),
+                             f"broken={bl_broken}", eq["broken"],
+                             bl_broken,
                              ok_rule=lambda v, e: v == e,
                              drift="故障设备数与 RCC 基线不一致"))
     except Exception as e:
