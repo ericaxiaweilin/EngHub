@@ -392,6 +392,47 @@ class FactoryCommander:
         decisions = await self._decide(state)
         report.decisions = decisions
 
+        # 3.5 AI→审批闭环：高风险决策自动落 RCC 待审批任务（人审批通过才执行）
+        # 需要审批的动作：插单/改期/撤单/下单/拒单/加急（影响资源或资金）
+        APPROVAL_ACTIONS = {
+            "rush_insert", "reschedule", "cancel_order", "place_order",
+            "reject_order", "expedite", "change_priority",
+        }
+        try:
+            from sqlalchemy import text as _t
+            import uuid as _uid
+            for d in decisions:
+                act = getattr(d, "action", None)
+                act_str = act.value if hasattr(act, "value") else str(act)
+                if act_str in APPROVAL_ACTIONS:
+                    # 去重：同 factory+同动作类型+同 target 已有 pending 任务则跳过
+                    dup = (await self.db.execute(_t("""
+                        SELECT 1 FROM rcc_tasks WHERE task_type=:tt
+                        AND title LIKE :tl AND status='pending' LIMIT 1
+                    """), {"tt": act_str,
+                           "tl": f"%{getattr(d, 'target', '')}%"})).scalar_one_or_none()
+                    if not dup:
+                        await self.db.execute(_t("""
+                            INSERT INTO rcc_tasks (id, task_code, task_type, title, description,
+                                status, requested_by, affected_params, created_at, updated_at)
+                            VALUES (:id, :code, :tt, :title, :desc, 'pending', :by,
+                                    CAST(:ap AS jsonb), NOW(), NOW())
+                        """), {
+                            "id": str(_uid.uuid4()),
+                            "code": f"RCC-AI-{_uid.uuid4().hex[:6].upper()}",
+                            "tt": act_str,
+                            "title": f"[AI决策] {getattr(d, 'reason', '')[:60]}",
+                            "desc": f"AI 指挥官决策，需审批后执行。action={act_str} target={getattr(d, 'target', '')}",
+                            "by": created_by or "ai_commander",
+                            "ap": __import__('json').dumps({"action": act_str,
+                                                            "target": getattr(d, "target", ""),
+                                                            "params": getattr(d, "params", {})},
+                                                           ensure_ascii=False),
+                        })
+            await self.db.commit()
+        except Exception as _ae:
+            _logger.warning(f"[commander] AI决策落RCC任务失败(不阻塞): {_ae}")
+
         # 4. 执行 + 计划（Planner）：是任务就有 plan —— 决策聚合为目标导向的行动计划
         if auto_execute:
             await self._execute_decisions(decisions, factory_id, state)

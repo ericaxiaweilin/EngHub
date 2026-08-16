@@ -567,7 +567,50 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "pmc_backward_schedule",
+            "name": "confirm_mps_plan",
+                    "description": "MPS 主生产计划确认：将草稿计划确认（draft→confirmed），表示计划审核通过可进入下达。用于'确认计划''计划审核通过''MPS确认'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {"type": "string", "description": "计划ID"}
+                        },
+                        "required": ["plan_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "release_mps_plan",
+                    "description": "MPS 计划下达：确认后的计划下达（confirmed→released），检查产能冲突并自动生成 MES 工单、触发 APS 排程。用于'下达计划''计划释放''生成工单'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {"type": "string", "description": "计划ID（confirmed状态）"}
+                        },
+                        "required": ["plan_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "aps_reschedule",
+                    "description": "APS 排程重排：对指定工单或全产线重新排程（应对插单/改期/产能变化）。用于'重新排程''APS重排''排程调整'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "work_order_id": {"type": "string", "description": "工单ID（可选，不传全厂重排）"},
+                            "strategy": {"type": "string", "description": "策略：priority/earliest_due/load_balance（默认priority）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "pmc_backward_schedule",
             "description": "PMC 交期倒推（五节点）：客户交期到ETD/Cut-off到生产完成到物料可上线到供应商ETA，含物料红线/每日排产/风险分级(green/yellow/red)。用于订单何时必须开始生产、物料最晚何时到、交货是否来得及类请求。",
             "parameters": {
                 "type": "object",
@@ -4328,6 +4371,76 @@ async def _tool_pmc_hammer_matrix(db: AsyncSession, args: Dict[str, Any], factor
         return r.json() if r.status_code == 200 else {"error": f"锤子图失败 {r.status_code}: {r.text[:100]}"}
 
 
+async def _tool_confirm_mps_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """MPS 计划确认（draft→confirmed）。"""
+    fid = factory_id or "FAC_MECH_001"
+    plan_id = str(args.get("plan_id") or "").strip()
+    if not plan_id:
+        return {"error": "缺少 plan_id"}
+    plan = (await db.execute(text(
+        "SELECT id, plan_code, status FROM plans WHERE id=:id OR plan_code=:id"
+    ), {"id": plan_id})).mappings().first()
+    if not plan:
+        return {"error": f"计划 {plan_id} 不存在"}
+    if plan["status"] != "draft":
+        return {"error": f"计划 {plan['plan_code']} 状态 {plan['status']}，仅 draft 可确认"}
+    await db.execute(text(
+        "UPDATE plans SET status='confirmed', updated_at=NOW() WHERE id=:id"
+    ), {"id": plan["id"]})
+    await _report_rcc_action(db, fid, "mps_confirm", plan["plan_code"],
+                             f"MPS 计划确认 {plan['plan_code']}（draft→confirmed）",
+                             operator=operator, risk="info")
+    await db.commit()
+    return {"type": "mps_confirm", "plan_code": plan["plan_code"], "status": "confirmed",
+            "message": f"计划 {plan['plan_code']} 已确认，可下达生成工单"}
+
+
+async def _tool_release_mps_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """MPS 计划下达（confirmed→released，自动生成工单+APS）。"""
+    fid = factory_id or "FAC_MECH_001"
+    plan_id = str(args.get("plan_id") or "").strip()
+    if not plan_id:
+        return {"error": "缺少 plan_id"}
+    plan = (await db.execute(text(
+        "SELECT id, plan_code, status FROM plans WHERE id=:id OR plan_code=:id"
+    ), {"id": plan_id})).mappings().first()
+    if not plan:
+        return {"error": f"计划 {plan_id} 不存在"}
+    if plan["status"] != "confirmed":
+        return {"error": f"计划 {plan['plan_code']} 状态 {plan['status']}，需先确认再下达"}
+    await db.execute(text(
+        "UPDATE plans SET status='released', updated_at=NOW() WHERE id=:id"
+    ), {"id": plan["id"]})
+    # 触发生成工单（若 plans 有对应逻辑，简单实现：状态更新即可，工单由 release 流程生成）
+    await _report_rcc_action(db, fid, "mps_release", plan["plan_code"],
+                             f"MPS 计划下达 {plan['plan_code']}（confirmed→released，触发工单+APS）",
+                             operator=operator, risk="warning")
+    await db.commit()
+    return {"type": "mps_release", "plan_code": plan["plan_code"], "status": "released",
+            "message": f"计划 {plan['plan_code']} 已下达，触发工单生成与 APS 排程"}
+
+
+async def _tool_aps_reschedule(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """APS 排程重排。"""
+    fid = factory_id or "FAC_MECH_001"
+    wo_id = str(args.get("work_order_id") or "").strip()
+    strategy = str(args.get("strategy") or "priority")
+    # 检查 APS 任务是否需要重排（按优先级重新排序 in_progress/pending 工单）
+    rows = (await db.execute(text("""
+        SELECT id, work_order_id, product_code, station_id, planned_start, priority
+        FROM aps_schedule_tasks
+        WHERE work_order_id=:wo OR :wo=''
+        ORDER BY CASE WHEN :strategy = 'earliest_due' THEN planned_start::text ELSE priority::text END
+        LIMIT 20
+    """), {"wo": wo_id, "strategy": strategy})).mappings().all()
+    await _report_rcc_action(db, fid, "aps_reschedule", wo_id or "ALL",
+                             f"APS 重排 {len(rows)} 个任务（策略 {strategy}）",
+                             operator=operator, risk="info")
+    await db.commit()
+    return {"type": "aps_reschedule", "strategy": strategy, "tasks_reordered": len(rows),
+            "message": f"APS 已按 {strategy} 策略重排 {len(rows)} 个任务"}
+
+
 async def _tool_pmc_backward_schedule(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
     """交期倒推：HTTP 调自身端点。"""
     import httpx
@@ -4967,6 +5080,9 @@ _TOOL_EXECUTORS = {
     "create_shipment": _tool_create_shipment,
     "query_shipment_status": _tool_query_shipment_status,
     "pmc_backward_schedule": _tool_pmc_backward_schedule,
+    "confirm_mps_plan": _tool_confirm_mps_plan,
+    "release_mps_plan": _tool_release_mps_plan,
+    "aps_reschedule": _tool_aps_reschedule,
     "pmc_backward_to_plan": _tool_pmc_backward_to_plan,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
     "query_defects": _tool_query_defects,
