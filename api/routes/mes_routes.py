@@ -1125,3 +1125,73 @@ async def list_work_order_templates(
 
 
 __all__ = ["router"]
+
+
+@router.get("/work-orders/{work_order_id}/relations", summary="工单跨表关联数据（BOM/物料库存/在途PO/报工）")
+async def work_order_relations(
+    work_order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """工单关联数据聚合（只读，飞书式跨表引用）：
+    1. 物料齐套：work_order_materials（需求/已收/缺口）
+    2. 库存：inventory（各物料可用量）
+    3. 在途采购：purchase_orders（PO 状态/ETA）
+    4. 报工记录：production_reports（良品/不良/报废）
+    """
+    from sqlalchemy import text as _t
+    # 1) 工单基本信息
+    wo = (await db.execute(_t(
+        "SELECT id, work_order_code, product_id, planned_qty, completed_qty, status FROM work_orders WHERE id=:id OR work_order_code=:id"
+    ), {"id": work_order_id})).mappings().first()
+    if not wo:
+        raise HTTPException(404, "工单不存在")
+
+    # 2) 物料齐套 + 库存 + 在途 PO（一次查）
+    mats = (await db.execute(_t("""
+        SELECT wom.material_code, wom.material_name, wom.required_qty, wom.received_qty, wom.shortage_qty,
+               (SELECT COALESCE(SUM(i.available_qty),0) FROM inventory i
+                WHERE i.material_code=wom.material_code AND i.factory_id=wo.factory_id) AS inv_qty,
+               (SELECT COALESCE(SUM(po.qty),0) FROM purchase_orders po
+                WHERE po.material_code=wom.material_code AND po.factory_id=wo.factory_id
+                  AND po.status IN ('ordered','confirmed','shipped')) AS po_qty,
+               (SELECT MIN(po2.expected_date) FROM purchase_orders po2
+                WHERE po2.material_code=wom.material_code AND po2.factory_id=wo.factory_id
+                  AND po2.status IN ('ordered','confirmed','shipped')) AS po_eta
+        FROM work_order_materials wom
+        JOIN work_orders wo ON wo.id=wom.work_order_id
+        WHERE wom.work_order_id=:id
+        ORDER BY wom.required_qty DESC
+    """), {"id": wo["id"]})).mappings().all()
+
+    # 3) 报工记录
+    reports = (await db.execute(_t("""
+        SELECT pr.report_code, pr.good_qty, pr.defect_qty, pr.scrap_qty, pr.shift, pr.operator_id, pr.created_at
+        FROM production_reports pr WHERE pr.work_order_id=:id
+        ORDER BY pr.created_at DESC LIMIT 10
+    """), {"id": wo["id"]})).mappings().all()
+
+    # 4) 汇总齐套状态
+    shortage_total = sum(float(m["shortage_qty"] or 0) for m in mats)
+    return {
+        "success": True,
+        "work_order": {"code": wo["work_order_code"], "product": wo["product_id"],
+                       "planned_qty": wo["planned_qty"], "completed_qty": wo["completed_qty"],
+                       "status": wo["status"]},
+        "materials": [{"material_code": m["material_code"], "material_name": m["material_name"] or m["material_code"],
+                       "required": float(m["required_qty"] or 0), "received": float(m["received_qty"] or 0),
+                       "shortage": float(m["shortage_qty"] or 0),
+                       "inventory": float(m["inv_qty"] or 0),
+                       "on_order": float(m["po_qty"] or 0),
+                       "po_eta": str(m["po_eta"])[:10] if m["po_eta"] else None,
+                       "ready": float(m["shortage_qty"] or 0) <= 0} for m in mats],
+        "reports": [{"code": r["report_code"], "good": float(r["good_qty"] or 0),
+                     "defect": float(r["defect_qty"] or 0), "scrap": float(r["scrap_qty"] or 0),
+                     "shift": r["shift"], "operator": r["operator_id"],
+                     "at": str(r["created_at"])[:16]} for r in reports],
+        "summary": {"material_count": len(mats),
+                    "kitting_ok": shortage_total <= 0,
+                    "total_shortage": round(shortage_total, 1),
+                    "report_count": len(reports)},
+        "note": "跨表关联（只读）：物料齐套 ← work_order_materials，库存 ← inventory，在途 ← purchase_orders，报工 ← production_reports",
+    }
