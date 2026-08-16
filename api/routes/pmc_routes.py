@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -767,3 +768,143 @@ async def personal_plan(
                      "change": f"{c['before_value']} → {c['after_value']}",
                      "reason": c["reason"], "at": str(c["created_at"])[:16]} for c in changes],
     }
+
+
+# ═══ PO/PR 单据模板（标准采购单据，可打印/存 PDF）═══
+def _doc_style() -> str:
+    return """
+    <style>
+      body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; margin: 24px; color: #222; }
+      .doc-header { display: flex; justify-content: space-between; border-bottom: 2px solid #333; padding-bottom: 12px; }
+      .doc-title { font-size: 24px; font-weight: 700; }
+      .doc-no { font-size: 14px; color: #555; margin-top: 4px; }
+      .doc-parties { display: flex; justify-content: space-between; margin: 16px 0; }
+      .party-box { width: 45%; font-size: 13px; line-height: 1.8; }
+      .party-label { font-weight: 700; margin-bottom: 4px; }
+      table.items { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+      table.items th { background: #f0f0f0; border: 1px solid #ccc; padding: 8px; text-align: left; }
+      table.items td { border: 1px solid #ccc; padding: 8px; }
+      table.items td.num { text-align: right; }
+      .doc-meta { font-size: 13px; line-height: 2; margin: 12px 0; }
+      .doc-total { text-align: right; font-size: 15px; font-weight: 700; margin: 8px 0; }
+      .doc-footer { margin-top: 32px; font-size: 12px; color: #777; border-top: 1px solid #ddd; padding-top: 8px; }
+      .sign-row { display: flex; justify-content: space-between; margin-top: 48px; font-size: 13px; }
+      .sign-box { width: 30%; text-align: center; }
+      .sign-line { border-top: 1px solid #333; margin-top: 32px; padding-top: 4px; }
+    </style>
+    """
+
+
+@router.get("/doc-template/po", summary="PO 采购订单单模板（标准单据，打印/PDF）")
+async def po_doc_template(po_code: str, db: AsyncSession = Depends(get_db)):
+    """按 PO 编号生成标准采购订单单（HTML，可打印导出 PDF）。"""
+    from sqlalchemy import text as sql_text
+    po = (await db.execute(sql_text(
+        "SELECT po_code, supplier_name, supplier_id, material_code, material_name, qty, unit_price, "
+        "total_amount, expected_date, status, created_at FROM purchase_orders WHERE po_code=:c OR id=:c"
+    ), {"c": po_code})).mappings().first()
+    if not po:
+        return HTMLResponse(f"<h3>PO {po_code} 不存在</h3>", status_code=404)
+    html = f"""<html><head><meta charset="utf-8">{_doc_style()}</head><body>
+    <div class="doc-header">
+      <div>
+        <div class="doc-title">采 购 订 单</div>
+        <div class="doc-no">PURCHASE ORDER · {po["po_code"]}</div>
+      </div>
+      <div style="text-align:right; font-size:13px; line-height:1.8;">
+        <div>日期：{str(po["created_at"])[:10]}</div>
+        <div>状态：{po["status"]}</div>
+      </div>
+    </div>
+    <div class="doc-parties">
+      <div class="party-box">
+        <div class="party-label">采购方（Buyer）</div>
+        <div>某某机械制造有限公司</div>
+        <div>联系人：采购部</div>
+      </div>
+      <div class="party-box">
+        <div class="party-label">供应商（Supplier）</div>
+        <div>{po["supplier_name"] or po["supplier_id"] or "未指派"}</div>
+        <div>供应商编号：{po["supplier_id"] or "-"}</div>
+      </div>
+    </div>
+    <table class="items">
+      <tr><th>序号</th><th>物料编码</th><th>物料名称</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>要求交期</th></tr>
+      <tr>
+        <td>1</td><td>{po["material_code"]}</td><td>{po["material_name"] or "-"}</td>
+        <td>PCS</td>
+        <td class="num">{float(po["qty"]):,.1f}</td>
+        <td class="num">{float(po["unit_price"] or 0):,.2f}</td>
+        <td class="num">{float(po["total_amount"] or 0):,.2f}</td>
+        <td>{str(po["expected_date"])[:10] if po["expected_date"] else "-"}</td>
+      </tr>
+    </table>
+    <div class="doc-total">合计金额：¥ {float(po["total_amount"] or 0):,.2f}</div>
+    <div class="doc-meta">
+      付款条款：月结 30 天<br/>
+      交期要求：按订单要求日期交货，逾期按合同条款处理<br/>
+      质检要求：到货须附合格证，IQC 检验合格后入库
+    </div>
+    <div class="sign-row">
+      <div class="sign-box"><div class="sign-line">采购经办</div></div>
+      <div class="sign-box"><div class="sign-line">供应商确认</div></div>
+      <div class="sign-box"><div class="sign-line">财务</div></div>
+    </div>
+    <div class="doc-footer">本订单由企业数字员工系统生成 · {po["po_code"]} · 打印时间 {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
+    </body></html>"""
+    return HTMLResponse(html)
+
+
+@router.get("/doc-template/pr", summary="PR 采购申请单模板（标准单据，打印/PDF）")
+async def pr_doc_template(pr_code: str, db: AsyncSession = Depends(get_db)):
+    """按 PR 编号生成标准采购申请单（HTML，可打印导出 PDF）。"""
+    from sqlalchemy import text as sql_text
+    pr = (await db.execute(sql_text(
+        "SELECT pr_code, material_code, material_name, qty, unit, status, source, created_by, "
+        "created_at, priority FROM purchase_requisitions WHERE pr_code=:c OR id=:c"
+    ), {"c": pr_code})).mappings().first()
+    if not pr:
+        return HTMLResponse(f"<h3>PR {pr_code} 不存在</h3>", status_code=404)
+    html = f"""<html><head><meta charset="utf-8">{_doc_style()}</head><body>
+    <div class="doc-header">
+      <div>
+        <div class="doc-title">采 购 申 请 单</div>
+        <div class="doc-no">PURCHASE REQUISITION · {pr["pr_code"]}</div>
+      </div>
+      <div style="text-align:right; font-size:13px; line-height:1.8;">
+        <div>日期：{str(pr["created_at"])[:10]}</div>
+        <div>状态：{pr["status"]}</div>
+      </div>
+    </div>
+    <div class="doc-parties">
+      <div class="party-box">
+        <div class="party-label">申请部门</div>
+        <div>PMC 计划部</div>
+        <div>申请人：{pr["created_by"] or "-"}</div>
+      </div>
+      <div class="party-box">
+        <div class="party-label">申请用途</div>
+        <div>生产物料需求 / 缺料补货</div>
+        <div>来源：{pr["source"] or "-"} · 优先级：{pr.get("priority") or "正常"}</div>
+      </div>
+    </div>
+    <table class="items">
+      <tr><th>序号</th><th>物料编码</th><th>物料名称</th><th>单位</th><th>申请数量</th><th>需求日期</th></tr>
+      <tr>
+        <td>1</td><td>{pr["material_code"]}</td><td>{pr["material_name"] or "-"}</td>
+        <td>{pr["unit"] or "PCS"}</td><td class="num">{float(pr["qty"]):,.1f}</td>
+        <td>{str(pr["created_at"])[:10]}</td>
+      </tr>
+    </table>
+    <div class="doc-meta">
+      请购说明：生产缺料/安全库存补货，请采购按此申请执行寻源询价并回传预计到货时间。<br/>
+      审批流程：PMC 申请 → 部门主管审批 → 采购处理
+    </div>
+    <div class="sign-row">
+      <div class="sign-box"><div class="sign-line">申请人</div></div>
+      <div class="sign-box"><div class="sign-line">部门主管</div></div>
+      <div class="sign-box"><div class="sign-line">采购接收</div></div>
+    </div>
+    <div class="doc-footer">本申请由企业数字员工系统生成 · {pr["pr_code"]} · 打印时间 {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
+    </body></html>"""
+    return HTMLResponse(html)

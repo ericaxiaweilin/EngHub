@@ -135,7 +135,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "create_supplier_profile",
+            "name": "get_document_template",
+                    "description": "获取采购单据模板（PO采购订单单/PR采购申请单）：返回可打印/存PDF的单据 HTML 链接。用于'PO单模板''PR单模板''打印采购订单''采购申请单'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "doc_type": {"type": "string", "description": "po或pr"},
+                            "doc_code": {"type": "string", "description": "单据编号（PO-xxx 或 PR-xxx）"}
+                        },
+                        "required": ["doc_type", "doc_code"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_supplier_profile",
                     "description": "供应商建档：登记新供应商（名称/类别/联系人/付款条件/资质），供应商开发日常。用于'新供应商建档''开发供应商''登记供应商'类请求。",
                     "parameters": {
                         "type": "object",
@@ -3258,6 +3273,28 @@ async def _report_rcc_action(db, factory_id: str, action_type: str, target: str,
         pass
 
 
+async def _tool_get_document_template(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """PO/PR 单据模板链接。"""
+    doc_type = str(args.get("doc_type") or "").strip().lower()
+    doc_code = str(args.get("doc_code") or "").strip()
+    if doc_type not in ("po", "pr") or not doc_code:
+        return {"error": "需要 doc_type(po/pr) 和 doc_code"}
+    # 验证单据存在
+    if doc_type == "po":
+        tbl, col = "purchase_orders", "po_code"
+    else:
+        tbl, col = "purchase_requisitions", "pr_code"
+    row = (await db.execute(text(
+        f"SELECT {col} FROM {tbl} WHERE {col}=:c OR id=:c LIMIT 1"
+    ), {"c": doc_code})).mappings().first()
+    if not row:
+        return {"error": f"{doc_type.upper()} {doc_code} 不存在"}
+    code = row[col]
+    url = f"/api/v1/pmc/doc-template/{doc_type}?{doc_type}_code={code}"
+    return {"type": "document_template", "doc_type": doc_type, "doc_code": code,
+            "url": url, "message": f"{'采购订单' if doc_type=='po' else '采购申请'} {code} 模板已生成，可打印/存PDF"}
+
+
 async def _tool_create_supplier_profile(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
     """供应商建档。"""
     fid = factory_id or "FAC_MECH_001"
@@ -4865,6 +4902,7 @@ _TOOL_EXECUTORS = {
     "query_pmc_change_log": _tool_query_pmc_change_log,
     "create_rfq": _tool_create_rfq,
     "create_supplier_profile": _tool_create_supplier_profile,
+    "get_document_template": _tool_get_document_template,
     "payment_request": _tool_payment_request,
     "purchase_return": _tool_purchase_return,
     "manage_supplier_status": _tool_manage_supplier_status,
