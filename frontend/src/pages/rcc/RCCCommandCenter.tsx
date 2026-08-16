@@ -105,8 +105,14 @@ export default function RCCCommandCenter() {
 
   const people = baseline.people || {}
   const equipment = baseline.equipment || {}
+  // baseline 是聚合对象（people: active_workers/skills/alert_count；equipment: total/statuses/oee）
   const peopleList = Array.isArray(people) ? people : (people.items || [])
   const equipList = Array.isArray(equipment) ? equipment : (equipment.items || [])
+  const peopleCount = typeof people === 'object' && !Array.isArray(people) ? (people.active_workers || 0) : peopleList.length
+  const equipTotal = typeof equipment === 'object' && !Array.isArray(equipment) ? (equipment.total || 0) : equipList.length
+  const equipStatuses = (equipment && typeof equipment === 'object' && !Array.isArray(equipment) && equipment.statuses) || {}
+  const equipFaultCount = equipStatuses.broken || equipStatuses.fault || 0
+  const equipMaintenanceCount = equipStatuses.maintenance || 0
 
   // 视图导航（找回全部页面）
   const views = [
@@ -169,10 +175,10 @@ export default function RCCCommandCenter() {
             全局资源态势 <span style={{ marginLeft: 'auto', fontSize: 11, fontFamily: 'monospace', color: C.text3 }}>LIVE</span>
           </button>
           {[
-            { id: 'line', name: '线体 / 车间', icon: '⌁', accent: C.brand, soft: C.brandSoft, state: `${equipList.filter((e: any) => e.utilization > 0.9).length || 0} 超载`, meta: `${equipList.length || 0} 节点` },
+            { id: 'line', name: '线体 / 车间', icon: '⌁', accent: C.brand, soft: C.brandSoft, state: `${equipFaultCount + equipMaintenanceCount} 异常`, meta: `${equipTotal} 台设备` },
             { id: 'material', name: '物料 / 齐套', icon: '◇', accent: C.danger, soft: C.dangerSoft, state: `${blockedTasks.filter((t: any) => (t.block_category || '') === 'material').length} 缺料`, meta: `${blockedTasks.length} 受阻` },
-            { id: 'people', name: '人员 / 技能', icon: '◎', accent: C.purple, soft: C.purpleSoft, state: `${peopleList.length || 0} 人`, meta: '技能矩阵' },
-            { id: 'equipment', name: '设备 / 模具', icon: '▣', accent: C.cyan, soft: C.cyanSoft, state: `${equipList.filter((e: any) => e.status === 'fault').length || 0} 故障`, meta: 'OEE' },
+            { id: 'people', name: '人员 / 技能', icon: '◎', accent: C.purple, soft: C.purpleSoft, state: `${peopleCount} 人`, meta: `出勤 ${people.attendance_rate_pct || '-'}%` },
+            { id: 'equipment', name: '设备 / 模具', icon: '▣', accent: C.cyan, soft: C.cyanSoft, state: `${equipFaultCount} 故障`, meta: `${equipMaintenanceCount} 维护` },
             { id: 'order', name: '工单 / 依赖链', icon: '↳', accent: C.warn, soft: C.warnSoft, state: `${openTasks.length} 跟进`, meta: '生命周期' },
           ].map(r => (
             <button key={r.id} onClick={() => setScope(r.id)} style={{ width: '100%', textAlign: 'left', border: scope === r.id ? `1px solid ${r.accent}` : `1px solid ${C.border}`, background: C.surface, borderRadius: 10, padding: '11px', margin: '7px 0', cursor: 'pointer' }}>
@@ -287,38 +293,60 @@ export default function RCCCommandCenter() {
                   <span style={{ marginLeft: 'auto', fontSize: 10, fontFamily: 'monospace', color: C.cyan, background: C.cyanSoft, padding: '3px 7px', borderRadius: 10 }}>LIVE</span>
                 </div>
                 <div style={{ padding: '4px 14px 8px' }}>
-                  {equipList.length === 0 && <div style={{ padding: 30, textAlign: 'center', color: C.text3, fontSize: 12 }}>暂无设备基线数据</div>}
-                  {equipList.slice(0, 8).map((e: any) => {
-                    const pct = Math.round((e.utilization || 0) * 100)
-                    const status = pct > 90 ? 'danger' : pct < 60 ? 'ok' : 'warn'
+                  {equipTotal === 0 && <div style={{ padding: 30, textAlign: 'center', color: C.text3, fontSize: 12 }}>暂无设备基线数据</div>}
+                  {/* 设备状态分布 */}
+                  {Object.entries(equipStatuses).map(([st, cnt]: any) => {
+                    const pct = equipTotal > 0 ? Math.round((cnt as number) / equipTotal * 100) : 0
+                    const status = st === 'broken' || st === 'fault' ? 'danger' : st === 'maintenance' ? 'warn' : 'ok'
+                    const label = { running: '运行中', broken: '故障', maintenance: '维护中', idle: '空闲' }[st] || st
                     return (
-                      <div key={e.equipment_code || e.id || e.name} style={{ display: 'grid', gridTemplateColumns: '185px minmax(200px,1fr) 92px 100px', gap: 12, alignItems: 'center', padding: '12px 4px', borderBottom: `1px solid ${C.border}` }}>
-                        <div><div style={{ fontSize: 12.5, fontWeight: 720 }}>{e.equipment_name || e.name}</div><div style={{ fontSize: 10.5, color: C.text3, marginTop: 3 }}>{e.equipment_code || e.id} · {e.status || '运行中'}</div></div>
+                      <div key={st} style={{ display: 'grid', gridTemplateColumns: '185px minmax(200px,1fr) 92px 100px', gap: 12, alignItems: 'center', padding: '12px 4px', borderBottom: `1px solid ${C.border}` }}>
+                        <div><div style={{ fontSize: 12.5, fontWeight: 720 }}>{label}</div><div style={{ fontSize: 10.5, color: C.text3, marginTop: 3 }}>{cnt} 台</div></div>
                         <div style={{ height: 20, borderRadius: 6, background: '#EEF1F5', position: 'relative', overflow: 'hidden' }}>
                           <div style={{ height: '100%', borderRadius: 6, background: status === 'danger' ? 'linear-gradient(90deg,#B36A12,#D64545)' : status === 'ok' ? 'linear-gradient(90deg,#157C4F,#38A873)' : 'linear-gradient(90deg,#315DAA,#4F7CC7)', width: `${Math.min(pct, 100)}%`, position: 'relative' }}>
                             <span style={{ fontWeight: 700, fontSize: 12, fontFamily: 'monospace', color: '#fff', position: 'absolute', left: 8, top: 2 }}>{pct}%</span>
                           </div>
                         </div>
-                        <span style={{ fontSize: 10.5, fontWeight: 800, padding: '3px 7px', borderRadius: 10, textAlign: 'center', background: status === 'danger' ? C.dangerSoft : status === 'warn' ? C.warnSoft : C.successSoft, color: status === 'danger' ? C.danger : status === 'warn' ? C.warn : C.success }}>{status === 'danger' ? '超载' : status === 'warn' ? '高负荷' : '正常'}</span>
-                        <div style={{ textAlign: 'right', fontSize: 10.5, color: C.text3 }}><b style={{ display: 'block', color: C.text2, fontFamily: 'monospace', fontSize: 11.5 }}>{e.capacity_hours || e.available_hours || '-'}h</b>可用产能</div>
+                        <span style={{ fontSize: 10.5, fontWeight: 800, padding: '3px 7px', borderRadius: 10, textAlign: 'center', background: status === 'danger' ? C.dangerSoft : status === 'warn' ? C.warnSoft : C.successSoft, color: status === 'danger' ? C.danger : status === 'warn' ? C.warn : C.success }}>{status === 'danger' ? '异常' : status === 'warn' ? '维护' : '正常'}</span>
+                        <div style={{ textAlign: 'right', fontSize: 10.5, color: C.text3 }}><b style={{ display: 'block', color: C.text2, fontFamily: 'monospace', fontSize: 11.5 }}>{cnt}</b>台</div>
                       </div>
                     )
                   })}
+                  {/* OEE 概览 */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, padding: '12px 4px' }}>
+                    {[['OEE 实际', equipment.oee_actual_pct], ['OEE 目标', equipment.oee_target_pct], ['PM 逾期', equipment.pm_overdue_count], ['设备总数', equipTotal]].map(([k, v]: any) => (
+                      <div key={k} style={{ border: `1px solid ${C.border}`, borderRadius: 9, padding: 9, background: C.surface }}>
+                        <div style={{ fontSize: 9.5, color: C.text3 }}>{k}</div>
+                        <div style={{ fontSize: 15, fontFamily: 'monospace', fontWeight: 800, color: typeof v === 'number' && v > 0 && k.includes('逾期') ? C.danger : C.text }}>{v}{typeof v === 'number' && k.includes('OEE') ? '%' : ''}</div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
               <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 14, overflow: 'hidden' }}>
                 <div style={{ display: 'flex', alignItems: 'center', padding: '13px 15px', borderBottom: `1px solid ${C.border}` }}><b style={{ fontSize: 13 }}>人员负荷</b><span style={{ fontSize: 10.5, color: C.text3, marginLeft: 8 }}>People & Skills</span></div>
                 <div style={{ padding: '4px 14px 8px' }}>
-                  {peopleList.length === 0 && <div style={{ padding: 30, textAlign: 'center', color: C.text3, fontSize: 12 }}>暂无人员基线数据</div>}
-                  {peopleList.slice(0, 8).map((p: any) => {
-                    const load = Math.round((p.load || 0) * 100)
+                  {peopleCount === 0 && <div style={{ padding: 30, textAlign: 'center', color: C.text3, fontSize: 12 }}>暂无人员基线数据</div>}
+                  {/* 人员总览 + 技能分布 */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, padding: '12px 4px' }}>
+                    {[['在岗人数', peopleCount], ['出勤率', `${people.attendance_rate_pct || 0}%`], ['缺勤预警', people.alert_count || 0], ['技能等级', Object.keys(people.skills || {}).length]].map(([k, v]: any) => (
+                      <div key={k} style={{ border: `1px solid ${C.border}`, borderRadius: 9, padding: 9, background: C.surface }}>
+                        <div style={{ fontSize: 9.5, color: C.text3 }}>{k}</div>
+                        <div style={{ fontSize: 15, fontFamily: 'monospace', fontWeight: 800, color: String(v).includes('%') ? C.success : C.text }}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {/* 技能等级分布 */}
+                  {Object.entries(people.skills || {}).map(([lv, cnt]: any) => {
+                    const max = Math.max(...Object.values(people.skills || {}).map(Number), 1)
+                    const pct = Math.round((cnt as number) / max * 100)
                     return (
-                      <div key={p.employee_code || p.id || p.name} style={{ display: 'grid', gridTemplateColumns: '185px minmax(200px,1fr) 92px', gap: 12, alignItems: 'center', padding: '12px 4px', borderBottom: `1px solid ${C.border}` }}>
-                        <div><div style={{ fontSize: 12.5, fontWeight: 720 }}>{p.name}</div><div style={{ fontSize: 10.5, color: C.text3, marginTop: 3 }}>{p.position || p.role}</div></div>
+                      <div key={lv} style={{ display: 'grid', gridTemplateColumns: '185px minmax(200px,1fr) 92px', gap: 12, alignItems: 'center', padding: '12px 4px', borderBottom: `1px solid ${C.border}` }}>
+                        <div><div style={{ fontSize: 12.5, fontWeight: 720 }}>技能等级 {lv}</div><div style={{ fontSize: 10.5, color: C.text3, marginTop: 3 }}>{cnt} 人</div></div>
                         <div style={{ height: 20, borderRadius: 6, background: '#EEF1F5', position: 'relative', overflow: 'hidden' }}>
-                          <div style={{ height: '100%', borderRadius: 6, background: load > 90 ? 'linear-gradient(90deg,#B36A12,#D64545)' : 'linear-gradient(90deg,#315DAA,#4F7CC7)', width: `${Math.min(load, 100)}%` }}><span style={{ fontWeight: 700, fontSize: 12, fontFamily: 'monospace', color: '#fff', position: 'absolute', left: 8, top: 2 }}>{load}%</span></div>
+                          <div style={{ height: '100%', borderRadius: 6, background: 'linear-gradient(90deg,#315DAA,#4F7CC7)', width: `${pct}%` }}><span style={{ fontWeight: 700, fontSize: 12, fontFamily: 'monospace', color: '#fff', position: 'absolute', left: 8, top: 2 }}>{pct}%</span></div>
                         </div>
-                        <span style={{ fontSize: 10.5, color: C.text3 }}>{p.skill || p.department || '-'}</span>
+                        <span style={{ fontSize: 10.5, color: C.text3 }}>{lv === 'L5' ? '专家' : lv === 'L4' ? '高级' : lv === 'L3' ? '中级' : '初级'}</span>
                       </div>
                     )
                   })}
