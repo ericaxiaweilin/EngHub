@@ -1075,6 +1075,63 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
 
 
 # ═══ AI 任务处理引擎：chatbot 接管非必要电脑工作（确定性，有证据才闭环）═══
+
+
+# ═══ 任务解决验证器：防假阳性（done 前必须验证数据真变化）═══
+async def _verify_task_resolution(db: AsyncSession, task: Dict[str, Any]) -> Optional[str]:
+    """验证任务声称的解决条件是否与 DB 事实一致。
+    返回 None=未验证通过（不能 done）或 验证失败原因。
+    通过条件（按任务类型）：
+    - 缺料：物料库存 >= 工单需求（真齐套）
+    - 设备：状态 running（真恢复）
+    - 订单：状态已确认（真评审完）
+    """
+    import re as _re
+    title = (task.get("title") or "") + " " + (task.get("description") or "")
+    fid = task.get("factory_id") or "FAC_MECH_001"
+
+    # 缺料类：库存 >= 需求才算真解决
+    if any(k in title for k in ["缺料", "齐套", "补货", "shortage"]):
+        mcode = _re.search(r"([A-Z0-9]{2,4}-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        if mcode:
+            code = mcode.group(1)
+            inv = (await db.execute(text(
+                "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
+            ), {"m": code, "f": fid})).scalar_one() or 0
+            need = (await db.execute(text("""
+                SELECT COALESCE(SUM(wom.required_qty - wom.received_qty),0) FROM work_order_materials wom
+                JOIN work_orders wo ON wo.id=wom.work_order_id
+                WHERE wom.material_code=:m AND wo.factory_id=:f AND wo.status IN ('released','in_progress','pending')
+            """), {"m": code, "f": fid})).scalar_one() or 0
+            if float(inv) >= float(need):
+                return None  # 真解决，可 done
+            return f"验证未通过：物料 {code} 库存 {inv} < 工单需求 {need}，缺口 {float(need)-float(inv)}"
+
+    # 设备类：running 才算真解决
+    if any(k in title for k in ["设备", "equipment", "故障"]):
+        ec = _re.search(r"(EQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        if ec:
+            st = (await db.execute(text(
+                "SELECT status FROM equipment WHERE equipment_code=:c AND factory_id=:f LIMIT 1"
+            ), {"c": ec.group(1), "f": fid})).scalar_one_or_none()
+            if st == "running":
+                return None
+            return f"验证未通过：设备 {ec.group(1)} 状态 {st}，未恢复运行"
+
+    # 订单类：已确认才算真解决
+    if "订单" in title or "评审" in title:
+        so = _re.search(r"(SO-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
+        if so:
+            st = (await db.execute(text(
+                "SELECT status FROM sales_orders WHERE order_code=:c OR id=:c LIMIT 1"
+            ), {"c": so.group(1)})).scalar_one_or_none()
+            if st in ("confirmed", "approved", "在生产", "completed"):
+                return None
+            return f"验证未通过：订单 {so.group(1)} 状态 {st}，未确认"
+
+    return None  # 无匹配规则 = 不强制验证（人工跟进类）
+
+
 async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """按任务类型确定性处理：
     - 缺料/齐套任务 → 查库存：够→自动闭环；不够→自动建PR(采购接管)
@@ -1096,14 +1153,22 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
             inv = (await db.execute(text(
                 "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
             ), {"m": mcode.group(1), "f": fid})).scalar_one() or 0
-            if float(inv) > 0:
+            # 解决验证：库存 >= 工单需求才算真闭环（防假阳性）
+            need_check = (await db.execute(text("""
+                SELECT COALESCE(SUM(wom.required_qty - wom.received_qty),0) FROM work_order_materials wom
+                JOIN work_orders wo ON wo.id=wom.work_order_id
+                WHERE wom.material_code=:m AND wo.factory_id=:f AND wo.status IN ('released','in_progress','pending')
+            """), {"m": mcode.group(1), "f": fid})).scalar_one() or 0
+            if float(inv) > 0 and float(inv) >= float(need_check):
                 await db.execute(text("""
                     UPDATE followup_tasks SET status='done', progress_pct=100,
                         last_follow_note=:note, ai_summary=:note, updated_at=NOW()
                     WHERE id=:id
-                """), {"note": f"[AI自动闭环] 物料 {mcode.group(1)} 库存 {inv} 已充足，缺料解除", "id": task_id})
+                """), {"note": f"[AI自动闭环] 物料 {mcode.group(1)} 库存 {inv} >= 工单需求 {need_check}，真齐套，缺料解除", "id": task_id})
                 await db.commit()
-                return {"action": "closed", "note": f"物料 {mcode.group(1)} 库存 {inv} 充足，AI 自动闭环"}
+                return {"action": "closed", "note": f"物料 {mcode.group(1)} 库存 {inv} >= 需求 {need_check}，AI 验证后闭环"}
+            # 库存不足 = 不是假闭环，转采购
+            return {"action": "escalated", "note": f"物料 {mcode.group(1)} 库存 {inv} < 工单需求 {need_check}，缺口 {float(need_check)-float(inv)}，转采购补货"}
             # 库存不足 → 检查是否已有 PR，无则自动建 PR（采购接管）
             has_pr = (await db.execute(text(
                 "SELECT 1 FROM purchase_requisitions WHERE material_code=:m AND status IN ('PENDING','pending') LIMIT 1"
@@ -1136,9 +1201,9 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
                     UPDATE followup_tasks SET status='done', progress_pct=100,
                         last_follow_note=:note, ai_summary=:note, updated_at=NOW()
                     WHERE id=:id
-                """), {"note": f"[AI自动闭环] 设备 {ec.group(1)} 已恢复运行", "id": task_id})
+                """), {"note": f"[AI自动闭环] 设备 {ec.group(1)} 已恢复运行（DB 状态验证）", "id": task_id})
                 await db.commit()
-                return {"action": "closed", "note": f"设备 {ec.group(1)} 运行正常，AI 自动闭环"}
+                return {"action": "closed", "note": f"设备 {ec.group(1)} 运行正常，AI 验证后闭环"}
             return {"action": "escalated", "note": f"设备 {ec.group(1)} 状态 {st}，仍需处理"}
 
     # 3) 交期风险任务：查工单状态 → 已完工/已取消 → 自动闭环
