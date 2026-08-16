@@ -441,11 +441,14 @@ async def pmc_backward_to_plan(payload: Dict[str, Any], db: AsyncSession = Depen
         return {"error": "缺少 product_id/qty/delivery"}
     plan_code = f"PMB-{datetime.now().strftime('%Y%m%d%H%M')}"
     plan_id = str(uuid.uuid4())
+    due_dt = datetime.strptime(due, "%Y-%m-%d")
     await db.execute(text("""
-        INSERT INTO plans (id, plan_code, factory_id, product_id, planned_qty, planned_start, planned_end, status, priority, created_by, created_at, updated_at)
-        VALUES (:id, :code, :f, :p, :q, CURRENT_DATE, :due, 'draft', 'high', :cb, NOW(), NOW())
-    """), {"id": plan_id, "code": plan_code, "f": fid, "p": product_id, "q": qty,
-           "due": datetime.strptime(due, "%Y-%m-%d").date(), "cb": "pmc_agent"})
+        INSERT INTO plans (id, plan_code, factory_id, product_id, quantity, required_date,
+                           plan_type, customer_level, priority, status, due_date, priority_score,
+                           created_at, updated_at)
+        VALUES (:id, :code, :f, :p, :q, :due, 'MPS', 'A', 1, 'draft', :due, :ps, NOW(), NOW())
+    """), {"id": plan_id, "code": plan_code, "f": fid, "p": product_id, "q": int(qty),
+           "due": due_dt, "ps": 0.5})
     await db.commit()
     return {"success": True, "plan_id": plan_id, "plan_code": plan_code, "status": "draft",
             "message": "生产计划草案已生成，可在计划列表确认/下达"}
