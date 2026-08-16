@@ -1116,9 +1116,31 @@ async def followup_scanner_loop() -> None:
     interval = max(15, int(os.getenv("FOLLOWUP_SCAN_INTERVAL_SECONDS", "60") or 60))
     _logger.info("任务中心扫描器启动，每 %s 秒检查到期任务", interval)
     from database.db_config import db_config
+    _last_reconcile = 0.0
     while True:
         try:
             await asyncio.sleep(interval)
+            # ── RCC 事件驱动数据层：检测事实源变化 → 事件 → RCC 感知 → 决策/通知 ──
+            # 员工缺勤/设备故障/订单加急/缺料 → RCC 统一基线更新 + 通知 PMC/采购/产线
+            try:
+                import time as _t4
+                if _t4.time() - _last_reconcile > 300:  # 每 5 分钟
+                    _last_reconcile = _t4.time()
+                    from api.services.rcc_event_driven import detect_changes, reconcile
+                    async with db_config.session_factory() as db:
+                        for fid in ("FAC_MECH_001", "FAC_ELEC_DEMO_2026"):
+                            try:
+                                det = await detect_changes(db, fid)
+                                if det["written"]:
+                                    _logger.info(f"[rcc-events] {fid} 检测到 {len(det['written'])} 个事件: {[e['event_type'] for e in det['written']]}")
+                                res = await reconcile(db, fid)
+                                if res["notified"]:
+                                    _logger.info(f"[rcc-events] {fid} 决策通知: {res['notified']}")
+                            except Exception as _ex:
+                                await db.rollback()
+                                _logger.warning(f"[rcc-events] {fid} 处理异常: {_ex}")
+            except Exception as _e2:
+                _logger.warning(f"[rcc-events] 调度异常: {_e2}")
             async with db_config.session_factory() as db:
                 result = await scan_due_tasks(db)
                 if result["scanned"]:
