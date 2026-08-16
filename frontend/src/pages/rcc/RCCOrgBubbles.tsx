@@ -75,12 +75,14 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
   const firstLevel = Math.min(...nodes.map(node => node.level))
   // 有 parent_id 的节点归属到父节点下（如 SMT线长 → hr_sup 人力）
   const withParent = new Set(nodes.filter(n => n.parent_id && byId.has(n.parent_id)).map(n => n.id))
-  const roots = nodes.filter(n => !withParent.has(n.id))
+  const roots = nodes.filter(n => !withParent.has(n.id) && n.level === firstLevel)
 
-  const buildNode = (node: BubbleNode): BubbleNode => {
+  const buildNode = (node: BubbleNode, visited: Set<string>): BubbleNode => {
+    if (visited.has(node.id)) return { ...node, children: [] }  // 防环
+    const nextVisited = new Set(visited).add(node.id)
     // 1) 优先按 parent_id 挂子节点（组织归属）
     const directChildren = nodes.filter(c => c.parent_id === node.id)
-    // 2) 其次按 level 层级连（信号传导链）
+    // 2) 其次按 level 层级连（信号传导链，排除已归属其他父的）
     const nextLevel = node.level + 1
     const linkedIds = new Set<string>()
     edges.forEach(edge => {
@@ -98,7 +100,7 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
       children: [...new Set(childIds)]
         .map(childId => byId.get(childId))
         .filter((child): child is BubbleNode => Boolean(child))
-        .map(buildNode),
+        .map(child => buildNode(child, nextVisited)),
     }
   }
 
@@ -113,9 +115,7 @@ function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | 
     key_outputs: {},
     param_count: 0,
     capability_count: 0,
-    children: roots
-      .filter(node => node.level <= firstLevel + 1)
-      .map(buildNode),
+    children: roots.map(buildNode),
   }
 }
 
