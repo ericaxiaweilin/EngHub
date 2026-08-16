@@ -135,7 +135,54 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "pmc_hammer_matrix",
+            "name": "run_mrp_calculation",
+                    "description": "运行 MRP 计算（毛需求→净需求→批量→提前期）：按产品/工单展开 BOM 计算物料需求，返回需求明细与缺料清单。用于'帮我跑一下MRP''这个产品物料需求多少''哪些料需要采购'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "product_id": {"type": "string", "description": "产品编码（可选，不传跑全部在制工单）"},
+                            "horizon_days": {"type": "integer", "description": "展望期天数（默认14）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_shipment",
+                    "description": "创建出货单：按工单/订单生成出货计划（整柜/拼柜），登记客户、数量、ETD。用于'安排出货''这单什么时候出柜''建出货单'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "customer_name": {"type": "string", "description": "客户名称"},
+                            "product_id": {"type": "string", "description": "产品编码"},
+                            "quantity": {"type": "number", "description": "出货数量"},
+                            "etd": {"type": "string", "description": "预计开船日 YYYY-MM-DD"},
+                            "container_count": {"type": "integer", "description": "柜数（默认1）"}
+                        },
+                        "required": ["customer_name", "product_id", "quantity", "etd"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_shipment_status",
+                    "description": "查询出货状态：出货单列表（计划/在途/已出），ETD 与客户。用于'出货到哪了''有哪些在途柜''这单出了吗'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string", "description": "过滤状态：planned/in_transit/shipped（可选）"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "pmc_hammer_matrix",
             "description": "PMC 锤子图决策矩阵：工单×开关影响分析，返回敏感工单（排程敏感需重点保障）、全局风险开关（多工单受影响）、每个工单的推荐杠杆（哪个开关能提前/避免延后）。用于这批工单怎么排最稳、哪个工单最敏感、排程风险在哪、怎么保交付类请求。",
             "parameters": {
                 "type": "object",
@@ -2775,6 +2822,109 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _tool_run_mrp_calculation(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """运行 MRP（确定性，直查 DB 不走权限墙）：
+    计划 → BOM 展开毛需求 → 扣库存/在途 → 净需求 → 缺料清单 + 采购建议。"""
+    fid = factory_id or "FAC_MECH_001"
+    product_id = str(args.get("product_id") or "").strip()
+    # 1) 找计划（指定产品或最新 released）
+    if product_id:
+        rows = (await db.execute(text("""
+            SELECT id, plan_code, product_id, planned_qty, required_date FROM plans
+            WHERE factory_id=:f AND product_id=:p AND status='released'
+            ORDER BY created_at DESC LIMIT 3
+        """), {"f": fid, "p": product_id})).mappings().all()
+    else:
+        rows = (await db.execute(text("""
+            SELECT id, plan_code, product_id, quantity AS planned_qty, required_date FROM plans
+            WHERE factory_id=:f AND status='released'
+            ORDER BY created_at DESC LIMIT 3
+        """), {"f": fid})).mappings().all()
+    if not rows:
+        return {"error": "无 released 计划可运行 MRP（需先创建并确认计划）"}
+
+    results = []
+    for plan in rows:
+        # 2) BOM 展开（毛需求）
+        boms = (await db.execute(text("""
+            SELECT material_code, material_name, quantity FROM bom_items
+            WHERE product_id=:p AND factory_id=:f
+        """), {"p": plan["product_id"], "f": fid})).mappings().all()
+        if not boms:
+            results.append({"plan_code": plan["plan_code"], "product_id": plan["product_id"],
+                            "error": "无 BOM（先维护物料清单）"})
+            continue
+        qty = float(plan["planned_qty"] or 0)
+        # 3) 库存 + 在途
+        needs = []
+        for b in boms:
+            mcode = b["material_code"]
+            need = float(b["quantity"] or 0) * qty
+            inv = (await db.execute(text(
+                "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
+            ), {"m": mcode, "f": fid})).scalar_one() or 0
+            po = (await db.execute(text(
+                "SELECT COALESCE(SUM(qty),0) FROM purchase_orders WHERE material_code=:m AND factory_id=:f AND status IN ('confirmed','shipped')"
+            ), {"m": mcode, "f": fid})).scalar_one() or 0
+            avail = float(inv) + float(po)
+            shortage = max(0, need - avail)
+            needs.append({"material_code": mcode, "material_name": b["material_name"] or mcode,
+                          "gross_need": round(need, 1), "on_hand": float(inv), "on_order": float(po),
+                          "net_need": round(shortage, 1),
+                          "status": "shortage" if shortage > 0 else "ok"})
+        shortage_count = sum(1 for n in needs if n["status"] == "shortage")
+        results.append({"plan_code": plan["plan_code"], "product_id": plan["product_id"],
+                        "qty": qty, "materials": needs,
+                        "summary": f"{len(needs)} 项物料，{shortage_count} 项缺料"})
+    return {"type": "mrp_result", "count": len(results), "results": results}
+
+
+async def _tool_create_shipment(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """创建出货单（写 shipments + shipment_items）。"""
+    fid = factory_id or "FAC_MECH_001"
+    cust = str(args.get("customer_name") or "").strip()
+    prod = str(args.get("product_id") or "").strip()
+    qty = float(args.get("quantity") or 0)
+    etd = str(args.get("etd") or "").strip()
+    if not cust or not prod or qty <= 0 or not etd:
+        return {"error": "缺少 customer_name/product_id/quantity/etd"}
+    import uuid
+    from datetime import datetime as _dt
+    ship_id = str(uuid.uuid4())
+    code = f"SHP-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    etd_date = _dt.strptime(etd, "%Y-%m-%d").date() if etd else None
+    await db.execute(text("""
+        INSERT INTO shipments (id, shipment_code, factory_id, customer_name, container_count,
+                               plan_date, etd, status, total_qty, total_amount, remark, created_by, created_at, updated_at)
+        VALUES (:id, :code, :f, :cust, :cc, CURRENT_DATE, :etd, 'planned', :q, 0, 'chatbot 创建', :cb, NOW(), NOW())
+    """), {"id": ship_id, "code": code, "f": fid, "cust": cust, "cc": int(args.get("container_count") or 1),
+           "etd": etd_date, "q": qty, "cb": operator})
+    await db.execute(text("""
+        INSERT INTO shipment_items (id, shipment_id, product_id, product_name, quantity, packed_qty)
+        VALUES (gen_random_uuid()::text, :sid, :p, :p, :q, 0)
+    """), {"sid": ship_id, "p": prod, "q": qty})
+    await db.commit()
+    return {"type": "shipment", "action": "created", "shipment_code": code, "status": "planned",
+            "customer": cust, "qty": qty, "etd": etd, "shipment_id": ship_id}
+
+
+async def _tool_query_shipment_status(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
+    """查询出货状态。"""
+    fid = factory_id or "FAC_MECH_001"
+    status = str(args.get("status") or "").strip()
+    sql = "SELECT shipment_code, customer_name, container_count, etd, status, total_qty FROM shipments WHERE factory_id=:f"
+    params = {"f": fid}
+    if status:
+        sql += " AND status=:s"
+        params["s"] = status
+    sql += " ORDER BY etd DESC LIMIT 10"
+    rows = (await db.execute(text(sql), params)).mappings().all()
+    return {"type": "shipment_status", "count": len(rows),
+            "shipments": [{"code": r["shipment_code"], "customer": r["customer_name"],
+                           "containers": r["container_count"], "etd": str(r["etd"])[:10],
+                           "status": r["status"], "qty": r["total_qty"]} for r in rows]}
+
+
 async def _tool_pmc_hammer_matrix(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
     """锤子图决策矩阵：HTTP 调自身端点。"""
     import httpx
@@ -3389,6 +3539,9 @@ _TOOL_EXECUTORS = {
     "query_inventory": _tool_query_inventory,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
     "pmc_hammer_matrix": _tool_pmc_hammer_matrix,
+    "run_mrp_calculation": _tool_run_mrp_calculation,
+    "create_shipment": _tool_create_shipment,
+    "query_shipment_status": _tool_query_shipment_status,
     "pmc_backward_schedule": _tool_pmc_backward_schedule,
     "pmc_backward_to_plan": _tool_pmc_backward_to_plan,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
