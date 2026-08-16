@@ -135,7 +135,72 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "create_rfq",
+            "name": "create_supplier_profile",
+                    "description": "供应商建档：登记新供应商（名称/类别/联系人/付款条件/资质），供应商开发日常。用于'新供应商建档''开发供应商''登记供应商'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "supplier_name": {"type": "string", "description": "供应商名称"},
+                            "category": {"type": "string", "description": "类别：原材料/辅料/包材/设备"},
+                            "contact_person": {"type": "string", "description": "联系人"},
+                            "payment_terms": {"type": "string", "description": "付款条件（默认月结30天）"}
+                        },
+                        "required": ["supplier_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "payment_request",
+                    "description": "付款申请：PO 收货且发票匹配后，向财务发起付款申请（供应商/金额/到期日）。用于'申请付款''这笔该付款了''付款申请'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "po_code": {"type": "string", "description": "采购订单编号"},
+                            "amount": {"type": "number", "description": "付款金额（可选，默认PO金额）"}
+                        },
+                        "required": ["po_code"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "purchase_return",
+                    "description": "采购退货/索赔：到货不良或错料时登记退货（数量/原因），或向供应商索赔。用于'这批货要退''退货''索赔'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "po_code": {"type": "string", "description": "采购订单编号"},
+                            "quantity": {"type": "number", "description": "退货数量"},
+                            "reason": {"type": "string", "description": "原因：不良/错料/逾期"},
+                            "return_type": {"type": "string", "description": "return退货/claim索赔（默认return）"}
+                        },
+                        "required": ["po_code", "quantity"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "manage_supplier_status",
+                    "description": "供应商状态管理：暂停合作/恢复/拉黑（绩效差或违规时）。用于'这家供应商暂停''拉黑这家''恢复合作'类请求。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "supplier_id": {"type": "string", "description": "供应商ID或编码"},
+                            "status": {"type": "string", "description": "active/hold/blacklist"},
+                            "reason": {"type": "string", "description": "原因"}
+                        },
+                        "required": ["supplier_id", "status"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_rfq",
                     "description": "发起询价(RFQ)：为缺料/PR物料向多家供应商发出询价请求，收集报价。返回RFQ编号与状态。用于'向供应商询价''发RFQ''这料问几家报价'类请求。",
                     "parameters": {
                         "type": "object",
@@ -3066,6 +3131,113 @@ async def _report_rcc_action(db, factory_id: str, action_type: str, target: str,
         pass
 
 
+async def _tool_create_supplier_profile(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """供应商建档。"""
+    fid = factory_id or "FAC_MECH_001"
+    name = str(args.get("supplier_name") or "").strip()
+    if not name:
+        return {"error": "缺少 supplier_name"}
+    import uuid
+    sid = str(uuid.uuid4())
+    code = f"SUP-{str(uuid.uuid4())[:6].upper()}"
+    await db.execute(text("""
+        INSERT INTO supplier_profiles (id, factory_id, supplier_code, supplier_name, category, contact_person, payment_terms, status, created_at, updated_at)
+        VALUES (:id, :f, :code, :name, :cat, :cp, :pt, 'active', NOW(), NOW())
+    """), {"id": sid, "f": fid, "code": code, "name": name,
+           "cat": str(args.get("category") or "原材料"),
+           "cp": str(args.get("contact_person") or ""),
+           "pt": str(args.get("payment_terms") or "月结30天")})
+    await _report_rcc_action(db, fid, "supplier_created", code,
+                             f"供应商建档 {name} [{args.get('category') or '原材料'}]",
+                             detail=f"联系人 {args.get('contact_person') or '-'} 付款 {args.get('payment_terms') or '月结30天'}", operator=operator, risk="info")
+    await db.commit()
+    return {"type": "supplier_profile", "action": "created", "supplier_id": sid, "supplier_code": code,
+            "name": name, "status": "active", "message": f"供应商 {name} 已建档（{code}）"}
+
+
+async def _tool_payment_request(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """付款申请。"""
+    fid = factory_id or "FAC_MECH_001"
+    po_code = str(args.get("po_code") or "").strip()
+    if not po_code:
+        return {"error": "缺少 po_code"}
+    po = (await db.execute(text(
+        "SELECT id, po_code, supplier_id, supplier_name, total_amount FROM purchase_orders WHERE po_code=:c OR id=:c"
+    ), {"c": po_code})).mappings().first()
+    if not po:
+        return {"error": f"PO {po_code} 不存在"}
+    amount = float(args.get("amount") or po["total_amount"] or 0)
+    import uuid
+    pid = str(uuid.uuid4())
+    pcode = f"PAY-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
+    await db.execute(text("""
+        INSERT INTO payment_requests (id, factory_id, payment_code, supplier_id, supplier_name, po_code, amount, due_date, status, created_by, created_at, updated_at)
+        VALUES (:id, :f, :code, :sid, :sn, :po, :amt, CURRENT_DATE + 30, 'pending', :cb, NOW(), NOW())
+    """), {"id": pid, "f": fid, "code": pcode, "sid": po["supplier_id"], "sn": po["supplier_name"] or po["supplier_id"],
+           "po": po_code, "amt": amount, "cb": operator})
+    await _report_rcc_action(db, fid, "payment_requested", pcode,
+                             f"付款申请 {po_code} {amount}元（供应商 {po['supplier_name'] or po['supplier_id']}）",
+                             detail=f"月结30天", operator=operator, risk="info")
+    await db.commit()
+    return {"type": "payment_request", "action": "created", "payment_code": pcode, "po_code": po_code,
+            "amount": amount, "status": "pending", "message": f"付款申请 {pcode} 已提交（{amount}元）"}
+
+
+async def _tool_purchase_return(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """采购退货/索赔。"""
+    fid = factory_id or "FAC_MECH_001"
+    po_code = str(args.get("po_code") or "").strip()
+    qty = float(args.get("quantity") or 0)
+    reason = str(args.get("reason") or "不良")
+    rtype = str(args.get("return_type") or "return")
+    if not po_code or qty <= 0:
+        return {"error": "缺少 po_code/quantity"}
+    po = (await db.execute(text(
+        "SELECT id, po_code, material_code, supplier_id FROM purchase_orders WHERE po_code=:c OR id=:c"
+    ), {"c": po_code})).mappings().first()
+    if not po:
+        return {"error": f"PO {po_code} 不存在"}
+    import uuid
+    rid = str(uuid.uuid4())
+    rcode = f"RTN-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
+    await db.execute(text("""
+        INSERT INTO purchase_returns (id, factory_id, return_code, po_code, material_code, quantity, reason, return_type, status, supplier_id, created_by, created_at)
+        VALUES (:id, :f, :code, :po, :m, :q, :r, :t, 'pending', :sid, :cb, NOW())
+    """), {"id": rid, "f": fid, "code": rcode, "po": po_code, "m": po["material_code"],
+           "q": qty, "r": reason, "t": rtype, "sid": po["supplier_id"], "cb": operator})
+    await _report_rcc_action(db, fid, "purchase_return", rcode,
+                             f"{'索赔' if rtype == 'claim' else '退货'} {po_code} {po['material_code']}×{int(qty)}（{reason}）",
+                             detail=f"PO {po_code}", operator=operator, risk="warning")
+    await db.commit()
+    return {"type": "purchase_return", "action": "created", "return_code": rcode, "po_code": po_code,
+            "qty": qty, "reason": reason, "type": rtype, "message": f"{'索赔' if rtype == 'claim' else '退货'} {rcode} 已登记"}
+
+
+async def _tool_manage_supplier_status(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
+    """供应商状态管理。"""
+    fid = factory_id or "FAC_MECH_001"
+    sid = str(args.get("supplier_id") or "").strip()
+    status = str(args.get("status") or "").strip()
+    reason = str(args.get("reason") or "")
+    if not sid or status not in ("active", "hold", "blacklist"):
+        return {"error": "缺少 supplier_id 或 status 非法（active/hold/blacklist）"}
+    sup = (await db.execute(text(
+        "SELECT id, supplier_name FROM suppliers WHERE id=:s OR supplier_code=:s"
+    ), {"s": sid})).mappings().first()
+    if not sup:
+        return {"error": f"供应商 {sid} 不存在"}
+    await db.execute(text(
+        "UPDATE suppliers SET status=:st WHERE id=:id"
+    ), {"st": status, "id": sup["id"]})
+    status_label = {"active": "正常合作", "hold": "暂停合作", "blacklist": "拉黑"}
+    await _report_rcc_action(db, fid, "supplier_status_change", sup["supplier_name"] or sid,
+                             f"供应商状态 → {status_label.get(status, status)}",
+                             detail=reason, operator=operator, risk="warning" if status != "active" else "info")
+    await db.commit()
+    return {"type": "supplier_status", "supplier": sup["supplier_name"] or sid,
+            "status": status, "reason": reason, "message": f"{sup['supplier_name'] or sid} 已{status_label.get(status, status)}"}
+
+
 async def _tool_create_rfq(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
     """发起询价(RFQ)：为物料向候选供应商发出询价。"""
     fid = factory_id or "FAC_MECH_001"
@@ -4306,6 +4478,10 @@ _TOOL_EXECUTORS = {
     "cancel_work_order": _tool_cancel_work_order,
     "query_pmc_change_log": _tool_query_pmc_change_log,
     "create_rfq": _tool_create_rfq,
+    "create_supplier_profile": _tool_create_supplier_profile,
+    "payment_request": _tool_payment_request,
+    "purchase_return": _tool_purchase_return,
+    "manage_supplier_status": _tool_manage_supplier_status,
     "collect_quotations": _tool_collect_quotations,
     "select_best_quote": _tool_select_best_quote,
     "goods_receipt": _tool_goods_receipt,
