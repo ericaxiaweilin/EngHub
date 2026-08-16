@@ -11,6 +11,7 @@ RCC = Resource Control Center — 全局统筹人/物/工单计算
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.db_config import get_db
+import json
 from typing import Optional, Dict, Any
 
 router = APIRouter(prefix="/api/v1/rcc", tags=["rcc"])
@@ -457,3 +458,58 @@ async def claim_tasks(
         claimed += 1
     await db.commit()
     return {"claimed": claimed, "message": f"已按卡点规则认领 {claimed} 个未分配任务到具体岗位"}
+
+
+@router.get("/agent-work-log", summary="智能体工作记录（真实追溯）：谁/何时/做了什么/证据")
+async def agent_work_log(
+    agent: str = "",
+    action: str = "",
+    ref: str = "",
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    """按智能体/动作/关联单据查询工作记录，支持追溯：
+    - 某岗位今天干了什么（agent=pmc_agent/procurement_agent）
+    - 某单据的完整处理链（ref=PO-RM-ELEC-036-AC9EE4 从询价到收货全过程）
+    """
+    from sqlalchemy import text as sql_text
+    cond = ["1=1"]
+    params: Dict[str, Any] = {"lim": min(max(limit, 1), 100)}
+    if agent:
+        cond.append("(agent_key=:a OR agent_key=:a2)")
+        params["a"] = agent
+        params["a2"] = agent if agent.endswith("_agent") else agent + "_agent"
+    if action:
+        cond.append("action=:ac")
+        params["ac"] = action
+    if ref:
+        cond.append("(related_ref=:r OR target=:r)")
+        params["r"] = ref
+    rows = (await db.execute(sql_text(f"""
+        SELECT agent_key, action, target, detail, evidence, related_ref, created_at
+        FROM agent_work_log WHERE {' AND '.join(cond)}
+        ORDER BY created_at DESC LIMIT :lim
+    """), params)).mappings().all()
+    return {"count": len(rows),
+            "records": [{"agent": r["agent_key"], "action": r["action"], "target": r["target"],
+                         "detail": r["detail"], "evidence": r["evidence"], "ref": r["related_ref"],
+                         "at": str(r["created_at"])[:16]} for r in rows]}
+
+
+@router.post("/agent-work-log", summary="智能体工作记录写入（工具层自动调用）")
+async def log_agent_work(
+    payload: Dict[str, Any],
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import text as sql_text
+    import uuid
+    await db.execute(sql_text("""
+        INSERT INTO agent_work_log (id, factory_id, agent_key, action, target, detail, evidence, result, related_ref, created_at, updated_at)
+        VALUES (:id, :f, :agent, :act, :tgt, :detail, CAST(:ev AS jsonb), :res, :ref, NOW(), NOW())
+    """), {"id": str(uuid.uuid4()), "f": payload.get("factory_id", "FAC_MECH_001"),
+           "agent": payload.get("agent", "unknown"), "act": payload.get("action", ""),
+           "tgt": payload.get("target", ""), "detail": payload.get("detail", ""),
+           "ev": json.dumps(payload.get("evidence") or {}, ensure_ascii=False),
+           "res": payload.get("result", "ok"), "ref": payload.get("ref", "")})
+    await db.commit()
+    return {"success": True}

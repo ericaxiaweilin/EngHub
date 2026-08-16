@@ -3044,6 +3044,15 @@ async def _report_rcc_action(db, factory_id: str, action_type: str, target: str,
                "d": json.dumps({"action_type": action_type, "target": target,
                                 "summary": summary, "detail": detail,
                                 "risk": risk, "by": operator}, ensure_ascii=False)})
+        # ── 工作数据记录（真实追溯：智能体每步工作留痕）──
+        await db.execute(text("""
+            INSERT INTO agent_work_log (id, factory_id, agent_key, action, target, detail, evidence, result, related_ref, created_at, updated_at)
+            VALUES (:id, :f, :agent, :act, :tgt, :detail, CAST(:ev AS jsonb), :result, :ref, NOW(), NOW())
+        """), {"id": str(_uuid.uuid4()), "f": factory_id, "agent": operator,
+               "act": action_type, "tgt": target,
+               "detail": summary + (" · " + detail if detail else ""),
+               "ev": json.dumps({"risk": risk, "by": operator, "summary": summary}, ensure_ascii=False),
+               "result": "ok", "ref": target})
         if rcc_task_type:
             await db.execute(text("""
                 INSERT INTO rcc_tasks (id, task_code, org_unit_id, task_type, title, description, status, requested_by, created_at, updated_at)
@@ -3086,6 +3095,9 @@ async def _tool_create_rfq(db: AsyncSession, args: Dict[str, Any], factory_id: O
             SELECT id FROM suppliers WHERE supplier_code IS NOT NULL LIMIT 5
         """))).mappings().all()
         sids = [r["id"] for r in rows]
+    await _report_rcc_action(db, fid, "rfq_created", code,
+                             f"询价 {mcode}×{int(qty)}，向 {len(sids)} 家供应商",
+                             detail=f"候选: {','.join(sids[:5])}", operator=operator, risk="info")
     await db.commit()
     return {"type": "rfq", "action": "created", "rfq_id": rfq_id, "rfq_code": code,
             "material": mcode, "qty": qty, "suppliers_targeted": len(sids),
@@ -3119,6 +3131,9 @@ async def _tool_collect_quotations(db: AsyncSession, args: Dict[str, Any], facto
         """), {"rfq": row["id"], "sid": sid, "sn": srow["supplier_name"] if srow else sid,
                "price": price, "lead": lead, "lead_days": str(lead)})
         await db.execute(text("UPDATE rfqs SET status='quoting' WHERE id=:id"), {"id": row["id"]})
+        await _report_rcc_action(db, fid, "quotation_received", row["rfq_code"],
+                                 f"收到报价 {sid} {price}元/{lead}天",
+                                 detail=f"RFQ {row['rfq_code']} 物料 {row['material_code']}", operator=operator, risk="info")
         await db.commit()
         return {"type": "quotation", "action": "recorded", "rfq_code": row["rfq_code"],
                 "supplier": sid, "price": price, "lead_days": lead}
@@ -3171,6 +3186,9 @@ async def _tool_select_best_quote(db: AsyncSession, args: Dict[str, Any], factor
         UPDATE quotations SET status='rejected' WHERE rfq_id=:rid AND id != :id
     """), {"rid": row["id"], "id": best["id"]})
     await db.execute(text("UPDATE rfqs SET status='selected' WHERE id=:id"), {"id": row["id"]})
+    await _report_rcc_action(db, fid, "quote_selected", row["rfq_code"],
+                             f"比价选中 {best['supplier_name'] or best['supplier_id']} {float(best['unit_price'])}元/{best['lead_time_days']}天",
+                             detail=f"评分 {round(float(best['score']), 1)}", operator=operator, risk="info")
     await db.commit()
     return {"type": "best_quote", "rfq_code": row["rfq_code"], "selected_supplier": best["supplier_name"] or best["supplier_id"],
             "unit_price": float(best["unit_price"]), "lead_days": best["lead_time_days"],
@@ -4025,6 +4043,9 @@ async def _tool_create_purchase_requisition(db: AsyncSession, args: Dict[str, An
         "qty, unit, status, auto_approved, created_by, created_at, updated_at) "
         "VALUES (:id, :f, :pc, 'procurement_agent', :m, :n, :q, 'PCS', 'PENDING', FALSE, :src, NOW(), NOW())"
     ), {"id": pr_id, "f": fid, "pc": pr_code, "m": mat, "n": name, "q": qty, "src": operator or "procurement_agent"})
+    await _report_rcc_action(db, fid, "pr_created", pr_code,
+                             f"采购申请 {mat}×{int(qty)}",
+                             detail=f"operator: {operator or 'procurement_agent'}", operator=operator, risk="info")
     await db.commit()
     return {"type": "purchase_requisition", "action": "created", "pr_id": pr_id, "pr_code": pr_code,
             "material_code": mat, "material_name": name, "requested_qty": qty, "status": "PENDING"}
