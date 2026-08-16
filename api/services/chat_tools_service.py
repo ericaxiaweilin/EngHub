@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import asyncio
+import inspect
 import io
 import json
 import re
@@ -3581,8 +3582,8 @@ async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id
     if not po_code or qty <= 0:
         return {"error": "缺少 po_code/quantity"}
     po = (await db.execute(text(
-        "SELECT id, material_code, supplier_id, qty FROM purchase_orders WHERE po_code=:c OR id=:c"
-    ), {"c": po_code})).mappings().first()
+        "SELECT id, material_code, supplier_id, qty FROM purchase_orders WHERE (po_code=:c OR id=:c) AND factory_id=:f"
+    ), {"c": po_code, "f": fid})).mappings().first()
     if not po:
         return {"error": f"PO {po_code} 不存在"}
     import uuid
@@ -4745,18 +4746,20 @@ async def _tool_query_purchase_pipeline(db: AsyncSession, args: Dict[str, Any], 
     cond = "factory_id = :fid"
     params: Dict[str, Any] = {"fid": fid, "limit": limit}
     if mat:
-        cond += " AND material_code = :mat"
         params["mat"] = mat
     if status:
         cond += " AND status = :st"
         params["st"] = status
+    # 过滤条件同时支持物料码与单号（pr_code/po_code/id），保证单号可溯源
+    mat_cond_pr = " AND (material_code = :mat OR pr_code = :mat OR CAST(id AS TEXT) = :mat)" if mat else ""
+    mat_cond_po = " AND (material_code = :mat OR po_code = :mat OR CAST(id AS TEXT) = :mat)" if mat else ""
     prs = (await db.execute(text(
         f"SELECT id, pr_code, material_code, material_name, qty, unit, status, supplier_id, lead_time_days, source, created_at "
-        f"FROM purchase_requisitions WHERE {cond} ORDER BY created_at DESC LIMIT :limit"
+        f"FROM purchase_requisitions WHERE {cond}{mat_cond_pr} ORDER BY created_at DESC LIMIT :limit"
     ), params)).mappings().all()
     pos = (await db.execute(text(
         f"SELECT po_code, pr_id, supplier_name, material_code, qty, unit_price, status, expected_date, actual_date "
-        f"FROM purchase_orders WHERE {cond} ORDER BY order_date DESC LIMIT :limit"
+        f"FROM purchase_orders WHERE {cond}{mat_cond_po} ORDER BY order_date DESC LIMIT :limit"
     ), params)).mappings().all()
     return {
         "type": "purchase_pipeline",
@@ -6222,7 +6225,16 @@ async def execute_tool(
         if tool_name == "create_online_pivot":
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name in WRITE_TOOLS:
-            return await executor(db, arguments, operator)
+            # 按执行器签名透传参数：采购/PMC 写工具为 (db,args,factory_id,operator)，
+            # 工单类写工具为 (db,args,operator)。早期按位置传 operator 会错落到
+            # factory_id 槽位，导致按工厂过滤的写工具报「单据不存在」。
+            _params = inspect.signature(executor).parameters
+            _kw: Dict[str, Any] = {}
+            if "operator" in _params:
+                _kw["operator"] = operator
+            if "factory_id" in _params:
+                _kw["factory_id"] = factory_id
+            return await executor(db, arguments, **_kw)
         if tool_name in {"send_group_message", "query_group_messages"}:
             # 群消息工具需要 operator（发送者身份）
             return await executor(db, arguments, operator=operator, factory_id=factory_id)

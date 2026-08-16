@@ -104,6 +104,13 @@ class RCCTaskService:
             action = ap.get("action", "") if isinstance(ap, dict) else ""
             target = ap.get("target", "") if isinstance(ap, dict) else ""
             params = ap.get("params", {}) if isinstance(ap, dict) else {}
+            if not action:
+                # 无执行动作的任务（如 followup 升级审批）：审批即终态，
+                # 直接置 completed，避免永久卡在 approved（实测 23 单堆积）。
+                task.status = "completed"
+                task.completed_at = datetime.utcnow()
+                await self.db.commit()
+                return task
             if action:
                 from sqlalchemy import text as _tex
                 executed = False

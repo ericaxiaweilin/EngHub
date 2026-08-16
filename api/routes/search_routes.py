@@ -73,6 +73,18 @@ SEARCH_MODULES = [
         "from": "sales_orders so",
         "fields": ["so.order_code", "so.customer_name", "so.customer_code", "so.product_id", "so.status"],
     },
+    {
+        "source": "purchase_requisition", "label": "采购申请", "route": "/procurement",
+        "select": "id, pr_code, factory_id, material_code, material_name, qty, status, supplier_id, source",
+        "from": "purchase_requisitions",
+        "fields": ["pr_code", "material_code", "material_name"],
+    },
+    {
+        "source": "purchase_order", "label": "采购订单", "route": "/procurement",
+        "select": "id, po_code, factory_id, material_code, material_name, qty, status, supplier_name, order_date, expected_date",
+        "from": "purchase_orders",
+        "fields": ["po_code", "material_code", "material_name", "supplier_name"],
+    },
 ]
 
 

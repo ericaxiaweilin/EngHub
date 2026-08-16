@@ -405,12 +405,16 @@ class FactoryCommander:
                 act = getattr(d, "action", None)
                 act_str = act.value if hasattr(act, "value") else str(act)
                 if act_str in APPROVAL_ACTIONS:
-                    # 去重：同 factory+同动作类型+同 target 已有 pending 任务则跳过
+                    # 去重：同动作类型+同 target，24h 内已有非终态任务（pending/approved/in_progress）则跳过。
+                    # 旧版只查 pending：任务一旦获批，下一周期决策又会重复落单（实测同题 13 连刷）。
+                    # 旧版用 title LIKE %target%：target 为空时 %% 误匹配全部同类任务。
+                    _tgt = str(getattr(d, "target", "") or "")
                     dup = (await self.db.execute(_t("""
                         SELECT 1 FROM rcc_tasks WHERE task_type=:tt
-                        AND title LIKE :tl AND status='pending' LIMIT 1
-                    """), {"tt": act_str,
-                           "tl": f"%{getattr(d, 'target', '')}%"})).scalar_one_or_none()
+                        AND COALESCE(affected_params->>'target','') = :tgt
+                        AND status IN ('pending','approved','in_progress')
+                        AND created_at > NOW() - interval '24 hours' LIMIT 1
+                    """), {"tt": act_str, "tgt": _tgt})).scalar_one_or_none()
                     if not dup:
                         await self.db.execute(_t("""
                             INSERT INTO rcc_tasks (id, task_code, task_type, title, description,
