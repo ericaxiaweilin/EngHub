@@ -130,13 +130,16 @@ async def enforce_tenant(
     """多租户隔离依赖 (改进自 engflow TenantContext)。
 
     factory_id 来源优先级：函数参数 > X-Factory-Id 请求头 > 用户自身。
-    普通用户强制锁定自身厂区，传不一致直接 403；超管可跨厂区。
+    普通用户强制锁定自身厂区，传不一致直接 403；超管/admin 可跨厂区。
     """
     if request is not None:
         header_fid = request.headers.get("X-Factory-Id") or request.headers.get("x-factory-id")
         if header_fid and not factory_id:
             factory_id = header_fid
-    if current_user.is_superuser:
+    # 权限口径与 RBAC 层对齐：is_superuser 或 role=='admin' 均可跨厂区。
+    # （require_permission 早已将 admin 视为全权限，此处旧版只认 is_superuser，
+    #   导致 admin 用户跨厂读数据 403——双标 bug）
+    if current_user.is_superuser or current_user.role == "admin":
         return factory_id or current_user.factory_id
     if not current_user.factory_id:
         raise HTTPException(
