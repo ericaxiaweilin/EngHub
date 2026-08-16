@@ -3049,9 +3049,46 @@ async def _tool_query_shortage_alerts(db: AsyncSession, args: Dict[str, Any], fa
         for r in rows
     ]
     critical = [i for i in items if i["severity"] == "critical"]
+    # ── 工单需求缺料口径：在制/待排工单物料需求 > 可用 → 真缺料（MRP 视角）──
+    wo_items = []
+    wo_rows = (await db.execute(sa_text("""
+        SELECT wom.material_code, wom.material_name,
+               COALESCE(SUM(wom.required_qty - wom.received_qty), 0) AS shortage_qty,
+               (SELECT COALESCE(SUM(inv2.available_qty), 0) FROM inventory inv2
+                WHERE inv2.material_code = wom.material_code AND inv2.factory_id = :fid) AS avail_qty,
+               COUNT(DISTINCT wom.work_order_id) AS wo_count
+        FROM work_order_materials wom
+        JOIN work_orders wo ON wo.id = wom.work_order_id
+        WHERE wo.factory_id = :fid AND wo.status IN ('released','in_progress','pending')
+          AND wom.required_qty > wom.received_qty
+        GROUP BY wom.material_code, wom.material_name
+        HAVING SUM(wom.required_qty - wom.received_qty) > 0
+        ORDER BY SUM(wom.required_qty - wom.received_qty) DESC
+        LIMIT 10
+    """), {"fid": fid})).mappings().all()
+    for r in wo_rows:
+        need = float(r["shortage_qty"] or 0)
+        avail = float(r["avail_qty"] or 0)
+        if need > avail:
+            wo_items.append({
+                "material_code": r["material_code"], "material_name": r["material_name"] or r["material_code"],
+                "required_qty": need, "available_qty": avail, "gap": round(need - avail, 1),
+                "affected_work_orders": r["wo_count"], "severity": "critical" if need - avail > 100 else "warning",
+            })
+
+    merged = wo_items + [i for i in items if i["material_code"] not in {w["material_code"] for w in wo_items}]
+    # ── 建议动作（PMC 主动性）：每个缺料项给下一步行动 ──
+    for i in merged:
+        if i.get("required_qty", 0) > 0:
+            i["action_suggestion"] = f"缺口 {i.get('gap', 0)}，建议创建采购申请并通知采购跟进（1 个工单已受影响）" if i.get("affected_work_orders") else f"缺口 {i.get('gap', 0)}，建议创建采购申请补货"
+        else:
+            i["action_suggestion"] = f"库存低于补货阈值，建议按安全库存补货（缺口 {i.get('gap', 0)}）"
     return {
-        "factory_id": fid, "shortage_count": len(items),
-        "critical_count": len(critical), "items": items,
+        "factory_id": fid, "shortage_count": len(merged),
+        "critical_count": len([i for i in merged if i["severity"] == "critical"]),
+        "items": merged,
+        "note": "缺料口径：①工单需求>可用（MRP视角）②库存低于补货阈值",
+        "suggestions": [i["action_suggestion"] for i in merged[:5]],
     }
 
 
@@ -3390,12 +3427,13 @@ async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id
         VALUES (:id, :code, :f, :po, :m, :sup, :q, :acc, :rej, 'pending', 'MAIN', :cb, NOW())
     """), {"id": gr_id, "code": gr_code, "f": fid, "po": po["id"], "m": po["material_code"],
            "sup": po["supplier_id"], "q": qty, "acc": accepted, "rej": rejected, "cb": operator})
-    # 更新 PO 状态 + 库存（合格入账）
+    # 更新 PO 状态 + 库存（合格入账，可用与总量同步）
     await db.execute(text("""
         UPDATE purchase_orders SET status='received', actual_date=CURRENT_DATE WHERE id=:id
     """), {"id": po["id"]})
     await db.execute(text("""
-        UPDATE inventory SET available_qty=available_qty+:acc WHERE material_code=:m AND factory_id=:f
+        UPDATE inventory SET available_qty=available_qty+:acc, total_qty=total_qty+:acc
+        WHERE material_code=:m AND factory_id=:f
     """), {"acc": accepted, "m": po["material_code"], "f": fid})
     await _report_rcc_action(db, fid, "goods_receipt", gr_code,
                              f"PO {po_code} 收货 {int(accepted)} 合格/{int(rejected)} 不良，已入库存",
