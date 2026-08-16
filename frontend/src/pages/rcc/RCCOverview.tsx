@@ -245,7 +245,26 @@ export default function RCCOverview() {
 
       {/* 五维健康度 + 工单分布 */}
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={24}>
+        <Col xs={24} lg={14}>
+          <div style={{ background: COLORS.bgCard, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 24 }}>
+            <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14, marginBottom: 16 }}>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <span><ExperimentOutlined style={{ color: COLORS.accent, marginRight: 8 }} />五维资源健康度</span>
+                <Tooltip title="追溯五维来源">
+                  <Button type="text" size="small" icon={<EyeOutlined />} onClick={() => openTrace('rcc', '五维资源健康追溯')} style={{ color: COLORS.textDim }} />
+                </Tooltip>
+              </Space>
+            </div>
+            <Row gutter={8}>
+              <Col span={4} offset={1}><HealthRing label="人力" percent={metrics.peopleHealth} color={COLORS.accent} icon={<TeamOutlined />} onClick={() => openTrace('people', '人力健康度追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="设备" percent={metrics.equipHealth} color={COLORS.accentBlue} icon={<ToolOutlined />} onClick={() => openTrace('equipment', '设备健康度追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="工单" percent={metrics.orderHealth} color={COLORS.accentPurple} icon={<FileTextOutlined />} onClick={() => openTrace('work_orders', '工单健康度追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="环境" percent={metrics.envHealth} color={COLORS.warning} icon={<EnvironmentOutlined />} onClick={() => openTrace('qms', '环境/质量预警追溯')} /></Col>
+              <Col span={4} offset={1}><HealthRing label="工艺" percent={metrics.processHealth} color={COLORS.success} icon={<ExperimentOutlined />} onClick={() => openTrace('process', '工艺健康度追溯')} /></Col>
+            </Row>
+          </div>
+        </Col>
+        <Col xs={24} lg={10}>
           <div style={{ background: COLORS.bgCard, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 24, height: '100%' }}>
             <div style={{ color: COLORS.text, fontWeight: 600, fontSize: 14, marginBottom: 16 }}>
               <Space style={{ width: '100%', justifyContent: 'space-between' }}>
