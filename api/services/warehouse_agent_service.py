@@ -81,13 +81,13 @@ class WarehouseAgent:
         # 创建采购申请记录
         for r in replenishments:
             await self.db.execute(text("""
-                INSERT INTO purchase_requests (id, factory_id, material_code, material_name,
-                    requested_qty, unit, urgency, status, source, created_at)
-                VALUES (gen_random_uuid(), :fid, :mc, :mn, :qty, :unit, :urg, 'pending', 'warehouse_agent', NOW())
-                ON CONFLICT DO NOTHING
+                INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, source_id, material_code,
+                    material_name, qty, unit, required_date, status, auto_approved, priority, created_by, created_at, updated_at)
+                VALUES (gen_random_uuid()::text, :fid, :pc, 'warehouse_agent', :fid, :mc,
+                    :mn, :qty, :unit, (CURRENT_DATE + INTERVAL '7 days')::date, 'pending', FALSE, :urg, 'warehouse_agent', NOW(), NOW())
             """), {
-                "fid": factory_id, "mc": r["material_code"],
-                "mn": r["material_name"], "qty": r["suggested_qty"],
+                "fid": factory_id, "pc": f"PR-WA-{__import__('uuid').uuid4().hex[:8].upper()}",
+                "mc": r["material_code"], "mn": r["material_name"], "qty": r["suggested_qty"],
                 "unit": item.get("unit", "pcs"), "urg": r["urgency"],
             })
 

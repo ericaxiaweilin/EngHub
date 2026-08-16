@@ -129,12 +129,13 @@ class ReplenishExecutor(BaseWmsExecutor):
             urgency = item["urgency"]
             
             await db.execute(text("""
-                INSERT INTO purchase_requests (id, factory_id, material_code, material_name,
-                    requested_qty, unit, urgency, status, source, created_at)
-                VALUES (gen_random_uuid(), :fid, :mc, :mn, :qty, 'pcs', :urg, 'pending', 'wms_replenish', NOW())
-                ON CONFLICT DO NOTHING
+                INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, source_id, material_code,
+                    material_name, qty, unit, required_date, status, auto_approved, priority, created_by, created_at, updated_at)
+                VALUES (gen_random_uuid()::text, :fid, :pc, 'wms_replenish', :fid, :mc,
+                    :mn, :qty, 'pcs', (CURRENT_DATE + INTERVAL '7 days')::date, 'pending', FALSE, :urg, 'wms_replenish', NOW(), NOW())
             """), {
                 "fid": factory_id,
+                "pc": f"PR-WMS-{__import__('uuid').uuid4().hex[:8].upper()}",
                 "mc": item["material_code"],
                 "mn": item["material_name"],
                 "qty": item["suggested_qty"],

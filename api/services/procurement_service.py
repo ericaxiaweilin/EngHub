@@ -56,7 +56,7 @@ class ProcurementService:
                 "id": _gen_id(), "fid": factory_id, "code": pr_code,
                 "src": item.get("plan_id", ""), "mc": material_code,
                 "mn": item.get("material_name", ""), "qty": net_qty,
-                "rd": (date.today() + timedelta(days=item.get("lead_days", 7))).isoformat(),
+                "rd": date.today() + timedelta(days=int(item.get("lead_days", 7) or 7)),
             })
             created.append({"pr_code": pr_code, "material_code": material_code, "qty": net_qty})
 

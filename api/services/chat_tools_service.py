@@ -3559,6 +3559,39 @@ async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id
         UPDATE inventory SET available_qty=available_qty+:acc, total_qty=total_qty+:acc
         WHERE material_code=:m AND factory_id=:f
     """), {"acc": accepted, "m": po["material_code"], "f": fid})
+    # ── 回写工单物料已收量（齐套可补齐）：合格数计入在制工单 received_qty ──
+    if accepted > 0:
+        # 优先：PO→PR→source_id 指向工单
+        po_pr = (await db.execute(text(
+            "SELECT pr_id FROM purchase_orders WHERE id=:id"
+        ), {"id": po["id"]})).mappings().first()
+        target_wo = None
+        if po_pr and po_pr["pr_id"]:
+            pr = (await db.execute(text(
+                "SELECT source, source_id FROM purchase_requisitions WHERE id=:pid OR pr_code=:pid"
+            ), {"pid": po_pr["pr_id"]})).mappings().first()
+            if pr and pr["source"] == "work_order" and pr["source_id"]:
+                target_wo = pr["source_id"]
+        if target_wo:
+            await db.execute(text("""
+                UPDATE work_order_materials SET received_qty=received_qty+:acc,
+                    shortage_qty=GREATEST(required_qty-received_qty-:acc, 0)
+                WHERE material_code=:m AND work_order_id=:wo
+            """), {"acc": accepted, "m": po["material_code"], "wo": target_wo})
+        else:
+            # 通用：回写所有在制/待排工单该物料
+            await db.execute(text("""
+                UPDATE work_order_materials SET received_qty=received_qty+:acc,
+                    shortage_qty=GREATEST(required_qty-received_qty-:acc, 0)
+                WHERE material_code=:m AND work_order_id IN (
+                    SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress','pending')
+                )
+            """), {"acc": accepted, "m": po["material_code"], "f": fid})
+        # 回写后重新计算 shortage（防御：required_qty 可能更新）
+        await db.execute(text("""
+            UPDATE work_order_materials SET shortage_qty=GREATEST(required_qty-received_qty, 0)
+            WHERE material_code=:m AND shortage_qty < 0
+        """), {"m": po["material_code"]})
     await _report_rcc_action(db, fid, "goods_receipt", gr_code,
                              f"PO {po_code} 收货 {int(accepted)} 合格/{int(rejected)} 不良，已入库存",
                              detail=f"供应商 {po['supplier_id']} 物料 {po['material_code']}", operator=operator,
@@ -4212,7 +4245,28 @@ async def _tool_run_mrp_calculation(db: AsyncSession, args: Dict[str, Any], fact
                              f"MRP 计算 {len(results)} 个需求源",
                              detail=json.dumps([{"plan": r["plan_code"], "summary": r.get("summary", "")} for r in results[:5]], ensure_ascii=False),
                              operator=operator, risk="info")
-    return {"type": "mrp_result", "count": len(results), "results": results}
+    # ── MRP→PR 自动闭环：净需求>0 的物料自动生成采购申请（采购执行链路起点）──
+    pr_info = []
+    try:
+        from api.services.procurement_service import ProcurementService
+        ps = ProcurementService(db)
+        mrp_items = []
+        for r in results:
+            for m in r.get("materials", []):
+                if m.get("status") == "shortage" and m.get("net_need", 0) > 0:
+                    mrp_items.append({
+                        "material_code": m["material_code"], "material_name": m.get("material_name", m["material_code"]),
+                        "net_requirement": m["net_need"], "plan_id": r.get("plan_code"),
+                        "lead_days": 7,
+                    })
+        if mrp_items:
+            pr_res = await ps.auto_pr_from_mrp(fid, mrp_items)
+            pr_info = pr_res.get("requisitions", [])
+    except Exception as e:
+        pr_info = [{"error": str(e)[:80]}]
+    return {"type": "mrp_result", "count": len(results), "results": results,
+            "auto_pr_count": len(pr_info), "auto_prs": pr_info,
+            "note": f"MRP 完成：净需求>0 的 {len(pr_info)} 个物料已自动生成采购申请" if pr_info else "MRP 完成：无净需求缺料" if not mrp_items else f"MRP 完成：{len(mrp_items)} 项缺料待建PR"}
 
 
 async def _tool_create_shipment(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
