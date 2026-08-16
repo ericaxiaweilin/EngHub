@@ -221,7 +221,12 @@ export default function RCCCommandCenter() {
               </button>
             ))}
           </div>
-          {activeTab === 'overview' && <RCCOverview />}
+          {activeTab === 'overview' && (
+            <>
+              <ResourceIndexCard />
+              <RCCOverview />
+            </>
+          )}
           {activeTab === 'resources' && <RCCResourceBoard />}
           {activeTab === 'decisions' && <RCCDecisionHub />}
           {activeTab === 'analysis' && <RCCAnalysis />}

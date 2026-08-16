@@ -276,3 +276,68 @@ async def sync_baseline(
         return {"success": True, "data": result}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/resource-index", summary="RCC 四维资源可用指数：人力×设备×物料×时间 乘积模型")
+async def resource_index(
+    date: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    """RCC 核心抓手：可用产能 = 可用人力 × 可用设备 × 可用物料 × 可用时间。
+    任一维为 0 → 整体产能 0（缺料停产/设备坏停线/人不够降速/无班次停工）。
+    """
+    from datetime import datetime as _dt
+    from sqlalchemy import text as sql_text
+    fid = "FAC_MECH_001"
+    today = _dt.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d") if date else _dt.now().strftime("%Y-%m-%d")
+
+    # ① 人力可用率 = 在岗 / 出勤编制
+    hr = (await db.execute(sql_text("""
+        SELECT COUNT(*) FILTER (WHERE status='present') AS present, COUNT(*) AS total
+        FROM attendance WHERE factory_id=:f AND date=:d
+    """), {"f": fid, "d": today})).mappings().first()
+    hr_pct = round(hr["present"] / hr["total"] * 100, 1) if hr["total"] else 0
+
+    # ② 设备可用率 = 运行 / 全部
+    eq = (await db.execute(sql_text("""
+        SELECT COUNT(*) FILTER (WHERE status='running') AS running, COUNT(*) AS total
+        FROM equipment WHERE factory_id=:f
+    """), {"f": fid})).mappings().first()
+    eq_pct = round(eq["running"] / eq["total"] * 100, 1) if eq["total"] else 0
+
+    # ③ 物料齐套率 = 已齐套工单物料 / 全部需求物料
+    mat = (await db.execute(sql_text("""
+        SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE received_qty >= required_qty) AS kit
+        FROM work_order_materials WHERE work_order_id IN
+          (SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress'))
+    """), {"f": fid})).mappings().first()
+    mat_pct = round(mat["kit"] / mat["total"] * 100, 1) if mat["total"] else 0
+
+    # ④ 时间可用率 = 今日运转班次工时 / 标准 20h（2班倒）
+    shifts = (await db.execute(sql_text("""
+        SELECT shift, COUNT(DISTINCT operator_id) AS workers FROM attendance
+        WHERE factory_id=:f AND date=:d AND status='present'
+        GROUP BY shift
+    """), {"f": fid, "d": today})).mappings().all()
+    hours_map = {"白班": 10, "夜班": 10, "两班倒": 20, "早班": 8, "中班": 8, "晚班": 8}
+    covered = max((hours_map.get(s["shift"], 8) for s in shifts if s["workers"] > 0), default=0)
+    time_pct = round(min(100, covered / 20 * 100), 1)
+
+    # 乘积
+    idx = round((hr_pct/100) * (eq_pct/100) * (mat_pct/100) * (time_pct/100) * 100, 1)
+    level = "green" if idx >= 80 else ("warning" if idx >= 60 else "danger")
+
+    return {
+        "factory_id": fid, "date": today, "index": idx, "level": level,
+        "dimensions": {
+            "manpower": {"pct": hr_pct, "available": hr["present"], "total": hr["total"], "desc": "在岗/出勤编制"},
+            "equipment": {"pct": eq_pct, "available": eq["running"], "total": eq["total"], "desc": "运行/全部设备"},
+            "material": {"pct": mat_pct, "available": mat["kit"], "total": mat["total"], "desc": "齐套物料/需求物料"},
+            "time": {"pct": time_pct, "available": covered, "total": 20, "desc": "运转班次工时/标准20h"},
+        },
+        "formula": f"{hr_pct}% × {eq_pct}% × {mat_pct}% × {time_pct}% = {idx}%",
+        "bottleneck": min(
+            [("manpower", hr_pct), ("equipment", eq_pct), ("material", mat_pct), ("time", time_pct)],
+            key=lambda x: x[1])[0],
+        "message": "任一维为 0 → 整体产能为 0（缺料停产/设备坏停线/人不够降速/无班次停工）",
+    }
