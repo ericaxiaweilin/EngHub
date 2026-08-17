@@ -1178,14 +1178,16 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
             if not pr_exists:
                 try:
                     await db.execute(text("""
-                        INSERT INTO purchase_requisitions (id, factory_id, material_code, material_name, qty, unit,
+                        INSERT INTO purchase_requisitions (id, pr_code, factory_id, material_code, material_name, qty, unit,
                             status, source, created_by, created_at, updated_at)
-                        VALUES (gen_random_uuid()::text, :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
+                        VALUES (gen_random_uuid()::text,
+                            'PR-' || to_char(NOW(),'YYYYMMDD') || '-' || substr(gen_random_uuid()::text,1,6),
+                            :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
                     """), {"f": fid, "m": mcode.group(1), "mn": mcode.group(1), "q": gap})
                     await db.commit()
                     return {"action": "auto_pr", "note": f"物料 {mcode.group(1)} 缺口 {round(gap,1)}，采购智能体已自动创建 PR（数量=缺口）"}
                 except Exception:
-                    pass
+                    await db.rollback()  # 防会话中毒拖垮后续扫描
             return {"action": "escalated", "note": f"物料 {mcode.group(1)} 库存 {inv} < 工单需求 {need_check}，缺口 {round(gap,1)}，已有 PR 在途转采购跟催"}
             # 库存不足 → 检查是否已有 PR，无则自动建 PR（采购接管）
             has_pr = (await db.execute(text(
@@ -1194,9 +1196,11 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
             if not has_pr:
                 try:
                     await db.execute(text("""
-                        INSERT INTO purchase_requisitions (id, factory_id, material_code, material_name, qty, unit,
+                        INSERT INTO purchase_requisitions (id, pr_code, factory_id, material_code, material_name, qty, unit,
                             status, source, created_by, created_at, updated_at)
-                        VALUES (gen_random_uuid()::text, :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
+                        VALUES (gen_random_uuid()::text,
+                            'PR-' || to_char(NOW(),'YYYYMMDD') || '-' || substr(gen_random_uuid()::text,1,6),
+                            :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
                     """), {"f": fid, "m": mcode.group(1), "mn": mcode.group(1),
                             "q": float((await db.execute(text(
                                 "SELECT COALESCE(required_qty, 100) FROM work_order_materials WHERE material_code=:m AND work_order_id IN (SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress')) LIMIT 1"
@@ -1204,7 +1208,7 @@ async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[
                     await db.commit()
                     return {"action": "auto_pr", "note": f"物料 {mcode.group(1)} 库存 0，AI 已自动创建采购申请"}
                 except Exception:
-                    pass
+                    await db.rollback()  # 防会话中毒拖垮后续扫描
             return {"action": "escalated", "note": f"物料 {mcode.group(1)} 缺料，已有 PR 在途，转采购跟催"}
 
     # 2) 设备任务
