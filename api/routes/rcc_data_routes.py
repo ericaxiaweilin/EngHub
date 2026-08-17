@@ -299,9 +299,22 @@ async def resource_index(
     fid = "FAC_MECH_001"
     today = _dt.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d") if date else _dt.now().strftime("%Y-%m-%d")
 
-    # ① 人力可用率 = 在岗 / 出勤编制
+    # 兜底：当日考勤未生成时按需生成（幂等），避免人力/工时维度归零拖垮指数
+    try:
+        from api.services.attendance_service import ensure_attendance
+        await ensure_attendance(db, fid, today)
+    except Exception as _ae:
+        # 禁止静默吞异常：记日志便于定位（如 FK 违反/schema 不一致）
+        import logging as _lg
+        _lg.getLogger("rcc_data").warning("[resource-index] 考勤按需生成失败: %s", _ae)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ① 人力可用率 = 在岗（含迟到）/ 出勤编制
     hr = (await db.execute(sql_text("""
-        SELECT COUNT(*) FILTER (WHERE status='present') AS present, COUNT(*) AS total
+        SELECT COUNT(*) FILTER (WHERE status IN ('present','late')) AS present, COUNT(*) AS total
         FROM attendance WHERE factory_id=:f AND date=:d
     """), {"f": fid, "d": today})).mappings().first()
     hr_pct = round(hr["present"] / hr["total"] * 100, 1) if hr["total"] else 0
@@ -324,7 +337,7 @@ async def resource_index(
     # ④ 时间可用率 = 今日运转班次工时 / 标准 20h（2班倒）
     shifts = (await db.execute(sql_text("""
         SELECT shift, COUNT(DISTINCT operator_id) AS workers FROM attendance
-        WHERE factory_id=:f AND date=:d AND status='present'
+        WHERE factory_id=:f AND date=:d AND status IN ('present','late')
         GROUP BY shift
     """), {"f": fid, "d": today})).mappings().all()
     hours_map = {"白班": 10, "夜班": 10, "两班倒": 20, "早班": 8, "中班": 8, "晚班": 8}

@@ -378,6 +378,27 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 交期智能体任务异常: {e}")
 
+        # 考勤自动生成 —— 每 60 分钟幂等检查（当日无考勤则按花名册生成，
+        # 保障 RCC 资源可用指数的人力/工时维度每日不塌方）
+        try:
+            import time as _t11
+            if not hasattr(_periodic_scheduler, "_last_attendance_gen"):
+                _periodic_scheduler._last_attendance_gen = 0
+            if _t11.time() - _periodic_scheduler._last_attendance_gen > 3600:  # 60min
+                _periodic_scheduler._last_attendance_gen = _t11.time()
+                from api.services.attendance_service import ensure_attendance
+                async with db_config.session_factory() as db:
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            res = await ensure_attendance(db, fid)
+                            if res.get("created"):
+                                _logger.info(f"[attendance] {fid}: 生成{res['created']}条当日考勤")
+                        except Exception as ex:
+                            await db.rollback()
+                            _logger.warning(f"[attendance] 考勤生成失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 考勤生成任务异常: {e}")
+
         # 虚拟工厂脉搏 —— 每 60 分钟按真实节奏接单/拆单/报工/预警
         try:
             import time as _t_vf

@@ -42,6 +42,7 @@ RETENTION_RULES: List[Dict[str, Any]] = [
     {"table": "agent_heartbeats", "ts": "created_at", "keep_days": 30, "max_rows": 50_000},
     {"table": "tms_agent_actions", "ts": "created_at", "keep_days": 90, "max_rows": 50_000},
     {"table": "commander_cycles", "ts": "created_at", "keep_days": 90, "max_rows": 20_000},
+    {"table": "attendance", "ts": "created_at", "keep_days": 120, "max_rows": 500_000},
 ]
 
 # 终态任务归档线：完成/取消的跟进任务超过该天数后清理（保留近期可追溯）
