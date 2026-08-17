@@ -1195,3 +1195,140 @@ async def work_order_relations(
                     "report_count": len(reports)},
         "note": "跨表关联（只读）：物料齐套 ← work_order_materials，库存 ← inventory，在途 ← purchase_orders，报工 ← production_reports",
     }
+
+
+# ==================== 标准模板程序工单（8D/CAR/退料单等模板一键开单） ====================
+
+async def _ensure_pwo_table(db: AsyncSession):
+    from sqlalchemy import text as sa_text
+    # asyncpg 不支持多语句一次执行，逐条下发
+    await db.execute(sa_text("""
+        CREATE TABLE IF NOT EXISTS program_work_orders (
+            id VARCHAR(50) PRIMARY KEY,
+            factory_id VARCHAR(50),
+            pwo_code VARCHAR(50) NOT NULL,
+            template_code VARCHAR(50) NOT NULL,
+            template_name VARCHAR(120),
+            module VARCHAR(30),
+            title VARCHAR(300) NOT NULL,
+            priority VARCHAR(20) DEFAULT 'medium',
+            status VARCHAR(20) DEFAULT 'open',
+            form_data JSONB DEFAULT '{}'::jsonb,
+            source_ticket_id VARCHAR(50),
+            created_by VARCHAR(80),
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            closed_at TIMESTAMP,
+            closed_by VARCHAR(80)
+        )
+    """))
+    await db.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_pwo_factory_status ON program_work_orders(factory_id, status)"))
+    await db.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_pwo_template ON program_work_orders(template_code)"))
+    await db.commit()  # DDL 先行落盘，避免与后续业务写入同事务
+
+
+class TemplateCreatePayload(BaseModel):
+    factory_id: Optional[str] = None
+    template_code: str
+    title: str
+    priority: Optional[str] = "medium"
+    data: Optional[Dict[str, Any]] = None
+    metadata_: Optional[Dict[str, Any]] = None
+
+
+def _resolve_fid(request: Request, current_user: User, payload_fid: Optional[str] = None) -> str:
+    return ((request.headers.get("x-factory-id") if request else None)
+            or payload_fid
+            or getattr(current_user, "active_factory_id", None)
+            or current_user.factory_id or "FAC_MECH_001")
+
+
+@router.post("/work-order-templates/create", summary="基于标准模板创建程序工单（8D/CAR/退料单等）")
+async def create_from_template(
+    payload: TemplateCreatePayload,
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from sqlalchemy import text as sa_text
+    import uuid as _uuid
+    fid = _resolve_fid(request, current_user, payload.factory_id)
+    # 模板存在性校验（当前厂，允许跨厂公共模板回退）
+    tpl = (await db.execute(sa_text("""
+        SELECT template_code, template_name, module, default_priority
+        FROM work_order_templates
+        WHERE template_code=:c AND is_active=true AND (factory_id=:f OR factory_id IS NULL)
+        ORDER BY (factory_id=:f) DESC LIMIT 1
+    """), {"c": payload.template_code, "f": fid})).fetchone()
+    if not tpl:
+        raise HTTPException(status_code=404, detail=f"模板不存在或未启用: {payload.template_code}")
+    await _ensure_pwo_table(db)
+    # 编号：PWO-YYYYMMDD-序号（当日自增）
+    seq = (await db.execute(sa_text("""
+        SELECT COUNT(*)+1 FROM program_work_orders
+        WHERE created_at >= CURRENT_DATE AND factory_id=:f
+    """), {"f": fid})).scalar()
+    pwo_code = f"PWO-{datetime.now().strftime('%Y%m%d')}-{int(seq):03d}"
+    pwo_id = str(_uuid.uuid4())
+    meta = payload.metadata_ or {}
+    await db.execute(sa_text("""
+        INSERT INTO program_work_orders
+        (id, factory_id, pwo_code, template_code, template_name, module, title, priority,
+         status, form_data, source_ticket_id, created_by)
+        VALUES (:id,:f,:code,:tpl,:name,:module,:title,:pri,'open',CAST(:data AS jsonb),:src,:by)
+    """), {
+        "id": pwo_id, "f": fid, "code": pwo_code, "tpl": tpl[0], "name": tpl[1],
+        "module": tpl[2], "title": payload.title, "pri": payload.priority or tpl[3] or "medium",
+        "data": json.dumps(payload.data or {}, ensure_ascii=False),
+        "src": meta.get("source_ticket_id"), "by": current_user.username,
+    })
+    await db.commit()
+    return {"success": True, "id": pwo_id, "work_order_code": pwo_code,
+            "template_code": tpl[0], "template_name": tpl[1], "status": "open"}
+
+
+@router.get("/work-order-templates/orders", summary="程序工单列表（标准模板开出的 8D/CAR 等单据）")
+async def list_program_work_orders(
+    request: Request = None,
+    status: Optional[str] = None,
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from sqlalchemy import text as sa_text
+    fid = _resolve_fid(request, current_user)
+    await _ensure_pwo_table(db)
+    sql = "SELECT id, pwo_code, template_code, template_name, module, title, priority, status, form_data, created_by, created_at, closed_at FROM program_work_orders WHERE factory_id=:f"
+    params: dict = {"f": fid, "limit": limit}
+    if status:
+        sql += " AND status=:s"
+        params["s"] = status
+    sql += " ORDER BY created_at DESC LIMIT :limit"
+    rows = (await db.execute(sa_text(sql), params)).fetchall()
+    return {"items": [{
+        "id": r[0], "pwo_code": r[1], "template_code": r[2], "template_name": r[3],
+        "module": r[4], "title": r[5], "priority": r[6], "status": r[7],
+        "form_data": r[8] if isinstance(r[8], dict) else {},
+        "created_by": r[9], "created_at": str(r[10])[:16],
+        "closed_at": str(r[11])[:16] if r[11] else None,
+    } for r in rows]}
+
+
+@router.post("/work-order-templates/orders/{order_id}/close", summary="关闭程序工单")
+async def close_program_work_order(
+    order_id: str,
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from sqlalchemy import text as sa_text
+    fid = _resolve_fid(request, current_user)
+    await _ensure_pwo_table(db)
+    res = await db.execute(sa_text("""
+        UPDATE program_work_orders SET status='closed', closed_at=NOW(), closed_by=:by, updated_at=NOW()
+        WHERE id=:id AND factory_id=:f AND status<>'closed'
+    """), {"id": order_id, "f": fid, "by": current_user.username})
+    await db.commit()
+    if res.rowcount == 0:
+        raise HTTPException(status_code=404, detail="程序工单不存在或已关闭")
+    return {"success": True}

@@ -24,6 +24,8 @@ import RCCAnalysis from './RCCAnalysis'
 import LogicChainEditor from './LogicChainEditor'
 import NeuralGraph from './RCCNeuralGraph'
 import RCCApprovalCenter from './RCCApprovalCenter'
+import RCCStandardTemplates from './RCCStandardTemplates'
+import PMCCollaborationCard from './PMCCollaborationCard'
 
 const API = '/api/v1'
 const C = {
@@ -128,6 +130,8 @@ export default function RCCCommandCenter() {
     { key: 'dispatch', label: '任务队列', icon: <CarryOutOutlined />, badge: blockedTasks.length },
     { key: 'neural', label: '图连接矩阵', icon: <ApartmentOutlined /> },
     { key: 'logic', label: '逻辑链编排', icon: <ControlOutlined /> },
+    { key: 'templates', label: '标准模板', icon: <FileTextOutlined /> },
+    { key: 'supply', label: '供应链协同', icon: <CarryOutOutlined /> },
     { key: 'logs', label: '调度日志', icon: <FileTextOutlined /> },
   ]
 
@@ -238,6 +242,8 @@ export default function RCCCommandCenter() {
           {activeTab === 'logic' && <LogicChainView />}
           {activeTab === 'neural' && <NeuralGraph tasks={tasks} inbox={inbox} baseline={baseline} factoryId={factoryId} />}
           {activeTab === 'approvals' && <RCCApprovalCenter onApproved={loadAll} />}
+          {activeTab === 'templates' && <RCCStandardTemplates factoryId={factoryId} />}
+          {activeTab === 'supply' && <PMCCollaborationCard factoryId={factoryId} />}
           {activeTab === 'logs' && <LogStream />}
 
           {/* AI 调度（设计稿排版：hero + 流水线 + 方案卡网格） */}

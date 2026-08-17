@@ -824,3 +824,382 @@ async def doc_template_unified(doc_type: str, code: str = "", db: AsyncSession =
     return HTMLResponse(render_doc(doc_type, rd, str(doc_code), doc_date))
 
 
+
+# ==================== PR 请购审批工作流（行业标准：请购→审批→转采购） ====================
+
+PR_AUTO_APPROVE_LIMIT = 5000.0  # 金额阈值（元）：低于自动通过，高于需人工审批
+
+
+async def _ensure_pr_approval_columns(db: AsyncSession):
+    """PR 审批字段补齐（幂等，逐条执行——asyncpg 不支持多语句）"""
+    for stmt in (
+        "ALTER TABLE purchase_requisitions ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP",
+        "ALTER TABLE purchase_requisitions ADD COLUMN IF NOT EXISTS rejection_reason TEXT",
+        "ALTER TABLE purchase_requisitions ADD COLUMN IF NOT EXISTS approved_comment TEXT",
+    ):
+        await db.execute(text(stmt))
+    await db.commit()
+
+
+@router.get("/purchase-requisitions/summary", summary="PR 审批队列统计")
+async def pr_approval_summary(
+    factory_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    fid = factory_id or current_user.factory_id or "FAC_MECH_001"
+    await _ensure_pr_approval_columns(db)
+    rows = (await db.execute(text("""
+        SELECT LOWER(status) AS st, COUNT(*)::int AS n,
+               COALESCE(SUM(estimated_cost),0)::float AS amount
+        FROM purchase_requisitions WHERE factory_id=:f
+        GROUP BY LOWER(status)
+    """), {"f": fid})).fetchall()
+    dist = {r[0]: {"count": r[1], "amount": round(r[2], 2)} for r in rows}
+    pending = dist.get("pending", {"count": 0, "amount": 0})
+    manual = (await db.execute(text("""
+        SELECT COUNT(*)::int, COALESCE(SUM(estimated_cost),0)::float
+        FROM purchase_requisitions
+        WHERE factory_id=:f AND LOWER(status)='pending' AND COALESCE(estimated_cost,0) > :lim
+    """), {"f": fid, "lim": PR_AUTO_APPROVE_LIMIT})).fetchone()
+    return {
+        "factory_id": fid,
+        "status_distribution": dist,
+        "pending_total": pending["count"],
+        "pending_amount": pending["amount"],
+        "needs_manual_review": manual[0] if manual else 0,
+        "needs_manual_amount": round(manual[1], 2) if manual else 0,
+        "auto_approve_limit": PR_AUTO_APPROVE_LIMIT,
+    }
+
+
+@router.get("/purchase-requisitions", summary="PR 请购单列表（含审批状态/金额分级）")
+async def list_purchase_requisitions(
+    factory_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    fid = factory_id or current_user.factory_id or "FAC_MECH_001"
+    await _ensure_pr_approval_columns(db)
+    sql = """
+        SELECT id, pr_code, material_code, material_name, qty, unit, required_date,
+               status, priority, estimated_cost, supplier_id, source, created_by,
+               approved_by, approved_at, rejection_reason, created_at
+        FROM purchase_requisitions WHERE factory_id=:f
+    """
+    params: Dict[str, Any] = {"f": fid, "limit": limit}
+    if status:
+        sql += " AND LOWER(status)=:st"
+        params["st"] = status.lower()
+    sql += " ORDER BY created_at DESC LIMIT :limit"
+    rows = (await db.execute(text(sql), params)).fetchall()
+    return {"items": [{
+        "id": r[0], "pr_code": r[1], "material_code": r[2], "material_name": r[3],
+        "qty": float(r[4] or 0), "unit": r[5], "required_date": str(r[6])[:10] if r[6] else None,
+        "status": (r[7] or "").lower(), "priority": r[8],
+        "estimated_cost": float(r[9] or 0), "supplier_id": r[10], "source": r[11],
+        "created_by": r[12], "approved_by": r[13],
+        "approved_at": str(r[14])[:16] if r[14] else None,
+        "rejection_reason": r[15], "created_at": str(r[16])[:16],
+        "needs_manual": float(r[9] or 0) > PR_AUTO_APPROVE_LIMIT,
+    } for r in rows]}
+
+
+@router.post("/purchase-requisitions/{pr_id}/approve", summary="审批通过 PR（可选直接转采购下单）")
+async def approve_purchase_requisition(
+    pr_id: str,
+    action: str = Query("approve", description="approve=仅批准; approve_and_order=批准并自动下单"),
+    comment: str = "",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _ensure_pr_approval_columns(db)
+    row = (await db.execute(text(
+        "SELECT id, pr_code, status, factory_id FROM purchase_requisitions WHERE id=:id"
+    ), {"id": pr_id})).mappings().first()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="PR 不存在")
+    if (row["status"] or "").lower() not in ("pending", "approved"):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"PR 当前状态 {row['status']} 不可审批")
+    await db.execute(text("""
+        UPDATE purchase_requisitions
+        SET status='approved', approved_by=:by, approved_at=NOW(),
+            approved_comment=:c, auto_approved=FALSE, rejection_reason=NULL, updated_at=NOW()
+        WHERE id=:id
+    """), {"id": pr_id, "by": current_user.username, "c": comment or None})
+    await db.commit()
+    result: Dict[str, Any] = {"success": True, "pr_code": row["pr_code"], "status": "approved", "approved_by": current_user.username}
+    if action == "approve_and_order":
+        from api.services.procurement_service import ProcurementService
+        po_result = await ProcurementService(db).auto_create_po(row["factory_id"], pr_id)
+        result["order_result"] = po_result
+    return result
+
+
+@router.post("/purchase-requisitions/{pr_id}/reject", summary="驳回 PR")
+async def reject_purchase_requisition(
+    pr_id: str,
+    reason: str = Query(..., min_length=2, description="驳回原因（必填）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _ensure_pr_approval_columns(db)
+    row = (await db.execute(text(
+        "SELECT id, pr_code, status FROM purchase_requisitions WHERE id=:id"
+    ), {"id": pr_id})).mappings().first()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="PR 不存在")
+    if (row["status"] or "").lower() != "pending":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"PR 当前状态 {row['status']} 不可驳回")
+    await db.execute(text("""
+        UPDATE purchase_requisitions
+        SET status='rejected', approved_by=:by, approved_at=NOW(), rejection_reason=:r, updated_at=NOW()
+        WHERE id=:id
+    """), {"id": pr_id, "by": current_user.username, "r": reason})
+    await db.commit()
+    return {"success": True, "pr_code": row["pr_code"], "status": "rejected", "reason": reason}
+
+# ==================== 收货→IQC→入库放行工作流（行业标准闭环） ====================
+
+@router.get("/goods-receipts", summary="收货单列表（含 IQC 检验状态）")
+async def list_goods_receipts(
+    factory_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    fid = factory_id or current_user.factory_id or "FAC_MECH_001"
+    await db.execute(text("ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS inspection_task_id VARCHAR(50)"))
+    await db.commit()
+    sql = """
+        SELECT gr.id, gr.gr_code, gr.po_id, po.po_code, gr.material_code, gr.supplier_id,
+               gr.quantity, gr.qty_accepted, gr.qty_rejected, gr.iqc_status, gr.warehouse,
+               gr.received_by, gr.received_at, gr.inspection_task_id, it.task_code, it.status
+        FROM goods_receipts gr
+        LEFT JOIN purchase_orders po ON po.id=gr.po_id
+        LEFT JOIN inspection_tasks it ON it.id=gr.inspection_task_id
+        WHERE gr.factory_id=:f
+    """
+    params: Dict[str, Any] = {"f": fid, "limit": limit}
+    if status:
+        sql += " AND gr.iqc_status=:st"
+        params["st"] = status
+    sql += " ORDER BY gr.received_at DESC NULLS LAST LIMIT :limit"
+    rows = (await db.execute(text(sql), params)).fetchall()
+    return {"items": [{
+        "id": r[0], "gr_code": r[1], "po_id": r[2], "po_code": r[3], "material_code": r[4],
+        "supplier_id": r[5], "quantity": float(r[6] or 0), "qty_accepted": float(r[7] or 0),
+        "qty_rejected": float(r[8] or 0), "iqc_status": r[9], "warehouse": r[10],
+        "received_by": r[11], "received_at": str(r[12])[:16] if r[12] else None,
+        "inspection_task_id": r[13], "inspection_task_code": r[14], "inspection_status": r[15],
+    } for r in rows]}
+
+
+@router.post("/goods-receipts/{gr_id}/inspect", summary="IQC 检验结论（合格放行/拒收退供）")
+async def inspect_goods_receipt(
+    gr_id: str,
+    result: str = Query(..., description="passed=合格放行 / conditional=让步接收 / rejected=拒收"),
+    qty_accepted: Optional[float] = None,
+    qty_rejected: Optional[float] = None,
+    remark: str = "",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """行业闭环：收货→IQC检验→合格放行入库 / 拒收扣回并退供。"""
+    from fastapi import HTTPException
+    if result not in ("passed", "conditional", "rejected"):
+        raise HTTPException(status_code=400, detail="result 必须是 passed/conditional/rejected")
+    await db.execute(text("ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS inspection_task_id VARCHAR(50)"))
+    await db.commit()
+    gr = (await db.execute(text(
+        "SELECT id, gr_code, factory_id, material_code, quantity, qty_accepted, inspection_task_id "
+        "FROM goods_receipts WHERE id=:id"
+    ), {"id": gr_id})).mappings().first()
+    if not gr:
+        raise HTTPException(status_code=404, detail="收货单不存在")
+    total = float(gr["quantity"] or 0)
+    acc = float(qty_accepted if qty_accepted is not None else (total if result != "rejected" else 0))
+    rej = float(qty_rejected if qty_rejected is not None else max(total - acc, 0))
+    iqc_status = {"passed": "passed", "conditional": "conditional", "rejected": "rejected"}[result]
+    await db.execute(text("""
+        UPDATE goods_receipts SET iqc_status=:s, qty_accepted=:acc, qty_rejected=:rej WHERE id=:id
+    """), {"s": iqc_status, "acc": acc, "rej": rej, "id": gr_id})
+    # 同步关闭关联检验任务
+    if gr["inspection_task_id"]:
+        await db.execute(text("""
+            UPDATE inspection_tasks SET status='completed', result=:r, defect_qty=:rej,
+                inspector=:by, completed_at=NOW(), remark=:rm, updated_at=NOW()
+            WHERE id=:t
+        """), {"r": "passed" if result != "rejected" else "failed", "rej": rej,
+               "by": current_user.username, "rm": remark or None, "t": gr["inspection_task_id"]})
+    effects: Dict[str, Any] = {}
+    if result == "rejected":
+        # 拒收：已入账的合格量扣回，避免未合格库存被占用
+        old_acc = float(gr["qty_accepted"] or 0)
+        if old_acc > 0:
+            await db.execute(text("""
+                UPDATE inventory SET available_qty=GREATEST(available_qty-:q,0), total_qty=GREATEST(total_qty-:q,0)
+                WHERE material_code=:m AND factory_id=:f
+            """), {"q": old_acc, "m": gr["material_code"], "f": gr["factory_id"]})
+            effects["inventory_rolled_back"] = old_acc
+        effects["next_step"] = "建议开退供单（模板：退料单/来料异常报告）并通知供应商"
+    else:
+        # 合格/让步接收：放行标记库存合格状态
+        await db.execute(text("""
+            UPDATE inventory SET qualified_status='qualified'
+            WHERE material_code=:m AND factory_id=:f AND (qualified_status IS NULL OR qualified_status='pending')
+        """), {"m": gr["material_code"], "f": gr["factory_id"]})
+        effects["released_to_stock"] = acc
+    await db.commit()
+    return {"success": True, "gr_code": gr["gr_code"], "iqc_status": iqc_status,
+            "qty_accepted": acc, "qty_rejected": rej, "inspector": current_user.username,
+            "effects": effects}
+
+# ==================== PO 采购订单管理（字段补齐 + 收货闭环） ====================
+
+PO_EXTRA_COLUMNS = (
+    "ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS received_qty NUMERIC DEFAULT 0",
+    "ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS tax_rate NUMERIC",
+    "ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS payment_terms VARCHAR(50)",
+    "ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS contract_no VARCHAR(50)",
+    "ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS delivery_address VARCHAR(200)",
+    "ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS supplier_contact VARCHAR(80)",
+)
+
+
+async def _ensure_po_columns(db: AsyncSession):
+    for stmt in PO_EXTRA_COLUMNS:
+        await db.execute(text(stmt))
+    await db.commit()
+
+
+@router.get("/purchase-orders", summary="采购订单列表（收货进度/逾期/闭环状态）")
+async def list_purchase_orders(
+    factory_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    fid = factory_id or current_user.factory_id or "FAC_MECH_001"
+    await _ensure_po_columns(db)
+    sql = """
+        SELECT id, po_code, pr_id, supplier_id, supplier_name, material_code, material_name,
+               qty, COALESCE(received_qty,0), unit_price, total_amount, currency,
+               order_date, expected_date, actual_date, status, auto_generated, tax_rate,
+               payment_terms, contract_no,
+               CASE WHEN expected_date < CURRENT_DATE
+                     AND status NOT IN ('received','completed','cancelled','closed')
+                    THEN (CURRENT_DATE - expected_date) ELSE 0 END AS overdue_days
+        FROM purchase_orders WHERE factory_id=:f
+    """
+    params: Dict[str, Any] = {"f": fid, "limit": limit}
+    if status:
+        sql += " AND status=:st"
+        params["st"] = status
+    sql += " ORDER BY order_date DESC NULLS LAST LIMIT :limit"
+    rows = (await db.execute(text(sql), params)).fetchall()
+    items = []
+    for r in rows:
+        qty, recv = float(r[7] or 0), float(r[8] or 0)
+        items.append({
+            "id": r[0], "po_code": r[1], "pr_id": r[2], "supplier_id": r[3], "supplier_name": r[4],
+            "material_code": r[5], "material_name": r[6], "qty": qty, "received_qty": recv,
+            "receipt_pct": round(recv / qty * 100, 1) if qty else 0,
+            "unit_price": float(r[9] or 0), "total_amount": float(r[10] or 0), "currency": r[11],
+            "order_date": str(r[12])[:10] if r[12] else None,
+            "expected_date": str(r[13])[:10] if r[13] else None,
+            "actual_date": str(r[14])[:10] if r[14] else None,
+            "status": r[15], "auto_generated": r[16], "tax_rate": float(r[17]) if r[17] is not None else None,
+            "payment_terms": r[18], "contract_no": r[19],
+            "overdue_days": int(r[20] or 0),
+            "complete": qty > 0 and recv >= qty,
+        })
+    return {"items": items}
+
+
+@router.post("/purchase-orders/{po_id}/receive", summary="PO 收货登记（累计收货量+生成GR+触发IQC）")
+async def receive_purchase_order(
+    po_id: str,
+    quantity: float = Query(..., gt=0, description="本次收货数量"),
+    warehouse: str = "MAIN",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """收货闭环：累计 received_qty → 部分收货/完全收货状态 → 生成 GR 并触发 IQC。"""
+    from fastapi import HTTPException
+    import uuid as _uuid
+    await _ensure_po_columns(db)
+    po = (await db.execute(text(
+        "SELECT id, po_code, factory_id, material_code, supplier_id, qty, status, COALESCE(received_qty,0) AS recv "
+        "FROM purchase_orders WHERE id=:id"
+    ), {"id": po_id})).mappings().first()
+    if not po:
+        raise HTTPException(status_code=404, detail="PO 不存在")
+    if po["status"] in ("cancelled", "closed"):
+        raise HTTPException(status_code=400, detail=f"PO 状态 {po['status']} 不可收货")
+    new_recv = float(po["recv"]) + quantity
+    new_status = "received" if new_recv >= float(po["qty"] or 0) else "partially_received"
+    gr_id, gr_code = str(_uuid.uuid4()), f"GR-{datetime.now().strftime('%Y%m%d')}-{str(_uuid.uuid4())[:6].upper()}"
+    await db.execute(text("ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS inspection_task_id VARCHAR(50)"))
+    await db.execute(text("""
+        INSERT INTO goods_receipts (id, gr_code, factory_id, po_id, material_code, supplier_id,
+                                    quantity, qty_accepted, qty_rejected, iqc_status, warehouse, received_by, received_at)
+        VALUES (:id,:code,:f,:po,:m,:sup,:q,0,0,'pending',:wh,:by,NOW())
+    """), {"id": gr_id, "code": gr_code, "f": po["factory_id"], "po": po_id, "m": po["material_code"],
+           "sup": po["supplier_id"], "q": quantity, "wh": warehouse, "by": current_user.username})
+    await db.execute(text("""
+        UPDATE purchase_orders SET received_qty=:recv, status=:st, updated_at=NOW()
+        WHERE id=:id
+    """), {"recv": new_recv, "st": new_status, "id": po_id})
+    if new_status == "received":
+        await db.execute(text(
+            "UPDATE purchase_orders SET actual_date=CURRENT_DATE WHERE id=:id"
+        ), {"id": po_id})
+    # 触发 IQC 检验任务（收货→IQC 联动）
+    iqc_code = None
+    try:
+        from api.services.inspection_service import InspectionService
+        iqc_task = await InspectionService(db).create_task(
+            factory_id=po["factory_id"], inspect_type="iqc",
+            material_code=po["material_code"], batch_qty=int(quantity),
+            source_type="goods_receipt", source_code=gr_code, created_by=current_user.username,
+        )
+        iqc_code = iqc_task.get("task_code")
+        await db.execute(text(
+            "UPDATE goods_receipts SET iqc_status='inspecting', inspection_task_id=:t WHERE id=:id"
+        ), {"t": iqc_task.get("id"), "id": gr_id})
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger("pmc").warning(f"[PO收货] IQC任务生成失败(不阻塞): {_e}")
+    await db.commit()
+    return {"success": True, "po_code": po["po_code"], "gr_code": gr_code,
+            "received_qty": new_recv, "po_status": new_status,
+            "inspection_task_code": iqc_code,
+            "message": f"收货 {quantity}，累计 {new_recv}/{po['qty']}，IQC单 {iqc_code or '(未生成)'} 待检"}
+
+
+@router.post("/purchase-orders/{po_id}/cancel", summary="取消 PO")
+async def cancel_purchase_order(
+    po_id: str,
+    reason: str = Query("", description="取消原因"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from fastapi import HTTPException
+    await _ensure_po_columns(db)
+    res = await db.execute(text("""
+        UPDATE purchase_orders SET status='cancelled', updated_at=NOW()
+        WHERE id=:id AND status NOT IN ('received','completed','cancelled')
+    """), {"id": po_id})
+    await db.commit()
+    if res.rowcount == 0:
+        raise HTTPException(status_code=400, detail="PO 不存在或已收货/已取消，不可取消")
+    return {"success": True, "status": "cancelled", "reason": reason}

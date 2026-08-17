@@ -3599,10 +3599,13 @@ async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id
         VALUES (:id, :code, :f, :po, :m, :sup, :q, :acc, :rej, 'pending', 'MAIN', :cb, NOW())
     """), {"id": gr_id, "code": gr_code, "f": fid, "po": po["id"], "m": po["material_code"],
            "sup": po["supplier_id"], "q": qty, "acc": accepted, "rej": rejected, "cb": operator})
-    # 更新 PO 状态 + 库存（合格入账，可用与总量同步）
+    # 更新 PO 状态 + 库存（合格入账，可用与总量同步）；received_qty 累计与收货闭环口径一致
+    await db.execute(text("ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS received_qty NUMERIC DEFAULT 0"))
     await db.execute(text("""
-        UPDATE purchase_orders SET status='received', actual_date=CURRENT_DATE WHERE id=:id
-    """), {"id": po["id"]})
+        UPDATE purchase_orders SET status='received', actual_date=CURRENT_DATE,
+            received_qty=COALESCE(received_qty,0)+:q
+        WHERE id=:id
+    """), {"id": po["id"], "q": qty})
     await db.execute(text("""
         UPDATE inventory SET available_qty=available_qty+:acc, total_qty=total_qty+:acc
         WHERE material_code=:m AND factory_id=:f
@@ -3644,10 +3647,29 @@ async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id
                              f"PO {po_code} 收货 {int(accepted)} 合格/{int(rejected)} 不良，已入库存",
                              detail=f"供应商 {po['supplier_id']} 物料 {po['material_code']}", operator=operator,
                              risk="info")
+    # ── IQC 联动：收货自动生成来料检验任务（行业标准：收货→IQC→入库放行） ──
+    iqc_task_code = None
+    try:
+        await db.execute(text("ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS inspection_task_id VARCHAR(50)"))
+        from api.services.inspection_service import InspectionService
+        iqc_task = await InspectionService(db).create_task(
+            factory_id=fid, inspect_type="iqc",
+            material_code=po["material_code"], batch_qty=int(accepted or qty),
+            source_type="goods_receipt", source_code=gr_code, created_by=operator,
+        )
+        iqc_task_code = iqc_task.get("task_code")
+        await db.execute(text(
+            "UPDATE goods_receipts SET iqc_status='inspecting', inspection_task_id=:t WHERE id=:id"
+        ), {"t": iqc_task.get("id"), "id": gr_id})
+    except Exception as _iqc_e:
+        import logging as _lg
+        _lg.getLogger("chat_tools").warning(f"[goods_receipt] IQC任务生成失败(不阻塞收货): {_iqc_e}")
     await db.commit()
     return {"type": "goods_receipt", "action": "received", "gr_code": gr_code, "po_code": po_code,
             "qty": qty, "accepted": accepted, "rejected": rejected,
-            "iqc_status": "pending", "message": f"收货 {gr_code} 登记完成，合格 {accepted} 待IQC检验"}
+            "iqc_status": "inspecting" if iqc_task_code else "pending",
+            "inspection_task_code": iqc_task_code,
+            "message": f"收货 {gr_code} 登记完成，合格 {accepted}，已自动生成IQC检验单 {iqc_task_code or '(生成失败)'}"}
 
 
 async def _tool_supplier_evaluation(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
