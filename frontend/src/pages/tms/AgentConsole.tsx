@@ -104,7 +104,8 @@ const AgentConsole: React.FC = () => {
         return;
       }
 
-      const result = await tmsApi.agentCommand({
+      // 共享 api 实例响应拦截器已 unwrap（返回 response.data），不能再取 .data
+      const result: any = await tmsApi.agentCommand({
         agent_id: values.agent_id,
         command: values.command,
         params,
@@ -115,18 +116,18 @@ const AgentConsole: React.FC = () => {
         id: Date.now().toString(),
         command: values.command,
         params: values.params || '{}',
-        response: result.data,
-        success: result.data?.success,
+        response: result,
+        success: !!result?.success,
         timestamp: new Date().toISOString(),
       };
 
       setCommandLogs(prev => [log, ...prev]);
-      setLastResponse(result.data);
+      setLastResponse(result);
 
-      if (result.data?.success) {
-        message.success(result.data.message || '命令执行成功');
+      if (result?.success) {
+        message.success(result.message || '命令执行成功');
       } else {
-        message.warning(result.data?.message || '命令执行完成');
+        message.warning(result?.message || '命令执行完成');
       }
     } catch (error: any) {
       message.error(error.response?.data?.detail || '命令执行失败');
@@ -139,12 +140,12 @@ const AgentConsole: React.FC = () => {
   // 注册 Agent
   const handleRegisterAgent = async (values: any) => {
     try {
-      const result = await tmsApi.registerAgent({
+      const result: any = await tmsApi.registerAgent({
         agent_id: values.agent_id,
         permission_level: values.permission_level,
         whitelisted: values.whitelisted,
       });
-      message.success(result.data?.message || 'Agent 注册成功');
+      message.success(result?.message || 'Agent 注册成功');
     } catch (error) {
       message.error('Agent 注册失败');
     }
@@ -153,13 +154,13 @@ const AgentConsole: React.FC = () => {
   // 注册 Webhook
   const handleRegisterWebhook = async (values: any) => {
     try {
-      const result = await tmsApi.registerWebhook({
+      const result: any = await tmsApi.registerWebhook({
         agent_id: values.agent_id,
         event_types: values.event_types,
         webhook_url: values.webhook_url,
         secret: values.secret,
       });
-      message.success(result.data?.message || 'Webhook 注册成功');
+      message.success(result?.message || 'Webhook 注册成功');
     } catch (error) {
       message.error('Webhook 注册失败');
     }
