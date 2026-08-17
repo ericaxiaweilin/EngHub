@@ -106,7 +106,7 @@ export default function WorkOrderTemplatesPage() {
                   onClick={() => handleSelectTemplate(tpl)}
                   icon={<FileTextOutlined />}
                 >
-                  {tpl.template_name}
+                  {tpl.template_name}{!tpl.factory_id && <span style={{ color: '#52c41a', fontWeight: 700 }}> ·公共</span>}
                 </Button>
               ))}
             </Space>

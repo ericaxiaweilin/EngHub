@@ -722,6 +722,7 @@ def get_menu_items_for_user(user) -> list:
     # ━━━ 7. 协同 ━━━
     collab_children = []
     collab_children.append({"key": "/quick-request", "label": "快速工单"})
+    collab_children.append({"key": "/work-order-templates", "label": "标准工单模板"})
     if "tms" in modules_with_access:
         collab_children.append({"key": "/tms/approval", "label": "审批中心"})
         collab_children.append({"key": "/tms/distribution", "label": "分发看板"})

@@ -1085,7 +1085,7 @@ async def list_work_order_templates(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取当前工厂的工单模板列表（含动态表单字段定义，支持按模块过滤）"""
+    """获取当前工厂的工单模板列表（含公共模板，factory_id 为空=全厂共享；支持按模块过滤）"""
     from sqlalchemy import text as sa_text
     import json as _json
     fid = (request.headers.get("x-factory-id") if request else None) or getattr(current_user, "active_factory_id", None) or current_user.factory_id or "FAC_MECH_001"
@@ -1094,13 +1094,14 @@ async def list_work_order_templates(
                default_priority, is_active, module, form_fields, standard_ref,
                badge_text, color, sort_order
         FROM work_order_templates
-        WHERE factory_id = :fid AND is_active = true
+        WHERE (factory_id = :fid OR factory_id IS NULL) AND is_active = true
     """
     params: dict = {"fid": fid}
     if module:
         sql += " AND module = :module"
         params["module"] = module
-    sql += " ORDER BY module, sort_order, template_code"
+    # 本厂专属优先于公共（同 template_code 时），其余按模块/排序号
+    sql += " ORDER BY module, sort_order, template_code, (factory_id IS NULL)"
     rows = (await db.execute(sa_text(sql), params)).fetchall()
     result = []
     for r in rows:
