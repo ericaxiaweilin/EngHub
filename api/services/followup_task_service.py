@@ -1276,6 +1276,11 @@ async def ai_process_due_tasks(db: AsyncSession) -> Dict[str, Any]:
             if r:
                 handled.append({"id": t["id"], "title": (t["title"] or "")[:40], **r})
         except Exception:
+            # 必须回滚：否则会话中毒（InFailedSQLTransaction）会拖垮后续 scan_due_tasks
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             continue
     return {"scanned": len(tasks), "handled": handled, "auto_closed": sum(1 for h in handled if h.get("action") == "closed")}
 async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:

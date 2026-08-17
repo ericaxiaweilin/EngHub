@@ -556,6 +556,18 @@ class AgentSupervisor:
             """), {"fid": factory_id, "ak": key})
             last_hb = hb.first()
 
+            # 心跳兜底：定时/事件驱动智能体不写心跳，回退到 agent_events 最近活动
+            if not last_hb:
+                ev = await self.db.execute(text("""
+                    SELECT event_type, agent_key, created_at
+                    FROM agent_events
+                    WHERE factory_id = :fid AND agent_key = :ak
+                    ORDER BY created_at DESC LIMIT 1
+                """), {"fid": factory_id, "ak": key})
+                last_ev = ev.first()
+            else:
+                last_ev = None
+
             # 运行中任务
             tasks = await self.db.execute(text("""
                 SELECT count(*) as running, 
@@ -575,7 +587,14 @@ class AgentSupervisor:
                 "outputs": agent["outputs"],
                 "boundaries": agent["boundaries"],
                 "sensing": agent["sensing"],
-                "last_action": dict(last_hb._mapping) if last_hb else None,
+                "last_action": dict(last_hb._mapping) if last_hb else (
+                    {
+                        "action_taken": f"事件: {last_ev[0]}",
+                        "trigger_type": "event",
+                        "result_summary": None,
+                        "created_at": last_ev[2],
+                    } if last_ev else None
+                ),
                 "running_tasks": task_info[0] if task_info else 0,
                 "stalled_tasks": task_info[1] if task_info else 0,
                 "status": "stalled" if (task_info and task_info[1] > 0) else "active",
