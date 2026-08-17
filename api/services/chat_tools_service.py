@@ -4790,15 +4790,24 @@ async def _tool_query_purchase_pipeline(db: AsyncSession, args: Dict[str, Any], 
         f"SELECT po_code, pr_id, supplier_name, material_code, qty, unit_price, status, expected_date, actual_date "
         f"FROM purchase_orders WHERE {cond}{mat_cond_po} ORDER BY order_date DESC LIMIT :limit"
     ), params)).mappings().all()
+    # 全量统计（不受 limit 截断）：各状态条数 + 金额，避免模型把 LIMIT 样本误报为全量
+    stats_rows = (await db.execute(text(
+        f"SELECT status, COUNT(*)::int AS cnt, COALESCE(SUM(estimated_cost),0)::float AS amount "
+        f"FROM purchase_requisitions WHERE {cond}{mat_cond_pr} GROUP BY status"
+    ), {k: v for k, v in params.items() if k != "limit"})).mappings().all()
+    pr_stats = {r["status"]: {"count": r["cnt"], "amount": round(r["amount"], 2)} for r in stats_rows}
     return {
         "type": "purchase_pipeline",
         "factory_id": fid,
         "material_filter": mat or "(全部)",
+        "pr_status_stats": pr_stats,
+        "pr_total_count": sum(s["count"] for s in pr_stats.values()),
+        "pr_total_amount": round(sum(s["amount"] for s in pr_stats.values()), 2),
         "purchase_requests_count": len(prs),
         "purchase_orders_count": len(pos),
         "purchase_requests": [dict(r) for r in prs],
         "purchase_orders": [dict(r) for r in pos],
-        "note": "PR=采购申请(purchase_requisitions 正表, PENDING→指派供应商→converted)，PO=采购订单(已下单待到货)。",
+        "note": "pr_status_stats/pr_total_* 是全量统计；purchase_requests 仅为最近样本(limit 截断)，不得把样本数当作总数。PR=采购申请，PO=采购订单。",
     }
 
 

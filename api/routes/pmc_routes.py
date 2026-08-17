@@ -912,6 +912,7 @@ async def approve_purchase_requisition(
     pr_id: str,
     action: str = Query("approve", description="approve=仅批准; approve_and_order=批准并自动下单"),
     comment: str = "",
+    force_order: bool = Query(False, description="金额超阈值时人工批准后强制下单"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -935,7 +936,7 @@ async def approve_purchase_requisition(
     result: Dict[str, Any] = {"success": True, "pr_code": row["pr_code"], "status": "approved", "approved_by": current_user.username}
     if action == "approve_and_order":
         from api.services.procurement_service import ProcurementService
-        po_result = await ProcurementService(db).auto_create_po(row["factory_id"], pr_id)
+        po_result = await ProcurementService(db).auto_create_po(row["factory_id"], pr_id, force_order=force_order)
         result["order_result"] = po_result
     return result
 

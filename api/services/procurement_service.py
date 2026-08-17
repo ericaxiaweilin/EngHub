@@ -120,20 +120,22 @@ class ProcurementService:
             return {"material_code": material_code, "quotes": [], "recommendation": None,
                     "message": "无合格供应商报价，需人工寻源"}
 
-        # 归一化评分
-        min_price = min(q["unit_price"] for q in quotes)
-        min_lead = min(q["lead_days"] for q in quotes)
+        # 归一化评分（numeric 列返回 Decimal，统一转 float 避免 Decimal/float TypeError）
+        min_price = min(float(q["unit_price"]) for q in quotes)
+        min_lead = min(int(q["lead_days"] or 999) for q in quotes)
         max_rating = max(float(q["rating"]) for q in quotes) or 5
 
         scored = []
         for q in quotes:
-            price_score = (min_price / float(q["unit_price"])) * 50 if q["unit_price"] > 0 else 50
-            lead_score = (min_lead / max(q["lead_days"], 1)) * 30
+            up = float(q["unit_price"] or 0)
+            lead = int(q["lead_days"] or 1)
+            price_score = (min_price / up) * 50 if up > 0 else 50
+            lead_score = (min_lead / max(lead, 1)) * 30
             rating_score = (float(q["rating"]) / max_rating) * 20
             total = round(price_score + lead_score + rating_score, 2)
 
             # MOQ 检查
-            meets_moq = qty >= (q["moq"] or 1)
+            meets_moq = qty >= float(q["moq"] or 1)
             scored.append({
                 **q,
                 "price_score": round(price_score, 1),
@@ -141,7 +143,7 @@ class ProcurementService:
                 "rating_score": round(rating_score, 1),
                 "total_score": total,
                 "meets_moq": meets_moq,
-                "total_cost": round(float(q["unit_price"]) * qty, 2),
+                "total_cost": round(up * qty, 2),
             })
 
         scored.sort(key=lambda x: (-x["total_score"], -x["meets_moq"]))
@@ -165,11 +167,12 @@ class ProcurementService:
 
     # ==================== 自动下单（PR→PO） ====================
 
-    async def auto_create_po(self, factory_id: str, pr_id: str) -> Dict[str, Any]:
+    async def auto_create_po(self, factory_id: str, pr_id: str, force_order: bool = False) -> Dict[str, Any]:
         """采购申请 → 自动比价 → 自动生成 PO。
 
         采购员替代逻辑：PR 审批通过后，系统自动选供应商下单。
-        只有金额>阈值 或 无合格供应商 才需要人工介入。
+        只有金额>阈值 或 无合格供应商 才需要人工介入；
+        force_order=True 时人工已批准高额 PR，跳过金额检查直接下单。
         """
         # 获取 PR
         pr_result = await self.db.execute(text(
@@ -188,7 +191,7 @@ class ProcurementService:
                     "action_required": "manual_sourcing"}
 
         total_cost = rec["total_cost"]
-        needs_manual = total_cost > AUTO_APPROVE_LIMIT
+        needs_manual = (not force_order) and total_cost > AUTO_APPROVE_LIMIT
 
         if needs_manual:
             # 金额超阈值 → 标记待人工审批
@@ -207,7 +210,8 @@ class ProcurementService:
         # 自动审批 + 自动下单
         po_code = f"PO-{factory_id[:6]}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         po_id = _gen_id()
-        expected_date = (date.today() + timedelta(days=rec["lead_days"])).isoformat()
+        # asyncpg 日期参数必须传 date 对象，不能传 isoformat 字符串
+        expected_date = date.today() + timedelta(days=int(rec["lead_days"] or 7))
 
         await self.db.execute(text("""
             INSERT INTO purchase_orders
