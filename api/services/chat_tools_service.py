@@ -4849,7 +4849,7 @@ async def _tool_create_purchase_requisition(db: AsyncSession, args: Dict[str, An
                              detail=f"operator: {operator or 'procurement_agent'}", operator=operator, risk="info")
     await db.commit()
     return {"type": "purchase_requisition", "action": "created", "pr_id": pr_id, "pr_code": pr_code,
-            "material_code": mat, "material_name": name, "requested_qty": qty, "status": "PENDING"}
+            "material_code": mat, "material_name": name, "requested_qty": qty, "status": "pending"}
 
 
 async def _tool_assign_supplier_to_pr(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
