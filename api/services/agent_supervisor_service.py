@@ -378,9 +378,32 @@ class AgentSupervisor:
         if stalled:
             await self.db.commit()
 
+        # 超时自动关闭：stalled 超过24小时的任务自动结清（避免残留堆积污染看板统计）
+        closed = await self.db.execute(text("""
+            UPDATE agent_tasks
+            SET status = 'completed', completed_at = NOW(),
+                error = '卡住超24小时，监督循环自动关闭',
+                result = jsonb_set(COALESCE(result, '{}'::jsonb), '{closed_by}', '"supervisor_timeout"')
+            WHERE factory_id = :fid AND status = 'stalled'
+              AND last_progress_at < NOW() - INTERVAL '24 hours'
+            RETURNING id
+        """), {"fid": factory_id})
+        closed_count = len(closed.fetchall())
+        if closed_count:
+            await self.db.commit()
+
+        # 保留策略兜底：已完成任务仅保留30天，防止追加表无限膨胀
+        await self.db.execute(text("""
+            DELETE FROM agent_tasks
+            WHERE factory_id = :fid AND status = 'completed'
+              AND COALESCE(completed_at, started_at) < NOW() - INTERVAL '30 days'
+        """), {"fid": factory_id})
+        await self.db.commit()
+
         return {
             "factory_id": factory_id,
             "stalled_count": len(stalled),
+            "auto_closed": closed_count,
             "stalled_tasks": [{
                 "task_id": t["id"],
                 "agent": t["agent_name"],

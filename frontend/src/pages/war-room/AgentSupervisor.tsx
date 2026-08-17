@@ -1,7 +1,7 @@
 /**
  * 智能体监督看板 - Agent Supervisor Dashboard
  * 
- * 实时展示8个智能体运行状态、任务进度、健康度、预测性预警
+ * 实时展示全部智能体运行状态、任务进度、健康度、预测性预警
  * 对接后端 /api/v1/agent-supervisor/*
  */
 import React, { useState, useEffect, useCallback } from 'react'
@@ -129,7 +129,7 @@ const AgentSupervisor: React.FC = () => {
           </Card>
         </Col>
         <Col span={4}>
-          <Card size="small"><Statistic title="智能体总数" value={dashboard?.total_agents || 8} prefix={<RobotOutlined />} /></Card>
+          <Card size="small"><Statistic title="智能体总数" value={dashboard?.total_agents || 0} prefix={<RobotOutlined />} /></Card>
         </Col>
         <Col span={4}>
           <Card size="small"><Statistic title="正常运行" value={dashboard?.health?.active || 0} valueStyle={{ color: '#52c41a' }} /></Card>
