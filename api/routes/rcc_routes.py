@@ -103,6 +103,45 @@ async def reject_rcc_task(task_id: str, reason: str, approver_id: str = "current
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+# ==================== 决策效果回评估 ====================
+
+@router.get("/decision-evaluations", summary="决策效果回评估列表")
+async def list_decision_evaluations(
+    factory_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(30, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """决策执行后的效果追踪记录（追踪中/已定论）"""
+    from api.services.decision_evaluation_service import list_evaluations
+    items = await list_evaluations(db, factory_id=factory_id, status=status, limit=limit)
+    for d in items:
+        for k in ("executed_at", "last_evaluated_at", "finalized_at", "created_at", "next_evaluate_at"):
+            if d.get(k) is not None and not isinstance(d[k], str):
+                d[k] = d[k].isoformat()
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/decision-evaluations/summary", summary="决策质量汇总指标")
+async def decision_evaluation_summary(
+    factory_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """决策达成率/按动作分布——决策中心的决策质量硬指标"""
+    from api.services.decision_evaluation_service import evaluation_summary
+    return await evaluation_summary(db, factory_id=factory_id)
+
+
+@router.post("/decision-evaluations/{eval_id}/evaluate", summary="立即复评一条决策")
+async def force_decision_evaluation(eval_id: str, db: AsyncSession = Depends(get_db)):
+    """不等到期，立即复测指标并给出阶段结论"""
+    from api.services.decision_evaluation_service import force_evaluate
+    res = await force_evaluate(db, eval_id)
+    if res.get("error"):
+        raise HTTPException(status_code=404, detail=res["error"])
+    return {"success": True, "data": res}
+
+
 # ==================== 可调参数 ====================
 
 @router.get("/params", summary="查询可调参数")

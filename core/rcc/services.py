@@ -264,6 +264,20 @@ class RCCTaskService:
                     task.status = "executed"
                     task.executed_at = datetime.utcnow()
                 await self.db.commit()  # 执行器落库（工单优先级 + 任务状态 + 审计）
+                # 决策效果回评估：执行成功即注册追踪（锁定预期+T0基线，并预警下游部门）
+                # 上游决策必然波及下游——执行不再是黑盒，效果持续度量直至定论
+                if executed:
+                    try:
+                        from api.services.decision_evaluation_service import register_decision
+                        # 必须先 refresh：执行器 commit 后 ORM 属性已过期，
+                        # 同步访问会触发惰性 IO 报 greenlet_spawn 错误
+                        await self.db.refresh(task)
+                        await register_decision(self.db, task)
+                        # register 内部 commit 会使属性再次过期，路由返回前再刷新一次
+                        await self.db.refresh(task)
+                    except Exception as _re:
+                        import logging as _lg2
+                        _lg2.getLogger("rcc").warning(f"[approve_task] 决策评估注册失败(不阻塞): {_re}")
         except Exception as _ee:
             # 执行失败不阻塞审批主流程，但必须留痕+回滚，否则卡单无从排查
             # （实测：reschedule 传字符串日期被 asyncpg 拒收，静默吞掉卡 approved）

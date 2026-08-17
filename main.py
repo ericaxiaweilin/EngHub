@@ -474,6 +474,11 @@ async def _start_scheduler():
         from api.services.data_governance_service import data_governance_loop
         asyncio.create_task(data_governance_loop())
 
+        # 决策效果回评估循环：RCC 决策执行后持续度量效果并通报下游部门，
+        # 形成决策→执行→验证→反馈闭环（DECISION_EVAL_INTERVAL_SECONDS 调间隔）
+        from api.services.decision_evaluation_service import decision_eval_loop
+        asyncio.create_task(decision_eval_loop())
+
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------
 FRONTEND_DIST = Path(os.environ.get("FRONTEND_DIST", str(Path(__file__).parent / "frontend_dist")))

@@ -158,7 +158,6 @@ src/pages/qms/OcapDetail.tsx(74,11): error TS2322: Type '{ children: Element[]; 
 src/pages/qms/OcapList.tsx(45,26): error TS7053: Element implicitly has an 'any' type because expression of type 'string' can't be used to index type '{ critical: string; major: string; minor: string; observation: string; }'.
 src/pages/qms/RedTagCreate.tsx(19,21): error TS2865: Import 'RedTagCreate' conflicts with local value, so must be declared with a type-only import when 'isolatedModules' is enabled.
 src/pages/rcc/RCCAnalysis.tsx(161,71): error TS2349: This expression is not callable.
-src/pages/rcc/RCCCommandCenter.tsx(306,35): error TS7053: Element implicitly has an 'any' type because expression of type 'any' can't be used to index type '{ running: string; broken: string; maintenance: string; idle: string; }'.
 src/pages/simulation/SimulationEngine.tsx(61,50): error TS2339: Property 'SIM_FACTORY_SELF_TEST' does not exist on type '{ AUTH_LOGIN: string; AUTH_ME: string; AUTH_REFRESH: string; WORK_ORDERS: string; WORK_ORDER: (id: string) => string; PRODUCTION_REPORTS: string; ROUTINGS: string; STATIONS: string; EQUIPMENT: string; ... 48 more ...; IE_ADVANCED_5S_AUDITS_BY_CENTER: (work_center_id: string) => string; }'.
 src/pages/tpm/EarlyEquipmentManagement.tsx(198,33): error TS2339: Property 'expected_cost' does not exist on type 'EarlyEquipmentProject'.
 src/pages/tpm/EarlyEquipmentManagement.tsx(199,43): error TS2339: Property 'expected_cost' does not exist on type 'EarlyEquipmentProject'.

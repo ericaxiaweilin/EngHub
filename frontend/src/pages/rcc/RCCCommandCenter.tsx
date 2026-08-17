@@ -17,6 +17,7 @@ import { useSearchParams } from 'react-router-dom'
 import RCCOverview from './RCCOverview'
 import ResourceIndexCard from './ResourceIndexCard'
 import TaskHealthCard from './TaskHealthCard'
+import DecisionEvalCard from './DecisionEvalCard'
 import RCCResourceBoard from './RCCResourceBoard'
 import RCCDecisionHub from './RCCDecisionHub'
 import RCCAnalysis from './RCCAnalysis'
@@ -227,6 +228,7 @@ export default function RCCCommandCenter() {
             <>
               <ResourceIndexCard />
               <TaskHealthCard />
+              <DecisionEvalCard factoryId={factoryId} />
               <RCCOverview />
             </>
           )}
@@ -303,7 +305,7 @@ export default function RCCCommandCenter() {
                   {Object.entries(equipStatuses).map(([st, cnt]: any) => {
                     const pct = equipTotal > 0 ? Math.round((cnt as number) / equipTotal * 100) : 0
                     const status = st === 'broken' || st === 'fault' ? 'danger' : st === 'maintenance' ? 'warn' : 'ok'
-                    const label = { running: '运行中', broken: '故障', maintenance: '维护中', idle: '空闲' }[st] || st
+                    const label = ({ running: '运行中', broken: '故障', maintenance: '维护中', idle: '空闲' } as Record<string, string>)[st] || st
                     return (
                       <div key={st} style={{ display: 'grid', gridTemplateColumns: '185px minmax(200px,1fr) 92px 100px', gap: 12, alignItems: 'center', padding: '12px 4px', borderBottom: `1px solid ${C.border}` }}>
                         <div><div style={{ fontSize: 12.5, fontWeight: 720 }}>{label}</div><div style={{ fontSize: 10.5, color: C.text3, marginTop: 3 }}>{cnt} 台</div></div>
