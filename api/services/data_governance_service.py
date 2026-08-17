@@ -37,6 +37,11 @@ RETENTION_RULES: List[Dict[str, Any]] = [
     {"table": "chat_session_events", "ts": "created_at", "keep_days": 30, "max_rows": 100_000},
     {"table": "followup_task_logs", "ts": "created_at", "keep_days": 60, "max_rows": 50_000},
     {"table": "rcc_decision_evaluations", "ts": "created_at", "keep_days": 180, "max_rows": 20_000},
+    # 智能体追加表兜底（supervisor 循环只管 agent_tasks 已完成记录，此处双保险）
+    {"table": "agent_tasks", "ts": "created_at", "keep_days": 60, "max_rows": 50_000},
+    {"table": "agent_heartbeats", "ts": "created_at", "keep_days": 30, "max_rows": 50_000},
+    {"table": "tms_agent_actions", "ts": "created_at", "keep_days": 90, "max_rows": 50_000},
+    {"table": "commander_cycles", "ts": "created_at", "keep_days": 90, "max_rows": 20_000},
 ]
 
 # 终态任务归档线：完成/取消的跟进任务超过该天数后清理（保留近期可追溯）

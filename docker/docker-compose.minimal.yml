@@ -2,6 +2,11 @@
 services:
   postgres:
     image: postgres:15-alpine
+    logging: &logrotate
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     environment:
       POSTGRES_USER: enghub
       POSTGRES_PASSWORD: enghub123
@@ -19,6 +24,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    logging: *logrotate
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -32,6 +38,7 @@ services:
 
   backend:
     container_name: enghub-backend-1
+    logging: *logrotate
     build:
       context: ..
       dockerfile: docker/Dockerfile.backend
