@@ -22,7 +22,7 @@ _logger = logging.getLogger("rcc_event_driven")
 
 async def emit_event(db, factory_id: str, event_type: str, agent_key: str,
                      data: Dict, task_id: Optional[str] = None) -> str:
-    """写入事件总线（agent_events）。"""
+    """写入事件总线（agent_events）并实时推送内存总线。"""
     event_id = str(uuid.uuid4())
     await db.execute(text("""
         INSERT INTO agent_events (event_id, event_type, agent_key, factory_id, task_id, data, created_at)
@@ -30,6 +30,23 @@ async def emit_event(db, factory_id: str, event_type: str, agent_key: str,
     """), {"eid": event_id, "etype": event_type, "ak": agent_key,
            "fid": factory_id, "tid": task_id,
            "data": json.dumps(data, ensure_ascii=False, default=str)})
+
+    # 实时接线：同步推给内存事件总线（SSE/订阅者可即时收到）；
+    # persist=False 防止与上面的 agent_events 落库双写。业务事件类型放 data 透传。
+    try:
+        from core.agent import AgentEventBus
+        from core.agent.event_bus import EventType
+        await AgentEventBus.get_instance().emit(
+            EventType.ACTION_UPDATE,
+            agent_key=agent_key,
+            factory_id=factory_id,
+            task_id=task_id,
+            data={"event_type": event_type, "event_id": event_id, **(data or {})},
+            persist=False,
+        )
+    except Exception as _be:
+        _logger.debug("[event] 内存总线推送失败（不影响DB审计）: %s", _be)
+
     return event_id
 
 

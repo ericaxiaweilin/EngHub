@@ -467,7 +467,7 @@ class AgentSupervisor:
                             "target": r["work_order_code"],
                             "prediction": f"按当前速度需{remaining_days:.1f}天完成，但距交期只有{days_to_due:.1f}天",
                             "suggestion": "建议提前调整排产优先级或安排加班",
-                            "auto_action": "已自动提升该工单优先级" if days_to_due < 3 else "建议关注",
+                            "auto_action": "交期智能体将自动提升该工单优先级（60分钟循环）" if days_to_due < 3 else "建议关注",
                         })
         except Exception as e:
             _logger.warning(f"[predict] 工单超期预测失败: {e}")
