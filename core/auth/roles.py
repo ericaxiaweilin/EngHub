@@ -724,8 +724,7 @@ def get_menu_items_for_user(user) -> list:
     collab_children.append({"key": "/quick-request", "label": "快速工单"})
     collab_children.append({"key": "/work-order-templates", "label": "标准工单模板"})
     if "tms" in modules_with_access:
-        collab_children.append({"key": "/tms/approval", "label": "审批中心"})
-        collab_children.append({"key": "/tms/distribution", "label": "分发看板"})
+        # 审批中心/分发看板已下线，TMS 能力统一由 Agent 控制台承载
         collab_children.append({"key": "/tms/agent", "label": "Agent控制台"})
     # 我的任务已拆分至 RCC 任务中心（/task-center），协同组不再重复挂载
     if is_admin or "tms" in modules_with_access:
