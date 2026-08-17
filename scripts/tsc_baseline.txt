@@ -109,37 +109,6 @@ src/pages/equipment/FiveSAudit.tsx(509,17): error TS2304: Cannot find name 'Desc
 src/pages/equipment/FiveSAudit.tsx(510,15): error TS2304: Cannot find name 'Descriptions'.
 src/pages/equipment/FiveSAudit.tsx(512,14): error TS2304: Cannot find name 'Divider'.
 src/pages/equipment/FiveSAudit.tsx(518,17): error TS2322: Type '(record: { category: string; item: string; score: number; notes: string; }, index: number | undefined) => number | undefined' is not assignable to type 'string | GetRowKey<{ category: string; item: string; score: number; notes: string; }> | undefined'.
-src/pages/equipment/MaintenanceCenter.tsx(496,14): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(497,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(497,71): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(498,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(506,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(507,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(507,84): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(508,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(515,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(516,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(524,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(525,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(525,90): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(526,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(528,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(529,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(531,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(532,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(534,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(535,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(537,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(538,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(540,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(541,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(541,131): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(542,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(544,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(545,16): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(547,17): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(548,15): error TS2304: Cannot find name 'Descriptions'.
-src/pages/equipment/MaintenanceCenter.tsx(552,18): error TS2304: Cannot find name 'Divider'.
 src/pages/ie-advanced/ActionStudies.tsx(70,25): error TS2339: Property 'items' does not exist on type 'AxiosResponse<any, any, {}>'.
 src/pages/ie-advanced/FiveSAudits.tsx(61,25): error TS2339: Property 'items' does not exist on type 'AxiosResponse<any, any, {}>'.
 src/pages/ie-advanced/Kanbans.tsx(59,25): error TS2339: Property 'items' does not exist on type 'AxiosResponse<any, any, {}>'.
