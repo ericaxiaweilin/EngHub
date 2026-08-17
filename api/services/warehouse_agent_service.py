@@ -100,17 +100,19 @@ class WarehouseAgent:
         # 记录补货事件
         task_id = await self._start_task(factory_id, "auto_replenish", f"{len(replenishments)}项物料需补货")
 
-        # 创建采购申请记录
+        # 创建采购申请记录（含估算成本：供应商报价→库存成本→确定性mock）
+        from api.services.procurement_service import estimate_unit_cost
         for r in replenishments:
+            est_cost = round(float(r["suggested_qty"] or 0) * await estimate_unit_cost(self.db, r["material_code"]), 2)
             await self.db.execute(text("""
                 INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, source_id, material_code,
-                    material_name, qty, unit, required_date, status, auto_approved, priority, created_by, created_at, updated_at)
+                    material_name, qty, unit, required_date, status, auto_approved, priority, estimated_cost, created_by, created_at, updated_at)
                 VALUES (gen_random_uuid()::text, :fid, :pc, 'warehouse_agent', :fid, :mc,
-                    :mn, :qty, 'pcs', (CURRENT_DATE + INTERVAL '7 days')::date, 'pending', FALSE, :urg, 'warehouse_agent', NOW(), NOW())
+                    :mn, :qty, 'pcs', (CURRENT_DATE + INTERVAL '7 days')::date, 'pending', FALSE, :urg, :cost, 'warehouse_agent', NOW(), NOW())
             """), {
                 "fid": factory_id, "pc": f"PR-WA-{__import__('uuid').uuid4().hex[:8].upper()}",
                 "mc": r["material_code"], "mn": r["material_name"], "qty": r["suggested_qty"],
-                "urg": r["urgency"],
+                "urg": r["urgency"], "cost": est_cost,
             })
 
         await self.db.commit()

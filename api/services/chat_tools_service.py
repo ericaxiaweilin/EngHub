@@ -4802,6 +4802,12 @@ async def _tool_query_purchase_pipeline(db: AsyncSession, args: Dict[str, Any], 
     }
 
 
+async def _pr_unit_cost(db: AsyncSession, material_code: str) -> float:
+    """PR 估算单价（供应商报价→库存成本→确定性 mock）"""
+    from api.services.procurement_service import estimate_unit_cost
+    return await estimate_unit_cost(db, material_code)
+
+
 async def _tool_create_purchase_requisition(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
     """创建采购申请（确定性，写 purchase_requisitions 正表）：同物料已有 PENDING PR 则更新数量，否则新建。"""
     fid = factory_id or "FAC_MECH_001"
@@ -4811,23 +4817,24 @@ async def _tool_create_purchase_requisition(db: AsyncSession, args: Dict[str, An
         return {"error": "缺少物料编码或数量不合法"}
     name = str(args.get("material_name") or mat)
     exist = (await db.execute(text(
-        "SELECT id, qty FROM purchase_requisitions WHERE factory_id=:f AND material_code=:m AND status='PENDING' LIMIT 1"
+        "SELECT id, qty FROM purchase_requisitions WHERE factory_id=:f AND material_code=:m AND LOWER(status)='pending' LIMIT 1"
     ), {"f": fid, "m": mat})).mappings().first()
     if exist:
         new_qty = float(exist["qty"]) + qty
         await db.execute(text(
-            "UPDATE purchase_requisitions SET qty=:q, updated_at=NOW() WHERE id=:id"
-        ), {"q": new_qty, "id": exist["id"]})
+            "UPDATE purchase_requisitions SET qty=:q, estimated_cost=COALESCE(estimated_cost,0)+:cost, updated_at=NOW() WHERE id=:id"
+        ), {"q": new_qty, "cost": round(qty * await _pr_unit_cost(db, mat), 2), "id": exist["id"]})
         await db.commit()
         return {"type": "purchase_requisition", "action": "updated", "pr_id": exist["id"],
-                "material_code": mat, "requested_qty": new_qty, "status": "PENDING"}
+                "material_code": mat, "requested_qty": new_qty, "status": "pending"}
     pr_id = str(uuid.uuid4())
     pr_code = f"PR-{mat}-{str(uuid.uuid4())[:6].upper()}"
+    est_cost = round(qty * await _pr_unit_cost(db, mat), 2)
     await db.execute(text(
         "INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, material_code, material_name, "
-        "qty, unit, status, auto_approved, created_by, created_at, updated_at) "
-        "VALUES (:id, :f, :pc, 'procurement_agent', :m, :n, :q, 'PCS', 'PENDING', FALSE, :src, NOW(), NOW())"
-    ), {"id": pr_id, "f": fid, "pc": pr_code, "m": mat, "n": name, "q": qty, "src": operator or "procurement_agent"})
+        "qty, unit, status, auto_approved, estimated_cost, created_by, created_at, updated_at) "
+        "VALUES (:id, :f, :pc, 'procurement_agent', :m, :n, :q, 'PCS', 'pending', FALSE, :cost, :src, NOW(), NOW())"
+    ), {"id": pr_id, "f": fid, "pc": pr_code, "m": mat, "n": name, "q": qty, "cost": est_cost, "src": operator or "procurement_agent"})
     await _report_rcc_action(db, fid, "pr_created", pr_code,
                              f"采购申请 {mat}×{int(qty)}",
                              detail=f"operator: {operator or 'procurement_agent'}", operator=operator, risk="info")

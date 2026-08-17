@@ -1203,3 +1203,27 @@ async def cancel_purchase_order(
     if res.rowcount == 0:
         raise HTTPException(status_code=400, detail="PO 不存在或已收货/已取消，不可取消")
     return {"success": True, "status": "cancelled", "reason": reason}
+
+
+@router.post("/purchase-requisitions/backfill-costs", summary="存量 PR 成本回填（幂等：仅补空/0，估算口径：报价→库存成本→mock）")
+async def backfill_pr_costs(
+    factory_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from api.services.procurement_service import estimate_unit_cost
+    fid = factory_id or current_user.factory_id or "FAC_MECH_001"
+    rows = (await db.execute(text("""
+        SELECT id, material_code, qty FROM purchase_requisitions
+        WHERE factory_id=:f AND (estimated_cost IS NULL OR estimated_cost=0)
+    """), {"f": fid})).fetchall()
+    filled = 0
+    for r in rows:
+        cost = round(float(r[2] or 0) * await estimate_unit_cost(db, r[1]), 2)
+        await db.execute(text(
+            "UPDATE purchase_requisitions SET estimated_cost=:c, updated_at=NOW() WHERE id=:id"
+        ), {"c": cost, "id": r[0]})
+        filled += 1
+    await db.commit()
+    return {"success": True, "factory_id": fid, "backfilled": filled,
+            "note": "单价口径：供应商报价 → 库存单位成本 → 确定性 mock（同物料恒价）"}

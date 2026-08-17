@@ -125,14 +125,16 @@ class ReplenishExecutor(BaseWmsExecutor):
         
         # Create purchase requests
         replenishments = []
+        from api.services.procurement_service import estimate_unit_cost
         for item in suggestions:
             urgency = item["urgency"]
-            
+            est_cost = round(float(item["suggested_qty"] or 0) * await estimate_unit_cost(db, item["material_code"]), 2)
+
             await db.execute(text("""
                 INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, source_id, material_code,
-                    material_name, qty, unit, required_date, status, auto_approved, priority, created_by, created_at, updated_at)
+                    material_name, qty, unit, required_date, status, auto_approved, priority, estimated_cost, created_by, created_at, updated_at)
                 VALUES (gen_random_uuid()::text, :fid, :pc, 'wms_replenish', :fid, :mc,
-                    :mn, :qty, 'pcs', (CURRENT_DATE + INTERVAL '7 days')::date, 'pending', FALSE, :urg, 'wms_replenish', NOW(), NOW())
+                    :mn, :qty, 'pcs', (CURRENT_DATE + INTERVAL '7 days')::date, 'pending', FALSE, :urg, :cost, 'wms_replenish', NOW(), NOW())
             """), {
                 "fid": factory_id,
                 "pc": f"PR-WMS-{__import__('uuid').uuid4().hex[:8].upper()}",
@@ -140,6 +142,7 @@ class ReplenishExecutor(BaseWmsExecutor):
                 "mn": item["material_name"],
                 "qty": item["suggested_qty"],
                 "urg": urgency,
+                "cost": est_cost,
             })
             
             replenishments.append({

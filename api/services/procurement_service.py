@@ -28,6 +28,36 @@ def _gen_id():
     return str(uuid.uuid4())
 
 
+def mock_unit_price(material_code: str) -> float:
+    """确定性 mock 单价：同物料编码恒定同价（md5 散列），覆盖低/中/高价值带，
+    使金额分级审批（>5000 人工）有真实分布。真实价格接入后可整体替换。"""
+    import hashlib
+    h = int(hashlib.md5((material_code or "?").encode()).hexdigest()[:8], 16)
+    band = h % 100
+    if band < 7:      # 7% 高价值（设备件/模具材料）：800-2500 元
+        return round(800 + (h % 1700) + (h % 97) / 100.0, 2)
+    if band < 45:     # 38% 中价值（标准件/电子料）：30-300 元
+        return round(30 + (h % 270) + (h % 89) / 100.0, 2)
+    return round(1.5 + (h % 4850) / 100.0, 2)  # 55% 低价值耗材：1.5-50 元
+
+
+async def estimate_unit_cost(db: AsyncSession, material_code: str) -> float:
+    """物料估算单价：供应商报价 → 库存单位成本 → 确定性 mock。"""
+    if not material_code:
+        return mock_unit_price("?")
+    sp = (await db.execute(text(
+        "SELECT unit_price FROM supplier_prices WHERE material_code=:m AND is_active=true LIMIT 1"
+    ), {"m": material_code})).scalar()
+    if sp:
+        return float(sp)
+    ic = (await db.execute(text(
+        "SELECT unit_cost FROM inventory WHERE material_code=:m AND unit_cost IS NOT NULL AND unit_cost>0 LIMIT 1"
+    ), {"m": material_code})).scalar()
+    if ic:
+        return float(ic)
+    return mock_unit_price(material_code)
+
+
 class ProcurementService:
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -46,19 +76,21 @@ class ProcurementService:
                 continue
             material_code = item.get("material_code", "")
             pr_code = f"PR-{factory_id[:6]}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{len(created)+1:03d}"
+            est_cost = round(net_qty * await estimate_unit_cost(self.db, material_code), 2)
 
             await self.db.execute(text("""
                 INSERT INTO purchase_requisitions
                 (id, factory_id, pr_code, source, source_id, material_code, material_name,
-                 qty, unit, required_date, status, auto_approved, created_at, updated_at)
-                VALUES (:id, :fid, :code, 'mrp', :src, :mc, :mn, :qty, 'PCS', :rd, 'pending', FALSE, NOW(), NOW())
+                 qty, unit, required_date, status, auto_approved, estimated_cost, created_at, updated_at)
+                VALUES (:id, :fid, :code, 'mrp', :src, :mc, :mn, :qty, 'PCS', :rd, 'pending', FALSE, :cost, NOW(), NOW())
             """), {
                 "id": _gen_id(), "fid": factory_id, "code": pr_code,
                 "src": item.get("plan_id", ""), "mc": material_code,
                 "mn": item.get("material_name", ""), "qty": net_qty,
                 "rd": date.today() + timedelta(days=int(item.get("lead_days", 7) or 7)),
+                "cost": est_cost,
             })
-            created.append({"pr_code": pr_code, "material_code": material_code, "qty": net_qty})
+            created.append({"pr_code": pr_code, "material_code": material_code, "qty": net_qty, "estimated_cost": est_cost})
 
         if created:
             await self.db.commit()
