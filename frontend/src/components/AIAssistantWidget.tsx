@@ -1893,7 +1893,7 @@ export default function AIAssistantWidget() {
     setCallModalOpen(true)
   }
 
-  // ---------- 提交工单呼叫 → 直接创建 TMS 任务（不跳转页面） ----------
+  // ---------- 提交工单呼叫 → 直接创建 RCC 任务中心任务（不跳转页面） ----------
   const submitCall = async () => {
     if (!selectedContact) return
     try {
