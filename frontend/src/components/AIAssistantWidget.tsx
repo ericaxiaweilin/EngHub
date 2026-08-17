@@ -3560,7 +3560,7 @@ export default function AIAssistantWidget() {
         {selectedContact && (
           <div style={{ marginBottom: 12, padding: '8px 10px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, fontSize: 12 }}>
             <CheckCircleOutlined style={{ color: '#52c41a', marginRight: 6 }} />
-            呼叫将直达 <Text strong>{selectedContact.name}</Text>（{selectedContact.role}），并同步创建 TMS 任务
+            呼叫将直达 <Text strong>{selectedContact.name}</Text>（{selectedContact.role}），并同步创建任务中心（RCC）任务
           </div>
         )}
         <Form form={callForm} layout="vertical">

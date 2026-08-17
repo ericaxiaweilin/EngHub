@@ -22,7 +22,7 @@
     "g-hr": "人員",
     "/skill-matrix": "員工技能矩陣",
     "/simulation": "仿真引擎",
-    "g-tms": "TMS 任務管理",
+    "g-tms": "RCC 任務中心",
     "/tms/approval": "審批中心",
     "/tms/distribution": "分發看板",
     "/tms/agent": "Agent控制台",

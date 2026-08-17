@@ -20,7 +20,7 @@ const MODULES = [
   { key: 'TPM', title: 'TPM', desc: '设备管理', icon: <ToolOutlined style={{ fontSize: 36, color: '#13c2c2' }} />, path: '/base-data' },
   { key: 'SIM', title: 'SIM', desc: '系统仿真', icon: <ExperimentOutlined style={{ fontSize: 36, color: '#eb2f96' }} />, path: '/simulation' },
   { key: 'HR', title: 'HR', desc: '人员技能', icon: <TeamOutlined style={{ fontSize: 36, color: '#2f54eb' }} />, path: '/skill-matrix' },
-  { key: 'TMS', title: 'TMS', desc: '任务管理', icon: <CarOutlined style={{ fontSize: 36, color: '#fa541c' }} />, path: '/tms/approval' },
+  { key: 'RCC', title: 'RCC', desc: '任务中心', icon: <CarOutlined style={{ fontSize: 36, color: '#fa541c' }} />, path: '/task-center' },
 ]
 
 const ModuleSelect: React.FC = () => {
