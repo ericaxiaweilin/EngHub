@@ -727,7 +727,7 @@ def get_menu_items_for_user(user) -> list:
         collab_children.append({"key": "/tms/approval", "label": "审批中心"})
         collab_children.append({"key": "/tms/distribution", "label": "分发看板"})
         collab_children.append({"key": "/tms/agent", "label": "Agent控制台"})
-    collab_children.append({"key": "/my-tasks", "label": "我的任务"})
+    # 我的任务已拆分至 RCC 任务中心（/task-center），协同组不再重复挂载
     if is_admin or "tms" in modules_with_access:
         collab_children.append({"key": "/agent-supervisor", "label": "智能体监督"})
     if is_admin:

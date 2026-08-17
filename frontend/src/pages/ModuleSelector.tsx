@@ -93,7 +93,7 @@ const MODULES: ModuleDef[] = [
   {
     key: 'collab-work',
     title: '协同',
-    desc: '快速工单 · 标准工单模板（8D/公共） · 我的任务',
+    desc: '快速工单 · 标准工单模板（8D/公共） · 审批分发',
     icon: <InboxOutlined style={{ fontSize: 36 }} />,
     color: '#f5222d',
     path: '/work-order-templates',
