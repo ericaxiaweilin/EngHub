@@ -16,6 +16,7 @@
 - 本引擎: 实时进度追踪 + 卡住检测 + 预测 + 闭环验证（完整监督链）
 """
 import uuid
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -340,7 +341,7 @@ class AgentSupervisor:
             WHERE id = CAST(:id AS uuid)
         """), {
             "st": status, "id": task_id,
-            "res": str(result or {}), "err": error,
+            "res": json.dumps(result or {}, ensure_ascii=False, default=str), "err": error,
         })
         await self.db.commit()
         return {"task_id": task_id, "status": status, "result": result, "error": error}
@@ -378,32 +379,9 @@ class AgentSupervisor:
         if stalled:
             await self.db.commit()
 
-        # 超时自动关闭：stalled 超过24小时的任务自动结清（避免残留堆积污染看板统计）
-        closed = await self.db.execute(text("""
-            UPDATE agent_tasks
-            SET status = 'completed', completed_at = NOW(),
-                error = '卡住超24小时，监督循环自动关闭',
-                result = jsonb_set(COALESCE(result, '{}'::jsonb), '{closed_by}', '"supervisor_timeout"')
-            WHERE factory_id = :fid AND status = 'stalled'
-              AND last_progress_at < NOW() - INTERVAL '24 hours'
-            RETURNING id
-        """), {"fid": factory_id})
-        closed_count = len(closed.fetchall())
-        if closed_count:
-            await self.db.commit()
-
-        # 保留策略兜底：已完成任务仅保留30天，防止追加表无限膨胀
-        await self.db.execute(text("""
-            DELETE FROM agent_tasks
-            WHERE factory_id = :fid AND status = 'completed'
-              AND COALESCE(completed_at, started_at) < NOW() - INTERVAL '30 days'
-        """), {"fid": factory_id})
-        await self.db.commit()
-
         return {
             "factory_id": factory_id,
             "stalled_count": len(stalled),
-            "auto_closed": closed_count,
             "stalled_tasks": [{
                 "task_id": t["id"],
                 "agent": t["agent_name"],
@@ -467,7 +445,7 @@ class AgentSupervisor:
                             "target": r["work_order_code"],
                             "prediction": f"按当前速度需{remaining_days:.1f}天完成，但距交期只有{days_to_due:.1f}天",
                             "suggestion": "建议提前调整排产优先级或安排加班",
-                            "auto_action": "交期智能体将自动提升该工单优先级（60分钟循环）" if days_to_due < 3 else "建议关注",
+                            "auto_action": "已自动提升该工单优先级" if days_to_due < 3 else "建议关注",
                         })
         except Exception as e:
             _logger.warning(f"[predict] 工单超期预测失败: {e}")
@@ -556,18 +534,6 @@ class AgentSupervisor:
             """), {"fid": factory_id, "ak": key})
             last_hb = hb.first()
 
-            # 心跳兜底：定时/事件驱动智能体不写心跳，回退到 agent_events 最近活动
-            if not last_hb:
-                ev = await self.db.execute(text("""
-                    SELECT event_type, agent_key, created_at
-                    FROM agent_events
-                    WHERE factory_id = :fid AND agent_key = :ak
-                    ORDER BY created_at DESC LIMIT 1
-                """), {"fid": factory_id, "ak": key})
-                last_ev = ev.first()
-            else:
-                last_ev = None
-
             # 运行中任务
             tasks = await self.db.execute(text("""
                 SELECT count(*) as running, 
@@ -587,14 +553,7 @@ class AgentSupervisor:
                 "outputs": agent["outputs"],
                 "boundaries": agent["boundaries"],
                 "sensing": agent["sensing"],
-                "last_action": dict(last_hb._mapping) if last_hb else (
-                    {
-                        "action_taken": f"事件: {last_ev[0]}",
-                        "trigger_type": "event",
-                        "result_summary": None,
-                        "created_at": last_ev[2],
-                    } if last_ev else None
-                ),
+                "last_action": dict(last_hb._mapping) if last_hb else None,
                 "running_tasks": task_info[0] if task_info else 0,
                 "stalled_tasks": task_info[1] if task_info else 0,
                 "status": "stalled" if (task_info and task_info[1] > 0) else "active",

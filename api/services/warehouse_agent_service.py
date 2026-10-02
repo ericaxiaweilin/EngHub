@@ -42,7 +42,7 @@ class WarehouseAgent:
         """事件：库存低于安全线 → 自动创建补货需求"""
         _logger.info(f"[warehouse] 检查安全库存: {factory_id}")
 
-        # 找低于安全线的物料
+        # 找低于安全线的物料（已有未处理补货申请的物料不重复开单）
         result = await self.db.execute(text("""
             SELECT i.material_code, i.material_name, i.available_qty,
                    i.safety_stock, i.reorder_point, i.reorder_qty,
@@ -51,6 +51,12 @@ class WarehouseAgent:
             WHERE i.factory_id = :fid
               AND i.available_qty <= COALESCE(i.reorder_point, i.safety_stock, 10)
               AND i.available_qty >= 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM purchase_requests pr
+                  WHERE pr.factory_id = i.factory_id
+                    AND pr.material_code = i.material_code
+                    AND pr.status = 'pending'
+              )
         """), {"fid": factory_id})
         low_stock = [dict(r) for r in result.mappings().all()]
 
@@ -73,46 +79,23 @@ class WarehouseAgent:
                 "suggested_qty": suggested_qty,
                 "urgency": urgency,
                 "abc_class": item.get("abc_class", "C"),
+                "unit": item.get("unit", "pcs"),
             })
-
-        # 去重：同工厂+物料已有在途 PR（pending/assigned）或在途 PO（ordered）则不再重复建单
-        # （实测：无去重时同一物料被刷出 24 张重复 PR，污染采购池与 RCC 收件箱）
-        deduped: List[Dict[str, Any]] = []
-        for r in replenishments:
-            dup_pr = (await self.db.execute(text(
-                "SELECT 1 FROM purchase_requisitions WHERE factory_id=:fid AND material_code=:mc "
-                "AND status IN ('pending','assigned') LIMIT 1"
-            ), {"fid": factory_id, "mc": r["material_code"]})).scalar_one_or_none()
-            if dup_pr:
-                continue
-            dup_po = (await self.db.execute(text(
-                "SELECT 1 FROM purchase_orders WHERE factory_id=:fid AND material_code=:mc "
-                "AND status IN ('ordered','partial') LIMIT 1"
-            ), {"fid": factory_id, "mc": r["material_code"]})).scalar_one_or_none()
-            if dup_po:
-                continue
-            deduped.append(r)
-        replenishments = deduped
-        if not replenishments:
-            await self.db.commit()
-            return {"action": "none", "message": "低库存物料均已有在途采购单据，无需重复建单"}
 
         # 记录补货事件
         task_id = await self._start_task(factory_id, "auto_replenish", f"{len(replenishments)}项物料需补货")
 
-        # 创建采购申请记录（含估算成本：供应商报价→库存成本→确定性mock）
-        from api.services.procurement_service import estimate_unit_cost
+        # 创建采购申请记录
         for r in replenishments:
-            est_cost = round(float(r["suggested_qty"] or 0) * await estimate_unit_cost(self.db, r["material_code"]), 2)
             await self.db.execute(text("""
-                INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, source_id, material_code,
-                    material_name, qty, unit, required_date, status, auto_approved, priority, estimated_cost, created_by, created_at, updated_at)
-                VALUES (gen_random_uuid()::text, :fid, :pc, 'warehouse_agent', :fid, :mc,
-                    :mn, :qty, 'pcs', (CURRENT_DATE + INTERVAL '7 days')::date, 'pending', FALSE, :urg, :cost, 'warehouse_agent', NOW(), NOW())
+                INSERT INTO purchase_requests (id, factory_id, material_code, material_name,
+                    requested_qty, unit, urgency, status, source, created_at)
+                VALUES (gen_random_uuid(), :fid, :mc, :mn, :qty, :unit, :urg, 'pending', 'warehouse_agent', NOW())
+                ON CONFLICT DO NOTHING
             """), {
-                "fid": factory_id, "pc": f"PR-WA-{__import__('uuid').uuid4().hex[:8].upper()}",
-                "mc": r["material_code"], "mn": r["material_name"], "qty": r["suggested_qty"],
-                "urg": r["urgency"], "cost": est_cost,
+                "fid": factory_id, "mc": r["material_code"],
+                "mn": r["material_name"], "qty": r["suggested_qty"],
+                "unit": r["unit"], "urg": r["urgency"],
             })
 
         await self.db.commit()
@@ -350,7 +333,6 @@ class WarehouseAgent:
             result = await supervisor.start_task(
                 factory_id=factory_id,
                 agent_key=self.AGENT_KEY,
-                agent_name=self.AGENT_NAME,
                 task_type=task_type,
                 task_desc=desc,
                 total_steps=3,
