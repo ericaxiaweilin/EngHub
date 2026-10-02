@@ -271,9 +271,10 @@ class HybridScheduler:
         if res.is_broken:
             return False, datetime.datetime.max
         
-        # 2. 检查是否在维护期间
+        # 2. 检查是否在维护期间 (按跨班次占用区间判断)
+        span_end = self._work_span_end(res, start_time, duration)
         for maint_start, maint_end in res.maintenance_schedule:
-            if start_time < maint_end and (start_time + datetime.timedelta(seconds=duration)) > maint_start:
+            if start_time < maint_end and span_end > maint_start:
                 # 与维护时间冲突，跳到维护结束后
                 return False, maint_end
         
@@ -282,10 +283,9 @@ class HybridScheduler:
         if conflict:
             return False, conflict.end_time
         
-        # 4. 检查工作日历
-        if not self._is_within_calendar(res, start_time, duration):
-            next_slot = self._find_next_work_slot(res, start_time, duration)
-            return False, next_slot
+        # 4. 检查工作日历：开工时点必须落在班次内，完工允许跨班次连续占用
+        if not self._can_start_in_calendar(res, start_time):
+            return False, self._find_next_work_slot(res, start_time)
         
         return True, start_time
     
@@ -296,55 +296,86 @@ class HybridScheduler:
         duration: float,
     ) -> Optional[ScheduleTask]:
         """检查时间轴冲突"""
-        end = start + datetime.timedelta(seconds=duration)
         resource = self.resources.get(resource_id)
+        if resource is None:
+            return None
+        end = self._work_span_end(resource, start, duration)
         overlapping = [
             task for task in self.resource_timeline.get(resource_id, [])
             if not (end <= task.start_time or start >= task.end_time)
         ]
-        if resource and len(overlapping) >= max(1, resource.capacity):
+        if len(overlapping) >= max(1, resource.capacity):
             return max(overlapping, key=lambda task: task.end_time)
         return None
     
-    def _is_within_calendar(
+    def _working_slots(
+        self,
+        resource: ResourceConstraint,
+        day: datetime.date,
+    ) -> List[Tuple[datetime.time, datetime.time]]:
+        """某日的有效班次。工厂维护了按周日历时，缺失的星期即为休息日，不回落到默认班次。"""
+        if resource.calendar_by_weekday:
+            slots = resource.calendar_by_weekday.get(day.weekday(), [])
+        else:
+            slots = resource.calendar
+        if day in resource.blocked_dates and day not in resource.working_dates:
+            return []
+        return sorted(slots)
+    
+    def _can_start_in_calendar(
+        self,
+        resource: ResourceConstraint,
+        start: datetime.datetime,
+    ) -> bool:
+        """开工时点是否落在有效班次内 (完工可跨班次，不要求整段塞进同一班次)。"""
+        return any(
+            slot_start <= start.time() < slot_end
+            for slot_start, slot_end in self._working_slots(resource, start.date())
+        )
+    
+    def _work_span_end(
         self,
         resource: ResourceConstraint,
         start: datetime.datetime,
         duration: float,
-    ) -> bool:
-        """检查任务是否完整落在一个有效班次内，并排除法定假期。"""
-        work_slots = resource.calendar_by_weekday.get(start.weekday(), resource.calendar)
-        if start.date() in resource.blocked_dates and start.date() not in resource.working_dates:
-            return False
-        for work_start, work_end in work_slots:
-            slot_start = datetime.datetime.combine(start.date(), work_start)
-            slot_end = datetime.datetime.combine(start.date(), work_end)
-            end = start + datetime.timedelta(seconds=duration)
-            if slot_start <= start and end <= slot_end:
-                return True
-        
-        return False
+    ) -> datetime.datetime:
+        """从 start 起沿班次累积消耗 duration 秒，返回完工时刻。"""
+        if duration <= 0:
+            return start
+        remaining = float(duration)
+        cursor = start
+        day = start.date()
+        # 上限两年：超出说明批量大到无法在计划期内完成，交由调用方按未排处理。
+        for _ in range(732):
+            for slot_start, slot_end in self._working_slots(resource, day):
+                begin = datetime.datetime.combine(day, slot_start)
+                finish = datetime.datetime.combine(day, slot_end)
+                segment_start = max(cursor, begin)
+                if segment_start >= finish:
+                    continue
+                segment_seconds = (finish - segment_start).total_seconds()
+                if remaining <= segment_seconds:
+                    return segment_start + datetime.timedelta(seconds=remaining)
+                remaining -= segment_seconds
+            day += datetime.timedelta(days=1)
+            cursor = datetime.datetime.combine(day, datetime.time.min)
+        return cursor
     
     def _find_next_work_slot(
         self,
         resource: ResourceConstraint,
         from_time: datetime.datetime,
-        duration: float = 0.0,
     ) -> datetime.datetime:
-        """查找下一个工作时间段"""
-        # 找下一个能容纳完整任务的工作时间段，最多搜索一年，避免死循环。
-        # 不能只返回下一天的第一班：两班制或当天午休后仍可能有可用窗口。
-        next_day = from_time.date()
-        for _ in range(366):
-            slots = resource.calendar_by_weekday.get(next_day.weekday(), resource.calendar)
-            if slots and (next_day not in resource.blocked_dates or next_day in resource.working_dates):
-                for slot_start, slot_end in sorted(slots):
-                    slot_begin = datetime.datetime.combine(next_day, slot_start)
-                    slot_finish = datetime.datetime.combine(next_day, slot_end)
-                    candidate = max(from_time, slot_begin)
-                    if candidate <= slot_finish and candidate + datetime.timedelta(seconds=duration) <= slot_finish:
-                        return candidate
-            next_day += datetime.timedelta(days=1)
+        """查找下一个可开工时刻。只要求落在班次内，不要求整道工序塞进同一班次。"""
+        day = from_time.date()
+        for _ in range(732):
+            for slot_start, slot_end in self._working_slots(resource, day):
+                begin = datetime.datetime.combine(day, slot_start)
+                finish = datetime.datetime.combine(day, slot_end)
+                candidate = max(from_time, begin)
+                if candidate < finish:
+                    return candidate
+            day += datetime.timedelta(days=1)
         return from_time + datetime.timedelta(hours=1)
     
     def _calculate_setup_time(
@@ -550,7 +581,9 @@ class HybridScheduler:
                 run_time = best_duration - setup_time
                 
                 start_time = best_start
-                end_time = best_start + datetime.timedelta(seconds=best_duration)
+                end_time = self._work_span_end(
+                    self.resources[best_station], best_start, best_duration
+                )
                 
                 task = ScheduleTask(
                     task_id=f"TSK-{order.order_id}-{op.operation_sequence:03d}",

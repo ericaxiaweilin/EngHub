@@ -463,17 +463,23 @@ class ApsService:
 
                 needed_stations.update(op.get("allowed_stations", []))
 
-        # 加载设备作为资源
+        # 加载设备作为资源：按工位聚合其下所有设备，只要还有可用设备该工位就可排，
+        # 避免扫到哪台设备就决定整个工位健康度。
+        station_equipment: Dict[str, List] = {}
+        for eq in equipments:
+            resource_id = eq.station_id or eq.equipment_code
+            if resource_id:
+                station_equipment.setdefault(resource_id, []).append(eq)
 
         loaded_resources = set()
 
-        for eq in equipments:
+        for resource_id, eq_rows in station_equipment.items():
 
-            resource_id = eq.station_id or eq.equipment_code
+            if resource_id not in loaded_resources:
 
-            if resource_id and resource_id not in loaded_resources:
-
-                is_broken = eq.status in ("broken", "maintenance")
+                is_broken = all(
+                    eq.status in ("broken", "maintenance") for eq in eq_rows
+                )
                 capacity = capacity_map.get(resource_id, {})
                 calendar = await self._load_calendar_constraints(
                     factory_id, resource_id, horizon_start, horizon_end
