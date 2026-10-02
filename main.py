@@ -327,6 +327,27 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 仓储智能体任务异常: {e}")
 
+        # 交期智能体：T+3 交期风险扫描 —— 每 60 分钟（高风险真实提优先级，幂等）
+        try:
+            import time as _t10
+            if not hasattr(_periodic_scheduler, "_last_delivery_check"):
+                _periodic_scheduler._last_delivery_check = 0
+            if _t10.time() - _periodic_scheduler._last_delivery_check > 3600:  # 60min
+                _periodic_scheduler._last_delivery_check = _t10.time()
+                from api.services.delivery_agent_service import DeliveryAgent
+                async with db_config.session_factory() as db:
+                    agent = DeliveryAgent(db)
+                    for fid in ["FAC_ELEC_DEMO_2026", "FAC_MECH_001"]:
+                        try:
+                            res = await agent.check_delivery_risks(fid)
+                            if res.get("scanned_risks"):
+                                _logger.info(f"[delivery] {fid}: 风险{res['scanned_risks']}单，提级{len(res.get('escalated', []))}单")
+                        except Exception as ex:
+                            await db.rollback()
+                            _logger.warning(f"[delivery] 交期扫描失败 {fid}: {ex}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 交期智能体任务异常: {e}")
+
         # 虚拟工厂脉搏 —— 每 60 分钟按真实节奏接单/拆单/报工/预警
         try:
             import time as _t_vf
