@@ -10,31 +10,16 @@ import React, { useCallback, useEffect, useState } from 'react'
 import {
   Alert, Badge, Button, Card, Col, DatePicker, Drawer, Form, Input, InputNumber,
   List, Modal, Popconfirm, Progress, Row, Select, Space, Statistic, Table, Tabs,
-  Steps, Tag, Timeline, Tooltip, Typography, Divider, message,
+  Tag, Timeline, Tooltip, Typography, message,
 } from 'antd'
 import {
   BellOutlined, CarryOutOutlined, ClockCircleOutlined, DeleteOutlined,
   HistoryOutlined, ImportOutlined, PlusOutlined, ReloadOutlined,
-  RobotOutlined, StopOutlined, ThunderboltOutlined, ToolOutlined, UserSwitchOutlined,
+  RobotOutlined, ThunderboltOutlined, ToolOutlined, UserSwitchOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
 
 const { Text, Paragraph } = Typography
-
-// 清洗跟进记录：JSON 原文 → 人类可读（防系统代码泄漏）
-function humanizeNote(raw?: string): string {
-  if (!raw) return '-'
-  let text = raw.trim()
-  if (text.startsWith('{') && text.endsWith('}')) {
-    try {
-      const d = JSON.parse(text)
-      if (d && typeof d === 'object' && d.note) text = String(d.note).trim()
-    } catch { /* keep raw */ }
-  }
-  // 去 XML 残留
-  text = text.replace(/<tool_call>|<\/tool_call>|<function=[^>]*>|<\/function>|<parameter[^>]*>|<\/parameter>/g, '')
-  return text || '-'
-}
 
 interface FollowupTask {
   id: string
@@ -103,9 +88,6 @@ interface PlanItem {
   plan_seq?: number
   follow_count: number
   last_follow_note?: string
-  blocked_by?: string
-  block_category?: string
-  work_order_code?: string
 }
 
 interface CommanderPlan {
@@ -122,16 +104,6 @@ interface CommanderPlan {
 }
 
 interface AgentOption { key: string; name: string; description?: string }
-
-const BLOCK_CATEGORY_META: Record<string, { label: string; color: string }> = {
-  material: { label: '缺料/物料', color: 'orange' },
-  supplier: { label: '供应商交付', color: 'volcano' },
-  approval: { label: '待审批', color: 'gold' },
-  equipment: { label: '设备问题', color: 'purple' },
-  staff: { label: '人员', color: 'geekblue' },
-  data: { label: '数据异常', color: 'cyan' },
-  other: { label: '其他', color: 'default' },
-}
 
 const STATUS_META: Record<string, { color: string; label: string }> = {
   open: { color: 'processing', label: '跟进中' },
@@ -192,7 +164,6 @@ const TaskCenter: React.FC = () => {
   const [agents, setAgents] = useState<AgentOption[]>([])
   const [loading, setLoading] = useState(false)
   const [activeTab, setActiveTab] = useState('all')
-  const [ownerFilter, setOwnerFilter] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [ingestOpen, setIngestOpen] = useState(false)
   const [ingesting, setIngesting] = useState(false)
@@ -200,7 +171,6 @@ const TaskCenter: React.FC = () => {
   const [editTask, setEditTask] = useState<FollowupTask | null>(null)
   const [logsTask, setLogsTask] = useState<FollowupTask | null>(null)
   const [logs, setLogs] = useState<TaskLog[]>([])
-  const [taskMap, setTaskMap] = useState<any>(null)
   const [logsLoading, setLogsLoading] = useState(false)
   const [followingId, setFollowingId] = useState<string>('')
   const [createForm] = Form.useForm()
@@ -232,15 +202,9 @@ const TaskCenter: React.FC = () => {
   const doneCount = tasks.filter(t => t.status === 'done').length
   const typeCount = (t: string) => tasks.filter(x => x.item_type === t).length
 
-  const visibleTasks = (activeTab === 'all'
+  const visibleTasks = activeTab === 'all'
     ? tasks
     : tasks.filter(t => t.item_type === activeTab)
-  ).filter(t => {
-    if (!ownerFilter) return true
-    const owner = ownerFilter.toLowerCase()
-    return (t.created_by || '').toLowerCase().includes(owner)
-      || (t.assigned_to || '').toLowerCase().includes(owner)
-  })
 
   const handleCreate = async () => {
     const values = await createForm.validateFields()
@@ -338,10 +302,6 @@ const TaskCenter: React.FC = () => {
     try {
       const res: any = await api.get(`/api/v1/task-center/tasks/${task.id}/logs`)
       setLogs(res.logs || [])
-      try {
-        const mres: any = await api.get(`/api/v1/task-center/tasks/${task.id}/map`)
-        setTaskMap(mres && !mres.error ? mres : null)
-      } catch { setTaskMap(null) }
     } catch { /* 拦截器已提示 */ } finally {
       setLogsLoading(false)
     }
@@ -379,18 +339,6 @@ const TaskCenter: React.FC = () => {
           </Space>
         )
       },
-    },
-    {
-      title: '创建人',
-      dataIndex: 'created_by',
-      key: 'created_by',
-      width: 110,
-      render: (v?: string, r?: FollowupTask) => (
-        <Space size={4} wrap>
-          <Tag>{v || '-'}</Tag>
-          {r?.assigned_to && <Tag icon={<UserSwitchOutlined />} color="geekblue">→{r.assigned_to}</Tag>}
-        </Space>
-      ),
     },
     {
       title: '智能体',
@@ -555,55 +503,28 @@ const TaskCenter: React.FC = () => {
       expandable={{
         rowExpandable: (p: CommanderPlan) => (p.items?.length || 0) > 0,
         expandedRowRender: (p: CommanderPlan) => (
-          <Space direction="vertical" size={8} style={{ width: '100%' }}>
-            {/* 计划 roadmap：目标 → 各子任务流转状态 */}
-            <Alert type="info" showIcon icon={<RobotOutlined />} message="计划处理地图（Roadmap）"
-              description={
-                <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                  <Text>目标：{p.objective}</Text>
-                  <Text type="secondary">模式 {PLAN_MODE_META[p.mode || '']?.label || p.mode || '-'} · 总进度 {p.progress_pct || 0}% · {p.items?.length || 0} 个子任务</Text>
-                </Space>
-              } />
-            <Timeline
-              items={(p.items || []).map((it: PlanItem) => {
-                const sm = STATUS_META[it.status] || { color: 'default', label: it.status }
-                const blocked = it.status === 'blocked'
-                return {
-                  color: it.status === 'done' ? 'green' : blocked ? 'red' : 'blue',
-                  children: (
-                    <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                      <Space size={6} wrap>
-                        <Tag color="blue">步骤 {it.plan_seq ?? '-'}</Tag>
-                        <Text strong>{it.title}</Text>
-                        {it.agent_name && <Tag>{it.agent_name}</Tag>}
-                        <Tag color={sm.color}>{sm.label}</Tag>
-                        {it.status === 'done' && <Tag color="green">✓</Tag>}
-                        {blocked && <Tag color="red">⛔</Tag>}
-                      </Space>
-                      <Space size={8} wrap>
-                        <Progress percent={it.progress_pct || 0} size="small" style={{ width: 120, marginBottom: 0 }} />
-                        {it.follow_count > 0 && <Text type="secondary" style={{ fontSize: 12 }}>跟进 {it.follow_count} 次</Text>}
-                      </Space>
-                      {blocked && (
-                        <Space size={6} wrap>
-                          {it.blocked_by && <Tag color="orange">卡在：{it.blocked_by}</Tag>}
-                          {it.block_category && (
-                            <Tag color={(BLOCK_CATEGORY_META[it.block_category] || {}).color}>
-                              {(BLOCK_CATEGORY_META[it.block_category] || { label: it.block_category }).label}
-                            </Tag>
-                          )}
-                          {it.work_order_code && <Text type="secondary" style={{ fontSize: 12 }}>{it.work_order_code}</Text>}
-                        </Space>
-                      )}
-                      {it.last_follow_note && !blocked && (
-                        <Text type="secondary" style={{ fontSize: 12 }} ellipsis>{it.last_follow_note}</Text>
-                      )}
+          <List
+            size="small"
+            dataSource={p.items}
+            renderItem={(it: PlanItem) => {
+              const sm = STATUS_META[it.status] || { color: 'default', label: it.status }
+              return (
+                <List.Item style={{ padding: '6px 12px' }}>
+                  <Space size={8} style={{ width: '100%', justifyContent: 'space-between' }}>
+                    <Space size={6}>
+                      <Tag color="blue">{it.plan_seq ?? '-'}</Tag>
+                      <Text>{it.title}</Text>
+                      {it.agent_name && <Tag>{it.agent_name}</Tag>}
                     </Space>
-                  ),
-                }
-              })}
-            />
-          </Space>
+                    <Space size={8}>
+                      <Tag color={sm.color}>{sm.label}</Tag>
+                      <Progress percent={it.progress_pct || 0} size="small" style={{ width: 100, marginBottom: 0 }} />
+                    </Space>
+                  </Space>
+                </List.Item>
+              )
+            }}
+          />
         ),
       }}
     />
@@ -726,16 +647,6 @@ const TaskCenter: React.FC = () => {
           </Space>
         }
       >
-        <Space style={{ marginBottom: 8 }} wrap>
-          <Input.Search
-            placeholder="按归属人筛选（创建人/指派对象，如 vf_mec_pmc_01 / procurement）"
-            allowClear
-            style={{ width: 380 }}
-            onSearch={v => setOwnerFilter(v.trim())}
-            onChange={e => !e.target.value && setOwnerFilter('')}
-          />
-          {ownerFilter && <Tag closable onClose={() => setOwnerFilter('')} color="blue">归属人：{ownerFilter}</Tag>}
-        </Space>
         <Tabs activeKey={activeTab} onChange={setActiveTab} items={tabItems} />
       </Card>
 
@@ -873,137 +784,36 @@ const TaskCenter: React.FC = () => {
         </Form>
       </Modal>
 
-      {/* 任务处理地图：生命周期节点 + 卡点归因 + 跟进流水 */}
+      {/* 跟进时间线 */}
       <Drawer
-        title={`任务处理地图：${logsTask?.title || ''}`}
+        title={`跟进时间线：${logsTask?.title || ''}`}
         open={!!logsTask}
-        onClose={() => { setLogsTask(null); setTaskMap(null) }}
-        width={560}
+        onClose={() => setLogsTask(null)}
+        width={520}
       >
         {logsLoading ? <Text type="secondary">加载中…</Text> : (
-          <Space direction="vertical" size={16} style={{ width: '100%' }}>
-            {/* 状态总览卡 */}
-            {taskMap && (
-              <>
-                <Row gutter={8}>
-                  <Col span={8}><Card size="small"><Statistic title="状态" value={STATUS_META[taskMap.status]?.label || taskMap.status} valueStyle={{ fontSize: 18, color: (STATUS_META[taskMap.status] || {}).color }} /></Card></Col>
-                  <Col span={8}><Card size="small"><Statistic title="进度" value={taskMap.progress_pct || 0} suffix="%" valueStyle={{ fontSize: 18 }} /></Card></Col>
-                  <Col span={8}><Card size="small"><Statistic title="跟进次数" value={taskMap.follow_count || 0} suffix={`/ ${taskMap.max_follows || 0}`} valueStyle={{ fontSize: 18 }} /></Card></Col>
-                </Row>
-                {taskMap.agent_name && <Text type="secondary">负责智能体：{taskMap.agent_name}</Text>}
-
-                {/* 工作流流程条：工单生命周期 8 阶段，当前高亮，卡点红标 */}
-                {taskMap.workflow && taskMap.workflow.stages && (
-                  <>
-                    <Divider style={{ margin: '4px 0' }}>工单流转工作流</Divider>
-                    {taskMap.workflow.work_order_code && (
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        工单 {taskMap.workflow.work_order_code}
-                        {taskMap.workflow.work_order_status && ` · 状态 ${taskMap.workflow.work_order_status}`}
-                      </Text>
+          <Timeline
+            items={logs.map(l => ({
+              color: l.status_after === 'done' ? 'green' : l.status_after === 'blocked' ? 'orange' : 'blue',
+              children: (
+                <Space direction="vertical" size={0}>
+                  <Space size={6}>
+                    <Tag color={l.trigger_type === 'schedule' ? 'blue' : l.trigger_type === 'manual' ? 'purple' : 'default'}>
+                      {l.trigger_type === 'schedule' ? '定期扫描' : l.trigger_type === 'manual' ? '手动跟进' : '状态变更'}
+                    </Tag>
+                    {l.status_after && (
+                      <Tag color={(STATUS_META[l.status_after] || {}).color}>{(STATUS_META[l.status_after] || { label: l.status_after }).label}</Tag>
                     )}
-                    <Steps
-                      direction="vertical" size="small" responsive={false}
-                      current={taskMap.workflow.current_stage_idx ?? 0}
-                      status={taskMap.workflow.block_stage_idx != null ? 'error' : 'process'}
-                      items={taskMap.workflow.stages.map((s: any, i: number) => ({
-                        title: (
-                          <Space size={4} wrap>
-                            <Text strong style={{ fontSize: 13 }}>{s.stage}</Text>
-                            {s.role && <Tag color="blue" style={{ fontSize: 11 }}>{s.role}</Tag>}
-                            {i === taskMap.workflow.current_stage_idx && <Tag color="green">当前</Tag>}
-                            {i === taskMap.workflow.block_stage_idx && <Tag color="red">卡点</Tag>}
-                          </Space>
-                        ),
-                        description: (
-                          <Space direction="vertical" size={0} style={{ width: '100%' }}>
-                            <Text style={{ fontSize: 12 }}>{s.actions}</Text>
-                            {i === taskMap.workflow.block_stage_idx && s.blockpoint && (
-                              <Text type="warning" style={{ fontSize: 12 }}>⚠ {s.blockpoint}</Text>
-                            )}
-                          </Space>
-                        ),
-                      }))}
-                    />
-                    {taskMap.workflow.owner && (
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        当前阶段责任：{[...(taskMap.workflow.owner.responsible || []), ...(taskMap.workflow.owner.accountable || [])].filter((v: string, i: number, a: string[]) => a.indexOf(v) === i).join(' / ') || '-'}
-                      </Text>
-                    )}
-                  </>
-                )}
-
-                {/* 受阻卡点醒目提示 */}
-                {taskMap.block_attribution && (
-                  <Alert
-                    type="warning" showIcon icon={<StopOutlined />}
-                    message={`⛔ 任务卡在：${taskMap.block_attribution.blocked_by}`}
-                    description={
-                      <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                        <Text>原因类别：{BLOCK_CATEGORY_META[taskMap.block_attribution.block_category]?.label || taskMap.block_attribution.block_category || '未归类'}</Text>
-                        <Text style={{ whiteSpace: 'pre-wrap' }}>{taskMap.block_attribution.note}</Text>
-                        {taskMap.block_attribution.next_retry_at && (
-                          <Text type="secondary">下次自动重试：{fmtTime(taskMap.block_attribution.next_retry_at)}</Text>
-                        )}
-                      </Space>
-                    }
-                  />
-                )}
-              </>
-            )}
-
-            {/* 生命周期节点地图 */}
-            {taskMap && taskMap.nodes && taskMap.nodes.length > 0 && (
-              <>
-                <Divider style={{ margin: '4px 0' }}>处理路径</Divider>
-                <Timeline
-                  items={taskMap.nodes.map((n: any, idx: number) => ({
-                    color: n.status === 'done' ? 'green' : n.status === 'blocked' ? 'red' : 'blue',
-                    children: (
-                      <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                        <Space size={6} wrap>
-                          <Text strong>{n.label}</Text>
-                          {n.status === 'blocked' && <Tag color="red">受阻</Tag>}
-                          {n.status === 'done' && <Tag color="green">完成</Tag>}
-                          {n.status === 'active' && <Tag color="blue">进行中</Tag>}
-                          {n.blocked_by && <Tag color="orange">卡在：{n.blocked_by}</Tag>}
-                          {typeof n.pct === 'number' && n.pct !== null && <Text type="secondary">{n.pct}%</Text>}
-                        </Space>
-                        {n.note && <Text style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{humanizeNote(n.note)}</Text>}
-                        {n.at && <Text type="secondary" style={{ fontSize: 12 }}>{fmtTime(n.at)}{n.by ? ` · ${n.by}` : ''}</Text>}
-                      </Space>
-                    ),
-                  }))}
-                />
-              </>
-            )}
-
-            {/* 原始跟进流水（折叠） */}
-            <Divider style={{ margin: '4px 0' }}>跟进明细</Divider>
-            {logs.length > 0 ? (
-              <Timeline
-                items={logs.map(l => ({
-                  color: l.status_after === 'done' ? 'green' : l.status_after === 'blocked' ? 'orange' : 'blue',
-                  children: (
-                    <Space direction="vertical" size={0}>
-                      <Space size={6}>
-                        <Tag color={l.trigger_type === 'schedule' ? 'blue' : (l.trigger_type || '').startsWith('manual') ? 'purple' : 'default'}>
-                          {l.trigger_type === 'schedule' ? '定期扫描' : (l.trigger_type || '').startsWith('manual') ? '手动跟进' : l.trigger_type === 'status' ? '状态变更' : '系统'}
-                        </Tag>
-                        {l.status_after && (
-                          <Tag color={(STATUS_META[l.status_after] || {}).color}>{(STATUS_META[l.status_after] || { label: l.status_after }).label}</Tag>
-                        )}
-                        {typeof l.progress_pct === 'number' && <Text type="secondary">{l.progress_pct}%</Text>}
-                      </Space>
-                      <Text>{humanizeNote(l.note)}</Text>
-                      <Text type="secondary" style={{ fontSize: 12 }}>{fmtTime(l.created_at)} · {l.created_by || 'system'}</Text>
-                    </Space>
-                  ),
-                }))}
-              />
-            ) : <Text type="secondary">暂无跟进记录</Text>}
-          </Space>
+                    {typeof l.progress_pct === 'number' && <Text type="secondary">{l.progress_pct}%</Text>}
+                  </Space>
+                  <Text>{l.note || '-'}</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{fmtTime(l.created_at)} · {l.created_by || 'system'}</Text>
+                </Space>
+              ),
+            }))}
+          />
         )}
+        {!logsLoading && logs.length === 0 && <Text type="secondary">暂无跟进记录</Text>}
       </Drawer>
     </div>
   )

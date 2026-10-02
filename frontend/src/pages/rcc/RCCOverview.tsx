@@ -186,7 +186,6 @@ export default function RCCOverview() {
 
   return (
     <div>
-
       {/* 告警横幅 */}
       <AlertBanner alerts={metrics.alerts} />
 

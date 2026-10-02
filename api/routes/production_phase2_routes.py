@@ -82,14 +82,13 @@ async def create_sales_order(
 async def list_sales_orders(
     factory_id: str = Query(...),
     status: Optional[str] = None,
-    search: Optional[str] = None,
-    limit: int = Query(default=200),
+    limit: int = Query(default=50),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """销售订单列表（含缺料风险标记；search 按订单号/客户/产品模糊搜索）"""
+    """销售订单列表（含缺料风险标记）"""
     svc = OrderDecompositionService(db)
-    result = await svc.list_sales_orders(factory_id, status, limit, search)
+    result = await svc.list_sales_orders(factory_id, status, limit)
 
     # 缺料风险：订单产品 BOM 物料中 库存可用 < 需求 的项数（PMC 联动）
     try:

@@ -14,12 +14,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from core.auth.security import enforce_tenant, get_current_user, require_permission
+from core.auth.security import get_current_user, require_permission
 from database.models import User, Plan, Product, BomItem, Inventory, Station, WorkOrder, WorkOrderMaterial
 from core.pp.plan import MPSService
 from core.pp.mrp import MRPService
 
-router = APIRouter(prefix="/api/v1", tags=["pp"], dependencies=[Depends(enforce_tenant)])
+router = APIRouter(prefix="/api/v1", tags=["pp"])
 
 
 # --- Pydantic Models for Validation ---
@@ -792,8 +792,8 @@ async def calculate_mrp(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"MRP计算失败：计划[{p.plan_code}]关联的产品[{product_name}]没有关联BOM（物料清单）。"
-                f"请先在基础数据中为该产品维护BOM，再重新执行MRP。"
+                f"MRP计算失败：产品[{product_name}]未配置BOM（物料清单）。"
+                f"MRP需要：计划→产品→BOM→库存数据，请先为基础数据中的产品维护BOM。"
             ),
         )
     
@@ -938,19 +938,6 @@ async def calculate_mrp(
     p.mrp_status = "calculated"
     p.updated_at = calculated_at
     await db.commit()
-    # ── MRP→PR 自动闭环（REST 路径同样生效）：净需求>0 自动生成采购申请 ──
-    try:
-        shortage_items = [i for i in items if i["net_qty"] > 0]
-        if shortage_items:
-            from api.services.procurement_service import ProcurementService
-            ps = ProcurementService(db)
-            await ps.auto_pr_from_mrp(p.factory_id, [
-                {"material_code": i["material_code"], "material_name": i["material_name"],
-                 "net_requirement": i["net_qty"], "plan_id": p.id,
-                 "lead_days": 7} for i in shortage_items
-            ])
-    except Exception:
-        pass  # 自动 PR 失败不阻塞 MRP 结果返回
 
     mrp_result = {
         "id": mrp_result_id,

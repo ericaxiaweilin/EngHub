@@ -14,7 +14,7 @@ import {
   TeamOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
-import axios from '../../services/api'
+import axios from 'axios'
 import { COLORS } from './RCCCommandCenter'
 
 const API_BASE = '/api/v1/rcc'
@@ -23,7 +23,6 @@ const ROOT_ID = '__rcc_root__'
 interface BubbleNode {
   id: string
   name: string
-  parent_id?: string | null
   level: number
   scope: string
   health: 'normal' | 'warning' | 'danger'
@@ -68,46 +67,54 @@ function healthLabel(health: BubbleNode['health']) {
   return health === 'normal' ? '正常' : health === 'warning' ? '预警' : '瓶颈'
 }
 
-function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode[] {
-  if (nodes.length === 0) return []
+function buildHierarchy(nodes: BubbleNode[], edges: BubbleEdge[]): BubbleNode | null {
+  if (nodes.length === 0) return null
 
   const byId = new Map(nodes.map(node => [node.id, node]))
   const firstLevel = Math.min(...nodes.map(node => node.level))
-  // 有 parent_id 的节点归属到父节点下（如 SMT线长 → hr_sup 人力）
-  const withParent = new Set(nodes.filter(n => n.parent_id && byId.has(n.parent_id)).map(n => n.id))
-  // 顶层 = 无 parent 的节点（level 1 线长归 hr_sup 后，hr_sup/质量/设备/仓储/生产经理都是顶层）
-  const roots = nodes.filter(n => !withParent.has(n.id))
-  const rootIds = new Set(roots.map(n => n.id))
 
-  const buildNode = (node: BubbleNode, visited: Set<string>): BubbleNode => {
-    if (visited.has(node.id)) return { ...node, children: [] }  // 防环
-    const nextVisited = new Set(visited).add(node.id)
-    // 1) 优先按 parent_id 挂子节点（组织归属）
-    const directChildren = nodes.filter(c => c.parent_id === node.id)
-    // 2) 其次按 level 层级连（信号传导链，排除已归属其他父的 AND 顶层节点——避免重复挂载）
+  const buildNode = (node: BubbleNode): BubbleNode => {
     const nextLevel = node.level + 1
     const linkedIds = new Set<string>()
+
     edges.forEach(edge => {
-      const candidateId = edge.source === node.id ? edge.target : edge.target === node.id ? edge.source : null
-      if (candidateId && byId.get(candidateId)?.level === nextLevel
-          && !withParent.has(candidateId) && !rootIds.has(candidateId)) linkedIds.add(candidateId)
+      const candidateId = edge.source === node.id
+        ? edge.target
+        : edge.target === node.id
+          ? edge.source
+          : null
+      if (candidateId && byId.get(candidateId)?.level === nextLevel) linkedIds.add(candidateId)
     })
-    const childIds = directChildren.length > 0
-      ? [...directChildren.map(c => c.id), ...linkedIds]
-      : linkedIds.size > 0
-        ? [...linkedIds]
-        : nodes.filter(candidate => candidate.level === nextLevel && !withParent.has(candidate.id) && !rootIds.has(candidate.id)).map(candidate => candidate.id)
+
+    // RCC 图可能存在未连线的角色，仍让它进入下一层，避免点击后没有层级反馈。
+    const childIds = linkedIds.size > 0
+      ? [...linkedIds]
+      : nodes.filter(candidate => candidate.level === nextLevel).map(candidate => candidate.id)
 
     return {
       ...node,
-      children: [...new Set(childIds)]
+      children: childIds
         .map(childId => byId.get(childId))
         .filter((child): child is BubbleNode => Boolean(child))
-        .map(child => buildNode(child, nextVisited)),
+        .map(buildNode),
     }
   }
 
-  return roots.map(node => buildNode(node, new Set()))
+  return {
+    id: ROOT_ID,
+    name: 'RCC 组织决策中心',
+    level: firstLevel - 1,
+    scope: '按组织层级逐层查看 RCC 资源协同关系',
+    health: 'normal',
+    load: 0,
+    violations: [],
+    key_outputs: {},
+    param_count: 0,
+    capability_count: 0,
+    children: nodes
+      .filter(node => node.level === firstLevel)
+      .map(buildNode),
+  }
 }
 
 function Bubble({ node, size, onClick }: { node: BubbleNode; size: number; onClick: () => void }) {
@@ -203,7 +210,7 @@ function Bubble({ node, size, onClick }: { node: BubbleNode; size: number; onCli
 }
 
 export default function RCCOrgBubbles({ factoryId = 'FAC_ELEC_DEMO_2026' }: RCCOrgBubblesProps) {
-  const [tree, setTree] = useState<BubbleNode[]>([])
+  const [tree, setTree] = useState<BubbleNode | null>(null)
   const [edges, setEdges] = useState<BubbleEdge[]>([])
   const [meta, setMeta] = useState<{ total_nodes: number; total_edges: number } | null>(null)
   const [path, setPath] = useState<BubbleNode[]>([])
@@ -215,14 +222,14 @@ export default function RCCOrgBubbles({ factoryId = 'FAC_ELEC_DEMO_2026' }: RCCO
     setError(null)
     try {
       const response = await axios.get(`${API_BASE}/org-bubbles`, { params: { factory_id: factoryId } })
-      const data = response as any
+      const data = response.data
       const rawNodes: BubbleNode[] = (data.nodes || []).map((node: Omit<BubbleNode, 'children'>) => ({
         ...node,
         children: [],
       }))
 
       if (!data.success || rawNodes.length === 0) {
-        setTree([])
+        setTree(null)
         setEdges([])
         setMeta(null)
         setError('RCC气泡数据返回为空')
@@ -234,7 +241,7 @@ export default function RCCOrgBubbles({ factoryId = 'FAC_ELEC_DEMO_2026' }: RCCO
         setPath([])
       }
     } catch (requestError: any) {
-      setTree([])
+      setTree(null)
       setEdges([])
       setMeta(null)
       setError(requestError?.response?.data?.detail || requestError?.message || 'RCC气泡数据加载失败')
@@ -245,12 +252,11 @@ export default function RCCOrgBubbles({ factoryId = 'FAC_ELEC_DEMO_2026' }: RCCO
 
   useEffect(() => { fetchData() }, [fetchData])
 
-  // 当前层：drill 路径最后节点 或 顶层（tree 数组，无 L0 虚拟根）
-  const currentNode = path[path.length - 1] || null
-  const children = currentNode ? (currentNode.children || []) : tree
+  const currentNode = path[path.length - 1] || tree
+  const children = currentNode?.children || []
   const childIds = useMemo(() => new Set(children.map(child => child.id)), [children])
   const currentEdges = useMemo(() => {
-    if (!currentNode) return []  // 顶层：直接展示全部节点，无单一中心协同链
+    if (!currentNode || currentNode.id === ROOT_ID) return []
     return edges.filter(edge => {
       const connected = edge.source === currentNode.id || edge.target === currentNode.id
       const childId = edge.source === currentNode.id ? edge.target : edge.source
@@ -366,9 +372,11 @@ export default function RCCOrgBubbles({ factoryId = 'FAC_ELEC_DEMO_2026' }: RCCO
               <ThunderboltOutlined style={{ color: COLORS.warning, marginRight: 4 }} />{currentEdges.length} 条直接协同链
             </span>
           )}
-          <span style={{ color: COLORS.textMuted, fontSize: 12, marginLeft: 'auto' }}>
-            <ApiOutlined style={{ marginRight: 4, color: COLORS.accentBlue }} />{currentNode.scope}
-          </span>
+          {currentNode.id !== ROOT_ID && (
+            <span style={{ color: COLORS.textMuted, fontSize: 12, marginLeft: 'auto' }}>
+              <ApiOutlined style={{ marginRight: 4, color: COLORS.accentBlue }} />{currentNode.scope}
+            </span>
+          )}
         </div>
       )}
 

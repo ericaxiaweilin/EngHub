@@ -721,12 +721,14 @@ def get_menu_items_for_user(user) -> list:
 
     # ━━━ 7. 协同 ━━━
     collab_children = []
+    collab_children.append({"key": "/rcc", "label": "RCC指挥中心"})
     collab_children.append({"key": "/quick-request", "label": "快速工单"})
-    collab_children.append({"key": "/work-order-templates", "label": "标准工单模板"})
     if "tms" in modules_with_access:
-        # 审批中心/分发看板已下线，TMS 能力统一由 Agent 控制台承载
+        collab_children.append({"key": "/tms/approval", "label": "审批中心"})
+        collab_children.append({"key": "/tms/distribution", "label": "分发看板"})
         collab_children.append({"key": "/tms/agent", "label": "Agent控制台"})
-    # 我的任务已拆分至 RCC 任务中心（/task-center），协同组不再重复挂载
+    collab_children.append({"key": "/my-tasks", "label": "我的任务"})
+    collab_children.append({"key": "/task-center", "label": "任务中心"})
     if is_admin or "tms" in modules_with_access:
         collab_children.append({"key": "/agent-supervisor", "label": "智能体监督"})
     if is_admin:
@@ -735,13 +737,6 @@ def get_menu_items_for_user(user) -> list:
         collab_children.append({"key": "/alert-intelligence", "label": "预警情报"})
     if collab_children:
         items.append({"key": "g-collab", "label": "协同", "children": collab_children})
-
-    # ━━━ 7.5 RCC 调度（资源调度中心 + 全厂任务中心 = 调度执行视图）━━━
-    rcc_children = []
-    rcc_children.append({"key": "/rcc", "label": "RCC指挥中心"})
-    rcc_children.append({"key": "/task-center", "label": "任务中心"})
-    if rcc_children:
-        items.append({"key": "g-rcc", "label": "RCC调度", "children": rcc_children})
 
     # ━━━ 8. 仿真引擎 ━━━
     if "simulation" in modules_with_access:

@@ -22,7 +22,7 @@
     "g-hr": "Nhân sự",
     "/skill-matrix": "Ma trận kỹ năng nhân viên",
     "/simulation": "Công cụ mô phỏng",
-    "g-tms": "Trung tâm nhiệm vụ RCC",
+    "g-tms": "Quản lý nhiệm vụ TMS",
     "/tms/approval": "Trung tâm phê duyệt",
     "/tms/distribution": "Bảng phân phối",
     "/tms/agent": "Bảng điều khiển Agent",
@@ -67,6 +67,5 @@
     "pwdMismatch": "Hai mật khẩu không khớp",
     "pwdSuccess": "Đổi mật khẩu thành công. Vui lòng dùng mật khẩu mới ở lần đăng nhập sau",
     "pwdFail": "Thay đổi thất bại"
-  },
-  "搜索订单号/客户/产品": "Tìm đơn hàng / khách hàng / sản phẩm"
+  }
 }

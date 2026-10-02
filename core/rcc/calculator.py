@@ -378,12 +378,11 @@ class RCCResourceCalculator:
         }
 
         try:
-            # 工单状态分布（排除已取消/已关闭，与 total_work_orders、优先级、
-            # 急单口径保持一致——否则基线总数会比可调度工单多，审查报漂移）
+            # 工单状态分布
             wo_status_rows = await self.db.execute(sql_text("""
                 SELECT status, COUNT(*)::int AS cnt
                 FROM work_orders
-                WHERE factory_id = :fid AND status NOT IN ('cancelled', 'closed')
+                WHERE factory_id = :fid
                 GROUP BY status
                 ORDER BY cnt DESC
             """), {"fid": factory_id})

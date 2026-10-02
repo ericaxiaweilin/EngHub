@@ -11,7 +11,6 @@ RCC资源决策引擎 — 基于基线数据生成资源调度决策
 - process_response: 工艺参数偏离时的决策
 """
 
-import json
 import uuid
 from datetime import datetime, timezone, date, timedelta
 from typing import Optional, List, Dict, Any
@@ -75,7 +74,7 @@ class RCCResourceDecisionEngine:
                 WHERE factory_id = :fid AND position IN ('操作员','组长','技术员')
                   AND department NOT IN ('HR部','行政部','财务部','品质部')
                 GROUP BY station
-                ORDER BY (COUNT(*) FILTER (WHERE status='active'))::float / NULLIF(COUNT(*), 0) ASC
+                ORDER BY active_in_station::float / NULLIF(total_in_station, 0) ASC
             """), {"fid": factory_id})
             
             stations = []
@@ -85,12 +84,9 @@ class RCCResourceDecisionEngine:
                 leave = r["on_leave"]
                 if total > 0:
                     utilization = round(active / total * 100, 1)
-                    # 缺勤率分级：≥10% critical / ≥5% warning（喷涂等关键工位 11% 缺勤=重大产能风险）
-                    leave_rate = round(leave / total * 100, 1)
-                    alert_level = "critical" if leave_rate >= 10 else "warning" if leave_rate >= 5 else "normal"
+                    alert_level = "critical" if utilization < 50 else "warning" if utilization < 75 else "normal"
                 else:
                     utilization = 0
-                    leave_rate = 100.0
                     alert_level = "critical"
                 
                 stations.append({
@@ -103,90 +99,11 @@ class RCCResourceDecisionEngine:
                     "night_shift_count": r["night_shift_count"],
                     "two_shifts_count": r["two_shifts_count"],
                     "utilization_pct": utilization,
-                    "leave_rate_pct": leave_rate,
                     "alert_level": alert_level,
-                    "needs_more_workers": active == 0 or leave_rate >= 5,
+                    "needs_more_workers": active == 0 or utilization < 50,
                 })
             
             result["station_assignments"] = stations
-
-            # 关联在制工单：缺勤率≥5% 的工位 → 列出受影响工单（交期风险）
-            affected_work_orders = []
-            for station in stations:
-                if station["leave_rate_pct"] >= 5:
-                    wo_rows = await self.db.execute(sql_text("""
-                        SELECT work_order_code, status, priority, planned_qty,
-                               planned_start, planned_due, process_code
-                        FROM work_orders
-                        WHERE factory_id = :fid AND status IN ('in_progress','pending')
-                          AND (process_code ILIKE '%' || :st || '%' OR remark ILIKE '%' || :st || '%'
-                               OR remark ILIKE '%喷涂%' OR product_id ILIKE '%' || :st || '%'
-                               OR (CASE WHEN :st = '涂装' THEN remark ILIKE '%喷涂%' ELSE false END))
-                        ORDER BY (priority='urgent') DESC, planned_due ASC
-                        LIMIT 6
-                    """), {"fid": factory_id, "st": station["station"]})
-                    for w in wo_rows.mappings().all():
-                        affected_work_orders.append({
-                            "station": station["station"],
-                            "leave_rate_pct": station["leave_rate_pct"],
-                            "work_order_code": w["work_order_code"],
-                            "status": w["status"],
-                            "priority": w["priority"],
-                            "planned_qty": w["planned_qty"],
-                            "planned_due": str(w["planned_due"] or "")[:10],
-                            "risk": "交期风险" if w["priority"] == "urgent" else "关注",
-                        })
-            result["affected_work_orders"] = affected_work_orders
-
-            # 缺勤率≥10%（critical）→ 自动生成 RCC 调度任务（人力借调申请），数字员工闭环
-            for station in stations:
-                if station["leave_rate_pct"] >= 10:
-                    # 查是否已有该工位的人力调度申请（幂等）
-                    exists = await self.db.execute(sql_text("""
-                        SELECT 1 FROM rcc_tasks
-                        WHERE task_type = 'manpower'
-                          AND title ILIKE '%' || :st || '%缺勤%'
-                          AND status IN ('pending','approved','executing')
-                        LIMIT 1
-                    """), {"st": station["station"]})
-                    if not exists.mappings().first():
-                        trans = next((t for t in result["suggested_transfers"]
-                                      if t.get("to_station") == station["station"]), None)
-                        source = trans["from_station"] if trans else "其他工位"
-                        count = trans["suggested_count"] if trans else station["on_leave"]
-                        await self.db.execute(sql_text("""
-                            INSERT INTO rcc_tasks
-                              (id, task_code, org_unit_id, factory_id, task_type, title, description,
-                               status, requested_by, expected_impact_summary, request_context, created_at, updated_at)
-                            VALUES
-                              (gen_random_uuid()::text,
-                               'RCC-' || upper(substr(md5(random()::text), 1, 8)),
-                               :org_id, :fid, 'manpower', :title, :desc,
-                               'pending', 'RCCResourceDecisionEngine',
-                               :impact,
-                               CAST(:ctx AS jsonb),
-                               NOW(), NOW())
-                        """), {
-                            "org_id": "fb8337eb-c1d3-58af-842f-cf56d29e3f98",
-                            "fid": factory_id,
-                            "title": f"[人力调度] {station['station']} 缺勤 {station['leave_rate_pct']}%（{station['on_leave']}人请假），需借调支援",
-                            "desc": f"{station['station']} 工位缺勤率 {station['leave_rate_pct']}% 大于等于 10%，"
-                                    f"影响喷涂工单（WO-VF-0809-E987C urgent 等），需从 {source} 借调 {count} 人。",
-                            "impact": f"从 {source} 借调 {count} 人支援，避免喷涂工单交期风险",
-                            "ctx": json.dumps({
-                                "source": "people-assignment",
-                                "station": station["station"],
-                                "leave_rate": station["leave_rate_pct"],
-                                "suggested_transfer": source,
-                                "suggested_count": count,
-                            }, ensure_ascii=False),
-                        })
-                        await self.db.commit()
-                        result["created_rcc_task"] = {
-                            "station": station["station"],
-                            "title": f"[人力调度] {station['station']} 缺勤 {station['leave_rate_pct']}%",
-                            "transfer": f"{source} → {station['station']} × {count}人",
-                        }
 
             # 找出低出勤率的工位，建议从其他工位调剂
             for station in stations:
@@ -195,18 +112,18 @@ class RCCResourceDecisionEngine:
                     potential_sources = [
                         s for s in stations
                         if s["station"] != station["station"]
-                        and s["leave_rate_pct"] <= 3
+                        and s["utilization_pct"] > 90
                         and s["active_in_station"] > 2
                     ]
                     
                     if potential_sources:
-                        source = potential_sources[0]  # 取缺勤最低的
+                        source = potential_sources[0]  # 取最饱和的
                         result["suggested_transfers"].append({
                             "from_station": source["station"],
                             "to_station": station["station"],
-                            "reason": f"{station['station']} 缺勤率{station['leave_rate_pct']}%≥5%（{station['on_leave']}人请假），需借调支援",
+                            "reason": f"{station['station']} 在岗率{station['utilization_pct']}%低于50%",
                             "source_station_utilization": source["utilization_pct"],
-                            "suggested_count": min(max(1, station["on_leave"]), 5),
+                            "suggested_count": max(1, (source["active_in_station"] - 2) // 2),
                             "action": "borrow_worker"
                         })
 

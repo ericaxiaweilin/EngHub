@@ -2,9 +2,6 @@
 Database Configuration and Session Management
 数据库配置和会话管理模块
 """
-import json as _json
-from decimal import Decimal
-from datetime import date as _date, datetime as _datetime
 from pathlib import Path
 import os
 from typing import AsyncGenerator
@@ -17,16 +14,6 @@ from sqlalchemy.ext.asyncio import (
 )
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
-
-def _json_default(obj):
-    """JSONB 写入兼容：Decimal→float、日期→ISO 字符串，其余 str 兜底。
-    修复成本回填后 chat_messages.tool_results 等 JSONB 字段 Decimal 序列化 500。"""
-    if isinstance(obj, Decimal):
-        return float(obj)
-    if isinstance(obj, (_datetime, _date)):
-        return obj.isoformat()
-    return str(obj)
 
 
 def _normalize_database_url(raw_url: str) -> str:
@@ -64,7 +51,6 @@ class DatabaseConfig:
         if self._engine is None:
             engine_kwargs = {
                 "echo": self.echo,
-                "json_serializer": lambda o: _json.dumps(o, default=_json_default, ensure_ascii=False),
             }
             if not self.database_url.startswith("sqlite"):
                 engine_kwargs.update(

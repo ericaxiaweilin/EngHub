@@ -11,14 +11,14 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from core.auth.security import enforce_tenant, get_current_user, require_permission
+from core.auth.security import get_current_user, require_permission
 from database.models import (
     User, ApsSchedule, ApsScheduleTask, ApsWorkCalendar, ApsHoliday,
     ApsCoordinationMeeting, ApsPlannerActivity, ApsPlanEvent,
 )
 from api.services.aps_service import ApsService
 
-router = APIRouter(prefix="/api/v1/aps", tags=["aps"], dependencies=[Depends(enforce_tenant)])
+router = APIRouter(prefix="/api/v1/aps", tags=["aps"])
 
 
 # ============== Request Schemas ==============

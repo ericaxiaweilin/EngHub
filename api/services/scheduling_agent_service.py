@@ -485,7 +485,6 @@ class SchedulingAgent:
             result = await supervisor.start_task(
                 factory_id=factory_id,
                 agent_key=self.AGENT_KEY,
-                agent_name=self.AGENT_NAME,
                 task_type=task_type,
                 task_desc=desc,
                 total_steps=3,

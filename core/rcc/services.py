@@ -65,7 +65,7 @@ class RCCTaskService:
         
         task.status = "approved"
         task.approved_by = approver_id
-        task.approved_at = datetime.utcnow()
+        task.approved_at = datetime.now(timezone.utc)
         
         # 创建审批记录
         record = RccApprovalRecord(
@@ -78,216 +78,6 @@ class RCCTaskService:
         
         await self.db.commit()
         await self.db.refresh(task)
-
-        # ── RCC 审批 → 回写任务中心：批准后解除关联 followup 任务阻塞，触发重新跟进 ──
-        try:
-            from sqlalchemy import text as _rt
-            ctx = task.request_context or {}
-            ftid = ctx.get("followup_task_id") if isinstance(ctx, dict) else None
-            if ftid:
-                await self.db.execute(_rt(
-                    "UPDATE followup_tasks SET status='open', progress_pct=LEAST(progress_pct + 10, 90), "
-                    "blocked_by=NULL, block_category=NULL, next_follow_at=NOW(), "
-                    "last_follow_note=COALESCE(last_follow_note || '；', '') || :note, updated_at=NOW() "
-                    "WHERE id = :tid AND status = 'blocked'"
-                ), {"tid": str(ftid), "note": f"RCC 调度审批通过（{approver_id}），已解除阻塞重新跟进"})
-                await self.db.commit()
-        except Exception:
-            pass
-
-        # ── AI→审批→执行 闭环：审批通过后按 affected_params.action 执行原决策 ──
-        try:
-            import json as _json
-            ap = getattr(task, "affected_params", None) or {}
-            if isinstance(ap, str):
-                ap = _json.loads(ap)
-            action = ap.get("action", "") if isinstance(ap, dict) else ""
-            target = ap.get("target", "") if isinstance(ap, dict) else ""
-            params = ap.get("params", {}) if isinstance(ap, dict) else {}
-            if not action:
-                # 无执行动作的任务（如 followup 升级审批）：审批即终态，
-                # 直接置 completed，避免永久卡在 approved（实测 23 单堆积）。
-                task.status = "completed"
-                task.completed_at = datetime.utcnow()
-                await self.db.commit()
-                return task
-            if action:
-                from sqlalchemy import text as _tex
-                executed = False
-                if action == "expedite" and target:
-                    # 加急：目标工单优先级提到 urgent + 记事件
-                    wo = await self.db.execute(_tex(
-                        "SELECT id, work_order_code FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
-                    ), {"t": target})
-                    wo_row = wo.mappings().first()
-                    if wo_row:
-                        await self.db.execute(_tex(
-                            "UPDATE work_orders SET priority='urgent', updated_at=NOW() WHERE id=:id"
-                        ), {"id": wo_row["id"]})
-                        executed = True
-                elif action == "change_priority" and target:
-                    prio = params.get("priority", "urgent") if isinstance(params, dict) else "urgent"
-                    wo = await self.db.execute(_tex(
-                        "SELECT id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
-                    ), {"t": target})
-                    wo_row = wo.mappings().first()
-                    if wo_row:
-                        await self.db.execute(_tex(
-                            "UPDATE work_orders SET priority=:p, updated_at=NOW() WHERE id=:id"
-                        ), {"p": prio, "id": wo_row["id"]})
-                        executed = True
-                elif action == "rush_insert" and target:
-                    # 插单：目标工单提为 urgent 并释放到产线（pending→released）
-                    wo_row = (await self.db.execute(_tex(
-                        "SELECT id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
-                    ), {"t": target})).mappings().first()
-                    if wo_row:
-                        await self.db.execute(_tex(
-                            "UPDATE work_orders SET priority='urgent', "
-                            "status=CASE WHEN status='pending' THEN 'released' ELSE status END, "
-                            "updated_at=NOW() WHERE id=:id"
-                        ), {"id": wo_row["id"]})
-                        executed = True
-                elif action == "reschedule" and target:
-                    # 改期：更新目标工单交期（params 支持 new_due/planned_due/due）
-                    _new_due = None
-                    if isinstance(params, dict):
-                        _new_due = params.get("new_due") or params.get("planned_due") or params.get("due")
-                    wo_row = (await self.db.execute(_tex(
-                        "SELECT id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
-                    ), {"t": target})).mappings().first()
-                    if wo_row and _new_due:
-                        # asyncpg 拒收字符串日期参数，必须先解析为 date（实测 str 报 DataError）
-                        from datetime import date as _date_t
-                        try:
-                            _d = _date_t.fromisoformat(str(_new_due)[:10])
-                        except ValueError:
-                            _d = None
-                        if _d:
-                            await self.db.execute(_tex(
-                                "UPDATE work_orders SET planned_due=:d, updated_at=NOW() WHERE id=:id"
-                            ), {"d": _d, "id": wo_row["id"]})
-                            executed = True
-                elif action == "cancel_order" and target:
-                    # 撤单：优先撤采购订单，无则撤工单（已到终态的单据不动）
-                    po_row = (await self.db.execute(_tex(
-                        "SELECT id FROM purchase_orders WHERE (id=:t OR po_code=:t) "
-                        "AND status NOT IN ('received','completed','cancelled') LIMIT 1"
-                    ), {"t": target})).mappings().first()
-                    if po_row:
-                        await self.db.execute(_tex(
-                            "UPDATE purchase_orders SET status='cancelled', updated_at=NOW() WHERE id=:id"
-                        ), {"id": po_row["id"]})
-                        executed = True
-                    else:
-                        wo_row = (await self.db.execute(_tex(
-                            "SELECT id FROM work_orders WHERE (id=:t OR work_order_code=:t) "
-                            "AND status NOT IN ('completed','cancelled') LIMIT 1"
-                        ), {"t": target})).mappings().first()
-                        if wo_row:
-                            await self.db.execute(_tex(
-                                "UPDATE work_orders SET status='cancelled', updated_at=NOW() WHERE id=:id"
-                            ), {"id": wo_row["id"]})
-                            executed = True
-                elif action == "place_order" and target:
-                    # 下单：PR → 定供应商 → 创建 PO（复用采购工具同构字段）
-                    pr_row = (await self.db.execute(_tex(
-                        "SELECT id, factory_id, material_code, material_name, qty, supplier_id "
-                        "FROM purchase_requisitions WHERE (id=:t OR pr_code=:t) "
-                        "AND status IN ('pending','assigned') LIMIT 1"
-                    ), {"t": target})).mappings().first()
-                    if pr_row:
-                        sup_id = (params.get("supplier_id") if isinstance(params, dict) else None) or pr_row["supplier_id"]
-                        if not sup_id:
-                            _sup = (await self.db.execute(_tex(
-                                "SELECT id FROM suppliers WHERE is_active=TRUE ORDER BY rating DESC NULLS LAST LIMIT 1"
-                            ))).mappings().first()
-                            sup_id = _sup["id"] if _sup else None
-                        if sup_id:
-                            sup_row = (await self.db.execute(_tex(
-                                "SELECT supplier_name FROM suppliers WHERE id=:s"
-                            ), {"s": sup_id})).mappings().first()
-                            import uuid as _u2
-                            _po_code = f"PO-{pr_row['material_code']}-{_u2.uuid4().hex[:6].upper()}"
-                            await self.db.execute(_tex(
-                                "INSERT INTO purchase_orders (id, factory_id, po_code, pr_id, supplier_id, supplier_name, "
-                                "material_code, material_name, qty, order_date, expected_date, status, auto_generated, created_at, updated_at) "
-                                "VALUES (gen_random_uuid()::text, :f, :po, :pr, :s, :sn, :m, :mn, :q, "
-                                "CURRENT_DATE, CURRENT_DATE + 7, 'ordered', TRUE, NOW(), NOW())"
-                            ), {"f": pr_row["factory_id"], "po": _po_code, "pr": pr_row["id"],
-                                "s": sup_id, "sn": (sup_row["supplier_name"] if sup_row else ""),
-                                "m": pr_row["material_code"],
-                                "mn": pr_row["material_name"] or pr_row["material_code"],
-                                "q": pr_row["qty"]})
-                            await self.db.execute(_tex(
-                                "UPDATE purchase_requisitions SET status='converted', supplier_id=:s, "
-                                "purchase_code=:pc, updated_at=NOW() WHERE id=:id"
-                            ), {"s": sup_id, "pc": _po_code, "id": pr_row["id"]})
-                            executed = True
-                elif action == "reject_order" and target:
-                    # 拒单：取消采购订单并释放关联 PR 回待指派（可重新选供应商）
-                    po_row = (await self.db.execute(_tex(
-                        "SELECT id, pr_id FROM purchase_orders WHERE (id=:t OR po_code=:t) "
-                        "AND status IN ('ordered','partial','pending') LIMIT 1"
-                    ), {"t": target})).mappings().first()
-                    if po_row:
-                        await self.db.execute(_tex(
-                            "UPDATE purchase_orders SET status='cancelled', updated_at=NOW() WHERE id=:id"
-                        ), {"id": po_row["id"]})
-                        if po_row["pr_id"]:
-                            await self.db.execute(_tex(
-                                "UPDATE purchase_requisitions SET status='pending', supplier_id=NULL, "
-                                "updated_at=NOW() WHERE id=:id AND status='converted'"
-                            ), {"id": po_row["pr_id"]})
-                        executed = True
-                # 审计事件
-                # 工厂推导：优先任务自身 factory_id，其次目标工单，最后默认机械厂
-                fid = getattr(task, "factory_id", None)
-                if not fid and target:
-                    _r = await self.db.execute(_tex(
-                        "SELECT factory_id FROM work_orders WHERE id=:t OR work_order_code=:t LIMIT 1"
-                    ), {"t": target})
-                    fid = _r.scalar_one_or_none()
-                if not fid:
-                    fid = "FAC_MECH_001"
-                await self.db.execute(_tex("""
-                    INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
-                    VALUES (gen_random_uuid()::text, :f,
-                            'rcc_task_executed', 'rcc_approval',
-                            CAST(:d AS jsonb), NOW())
-                """), {"f": fid,
-                       "d": _json.dumps({"task_code": getattr(task, "task_code", ""),
-                                         "action": action, "target": target,
-                                         "executed": executed, "approver": approver_id},
-                                        ensure_ascii=False)})
-                if executed:
-                    task.status = "executed"
-                    task.executed_at = datetime.utcnow()
-                await self.db.commit()  # 执行器落库（工单优先级 + 任务状态 + 审计）
-                # 决策效果回评估：执行成功即注册追踪（锁定预期+T0基线，并预警下游部门）
-                # 上游决策必然波及下游——执行不再是黑盒，效果持续度量直至定论
-                if executed:
-                    try:
-                        from api.services.decision_evaluation_service import register_decision
-                        # 必须先 refresh：执行器 commit 后 ORM 属性已过期，
-                        # 同步访问会触发惰性 IO 报 greenlet_spawn 错误
-                        await self.db.refresh(task)
-                        await register_decision(self.db, task)
-                        # register 内部 commit 会使属性再次过期，路由返回前再刷新一次
-                        await self.db.refresh(task)
-                    except Exception as _re:
-                        import logging as _lg2
-                        _lg2.getLogger("rcc").warning(f"[approve_task] 决策评估注册失败(不阻塞): {_re}")
-        except Exception as _ee:
-            # 执行失败不阻塞审批主流程，但必须留痕+回滚，否则卡单无从排查
-            # （实测：reschedule 传字符串日期被 asyncpg 拒收，静默吞掉卡 approved）
-            import logging as _lg
-            _lg.getLogger("rcc").warning(
-                f"[approve_task] action={action} target={target} 执行失败: {_ee}")
-            try:
-                await self.db.rollback()
-            except Exception:
-                pass
         return task
     
     async def reject_task(self, task_id: str, approver_id: str, reason: str) -> Any:
@@ -301,7 +91,6 @@ class RCCTaskService:
         task.status = "rejected"
         task.rejected_by = approver_id
         task.rejection_reason = reason
-        # naive UTC（表列无时区）
         
         record = RccApprovalRecord(
             rcc_task_id=task.id,
@@ -319,21 +108,17 @@ class RCCTaskService:
         self,
         status: Optional[str] = None,
         org_unit_id: Optional[str] = None,
-        factory_id: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> List[Any]:
-        """查询 RCC 任务列表（factory_id 过滤时兼容旧数据：含 factory_id 为空的任务）"""
+        """查询 RCC 任务列表"""
         from core.rcc.models import RCCTask
-        from sqlalchemy import or_
         
         query = select(RCCTask)
         if status:
             query = query.where(RCCTask.status == status)
         if org_unit_id:
             query = query.where(RCCTask.org_unit_id == org_unit_id)
-        if factory_id:
-            query = query.where(or_(RCCTask.factory_id == factory_id, RCCTask.factory_id.is_(None)))
         query = query.order_by(RCCTask.created_at.desc()).offset((page-1)*page_size).limit(page_size)
         
         return list((await self.db.execute(query)).scalars().all())
@@ -433,33 +218,10 @@ class ParamAdjustmentService:
         return param
     
     async def _sync_to_rcc_baseline(self, param: Any, old_value: str, new_value: str, reason: str):
-        """同步参数到RCC基线：参数生效时间前移 + 审计事件落 agent_events（可经事件回放追溯）。
-
-        基线本身由 RCCResourceCalculator 从业务表实时计算，无需快照回写；
-        此方法确保参数变更"生效可追溯"：effective_from 标记生效时点，
-        rcc_param_synced 事件供监督引擎/调度日志消费。
-        """
-        import json as _json
-        from sqlalchemy import text as _tex
-
-        # 生效时点前移到当前（参数新值即刻生效）
-        param.effective_from = datetime.utcnow()
-
-        # 工厂推导：param_code 前缀为 factory_id（如 FAC_MECH_001_monthly_container_capacity）
-        code = param.param_code or ""
-        r = await self.db.execute(_tex("SELECT id FROM factories WHERE :c LIKE id || '%' LIMIT 1"), {"c": code})
-        factory_id = r.scalar_one_or_none() or "FAC_MECH_001"
-
-        # 审计事件：与 rcc_task_executed 同表同模式，保证调度日志可回放
-        await self.db.execute(_tex("""
-            INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
-            VALUES (gen_random_uuid()::text, :f, 'rcc_param_synced', 'rcc_baseline',
-                    CAST(:d AS jsonb), NOW())
-        """), {"f": factory_id,
-               "d": _json.dumps({"param_code": code,
-                                 "category": param.category,
-                                 "from_value": old_value, "to_value": new_value,
-                                 "reason": reason or ""}, ensure_ascii=False)})
+        """同步参数到RCC基线"""
+        # 这里只是占位逻辑，实际应该更新RCC的resource_pool或capacity_model
+        # 完整实现需要考虑资源池的一致性
+        pass
     
     async def list_params(
         self,
@@ -663,36 +425,29 @@ class ChatbotTicketService:
         requested_resource: Optional[Dict[str, Any]] = None,
         requested_time_window: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """创建Chatbot工单（raw SQL 插入，绕开 org_units 模型缺失的 FK 解析 bug：
-        requester_org_unit 的 ForeignKey 指向 org_units.id，但 database.models 未定义 OrgUnit
-        模型 → ORM flush 报 PendingRollbackError。requester_org_unit 非必填，置空。）"""
-        from sqlalchemy import text as _text
-        import json as _json
-
-        ticket_id = str(uuid.uuid4())
+        """创建Chatbot工单"""
+        from core.rcc.models import ChatbotTicket
+        
         ticket_code = f"CBT-{requester_id[:6].upper()}-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
-
-        await self.db.execute(_text(
-            "INSERT INTO chatbot_tickets (id, ticket_code, requester_id, requester_org_unit, ticket_type, "
-            "raw_message, parsed_intents, parsed_slots, requested_resource, requested_time_window, "
-            "related_param_id, related_rcc_task_id, related_work_order_id, status, priority, created_at, updated_at) "
-            "VALUES (:id, :tc, :rq, NULL, :tt, :msg, CAST(:pi AS jsonb), CAST(:ps AS jsonb), "
-            "CAST(:rr AS jsonb), CAST(:tw AS jsonb), "
-            ":rp, :rt, :wo, 'open', 'medium', NOW(), NOW())"
-        ), {
-            "id": ticket_id, "tc": ticket_code, "rq": requester_id, "tt": ticket_type,
-            "msg": message,
-            "pi": _json.dumps(parsed_intents or {}, ensure_ascii=False),
-            "ps": _json.dumps(parsed_slots or {}, ensure_ascii=False),
-            "rr": _json.dumps(requested_resource or {}, ensure_ascii=False),
-            "tw": _json.dumps(requested_time_window or {}, ensure_ascii=False),
-            "rp": related_param_id, "rt": related_rcc_task_id, "wo": related_work_order_id,
-        })
+        
+        ticket = ChatbotTicket(
+            ticket_code=ticket_code,
+            requester_id=requester_id,
+            ticket_type=ticket_type,
+            raw_message=message,
+            parsed_intents=parsed_intents or {},
+            parsed_slots=parsed_slots or {},
+            related_param_id=related_param_id,
+            related_rcc_task_id=related_rcc_task_id,
+            related_work_order_id=related_work_order_id,
+            requested_resource=requested_resource or {},
+            requested_time_window=requested_time_window or {},
+            status="open",
+        )
+        
+        self.db.add(ticket)
         await self.db.commit()
-
-        # 返回轻量对象
-        from types import SimpleNamespace
-        ticket = SimpleNamespace(id=ticket_id, ticket_code=ticket_code, status="open")
+        await self.db.refresh(ticket)
         return ticket
     
     async def route_ticket(self, ticket_id: str, target_org_unit: str, target_position: str) -> Any:
@@ -715,7 +470,7 @@ class ChatbotTicketService:
         ticket.status = "resolved"
         ticket.resolved_by = resolved_by
         ticket.resolution = resolution
-        ticket.resolved_at = datetime.utcnow()
+        ticket.resolved_at = datetime.now(timezone.utc)
         await self.db.commit()
         await self.db.refresh(ticket)
         return ticket

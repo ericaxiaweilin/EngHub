@@ -57,6 +57,9 @@ rollback() {
   # 2. 回滚数据库（从 pg_dump 恢复）
   if [[ -n "$DB_BACKUP_FILE" ]]; then
     info "恢复数据库: $DB_BACKUP_FILE"
+    # 先停应用释放连接和空闲事务，否则 DROP SCHEMA 可能被验证请求锁住，
+    # 回滚会一直等待，反而扩大故障窗口。
+    ssh "$DEPLOY_HOST" "docker stop '$CONTAINER' >/dev/null 2>&1 || true"
     ssh "$DEPLOY_HOST" "
       docker exec -i '$DB_CONTAINER' psql -U '$DB_USER' -d '$DB_NAME' -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' 2>/dev/null
       docker exec -i '$DB_CONTAINER' psql -U '$DB_USER' -d '$DB_NAME' < '$DB_BACKUP_FILE'
@@ -194,7 +197,11 @@ tar -xzf "/tmp/enghub-frontend-${SHORT}.tgz" -C "$RELEASE/frontend"
 # 同步代码到 volume 挂载目录
 echo "  同步后端代码..."
 for dir in api core database integrations scripts; do
-  [[ -d "$RELEASE/source/$dir" ]] && rsync -a --delete "$RELEASE/source/$dir/" "$REMOTE_DIR/$dir/"
+  # Do not delete server-side files that are outside the current Git release.
+  # The deployment archive is authoritative for files it contains, while
+  # preserving operator/runtime artifacts prevents a deploy from erasing
+  # unrelated server state.
+  [[ -d "$RELEASE/source/$dir" ]] && rsync -a "$RELEASE/source/$dir/" "$REMOTE_DIR/$dir/"
 done
 for file in main.py requirements.txt; do
   [[ -f "$RELEASE/source/$file" ]] && cp "$RELEASE/source/$file" "$REMOTE_DIR/$file"
@@ -211,17 +218,16 @@ chmod -R 755 "$REMOTE_DIR/api" "$REMOTE_DIR/core" "$REMOTE_DIR/database" \
   "$REMOTE_DIR/integrations" "$REMOTE_DIR/frontend_dist" 2>/dev/null || true
 chmod 644 "$REMOTE_DIR/main.py" 2>/dev/null || true
 
-# 数据库迁移（如有 .sql 文件变更，事务包裹）
-MIGRATIONS=$(cd "$RELEASE/source" && find database/migrations -name '*.sql' -newer "$REMOTE_DIR/.last_deployed_commit" 2>/dev/null || true)
-if [[ -n "$MIGRATIONS" ]]; then
-  echo "  执行数据库迁移..."
-  for sql in $MIGRATIONS; do
-    echo "    应用: $sql"
-    docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-      -c "BEGIN;" < /dev/null
-    docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-      < "$RELEASE/source/$sql"
-  done
+# 数据库迁移：必须使用 EngHub 迁移台账和 checksum，不能用文件 mtime。
+# 服务器上的 .last_deployed_commit 可能来自旧分支或孤儿提交；用它作
+# find -newer 基线会把历史 MySQL/一次性 SQL 重新执行到 PostgreSQL。
+# schema_migrate.py 会跳过已登记迁移，并在 checksum 变化时明确失败。
+if docker exec "$CONTAINER" sh -lc 'test -f /app/scripts/schema_migrate.py'; then
+  echo "  执行 EngHub 迁移台账..."
+  docker exec "$CONTAINER" python /app/scripts/schema_migrate.py
+else
+  echo "ERROR: 容器缺少 /app/scripts/schema_migrate.py，拒绝执行无台账迁移" >&2
+  exit 1
 fi
 
 # 重启容器

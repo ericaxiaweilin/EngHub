@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api/v1/search", tags=["Global Search"])
 SEARCH_MODULES = [
     {
         "source": "work_order", "label": "工单", "route": "/work-orders",
-        "select": "wo.id, wo.work_order_code, wo.factory_id, wo.status, wo.priority, wo.planned_qty, wo.completed_qty, p.product_name",
+        "select": "wo.id, wo.work_order_code, wo.status, wo.priority, wo.planned_qty, wo.completed_qty, p.product_name",
         "from": "work_orders wo LEFT JOIN products p ON CAST(wo.product_id AS TEXT) = CAST(p.id AS TEXT)",
         "fields": ["wo.work_order_code", "p.product_name", "wo.status", "wo.priority"],
     },
@@ -66,24 +66,6 @@ SEARCH_MODULES = [
         "select": "id, username, full_name, email, role",
         "from": "users",
         "fields": ["username", "full_name", "email"],
-    },
-    {
-        "source": "sales_order", "label": "销售订单", "route": "/orders",
-        "select": "so.id, so.order_code, so.factory_id, so.status, so.product_id, so.quantity, so.delivery_date, so.priority, so.customer_name, so.total_amount",
-        "from": "sales_orders so",
-        "fields": ["so.order_code", "so.customer_name", "so.customer_code", "so.product_id", "so.status"],
-    },
-    {
-        "source": "purchase_requisition", "label": "采购申请", "route": "/procurement",
-        "select": "id, pr_code, factory_id, material_code, material_name, qty, status, supplier_id, source",
-        "from": "purchase_requisitions",
-        "fields": ["pr_code", "material_code", "material_name"],
-    },
-    {
-        "source": "purchase_order", "label": "采购订单", "route": "/procurement",
-        "select": "id, po_code, factory_id, material_code, material_name, qty, status, supplier_name, order_date, expected_date",
-        "from": "purchase_orders",
-        "fields": ["po_code", "material_code", "material_name", "supplier_name"],
     },
 ]
 

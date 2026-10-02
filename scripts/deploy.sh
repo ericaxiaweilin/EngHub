@@ -92,6 +92,7 @@ else
 fi
 
 COMMIT_SHA="$(git rev-parse HEAD)"
+TREE_SHA="$(git rev-parse "${COMMIT_SHA}^{tree}")"
 SHORT_SHA="$(git rev-parse --short HEAD)"
 BASE_SHA="${DEPLOY_BASE_SHA:-$(ssh "$DEPLOY_HOST" "cat '$REMOTE_DIR/.last_deployed_commit' 2>/dev/null || true")}"
 if [[ -z "$BASE_SHA" ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
@@ -114,17 +115,18 @@ scp -q "$MANIFEST" "$DEPLOY_HOST:/tmp/enghub-manifest-${COMMIT_SHA}.txt"
 
 info "更新服务器源码和容器"
 ssh "$DEPLOY_HOST" bash -s -- \
-  "$COMMIT_SHA" "$REMOTE_DIR" "$CONTAINER" "$HEALTH_URL" \
+  "$COMMIT_SHA" "$TREE_SHA" "$REMOTE_DIR" "$CONTAINER" "$HEALTH_URL" \
   "$DB_CONTAINER" "$DB_USER" "$DB_NAME" <<'REMOTE'
 set -Eeuo pipefail
 
 COMMIT_SHA="$1"
-REMOTE_DIR="$2"
-CONTAINER="$3"
-HEALTH_URL="$4"
-DB_CONTAINER="$5"
-DB_USER="$6"
-DB_NAME="$7"
+TREE_SHA="$2"
+REMOTE_DIR="$3"
+CONTAINER="$4"
+HEALTH_URL="$5"
+DB_CONTAINER="$6"
+DB_USER="$7"
+DB_NAME="$8"
 RELEASE_DIR="/tmp/enghub-release-${COMMIT_SHA}"
 SOURCE_ARCHIVE="/tmp/enghub-source-${COMMIT_SHA}.tgz"
 FRONTEND_ARCHIVE="/tmp/enghub-frontend-${COMMIT_SHA}.tgz"
@@ -227,6 +229,7 @@ printf '\nasset='
 curl -fsS "${HEALTH_URL%/health}/" | grep -o 'index-[A-Za-z0-9_-]*\.js' | head -1
 printf '\n'
 printf '%s\n' "$COMMIT_SHA" > "$REMOTE_DIR/.last_deployed_commit"
+printf '%s\n' "$TREE_SHA" > "$REMOTE_DIR/.last_deployed_tree"
 REMOTE
 
 ok "部署完成: ${SHORT_SHA}"

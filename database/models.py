@@ -2501,6 +2501,70 @@ class ChatSession(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
+class ChatGoal(Base):
+    """Thread-level durable objective, aligned with Codex ``thread/goal``."""
+    __tablename__ = "chat_goals"
+    __table_args__ = (
+        Index("idx_chat_goals_thread_status", "session_id", "status"),
+        Index("idx_chat_goals_factory_status", "factory_id", "status"),
+        {"extend_existing": True},
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    session_id = Column(String(36), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False, unique=True)
+    factory_id = Column(String(32), nullable=False, index=True)
+    user_id = Column(String(36), nullable=False, index=True)
+    objective = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default="active", index=True)
+    token_budget = Column(Integer, nullable=True)
+    tokens_used = Column(Integer, nullable=False, default=0)
+    time_used_seconds = Column(Integer, nullable=False, default=0)
+    progress_pct = Column(Integer, nullable=False, default=0)
+    summary = Column(Text, nullable=True)
+    blocked_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    cleared_at = Column(DateTime, nullable=True)
+
+    session = relationship("ChatSession", backref="goal", uselist=False)
+
+
+class ChatGoalMetric(Base):
+    """Business metric/evidence attached to a durable thread Goal."""
+    __tablename__ = "chat_goal_metrics"
+    __table_args__ = (
+        UniqueConstraint("goal_id", "metric_code", name="uq_chat_goal_metrics_goal_code"),
+        Index("idx_chat_goal_metrics_goal_status", "goal_id", "status"),
+        Index("idx_chat_goal_metrics_checked", "last_checked_at"),
+        {"extend_existing": True},
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    goal_id = Column(String(36), ForeignKey("chat_goals.id", ondelete="CASCADE"), nullable=False, index=True)
+    metric_code = Column(String(40), nullable=False)
+    label = Column(String(120), nullable=False)
+    comparator = Column(String(8), nullable=False, default="gte")  # gte / lte / eq
+    target_value = Column(Numeric(18, 4), nullable=True)
+    unit = Column(String(32), nullable=True)
+    current_value = Column(Numeric(18, 4), nullable=True)
+    status = Column(String(20), nullable=False, default="observed")  # observed/on_track/blocked/achieved/unknown
+    source_tool = Column(String(80), nullable=True)
+    evidence = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
+    last_checked_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    goal = relationship(
+        "ChatGoal",
+        backref=backref(
+            "metrics",
+            cascade="all, delete-orphan",
+            passive_deletes=True,
+        ),
+        passive_deletes=True,
+    )
+
+
 class ChatMessage(Base):
     """Chat 消息——按会话顺序追加，供 Trace/Replay/Eval 重建执行链。"""
     __tablename__ = "chat_messages"
@@ -2519,6 +2583,27 @@ class ChatMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     session = relationship("ChatSession", backref="messages")
+
+
+class ChatEventRecord(Base):
+    """Replayable Thread/Turn/Item events emitted by the chat harness."""
+    __tablename__ = "chat_events"
+    __table_args__ = (
+        UniqueConstraint("session_id", "sequence", name="uq_chat_events_session_sequence"),
+        Index("idx_chat_events_session_sequence", "session_id", "sequence"),
+        Index("idx_chat_events_request", "request_id", "sequence"),
+        Index("idx_chat_events_type", "event_type", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    event_id = Column(String(36), nullable=False, unique=True, index=True)
+    session_id = Column(String(36), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    request_id = Column(String(64), nullable=False, index=True)
+    sequence = Column(BigInteger, nullable=False)
+    event_type = Column(String(64), nullable=False, index=True)
+    item_id = Column(String(64), nullable=True, index=True)
+    data = Column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
 class ChatMessageAttachment(Base):
@@ -2563,25 +2648,6 @@ class ChatTelemetry(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
-class ChatSessionEvent(Base):
-    """Chat 会话事件流（DSH SessionEvent 对齐）——append-only 轨迹。
-
-    一个会话维护一段连续事件流（type/seq/time/data），Trajectory 视图从
-    该事件流组装读模型（注入 / 用户消息 / 工具调用 / 回复成节点），
-    不再维护第二条独立历史源。seq 在会话内单调递增。
-    """
-    __tablename__ = "chat_session_events"
-    __table_args__ = {"extend_existing": True}
-
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    session_id = Column(String(36), ForeignKey("chat_sessions.id"), index=True)
-    request_id = Column(String(64), index=True)
-    seq = Column(Integer, nullable=False)
-    event_type = Column(String(32), nullable=False)   # context_injection/user_message/tool_call/assistant_reply
-    data = Column(JSON().with_variant(JSONB, "postgresql"), default=dict)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
 class ChatEvalCase(Base):
     """Chat 批量评估用例（Phase 6 Engineering Surface）。"""
     __tablename__ = "chat_eval_cases"
@@ -2596,42 +2662,3 @@ class ChatEvalCase(Base):
     factory_id = Column(String(32), default="F01")
     enabled = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
-class ChatMemory(Base):
-    """Chat 用户长期记忆（跨会话）：按 user_id(+factory) 维度持久事实。
-
-    由 Harness Kernel 在请求前置入 system prompt 记忆块；请求结束后
-    由规则提取器把用户明确告知的事实（如姓名/工号/偏好）写入。
-    confidence: 1=模型推断, 2=用户明确告知。
-    """
-    __tablename__ = "chat_memories"
-    __table_args__ = {"extend_existing": True}
-
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    user_id = Column(String(36), nullable=False, index=True)
-    factory_id = Column(String(32), nullable=True)
-    key = Column(String(64), nullable=False)
-    value = Column(Text, nullable=False)
-    confidence = Column(Integer, nullable=False, default=2)
-    source = Column(String(32), nullable=False, default="chat")
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-
-
-class OrgUnit(Base):
-    """组织单元（RCC 资源指挥中心等）。表已存在但模型缺失，
-    导致 core/rcc/models.py 的 FK 解析失败（NoReferencedTableError）。
-    补齐后 RCC 写操作（ORM 路径）可用。"""
-    __tablename__ = "org_units"
-    __table_args__ = {"extend_existing": True}
-
-    id = Column(String(36), primary_key=True)
-    code = Column(String(50))
-    name = Column(String(200))
-    parent_id = Column(String(36))
-    level_type = Column(String(20), default="operational")
-    factory_id = Column(String(50))
-    metadata_ = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

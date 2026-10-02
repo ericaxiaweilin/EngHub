@@ -15,7 +15,7 @@ import {
   ArrowLeftOutlined, CheckOutlined, ReloadOutlined,
   PlusOutlined, DeleteOutlined, EditOutlined, UnorderedListOutlined,
   CarryOutOutlined, InfoCircleOutlined,
-  SaveOutlined, FileExcelOutlined, SearchOutlined, IdcardOutlined,
+  SaveOutlined, FileExcelOutlined, SearchOutlined,
 } from '@ant-design/icons'
 
 // 任务中心（嵌入 chatbot 浮窗第三个 tab）
@@ -454,6 +454,7 @@ interface ChatMsg {
     role: 'user' | 'assistant'
     content: string
   }
+  status?: string
   degraded?: boolean
   actions?: ToolAction[]
   attachments?: MsgAttachment[]
@@ -478,93 +479,29 @@ interface ChatMemoryResult {
   files: ChatMemoryFile[]
 }
 
-// ---------- 长期记忆 / 个人画像（跨会话，luaguage 记忆体系 → Harness Kernel 适配） ----------
-interface MemoryFactRow {
-  key: string
-  value: string
-  confidence: number
-  source?: string
-  created_at?: string | null
-  updated_at?: string | null
+interface ChatGoal {
+  goal_id: string
+  thread_id: string
+  objective: string
+  status: 'active' | 'paused' | 'completed' | 'blocked'
+  token_budget?: number | null
+  progress_pct?: number
+  summary?: string | null
+  blocked_reason?: string | null
+  metrics?: ChatGoalMetric[]
 }
 
-interface LongTermMemory {
-  user_id?: string
-  factory_id?: string
-  profile?: {
-    identity?: Record<string, string>
-    role?: Record<string, string>
-    work?: Record<string, string>
-    preferences?: Record<string, string>
-  }
-  facts?: MemoryFactRow[]
-  injected_block?: string
-  context_pieces?: {
-    source: string
-    label: string
-    content: string
-  }[]
-}
-
-interface TrajectoryNode {
-  kind: 'context_injection' | 'user_message' | 'tool_call' | 'assistant_reply' | 'compaction'
-  seq: number
-  request_id?: string | null
-  source?: string
-  label?: string
-  content?: string
-  tool?: string
-  args?: unknown
-  result?: unknown
-  success?: boolean
-  is_write?: boolean
-  reply?: string
-  model?: string | null
-  duration_ms?: number | null
-  degraded?: boolean
-  tool_count?: number
-  compaction_id?: string
-  summary?: string
-  fold_from?: number
-  fold_to?: number
-  folded_count?: number
-  reason?: string
-  status?: string
-  source_event_seqs?: number[]
-}
-
-interface TrajectoryData {
-  session_id: string
-  title?: string | null
-  event_count: number
-  nodes: TrajectoryNode[]
-  compactions?: {
-    compaction_id?: string
-    summary?: string
-    fold_from?: number
-    fold_to?: number
-    reason?: string
-    status?: string
-    source_event_seqs?: number[]
-  }[]
-  overview?: {
-    request_id: string
-    seq_from: number
-    seq_to: number
-    injections: { source?: string; label?: string }[]
-    user_message?: string | null
-    tools: { tool?: string; label?: string; success?: boolean; is_write?: boolean }[]
-    tool_sequence?: string[]
-    tool_count: number
-    reply?: string | null
-    model?: string | null
-    duration_ms?: number | null
-    degraded?: boolean
-    compaction?: boolean
-    summary?: string
-    folded_count?: number
-    reason?: string
-  }[]
+interface ChatGoalMetric {
+  metric_id: string
+  metric_code: string
+  label: string
+  comparator: 'gte' | 'lte' | 'eq'
+  target_value?: number | null
+  unit?: string | null
+  current_value?: number | null
+  status: 'observed' | 'on_track' | 'blocked' | 'achieved' | 'unknown'
+  evidence?: { data_status?: string; data_note?: string }
+  last_checked_at?: string | null
 }
 
 // ---------- 快捷指令（后端不可用时的本地兜底） ----------
@@ -680,6 +617,7 @@ export default function AIAssistantWidget() {
   // Phase 3：新对话——清空会话并提示
   const startNewConversation = useCallback(() => {
     setSessionId(null)
+    setGoal(null)
     setMessages([])
     setInput('')
     message.info('已开启新会话（历史已自动保存）')
@@ -688,9 +626,15 @@ export default function AIAssistantWidget() {
   const [shareMessage, setShareMessage] = useState<ChatMsg | null>(null)
   const [shareTarget, setShareTarget] = useState('info')
   const [loading, setLoading] = useState(false)
+  const [activeTurn, setActiveTurn] = useState<{ sessionId: string; turnId: string } | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   // Phase 3：会话持久化——done 事件回传 session_id，下一轮带入
   const [sessionId, setSessionId] = useState<string | null>(null)
+  const [goal, setGoal] = useState<ChatGoal | null>(null)
+  const [goalModalOpen, setGoalModalOpen] = useState(false)
+  const [goalDraft, setGoalDraft] = useState('')
+  const [goalBudget, setGoalBudget] = useState<number | null>(null)
+  const [goalSaving, setGoalSaving] = useState(false)
   // 待发送附件（先调 /files/upload 拿 file_id，再随消息提交）
   const [pendingAttachments, setPendingAttachments] = useState<MsgAttachment[]>([])
   // React state 更新是异步的；用 ref 保证“上传刚完成就按 Enter”时不会丢 file_id。
@@ -704,10 +648,6 @@ export default function AIAssistantWidget() {
   const [memoryQuery, setMemoryQuery] = useState('')
   const [memoryLoading, setMemoryLoading] = useState(false)
   const [memoryResults, setMemoryResults] = useState<ChatMemoryResult>({ sessions: [], messages: [], files: [] })
-  // 长期记忆 / 个人画像：跨会话记住的事实 + 本次注入上下文
-  const [longTermOpen, setLongTermOpen] = useState(false)
-  const [longTerm, setLongTerm] = useState<LongTermMemory | null>(null)
-  const [longTermLoading, setLongTermLoading] = useState(false)
 
   const searchChatMemory = useCallback(async (query?: string) => {
     const nextQuery = (query ?? memoryQuery).trim()
@@ -734,86 +674,87 @@ export default function AIAssistantWidget() {
     void searchChatMemory(memoryQuery)
   }
 
-  // 长期记忆 / 画像：加载后端持久化的事实与画像，展示本次注入上下文
-  const loadLongTermMemory = useCallback(async () => {
-    setLongTermLoading(true)
-    try {
-      const res: any = await api.get('/api/v1/chat/memory')
-      setLongTerm(res as LongTermMemory)
-    } catch {
-      // api 拦截器已提示；保留旧数据
-    } finally {
-      setLongTermLoading(false)
-    }
-  }, [])
-
-  const openLongTermMemory = () => {
-    setLongTermOpen(true)
-    void loadLongTermMemory()
+  const openGoalEditor = () => {
+    setGoalDraft(goal?.objective || '')
+    setGoalBudget(goal?.token_budget ?? null)
+    setGoalModalOpen(true)
   }
 
-  const forgetMemoryKey = async (key: string) => {
-    try {
-      await api.delete(`/api/v1/chat/memory/${encodeURIComponent(key)}`)
-      message.success(`已遗忘「${key}」`)
-      await loadLongTermMemory()
-    } catch {
-      // 拦截器已提示
-    }
-  }
-
-  // 会话轨迹（DSH Trajectory 对齐）：按事件流展示注入/消息/工具/回复节点
-  const [trajectory, setTrajectory] = useState<TrajectoryData | null>(null)
-  const [trajectoryLoading, setTrajectoryLoading] = useState(false)
-  const [trajectoryOpen, setTrajectoryOpen] = useState(false)
-  // 账本本地 inspector：点选记录行后展开完整 payload/耗时（DSH 设计）
-  const [ledgerInspector, setLedgerInspector] = useState<TrajectoryNode | null>(null)
-
-  const loadTrajectory = useCallback(async () => {
-    if (!sessionId) {
-      message.info('当前尚无会话，先发送一条消息后即可查看轨迹')
+  const applyGoalPayload = (payload: any) => {
+    if (!payload?.goal) {
+      setGoal(null)
       return
     }
-    setTrajectoryLoading(true)
-    try {
-      const res: any = await api.get(`/api/v1/chat/trajectory/${encodeURIComponent(sessionId)}`)
-      setTrajectory(res as TrajectoryData)
-    } catch {
-      // 拦截器已提示；保留旧数据
-    } finally {
-      setTrajectoryLoading(false)
-    }
-  }, [sessionId])
-
-  const openTrajectory = () => {
-    setTrajectoryOpen(true)
-    void loadTrajectory()
+    setGoal({
+      ...payload.goal,
+      metrics: Array.isArray(payload.metrics) ? payload.metrics : (payload.goal.metrics || []),
+    })
   }
 
-  // 手动压缩（对齐 DSH /compact 人类命令）：折叠最早一段历史为摘要
-  const [compacting, setCompacting] = useState(false)
-  const handleCompactSession = async () => {
-    if (!sessionId) {
-      message.info('当前尚无会话')
+  const saveGoal = async () => {
+    const objective = goalDraft.trim()
+    if (!objective) {
+      message.warning('请先填写 Goal 目标')
       return
     }
-    setCompacting(true)
+    setGoalSaving(true)
     try {
-      const res: any = await api.post(`/api/v1/chat/compact/${encodeURIComponent(sessionId)}`)
-      if (res?.folded) {
-        message.success(`已压缩 ${res.folded_count || res.source_event_seqs?.length || ''} 个历史事件`)
-      } else if (res?.status === 'nothing_to_fold') {
-        message.info('历史已足够精简，无需压缩')
-      } else if (res?.status === 'busy') {
-        message.warning('已有压缩进行中（未闭合）')
-      } else {
-        message.info('没有可压缩的历史')
+      let activeSessionId = sessionId
+      if (!activeSessionId) {
+        const started: any = await api.post('/api/v1/chat/app-server', {
+          jsonrpc: '2.0',
+          id: createId('thread-start'),
+          method: 'thread/start',
+          params: {},
+        })
+        activeSessionId = started?.result?.session_id || started?.result?.thread_id || null
+        if (!activeSessionId) throw new Error('线程创建失败')
+        setSessionId(activeSessionId)
       }
-      await loadTrajectory()
-    } catch {
-      // 拦截器已提示
+      const result: any = await api.post(`/api/v1/chat/threads/${activeSessionId}/goal`, {
+        objective,
+        token_budget: goalBudget || undefined,
+      })
+      applyGoalPayload(result)
+      setGoalModalOpen(false)
+      message.success('Goal 已保存，后续轮次会自动围绕它继续')
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || error?.message || 'Goal 保存失败')
     } finally {
-      setCompacting(false)
+      setGoalSaving(false)
+    }
+  }
+
+  const clearGoal = async () => {
+    if (!sessionId) return
+    try {
+      await api.delete(`/api/v1/chat/threads/${sessionId}/goal`)
+      setGoal(null)
+      message.success('Goal 已清除，历史会话仍保留')
+    } catch {
+      // api interceptor already surfaces the error.
+    }
+  }
+
+  const updateGoalStatus = async (status: 'active' | 'paused' | 'completed' | 'blocked') => {
+    if (!sessionId || !goal) return
+    try {
+      const result: any = await api.patch(`/api/v1/chat/threads/${sessionId}/goal`, { status })
+      applyGoalPayload(result)
+      message.success(status === 'paused' ? 'Goal 已暂停' : status === 'active' ? 'Goal 已恢复' : 'Goal 状态已更新')
+    } catch {
+      // api interceptor already surfaces the error.
+    }
+  }
+
+  const checkGoalMetrics = async () => {
+    if (!sessionId || !goal) return
+    try {
+      const result: any = await api.post(`/api/v1/chat/threads/${sessionId}/goal/check`)
+      applyGoalPayload(result)
+      message.success('PMC 业务指标已刷新')
+    } catch {
+      // api interceptor already surfaces the error.
     }
   }
 
@@ -839,6 +780,12 @@ export default function AIAssistantWidget() {
           })) : [],
         }))
       setSessionId(trace?.session_id || item.session_id)
+      try {
+        const goalResult: any = await api.get(`/api/v1/chat/threads/${item.session_id}/goal`)
+        applyGoalPayload(goalResult)
+      } catch {
+        setGoal(null)
+      }
       setMessages(restored)
       setMemoryOpen(false)
       setTab('ai')
@@ -847,6 +794,21 @@ export default function AIAssistantWidget() {
       message.error('历史会话加载失败')
     } finally {
       setMemoryLoading(false)
+    }
+  }
+
+  const cancelActiveTurn = async () => {
+    const current = activeTurn
+    if (!current) return
+    try {
+      await api.post(
+        `/api/v1/chat/threads/${current.sessionId}/cancel`,
+        {},
+        { params: { request_id: current.turnId } },
+      )
+      message.info('已请求停止当前回答，正在收尾…')
+    } catch {
+      message.error('停止请求发送失败，请稍后重试')
     }
   }
 
@@ -937,8 +899,6 @@ export default function AIAssistantWidget() {
   const [commanderLoading, setCommanderLoading] = useState(false)
 
   const user = getStoredUser()
-  // 头像/画像缩写（取工号首字母作为后端 profile 兜底展示）
-  const profileInitials = (user?.full_name || user?.username || 'AI').slice(0, 1)
   const activeFactoryId = () => localStorage.getItem('active_factory_id') || user?.factory_id || 'FAC_ELEC_DEMO_2026'
   const infoStorageKey = `enghub-info:${user?.username || 'anonymous'}:${localStorage.getItem('active_factory_id') || 'default'}`
 
@@ -1292,6 +1252,7 @@ export default function AIAssistantWidget() {
       const dispatchAgent = agentKeyOverride || (selectedAgent !== 'auto' ? selectedAgent : undefined)
       if (dispatchAgent) payload.agent_key = dispatchAgent
       if (sessionId) payload.session_id = sessionId
+      if (goal?.goal_id) payload.goal_id = goal.goal_id
       // 文件附件和在线工作簿是两条独立数据链路；本轮有附件时不要把浏览器
       // 中残留的 workbook_id 一起发送，避免模型读取到另一工厂的旧工作簿。
       const activeWorkbookId = atts.length === 0
@@ -1325,6 +1286,8 @@ export default function AIAssistantWidget() {
       let accTables: TableData[] = []
       let accDiagrams: FlowDiagram[] = []
       let degraded = false
+      let status = 'in_progress'
+      let harnessStreamedText = false
 
       const applyUpdate = () => {
         setMessages(prev => {
@@ -1335,6 +1298,7 @@ export default function AIAssistantWidget() {
             content: accContent,
             time: streamMsg.time,
             degraded,
+            status,
             actions: accActions.length > 0 ? [...accActions] : [],
             tables: accTables.length > 0 ? [...accTables] : [],
             diagrams: accDiagrams.length > 0 ? [...accDiagrams] : [],
@@ -1361,37 +1325,24 @@ export default function AIAssistantWidget() {
           if (!dataStr) continue
           try {
             const data = JSON.parse(dataStr)
-            if (eventType === 'delta') {
-              accContent += data.content || ''
+            // Harness lifecycle events wrap business data in `data`; legacy
+            // delta/action/table events carry the business payload directly.
+            const eventData = data?.data && typeof data.data === 'object' ? data.data : data
+            if (eventType === 'item/delta') {
+              const delta = eventData?.delta || eventData?.content || ''
+              if (delta) {
+                harnessStreamedText = true
+                accContent += delta
+                applyUpdate()
+              }
+            } else if (eventType === 'delta') {
+              // The kernel emits the full compatibility delta after the
+              // replayable item/delta stream. Avoid rendering the answer twice.
+              if (!harnessStreamedText) accContent += data.content || ''
               applyUpdate()
             } else if (eventType === 'action') {
               accActions = [...accActions, data]
               applyUpdate()
-            } else if (eventType === 'trajectory') {
-              // DSH trajectory 实时推送：工具执行完成即追加轨迹节点（静默累积）
-              setTrajectory(prev => {
-                const base = prev || {
-                  session_id: data.session_id || sessionId || '',
-                  event_count: 0,
-                  nodes: [],
-                }
-                const seq = (base.nodes?.length || 0) + 1
-                const node: TrajectoryNode = {
-                  kind: 'tool_call',
-                  seq,
-                  tool: data.tool,
-                  label: data.label || data.tool,
-                  args: data.args,
-                  result: data.result,
-                  success: data.success !== false,
-                  is_write: !!data.is_write,
-                }
-                return {
-                  ...base,
-                  event_count: (base.event_count || 0) + 1,
-                  nodes: [...(base.nodes || []), node],
-                }
-              })
             } else if (eventType === 'table') {
               const table = data as TableData
               if (table.workbook_id) {
@@ -1404,12 +1355,27 @@ export default function AIAssistantWidget() {
               applyUpdate()
             } else if (eventType === 'done') {
               degraded = !!data.degraded
+              status = data.status || (degraded ? 'degraded' : 'complete')
               if (data.session_id) setSessionId(data.session_id)
-              if (data.memory) setLongTerm(data.memory as LongTermMemory)
+              if (data.goal) setGoal({ ...data.goal, metrics: Array.isArray(data.metrics) ? data.metrics : data.goal.metrics })
+              applyUpdate()
+            } else if (eventType.startsWith('turn/')) {
+              status = eventData?.status || eventType.slice('turn/'.length)
+              const eventSessionId = data.session_id || data.thread_id || eventData?.thread_id
+              const eventTurnId = data.request_id || data.turn_id || eventData?.turn_id
+              if (eventType === 'turn/started' && eventSessionId && eventTurnId) {
+                setSessionId(eventSessionId)
+                setActiveTurn({ sessionId: eventSessionId, turnId: eventTurnId })
+              }
+              if (eventType === 'turn/cancelled' || eventType === 'turn/failed') degraded = true
+              applyUpdate()
+            } else if (eventType === 'item/completed' && eventData?.item_type === 'assistant_message') {
+              status = eventData.status || status
               applyUpdate()
             } else if (eventType === 'error') {
               accContent += data.message || '服务异常'
               degraded = true
+              status = 'failed'
               applyUpdate()
             }
           } catch { /* 忽略解析失败的帧 */ }
@@ -1428,11 +1394,13 @@ export default function AIAssistantWidget() {
           role: 'assistant',
           content: '网络异常，请稍后重试。',
           time: streamMsg.time,
+          status: 'failed',
           degraded: true,
         }
         return updated
       })
     } finally {
+      setActiveTurn(null)
       setLoading(false)
     }
   }
@@ -1893,7 +1861,7 @@ export default function AIAssistantWidget() {
     setCallModalOpen(true)
   }
 
-  // ---------- 提交工单呼叫 → 直接创建 RCC 任务中心任务（不跳转页面） ----------
+  // ---------- 提交工单呼叫 → 直接创建 TMS 任务（不跳转页面） ----------
   const submitCall = async () => {
     if (!selectedContact) return
     try {
@@ -2029,24 +1997,6 @@ export default function AIAssistantWidget() {
                   icon={<SearchOutlined />}
                   style={{ color: '#fff' }}
                   onClick={openChatMemory}
-                />
-              </Tooltip>
-              <Tooltip title="长期记忆与个人画像（跨会话记住的事实）">
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<IdcardOutlined />}
-                  style={{ color: '#fff' }}
-                  onClick={openLongTermMemory}
-                />
-              </Tooltip>
-              <Tooltip title="会话轨迹（注入上下文 / 工具调用事件流）">
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<UnorderedListOutlined />}
-                  style={{ color: '#fff' }}
-                  onClick={openTrajectory}
                 />
               </Tooltip>
               {/* 工厂指挥官开关 */}
@@ -2389,6 +2339,49 @@ export default function AIAssistantWidget() {
                         </div>
                       )}
                     </div>
+                    {/* Codex-style thread Goal：持久化目标，跨轮次自动续接 */}
+                    <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                      <CarryOutOutlined style={{ color: goal ? '#1677ff' : '#8c8c8c', fontSize: 12, flexShrink: 0 }} />
+                      {goal ? (
+                        <>
+                          <Tag color={goal.status === 'completed' ? 'green' : goal.status === 'blocked' ? 'red' : goal.status === 'paused' ? 'gold' : 'blue'} style={{ margin: 0, flexShrink: 0 }}>
+                            Goal {goal.progress_pct ?? 0}%
+                          </Tag>
+                          <Text ellipsis={{ tooltip: goal.objective }} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
+                            {goal.objective}
+                          </Text>
+                          {(goal.status === 'active' || goal.status === 'paused' || goal.status === 'blocked') && (
+                            <Button type="link" size="small" onClick={() => void updateGoalStatus(goal.status === 'active' ? 'paused' : 'active')} style={{ padding: '0 4px', height: 22 }}>
+                              {goal.status === 'active' ? '暂停' : '恢复'}
+                            </Button>
+                          )}
+                          <Button type="link" size="small" icon={<ReloadOutlined />} onClick={() => void checkGoalMetrics()} style={{ padding: '0 4px', height: 22 }}>
+                            检查
+                          </Button>
+                          <Button type="link" size="small" onClick={openGoalEditor} style={{ padding: '0 4px', height: 22 }}>编辑</Button>
+                          <Button type="link" danger size="small" onClick={() => void clearGoal()} style={{ padding: '0 4px', height: 22 }}>清除</Button>
+                        </>
+                      ) : (
+                        <Button type="link" size="small" onClick={openGoalEditor} style={{ padding: 0, height: 22 }}>
+                          设定 Goal（跨轮次持续推进）
+                        </Button>
+                      )}
+                    </div>
+                    {goal?.metrics && goal.metrics.length > 0 && (
+                      <div style={{ padding: '3px 12px 0', display: 'flex', gap: 4, flexWrap: 'wrap', flexShrink: 0 }}>
+                        {goal.metrics.map(metric => (
+                          <Tag
+                            key={metric.metric_id || metric.metric_code}
+                            color={metric.status === 'achieved' ? 'green' : metric.status === 'blocked' ? 'red' : metric.status === 'unknown' ? 'default' : metric.status === 'on_track' ? 'blue' : 'cyan'}
+                            style={{ margin: 0, fontSize: 10 }}
+                            title={metric.evidence?.data_note || metric.status}
+                          >
+                            {metric.label}：{metric.current_value == null ? '—' : `${metric.current_value}${metric.unit || ''}`}
+                            {metric.target_value != null ? ` / 目标${metric.target_value}${metric.unit || ''}` : ''}
+                          </Tag>
+                        ))}
+                      </div>
+                    )}
                     {/* 智能体调度选择器 */}
                     {agents.length > 0 && (
                       <div style={{ padding: '6px 12px 0', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
@@ -2454,6 +2447,31 @@ export default function AIAssistantWidget() {
                       </Tag>
                     </div>
                     {/* 快捷命令弹窗：点击命令即直接发送；新增后立即自动归类到对应智能体 */}
+                    <Modal
+                      title="线程 Goal"
+                      open={goalModalOpen}
+                      onCancel={() => setGoalModalOpen(false)}
+                      onOk={() => void saveGoal()}
+                      confirmLoading={goalSaving}
+                      okText="保存并持续推进"
+                      cancelText="取消"
+                    >
+                      <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+                        目标会保存在当前线程中，后续消息会自动带入；可随时暂停、恢复、编辑或清除。
+                      </Text>
+                      <TextArea
+                        rows={4}
+                        value={goalDraft}
+                        onChange={event => setGoalDraft(event.target.value)}
+                        placeholder="例如：把 chatbot 的 XLSX 公式扫描、关联、修改、重算和导出打通，并通过回归测试"
+                        maxLength={4000}
+                        showCount
+                      />
+                      <div style={{ marginTop: 12 }}>
+                        <Text style={{ marginRight: 8 }}>Token 预算（可选）</Text>
+                        <InputNumber min={1} value={goalBudget ?? undefined} onChange={value => setGoalBudget(value)} placeholder="不限制" />
+                      </div>
+                    </Modal>
                     <Modal
                       title="快捷命令"
                       open={cmdModalOpen}
@@ -2619,375 +2637,6 @@ export default function AIAssistantWidget() {
                         )}
                       </div>
                     </Modal>
-                    {/* 长期记忆 / 个人画像：展示跨会话记住的事实 + 本次注入上下文 */}
-                    <Modal
-                      title="长期记忆与个人画像"
-                      open={longTermOpen}
-                      onCancel={() => setLongTermOpen(false)}
-                      footer={null}
-                      width={560}
-                    >
-                      <Spin spinning={longTermLoading}>
-                        {!longTermLoading && !longTerm && (
-                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无记忆" />
-                        )}
-                        {longTerm && (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                            {/* 画像卡 */}
-                            <div style={{ display: 'flex', gap: 12, alignItems: 'center', background: '#f5f8ff', borderRadius: 10, padding: '12px 14px' }}>
-                              <Avatar style={{ background: '#1677ff' }}>{profileInitials}</Avatar>
-                              <div>
-                                <Text strong>{longTerm.profile?.identity?.称呼 || longTerm.profile?.identity?.全名 || user?.full_name || user?.username || '用户'}</Text>
-                                <div>
-                                  {Object.entries({ ...(longTerm.profile?.identity || {}), ...(longTerm.profile?.role || {}), ...(longTerm.profile?.work || {}) }).map(([k, v]) => (
-                                    <Tag key={k} style={{ marginTop: 4 }}>{k}：{v}</Tag>
-                                  ))}
-                                </div>
-                                {Object.keys(longTerm.profile?.preferences || {}).length > 0 && (
-                                  <Text type="secondary" style={{ fontSize: 12 }}>
-                                    {Object.entries(longTerm.profile!.preferences!).map(([k, v]) => `${k}：${v}`).join('；')}
-                                  </Text>
-                                )}
-                              </div>
-                            </div>
-                            {/* 已记住的事实 */}
-                            <div>
-                              <Text strong style={{ fontSize: 13 }}>已记住的事实（{(longTerm.facts || []).length}）</Text>
-                              <List
-                                size="small"
-                                dataSource={longTerm.facts || []}
-                                locale={{ emptyText: '暂无已记住的事实' }}
-                                renderItem={fact => (
-                                  <List.Item
-                                    actions={[
-                                      <Popconfirm
-                                        key="forget"
-                                        title={`确定遗忘「${fact.key}」？`}
-                                        onConfirm={() => void forgetMemoryKey(fact.key)}
-                                      >
-                                        <Button type="link" size="small" danger icon={<DeleteOutlined />}>遗忘</Button>
-                                      </Popconfirm>,
-                                    ]}
-                                  >
-                                    <List.Item.Meta
-                                      title={<Text style={{ fontSize: 12 }}>{fact.key}</Text>}
-                                      description={<Text style={{ fontSize: 12 }}>{fact.value}</Text>}
-                                    />
-                                  </List.Item>
-                                )}
-                              />
-                            </div>
-                            {/* 本次注入上下文（DSH 对齐：按 source 溯源披露） */}
-                            {(longTerm.context_pieces?.length || longTerm.injected_block) && (
-                              <div>
-                                <Text strong style={{ fontSize: 13 }}>
-                                  本次注入上下文（{longTerm.context_pieces?.length || 1} 条，按来源）
-                                </Text>
-                                {(longTerm.context_pieces || []).map((piece, idx) => (
-                                  <div key={`${piece.source}-${idx}`} style={{
-                                    background: '#fafafa', border: '1px solid #eee', borderRadius: 8,
-                                    padding: '8px 12px', marginTop: 8,
-                                  }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                                      <Text strong style={{ fontSize: 12 }}>{piece.label}</Text>
-                                      <Tag color={piece.source === 'guidance' ? 'purple' : piece.source === 'profile' ? 'blue' : piece.source === 'preferences' ? 'green' : 'default'} style={{ fontSize: 10, marginInlineEnd: 0 }}>
-                                        {piece.source}
-                                      </Tag>
-                                    </div>
-                                    <pre style={{
-                                      margin: 0, fontSize: 11, lineHeight: 1.6,
-                                      whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                                    }}>{piece.content}</pre>
-                                  </div>
-                                ))}
-                                {!longTerm.context_pieces?.length && longTerm.injected_block && (
-                                  <pre style={{
-                                    background: '#fafafa', border: '1px solid #eee', borderRadius: 8,
-                                    padding: '10px 12px', fontSize: 11, lineHeight: 1.6,
-                                    maxHeight: 180, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                                    marginTop: 8,
-                                  }}>{longTerm.injected_block}</pre>
-                                )}
-                                <Text type="secondary" style={{ fontSize: 11 }}>
-                                  每次对话系统会自动注入上述上下文供模型参考（来源标注如 profile / preferences / facts / guidance），也可遗忘不需要的事实。
-                                </Text>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </Spin>
-                    </Modal>
-                    {/* 会话轨迹（DSH Trajectory 对齐）：注入/消息/工具/回复事件流 */}
-                    <Modal
-                      title="会话轨迹"
-                      open={trajectoryOpen}
-                      onCancel={() => setTrajectoryOpen(false)}
-                      footer={null}
-                      width={640}
-                    >
-                      <Spin spinning={trajectoryLoading}>
-                        {!trajectoryLoading && !trajectory && (
-                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无轨迹数据" />
-                        )}
-                        {trajectory && (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <Text type="secondary" style={{ fontSize: 12 }}>
-                                共 {trajectory.event_count} 个事件 · {trajectory.overview?.length || 0} 次请求
-                              </Text>
-                              <Button
-                                size="small"
-                                type="primary"
-                                ghost
-                                loading={compacting}
-                                disabled={compacting}
-                                onClick={handleCompactSession}
-                                style={{ marginLeft: 'auto', fontSize: 11 }}
-                              >
-                                压缩历史（/compact）
-                              </Button>
-                            </div>
-                            {/* 时序 Overview（DSH ledger 对齐）：按耗时把记录投射为横向条，
-                                无耗时记录等宽中性展示；hover 查看阶段详情 */}
-                            {(() => {
-                              const stages = trajectory.overview || []
-                              if (stages.length === 0) return null
-                              const haveDur = stages.some(s => s.duration_ms != null)
-                              const maxDur = Math.max(1, ...stages.map(s => s.duration_ms || 0))
-                              return (
-                                <div>
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-                                    <ThunderboltOutlined style={{ fontSize: 11, color: '#999' }} />
-                                    <Text type="secondary" style={{ fontSize: 10 }}>时序概览（按回复耗时，hover 查看）</Text>
-                                  </div>
-                                  <div style={{ display: 'flex', gap: 2, height: 14 }}>
-                                    {stages.map((s, idx) => {
-                                      const w = s.duration_ms != null ? Math.max(4, Math.round((s.duration_ms / maxDur) * 100)) : 18
-                                      const bg = s.compaction ? '#1677ff'
-                                        : s.degraded ? '#cf1322'
-                                        : (haveDur ? (s.duration_ms != null ? '#52c41a' : '#d9d9d9') : '#91caff')
-                                      const label = s.compaction
-                                        ? `压缩 ${s.folded_count} 事件`
-                                        : (s.user_message || '附件消息')
-                                      return (
-                                        <Tooltip
-                                          key={`${s.request_id}-${idx}`}
-                                          title={`#${s.seq_from}-${s.seq_to} ${label}${s.duration_ms != null ? ` · ${Math.round(s.duration_ms)}ms` : ''}${s.tool_count > 0 ? ` · ${s.tool_count} 工具` : ''}`}
-                                        >
-                                          <div style={{ width: `${w}%`, minWidth: 3, height: '100%', background: bg, borderRadius: 2, cursor: 'help' }} />
-                                        </Tooltip>
-                                      )
-                                    })}
-                                  </div>
-                                </div>
-                              )
-                            })()}
-                            <Tabs
-                              size="small"
-                              items={[
-                                {
-                                  key: 'overview',
-                                  label: '请求概览（按 request 折叠）',
-                                  children: (
-                                    <List
-                                      size="small"
-                                      dataSource={trajectory.overview || []}
-                                      locale={{ emptyText: '暂无请求概览' }}
-                                      renderItem={stage => (
-                                        <List.Item style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                                          <div style={{ flex: 1, minWidth: 0 }}>
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                                              <Tag color="geekblue" style={{ flexShrink: 0, marginInlineEnd: 0 }}>#{stage.seq_from}–{stage.seq_to}</Tag>
-                                              {stage.compaction ? (
-                                                <>
-                                                  <Text strong style={{ fontSize: 12 }}>摘要折叠</Text>
-                                                  <Tag color="blue" style={{ fontSize: 10 }}>{stage.folded_count} 个事件</Tag>
-                                                </>
-                                              ) : (
-                                                <Text strong style={{ fontSize: 12 }}>{stage.user_message || '（附件消息）'}</Text>
-                                              )}
-                                              {stage.degraded && <Tag color="red" style={{ fontSize: 10 }}>降级</Tag>}
-                                            </div>
-                                            {stage.compaction && stage.summary && (
-                                              <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#f0f7ff', padding: 8, borderRadius: 6, borderLeft: '3px solid #1677ff' }}>
-                                                {stage.summary}
-                                              </pre>
-                                            )}
-                                            {!stage.compaction && (<>
-                                            <div style={{ marginTop: 3, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-                                              {(stage.injections || []).map((inj, idx) => (
-                                                <Tag key={`${inj.source}-${idx}`} color={inj.source === 'guidance' ? 'purple' : inj.source === 'profile' ? 'blue' : inj.source === 'preferences' ? 'green' : 'default'} style={{ fontSize: 10 }}>{inj.label}</Tag>
-                                              ))}
-                                              {(stage.tool_sequence || []).map((t, idx) => (
-                                                <Tag key={`${t}-${idx}`} color="orange" style={{ fontSize: 10 }}>{t}</Tag>
-                                              ))}
-                                              {stage.tool_count === 0 && <span style={{ fontSize: 11, color: '#999' }}>无工具调用</span>}
-                                            </div>
-                                            {stage.reply && (
-                                              <div style={{ marginTop: 4, fontSize: 12, color: '#555', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                                                {stage.reply}
-                                              </div>
-                                            )}
-                                            <div style={{ marginTop: 3, color: '#999', fontSize: 11 }}>
-                                              {stage.model && <span>{stage.model} · </span>}
-                                              {stage.tool_count > 0 && <span>{stage.tool_count} 次工具 · </span>}
-                                              {stage.duration_ms != null && <span>耗时 {Math.round(stage.duration_ms)}ms</span>}
-                                              {!stage.model && stage.duration_ms == null && <span>阶段完成</span>}
-                                            </div>
-                                            </>)}
-                                          </div>
-                                        </List.Item>
-                                      )}
-                                    />
-                                  ),
-                                },
-                                {
-                                  key: 'events',
-                                  label: '事件流（紧凑账本）',
-                                  children: (
-                                    <>
-                                      <div style={{ marginBottom: 6, fontSize: 11, color: '#999' }}>
-                                        点击记录行查看完整载荷 · 虚线分隔为 request 边界
-                                      </div>
-                                      <List
-                                        size="small"
-                                        dataSource={trajectory.nodes}
-                                        renderItem={(node, idx) => {
-                                          const prev = idx > 0 ? trajectory.nodes[idx - 1] : undefined
-                                          const newRequest = !prev || prev.request_id !== node.request_id
-                                          const colorHex = node.kind === 'context_injection' ? '#722ed1'
-                                            : node.kind === 'tool_call' ? (node.success === false ? '#cf1322' : '#fa8c16')
-                                            : node.kind === 'assistant_reply' ? '#52c41a'
-                                            : node.kind === 'compaction' ? '#1677ff'
-                                            : '#bfbfbf'
-                                          const kindLabel = node.kind === 'context_injection' ? '注入'
-                                            : node.kind === 'user_message' ? '用户'
-                                            : node.kind === 'tool_call' ? '工具'
-                                            : node.kind === 'compaction' ? '压缩'
-                                            : '回复'
-                                          const preview = node.kind === 'context_injection' ? (node.content || '')
-                                            : node.kind === 'user_message' ? (node.content || '')
-                                            : node.kind === 'tool_call' ? `${node.tool} · ${node.success === false ? '失败' : '成功'}${node.is_write ? '（写）' : ''}`
-                                            : node.kind === 'compaction' ? `折叠 ${node.folded_count || node.source_event_seqs?.length || 0} 个事件：${(node.summary || '').slice(0, 60)}`
-                                            : (node.reply || '')
-                                          const isSelected = ledgerInspector?.seq === node.seq
-                                          return (
-                                            <div key={`${node.seq}-${node.kind}`}>
-                                              {newRequest && (
-                                                <div style={{ margin: '4px 0', borderTop: '1px dashed #d9d9d9', paddingTop: 2, fontSize: 10, color: '#bbb', fontFamily: 'monospace' }}>
-                                                  ↳ request {node.request_id}
-                                                </div>
-                                              )}
-                                              <div
-                                                onClick={() => setLedgerInspector(isSelected ? null : node)}
-                                                style={{
-                                                  display: 'flex', gap: 8, alignItems: 'flex-start',
-                                                  padding: '4px 4px', borderRadius: 4, cursor: 'pointer',
-                                                  background: isSelected ? '#f5f8ff' : undefined,
-                                                  borderLeft: isSelected ? '2px solid #1677ff' : '2px solid transparent',
-                                                }}
-                                              >
-                                                <div style={{ width: 26, flexShrink: 0, textAlign: 'center', color: '#999', fontSize: 10, fontFamily: 'monospace', paddingTop: 1 }}>{node.seq}</div>
-                                                <div style={{ width: 6, flexShrink: 0, alignSelf: 'stretch', borderRadius: 2, background: colorHex, marginTop: 3, minHeight: 14 }} />
-                                                <div style={{ flex: 1, minWidth: 0 }}>
-                                                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                                                    <Text strong style={{ fontSize: 11 }}>{kindLabel}</Text>
-                                                    {node.kind === 'tool_call' && node.tool && <span style={{ fontSize: 10, color: '#555', fontFamily: 'monospace' }}>{node.tool}</span>}
-                                                    {node.kind === 'assistant_reply' && node.model && <span style={{ fontSize: 10, color: '#999' }}>{node.model}</span>}
-                                                    {node.kind === 'assistant_reply' && node.duration_ms != null && <span style={{ fontSize: 10, color: '#999' }}>{Math.round(node.duration_ms)}ms</span>}
-                                                  </div>
-                                                  <div style={{ fontSize: 11, color: '#555', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 1 }}>{preview}</div>
-                                                </div>
-                                              </div>
-                                            </div>
-                                          )
-                                        }}
-                                      />
-                                      {ledgerInspector && (
-                                        <div style={{ border: '1px solid #91caff', borderRadius: 6, padding: 8, marginTop: 6, background: '#f5f8ff' }}>
-                                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                                            <Text strong style={{ fontSize: 12 }}>
-                                              记录 #{ledgerInspector.seq}
-                                              {ledgerInspector.request_id && <span style={{ fontSize: 10, color: '#999', marginLeft: 6, fontFamily: 'monospace' }}>{ledgerInspector.request_id}</span>}
-                                            </Text>
-                                            <Button size="small" type="text" icon={<CloseOutlined />} onClick={() => setLedgerInspector(null)} />
-                                          </div>
-                                          {ledgerInspector.kind === 'context_injection' && (
-                                            <>
-                                              <div style={{ fontSize: 11, color: '#999' }}>source · {ledgerInspector.source} — {ledgerInspector.label}</div>
-                                              <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 160, overflowY: 'auto' }}>{ledgerInspector.content}</pre>
-                                            </>
-                                          )}
-                                          {ledgerInspector.kind === 'user_message' && (
-                                            <div style={{ fontSize: 12 }}>{ledgerInspector.content}</div>
-                                          )}
-                                          {ledgerInspector.kind === 'tool_call' && (
-                                            <>
-                                              <div style={{ fontSize: 11 }}>
-                                                <Tag color={ledgerInspector.success === false ? 'red' : 'orange'} style={{ fontSize: 10 }}>{ledgerInspector.success === false ? '失败' : '成功'}</Tag>
-                                                {ledgerInspector.is_write && <Tag color="red" style={{ fontSize: 10 }}>写操作</Tag>}
-                                                <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{ledgerInspector.tool}</span>
-                                              </div>
-                                              {ledgerInspector.args != null && (
-                                                <div style={{ marginTop: 4 }}>
-                                                  <Text type="secondary" style={{ fontSize: 10 }}>参数</Text>
-                                                  <pre style={{ margin: '2px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 160, overflowY: 'auto' }}>
-                                                    {typeof ledgerInspector.args === 'string' ? ledgerInspector.args : JSON.stringify(ledgerInspector.args, null, 2)}
-                                                  </pre>
-                                                </div>
-                                              )}
-                                              {ledgerInspector.result != null && (
-                                                <div style={{ marginTop: 4 }}>
-                                                  <Text type="secondary" style={{ fontSize: 10 }}>结果</Text>
-                                                  <pre style={{ margin: '2px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflowY: 'auto' }}>
-                                                    {typeof ledgerInspector.result === 'string' ? ledgerInspector.result : JSON.stringify(ledgerInspector.result, null, 2)}
-                                                  </pre>
-                                                </div>
-                                              )}
-                                            </>
-                                          )}
-                                          {ledgerInspector.kind === 'assistant_reply' && (
-                                            <>
-                                              <div style={{ fontSize: 11, color: '#666' }}>
-                                                {ledgerInspector.model && <Tag style={{ fontSize: 10 }}>{ledgerInspector.model}</Tag>}
-                                                {ledgerInspector.tool_count != null && ledgerInspector.tool_count > 0 && <Tag color="blue" style={{ fontSize: 10 }}>{ledgerInspector.tool_count} 次工具</Tag>}
-                                                {ledgerInspector.duration_ms != null && <span>耗时 {Math.round(ledgerInspector.duration_ms)}ms</span>}
-                                                {ledgerInspector.degraded && <Tag color="red" style={{ fontSize: 10 }}>降级</Tag>}
-                                              </div>
-                                              <div style={{ marginTop: 4, fontSize: 12, maxHeight: 240, overflowY: 'auto' }}>{ledgerInspector.reply}</div>
-                                            </>
-                                          )}
-                                          {ledgerInspector.kind === 'compaction' && (
-                                            <>
-                                              <div style={{ fontSize: 11 }}>
-                                                <Tag color="blue" style={{ fontSize: 10 }}>折叠 seq {ledgerInspector.fold_from}—{ledgerInspector.fold_to}</Tag>
-                                                {ledgerInspector.folded_count != null && <span style={{ fontSize: 10, color: '#999' }}>{ledgerInspector.folded_count} 个事件</span>}
-                                                {ledgerInspector.reason && <span style={{ fontSize: 10, color: '#999' }}> · {ledgerInspector.reason === 'manual' ? '手动' : '压力自动'}</span>}
-                                              </div>
-                                              {ledgerInspector.summary && (
-                                                <pre style={{ margin: '4px 0 0', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#fff', padding: 6, borderRadius: 4 }}>{ledgerInspector.summary}</pre>
-                                              )}
-                                              {ledgerInspector.source_event_seqs && ledgerInspector.source_event_seqs.length > 0 && (
-                                                <div style={{ marginTop: 4 }}>
-                                                  <Text type="secondary" style={{ fontSize: 10 }}>source_event_seqs（{ledgerInspector.source_event_seqs.length}）</Text>
-                                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, marginTop: 2 }}>
-                                                    {ledgerInspector.source_event_seqs.map(s => <Tag key={s} style={{ fontSize: 9 }}>{s}</Tag>)}
-                                                  </div>
-                                                </div>
-                                              )}
-                                            </>
-                                          )}
-                                        </div>
-                                      )}
-                                    </>
-                                  ),
-                                },
-                              ]}
-                            />
-                          </div>
-                        )}
-                      </Spin>
-                    </Modal>
                     {/* 输入区 */}
                     <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0', flexShrink: 0 }}>
                       {replyingTo && (
@@ -3059,19 +2708,22 @@ export default function AIAssistantWidget() {
                           value={input}
                           onChange={e => setInput(e.target.value)}
                           onPaste={onChatPaste}
-                          onPressEnter={e => { if (!e.shiftKey) { e.preventDefault(); sendMessage() } }}
+                          onPressEnter={e => { if (!e.shiftKey && !loading) { e.preventDefault(); sendMessage() } }}
+                          disabled={loading}
                           placeholder={uploading ? '图片上传中...' : '输入问题；可直接粘贴图片，Enter 发送...'}
                           autoSize={{ minRows: 1, maxRows: 3 }}
                           style={{ borderRadius: 0 }}
                         />
                         <Button
-                          type="primary"
-                          icon={<SendOutlined />}
-                          onClick={() => sendMessage()}
-                          loading={loading || uploading}
-                          disabled={uploading}
+                          type={loading ? 'default' : 'primary'}
+                          danger={loading}
+                          icon={loading ? <CloseCircleOutlined /> : <SendOutlined />}
+                          onClick={() => loading ? void cancelActiveTurn() : sendMessage()}
+                          loading={uploading}
+                          disabled={uploading || (loading && !activeTurn)}
+                          title={loading ? '停止当前回答' : '发送'}
                           style={{ borderRadius: '0 8px 8px 0', height: 'auto' }}
-                        />
+                        >{loading ? '停止' : null}</Button>
                       </Space.Compact>
                       {/* 隐藏的文件选择框（图片+文件多选） */}
                       <input
@@ -3560,7 +3212,7 @@ export default function AIAssistantWidget() {
         {selectedContact && (
           <div style={{ marginBottom: 12, padding: '8px 10px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, fontSize: 12 }}>
             <CheckCircleOutlined style={{ color: '#52c41a', marginRight: 6 }} />
-            呼叫将直达 <Text strong>{selectedContact.name}</Text>（{selectedContact.role}），并同步创建任务中心（RCC）任务
+            呼叫将直达 <Text strong>{selectedContact.name}</Text>（{selectedContact.role}），并同步创建 TMS 任务
           </div>
         )}
         <Form form={callForm} layout="vertical">

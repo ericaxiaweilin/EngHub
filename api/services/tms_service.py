@@ -306,7 +306,7 @@ class TMSService:
 
     async def register_agent(self, agent_id: str, permission_level: int = 1, whitelisted: bool = False) -> Dict[str, Any]:
         """注册 Agent"""
-        await self.agent_interface.register_agent(agent_id, permission_level, whitelisted)
+        self.agent_interface.register_agent(agent_id, permission_level, whitelisted)
         return {"success": True, "message": f"Agent {agent_id} 注册成功", "permission_level": permission_level}
 
     async def register_webhook(self, agent_id: str, event_types: List[str], webhook_url: str, secret: Optional[str] = None) -> Dict[str, Any]:

@@ -8,7 +8,6 @@ v2.6 - RCC API Routes
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.models import User
 
 from database.db_config import get_db
 from core.auth.security import get_current_user
@@ -22,21 +21,19 @@ router = APIRouter(prefix="/api/v1/rcc", tags=["rcc - 资源控制中心"])
 async def list_rcc_tasks(
     status: Optional[str] = None,
     org_unit_id: Optional[str] = None,
-    factory_id: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    """查询RCC调度任务列表（可按工厂过滤）"""
+    """查询RCC调度任务列表"""
     from core.rcc.services import RCCTaskService
 
     service = RCCTaskService(db)
     try:
-        tasks = await service.list_tasks(status=status, org_unit_id=org_unit_id, factory_id=factory_id, page=page, page_size=page_size)
+        tasks = await service.list_tasks(status=status, org_unit_id=org_unit_id, page=page, page_size=page_size)
         return {"items": [
             {
                 "id": t.id, "task_code": t.task_code, "org_unit_id": t.org_unit_id,
-                "factory_id": getattr(t, "factory_id", None),
                 "task_type": t.task_type, "title": t.title, "description": t.description,
                 "affected_params": t.affected_params, "affected_entities": t.affected_entities,
                 "expected_impact_summary": t.expected_impact_summary,
@@ -74,13 +71,13 @@ async def create_rcc_task(payload: Dict[str, Any], db: AsyncSession = Depends(ge
 
 
 @router.post("/tasks/{task_id}/approve", summary="审批通过RCC任务")
-async def approve_rcc_task(task_id: str, comment: str = "", approver_id: str = "current_user", db: AsyncSession = Depends(get_db)):
-    """审批通过RCC任务（approver_id 默认 current_user，可显式传）"""
+async def approve_rcc_task(task_id: str, comment: str = "", db: AsyncSession = Depends(get_db)):
+    """审批通过RCC任务"""
     from core.rcc.services import RCCTaskService
 
     service = RCCTaskService(db)
     try:
-        task = await service.approve_task(task_id, approver_id=approver_id, comment=comment)
+        task = await service.approve_task(task_id, approver_id="current_user", comment=comment)
         return {"success": True, "data": {"id": task.id, "status": task.status}}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -89,57 +86,18 @@ async def approve_rcc_task(task_id: str, comment: str = "", approver_id: str = "
 
 
 @router.post("/tasks/{task_id}/reject", summary="拒绝RCC任务")
-async def reject_rcc_task(task_id: str, reason: str, approver_id: str = "current_user", db: AsyncSession = Depends(get_db)):
-    """拒绝RCC任务（approver_id 默认 current_user，可显式传）"""
+async def reject_rcc_task(task_id: str, reason: str, db: AsyncSession = Depends(get_db)):
+    """拒绝RCC任务"""
     from core.rcc.services import RCCTaskService
 
     service = RCCTaskService(db)
     try:
-        task = await service.reject_task(task_id, approver_id=approver_id, reason=reason)
+        task = await service.reject_task(task_id, approver_id="current_user", reason=reason)
         return {"success": True, "data": {"id": task.id, "status": task.status}}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-
-# ==================== 决策效果回评估 ====================
-
-@router.get("/decision-evaluations", summary="决策效果回评估列表")
-async def list_decision_evaluations(
-    factory_id: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = Query(30, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-):
-    """决策执行后的效果追踪记录（追踪中/已定论）"""
-    from api.services.decision_evaluation_service import list_evaluations
-    items = await list_evaluations(db, factory_id=factory_id, status=status, limit=limit)
-    for d in items:
-        for k in ("executed_at", "last_evaluated_at", "finalized_at", "created_at", "next_evaluate_at"):
-            if d.get(k) is not None and not isinstance(d[k], str):
-                d[k] = d[k].isoformat()
-    return {"items": items, "total": len(items)}
-
-
-@router.get("/decision-evaluations/summary", summary="决策质量汇总指标")
-async def decision_evaluation_summary(
-    factory_id: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-):
-    """决策达成率/按动作分布——决策中心的决策质量硬指标"""
-    from api.services.decision_evaluation_service import evaluation_summary
-    return await evaluation_summary(db, factory_id=factory_id)
-
-
-@router.post("/decision-evaluations/{eval_id}/evaluate", summary="立即复评一条决策")
-async def force_decision_evaluation(eval_id: str, db: AsyncSession = Depends(get_db)):
-    """不等到期，立即复测指标并给出阶段结论"""
-    from api.services.decision_evaluation_service import force_evaluate
-    res = await force_evaluate(db, eval_id)
-    if res.get("error"):
-        raise HTTPException(status_code=404, detail=res["error"])
-    return {"success": True, "data": res}
 
 
 # ==================== 可调参数 ====================
@@ -435,86 +393,84 @@ async def delete_logic_chain(chain_id: str, db: AsyncSession = Depends(get_db)):
 # ==================== 组织泡泡图（任务智慧中心） ====================
 
 @router.get("/org-bubbles", summary="组织泡泡图数据 - 任务智慧中心")
-async def org_bubbles(factory_id: str = Query("F01"), db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
-    """组织泡泡图数据：真实组织（hr_employees 部门聚合）优先，presets 仿真兜底。
-
-    节点 = 组织单元（部门/岗位），大小=负荷（人力占比），颜色=健康度（离岗率）。
-    链 = 组织层级 parent 关系（真实）或仿真信号链（兜底）。
+async def org_bubbles(factory_id: str = Query("F01")):
+    """聚合 org_panel 节点 + 逻辑链，生成力导向泡泡图数据
+    
+    每个节点 = 一个组织泡泡（大小=负荷，颜色=健康度）
+    每条链 = 泡泡间连线（信号传导关系）
     """
-    from sqlalchemy import text as _sqlt
+    from core.org_panel.presets import build_electronics_factory
     from core.org_panel.signals import SignalType
 
-    nodes = []
-    edges = []
-    real_data = False
-    try:
-        # 主数据源：hr_employees 部门聚合（真实组织 = 员工部门结构）
-        emp_rows = (await db.execute(_sqlt("""
-            SELECT department, COUNT(*) AS headcount,
-                   SUM(CASE WHEN status='leave' THEN 1 ELSE 0 END) AS leave_cnt
-            FROM hr_employees WHERE factory_id=:f AND department IS NOT NULL AND department != ''
-            GROUP BY department ORDER BY headcount DESC
-        """), {"f": factory_id})).mappings().all()
-        if emp_rows:
-            real_data = True
-            max_hc = max(int(r["headcount"] or 1) for r in emp_rows)
-            for idx, r in enumerate(emp_rows):
-                headcount = int(r["headcount"] or 0)
-                leave = int(r["leave_cnt"] or 0)
-                leave_rate = leave / max(headcount, 1)
-                health = "danger" if leave_rate > 0.2 else ("warning" if leave_rate > 0.1 else "normal")
-                nodes.append({
-                    "id": f"dept_{r['department']}", "name": r["department"],
-                    "parent_id": None, "level": 1,
-                    "scope": f"部门 {r['department']} · 人力 {headcount}（离岗 {leave}）",
-                    "health": health,
-                    "load": round(min(1.0, headcount / max(max_hc, 1)), 3),
-                    "violations": [] if leave_rate <= 0.2 else [f"离岗率 {round(leave_rate*100,1)}%"],
-                    "key_outputs": {"人力": headcount, "离岗": leave},
-                })
-    except Exception:
-        pass
+    # 获取引擎单例（复用 org_panel 的实例）
+    from core.org_panel.api_adapter import get_engine
+    engine = get_engine()
 
-    if not real_data:
-        # ── 兜底：presets 仿真引擎 ──
-        from core.org_panel.presets import build_electronics_factory
-        from core.org_panel.api_adapter import get_engine
-        engine = get_engine()
-        for nid, node in engine.nodes.items():
-            health = "normal"
-            if node.violations:
+    nodes = []
+    for nid, node in engine.nodes.items():
+        # 计算健康度：有无 violations + 关键信号判断
+        health = "normal"  # normal / warning / danger
+        if node.violations:
+            health = "danger"
+        else:
+            # 检查关键输出信号是否越界
+            outputs = node.output_signals
+            escalation = outputs.get(SignalType.ESCALATION_LEVEL, 0)
+            if escalation >= 2:
                 health = "danger"
-            else:
-                outputs = node.output_signals
-                if outputs.get(SignalType.ESCALATION_LEVEL, 0) >= 2:
-                    health = "danger"
-                elif outputs.get(SignalType.ESCALATION_LEVEL, 0) >= 1:
-                    health = "warning"
-                if outputs.get(SignalType.AVAILABILITY, 1.0) < 0.85:
-                    health = "warning" if health == "normal" else health
-            load_score = min(1.0, (len(node.output_signals) * 0.08 + len(node.parameters) * 0.05 + len(node.violations) * 0.2))
-            nodes.append({
-                "id": nid, "name": node.name, "parent_id": getattr(node, "parent_id", None),
-                "level": node.level, "scope": node.scope, "health": health,
-                "load": round(load_score, 3), "violations": node.violations,
-                "key_outputs": {str(k): v for k, v in node.output_signals.items()},
+            elif escalation >= 1:
+                health = "warning"
+            # 设备可用率低 → warning
+            avail = outputs.get(SignalType.AVAILABILITY, 1.0)
+            if avail < 0.85:
+                health = "warning" if health == "normal" else health
+
+        # 负荷 = 输出信号数量 + 参数数量 的综合（归一化到 0-1）
+        load_score = min(1.0, (len(node.output_signals) * 0.08 + len(node.parameters) * 0.05 + len(node.violations) * 0.2))
+
+        nodes.append({
+            "id": nid,
+            "name": node.name,
+            "level": node.level,
+            "scope": node.scope,
+            "health": health,
+            "load": round(load_score, 3),
+            "violations": node.violations,
+            "key_outputs": {
+                k.label: round(v, 4)
+                for k, v in list(node.output_signals.items())[:6]
+            },
+            "param_count": len(node.parameters),
+            "capability_count": len(node.capabilities),
+        })
+
+    edges = []
+    for chain in engine.chains:
+        for link in chain.links:
+            source_node = engine.nodes.get(link.source_node_id)
+            current_value = None
+            if source_node and link.source_signal in source_node.output_signals:
+                current_value = round(source_node.output_signals[link.source_signal], 4)
+            edges.append({
+                "source": link.source_node_id,
+                "target": link.target_node_id,
+                "signal": link.source_signal.label,
+                "target_signal": link.target_signal.label,
+                "label": link.label or f"{link.source_signal.label}→{link.target_signal.label}",
+                "chain_name": chain.name,
+                "value": current_value,
+                "latency_h": link.latency_hours,
             })
-        # 仿真信号链（引擎 _outgoing: source_id -> [ChainLink]）
-        for source_id, links in getattr(engine, "_outgoing", {}).items():
-            for link in links:
-                edges.append({"source": source_id, "target": getattr(link, "target_id", None) or getattr(link, "target", ""),
-                              "signal_type": getattr(link, "signal_type", None), "strength": 1.0})
 
     return {
         "success": True,
         "factory_id": factory_id,
-        "data_source": "real_org" if real_data else "preset_sim",
         "nodes": nodes,
         "edges": edges,
         "meta": {
             "total_nodes": len(nodes),
             "total_edges": len(edges),
-            "note": "真实组织数据（org_units+hr_employees）" if real_data else "预设仿真（无真实组织数据兜底）",
+            "chains": [c.name for c in engine.chains],
         },
     }
 

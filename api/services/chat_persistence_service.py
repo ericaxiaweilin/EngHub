@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -13,20 +14,25 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import (
-    ChatMessage, ChatMessageAttachment, ChatSession, ChatSessionEvent, ChatTelemetry, FileRecord, generate_uuid,
+    ChatGoal, ChatGoalMetric, ChatMessage, ChatMessageAttachment, ChatSession, ChatTelemetry,
+    FileRecord, generate_uuid,
 )
 
 HISTORY_LIMIT = 50
 
-# 自动压缩压力阈值：会话普通事件数超过该值且可折叠事件数超过 COMPACTION_KEEP_RECENT 时，
-# 新请求进入前自动折叠旧历史（对齐 DSH after-call compaction pressure）。
-COMPACTION_PRESSURE_EVENTS = 40
-# 每次压缩保留的最近普通事件数（未折叠的尾部）。
-COMPACTION_KEEP_RECENT = 8
-
 
 class ChatSessionAccessError(PermissionError):
     """会话不存在或不属于当前用户/工厂。"""
+
+
+def session_metadata(session: ChatSession) -> Dict[str, Any]:
+    """Return a mutable metadata copy for lifecycle flags."""
+    value = session.metadata_ or {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def is_session_archived(session: ChatSession) -> bool:
+    return bool(session_metadata(session).get("archived"))
 
 
 # ──────────────────────────────────────────────
@@ -100,28 +106,162 @@ async def list_sessions(
     user: Any,
     factory_id: Optional[str] = None,
     limit: int = 20,
+    include_archived: bool = False,
 ) -> List[Dict[str, Any]]:
     """列出某用户最近的会话（供前端会话栏）。"""
     user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
+    fetch_limit = max(1, min(int(limit or 20), 100))
     stmt = (
         select(ChatSession)
         .where(ChatSession.user_id == user_id)
         .order_by(ChatSession.updated_at.desc())
-        .limit(limit)
+        .limit(fetch_limit if include_archived else min(fetch_limit * 3, 300))
     )
     if factory_id:
         stmt = stmt.where(ChatSession.factory_id == factory_id)
     rows = (await db.execute(stmt)).scalars().all()
-    return [
-        {
-            "session_id": s.id,
-            "factory_id": s.factory_id,
-            "title": s.title or "新会话",
-            "created_at": s.created_at.strftime("%Y-%m-%d %H:%M") if s.created_at else None,
-            "updated_at": s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else None,
-        }
-        for s in rows
-    ]
+    result = []
+    for session in rows:
+        if not include_archived and is_session_archived(session):
+            continue
+        metadata = session_metadata(session)
+        result.append({
+            "session_id": session.id,
+            "factory_id": session.factory_id,
+            "title": session.title or "新会话",
+            "created_at": session.created_at.strftime("%Y-%m-%d %H:%M") if session.created_at else None,
+            "updated_at": session.updated_at.strftime("%Y-%m-%d %H:%M") if session.updated_at else None,
+            "archived": bool(metadata.get("archived")),
+            "parent_thread_id": metadata.get("parent_thread_id"),
+        })
+        if len(result) >= fetch_limit:
+            break
+    return result
+
+
+async def fork_session(
+    db: AsyncSession,
+    source: ChatSession,
+    *,
+    user: Any,
+    factory_id: str,
+    title: Optional[str] = None,
+) -> ChatSession:
+    """Create a durable fork without mutating the source thread."""
+    user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
+    if source.user_id != user_id or source.factory_id != factory_id:
+        raise ChatSessionAccessError("无权复制该会话")
+    metadata = session_metadata(source)
+    metadata.update({
+        "parent_thread_id": source.id,
+        "forked_from": source.id,
+        "forked_at": datetime.utcnow().isoformat(),
+        "archived": False,
+    })
+    target = ChatSession(
+        id=generate_uuid(),
+        factory_id=source.factory_id,
+        user_id=source.user_id,
+        title=title or f"{source.title or '新会话'}（分支）",
+        metadata_=metadata,
+    )
+    db.add(target)
+    await db.flush()
+
+    source_goal = (await db.execute(
+        select(ChatGoal).where(ChatGoal.session_id == source.id)
+    )).scalar_one_or_none()
+    if source_goal is not None:
+        target_goal = ChatGoal(
+            id=generate_uuid(),
+            session_id=target.id,
+            factory_id=target.factory_id,
+            user_id=target.user_id,
+            objective=source_goal.objective,
+            status=source_goal.status,
+            token_budget=source_goal.token_budget,
+            tokens_used=source_goal.tokens_used,
+            time_used_seconds=source_goal.time_used_seconds,
+            progress_pct=source_goal.progress_pct,
+            summary=source_goal.summary,
+            blocked_reason=source_goal.blocked_reason,
+        )
+        db.add(target_goal)
+        source_metrics = (await db.execute(
+            select(ChatGoalMetric).where(ChatGoalMetric.goal_id == source_goal.id)
+        )).scalars().all()
+        for metric in source_metrics:
+            db.add(ChatGoalMetric(
+                id=generate_uuid(),
+                goal_id=target_goal.id,
+                metric_code=metric.metric_code,
+                label=metric.label,
+                comparator=metric.comparator,
+                target_value=metric.target_value,
+                unit=metric.unit,
+                current_value=metric.current_value,
+                status=metric.status,
+                source_tool=metric.source_tool,
+                evidence=deepcopy(metric.evidence),
+                last_checked_at=metric.last_checked_at,
+            ))
+
+    messages = list((await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == source.id)
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+    )).scalars().all())
+    attachment_rows = list((await db.execute(
+        select(ChatMessageAttachment)
+        .where(ChatMessageAttachment.session_id == source.id)
+        .order_by(ChatMessageAttachment.message_id, ChatMessageAttachment.ordinal.asc())
+    )).scalars().all())
+    message_ids: Dict[str, str] = {}
+    for message in messages:
+        new_id = generate_uuid()
+        message_ids[message.id] = new_id
+        db.add(ChatMessage(
+            id=new_id,
+            session_id=target.id,
+            role=message.role,
+            content=message.content,
+            tool_calls=deepcopy(message.tool_calls),
+            tool_results=deepcopy(message.tool_results),
+            model=message.model,
+            tokens_used=message.tokens_used,
+            duration_ms=message.duration_ms,
+            request_id=message.request_id,
+            created_at=message.created_at,
+        ))
+    for link in attachment_rows:
+        new_message_id = message_ids.get(link.message_id)
+        if new_message_id:
+            db.add(ChatMessageAttachment(
+                id=generate_uuid(),
+                message_id=new_message_id,
+                session_id=target.id,
+                file_id=link.file_id,
+                kind=link.kind,
+                ordinal=link.ordinal,
+                created_at=link.created_at,
+            ))
+    await db.flush()
+    return target
+
+
+async def set_session_archived(
+    db: AsyncSession,
+    session: ChatSession,
+    *,
+    archived: bool,
+) -> ChatSession:
+    metadata = session_metadata(session)
+    metadata["archived"] = bool(archived)
+    metadata["archived_at"] = datetime.utcnow().isoformat() if archived else None
+    session.metadata_ = metadata
+    session.updated_at = datetime.utcnow()
+    await db.flush()
+    return session
 
 
 # ──────────────────────────────────────────────
@@ -397,20 +537,38 @@ async def persist_round(
 ) -> None:
     """一次请求的完整落库：user 消息 + assistant 回复（含工具动作轨迹）。"""
     if request_id:
-        existing = await db.execute(
+        # A retry can observe a partially committed turn (for example the
+        # user message was flushed before a worker died).  Treat each role as
+        # its own idempotency boundary so the assistant completion can still
+        # be written without duplicating the user item.
+        existing_user = await db.execute(
             select(ChatMessage.id)
             .where(
                 ChatMessage.session_id == session_id,
                 ChatMessage.request_id == request_id,
+                ChatMessage.role == "user",
             )
             .limit(1)
         )
-        if existing.scalar_one_or_none() is not None:
+        existing_assistant = await db.execute(
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.session_id == session_id,
+                ChatMessage.request_id == request_id,
+                ChatMessage.role == "assistant",
+            )
+            .limit(1)
+        )
+        if existing_assistant.scalar_one_or_none() is not None:
             return
-    await append_message(
-        db, session_id=session_id, role="user", content=user_content,
-        request_id=request_id, attachment_ids=attachment_ids,
-    )
+    else:
+        existing_user = None
+
+    if existing_user is None or existing_user.scalar_one_or_none() is None:
+        await append_message(
+            db, session_id=session_id, role="user", content=user_content,
+            request_id=request_id, attachment_ids=attachment_ids,
+        )
     tool_trace = [_action_to_json(a) for a in (actions or [])] if actions else None
     await append_message(
         db, session_id=session_id, role="assistant", content=reply,
@@ -430,482 +588,3 @@ def _action_to_json(action: Any) -> Dict[str, Any]:
         "result": getattr(action, "result", None),
         "success": getattr(action, "success", True),
     }
-
-
-# ──────────────────────────────────────────────
-# Chat 会话事件流（DSH SessionEvent 对齐）
-# ──────────────────────────────────────────────
-#
-# 一个会话维护一段连续事件流（type/seq/time/data）。Trajectory 视图
-# 从该事件流组装读模型（注入 / 用户消息 / 工具调用 / 回复成节点），
-# 不再维护第二条独立历史源。
-
-async def append_session_events(
-    db: AsyncSession,
-    *,
-    session_id: str,
-    request_id: str,
-    events: List[Dict[str, Any]],
-) -> None:
-    """把本次请求产生的事件追加进会话事件流。
-
-    events: [{"type": ..., "data": {...}}, ...]，seq 在会话内自增。
-    幂等：同一 request_id 已存在事件时跳过，避免 persist_hook 重放。
-    """
-    if not events:
-        return
-    existing = await db.execute(
-        select(ChatSessionEvent.request_id)
-        .where(ChatSessionEvent.request_id == request_id)
-        .limit(1)
-    )
-    if existing.scalar_one_or_none() is not None:
-        return
-    last_seq = await _session_last_seq(db, session_id)
-    for evt in events:
-        seq = last_seq + 1
-        last_seq = seq
-        db.add(ChatSessionEvent(
-            id=generate_uuid(),
-            session_id=session_id,
-            request_id=request_id,
-            seq=seq,
-            event_type=evt.get("type", "generic"),
-            data=evt.get("data") or {},
-        ))
-    await db.flush()
-
-
-async def _session_last_seq(db: AsyncSession, session_id: str) -> int:
-    row = (await db.execute(
-        select(ChatSessionEvent.seq)
-        .where(ChatSessionEvent.session_id == session_id)
-        .order_by(ChatSessionEvent.seq.desc())
-        .limit(1)
-    )).scalar_one_or_none()
-    return int(row) if row else 0
-
-
-async def compact_session_events(
-    db: AsyncSession,
-    session_id: str,
-    *,
-    user: Any = None,
-    factory_id: Optional[str] = None,
-    compaction_id: Optional[str] = None,
-    fold_from: Optional[int] = None,
-    fold_to: Optional[int] = None,
-    keep_recent: int = COMPACTION_KEEP_RECENT,
-    reason: str = "manual",
-) -> Dict[str, Any]:
-    """折叠一段历史事件为一条摘要（对齐 DSH compaction bracket）。
-
-    落库三个事件（同一 compaction_id，atomic）：
-      compaction_start  → {compaction_id, fold_from, fold_to, reason}
-      compaction_summary→ {compaction_id, summary, source_event_seqs}
-      compaction_end    → {compaction_id, status, replacement_checkpoint}
-
-    锁：存在尚未闭合的 compaction_start（无对端 compaction_end）时拒绝（busy）。
-    幂等：同一 compaction_id 已应用则直接返回已有结果。
-    source_event_seqs 记录被折叠的每个源事件 seq，供 replay 校验替换覆盖全部来源。
-    """
-    session = await _get_session(db, session_id)
-    if session is None:
-        raise ChatSessionAccessError("会话不存在")
-    if user is not None:
-        user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
-        if (
-            session.user_id != user_id
-            or (factory_id is not None and session.factory_id != factory_id)
-        ):
-            raise ChatSessionAccessError("无权操作该会话")
-
-    rows = (await db.execute(
-        select(ChatSessionEvent)
-        .where(ChatSessionEvent.session_id == session_id)
-        .order_by(ChatSessionEvent.seq.asc())
-    )).scalars().all()
-
-    compaction_id = compaction_id or generate_uuid()
-
-    # 幂等：同一 compaction_id 已存在则返回其结果
-    existing = [e for e in rows if e.request_id == compaction_id]
-    if existing:
-        return {
-            "folded": True,
-            "compaction_id": compaction_id,
-            "status": "exists",
-            "seq_from": existing[0].seq,
-            "seq_to": existing[-1].seq,
-        }
-
-    # 锁：存在尚未闭合的 compaction_start（无对端 compaction_end）时拒绝
-    pending = {e.request_id for e in rows if e.event_type == "compaction_start"}
-    closed = {e.request_id for e in rows if e.event_type == "compaction_end"}
-    open_locks = pending - closed
-    if open_locks:
-        return {
-            "folded": False,
-            "compaction_id": compaction_id,
-            "status": "busy",
-            "lock_compaction_id": sorted(open_locks)[0],
-        }
-
-    # 折叠区间：普通（非 compaction_*）事件，按 seq 升序。
-    if fold_from is None or fold_to is None:
-        plain_rows = [e for e in rows if e.event_type not in (
-            "compaction_start", "compaction_summary", "compaction_end",
-        )]
-        # 自动压力门槛（对齐 DSH token-meter + threshold ratio）：
-        # 会话事件流 token 压力达到容量阈值才触发，避免小会话过早折叠可读历史。
-        if reason == "pressure":
-            from api.services.token_meter import (
-                DEFAULT_CONTEXT_WINDOW,
-                PRESSURE_THRESHOLD_RATIO,
-                measure_session_events,
-            )
-            measured = measure_session_events(plain_rows)
-            pressure_tokens = measured["total_tokens"]
-            threshold_tokens = int(DEFAULT_CONTEXT_WINDOW * PRESSURE_THRESHOLD_RATIO)
-            if pressure_tokens < threshold_tokens:
-                return {
-                    "folded": False,
-                    "compaction_id": compaction_id,
-                    "status": "no_pressure",
-                    "total_tokens": pressure_tokens,
-                    "pressure_threshold_tokens": threshold_tokens,
-                    "log_revision": measured["log_revision"],
-                }
-        # 已被先前折叠引用的事件不再重复折叠
-        already_folded = set()
-        for e in rows:
-            if e.event_type == "compaction_summary":
-                already_folded.update(e.data.get("source_event_seqs") or ())
-        foldable = [e for e in plain_rows if e.seq not in already_folded]
-        if len(foldable) <= keep_recent:
-            return {
-                "folded": False,
-                "compaction_id": compaction_id,
-                "status": "nothing_to_fold",
-                "foldable": len(foldable),
-                "keep_recent": keep_recent,
-            }
-        cut = foldable[-keep_recent - 1]
-        fold_from = foldable[0].seq
-        fold_to = cut.seq
-
-    folded = [e for e in rows if fold_from <= e.seq <= fold_to]
-    source_event_seqs = [e.seq for e in folded]
-    if not source_event_seqs:
-        return {
-            "folded": False,
-            "compaction_id": compaction_id,
-            "status": "empty_range",
-            "fold_from": fold_from,
-            "fold_to": fold_to,
-        }
-
-    summary = _build_compaction_summary(folded)
-    replacement_checkpoint = (folded[-1].seq if folded else fold_from) + 1
-
-    # 非缩小摘要拒绝（对齐 DSH non-shrinking-summary rejection）：
-    # 摘要 token 不得大于被折叠区间的 token 压力，否则压缩没有意义。
-    from api.services.token_meter import estimate_text, measure_session_events
-    folded_measured = measure_session_events(folded)
-    summary_tokens = estimate_text(summary)
-    if summary_tokens > folded_measured["surface_tokens"]:
-        return {
-            "folded": False,
-            "compaction_id": compaction_id,
-            "status": "not_shrinking",
-            "fold_from": fold_from,
-            "fold_to": fold_to,
-            "folded_tokens": folded_measured["surface_tokens"],
-            "summary_tokens": summary_tokens,
-        }
-
-    await append_session_events(db, session_id=session_id, request_id=compaction_id, events=[
-        {
-            "type": "compaction_start",
-            "data": {
-                "compaction_id": compaction_id,
-                "fold_from": fold_from,
-                "fold_to": fold_to,
-                "reason": reason,
-                "folded_tokens": folded_measured["surface_tokens"],
-            },
-        },
-        {
-            "type": "compaction_summary",
-            "data": {
-                "compaction_id": compaction_id,
-                "summary": summary,
-                "source_event_seqs": source_event_seqs,
-                "summary_tokens": summary_tokens,
-            },
-        },
-        {
-            "type": "compaction_end",
-            "data": {
-                "compaction_id": compaction_id,
-                "status": "ok",
-                "replacement_checkpoint": replacement_checkpoint,
-            },
-        },
-    ])
-    return {
-        "folded": True,
-        "compaction_id": compaction_id,
-        "status": "ok",
-        "fold_from": fold_from,
-        "fold_to": fold_to,
-        "folded_count": len(source_event_seqs),
-        "source_event_seqs": source_event_seqs,
-        "summary": summary,
-        "folded_tokens": folded_measured["surface_tokens"],
-        "summary_tokens": summary_tokens,
-    }
-
-
-def _build_compaction_summary(events: List[ChatSessionEvent]) -> str:
-    """本地降级摘要：把被折叠事件折叠为简洁要点（LLM 摘要失败时兜底）。
-
-    按 request 分组：用户消息 → 工具序列 → 回复要点。
-    """
-    by_request: Dict[str, List[str]] = {}
-    order: List[str] = []
-    for evt in events:
-        data = evt.data or {}
-        rid = evt.request_id or "-"
-        if rid not in by_request:
-            by_request[rid] = []
-            order.append(rid)
-        if evt.event_type == "user_message":
-            content = (data.get("content") or "").strip()
-            by_request[rid].append(f"问：{content[:60]}" if content else "问：（图片/附件）")
-        elif evt.event_type == "tool_call":
-            tool = data.get("tool") or data.get("label") or ""
-            ok = data.get("success", True)
-            by_request[rid].append(f"工具[{tool}]{'✓' if ok else '✗'}")
-        elif evt.event_type == "assistant_reply":
-            reply = (data.get("reply") or "").strip()
-            by_request[rid].append(f"答：{reply[:60]}" if reply else "")
-        elif evt.event_type == "context_injection":
-            src = data.get("source") or "context"
-            by_request[rid].append(f"注入({src})")
-    lines = []
-    for rid in order:
-        seg = "；".join([p for p in by_request[rid] if p])
-        if seg:
-            lines.append(seg)
-    if not lines:
-        return f"已折叠 {len(events)} 个事件"
-    summary = "；".join(lines)
-    return summary[:2000]
-
-
-async def get_trajectory(
-    db: AsyncSession,
-    session_id: str,
-    *,
-    user: Any = None,
-    factory_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """组装会话 Trajectory：按 seq 从事件流读取，并重放为节点序列。
-
-    对齐 DSH Trajectory view：事件流是唯一来源，读模型按业务折叠——
-      context_injection → 注入节点（source/label/content）
-      user_message     → 用户消息节点
-      tool_call        → 工具调用节点（tool/arguments/result 摘要）
-      assistant_reply  → 回复节点（reply/模型名/耗时）
-    """
-    session = await _get_session(db, session_id)
-    if session is None:
-        raise ChatSessionAccessError("会话不存在")
-    if user is not None:
-        user_id = str(getattr(user, "id", "")) or getattr(user, "username", "") or "anonymous"
-        if (
-            session.user_id != user_id
-            or (factory_id is not None and session.factory_id != factory_id)
-        ):
-            raise ChatSessionAccessError("无权访问该会话轨迹")
-
-    rows = (await db.execute(
-        select(ChatSessionEvent)
-        .where(ChatSessionEvent.session_id == session_id)
-        .order_by(ChatSessionEvent.seq.asc())
-    )).scalars().all()
-
-    # DSH compaction：识别 compaction_start/summary/end 三元组，
-    # 把被折叠的源事件（source_event_seqs 并集）从节点流中移除，
-    # 折叠为一条 compaction 节点（含摘要）。
-    compactions: List[Dict[str, Any]] = []
-    active: Optional[Dict[str, Any]] = None
-    for evt in rows:
-        data = evt.data or {}
-        if evt.event_type == "compaction_start":
-            active = {
-                "kind": "compaction",
-                "seq": evt.seq,
-                "request_id": evt.request_id,
-                "compaction_id": data.get("compaction_id"),
-                "fold_from": data.get("fold_from"),
-                "fold_to": data.get("fold_to"),
-                "reason": data.get("reason"),
-                "summary": "",
-                "source_event_seqs": [],
-                "folded_count": 0,
-                "status": "started",
-            }
-            compactions.append(active)
-        elif evt.event_type == "compaction_summary" and active is not None:
-            active["summary"] = data.get("summary") or ""
-            active["source_event_seqs"] = data.get("source_event_seqs") or []
-            active["folded_count"] = len(active["source_event_seqs"])
-            active["status"] = "summarized"
-        elif evt.event_type == "compaction_end" and active is not None:
-            active["status"] = "ok"
-            active["replacement_checkpoint"] = data.get("replacement_checkpoint")
-            active = None
-        elif evt.event_type in ("compaction_start", "compaction_summary", "compaction_end"):
-            active = None
-
-    # 被折叠的源事件 = 全部 compaction 的 source_event_seqs 并集
-    compacted_seqs: set = set()
-    for c in compactions:
-        compacted_seqs.update(c.get("source_event_seqs") or [])
-
-    nodes: List[Dict[str, Any]] = []
-    context_requests: Dict[str, Dict[str, Any]] = {}
-    next_compaction = 0
-    for evt in rows:
-        data = evt.data or {}
-        if evt.seq in compacted_seqs:
-            continue
-        if evt.event_type == "context_injection":
-            node = {
-                "kind": "context_injection",
-                "seq": evt.seq,
-                "request_id": evt.request_id,
-                "source": data.get("source") or "unknown",
-                "label": data.get("label") or "上下文",
-                "content": data.get("content") or "",
-            }
-            nodes.append(node)
-            context_requests.setdefault(evt.request_id, {})["injections"] = (
-                context_requests.get(evt.request_id, {}).get("injections", 0) + 1
-            )
-        elif evt.event_type == "user_message":
-            nodes.append({
-                "kind": "user_message",
-                "seq": evt.seq,
-                "request_id": evt.request_id,
-                "content": data.get("content") or "",
-            })
-        elif evt.event_type == "tool_call":
-            nodes.append({
-                "kind": "tool_call",
-                "seq": evt.seq,
-                "request_id": evt.request_id,
-                "tool": data.get("tool") or "",
-                "label": data.get("label") or data.get("tool") or "",
-                "args": data.get("args"),
-                "result": data.get("result"),
-                "success": data.get("success", True),
-                "is_write": data.get("is_write", False),
-            })
-        elif evt.event_type == "assistant_reply":
-            nodes.append({
-                "kind": "assistant_reply",
-                "seq": evt.seq,
-                "request_id": evt.request_id,
-                "reply": data.get("reply") or "",
-                "model": data.get("model"),
-                "duration_ms": data.get("duration_ms"),
-                "degraded": data.get("degraded", False),
-                "tool_count": data.get("tool_count", 0),
-            })
-        elif evt.event_type == "compaction_start":
-            if (
-                next_compaction < len(compactions)
-                and compactions[next_compaction]["source_event_seqs"]
-            ):
-                nodes.append(compactions[next_compaction])
-                next_compaction += 1
-        elif evt.event_type in ("compaction_summary", "compaction_end"):
-            pass
-
-    return {
-        "session_id": session.id,
-        "factory_id": session.factory_id,
-        "title": session.title,
-        "event_count": len(rows),
-        "nodes": nodes,
-        "injection_requests": context_requests,
-        "compactions": compactions,
-        "overview": _trajectory_overview(nodes),
-    }
-
-
-def _trajectory_overview(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """阶段导向读模型（DSH stage-oriented）：每次请求折叠为紧凑摘要。
-
-    每个 request 一条：注入 sources / 用户消息 / 工具调用序列 / 回复 / 模型 /
-    耗时 / 是否降级。Overview 不复制原始事件，仅引用折叠后的阶段事实。
-    """
-    by_request: Dict[str, Dict[str, Any]] = {}
-    order: List[str] = []
-    for node in nodes:
-        rid = node.get("request_id") or "-"
-        if rid not in by_request:
-            by_request[rid] = {
-                "request_id": rid,
-                "seq_from": node["seq"],
-                "seq_to": node["seq"],
-                "injections": [],
-                "user_message": None,
-                "tools": [],
-                "tool_count": 0,
-                "reply": None,
-                "model": None,
-                "duration_ms": None,
-                "degraded": False,
-            }
-            order.append(rid)
-        stage = by_request[rid]
-        stage["seq_from"] = min(stage["seq_from"], node["seq"])
-        stage["seq_to"] = max(stage["seq_to"], node["seq"])
-        kind = node.get("kind")
-        if kind == "context_injection":
-            stage["injections"].append({
-                "source": node.get("source"),
-                "label": node.get("label"),
-            })
-        elif kind == "user_message":
-            stage["user_message"] = node.get("content")
-        elif kind == "tool_call":
-            stage["tools"].append({
-                "tool": node.get("tool"),
-                "label": node.get("label") or node.get("tool"),
-                "success": node.get("success", True),
-                "is_write": node.get("is_write", False),
-            })
-            stage["tool_count"] += 1
-        elif kind == "assistant_reply":
-            stage["reply"] = node.get("reply")
-            stage["model"] = node.get("model")
-            stage["duration_ms"] = node.get("duration_ms")
-            stage["degraded"] = node.get("degraded", False)
-        elif kind == "compaction":
-            stage["compaction"] = True
-            stage["summary"] = node.get("summary")
-            stage["fold_from"] = node.get("fold_from")
-            stage["fold_to"] = node.get("fold_to")
-            stage["folded_count"] = len(node.get("source_event_seqs") or [])
-            stage["reason"] = node.get("reason")
-
-    out = [by_request[r] for r in order]
-    # 工具序列简化为名称列表（前端可直接展示），保留完整数组供展开。
-    for stage in out:
-        stage["tool_sequence"] = [t["tool"] for t in stage["tools"]]
-    return out

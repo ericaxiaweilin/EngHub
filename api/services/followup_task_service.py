@@ -15,9 +15,7 @@ import asyncio
 import json
 import logging
 import os
-import re
 import uuid
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
@@ -35,8 +33,6 @@ SCAN_BATCH_SIZE = 5
 FOLLOW_MAX_TOOL_ROUNDS = 4
 
 FOLLOWUP_STATUSES = {"open", "blocked", "done", "cancelled"}
-# blocked 冷却重试间隔（分钟）：达 max_follows 后隔这么久自动恢复跟进，避免永久卡死
-_BLOCKED_RETRY_MINUTES = max(30, int(os.getenv("FOLLOWUP_BLOCKED_RETRY_MINUTES", "360")))
 # 统一待办条目类型：AI跟进 / 他人指派 / 会议纪要 / 邮件 / 备忘
 ITEM_TYPES = {"followup", "assigned", "meeting", "email", "note"}
 
@@ -103,20 +99,7 @@ async def get_task_logs(db: AsyncSession, task_id: str, limit: int = 50) -> List
         ORDER BY created_at DESC
         LIMIT :limit
     """), {"tid": task_id, "limit": limit})
-    items = []
-    for r in result.fetchall():
-        item = dict(r._mapping)
-        # 清洗 note：JSON 原文 → 人类可读（防前端泄漏 {"progress_pct":75,...}）
-        raw = str(item.get("note") or "")
-        if raw.strip().startswith("{") and raw.rstrip().endswith("}"):
-            try:
-                d = json.loads(raw)
-                if isinstance(d, dict) and d.get("note"):
-                    item["note"] = str(d["note"]).strip()[:300]
-            except Exception:
-                pass
-        items.append(item)
-    return items
+    return [dict(r._mapping) for r in result.fetchall()]
 
 
 async def create_task(
@@ -152,24 +135,6 @@ async def create_task(
         from api.services.quick_command_service import classify_command
         classified = await classify_command(f"{title} {description}".strip())
         agent_key = classified.get("agent_key")
-
-    # 多租户校正：从工单号探测真实归属厂区（防止调用方传错厂区导致任务挂错厂）
-    if factory_id:
-        import re as _re
-        _m = _re.search(r"(WO-[\w\-]+)", title or "")
-        if _m:
-            try:
-                _row = (await db.execute(text(
-                    "SELECT factory_id FROM work_orders WHERE work_order_code = :c LIMIT 1"
-                ), {"c": _m.group(1)})).mappings().first()
-                if _row and _row["factory_id"] and str(_row["factory_id"]) != str(factory_id):
-                    _logger.info(
-                        "[followup] 任务厂区校正 %s -> %s (工单 %s 真实归属)",
-                        factory_id, _row["factory_id"], _m.group(1),
-                    )
-                    factory_id = str(_row["factory_id"])
-            except Exception:
-                pass
 
     task_id = _gen_id()
     await db.execute(text("""
@@ -436,255 +401,14 @@ FOLLOWUP_PROMPT = (
     "你是 EngHub MES 任务中心的跟进执行器。下面是一个此前无法一次完成、挂账跟进的任务。\n"
     "请调用工具核实当前最新状态，然后只输出 JSON（不要多余文字）：\n"
     '{"progress_pct": 0-100 整数, "state": "open|blocked|done", '
-    '"note": "本次跟进结论（150字内，说明当前进展/仍受阻原因/完成依据）", '
-    '"blocked_by": "卡在谁那里（责任人/部门/供应商/环节名，如：供应商A、采购部、设备维修组、计划员张三；无则空串）", '
-    '"block_category": "受阻原因类别（material=缺料/物料、supplier=供应商交付、approval=待审批、equipment=设备、staff=人员、data=数据异常、other=其他；无则空串）"}\n'
-    "判定规则：任务目标已达成→done；仍在等待外部条件（物料/审批/设备/供应商）→blocked，"
-    "**blocked 时必须给出 blocked_by 和 block_category，像人类员工汇报一样说清楚卡在谁那里、什么原因**；"
+    '"note": "本次跟进结论（150字内，说明当前进展/仍受阻原因/完成依据）"}\n'
+    "判定规则：任务目标已达成→done；仍在等待外部条件（物料/审批/设备/供应商）→blocked；"
     "有进展但未完成→open。note 必须基于工具返回的真实数据，禁止编造。"
 )
 
 
-async def _detect_task_done(db: AsyncSession, task: Dict[str, Any], messages: List[Dict[str, Any]]) -> str:
-    """确定性判定任务目标是否已达成（基于工具真实结果，不依赖模型输出）。
-
-    支持类型：
-    - 采购补货/缺料类（title 含 缺料/补货）：工具返回 shortage_count=0 且无缺料项 → done
-    - 工单推进类（title 含 工单/完工/进度）：工单状态 completed → done
-    返回达成证据文本；未达成返回空串。
-    """
-    title = str(task.get("title") or "")
-    is_shortage = ("缺料" in title) or ("补货" in title) or ("采购" in title)
-    is_work_order = ("工单" in title) or ("ORDER_REVIEW" in title) or ("MATERIAL_KITTING" in title)
-    evidence = []
-
-    # 标题带"可用 X < 在制需求 Y" → 提取物料号，DB 校验真实库存仍缺才不 done
-    # （库存已补足则允许按正常逻辑判定；库存仍缺则保持 blocked）
-    if is_shortage and "可用" in title and "<" in title and "需求" in title:
-        try:
-            m_mat = re.search(r"缺料[:：]\s*([\w\-]+)", title)
-            m_num = re.findall(r"(\d+(?:\.\d+)?)", title)
-            if m_mat and len(m_num) >= 2:
-                need = float(m_num[1])
-                row_inv = (await db.execute(text(
-                    "SELECT COALESCE(SUM(available_qty), 0) AS avail FROM inventory "
-                    "WHERE material_code = :m"
-                ), {"m": m_mat.group(1)})).mappings().first()
-                if row_inv and float(row_inv["avail"] or 0) < need:
-                    return ""
-        except Exception:
-            pass
-
-    # 缺料类任务：先从标题提取目标物料号，后续判定必须针对该物料真实库存
-    target_material = ""
-    if is_shortage:
-        m = re.search(r"缺料[:：]\s*([\w\-]+)", title)
-        if m:
-            target_material = m.group(1).strip()
-        # 也支持"缺料 X，请处理/加急"格式（无数字比较）
-        if not target_material:
-            m2 = re.search(r"缺料\s+([\w\-]+)", title)
-            if m2:
-                target_material = m2.group(1).strip()
-
-    for msg in messages:
-        if msg.get("role") != "tool":
-            continue
-        raw = str(msg.get("content") or "")
-        try:
-            data = json.loads(raw)
-        except Exception:
-            data = {}
-        if not isinstance(data, dict):
-            continue
-        # 工单完成
-        if is_work_order and isinstance(data, dict):
-            st = data.get("status") or data.get("state") or ""
-            if str(st).lower() in ("completed", "done", "closed"):
-                evidence.append(f"工单状态 {st}")
-            work_order = data.get("work_order") or {}
-            if isinstance(work_order, dict) and str(work_order.get("status") or "").lower() in ("completed", "done", "closed"):
-                evidence.append(f"工单 {work_order.get('work_order_code')} 状态 {work_order.get('status')}")
-            continue
-        # 缺料类：物料级校验（必须证明目标物料真实可用）
-        if is_shortage:
-            # 1) inventory 结果：目标物料可用量必须 >= 标题需求数量才算补上
-            #    （"可用 X < 在制需求 Y" 的 Y；无需求信息时按 >0）
-            inv = data.get("inventory") if isinstance(data.get("inventory"), list) else None
-            if inv and target_material:
-                need_qty = None
-                m_need = re.search(r"在制需求\s*([\d.]+)", title)
-                if m_need:
-                    need_qty = float(m_need.group(1))
-                for item in inv:
-                    if str(item.get("material_code") or "") == target_material:
-                        avail = float(item.get("available_qty") or 0)
-                        if need_qty is not None:
-                            if avail >= need_qty:
-                                evidence.append(f"物料 {target_material} 库存可用 {avail}（需求 {need_qty}）")
-                        else:
-                            if avail > 0:
-                                evidence.append(f"物料 {target_material} 库存可用 {avail}")
-                        break
-            # 2) 采购到货/PO 入库证据：material 字段匹配目标物料
-            items = data.get("items") if isinstance(data.get("items"), list) else None
-            if items and target_material:
-                for item in items:
-                    code = str(item.get("material_code") or item.get("code") or item.get("material_id") or "")
-                    if code == target_material:
-                        if str(item.get("status") or "").lower() in ("received", "arrived", "completed", "in_stock"):
-                            evidence.append(f"物料 {target_material} 已到货入库")
-                        break
-    if evidence:
-        return "；".join(evidence[:3])
-    return ""
-
-
-async def _is_procurement_shortage(db: AsyncSession, task: Dict[str, Any], messages: List[Dict[str, Any]], factory_id: Optional[str] = None) -> bool:
-    """判断采购任务当前是否有真实缺料（基于工具结果 + DB 零库存兜底，确定性）。"""
-    for msg in messages:
-        if msg.get("role") != "tool":
-            continue
-        raw = str(msg.get("content") or "")
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        if "shortage_count" in data and int(data.get("shortage_count") or 0) > 0:
-            return True
-        inv = data.get("inventory") if isinstance(data.get("inventory"), list) else None
-        if inv:
-            for item in inv:
-                if float(item.get("available_qty") or 0) <= 0:
-                    return True
-    # 兜底：DB 直查零库存物料（缺料预警可能因在途PO而消失，但任务未闭环时仍算缺料场景）
-    try:
-        zero = (await db.execute(text(
-            "SELECT count(*) FROM inventory WHERE factory_id = :f AND available_qty <= 0"
-        ), {"f": factory_id})).scalar_one()
-        return zero > 0
-    except Exception:
-        return False
-
-
-async def _run_procurement_action_chain(db: AsyncSession, factory_id: Optional[str]) -> List[Dict[str, Any]]:
-    """采购动作链确定性执行：查管道 → 对缺料物料建申请 → 指派供应商 → 转PO。
-    返回动作日志（最多处理 3 个缺料物料，避免一次跑太多）。"""
-    from api.services.chat_tools_service import execute_tool as _exec
-    fid = factory_id or "FAC_MECH_001"
-    actions: List[Dict[str, Any]] = []
-    try:
-        # 1) 缺料清单（shortage_alerts）
-        alerts = await _exec(db, "query_shortage_alerts", {"limit": 3}, operator="procurement", factory_id=fid)
-        items = alerts.get("items") or []
-        shortage_materials = []
-        for it in items[:3]:
-            code = it.get("material_code") or it.get("material_id") or ""
-            if code:
-                shortage_materials.append({"code": code, "name": it.get("material_name") or code,
-                                           "qty": float(it.get("shortage_qty") or it.get("required_qty") or 1)})
-        # 缺料工具无明细时，DB 直查库存为 0 的物料兜底（确定性）
-        if not shortage_materials:
-            zero_rows = (await db.execute(text(
-                "SELECT material_code, material_name, available_qty FROM inventory "
-                "WHERE factory_id = :f AND available_qty <= 0 "
-                "GROUP BY material_code, material_name, available_qty "
-                "ORDER BY available_qty ASC LIMIT 3"
-            ), {"f": fid})).mappings().all()
-            for r in zero_rows:
-                shortage_materials.append({"code": r["material_code"], "name": r["material_name"] or r["material_code"],
-                                           "qty": 10})
-        for mat in shortage_materials:
-            code, name, qty = mat["code"], mat["name"], mat["qty"]
-            # 2) 查管道：已有在途采购 → 对比交期是否来得及（交期冲突=生死线）
-            pipe = await _exec(db, "query_purchase_pipeline", {"material_code": code},
-                               operator="procurement", factory_id=fid)
-            if pipe.get("purchase_orders_count", 0) > 0:
-                # 在途 PO 交期 vs 需求日期（任务关联工单的 planned_start，无则取今天+3天兜底）
-                need_date = datetime.utcnow().date() + timedelta(days=3)
-                try:
-                    _wo = (await db.execute(text(
-                        "SELECT MIN(planned_start) AS need_dt FROM work_orders "
-                        "WHERE status IN ('in_progress','pending') AND planned_start IS NOT NULL"
-                    ))).mappings().first()
-                    if _wo and _wo["need_dt"]:
-                        need_date = _wo["need_dt"].date() if hasattr(_wo["need_dt"], "date") else _wo["need_dt"]
-                except Exception:
-                    pass
-                # 检查在途 PO 交期
-                conflict = False
-                po_eta = None
-                for po in (pipe.get("purchase_orders") or []):
-                    eta = po.get("expected_date")
-                    if eta:
-                        try:
-                            eta_d = eta.date() if hasattr(eta, "date") else eta
-                            if eta_d > need_date:
-                                conflict = True
-                                po_eta = eta_d
-                                break
-                        except Exception:
-                            continue
-                if conflict:
-                    actions.append({"step": "conflict", "material": code,
-                                    "reason": f"在途PO交期 {po_eta} 晚于需求 {need_date}（交期冲突，需升级RCC）"})
-                else:
-                    actions.append({"step": "skip", "material": code, "reason": "已有在途PO且交期满足"})
-                continue
-            # 3) 建申请
-            pr = await _exec(db, "create_purchase_requisition",
-                             {"material_code": code, "material_name": name, "required_qty": qty, "urgency": "critical"},
-                             operator="procurement", factory_id=fid)
-            pr_id = pr.get("pr_id")
-            actions.append({"step": "requisition", "material": code, "qty": qty, "pr_id": str(pr_id) if pr_id else None})
-            if not pr_id:
-                continue
-            # 4) 指派供应商
-            assign = await _exec(db, "assign_supplier_to_pr", {"pr_id": str(pr_id)},
-                                 operator="procurement", factory_id=fid)
-            actions.append({"step": "assign", "supplier": assign.get("supplier_name"), "status": assign.get("status")})
-            if assign.get("error"):
-                continue
-            # 5) 转PO
-            po = await _exec(db, "create_purchase_order", {"pr_id": str(pr_id)},
-                             operator="procurement", factory_id=fid)
-            actions.append({"step": "purchase_order", "po_code": po.get("po_code"), "status": po.get("status"),
-                            "supplier": po.get("supplier_name")})
-        return actions
-    except Exception as exc:  # noqa: BLE001
-        actions.append({"step": "error", "detail": f"{type(exc).__name__}: {str(exc)[:100]}"})
-        return actions
-
-
-def _clean_xml_tags(text: str) -> str:
-    """剥离模型 content 里残留的 XML 工具调用标签（tool_call/invoke/function/parameter 等），
-    与 chat_routes._clean_model_reply 同源逻辑，供跟进结论解析前清理。"""
-    if not text:
-        return text
-    import re as _re
-    t = text
-    # 1) 完整块
-    t = _re.sub(r"<tool_call\b[^>]*>.*?</tool_call>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
-    t = _re.sub(r"<(?:antml:)?invoke\b[^>]*>.*?</(?:antml:)?invoke>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
-    t = _re.sub(r"<antml:parameter\b[^>]*>.*?</antml:parameter>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
-    # 2) 残留单标签
-    t = _re.sub(r"</?tool_call\b[^>]*>", " ", t, flags=_re.IGNORECASE)
-    t = _re.sub(r"</?(?:antml:)?invoke\b[^>]*>", " ", t, flags=_re.IGNORECASE)
-    t = _re.sub(r"</?function\b[^>]*>", " ", t, flags=_re.IGNORECASE)
-    t = _re.sub(r"</?parameter\b[^>]*>", " ", t, flags=_re.IGNORECASE)
-    t = _re.sub(r"<parameter=[^>]*>.*?</parameter>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
-    t = _re.sub(r"<result>.*?</result>", " ", t, flags=_re.DOTALL | _re.IGNORECASE)
-    # 3) 清理多余空白
-    t = _re.sub(r"\s+", " ", t).strip()
-    return t
-
-
 def _parse_follow_reply(reply: str) -> Dict[str, Any]:
     """从模型回复中提取跟进结论 JSON，解析失败时降级为纯文本结论。"""
-    if reply:
-        reply = _clean_xml_tags(reply)
     try:
         start, end = reply.find("{"), reply.rfind("}")
         if start >= 0 and end > start:
@@ -694,17 +418,8 @@ def _parse_follow_reply(reply: str) -> Dict[str, Any]:
                 state = "open"
             pct = max(0, min(100, int(data.get("progress_pct") or 0)))
             note = str(data.get("note") or "").strip()[:1000]
-            blocked_by = str(data.get("blocked_by") or "").strip()[:100]
-            block_category = str(data.get("block_category") or "").strip().lower()[:30]
-            if block_category not in {"material", "supplier", "approval", "equipment", "staff", "data", "other"}:
-                block_category = ""
-            out = {"state": state, "progress_pct": pct, "note": note}
-            if blocked_by:
-                out["blocked_by"] = blocked_by
-            if block_category:
-                out["block_category"] = block_category
             if note:
-                return out
+                return {"state": state, "progress_pct": pct, "note": note}
     except (ValueError, TypeError, json.JSONDecodeError):
         pass
     return {"state": "open", "progress_pct": 0, "note": (reply or "跟进无有效结论").strip()[:1000]}
@@ -756,61 +471,30 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
         }
         reply = ""
         for _ in range(FOLLOW_MAX_TOOL_ROUNDS):
-            # 超时钳制：模型栈路由默认 30s 对工具链跟进太紧（ReadTimeout 频发），下限 90s
-            resp = await _call_llm(payload, request_timeout=max(90.0, route["request_timeout"]))
-            # 429 限流 → 退避重试（最多3次，限流是暂时的，重试可恢复）
-            for _retry in range(3):
-                if resp.status_code != 429:
-                    break
-                await asyncio.sleep(3 * (_retry + 1))
-                resp = await _call_llm(payload, request_timeout=max(90.0, route["request_timeout"]))
+            resp = await _call_llm(payload, request_timeout=route["request_timeout"])
             if resp.status_code >= 400:
                 reply = f"网关返回 {resp.status_code}，本次跟进未获结论"
                 break
             data = resp.json()
             message = (data.get("choices", [{}])[0] or {}).get("message", {}) or {}
             tool_calls = message.get("tool_calls") or []
-            content_text = message.get("content") or ""
-            # XML 兜底：模型（agnes 系）间歇性把工具调用写成 XML 标签而非 tool_calls 字段，
-            # 复用 AgentLoop 的解析器转成真实调用，否则 XML 当文本 → 结论被污染 → 反复跟进无结论。
-            if not tool_calls and content_text:
-                try:
-                    from core.kernel.agent_loop import _parse_xml_tool_calls
-                    xml_calls = _parse_xml_tool_calls(content_text)
-                    if xml_calls:
-                        tool_calls = xml_calls
-                except Exception:
-                    tool_calls = []
             if not tool_calls:
-                reply = content_text
+                reply = message.get("content") or ""
                 break
-            messages.append({"role": "assistant", "content": content_text, "tool_calls": tool_calls})
+            messages.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": tool_calls})
             for tc in tool_calls:
                 fn = tc.get("function", {}) or {}
                 tool_name = fn.get("name", "")
-                # 定期跟进只做核实，不做写操作（写操作必须由用户在对话里明确触发）。
-                # 例外：采购智能体的采购动作链（建申请/指派供应商/转PO/跟催）是本职动作，
-                # 允许自主推进——否则采购智能体永远只能查状态，无法自主规划采购流程。
-                PROCUREMENT_ACTION_TOOLS = {
-                    "create_purchase_requisition", "assign_supplier_to_pr",
-                    "create_purchase_order", "query_purchase_pipeline",
-                    "query_purchase_order_progress",
-                }
-                is_procurement_action = (
-                    task.get("agent_key") == "procurement_agent"
-                    and tool_name in PROCUREMENT_ACTION_TOOLS
-                )
-                if tool_name in WRITE_TOOLS and not is_procurement_action:
+                # 定期跟进只做核实，不做写操作（写操作必须由用户在对话里明确触发）
+                if tool_name in WRITE_TOOLS:
                     result: Dict[str, Any] = {"error": "任务中心定期跟进为只读核实，不执行写操作"}
                 else:
                     try:
                         arguments = json.loads(fn.get("arguments") or "{}")
                     except (json.JSONDecodeError, TypeError):
                         arguments = {}
-                    # 数字员工身份闭环：采购智能体以 procurement 账户身份执行工具
-                    follow_operator = "procurement" if task.get("agent_key") == "procurement_agent" else "task_center"
                     result = await execute_tool(db, tool_name, arguments,
-                                                operator=follow_operator, factory_id=factory_id)
+                                                operator="task_center", factory_id=factory_id)
                 messages.append({
                     "role": "tool", "tool_call_id": tc.get("id", ""),
                     "content": json.dumps(result, ensure_ascii=False, default=str)[:4000],
@@ -818,107 +502,6 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
             payload["messages"] = messages
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
-
-            # ── 目标达成检测（确定性，不依赖模型输出）──
-            # 采购补货类任务：工具结果证明缺料已清零 → 直接 done，避免模型贪心继续查工具
-            # 而永不输出结论（agnes 系模型在 tools 被 pop 后倾向继续输出 XML 工具标签）。
-            done_evidence = await _detect_task_done(db, task, messages)
-            if done_evidence:
-                reply = json.dumps(
-                    {"state": "done", "progress_pct": 100,
-                     "note": f"经 MES 工具复核（确定性判定）：{done_evidence}。任务目标达成，闭环。"},
-                    ensure_ascii=False,
-                )
-                break
-
-            # ── 采购动作链确定性推进（自主规划，不依赖模型）──
-            # 采购补货类任务且工具结果显示真实缺料 → 自动执行动作链：
-            # 查管道 → 为缺料物料建采购申请 → 指派供应商 → 转采购订单 → 跟催。
-            # 动作链是确定性动作，执行后直接生成结论（不再依赖模型输出，避免
-            # agnes 在 tools 被 pop 后输出 XML 导致"无有效结论"）。
-            if task.get("agent_key") == "procurement_agent":
-                # 双向确定性判定：
-                # ① 物料已补齐（库存≥需求）→ 直接 done 闭环（模型无结论也不卡）
-                # ② 仍缺料 → 执行采购动作链推进
-                if not await _is_procurement_shortage(db, task, messages, factory_id):
-                    _tm = re.search(r"缺料[:：\s]*([\w\-]+)", str(task.get("title") or ""))
-                    if _tm:
-                        _inv2 = (await db.execute(text(
-                            "SELECT COALESCE(SUM(available_qty),0) AS avail FROM inventory WHERE material_code=:m"
-                        ), {"m": _tm.group(1)})).mappings().first()
-                        if _inv2 and float(_inv2["avail"] or 0) > 0:
-                            reply = json.dumps({
-                                "state": "done", "progress_pct": 100,
-                                "note": f"确定性判定：物料 {_tm.group(1)} 库存 {_inv2['avail']} 已补齐"
-                                        f"（在途PO到货/加急处理完成），任务目标达成，闭环。",
-                            }, ensure_ascii=False)
-                            break
-                action_log = await _run_procurement_action_chain(db, factory_id)
-                if action_log:
-                    messages.append({
-                        "role": "tool", "tool_call_id": f"auto-{len(messages)}",
-                        "content": json.dumps({"type": "procurement_action_chain", "actions": action_log},
-                                              ensure_ascii=False)[:4000],
-                    })
-                    steps = []
-                    has_conflict = False
-                    for a in action_log:
-                        if a.get("step") == "requisition":
-                            steps.append(f"物料 {a.get('material')} 生成采购申请(PR {str(a.get('pr_id'))[:8]}…)")
-                        elif a.get("step") == "assign":
-                            steps.append(f"指派供应商 {a.get('supplier')}")
-                        elif a.get("step") == "purchase_order":
-                            steps.append(f"转采购订单 {a.get('po_code')}")
-                        elif a.get("step") == "skip":
-                            steps.append(f"{a.get('material')} 已有在途采购，不重复下单")
-                        elif a.get("step") == "conflict":
-                            has_conflict = True
-                            steps.append(f"⚠ {a.get('material')} 交期冲突：{a.get('reason')}")
-                    pct = min(90, int(task.get("progress_pct") or 0) + 15)
-                    # 等待 PO 到货 = 受阻于供应商交付 → blocked（触发 RCC 调度申请），
-                    # 不是 open：open 不会进入 RCC 资源调度流，数字员工闭环断在采购环节。
-                    if has_conflict:
-                        reply = json.dumps({
-                            "state": "blocked", "progress_pct": pct,
-                            "note": "采购动作链发现交期冲突：" + ("；".join(steps) if steps else "")
-                                    + "。在途 PO 无法满足需求日期，已升级 RCC 资源调度（需重新排产或加急采购）。",
-                            "blocked_by": "计划/生产", "block_category": "approval",
-                        }, ensure_ascii=False)
-                    else:
-                        reply = json.dumps({
-                            "state": "blocked", "progress_pct": pct,
-                            "note": "采购动作链已推进：" + ("；".join(steps) if steps else "核实缺料并执行采购动作")
-                                    + "。PO 已下单，等待到货后自动闭环（受阻于供应商交付）。",
-                            "blocked_by": "供应商", "block_category": "supplier",
-                        }, ensure_ascii=False)
-                    break
-
-        # ── 采购任务确定性终判（模型没调工具/无结论时兜底）──
-        # 模型直接输出结论但未调工具 → 循环空转，这里按 DB 真实状态终判
-        if task.get("agent_key") == "procurement_agent":
-            _title = str(task.get("title") or "")
-            _tm = (re.search(r"缺料[:：\s]*([\w\-]+)", _title)
-                   or re.search(r"物料[:：\s]*([\w\-]+)\s*缺料", _title)
-                   or re.search(r"物料\s+([\w\-]+)\s*缺料", _title)
-                   or re.search(r"缺料\s+([\w\-]+)", _title))
-            if _tm and "done" not in str(reply):
-                _inv3 = (await db.execute(text(
-                    "SELECT COALESCE(SUM(available_qty), 0) AS avail FROM inventory WHERE material_code = :m"
-                ), {"m": _tm.group(1)})).mappings().first()
-                if _inv3 and float(_inv3["avail"] or 0) > 0:
-                    reply = json.dumps({
-                        "state": "done", "progress_pct": 100,
-                        "note": f"确定性判定：物料 {_tm.group(1)} 库存 {_inv3['avail']} 已补齐，"
-                                f"任务目标达成，闭环。",
-                    }, ensure_ascii=False)
-                else:
-                    # 仍缺料 → 纯 DB 结论 blocked（在途PO/待补货），触发 RCC 调度申请
-                    reply = json.dumps({
-                        "state": "blocked", "progress_pct": min(90, int(task.get("progress_pct") or 0) + 10),
-                        "note": f"确定性判定：物料 {_tm.group(1)} 库存仍不足（{_inv3['avail']}），"
-                                f"等待采购/到货解决，保持受阻并已提交 RCC 资源调度。",
-                        "blocked_by": "供应商", "block_category": "supplier",
-                    }, ensure_ascii=False)
         conclusion = _parse_follow_reply(reply)
     except Exception as exc:  # noqa: BLE001 — 单任务跟进失败不能拖垮扫描循环
         _logger.warning("followup run failed for %s: %s", task_id, exc)
@@ -927,145 +510,35 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
 
     new_status = "done" if conclusion["state"] == "done" else conclusion["state"]
     follow_count = int(task.get("follow_count") or 0) + 1
-
-    # 缺料确认守卫：标题声明缺料且 DB 校验真实仍缺（可用 < 需求）→ 强制 blocked，
-    # 不因模型"无结论/open"而放行；blocked 会触发 RCC 资源调度申请。
-    if new_status != "blocked":
-        try:
-            _t = str(task.get("title") or "")
-            if ("缺料" in _t) and "可用" in _t and "<" in _t and "需求" in _t:
-                _m = (re.search(r"缺料[:：]\s*([\w\-]+)", _t)
-                      or re.search(r"物料[:：]\s*([\w\-]+)\s*缺料", _t))
-                _nums = re.findall(r"(\d+(?:\.\d+)?)", _t)
-                if _m and len(_nums) >= 2:
-                    _need = float(_nums[1])
-                    _inv = (await db.execute(text(
-                        "SELECT COALESCE(SUM(available_qty), 0) AS avail FROM inventory WHERE material_code = :m"
-                    ), {"m": _m.group(1)})).mappings().first()
-                    if _inv and float(_inv["avail"] or 0) < _need:
-                        new_status = "blocked"
-                        conclusion["state"] = "blocked"
-                        conclusion["note"] = (
-                            f"缺料确认：物料 {_m.group(1)} 库存 {float(_inv['avail'] or 0)} < 需求 {_need}，"
-                            f"仍未补齐，保持受阻并已提交 RCC 资源调度申请。"
-                        )
-        except Exception:
-            pass
-
-    # 设备故障守卫：设备智能体任务标题含设备号 → 查设备 broken/fault → 强制 blocked（触发 RCC 维修调度）
-    if new_status != "blocked" and task.get("agent_key") == "equipment_agent":
-        try:
-            _em = re.search(r"(EQ-[\w\-]+)", str(task.get("title") or ""))
-            if _em:
-                _eq = (await db.execute(text(
-                    "SELECT status FROM equipment WHERE equipment_code = :ec"
-                ), {"ec": _em.group(1)})).mappings().first()
-                if _eq and _eq["status"] in ("broken", "fault", "maintenance"):
-                    new_status = "blocked"
-                    conclusion["state"] = "blocked"
-                    conclusion["note"] = (
-                        f"设备故障确认：{_em.group(1)} 状态 {_eq['status']}，未恢复，"
-                        f"保持受阻并已提交 RCC 维修调度。"
-                    )
-        except Exception:
-            pass
-
-    # 审批守卫：标题含"审批/待批准"且任务初始 blocked → 保持 blocked（审批未完成前不放行）
-    if new_status != "blocked":
-        _t2 = str(task.get("title") or "")
-        if ("审批" in _t2 or "待批准" in _t2 or "待审批" in _t2) and task.get("status") == "blocked":
-            new_status = "blocked"
-            conclusion["state"] = "blocked"
-            conclusion["note"] = "审批未完成：任务等待审批人批准，保持受阻并已提交 RCC 审批升级。"
     reached_limit = follow_count >= int(task.get("max_follows") or 60) and new_status not in {"done"}
     if reached_limit:
         new_status = "blocked"
-        # 冷却后自动恢复（BLOCKED_RETRY_MINUTES 默认 360=6h）：不清空计数，但重排 next_follow_at，
-        # 让 scanner 重新接管，避免"卡死到天荒地老只等人工"。人工也可随时解锁。
-        conclusion["note"] += "（已达最大跟进次数，进入冷却期，将自动恢复重试）"
-
-    # 受阻归因：blocked 时记录卡点（卡在谁那里 + 原因类别），像人类员工汇报一样
-    blocked_by = conclusion.get("blocked_by", "") if new_status == "blocked" else ""
-    block_category = conclusion.get("block_category", "") if new_status == "blocked" else ""
-    if new_status != "blocked":
-        blocked_by = ""
-        block_category = ""
-
-    # ── 智能体 → RCC：任务受阻时自动向 RCC 资源调度中心提交调度申请 ──
-    # 缺料→资源调度(material)、设备→equipment、审批→approval；已有该任务的 RCC 申请则不重复。
-    if new_status == "blocked":
-        try:
-            from sqlalchemy import text as _rt
-            # 查 RCC 组织（当前工厂）
-            rcc_org = (await db.execute(_rt(
-                "SELECT ou.id FROM org_units ou WHERE ou.factory_id = :f AND ou.code LIKE 'RCC-%' LIMIT 1"
-            ), {"f": factory_id})).mappings().first()
-            if rcc_org:
-                org_id = str(rcc_org["id"])
-                # 查是否已有该任务的 RCC 申请
-                exist = (await db.execute(_rt(
-                    "SELECT count(*) FROM rcc_tasks WHERE request_context->>'followup_task_id' = :tid AND status IN ('pending','approved','executing')"
-                ), {"tid": task_id})).scalar_one()
-                if not exist:
-                    task_type = {"material": "resource_allocation", "supplier": "supplier_followup",
-                                 "equipment": "equipment_maintenance", "approval": "approval",
-                                 "staff": "manpower", "data": "data_fix"}.get(block_category, "resource_allocation")
-                    rcc_code = f"RCC-{str(uuid.uuid4())[:8].upper()}"
-                    rcc_task_id = str(uuid.uuid4())
-                    await db.execute(_rt(
-                        "INSERT INTO rcc_tasks (id, task_code, org_unit_id, factory_id, task_type, title, description, "
-                        "affected_params, affected_entities, expected_impact_summary, status, requested_by, "
-                        "request_context, created_at, updated_at) "
-                        "VALUES (:id, :code, :org, :fid, :tt, :title, :desc, '[]'::jsonb, :ents, :impact, 'pending', "
-                        ":req, :ctx, NOW(), NOW())"
-                    ), {
-                        "id": rcc_task_id, "code": rcc_code, "org": org_id, "fid": factory_id, "tt": task_type,
-                        "title": f"[任务受阻] {task['title'][:80]}",
-                        "desc": str(conclusion.get("note") or "")[:500],
-                        "ents": json.dumps([{"type": "followup_task", "id": task_id}], ensure_ascii=False),
-                        "impact": f"任务受阻于 {blocked_by or '未知'}（{block_category}），需 RCC 调度资源解决",
-                        "req": "followup_agent", "ctx": json.dumps({"followup_task_id": task_id}, ensure_ascii=False),
-                    })
-                    await db.commit()
-        except Exception:
-            pass  # RCC 提交失败不影响任务主体流程
+        conclusion["note"] += "（已达最大跟进次数，暂停自动跟进，请人工处理）"
 
     await db.execute(text("""
         UPDATE followup_tasks
         SET status = :st, progress_pct = :pct, last_follow_at = NOW(), last_follow_note = :note,
             follow_count = :fc, updated_at = NOW(),
-            blocked_by = :bb, block_category = :bc,
             next_follow_at = CASE WHEN :active
-                THEN NOW() + make_interval(mins => :retry_min) ELSE NULL END,
+                THEN NOW() + make_interval(mins => follow_interval_minutes) ELSE NULL END,
             result_summary = CASE WHEN :done THEN :note ELSE result_summary END,
             closed_at = CASE WHEN :done THEN NOW() ELSE closed_at END
         WHERE id = :id
     """), {
-        # 注意：同一命名参数禁止跨类型上下文复用（:st 赋值 varchar 列 vs 与 text 字面量比较），
-        # asyncpg 会报 AmbiguousParameterError 并毒化事务（实测任务中心每分钟报错 2270+ 次）。
-        # 状态比较一律用布尔参数 :done，不与 :st 复用。
         "st": new_status, "pct": conclusion["progress_pct"], "note": conclusion["note"],
-        "fc": follow_count, "active": new_status in ("open", "blocked") and not (reached_limit and new_status != "blocked"),
-        "retry_min": _BLOCKED_RETRY_MINUTES if reached_limit else int(task.get("follow_interval_minutes") or 30),
+        "fc": follow_count, "active": new_status == "open" and not reached_limit,
         "done": new_status == "done", "id": task_id,
-        "bb": blocked_by, "bc": block_category,
     })
     await _append_log(db, task_id, factory_id, trigger_type,
                       conclusion["note"], new_status, conclusion["progress_pct"], "system")
 
-    # 状态推进 / 完成 / 受阻 → 通知任务所有人（含数字员工账户）
+    # 状态推进 / 完成 / 受阻 → 通知任务所有人
     if new_status == "done":
         await _notify(db, factory_id, task["created_by"],
                       f"任务已完成：{task['title']}", conclusion["note"], "info")
-        if task.get("agent_key") == "procurement_agent":
-            await _notify(db, factory_id, "procurement",
-                          f"任务已完成：{task['title']}", conclusion["note"], "info")
     elif new_status == "blocked":
         await _notify(db, factory_id, task["created_by"],
                       f"任务跟进受阻：{task['title']}", conclusion["note"], "warning")
-        if task.get("agent_key") == "procurement_agent":
-            await _notify(db, factory_id, "procurement",
-                          f"任务跟进受阻：{task['title']}", conclusion["note"], "warning")
     await db.commit()
     return {"task_id": task_id, "status": new_status,
             "progress_pct": conclusion["progress_pct"], "note": conclusion["note"]}
@@ -1075,218 +548,6 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
 # 定期扫描：到期任务逐个跟进（startup 后台循环调用）
 # ═══════════════════════════════════════════════════════════
 
-
-
-# ═══ AI 任务处理引擎：chatbot 接管非必要电脑工作（确定性，有证据才闭环）═══
-
-
-# ═══ 任务解决验证器：防假阳性（done 前必须验证数据真变化）═══
-async def _verify_task_resolution(db: AsyncSession, task: Dict[str, Any]) -> Optional[str]:
-    """验证任务声称的解决条件是否与 DB 事实一致。
-    返回 None=未验证通过（不能 done）或 验证失败原因。
-    通过条件（按任务类型）：
-    - 缺料：物料库存 >= 工单需求（真齐套）
-    - 设备：状态 running（真恢复）
-    - 订单：状态已确认（真评审完）
-    """
-    import re as _re
-    title = (task.get("title") or "") + " " + (task.get("description") or "")
-    fid = task.get("factory_id") or "FAC_MECH_001"
-
-    # 缺料类：库存 >= 需求才算真解决
-    if any(k in title for k in ["缺料", "齐套", "补货", "shortage"]):
-        mcode = _re.search(r"([A-Z0-9]{2,4}-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
-        if mcode:
-            code = mcode.group(1)
-            inv = (await db.execute(text(
-                "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
-            ), {"m": code, "f": fid})).scalar_one() or 0
-            need = (await db.execute(text("""
-                SELECT COALESCE(SUM(wom.required_qty - wom.received_qty),0) FROM work_order_materials wom
-                JOIN work_orders wo ON wo.id=wom.work_order_id
-                WHERE wom.material_code=:m AND wo.factory_id=:f AND wo.status IN ('released','in_progress','pending')
-            """), {"m": code, "f": fid})).scalar_one() or 0
-            if float(inv) >= float(need):
-                return None  # 真解决，可 done
-            return f"验证未通过：物料 {code} 库存 {inv} < 工单需求 {need}，缺口 {float(need)-float(inv)}"
-
-    # 设备类：running 才算真解决
-    if any(k in title for k in ["设备", "equipment", "故障"]):
-        ec = _re.search(r"(EQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
-        if ec:
-            st = (await db.execute(text(
-                "SELECT status FROM equipment WHERE equipment_code=:c AND factory_id=:f LIMIT 1"
-            ), {"c": ec.group(1), "f": fid})).scalar_one_or_none()
-            if st == "running":
-                return None
-            return f"验证未通过：设备 {ec.group(1)} 状态 {st}，未恢复运行"
-
-    # 订单类：已确认才算真解决
-    if "订单" in title or "评审" in title:
-        so = _re.search(r"(SO-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
-        if so:
-            st = (await db.execute(text(
-                "SELECT status FROM sales_orders WHERE order_code=:c OR id=:c LIMIT 1"
-            ), {"c": so.group(1)})).scalar_one_or_none()
-            if st in ("confirmed", "approved", "在生产", "completed"):
-                return None
-            return f"验证未通过：订单 {so.group(1)} 状态 {st}，未确认"
-
-    return None  # 无匹配规则 = 不强制验证（人工跟进类）
-
-
-async def _ai_handle_task(db: AsyncSession, t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """按任务类型确定性处理：
-    - 缺料/齐套任务 → 查库存：够→自动闭环；不够→自动建PR(采购接管)
-    - 设备任务 → 查设备状态：running→自动闭环
-    - 订单评审 → 查订单状态：已评审/已转工单→自动闭环
-    - 巡检/核实任务 → 查目标状态：正常→自动闭环
-    返回 {"action": "closed"/"escalated"/"auto_pr", "note": ...} 或 None(不能自动处理)
-    """
-    import re as _re
-    title = (t.get("title") or "") + " " + (t.get("description") or "")
-    task_id = t["id"]
-    fid = t.get("factory_id") or "FAC_MECH_001"
-
-    # 1) 缺料/齐套/采购任务
-    if any(k in title for k in ["缺料", "齐套", "补货", "shortage", "物料"]):
-        mcode = _re.search(r"([A-Z0-9]{2,4}-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
-        # 查库存
-        if mcode:
-            inv = (await db.execute(text(
-                "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
-            ), {"m": mcode.group(1), "f": fid})).scalar_one() or 0
-            # 解决验证：库存 >= 工单需求才算真闭环（防假阳性）
-            need_check = (await db.execute(text("""
-                SELECT COALESCE(SUM(wom.required_qty - wom.received_qty),0) FROM work_order_materials wom
-                JOIN work_orders wo ON wo.id=wom.work_order_id
-                WHERE wom.material_code=:m AND wo.factory_id=:f AND wo.status IN ('released','in_progress','pending')
-            """), {"m": mcode.group(1), "f": fid})).scalar_one() or 0
-            if float(inv) > 0 and float(inv) >= float(need_check):
-                await db.execute(text("""
-                    UPDATE followup_tasks SET status='done', progress_pct=100,
-                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
-                    WHERE id=:id
-                """), {"note": f"[AI自动闭环] 物料 {mcode.group(1)} 库存 {inv} >= 工单需求 {need_check}，真齐套，缺料解除", "id": task_id})
-                await db.commit()
-                return {"action": "closed", "note": f"物料 {mcode.group(1)} 库存 {inv} >= 需求 {need_check}，AI 验证后闭环"}
-            # 库存不足 = 不是假闭环 → 采购智能体接管：自动建 PR（缺多少补多少）
-            gap = float(need_check) - float(inv)
-            pr_exists = (await db.execute(text(
-                "SELECT 1 FROM purchase_requisitions WHERE material_code=:m AND status IN ('PENDING','pending') LIMIT 1"
-            ), {"m": mcode.group(1)})).scalar_one_or_none()
-            if not pr_exists:
-                try:
-                    await db.execute(text("""
-                        INSERT INTO purchase_requisitions (id, pr_code, factory_id, material_code, material_name, qty, unit,
-                            status, source, created_by, created_at, updated_at)
-                        VALUES (gen_random_uuid()::text,
-                            'PR-' || to_char(NOW(),'YYYYMMDD') || '-' || substr(gen_random_uuid()::text,1,6),
-                            :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
-                    """), {"f": fid, "m": mcode.group(1), "mn": mcode.group(1), "q": gap})
-                    await db.commit()
-                    return {"action": "auto_pr", "note": f"物料 {mcode.group(1)} 缺口 {round(gap,1)}，采购智能体已自动创建 PR（数量=缺口）"}
-                except Exception:
-                    await db.rollback()  # 防会话中毒拖垮后续扫描
-            return {"action": "escalated", "note": f"物料 {mcode.group(1)} 库存 {inv} < 工单需求 {need_check}，缺口 {round(gap,1)}，已有 PR 在途转采购跟催"}
-            # 库存不足 → 检查是否已有 PR，无则自动建 PR（采购接管）
-            has_pr = (await db.execute(text(
-                "SELECT 1 FROM purchase_requisitions WHERE material_code=:m AND status IN ('PENDING','pending') LIMIT 1"
-            ), {"m": mcode.group(1)})).scalar_one_or_none()
-            if not has_pr:
-                try:
-                    await db.execute(text("""
-                        INSERT INTO purchase_requisitions (id, pr_code, factory_id, material_code, material_name, qty, unit,
-                            status, source, created_by, created_at, updated_at)
-                        VALUES (gen_random_uuid()::text,
-                            'PR-' || to_char(NOW(),'YYYYMMDD') || '-' || substr(gen_random_uuid()::text,1,6),
-                            :f, :m, :mn, :q, 'PCS', 'PENDING', 'ai_task_engine', 'ai_task_engine', NOW(), NOW())
-                    """), {"f": fid, "m": mcode.group(1), "mn": mcode.group(1),
-                            "q": float((await db.execute(text(
-                                "SELECT COALESCE(required_qty, 100) FROM work_order_materials WHERE material_code=:m AND work_order_id IN (SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress')) LIMIT 1"
-                            ), {"m": mcode.group(1), "f": fid})).scalar_one_or_none() or 100)})
-                    await db.commit()
-                    return {"action": "auto_pr", "note": f"物料 {mcode.group(1)} 库存 0，AI 已自动创建采购申请"}
-                except Exception:
-                    await db.rollback()  # 防会话中毒拖垮后续扫描
-            return {"action": "escalated", "note": f"物料 {mcode.group(1)} 缺料，已有 PR 在途，转采购跟催"}
-
-    # 2) 设备任务
-    if any(k in title for k in ["设备", "equipment", "故障", "维修", "保养"]):
-        ec = _re.search(r"(EQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
-        if ec:
-            st = (await db.execute(text(
-                "SELECT status FROM equipment WHERE equipment_code=:c AND factory_id=:f LIMIT 1"
-            ), {"c": ec.group(1), "f": fid})).scalar_one_or_none()
-            if st == "running":
-                await db.execute(text("""
-                    UPDATE followup_tasks SET status='done', progress_pct=100,
-                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
-                    WHERE id=:id
-                """), {"note": f"[AI自动闭环] 设备 {ec.group(1)} 已恢复运行（DB 状态验证）", "id": task_id})
-                await db.commit()
-                return {"action": "closed", "note": f"设备 {ec.group(1)} 运行正常，AI 验证后闭环"}
-            return {"action": "escalated", "note": f"设备 {ec.group(1)} 状态 {st}，仍需处理"}
-
-    # 3) 交期风险任务：查工单状态 → 已完工/已取消 → 自动闭环
-    if "交期风险" in title or "延期" in title or "delay" in title.lower():
-        wcode = _re.search(r"(WO-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
-        if wcode:
-            st = (await db.execute(text(
-                "SELECT status FROM work_orders WHERE work_order_code=:c AND factory_id=:f LIMIT 1"
-            ), {"c": wcode.group(1), "f": fid})).scalar_one_or_none()
-            if st in ("completed", "done", "cancelled"):
-                await db.execute(text("""
-                    UPDATE followup_tasks SET status='done', progress_pct=100,
-                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
-                    WHERE id=:id
-                """), {"note": f"[AI自动闭环] 工单 {wcode.group(1)} 已{st}，交期风险解除", "id": task_id})
-                await db.commit()
-                return {"action": "closed", "note": f"工单 {wcode.group(1)} 已{st}，AI 自动闭环"}
-            return {"action": "escalated", "note": f"工单 {wcode.group(1)} 状态 {st}，交期风险仍在，转PMC处理"}
-
-    # 4) 订单评审任务
-    if "评审" in title or "订单" in title:
-        so = _re.search(r"(SO-[A-Z0-9]+(?:-[A-Z0-9]+)*)", title)
-        if so:
-            st = (await db.execute(text(
-                "SELECT status FROM sales_orders WHERE order_code=:c OR id=:c LIMIT 1"
-            ), {"c": so.group(1)})).scalar_one_or_none()
-            if st in ("confirmed", "approved", "在生产", "completed"):
-                await db.execute(text("""
-                    UPDATE followup_tasks SET status='done', progress_pct=100,
-                        last_follow_note=:note, ai_summary=:note, updated_at=NOW()
-                    WHERE id=:id
-                """), {"note": f"[AI自动闭环] 订单 {so.group(1)} 已确认（{st}），评审完成", "id": task_id})
-                await db.commit()
-                return {"action": "closed", "note": f"订单 {so.group(1)} 已确认，AI 自动闭环"}
-    return None
-
-
-async def ai_process_due_tasks(db: AsyncSession) -> Dict[str, Any]:
-    """AI 任务处理引擎入口：扫 blocked/open 到期任务 → 确定性处理。"""
-    result = await db.execute(text("""
-        SELECT id, factory_id, created_by, title, description, status, assigned_to, payload
-        FROM followup_tasks
-        WHERE status IN ('open', 'blocked')
-        ORDER BY next_follow_at ASC NULLS FIRST
-        LIMIT 50
-    """))
-    tasks = [dict(r._mapping) for r in result.fetchall()]
-    handled = []
-    for t in tasks:
-        try:
-            r = await _ai_handle_task(db, t)
-            if r:
-                handled.append({"id": t["id"], "title": (t["title"] or "")[:40], **r})
-        except Exception:
-            # 必须回滚：否则会话中毒（InFailedSQLTransaction）会拖垮后续 scan_due_tasks
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-            continue
-    return {"scanned": len(tasks), "handled": handled, "auto_closed": sum(1 for h in handled if h.get("action") == "closed")}
 async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:
     """取到期任务执行跟进；FOR UPDATE SKIP LOCKED 防多 worker 重复跟进。"""
     result = await db.execute(text("""
@@ -1295,7 +556,7 @@ async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:
                last_follow_note, follow_count, max_follows, progress_pct,
                item_type, assigned_to, ai_summary, ai_suggestion, payload
         FROM followup_tasks
-        WHERE status IN ('open', 'blocked') AND next_follow_at IS NOT NULL AND next_follow_at <= NOW()
+        WHERE status = 'open' AND next_follow_at IS NOT NULL AND next_follow_at <= NOW()
         ORDER BY next_follow_at ASC
         LIMIT :batch
         FOR UPDATE SKIP LOCKED
@@ -1316,25 +577,11 @@ async def scan_due_tasks(db: AsyncSession) -> Dict[str, Any]:
     return {"scanned": len(due), "outcomes": outcomes}
 
 
-_AUDIT_LAST_RUN = 0.0
-
-
 def _env_flag(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
-async def _ai_engine_cycle(db: AsyncSession) -> None:
-    """AI 任务处理周期：每轮 scanner 先让 AI 接管可自动化的任务。"""
-    try:
-        from api.services.followup_task_service import ai_process_due_tasks
-        r = await ai_process_due_tasks(db)
-        if r.get("handled"):
-            print(f"[ai-engine] 处理 {len(r['handled'])} 个任务, 自动闭环 {r.get('auto_closed')}")
-    except Exception:
-        pass
 
 
 async def followup_scanner_loop() -> None:
@@ -1345,67 +592,10 @@ async def followup_scanner_loop() -> None:
     interval = max(15, int(os.getenv("FOLLOWUP_SCAN_INTERVAL_SECONDS", "60") or 60))
     _logger.info("任务中心扫描器启动，每 %s 秒检查到期任务", interval)
     from database.db_config import db_config
-    _last_reconcile = 0.0
     while True:
         try:
             await asyncio.sleep(interval)
-            # ── RCC 事件驱动数据层：检测事实源变化 → 事件 → RCC 感知 → 决策/通知 ──
-            # 员工缺勤/设备故障/订单加急/缺料 → RCC 统一基线更新 + 通知 PMC/采购/产线
-            try:
-                import time as _t4
-                if _t4.time() - _last_reconcile > 300:  # 每 5 分钟
-                    _last_reconcile = _t4.time()
-                    from api.services.rcc_event_driven import detect_changes, reconcile
-                    async with db_config.session_factory() as db:
-                        for fid in ("FAC_MECH_001", "FAC_ELEC_DEMO_2026"):
-                            try:
-                                det = await detect_changes(db, fid)
-                                if det["written"]:
-                                    _logger.info(f"[rcc-events] {fid} 检测到 {len(det['written'])} 个事件: {[e['event_type'] for e in det['written']]}")
-                                res = await reconcile(db, fid)
-                                if res["notified"]:
-                                    _logger.info(f"[rcc-events] {fid} 决策通知: {res['notified']}")
-                            except Exception as _ex:
-                                await db.rollback()
-                                _logger.warning(f"[rcc-events] {fid} 处理异常: {_ex}")
-            except Exception as _e2:
-                _logger.warning(f"[rcc-events] 调度异常: {_e2}")
-            # ── 数据一致性审查（自动对账，无需人肉）：每 15 分钟 ──
-            try:
-                import time as _t5
-                global _AUDIT_LAST_RUN
-                if _t5.time() - _AUDIT_LAST_RUN > 900:
-                    _AUDIT_LAST_RUN = _t5.time()
-                    from api.services.consistency_audit import audit_consistency, format_report
-                    async with db_config.session_factory() as db:
-                        for _fid in ("FAC_MECH_001", "FAC_ELEC_DEMO_2026"):
-                            try:
-                                _rep = await audit_consistency(db, _fid)
-                                _s = _rep["summary"]
-                                if _s["drift"] > 0 or _s["error"] > 0:
-                                    _logger.warning(f"[consistency] {_fid} 数据漂移! {_s['drift']} DRIFT {_s['error']} ERROR")
-                                else:
-                                    _logger.info(f"[consistency] {_fid} {_s['ok']}/{_s['total']} 一致 OK")
-                            except Exception as _ex3:
-                                await db.rollback()
-                                _logger.warning(f"[consistency] {_fid} 审查异常: {_ex3}")
-            except Exception as _e3:
-                _logger.warning(f"[consistency] 调度异常: {_e3}")
             async with db_config.session_factory() as db:
-                # ── AI 任务处理引擎：chatbot 先接管可自动化的任务 ──
-                try:
-                    from api.services.followup_task_service import ai_process_due_tasks
-                    _ai = await ai_process_due_tasks(db)
-                    if _ai.get("handled"):
-                        _logger.info("[ai-engine] AI 处理 %s 个任务，自动闭环 %s", len(_ai["handled"]), _ai.get("auto_closed"))
-                except Exception as _aie:
-                    # 必须回滚：AI 引擎与下方 scan_due_tasks 共用同一会话，
-                    # 事务毒化会导致后续每轮扫描全部 InFailedSQLTransaction 报错
-                    try:
-                        await db.rollback()
-                    except Exception:
-                        pass
-                    _logger.warning(f"[ai-engine] 异常: {_aie}")
                 result = await scan_due_tasks(db)
                 if result["scanned"]:
                     _logger.info("任务中心本轮跟进 %s 个任务", result["scanned"])
@@ -1496,21 +686,11 @@ async def get_plan_dict(db: AsyncSession, plan_id: str) -> Optional[Dict[str, An
 async def _plan_items(db: AsyncSession, plan_id: str) -> List[Dict[str, Any]]:
     rows = (await db.execute(text("""
         SELECT id, title, agent_key, agent_name, status, progress_pct,
-               plan_seq, follow_count, last_follow_note,
-               blocked_by, block_category, next_follow_at
+               plan_seq, follow_count, last_follow_note
         FROM followup_tasks WHERE plan_id = :pid
         ORDER BY plan_seq ASC NULLS LAST, created_at ASC
     """), {"pid": plan_id})).fetchall()
-    items = []
-    for r in rows:
-        item = dict(r._mapping)
-        # roadmap：从标题提取工单号（工作流阶段映射用）
-        import re as _re3
-        m = _re3.search(r"(WO-[\w\-]+)", item.get("title") or "")
-        if m:
-            item["work_order_code"] = m.group(1)
-        items.append(item)
-    return items
+    return [dict(r._mapping) for r in rows]
 
 
 async def list_plans(

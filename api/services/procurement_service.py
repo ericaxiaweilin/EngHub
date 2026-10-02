@@ -28,36 +28,6 @@ def _gen_id():
     return str(uuid.uuid4())
 
 
-def mock_unit_price(material_code: str) -> float:
-    """确定性 mock 单价：同物料编码恒定同价（md5 散列），覆盖低/中/高价值带，
-    使金额分级审批（>5000 人工）有真实分布。真实价格接入后可整体替换。"""
-    import hashlib
-    h = int(hashlib.md5((material_code or "?").encode()).hexdigest()[:8], 16)
-    band = h % 100
-    if band < 7:      # 7% 高价值（设备件/模具材料）：800-2500 元
-        return round(800 + (h % 1700) + (h % 97) / 100.0, 2)
-    if band < 45:     # 38% 中价值（标准件/电子料）：30-300 元
-        return round(30 + (h % 270) + (h % 89) / 100.0, 2)
-    return round(1.5 + (h % 4850) / 100.0, 2)  # 55% 低价值耗材：1.5-50 元
-
-
-async def estimate_unit_cost(db: AsyncSession, material_code: str) -> float:
-    """物料估算单价：供应商报价 → 库存单位成本 → 确定性 mock。"""
-    if not material_code:
-        return mock_unit_price("?")
-    sp = (await db.execute(text(
-        "SELECT unit_price FROM supplier_prices WHERE material_code=:m AND is_active=true LIMIT 1"
-    ), {"m": material_code})).scalar()
-    if sp:
-        return float(sp)
-    ic = (await db.execute(text(
-        "SELECT unit_cost FROM inventory WHERE material_code=:m AND unit_cost IS NOT NULL AND unit_cost>0 LIMIT 1"
-    ), {"m": material_code})).scalar()
-    if ic:
-        return float(ic)
-    return mock_unit_price(material_code)
-
-
 class ProcurementService:
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -76,21 +46,19 @@ class ProcurementService:
                 continue
             material_code = item.get("material_code", "")
             pr_code = f"PR-{factory_id[:6]}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{len(created)+1:03d}"
-            est_cost = round(net_qty * await estimate_unit_cost(self.db, material_code), 2)
 
             await self.db.execute(text("""
                 INSERT INTO purchase_requisitions
                 (id, factory_id, pr_code, source, source_id, material_code, material_name,
-                 qty, unit, required_date, status, auto_approved, estimated_cost, created_at, updated_at)
-                VALUES (:id, :fid, :code, 'mrp', :src, :mc, :mn, :qty, 'PCS', :rd, 'pending', FALSE, :cost, NOW(), NOW())
+                 qty, unit, required_date, status, auto_approved, created_at, updated_at)
+                VALUES (:id, :fid, :code, 'mrp', :src, :mc, :mn, :qty, 'PCS', :rd, 'pending', FALSE, NOW(), NOW())
             """), {
                 "id": _gen_id(), "fid": factory_id, "code": pr_code,
                 "src": item.get("plan_id", ""), "mc": material_code,
                 "mn": item.get("material_name", ""), "qty": net_qty,
-                "rd": date.today() + timedelta(days=int(item.get("lead_days", 7) or 7)),
-                "cost": est_cost,
+                "rd": (date.today() + timedelta(days=item.get("lead_days", 7))).isoformat(),
             })
-            created.append({"pr_code": pr_code, "material_code": material_code, "qty": net_qty, "estimated_cost": est_cost})
+            created.append({"pr_code": pr_code, "material_code": material_code, "qty": net_qty})
 
         if created:
             await self.db.commit()
@@ -120,22 +88,20 @@ class ProcurementService:
             return {"material_code": material_code, "quotes": [], "recommendation": None,
                     "message": "无合格供应商报价，需人工寻源"}
 
-        # 归一化评分（numeric 列返回 Decimal，统一转 float 避免 Decimal/float TypeError）
-        min_price = min(float(q["unit_price"]) for q in quotes)
-        min_lead = min(int(q["lead_days"] or 999) for q in quotes)
+        # 归一化评分
+        min_price = min(q["unit_price"] for q in quotes)
+        min_lead = min(q["lead_days"] for q in quotes)
         max_rating = max(float(q["rating"]) for q in quotes) or 5
 
         scored = []
         for q in quotes:
-            up = float(q["unit_price"] or 0)
-            lead = int(q["lead_days"] or 1)
-            price_score = (min_price / up) * 50 if up > 0 else 50
-            lead_score = (min_lead / max(lead, 1)) * 30
+            price_score = (min_price / float(q["unit_price"])) * 50 if q["unit_price"] > 0 else 50
+            lead_score = (min_lead / max(q["lead_days"], 1)) * 30
             rating_score = (float(q["rating"]) / max_rating) * 20
             total = round(price_score + lead_score + rating_score, 2)
 
             # MOQ 检查
-            meets_moq = qty >= float(q["moq"] or 1)
+            meets_moq = qty >= (q["moq"] or 1)
             scored.append({
                 **q,
                 "price_score": round(price_score, 1),
@@ -143,7 +109,7 @@ class ProcurementService:
                 "rating_score": round(rating_score, 1),
                 "total_score": total,
                 "meets_moq": meets_moq,
-                "total_cost": round(up * qty, 2),
+                "total_cost": round(float(q["unit_price"]) * qty, 2),
             })
 
         scored.sort(key=lambda x: (-x["total_score"], -x["meets_moq"]))
@@ -167,12 +133,11 @@ class ProcurementService:
 
     # ==================== 自动下单（PR→PO） ====================
 
-    async def auto_create_po(self, factory_id: str, pr_id: str, force_order: bool = False) -> Dict[str, Any]:
+    async def auto_create_po(self, factory_id: str, pr_id: str) -> Dict[str, Any]:
         """采购申请 → 自动比价 → 自动生成 PO。
 
         采购员替代逻辑：PR 审批通过后，系统自动选供应商下单。
-        只有金额>阈值 或 无合格供应商 才需要人工介入；
-        force_order=True 时人工已批准高额 PR，跳过金额检查直接下单。
+        只有金额>阈值 或 无合格供应商 才需要人工介入。
         """
         # 获取 PR
         pr_result = await self.db.execute(text(
@@ -191,7 +156,7 @@ class ProcurementService:
                     "action_required": "manual_sourcing"}
 
         total_cost = rec["total_cost"]
-        needs_manual = (not force_order) and total_cost > AUTO_APPROVE_LIMIT
+        needs_manual = total_cost > AUTO_APPROVE_LIMIT
 
         if needs_manual:
             # 金额超阈值 → 标记待人工审批
@@ -210,8 +175,7 @@ class ProcurementService:
         # 自动审批 + 自动下单
         po_code = f"PO-{factory_id[:6]}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         po_id = _gen_id()
-        # asyncpg 日期参数必须传 date 对象，不能传 isoformat 字符串
-        expected_date = date.today() + timedelta(days=int(rec["lead_days"] or 7))
+        expected_date = (date.today() + timedelta(days=rec["lead_days"])).isoformat()
 
         await self.db.execute(text("""
             INSERT INTO purchase_orders

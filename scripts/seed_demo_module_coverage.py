@@ -838,10 +838,11 @@ def hr_equipment_tpm_sql(factory_id: str) -> list[str]:
             }))
 
     # Repair the legacy demo factory key and connect operators to the current HR roster.
+    # Attendance is append-only operational history: never delete or rebuild it here.
+    # Add only today's missing coverage rows, keyed by factory/operator/date.
     sql.extend([
         "UPDATE operators SET factory_id='FAC_MECH_001', employee_id='MEC-' || LPAD(SUBSTRING(employee_id FROM 'EMP-M([0-9]+)-DEMO_2026'), 4, '0') WHERE factory_id='FAC_MECH_DEMO_2026';",
         "UPDATE operators SET employee_id='ELEC-' || LPAD(SUBSTRING(employee_id FROM 'EMP-E([0-9]+)-DEMO_2026'), 4, '0') WHERE factory_id='FAC_ELEC_DEMO_2026' AND employee_id LIKE 'EMP-E%-DEMO_2026';",
-        "DELETE FROM attendance WHERE factory_id IN ('FAC_ELEC_DEMO_2026','FAC_MECH_DEMO_2026','FAC_MECH_001');",
         """
         WITH ranked AS (
             SELECT o.id, o.factory_id, ROW_NUMBER() OVER (PARTITION BY o.factory_id ORDER BY o.employee_id) AS rn
@@ -857,7 +858,15 @@ def hr_equipment_tpm_sql(factory_id: str) -> list[str]:
                CASE WHEN rn % 2 = 0 THEN '夜班' ELSE '白班' END,
                CASE rn % 5 WHEN 0 THEN 'rest' WHEN 1 THEN 'leave' WHEN 2 THEN 'late' ELSE 'present' END,
                NOW()
-        FROM ranked;
+        FROM ranked
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM attendance existing
+            WHERE existing.factory_id = ranked.factory_id
+              AND existing.operator_id = ranked.id
+              AND existing.date = CURRENT_DATE::text
+        )
+        ON CONFLICT (id) DO NOTHING;
         """,
     ])
 

@@ -177,14 +177,12 @@ class CrewOrchestration:
 
         _logger.info(f"[crew] 启动 {crew['name']}: {context}")
 
-        # 1. 各Agent获取数据（顺序执行：同一 session 不能并发，asyncpg 限制）
-        gather_results = []
-        for agent_def in crew["agents"]:
-            try:
-                gather_results.append(await self._gather_agent_data(agent_def["data_source"], factory_id, context))
-            except Exception as _e:
-                _logger.warning(f"[crew] agent {agent_def['data_source']} 数据获取失败: {_e}")
-                gather_results.append({"error": str(_e)})
+        # 1. 各Agent并行获取数据（asyncio.gather）
+        gather_tasks = [
+            self._gather_agent_data(agent_def["data_source"], factory_id, context)
+            for agent_def in crew["agents"]
+        ]
+        gather_results = await asyncio.gather(*gather_tasks, return_exceptions=True)
         agent_inputs = []
         for agent_def, data in zip(crew["agents"], gather_results):
             if isinstance(data, Exception):

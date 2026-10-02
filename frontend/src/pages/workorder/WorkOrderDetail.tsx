@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  Card, Descriptions, Tag, Button, Space, Table, Steps, Statistic, Row, Col, Collapse,
+  Card, Descriptions, Tag, Button, Space, Table, Steps, Statistic, Row, Col,
   Progress, message, Spin, Modal, Input, Divider, Timeline, Tooltip, Alert,
 } from 'antd'
 import {
@@ -16,7 +16,6 @@ import {
   WorkOrder, ProductionReport, Station, Routing, Product, WoStatusLog, FlowStep,
 } from '../../services/mes'
 import { getStoredUser } from '../../services/auth'
-import api from '../../services/api'
 import RecordDetailDrawer, { DetailField } from '../../components/trace/RecordDetailDrawer'
 import { makeStationResolver, makeProductResolver } from '../../components/trace/resolvers'
 
@@ -75,7 +74,6 @@ const WorkOrderDetail: React.FC = () => {
   const [children, setChildren] = useState<WorkOrder[]>([])
   const [statusLogs, setStatusLogs] = useState<WoStatusLog[]>([])
   const [flowSteps, setFlowSteps] = useState<FlowStep[]>([])
-  const [relations, setRelations] = useState<any>(null)
   const [flowDone, setFlowDone] = useState(0)
   const [flowCurrent, setFlowCurrent] = useState(0)
 
@@ -113,14 +111,6 @@ const WorkOrderDetail: React.FC = () => {
   }
 
   useEffect(() => { fetchDetail() }, [id])
-
-  // 跨表关联数据（物料齐套/库存/在途PO/报工，只读聚合）
-  useEffect(() => {
-    if (!wo?.id) return
-    api.get(`/work-orders/${wo.id}/relations`)
-      .then(res => setRelations(res))
-      .catch(() => setRelations(null))
-  }, [wo?.id])
 
   // 追溯：拉取工位用于名称解析
   const factoryId = wo?.factory_id
@@ -283,57 +273,6 @@ const WorkOrderDetail: React.FC = () => {
       </Row>
 
       {/* 基本信息 */}
-      {/* 跨表关联数据（一张工单看全关联：物料齐套/库存/在途PO/报工） */}
-      {relations && (
-        <Card title="跨表关联数据" size="small" style={{ marginBottom: 16 }}>
-          <Collapse
-            size="small"
-            items={[
-              {
-                key: 'materials',
-                label: `物料齐套（${relations?.materials?.length || 0} 项 · ${relations?.summary?.kitting_ok ? '✅ 已齐套' : '⚠️ 缺 ' + (relations?.summary?.total_shortage ?? '-')}）`,
-                children: relations?.materials?.length ? (
-                  <Table
-                    size="small" rowKey="material_code" pagination={false}
-                    dataSource={relations.materials}
-                    columns={[
-                      { title: '物料编码', dataIndex: 'material_code' },
-                      { title: '物料名称', dataIndex: 'material_name' },
-                      { title: '需求', dataIndex: 'required', align: 'right' },
-                      { title: '已收', dataIndex: 'received', align: 'right' },
-                      { title: '缺口', dataIndex: 'shortage', align: 'right', render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : '#52c41a' }}>{v}</span> },
-                      { title: '库存', dataIndex: 'inventory', align: 'right' },
-                      { title: '在途PO', dataIndex: 'on_order', align: 'right' },
-                      { title: 'PO ETA', dataIndex: 'po_eta', render: (v: string) => v || '-' },
-                      { title: '状态', dataIndex: 'ready', render: (v: boolean) => v ? <Tag color="success">齐</Tag> : <Tag color="error">缺</Tag> },
-                    ]}
-                  />
-                ) : <span style={{ color: '#999' }}>该工单无物料需求记录</span>,
-              },
-              {
-                key: 'reports',
-                label: `报工记录（${relations?.reports?.length || 0} 条）`,
-                children: relations?.reports?.length ? (
-                  <Table
-                    size="small" rowKey="code" pagination={false}
-                    dataSource={relations.reports}
-                    columns={[
-                      { title: '报工号', dataIndex: 'code' },
-                      { title: '良品', dataIndex: 'good', align: 'right' },
-                      { title: '不良', dataIndex: 'defect', align: 'right', render: (v: number) => <span style={{ color: v > 0 ? '#faad14' : undefined }}>{v}</span> },
-                      { title: '报废', dataIndex: 'scrap', align: 'right', render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : undefined }}>{v}</span> },
-                      { title: '班次', dataIndex: 'shift' },
-                      { title: '操作工', dataIndex: 'operator' },
-                      { title: '时间', dataIndex: 'at' },
-                    ]}
-                  />
-                ) : <span style={{ color: '#999' }}>暂无报工记录</span>,
-              },
-            ]}
-          />
-        </Card>
-      )}
-
       <Card title="工单信息" size="small" style={{ marginBottom: 16 }}>
         <Descriptions bordered column={3} size="small">
           <Descriptions.Item label="工单号">{wo.work_order_code}</Descriptions.Item>

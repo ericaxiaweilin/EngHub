@@ -265,28 +265,7 @@ class ExceptionEngine:
             minutes = float(item["minutes_elapsed"] or 0)
             threshold = 5 if item["severity"] == "critical" else 30
 
-            # 超龄停升：7 天未读的异常不再升级（避免陈年未读通知无限链式增殖，
-            # 实测单日通知峰值 1513 条即升级链自举所致）
-            if minutes > 60 * 24 * 7:
-                continue
-
             if minutes > threshold:
-                # 升级深度上限：沿 source_id 链计数，最多 3 级
-                # （升级通知本身也是未读异常，无上限会 supervisor↔manager 乒乓到无穷）
-                depth = 1
-                cur = item["id"]
-                while depth <= 3:
-                    parent = (await self.db.execute(text(
-                        "SELECT source_id, source_type FROM notifications WHERE id=:i"
-                    ), {"i": cur})).mappings().first()
-                    if parent and parent["source_type"] == "escalation" and parent["source_id"]:
-                        depth += 1
-                        cur = parent["source_id"]
-                    else:
-                        break
-                if depth >= 3:
-                    continue
-
                 # 升级：创建新通知给更高级别
                 existing_escalation = await self.db.execute(text("""
                     SELECT 1

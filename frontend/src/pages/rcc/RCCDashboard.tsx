@@ -19,7 +19,7 @@ import {
   FundOutlined, LineChartOutlined, PieChartOutlined, CaretDownOutlined, CaretUpOutlined,
   AppstoreOutlined as AppstoreOutlinedIcon, EyeOutlined, TeamOutlined as TeamOutlinedIcon
 } from '@ant-design/icons'
-import axios from '../../services/api'
+import axios from 'axios'
 import dayjs from 'dayjs'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1/rcc'
@@ -159,11 +159,11 @@ export default function RCCCommandCenter() {
     try {
       if (selectedOrg === 'global' || selectedOrg === '') {
         const res = await axios.get(`${API_BASE}/data?mode=global`)
-        setRccData(res as any)
+        setRccData(res.data)
         setIsGlobalMode(true)
       } else {
         const res = await axios.get(`${API_BASE}/data?mode=single&factory_id=${selectedOrg}`)
-        setRccData(res as any)
+        setRccData(res.data)
         setIsGlobalMode(false)
       }
     } catch (e: any) {
@@ -177,7 +177,7 @@ export default function RCCCommandCenter() {
     setLoadingData(true)
     try {
       const res = await axios.get(`${API_BASE}/data?mode=single&factory_id=${fid}`)
-      setRccData(res as any)
+      setRccData(res.data)
       setIsGlobalMode(false)
     } catch (e: any) {}
     finally { setLoadingData(false) }

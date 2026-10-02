@@ -12,27 +12,30 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import os
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
 from database.models import (
     ChatEvalCase,
+    ChatEventRecord,
     ChatMessage as ChatMessageRecord,
     ChatMessageAttachment,
     ChatSession,
@@ -43,12 +46,16 @@ from database.models import (
 )
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
-    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, execute_tool, resolve_intent,
+    TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, detect_intent_tool,
+    execute_tool, resolve_intent,
 )
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
 )
 from api.services.workbook_service import apply_workbook_operations, xlsx_to_workbook_snapshot
+from core.kernel.context_window import compact_messages
+from core.kernel.events import get_harness_event_bus
+from core.kernel.plugins import HarnessProfile, PluginSpec, get_harness_plugin_registry
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 _logger = logging.getLogger("enghub.chat")
@@ -62,6 +69,14 @@ MODEL_STACK_CONTROL_PLANE_URL = os.getenv("MODEL_STACK_CONTROL_PLANE_URL", "").r
 MODEL_STACK_CHAT_TASK_ID = os.getenv("MODEL_STACK_CHAT_TASK_ID", "").strip()
 MODEL_STACK_VISION_TASK_ID = os.getenv("MODEL_STACK_VISION_TASK_ID", "").strip()
 MODEL_STACK_ROUTE_TIMEOUT = float(os.getenv("MODEL_STACK_ROUTE_TIMEOUT", "5"))
+MODEL_STACK_ROUTE_RETRY_ATTEMPTS = max(
+    1,
+    int(os.getenv("MODEL_STACK_ROUTE_RETRY_ATTEMPTS", "2")),
+)
+MODEL_STACK_ROUTE_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("MODEL_STACK_ROUTE_CACHE_TTL_SECONDS", "300")),
+)
 MODEL_COLD_START_RETRY_TIMEOUT = max(
     REQUEST_TIMEOUT,
     float(os.getenv("LLM_COLD_START_RETRY_TIMEOUT", "90")),
@@ -73,9 +88,24 @@ MODEL_WARMUP_INTERVAL_SECONDS = max(
     60.0,
     float(os.getenv("LLM_WARMUP_INTERVAL_SECONDS", "600")),
 )
+CHAT_STREAM_HEARTBEAT_SECONDS = max(
+    5.0,
+    float(os.getenv("CHAT_STREAM_HEARTBEAT_SECONDS", "15")),
+)
 CHECKPOINT_PERSISTENCE_ENABLED = os.getenv(
     "CHECKPOINT_PERSISTENCE_ENABLED", "0"
 ).lower() not in {"0", "false", "no", "off"}
+CHAT_CONTEXT_MAX_MESSAGES = max(
+    8, int(os.getenv("CHAT_CONTEXT_MAX_MESSAGES", "24"))
+)
+CHAT_CONTEXT_MAX_CHARS = max(
+    2_000, int(os.getenv("CHAT_CONTEXT_MAX_CHARS", "24000"))
+)
+
+# A route is always selected by the control plane first.  The cache is only a
+# short-lived outage fallback for a route that control plane itself previously
+# approved in this worker; it never carries a handwritten model candidate.
+_model_route_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
 SYSTEM_PROMPT = (
     "你是 EngHub MES 制造执行系统的智能助手，可以直接操作系统完成用户的请求。"
@@ -100,9 +130,9 @@ SYSTEM_PROMPT = (
     "【流程知识库】系统内置了完整的流程知识：工单全生命周期（8阶段：创建→下达→派工→执行→报工→质检→完工→入库）、"
     "6大职位标准作业流程(操作员/品检员/设备工程师/PMC计划员/生产主管/仓管员)、各环节RACI责任矩阵。"
     "用户只问职责、阶段责任或SOP文字时调用 query_process_knowledge；模型先识别用户所指的岗位、独立业务子流程或审批实例，只有明确要求将该对象画成流程图、查看完整工作流、正常路径、fallback、输入输出物或关联方时才调用 query_workflow_diagram。"
-    "范围必须严格匹配：用户点名“替代料验证”等子流程时，scope=standalone_process，并使用该子流程注册键（替代料验证为 process:alternate_material_validation），不得展开 PMC 父流程；只有明确要求 PMC 端到端时才使用 pmc:end_to_end。"
+    "范围必须严格匹配：用户点名“替代料验证”等子流程时，scope=standalone_process，并使用该子流程注册键（替代料验证为 process:alternate_material_validation），不得展开 PMC 父流程；明确要求 PMC 端到端时必须使用 scope=position_end_to_end 和 workflow_key=pmc:end_to_end。"
     "不要仅因出现“流程图”三个字就触发工具；若对象不明确，先向用户追问。未知流程不得回退PMC或DCC。工具返回后只呈现一张完整连通图，不要拆成散点知识卡。\n"
-    "【PMC控制塔】当用户询问‘排过多少订单、控过多少物料、shortage怎么处理、库存怎么降、OTD怎么保证、产能怎么平衡、紧急插单怎么排、EC/BOM change怎么处理、supplier delay怎么处理’中的任一项或多项时，必须调用 query_pmc_control_tower。单项使用对应 scope，多个问题使用 scope=all。回答必须区分系统事实、统计口径、当前无记录/缺失来源和处理流程；没有历史记录时明确说无系统记录，不得补造订单、PO、供应商、ECN或OTD数字。\n"
+    "【PMC控制塔】当用户询问‘PMC控制任务推进、排过多少订单、控过多少物料、shortage怎么处理、库存怎么降、OTD怎么保证、产能怎么平衡、紧急插单怎么排、EC/BOM change怎么处理、supplier delay怎么处理’中的任一项或多项时，必须调用 query_pmc_control_tower。单项使用对应 scope，整体推进或多个问题使用 scope=all。回答必须区分系统事实、统计口径、当前无记录/缺失来源和处理流程；没有历史记录时明确说无系统记录，不得补造订单、PO、供应商、ECN或OTD数字。\n"
     "【PMC工作矩阵】用户提到 PMC 矩阵、预排程沙盘、时间锤/物料锤/生产锤/出货锤/紧急锤、UHN、可加工时间或库存齐套时，"
     "有主工单号时必须调用 query_pmc_work_matrix；没有主工单号但只问物料齐套/供应证据时调用 query_pmc_material_supply。该工具只读取真实工单/BOM/库存/工位/APS，沙盘开关只改变本次计算，不修改工单；"
     "输出必须区分真实数据、假设、判断结论、风险和下一步交付物。UHN 未定义时不得猜测。\n"
@@ -160,24 +190,122 @@ _ONLINE_WORKBOOK_TOOL_NAMES = frozenset({
     "create_online_pivot",
 })
 
+# Groq accounts the complete function schema against the request token budget.
+# The full compatibility catalogue is intentionally broad (MES, PMC, quality,
+# Excel and workflow operations), but it cannot be sent with every greeting:
+# 53 definitions add more than 8k tokens and make an otherwise trivial request
+# fail before it reaches the model.  This is a *visibility* selector only; the
+# SkillRegistry still registers and executes every tool.
+_TOOL_SELECTION_ACTION_HINTS: Dict[str, tuple[str, ...]] = {
+    "create_work_order": ("创建工单", "新建工单", "建工单", "create work order"),
+    "release_work_order": ("下达工单", "释放工单", "下达生产", "release work order"),
+    "create_production_report": ("生产报工", "提交报工", "报工", "production report"),
+    "complete_work_order": ("完工工单", "完成工单", "关闭工单", "complete work order"),
+    "pause_work_order": ("暂停工单", "挂起工单", "pause work order"),
+    "resume_work_order": ("恢复工单", "继续工单", "resume work order"),
+    "split_work_order": ("拆分工单", "工单拆分", "split work order"),
+    "run_compliance_simulation": ("合规仿真", "人机工程仿真", "劳动合规", "compliance simulation"),
+    "query_alert_reviews": ("预警审查", "预警审核", "alert review"),
+    "acknowledge_alert": ("确认预警", "确认告警", "驳回预警", "忽略预警", "acknowledge alert"),
+    "query_ocap_tasks": ("ocap", "纠正预防措施", "待处理措施"),
+    "query_collaboration": ("协同规则", "协作规则", "通知谁", "谁能决定", "权限边界"),
+    "create_followup_task": ("跟进一下", "持续跟进", "盯着", "挂起来", "到时候提醒", "follow up"),
+    "run_workflow": ("日报", "日度复盘", "生产复盘", "一键建单", "一键下达", "自动编排"),
+    "search_entity": ("属于哪个部门", "是什么", "在哪", "查找编码", "search entity"),
+}
+
+_WORKBOOK_SELECTION_HINTS = (
+    "工作簿", "在线表格", "在线表", "xlsx", "excel", "表格公式", "公式依赖",
+    "单元格", "透视表", "重新加载表格", "重算表格",
+)
+
+_CONVERSATIONAL_ONLY_RE = re.compile(
+    r"^(?:hi|hello|hey|你好|您好|在吗|在不在|哈喽|嗨|早上好|下午好|晚上好)[!！。,.\s]*$",
+    flags=re.IGNORECASE,
+)
+_WORK_ORDER_CODE_RE = re.compile(r"\b(?:WO|MO)-[A-Za-z0-9_-]+\b", flags=re.IGNORECASE)
+_ENTITY_CODE_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,}(?:-[A-Za-z0-9_]+)+\b")
+_DATA_REQUEST_HINTS = (
+    "查询", "查看", "统计", "汇总", "数据", "情况", "状态", "风险", "异常",
+    "预警", "订单", "工单", "库存", "物料", "产能", "交期", "生产", "质量",
+    "设备", "人力", "供应商", "缺料",
+)
+_GENERIC_READ_TOOL_NAMES = (
+    "query_manufacturing_intelligence",
+    "get_production_summary",
+    "query_work_orders",
+    "query_inventory",
+    "get_pending_alerts",
+    "search_entity",
+)
+
+
+def _select_tool_names_for_message(message: str) -> set[str]:
+    """Return the smallest useful capability set for one user turn.
+
+    Deterministic intent rules remain the source of truth.  The extra action
+    cues cover mutation and administrative tools which deliberately do not use
+    ``resolve_intent`` (their parameters need model extraction).  Unknown
+    social messages intentionally return no tool: the model can converse
+    without paying the function-schema token cost.
+    """
+    text = (message or "").strip()
+    normalized = text.casefold()
+    if not text or _CONVERSATIONAL_ONLY_RE.fullmatch(text):
+        return set()
+
+    selected: set[str] = set()
+    resolved = resolve_intent(text)
+    if resolved and resolved.get("tool"):
+        selected.add(str(resolved["tool"]))
+    else:
+        detected = detect_intent_tool(text)
+        if detected:
+            selected.add(detected)
+
+    if any(hint in normalized for hint in _WORKBOOK_SELECTION_HINTS):
+        selected.update(_ONLINE_WORKBOOK_TOOL_NAMES)
+
+    for tool_name, hints in _TOOL_SELECTION_ACTION_HINTS.items():
+        if any(hint in normalized for hint in hints):
+            selected.add(tool_name)
+
+    if _WORK_ORDER_CODE_RE.search(text):
+        selected.add("get_work_order_detail")
+    elif _ENTITY_CODE_RE.search(text):
+        selected.add("search_entity")
+
+    # An otherwise unclassified data request keeps a small read-only discovery
+    # set.  It is deliberately six tools, not the old 53-tool universal list.
+    if not selected and any(hint in normalized for hint in _DATA_REQUEST_HINTS):
+        selected.update(_GENERIC_READ_TOOL_NAMES)
+    return selected
+
 
 def _chat_tool_definitions(
-    *, has_spreadsheet_attachment: bool, workbook_id: Optional[str] = None,
-    scope: Optional[str] = None,
+    *,
+    has_spreadsheet_attachment: bool,
+    workbook_id: Optional[str] = None,
+    user_message: str = "",
 ) -> List[Dict[str, Any]]:
     """选择本轮模型工具，并把表格附件绑定到唯一工作簿。
 
     有 XLSX 附件时只开放在线工作簿工具，避免模型把附件文件名误当成
     MES 业务实体调用 search_entity；但不再关闭表格工具，这样同一轮可以
-    读取公式、修改单元格并导出原工作簿。
+    读取公式、修改单元格并导出原工作簿。普通对话按本轮意图收窄工具集，
+    防止完整 catalog 超出模型网关的 token-per-minute 限制。
     """
     try:
-        tool_catalog = _get_skill_registry().all_tool_definitions(scope=scope)
+        tool_catalog = _get_skill_registry().all_tool_definitions()
     except Exception:  # noqa: BLE001
         # Import/startup fallback only; normal requests always use the registry.
         tool_catalog = TOOL_DEFINITIONS
     if not has_spreadsheet_attachment:
-        return tool_catalog
+        selected_names = _select_tool_names_for_message(user_message)
+        return [
+            definition for definition in tool_catalog
+            if definition.get("function", {}).get("name") in selected_names
+        ]
     if not workbook_id:
         return []
     return [
@@ -223,7 +351,53 @@ class ChatRequest(BaseModel):
     attachments: List[Attachment] = Field(default_factory=list)  # 本轮用户消息附带的附件
     agent_key: Optional[str] = None  # 指定调度的智能体（空=自动，由模型自行选择工具）
     session_id: Optional[str] = None  # Chat V2 会话 ID（新建对话传空）
+    goal_id: Optional[str] = None  # 当前线程的持久化 Goal
     workbook_id: Optional[str] = None  # 当前绑定的 Univer 在线工作簿，供 chatbot 读写
+    approval_mode: str = "auto"  # auto | interactive；写工具是否等待客户端批准
+
+
+class ChatApprovalRequest(BaseModel):
+    approved: bool
+    comment: str = ""
+
+
+class ChatThreadForkRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class ChatGoalSetRequest(BaseModel):
+    objective: Optional[str] = None
+    status: Optional[str] = None
+    token_budget: Optional[int] = None
+    metric_codes: List[str] = Field(default_factory=list)
+
+
+class ChatGoalMetricConfig(BaseModel):
+    metric_code: str
+    target_value: Optional[float] = None
+    comparator: Optional[str] = None
+    unit: Optional[str] = None
+
+
+class ChatGoalMetricsRequest(BaseModel):
+    metrics: List[ChatGoalMetricConfig] = Field(default_factory=list)
+    replace: bool = False
+
+
+class ChatGoalUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    token_budget: Optional[int] = None
+    progress_pct: Optional[int] = None
+    summary: Optional[str] = None
+    blocked_reason: Optional[str] = None
+
+
+class ChatAppServerRequest(BaseModel):
+    """HTTP adapter for the bidirectional-harness JSON-RPC vocabulary."""
+    jsonrpc: str = "2.0"
+    id: Optional[Union[str, int]] = None
+    method: str
+    params: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolAction(BaseModel):
@@ -245,8 +419,10 @@ class ChatResponse(BaseModel):
     diagrams: List[Dict[str, Any]] = Field(default_factory=list)
     tables: List[Dict[str, Any]] = Field(default_factory=list)
     session_id: Optional[str] = None  # Chat V2：供前端带入下一轮
+    goal: Optional[Dict[str, Any]] = None
+    metrics: List[Dict[str, Any]] = Field(default_factory=list)
     request_id: Optional[str] = None  # Chat V2：Trace 锚点
-    memory: Optional[Dict[str, Any]] = None  # 记忆/画像载荷：profile + 注入块 + facts（供前端展示）
+    status: str = "complete"  # complete | cancelled | degraded | no_reply | max_rounds | gateway_error | tool_error | exception
 
 
 @router.get("/health")
@@ -308,64 +484,13 @@ async def chat_tools():
     }
 
 
-@router.get("/memory")
-async def chat_memory(
-    http_request: Request = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """返回当前用户的个人画像与长期记忆事实（供前端「记忆/画像」面板展示）。"""
-    from api.services import chat_memory_service as mem
-    from database.models import Role as RoleModel
-    factory_id = _chat_factory_id(http_request, current_user)
-    user_identity = str(current_user.id) or str(current_user.username) or "anonymous"
-    memory_facts = await mem.load_user_memory(
-        db, user_id=user_identity, factory_id=factory_id,
-    )
-    memory_rows = await mem.load_user_memory_rows(
-        db, user_id=user_identity, factory_id=factory_id,
-    )
-    if not memory_facts:
-        memory_facts = mem.memory_from_user_row(current_user)
-    role_obj = None
-    if getattr(current_user, "role_id", None):
-        role_obj = (await db.execute(
-            select(RoleModel).where(RoleModel.id == current_user.role_id)
-        )).scalars().first()
-    user_profile = mem.build_user_profile(current_user, memory_facts, role_obj=role_obj)
-    return {
-        "user_id": user_identity,
-        "factory_id": factory_id,
-        "profile": user_profile,
-        "facts": memory_rows,
-        "injected_block": mem.build_memory_block(memory_facts, profile=user_profile),
-        "context_pieces": mem.build_context_pieces(memory_facts, profile=user_profile),
-    }
-
-
-@router.delete("/memory/{key}")
-async def chat_memory_forget(
-    key: str,
-    http_request: Request = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """遗忘一条记忆（从当前用户的记忆中删除该 key）。"""
-    from api.services import chat_memory_service as mem
-    factory_id = _chat_factory_id(http_request, current_user)
-    user_identity = str(current_user.id) or str(current_user.username) or "anonymous"
-    await mem.forget(db, user_id=user_identity, key=key)
-    await db.commit()
-    return {"ok": True, "key": key}
-
-
-async def _resolve_model_route(
+async def _request_model_route_once(
     task_id: str,
     *,
     prompt_tokens: int = 1000,
     max_completion_tokens: int = 1024,
 ) -> Dict[str, Any]:
-    """向模型底座申请任务路由；业务侧不维护模型候选或回退链。"""
+    """向控制面执行一次任务路由请求。"""
     if not MODEL_STACK_CONTROL_PLANE_URL or not task_id:
         raise RuntimeError("model-stack task routing is not configured")
 
@@ -424,9 +549,6 @@ async def _resolve_model_route(
         or runtime_policy.get("max_completion_tokens")
         or max_completion_tokens
     )
-    # 中文业务答复（订单概览/预警简报等多段表格）在 1024 tokens 下会被截断，
-    # 模型栈默认给 1024（enghub.advisor.chat runtime_policy），后端钳制下限 2048。
-    completion_limit = max(2048, int(completion_limit))
     return {
         "task_id": str(route.get("dispatch_scenario") or task_id),
         "provider": provider,
@@ -436,16 +558,69 @@ async def _resolve_model_route(
     }
 
 
+async def _resolve_model_route(
+    task_id: str,
+    *,
+    prompt_tokens: int = 1000,
+    max_completion_tokens: int = 1024,
+) -> Dict[str, Any]:
+    """Resolve through control plane with transient-timeout protection.
+
+    Routing remains control-plane owned.  A previously accepted route is used
+    only after transient transport failures exhaust a small retry budget, so a
+    brief control-plane blip cannot turn an ordinary Chatbot request into an
+    HTTP 500.
+    """
+    last_error: Optional[httpx.RequestError] = None
+    for attempt in range(1, MODEL_STACK_ROUTE_RETRY_ATTEMPTS + 1):
+        try:
+            route = await _request_model_route_once(
+                task_id,
+                prompt_tokens=prompt_tokens,
+                max_completion_tokens=max_completion_tokens,
+            )
+            _model_route_cache[task_id] = (time.monotonic(), dict(route))
+            return route
+        except httpx.RequestError as exc:
+            last_error = exc
+            if attempt < MODEL_STACK_ROUTE_RETRY_ATTEMPTS:
+                _logger.warning(
+                    "[model-route] transient failure task=%s attempt=%s/%s error=%s",
+                    task_id, attempt, MODEL_STACK_ROUTE_RETRY_ATTEMPTS,
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(0.2 * attempt)
+
+    cached = _model_route_cache.get(task_id)
+    if cached is not None:
+        cached_at, route = cached
+        age_seconds = time.monotonic() - cached_at
+        if age_seconds <= MODEL_STACK_ROUTE_CACHE_TTL_SECONDS:
+            _logger.warning(
+                "[model-route] using cached control-plane route task=%s age_seconds=%.1f error=%s",
+                task_id, age_seconds, type(last_error).__name__ if last_error else "unknown",
+            )
+            return dict(route)
+    if last_error is not None:
+        raise last_error
+    # _request_model_route_once only returns or raises.  Keep a stable error
+    # for static analysis and future changes to its implementation.
+    raise RuntimeError(f"model-stack route request failed for {task_id}")
+
+
+def _gateway_wire_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip Kernel-only metadata before crossing the model gateway boundary."""
+    return {
+        key: value for key, value in payload.items() if not key.startswith("_")
+    }
+
+
 async def _call_llm(
     payload: Dict[str, Any],
     *,
     request_timeout: Optional[float] = None,
 ) -> httpx.Response:
-    """通过模型底座网关调用控制面下发的 provider。
-
-    健壮性：ReadTimeout 是间歇性网关慢（实测偶发），重试一次（延长超时）大概率成功，
-    避免把偶发超时直接转成对用户的"服务不可用"报错。
-    """
+    """通过模型底座网关调用控制面下发的 provider。"""
     headers = {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
@@ -453,38 +628,15 @@ async def _call_llm(
     }
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
-    base_timeout = request_timeout or REQUEST_TIMEOUT
-    timeouts = (base_timeout, max(base_timeout, MODEL_COLD_START_RETRY_TIMEOUT))
-    last_exc: Optional[BaseException] = None
-    for attempt, read_timeout in enumerate(timeouts, start=1):
-        try:
-            timeout = httpx.Timeout(
-                read=read_timeout,
-                connect=min(10.0, read_timeout),
-                write=min(30.0, read_timeout),
-                pool=min(10.0, read_timeout),
-            )
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                return await client.post(
-                    f"{GATEWAY_URL}/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-        except httpx.ReadTimeout as exc:
-            last_exc = exc
-            if attempt >= len(timeouts):
-                break
-            _logger.warning(
-                "[model-call] read timeout %ss; retrying with %ss",
-                read_timeout, timeouts[1],
-            )
-            await asyncio.sleep(0.25)
-    if last_exc is not None:
-        raise last_exc
-    raise httpx.ReadTimeout(
-        "LLM call timed out after retries",
-        request=httpx.Request("POST", f"{GATEWAY_URL}/v1/chat/completions"),
-    )
+    # Kernel may keep transport/telemetry metadata in the in-process payload;
+    # it is not part of the OpenAI-compatible contract.
+    wire_payload = _gateway_wire_payload(payload)
+    async with httpx.AsyncClient(timeout=request_timeout or REQUEST_TIMEOUT) as client:
+        return await client.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            json=wire_payload,
+            headers=headers,
+        )
 
 
 async def _warm_model_once(reason: str = "interval") -> bool:
@@ -560,57 +712,14 @@ async def model_warmup_loop() -> None:
 
 
 def _clean_model_reply(content: str) -> str:
-    """清除模型协议中误混入 content 的推理/工具调用区块，不改变最终答案语义.
-
-    覆盖两类泄漏：
-    1) <think>...</think> 推理区块；
-    2) Claude XML 工具调用标签（<tool_call>/<function=call:tools>/<parameter=...>，
-       agnes-2.5-flash 等 Anthropic 系模型偶发输出）。标签被 AgentLoop 解析为
-       tool_calls 后不应残留进最终回复；未解析成功的兜底也要剥离，避免刷屏。
-    """
+    """清除模型协议中误混入 content 的推理区块，不改变最终答案语义."""
     reply = (content or "").strip()
-    reply = re.sub(
+    return re.sub(
         r"<think>.*?</think>",
         "",
         reply,
         flags=re.DOTALL | re.IGNORECASE,
-    )
-    # 剥离完整 XML 工具调用块（含嵌套），再剥离孤立的开/闭标签
-    reply = re.sub(
-        r"<tool_call\b.*?</tool_call>",
-        "",
-        reply,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    reply = re.sub(
-        r"<function(?:\s*=\s*[\w.:-]+)?\b.*?</function>",
-        "",
-        reply,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    reply = re.sub(
-        r"<parameter\s*=\s*[\w.:-]+>.*?</parameter>",
-        "",
-        reply,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    # Anthropic 标准 invoke 块：<invoke name="...">...</invoke> / <antml:invoke ...>...</antml:invoke>
-    reply = re.sub(
-        r"<(?:antml:)?invoke\b[^>]*>.*?</(?:antml:)?invoke>",
-        "",
-        reply,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    # 孤立残留标签（不闭合的 <tool_call> / </tool_call> / <invoke> 等）
-    reply = re.sub(
-        r"</?(?:tool_call|function|parameter|invoke|antml:invoke|antml:parameter)\b[^>]*>",
-        "",
-        reply,
-        flags=re.IGNORECASE,
-    )
-    # 清理剥离后产生的多余空行
-    reply = re.sub(r"\n{3,}", "\n\n", reply)
-    return reply.strip()
+    ).strip()
 
 
 def _grounded_tool_result(result: Dict[str, Any]) -> str:
@@ -657,34 +766,6 @@ def _format_orchestration_reply(orch_result) -> str:
             parts.append("\n⚠️ LLM不可用，以上为各智能体原始数据")
 
     return "\n".join(parts)
-
-
-def _summarize_actions(actions: List[ToolAction]) -> str:
-    """模型无正文输出时，用已执行的工具结果生成摘要回复（确定性兜底）。"""
-    parts: List[str] = []
-    for a in actions:
-        if a.tool == "run_virtual_factory_pulse":
-            continue  # 噪音
-        label = a.label or TOOL_LABELS.get(a.tool, a.tool)
-        r = a.result or {}
-        if "error" in r:
-            parts.append(f"❌ {label}：{r['error']}")
-            continue
-        direct = _direct_tool_reply(a.tool, r)
-        if direct and not direct.startswith(f"{label}执行失败"):
-            parts.append(direct)
-            continue
-        # 通用摘要：列出关键字段
-        summary = []
-        for k, v in list(r.items())[:6]:
-            if isinstance(v, (dict, list)):
-                continue
-            summary.append(f"{k}={v}")
-        parts.append(f"{label}：{'，'.join(summary) if summary else '查询完成'}")
-    if not parts:
-        return ""
-    body = "\n".join(parts)
-    return f"已为您查询到以下结果：\n\n{body}"
 
 
 def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
@@ -763,6 +844,24 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         )
     if tool_name == "query_pmc_control_tower":
         return _format_pmc_control_tower_reply(result)
+    if tool_name == "query_manufacturing_intelligence":
+        subsystems = result.get("subsystems") or []
+        signals = result.get("signals") or []
+        lines = [
+            f"制造智能总览（工厂：{result.get('factory_id', '未指定')}）：{result.get('status', 'unknown')}",
+            "- 运行组件：" + "；".join(
+                f"{item.get('name')}={item.get('status')}" for item in subsystems
+            ),
+        ]
+        if signals:
+            lines.append("- 当前风险信号：")
+            for signal in signals[:8]:
+                lines.append(f"  • [{signal.get('severity', 'unknown')}] {signal.get('message')}")
+                if signal.get("action"):
+                    lines.append(f"    建议：{signal['action']}")
+        else:
+            lines.append("- 当前没有由控制塔证据触发的跨模块风险信号。")
+        return "\n".join(lines)
     if tool_name in {"query_pmc_material_supply", "query_stagnant"}:
         items = result.get("items") or []
         if not items:
@@ -937,8 +1036,7 @@ async def _verify_grounded_reply(
                 "content": (
                     "你是事实审校器。仅保留能从工具 JSON 逐项验证的陈述，"
                     "删除所有原因猜测、风险推断、预警、建议、示例和未执行动作。"
-                    "保持中文自然表达，直接输出修订后的最终答复文本，"
-                    "不要提问、不要解释、不要输出任何与答复无关的内容。"
+                    "保持中文自然表达，只输出修订后的最终答复。"
                 ),
             },
             {
@@ -969,20 +1067,8 @@ async def _verify_grounded_reply(
 
 async def _load_attachment_records(
     db: AsyncSession, attachments: List[Attachment], user: User,
-    factory_id: Optional[str] = None,
 ) -> List[FileRecord]:
-    """按 file_id 加载附件记录（做工厂隔离：普通用户不可引用其他工厂文件）。
-
-    有效工厂与上传/下载口径一致（x-factory-id → active_factory_id → factory_id）；
-    同时放行用户归属工厂的历史附件，避免激活工厂与归属工厂不一致时照片被误丢弃。
-    """
-    allowed_factories = {
-        f for f in (
-            factory_id,
-            getattr(user, "active_factory_id", None),
-            getattr(user, "factory_id", None),
-        ) if f
-    }
+    """按 file_id 加载附件记录（做工厂隔离：普通用户不可引用其他工厂文件）。"""
     records: List[FileRecord] = []
     for att in attachments:
         rec = (await db.execute(
@@ -990,8 +1076,8 @@ async def _load_attachment_records(
         )).scalar_one_or_none()
         if not rec:
             continue
-        if not user.is_superuser and rec.factory_id and allowed_factories \
-                and rec.factory_id not in allowed_factories:
+        if not user.is_superuser and rec.factory_id and user.factory_id \
+                and rec.factory_id != user.factory_id:
             continue  # 跨工厂附件直接忽略，避免越权
         records.append(rec)
     return records
@@ -1434,7 +1520,7 @@ async def _legacy_chat_disabled(
     actions: List[ToolAction] = []
 
     # ---- 加载本轮附件（工厂隔离）：图片走多模态 vision，非图片以文字摘要告知 ----
-    att_records = await _load_attachment_records(db, request.attachments, current_user, factory_id=factory_id) \
+    att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
     non_image_records = [r for r in att_records if not _is_image_record(r)]
@@ -1595,7 +1681,7 @@ async def _legacy_chat_disabled(
     tool_definitions = _chat_tool_definitions(
         has_spreadsheet_attachment=bool(spreadsheet_tables),
         workbook_id=bound_workbook_id,
-        scope=factory_id,
+        user_message=last_user,
     )
     # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
     messages: List[Dict[str, Any]] = [{
@@ -1664,18 +1750,6 @@ async def _legacy_chat_disabled(
             if not tool_calls:
                 reply = _clean_model_reply(message.get("content") or "")
                 if not reply:
-                    # 模型没输出正文但执行过工具：用工具结果生成摘要兜底，
-                    # 而不是报"服务不可用"（用户有真实数据可看）。
-                    if actions:
-                        reply = _summarize_actions(actions)
-                    if reply:
-                        return ChatResponse(
-                            reply=reply,
-                            model=route["task_id"],
-                            degraded=False,
-                            actions=actions,
-                            diagrams=_collect_diagrams(actions),
-                        )
                     return ChatResponse(
                         reply=_degraded_message("网关无有效回复"),
                         model=route["task_id"], degraded=True, actions=actions,
@@ -1758,6 +1832,24 @@ def _get_skill_registry():
         return _skill_registry_instance
     from core.skills import SkillRegistry
     reg = SkillRegistry.get_instance()
+    plugin_registry = get_harness_plugin_registry()
+    for profile_name in ("web", "headless"):
+        plugin_registry.register_profile(
+            HarnessProfile(name=profile_name, plugins=("enghub.harness.core", "enghub.skills"))
+        )
+    if "enghub.skills" not in plugin_registry.snapshot()["plugins"]:
+        plugin_registry.mount(
+            PluginSpec(
+                "enghub.skills",
+                lambda ctx: ctx.provide(
+                    "skills",
+                    reg,
+                    description="Scoped business skill registry",
+                    contract="SkillRegistry",
+                ),
+            )
+        )
+    reg.attach_plugin_registry(plugin_registry)
     reg.autodiscover()
     _skill_registry_instance = reg
     return reg
@@ -1845,7 +1937,11 @@ async def _build_chat_history(
             and last_persisted.get("content") == current_user.get("content")
         ):
             history.append(current_user)
-    return history
+    return compact_messages(
+        history,
+        max_messages=CHAT_CONTEXT_MAX_MESSAGES,
+        max_chars=CHAT_CONTEXT_MAX_CHARS,
+    ).messages
 
 
 def _inject_chat_attachments(
@@ -1878,14 +1974,17 @@ async def _handle_kernel_chat(
     http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    event_listener=None,
+    request_id: Optional[str] = None,
+    stream_llm=None,
 ) -> ChatResponse:
     """统一 Harness Kernel 请求处理器，供 V1/V2/SSE 共用。
 
     Phase 3：会话持久化——无 session_id 自动建会话，请求结束落库消息+遥测。
-    on_event: 可选异步回调，每次工具执行完成后触发（SSE 实时推送轨迹用）。
     """
     from core.kernel import HarnessKernel, KernelResponse
+    from core.kernel.approvals import get_approval_manager
+    from core.kernel.thread_manager import ThreadBusyError, get_thread_manager
 
     operator = current_user.username or current_user.id
     factory_id = _chat_factory_id(http_request, current_user)
@@ -1893,6 +1992,7 @@ async def _handle_kernel_chat(
         (m.content for m in reversed(request.messages) if m.role == "user"),
         "",
     )
+    turn_id = request_id or f"req-{uuid.uuid4().hex[:12]}"
 
     # ── 会话持久化（Phase 3）：取既有或新建 session ──
     session = await _open_chat_session(
@@ -1904,40 +2004,26 @@ async def _handle_kernel_chat(
     )
     session_id = session.id
 
-    # ── 自动压缩压力（对齐 DSH after-call compaction pressure）──
-    # 会话事件数超阈值且可折叠事件超 keep_recent 时，趁本请求事务空闲折叠旧历史，
-    # 避免事件流无限增长。失败仅告警，不阻塞请求。
-    try:
-        from api.services import chat_persistence_service as _cp
-        await _cp.compact_session_events(
-            db,
-            session_id,
-            user=current_user,
-            factory_id=factory_id,
-            reason="pressure",
-        )
-    except Exception:  # noqa: BLE001
-        _logger.debug("[chat-kernel] 自动压缩跳过（无压力或无权限）", exc_info=True)
-
-    # ── 用户长期记忆（跨会话）：加载用户维度的已记事实，注入 system prompt ──
-    from api.services import chat_memory_service as mem
-    from database.models import Role as RoleModel
-    user_identity = str(current_user.id) or str(current_user.username) or "anonymous"
-    memory_facts = await mem.load_user_memory(
-        db, user_id=user_identity, factory_id=factory_id,
+    # A thread has at most one current Goal.  Supplying goal_id is an explicit
+    # scope check; omitting it resumes the current thread Goal automatically.
+    from api.services.chat_goal_service import get_goal_for_user, goal_to_dict, metric_to_dict
+    active_goal = await get_goal_for_user(
+        db, session_id, user=current_user, factory_id=factory_id,
     )
-    if not memory_facts:
-        memory_facts = mem.memory_from_user_row(current_user)
-    role_obj = None
-    if getattr(current_user, "role_id", None):
-        role_obj = (await db.execute(
-            select(RoleModel).where(RoleModel.id == current_user.role_id)
-        )).scalars().first()
-    user_profile = mem.build_user_profile(current_user, memory_facts, role_obj=role_obj)
-    memory_block = mem.build_memory_block(memory_facts, profile=user_profile)
+    if request.goal_id and (active_goal is None or active_goal.id != request.goal_id):
+        raise HTTPException(status_code=404, detail="Goal 不属于当前线程或已被清除")
+    goal_state = goal_to_dict(active_goal)
+    goal_metrics: List[Dict[str, Any]] = []
+    if active_goal is not None:
+        from api.services.chat_goal_service import get_goal_metrics
+        goal_metrics = [
+            metric_to_dict(metric)
+            for metric in await get_goal_metrics(db, active_goal.id)
+        ]
+        goal_state["metrics"] = goal_metrics
 
     # 附件加载与 V1 一致
-    att_records = await _load_attachment_records(db, request.attachments, current_user, factory_id=factory_id) \
+    att_records = await _load_attachment_records(db, request.attachments, current_user) \
         if request.attachments else []
     image_records = [r for r in att_records if _is_image_record(r)]
     non_image_records = [r for r in att_records if not _is_image_record(r)]
@@ -2018,13 +2104,13 @@ async def _handle_kernel_chat(
     tool_definitions = _chat_tool_definitions(
         has_spreadsheet_attachment=bool(spreadsheet_tables),
         workbook_id=bound_workbook_id,
-        scope=factory_id,
+        user_message=last_user,
     )
 
     async def deterministic_handler(ctx, execute, action_factory):
         """Handle facts that already have a stable server-side intent mapping.
 
-        This remains inside HarnessKernel so direct PMC/order answers receive
+        This remains inside HarnessKernel so direct PMC/order/diagram answers receive
         the same permission, telemetry and persistence treatment as model-led
         tool calls.
         """
@@ -2047,6 +2133,8 @@ async def _handle_kernel_chat(
         if tool_name not in {
             "query_pmc_control_tower",
             "query_order_work_order_status",
+            "query_manufacturing_intelligence",
+            "query_workflow_diagram",
         }:
             return None
         arguments = intent.get("args") or {}
@@ -2068,11 +2156,12 @@ async def _handle_kernel_chat(
             tables.append(table_data)
         return KernelResponse(
             reply=_direct_tool_reply(tool_name, result),
-            model=(
-                "pmc-control-tower"
-                if tool_name == "query_pmc_control_tower"
-                else "order-work-order-status"
-            ),
+            model={
+                "query_pmc_control_tower": "pmc-control-tower",
+                "query_manufacturing_intelligence": "manufacturing-intelligence",
+                "query_order_work_order_status": "order-work-order-status",
+                "query_workflow_diagram": "workflow-diagram-engine",
+            }[tool_name],
             degraded="error" in result,
             actions=[action] if action is not None else [],
             tables=tables,
@@ -2080,7 +2169,7 @@ async def _handle_kernel_chat(
         )
 
     async def persist_after(ctx, response):
-        """Phase 3：请求结束后落库（消息 + 遥测 + 事件流）。"""
+        """Phase 3：请求结束后落库（消息 + 遥测）。"""
         from api.services import chat_persistence_service as cp
         last_user = ctx.last_user_content
         await cp.persist_round(
@@ -2099,82 +2188,29 @@ async def _handle_kernel_chat(
             rounds=len(response.actions),
             success=not response.degraded,
         )
-        # 事件流（DSH SessionEvent 对齐）：注入上下文 → 用户消息 → 工具调用 → 回复。
-        try:
-            pieces = mem.build_context_pieces(memory_facts, profile=user_profile)
-            events: List[Dict[str, Any]] = []
-            for piece in pieces:
-                events.append({
-                    "type": "context_injection",
-                    "data": {
-                        "source": piece.get("source"),
-                        "label": piece.get("label"),
-                        "content": piece.get("content"),
-                    },
-                })
-            events.append({
-                "type": "user_message",
-                "data": {"content": last_user or "（图片/附件消息）"},
-            })
-            for action in response.actions:
-                events.append({
-                    "type": "tool_call",
-                    "data": {
-                        "tool": action.tool,
-                        "label": getattr(action, "label", action.tool),
-                        "args": getattr(action, "arguments", None),
-                        "result": getattr(action, "result", None),
-                        "success": getattr(action, "success", True),
-                        "is_write": getattr(action, "is_write", False),
-                    },
-                })
-            events.append({
-                "type": "assistant_reply",
-                "data": {
-                    "reply": response.reply,
-                    "model": response.model,
-                    "duration_ms": (getattr(response, "duration_ms", None)
-                                    or None),
-                    "degraded": response.degraded,
-                    "tool_count": len(response.actions),
-                },
-            })
-            await cp.append_session_events(
-                db, session_id=session_id, request_id=ctx.request_id, events=events,
-            )
-        except Exception:  # noqa: BLE001
-            _logger.exception("[chat-kernel] 事件流写入失败 request=%s", ctx.request_id)
-        # 记忆：从本轮用户消息规则提取新事实并落库（用户明确告知才记）
-        for fact in mem.learn_from_text(last_user or ""):
-            await mem.remember(
-                db, user_id=user_identity, key=fact["key"], value=fact["value"],
-                factory_id=factory_id, confidence=fact.get("confidence", 2),
-            )
         # StreamingResponse cleanup happens after the body is consumed. Commit
         # here so the shared Kernel path never leaves the request transaction
         # idle while the client or proxy is still holding the response open.
         await db.commit()
 
-    async def overflow_handler(_session_id: str, detail: str) -> bool:
-        """provider 确认 CONTEXT_WINDOW_EXCEEDED 时：强制压缩该会话旧历史。
-
-        返回是否发生了折叠；kernel 在折叠后重试一次。保留原始错误除非
-        压缩证明有进展（对齐 DSH capacity-independent overflow recovery）。
-        """
-        from api.services.chat_persistence_service import compact_session_events
-        try:
-            result = await compact_session_events(
-                db,
-                _session_id,
-                user=current_user,
-                factory_id=factory_id,
-                reason="overflow",
-                keep_recent=2,
+    async def persist_event(event):
+        """Persist the canonical event envelope for replay and audit."""
+        db.add(
+            ChatEventRecord(
+                id=event.event_id,
+                event_id=event.event_id,
+                session_id=event.session_id,
+                request_id=event.request_id,
+                sequence=event.sequence,
+                event_type=event.event_type,
+                item_id=event.item_id,
+                data=event.data,
+                created_at=_event_created_at(event.created_at),
             )
-            return bool(result.get("folded"))
-        except Exception:  # noqa: BLE001
-            _logger.debug("[chat-kernel] overflow 压缩失败", exc_info=True)
-            return False
+        )
+        # The request-level commit in persist_after makes the event ledger
+        # transactional with the compatibility message projection.  Avoid a
+        # flush per event: a cold-start request can emit many lifecycle events.
 
     kernel = HarnessKernel(
         db=db,
@@ -2184,14 +2220,11 @@ async def _handle_kernel_chat(
         clean_reply=_clean_model_reply,
         ground_tool_result=_grounded_tool_result,
         verify_reply=_verify_grounded_reply,
-        summarize_actions=_summarize_actions,
         make_tool_action=make_tool_action,
-        on_tool_event=on_event,
         write_tools=frozenset(WRITE_TOOLS),
         sim_tools=frozenset(SIM_TOOLS),
         tool_definitions=tool_definitions,
-        system_prompt=(memory_block + "\n" + SYSTEM_PROMPT if memory_block else SYSTEM_PROMPT)
-        + _attachment_analysis_context(
+        system_prompt=SYSTEM_PROMPT + _attachment_analysis_context(
             bool(spreadsheet_tables), bound_workbook_id,
         ) + workbook_context,
         final_grounding_prompt=FINAL_GROUNDING_PROMPT,
@@ -2199,11 +2232,17 @@ async def _handle_kernel_chat(
         vision_task_id=MODEL_STACK_VISION_TASK_ID,
         max_tool_rounds=MAX_TOOL_ROUNDS,
         skill_registry=skill_registry,
+        plugin_registry=get_harness_plugin_registry(),
         persist_hook=persist_after,
         permission_gate=permission_gate,
         model_reviewer=model_reviewer,
         deterministic_handler=deterministic_handler,
-        overflow_handler=overflow_handler,
+        event_persist=persist_event,
+        event_commit=db.commit,
+        event_listener=event_listener,
+        approval_manager=get_approval_manager(),
+        interactive_approval=request.approval_mode.strip().lower() == "interactive",
+        stream_llm=stream_llm,
         **_checkpoint_options(),
     )
 
@@ -2217,21 +2256,109 @@ async def _handle_kernel_chat(
         or (deterministic_intent and deterministic_intent.get("tool") in {
             "query_pmc_control_tower",
             "query_order_work_order_status",
+            "query_manufacturing_intelligence",
+            "query_workflow_diagram",
         })
     )
-    ctx = await kernel.build_context(
-        factory_id=factory_id,
-        user=current_user,
-        messages=history,
-        attachments=att_records,
-        enable_tools=request.enable_tools,
-        agent_key=request.agent_key,
-        temperature=request.temperature,
-        session_id=session_id,
-        prompt_tokens=prompt_tokens,
-        resolve_route=not route_not_required,
-    )
-    result = await kernel.handle(ctx)
+    try:
+        thread_manager = get_thread_manager()
+        run = await thread_manager.begin(session_id, turn_id)
+    except ThreadBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    turn_started_at = time.monotonic()
+    try:
+        ctx = await kernel.build_context(
+            factory_id=factory_id,
+            user=current_user,
+            messages=history,
+            attachments=att_records,
+            enable_tools=request.enable_tools,
+            agent_key=request.agent_key,
+            temperature=request.temperature,
+            session_id=session_id,
+            goal_id=active_goal.id if active_goal is not None else None,
+            goal=goal_state,
+            prompt_tokens=prompt_tokens,
+            resolve_route=not route_not_required,
+            request_id=turn_id,
+            cancel_check=run.cancel_event.is_set,
+            cancel_wait=run.cancel_event.wait,
+            steer_drain=lambda: thread_manager.drain_steer(run),
+        )
+        result = await kernel.handle(ctx)
+    except Exception as exc:  # noqa: BLE001
+        # Route resolution happens before HarnessKernel owns a context, so it
+        # cannot convert a transient control-plane timeout itself.  Preserve
+        # the Chat API contract instead of leaking this as an HTTP 500.
+        _logger.exception(
+            "[chat] kernel context setup failed request=%s error=%s",
+            turn_id, type(exc).__name__,
+        )
+        result = KernelResponse(
+            reply=_degraded_message("模型路由暂时不可用，请稍候重试"),
+            model=MODEL_STACK_CHAT_TASK_ID,
+            degraded=True,
+            request_id=turn_id,
+            status="gateway_error",
+        )
+    finally:
+        raw_state = getattr(result, "status", "failed") if "result" in locals() else "failed"
+        final_state = (
+            "cancelled" if raw_state == "cancelled" or run.cancel_requested
+            else "completed" if raw_state in {"complete", "completed"}
+            else "failed"
+        )
+        await thread_manager.finish(session_id, turn_id, final_state)
+
+    # Keep Codex-compatible Goal usage accounting and refresh configured PMC
+    # metrics after every completed turn.  These are post-turn bookkeeping
+    # operations; a telemetry/evidence failure must never hide the chat answer.
+    goal_event_type: Optional[str] = None
+    goal_event_extra: Dict[str, Any] = {}
+    if active_goal is not None:
+        try:
+            from api.services.chat_goal_service import (
+                get_goal_metrics, metric_to_dict, record_goal_usage,
+                refresh_goal_metrics,
+            )
+            estimated_tokens = max(
+                1,
+                (
+                    sum(len(str(message.content or "")) for message in request.messages)
+                    + len(non_image_note)
+                    + len(result.reply or "")
+                ) // 4,
+            )
+            await record_goal_usage(
+                db,
+                active_goal,
+                tokens=estimated_tokens,
+                elapsed_seconds=max(0, int(round(time.monotonic() - turn_started_at))),
+            )
+            # Refresh the response snapshot immediately after accounting so
+            # this turn does not return stale tokens/time values.
+            goal_state = goal_to_dict(active_goal)
+            goal_state["metrics"] = goal_metrics
+            goal_event_type = "thread/goal/updated"
+            existing_metrics = await get_goal_metrics(db, active_goal.id)
+            if existing_metrics:
+                refreshed = await refresh_goal_metrics(db, active_goal)
+                goal_metrics = [metric_to_dict(metric) for metric in refreshed]
+                goal_event_type = "thread/goal/metrics_updated"
+                goal_event_extra = {"metrics": goal_metrics}
+            goal_state = goal_to_dict(active_goal)
+            goal_state["metrics"] = goal_metrics
+            await _emit_goal_event(
+                db,
+                session_id=session_id,
+                event_type=goal_event_type,
+                goal=goal_state,
+                extra=goal_event_extra,
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            _logger.exception("[chat-goal] metric refresh failed session=%s", session_id)
 
     return ChatResponse(
         reply=result.reply,
@@ -2262,16 +2389,10 @@ async def _handle_kernel_chat(
             ]
         ),
         session_id=session_id,
+        goal=goal_state,
+        metrics=goal_metrics,
         request_id=result.request_id,
-        memory={
-            "profile": user_profile,
-            "injected_block": memory_block,
-            "context_pieces": mem.build_context_pieces(memory_facts, profile=user_profile),
-            "facts": [
-                {"key": k, "value": v}
-                for k, v in memory_facts.items()
-            ],
-        },
+        status=result.status,
     )
 
 
@@ -2287,11 +2408,9 @@ async def chat_v2(
 
 
 def _degraded_message(reason: str) -> str:
-    """服务降级时的用户提示：不暴露内部技术细节，给出业务向的引导。"""
     return (
-        f"抱歉，回答服务暂时没有响应（{reason}）。\n\n"
-        "这是服务端偶发波动，不影响您的数据。请稍等片刻后重试，"
-        "或者换个问法再试一次；如果持续出现，可联系系统管理员处理。"
+        f"AI 服务暂不可用（{reason}）。\n\n"
+        "模型任务未能由模型底座正常下发，请检查控制面与模型网关状态。"
     )
 
 
@@ -2664,6 +2783,30 @@ def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
+def _event_created_at(value: str) -> datetime:
+    """Convert the UTC wire timestamp into the existing DB naive UTC type."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return datetime.utcnow()
+
+
+def _encode_thread_item_cursor(created_at: datetime, item_id: str) -> str:
+    raw = f"{created_at.isoformat()}|{item_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_thread_item_cursor(value: str) -> tuple[datetime, str]:
+    padded = value + "=" * (-len(value) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        created_at, item_id = raw.rsplit("|", 1)
+        return datetime.fromisoformat(created_at), item_id
+    except (ValueError, UnicodeDecodeError, UnicodeEncodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail="无效的 thread item 游标") from exc
+
+
 async def _stream_llm_deltas(
     payload: Dict[str, Any],
     *,
@@ -2677,8 +2820,10 @@ async def _stream_llm_deltas(
     }
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
+    # Keep Kernel-only metadata local; never send private transport fields to
+    # the provider gateway (see _call_llm for the non-streaming path).
     stream_payload = {
-        **payload,
+        **_gateway_wire_payload(payload),
         "stream": True,
         "cache": {"no-cache": True},
     }
@@ -2838,7 +2983,7 @@ async def _legacy_stream_disabled(
         yield _sse("status", {"message": "正在读取表格附件…"})
 
         # ---- 加载附件 ----
-        att_records = await _load_attachment_records(db, request.attachments, current_user, factory_id=factory_id) \
+        att_records = await _load_attachment_records(db, request.attachments, current_user) \
             if request.attachments else []
         image_records = [r for r in att_records if _is_image_record(r)]
         non_image_records = [r for r in att_records if not _is_image_record(r)]
@@ -2926,6 +3071,54 @@ async def _legacy_stream_disabled(
             await persist_stream_round("order-work-order-status")
             return
 
+        if direct_intent and direct_intent.get("tool") == "query_workflow_diagram":
+            arguments = direct_intent.get("args") or {}
+            permission_error = (
+                permission_gate.check(
+                    tool_name="query_workflow_diagram",
+                    ctx=SimpleNamespace(user=current_user),
+                    user_permissions=stream_permissions,
+                    operator=operator,
+                    factory_id=factory_id,
+                )
+                if stream_permissions else None
+            )
+            result = (
+                {"error": permission_error, "permission_denied": True}
+                if permission_error
+                else await execute_tool(
+                    db,
+                    "query_workflow_diagram",
+                    arguments,
+                    operator=operator,
+                    factory_id=factory_id,
+                )
+            )
+            action = ToolAction(
+                tool="query_workflow_diagram",
+                label=TOOL_LABELS["query_workflow_diagram"],
+                arguments=arguments,
+                result=result,
+                is_write=False,
+                is_sim=False,
+                success="error" not in result,
+            )
+            actions.append(action)
+            acc_reply = _direct_tool_reply("query_workflow_diagram", result)
+            yield _sse("action", action.model_dump())
+            diagram_data = _extract_diagram_data("query_workflow_diagram", result)
+            if diagram_data:
+                yield _sse("diagram", diagram_data)
+            yield _sse("delta", {"content": acc_reply})
+            yield _sse("done", {
+                "model": "workflow-diagram-engine",
+                "degraded": "error" in result,
+                "session_id": session_id,
+                "request_id": stream_request_id,
+            })
+            await persist_stream_round("workflow-diagram-engine")
+            return
+
         unsupported_attachment = _unsupported_attachment_message(
             non_image_records,
             spreadsheet_tables,
@@ -2984,7 +3177,7 @@ async def _legacy_stream_disabled(
         tool_definitions = _chat_tool_definitions(
             has_spreadsheet_attachment=bool(spreadsheet_tables),
             workbook_id=bound_workbook_id,
-            scope=factory_id,
+            user_message=last_user,
         )
         # 所有文本意图统一交给模型解析；后端仅执行模型返回的 tool_calls。
         messages: List[Dict[str, Any]] = [{
@@ -3053,14 +3246,6 @@ async def _legacy_stream_disabled(
                 ]
                 if not tool_calls:
                     if not streamed_content:
-                        # 模型没输出正文但执行过工具：用工具结果摘要兜底（不报"服务不可用"）
-                        summary = _summarize_actions(actions) if actions else ""
-                        if summary:
-                            acc_reply = summary
-                            yield _sse("delta", {"content": summary})
-                            yield _sse("done", {"model": route["task_id"], "degraded": False,
-                                                "session_id": session_id, "request_id": stream_request_id})
-                            return
                         stream_degraded = True
                         acc_reply = _degraded_message("网关无有效回复")
                         yield _sse("delta", {"content": acc_reply})
@@ -3194,46 +3379,102 @@ async def chat_stream(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Kernel-backed SSE adapter.
+    """Kernel-backed SSE adapter with replayable harness lifecycle events.
 
-    The browser event contract remains status/action/table/diagram/delta/done;
-    execution and persistence are owned by the same Kernel path as /chat and
-    /chat/v2.  The final reply is emitted as one delta when Kernel completes.
+    Existing browser events (action/table/diagram/delta/done) remain intact.
+    New clients can additionally consume Thread/Turn/Item events such as
+    ``item/started`` and ``item/completed`` without changing the business
+    tools or the model gateway contract.
     """
     request_id = f"req-{uuid.uuid4().hex[:12]}"
 
     async def generate():
         yield _sse("status", {"message": "正在由统一 Chat Kernel 处理…"})
-        events = asyncio.Queue()
-        pushed = {"count": 0}
+        event_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
 
-        async def emit(event: Dict[str, Any]) -> None:
-            await events.put(event)
-            pushed["count"] += 1
+        async def on_event(event):
+            try:
+                event_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # The terminal response below is still emitted even if a
+                # browser falls behind on verbose lifecycle events.
+                pass
 
-        kernel_task = asyncio.create_task(
+        def stream_kernel_llm(payload):
+            return _stream_llm_deltas(
+                payload,
+                request_timeout=float(
+                    payload.get("_request_timeout", REQUEST_TIMEOUT)
+                ),
+            )
+
+        task = asyncio.create_task(
             _handle_kernel_chat(
-                request, http_request, db, current_user, on_event=emit,
+                request,
+                http_request,
+                db,
+                current_user,
+                event_listener=on_event,
+                request_id=request_id,
+                stream_llm=stream_kernel_llm,
             )
         )
-        # 并发消费：kernel 每完成一次工具执行即实时推送 trajectory 事件，
-        # 不等整个请求结束（对齐 DSH trajectory 运行中状态）。
-        while not kernel_task.done():
-            try:
-                evt = await asyncio.wait_for(
-                    events.get(), timeout=0.2,
-                )
-                yield _sse("trajectory", evt)
-            except asyncio.TimeoutError:
-                continue
-        # kernel 完成后清空剩余事件（理论上无剩余；防御性补推）
-        while not events.empty():
-            try:
-                yield _sse("trajectory", events.get_nowait())
-            except asyncio.QueueEmpty:
-                break
+        result = None
         try:
-            result = kernel_task.result()
+            while True:
+                if task.done():
+                    result = await task
+                    break
+                event_task = asyncio.create_task(event_queue.get())
+                done, _ = await asyncio.wait(
+                    {event_task, task},
+                    timeout=CHAT_STREAM_HEARTBEAT_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    # Keep the HTTP/SSE connection active while a cold model,
+                    # workbook parser, or long tool call is still running.
+                    # The browser ignores comment frames, while the status
+                    # frame gives clients a visible progress signal.
+                    event_task.cancel()
+                    await asyncio.gather(event_task, return_exceptions=True)
+                    yield ": keep-alive\n\n"
+                    yield _sse("status", {
+                        "message": "模型正在启动或处理附件，请稍候…",
+                        "request_id": request_id,
+                    })
+                elif event_task in done:
+                    event = event_task.result()
+                    yield _sse(event.event_type, event.to_dict())
+                else:
+                    event_task.cancel()
+                    await asyncio.gather(event_task, return_exceptions=True)
+                    result = await task
+                    break
+
+            # Drain events emitted immediately before the kernel task ended.
+            while not event_queue.empty():
+                event = event_queue.get_nowait()
+                yield _sse(event.event_type, event.to_dict())
+
+            for action in result.actions:
+                payload = action.model_dump() if hasattr(action, "model_dump") else action
+                yield _sse("action", payload)
+            for table in result.tables:
+                yield _sse("table", table)
+            for diagram in result.diagrams:
+                yield _sse("diagram", diagram)
+            if result.reply:
+                yield _sse("delta", {"content": result.reply})
+            yield _sse("done", {
+                "model": result.model,
+                "degraded": result.degraded,
+                "status": result.status,
+                "session_id": result.session_id,
+                "goal": getattr(result, "goal", None),
+                "metrics": getattr(result, "metrics", []),
+                "request_id": result.request_id or request_id,
+            })
         except Exception as exc:  # noqa: BLE001
             _logger.exception("[chat-stream-kernel] failed request=%s", request_id)
             yield _sse("delta", {
@@ -3247,37 +3488,13 @@ async def chat_stream(
                 "session_id": request.session_id,
                 "request_id": request_id,
             })
-            return
-        if pushed["count"] == 0:
-            # 无实时回调（deterministic 路径等）：从 result.actions 回放为
-            # trajectory 事件，保证前端轨迹与事件流视图一致。
-            for action in result.actions:
-                payload = action.model_dump() if hasattr(action, "model_dump") else action
-                yield _sse("trajectory", {
-                    "type": "tool_call",
-                    "tool": payload.get("tool") or getattr(action, "tool", ""),
-                    "label": payload.get("label") or getattr(action, "label", ""),
-                    "args": payload.get("arguments") or getattr(action, "arguments", None),
-                    "result": payload.get("result") or getattr(action, "result", None),
-                    "success": payload.get("success", True),
-                    "is_write": payload.get("is_write", False),
-                })
-        for action in result.actions:
-            payload = action.model_dump() if hasattr(action, "model_dump") else action
-            yield _sse("action", payload)
-        for table in result.tables:
-            yield _sse("table", table)
-        for diagram in result.diagrams:
-            yield _sse("diagram", diagram)
-        if result.reply:
-            yield _sse("delta", {"content": result.reply})
-        yield _sse("done", {
-            "model": result.model,
-            "degraded": result.degraded,
-            "session_id": result.session_id,
-            "request_id": result.request_id or request_id,
-            "memory": getattr(result, "memory", None),
-        })
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     return StreamingResponse(
         generate(),
@@ -3486,17 +3703,23 @@ async def chat_replay(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
-@router.get("/trajectory/{session_id}")
-async def chat_trajectory(
+@router.get("/events/{session_id}")
+async def chat_events(
     session_id: str,
+    after: int = 0,
+    limit: int = 200,
     http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """会话轨迹（DSH Trajectory 对齐）：从事件流组装注入/消息/工具/回复节点。"""
-    from api.services.chat_persistence_service import ChatSessionAccessError, get_trajectory
+    """Replay the unified Thread/Turn/Item event ledger for one session."""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_session_for_user,
+    )
+
     try:
-        return await get_trajectory(
+        session = await get_session_for_user(
             db,
             session_id,
             user=current_user,
@@ -3505,38 +3728,438 @@ async def chat_trajectory(
     except ChatSessionAccessError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    safe_after = max(0, int(after or 0))
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    rows = (
+        await db.execute(
+            select(ChatEventRecord)
+            .where(
+                ChatEventRecord.session_id == session.id,
+                ChatEventRecord.sequence > safe_after,
+            )
+            .order_by(ChatEventRecord.sequence.asc())
+            .limit(safe_limit)
+        )
+    ).scalars().all()
+    return {
+        "thread_id": session.id,
+        "events": [
+            {
+                "event_id": row.event_id,
+                "event_type": row.event_type,
+                "session_id": row.session_id,
+                "thread_id": row.session_id,
+                "request_id": row.request_id,
+                "turn_id": row.request_id,
+                "sequence": row.sequence,
+                "item_id": row.item_id,
+                "data": row.data or {},
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ],
+        "next_after": rows[-1].sequence if rows else safe_after,
+        "has_more": len(rows) == safe_limit,
+    }
 
-@router.post("/compact/{session_id}")
-async def chat_compact(
+
+@router.get("/threads/{session_id}/items")
+async def chat_thread_items(
+    session_id: str,
+    after: Optional[str] = None,
+    limit: int = 50,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List canonical Thread Items with cursor pagination.
+
+    ``/events`` is the low-level lifecycle ledger.  This endpoint is the
+    stable item projection used for reconnect/resume: one user/assistant/tool
+    message is one item, and ``after`` is an opaque created_at+id cursor.
+    """
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_session_for_user,
+    )
+
+    try:
+        session = await get_session_for_user(
+            db,
+            session_id,
+            user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    safe_limit = max(1, min(int(limit or 50), 100))
+    stmt = select(ChatMessageRecord).where(ChatMessageRecord.session_id == session.id)
+    if after:
+        after_created_at, after_id = _decode_thread_item_cursor(after)
+        stmt = stmt.where(or_(
+            ChatMessageRecord.created_at > after_created_at,
+            and_(
+                ChatMessageRecord.created_at == after_created_at,
+                ChatMessageRecord.id > after_id,
+            ),
+        ))
+    rows = list((await db.execute(
+        stmt.order_by(
+            ChatMessageRecord.created_at.asc(),
+            ChatMessageRecord.id.asc(),
+        ).limit(safe_limit + 1)
+    )).scalars().all())
+    has_more = len(rows) > safe_limit
+    page = rows[:safe_limit]
+
+    attachments_by_message: Dict[str, List[Dict[str, Any]]] = {}
+    message_ids = [row.id for row in page]
+    if message_ids:
+        attachment_rows = (await db.execute(
+            select(ChatMessageAttachment, FileRecord)
+            .join(FileRecord, FileRecord.id == ChatMessageAttachment.file_id)
+            .where(ChatMessageAttachment.message_id.in_(message_ids))
+            .order_by(ChatMessageAttachment.message_id, ChatMessageAttachment.ordinal.asc())
+        )).all()
+        for link, file_record in attachment_rows:
+            attachments_by_message.setdefault(link.message_id, []).append({
+                "file_id": link.file_id,
+                "filename": file_record.filename,
+                "content_type": file_record.content_type,
+                "size": file_record.size,
+                "kind": link.kind,
+                "download_url": f"/api/v1/files/{file_record.id}",
+                "preview_url": (
+                    f"/api/v1/files/{file_record.id}"
+                    if (file_record.content_type or "").startswith("image/")
+                    else None
+                ),
+            })
+
+    items = []
+    for row in page:
+        if row.role == "user":
+            item_type = "user_message"
+            content_type = "input_text"
+        elif row.role == "assistant":
+            item_type = "assistant_message"
+            content_type = "output_text"
+        elif row.role == "tool":
+            item_type = "tool_result"
+            content_type = "output_text"
+        else:
+            item_type = f"{row.role}_message"
+            content_type = "output_text"
+        item = {
+            "id": row.id,
+            "object": "chatkit.thread_item",
+            "type": item_type,
+            "thread_id": session.id,
+            "turn_id": row.request_id,
+            "request_id": row.request_id,
+            "status": "completed",
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "content": ([{"type": content_type, "text": row.content or ""}]
+                        if row.content is not None else []),
+        }
+        if row.role == "user":
+            item["attachments"] = attachments_by_message.get(row.id, [])
+        if row.tool_calls:
+            item["tool_calls"] = row.tool_calls
+        if row.tool_results:
+            item["tool_results"] = row.tool_results
+        items.append(item)
+
+    next_after = None
+    if has_more and page:
+        last = page[-1]
+        next_after = _encode_thread_item_cursor(last.created_at, last.id)
+    return {
+        "object": "list",
+        "thread_id": session.id,
+        "data": items,
+        "items": items,
+        "has_more": has_more,
+        "next_after": next_after,
+    }
+
+
+@router.post("/approvals/{approval_id}")
+async def resolve_chat_approval(
+    approval_id: str,
+    request: ChatApprovalRequest,
+    http_request: Request = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Resolve an interactive write-tool approval from a trusted client."""
+    from core.kernel.approvals import get_approval_manager
+
+    user_id = str(getattr(current_user, "id", "")) or current_user.username or "anonymous"
+    factory_id = _chat_factory_id(http_request, current_user)
+    try:
+        result = await get_approval_manager().resolve(
+            approval_id,
+            user_id=user_id,
+            factory_id=factory_id,
+            approved=request.approved,
+            comment=request.comment,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="审批请求不存在或已结束")
+    return result
+
+
+@router.get("/approvals")
+async def pending_chat_approvals(
+    http_request: Request = None,
+    current_user: User = Depends(get_current_user),
+):
+    """List pending approvals visible to the current user and factory."""
+    from core.kernel.approvals import get_approval_manager
+
+    user_id = str(getattr(current_user, "id", "")) or current_user.username or "anonymous"
+    return {
+        "approvals": await get_approval_manager().pending_for(
+            user_id=user_id,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    }
+
+
+@router.get("/threads/{session_id}")
+async def chat_thread_state(
     session_id: str,
     http_request: Request = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """手动压缩会话事件流（DSH compaction：/compact 人类命令）。
+    """Return the durable thread identity plus current worker run state."""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_session_for_user,
+        session_metadata,
+    )
+    from core.kernel.thread_manager import get_thread_manager
 
-    折叠最早一段历史为摘要，保留最近 keep_recent 个事件。
-    返回折叠结果（含 source_event_seqs 与摘要）；busy 表示已有未闭合压缩。
-    """
-    from api.services.chat_persistence_service import ChatSessionAccessError, compact_session_events
     try:
-        result = await compact_session_events(
+        session = await get_session_for_user(
             db,
             session_id,
             user=current_user,
             factory_id=_chat_factory_id(http_request, current_user),
-            reason="manual",
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {
+        "thread_id": session.id,
+        "session_id": session.id,
+        "factory_id": session.factory_id,
+        "title": session.title or "新会话",
+        "archived": bool(session_metadata(session).get("archived")),
+        "parent_thread_id": session_metadata(session).get("parent_thread_id"),
+        "goal": await _thread_goal_payload(db, session, current_user),
+        "run": await get_thread_manager().describe(session.id),
+        "resume": {
+            "chat_endpoint": "/api/v1/chat",
+            "events_endpoint": f"/api/v1/chat/events/{session.id}",
+            "items_endpoint": f"/api/v1/chat/threads/{session.id}/items",
+            "cancel_endpoint": f"/api/v1/chat/threads/{session.id}/cancel",
+            "fork_endpoint": f"/api/v1/chat/threads/{session.id}/fork",
+            "archive_endpoint": f"/api/v1/chat/threads/{session.id}/archive",
+        },
+    }
+
+
+@router.post("/threads/{session_id}/fork")
+async def fork_chat_thread(
+    session_id: str,
+    request: ChatThreadForkRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fork a durable thread while keeping the source append-only."""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        fork_session,
+        get_session_for_user,
+        session_metadata,
+    )
+
+    factory_id = _chat_factory_id(http_request, current_user)
+    try:
+        source = await get_session_for_user(
+            db, session_id, user=current_user, factory_id=factory_id,
+        )
+        target = await fork_session(
+            db, source, user=current_user, factory_id=factory_id, title=request.title,
         )
         await db.commit()
-        return result
     except ChatSessionAccessError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    metadata = session_metadata(target)
+    return {
+        "object": "thread",
+        "thread_id": target.id,
+        "session_id": target.id,
+        "factory_id": target.factory_id,
+        "title": target.title or "新会话",
+        "archived": bool(metadata.get("archived")),
+        "parent_thread_id": metadata.get("parent_thread_id"),
+        "source_thread_id": source.id,
+        "items_endpoint": f"/api/v1/chat/threads/{target.id}/items",
+    }
+
+
+@router.post("/threads/{session_id}/archive")
+async def archive_chat_thread(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Hide a thread from the default list without deleting its history."""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_session_for_user,
+        set_session_archived,
+    )
+    from core.kernel.thread_manager import get_thread_manager
+
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    run = await get_thread_manager().describe(session.id)
+    if run.get("state") in {"running", "cancelling"}:
+        raise HTTPException(status_code=409, detail="会话仍有 turn 执行中，不能归档")
+    await set_session_archived(db, session, archived=True)
+    await db.commit()
+    return {"object": "thread", "thread_id": session.id, "archived": True}
+
+
+@router.post("/threads/{session_id}/unarchive")
+async def unarchive_chat_thread(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Restore an archived thread to the default session list."""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_session_for_user,
+        set_session_archived,
+    )
+
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    await set_session_archived(db, session, archived=False)
+    await db.commit()
+    return {"object": "thread", "thread_id": session.id, "archived": False}
+
+
+@router.post("/threads/{session_id}/compact")
+async def compact_chat_thread(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Preview the bounded model input without rewriting canonical history."""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_history,
+        get_session_for_user,
+    )
+
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    history = await get_history(
+        db, session.id, limit=500,
+        include_tools=False, include_tool_calls=False, include_attachments=False,
+    )
+    result = compact_messages(
+        history,
+        max_messages=CHAT_CONTEXT_MAX_MESSAGES,
+        max_chars=CHAT_CONTEXT_MAX_CHARS,
+    )
+    return {
+        "object": "thread.compaction",
+        "thread_id": session.id,
+        "canonical_history_preserved": True,
+        "compacted": result.compacted,
+        "original_message_count": result.original_message_count,
+        "output_message_count": result.output_message_count,
+        "summarized_message_count": result.summarized_message_count,
+        "estimated_tokens_before": result.estimated_tokens_before,
+        "estimated_tokens_after": result.estimated_tokens_after,
+        "messages": result.messages,
+    }
+
+
+@router.post("/threads/{session_id}/cancel")
+async def cancel_chat_thread(
+    session_id: str,
+    request_id: Optional[str] = None,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Request cooperative cancellation of the active turn in a thread."""
+    from api.services.chat_persistence_service import (
+        ChatSessionAccessError,
+        get_session_for_user,
+    )
+    from core.kernel.thread_manager import get_thread_manager
+
+    try:
+        session = await get_session_for_user(
+            db,
+            session_id,
+            user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    run = await get_thread_manager().cancel(session.id, turn_id=request_id)
+    if run is None:
+        return {
+            "thread_id": session.id,
+            "state": "idle",
+            "cancelled": False,
+            "message": "当前没有正在执行的 turn",
+        }
+    return {
+        "thread_id": session.id,
+        "turn_id": run.turn_id,
+        "state": run.state,
+        "cancel_requested": True,
+        "cancelled": True,
+    }
 
 
 @router.get("/sessions")
 async def chat_sessions(
     http_request: Request = None,
     limit: int = 20,
+    include_archived: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -3549,8 +4172,354 @@ async def chat_sessions(
             user=current_user,
             factory_id=_chat_factory_id(http_request, current_user),
             limit=max(1, min(limit, 100)),
+            include_archived=include_archived,
         )
     }
+
+
+async def _emit_goal_event(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    event_type: str,
+    goal: Optional[Dict[str, Any]],
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Publish goal lifecycle events through the same Thread event bus."""
+    request_id = f"goal-{uuid.uuid4().hex[:12]}"
+
+    async def persist(event) -> None:
+        db.add(
+            ChatEventRecord(
+                id=event.event_id,
+                event_id=event.event_id,
+                session_id=event.session_id,
+                request_id=event.request_id,
+                sequence=event.sequence,
+                event_type=event.event_type,
+                item_id=event.item_id,
+                data=event.data,
+                created_at=_event_created_at(event.created_at),
+            )
+        )
+
+    await get_harness_event_bus().emit(
+        session_id=session_id,
+        request_id=request_id,
+        event_type=event_type,
+        data={"thread_id": session_id, "goal": goal, **(extra or {})},
+        persist=persist,
+    )
+
+
+async def _thread_goal_payload(
+    db: AsyncSession, session: ChatSession, user: Any,
+) -> Optional[Dict[str, Any]]:
+    from api.services.chat_goal_service import get_goal_for_user, goal_to_dict
+
+    goal = await get_goal_for_user(
+        db, session.id, user=user, factory_id=session.factory_id,
+    )
+    return goal_to_dict(goal)
+
+
+def _app_thread_id(params: Dict[str, Any]) -> str:
+    """Accept official App Server threadId plus EngHub legacy aliases."""
+    return str(
+        params.get("threadId")
+        or params.get("thread_id")
+        or params.get("sessionId")
+        or params.get("session_id")
+        or ""
+    )
+
+
+def _app_thread_payload(session: ChatSession) -> Dict[str, Any]:
+    """Return the official nested thread shape without removing legacy fields."""
+    metadata = session.metadata_ if isinstance(session.metadata_, dict) else {}
+    return {
+        "id": session.id,
+        "sessionId": session.id,
+        "name": session.title or None,
+        "preview": "",
+        "ephemeral": False,
+        "archived": bool(metadata.get("archived")),
+    }
+
+
+def _app_input_messages(raw_input: Any) -> List[ChatMessage]:
+    """Translate Codex ``turn/start.input`` items to the chat message contract."""
+    messages: List[ChatMessage] = []
+    if isinstance(raw_input, str) and raw_input.strip():
+        return [ChatMessage(role="user", content=raw_input)]
+    for item in raw_input or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("role"):
+            content = item.get("content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") in {"text", "input_text"}
+                )
+            messages.append(ChatMessage(role=str(item["role"]), content=str(content or "")))
+            continue
+        if item.get("type") == "text" and item.get("text"):
+            messages.append(ChatMessage(role="user", content=str(item["text"])))
+    return messages
+
+
+async def _goal_payload_with_metrics(
+    db: AsyncSession, goal: Optional[Any],
+) -> Dict[str, Any]:
+    from api.services.chat_goal_service import get_goal_metrics, goal_to_dict, metric_to_dict
+
+    metrics = await get_goal_metrics(db, goal.id) if goal is not None else []
+    return {
+        "goal": goal_to_dict(goal),
+        "metrics": [metric_to_dict(metric) for metric in metrics],
+    }
+
+
+@router.post("/threads/{session_id}/goal")
+async def set_chat_goal(
+    session_id: str,
+    request: ChatGoalSetRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create or update the single durable Goal attached to a thread."""
+    from api.services.chat_goal_service import (
+        ChatGoalAccessError, ensure_goal_metrics, goal_to_dict, infer_metric_codes, set_goal,
+    )
+    from api.services.chat_persistence_service import get_session_for_user
+
+    factory_id = _chat_factory_id(http_request, current_user)
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user, factory_id=factory_id,
+        )
+        goal = await set_goal(
+            db, session, user=current_user, factory_id=factory_id,
+            objective=request.objective,
+            status=request.status,
+            token_budget=request.token_budget,
+        )
+        metric_codes = request.metric_codes or infer_metric_codes(goal.objective)
+        if metric_codes:
+            await ensure_goal_metrics(db, goal, metric_codes)
+        payload = await _goal_payload_with_metrics(db, goal)
+        await _emit_goal_event(
+            db, session_id=session.id, event_type="thread/goal/updated",
+            goal=payload["goal"],
+            extra={"metrics": payload["metrics"]},
+        )
+        await db.commit()
+        return {"object": "goal", **payload}
+    except ChatGoalAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/threads/{session_id}/goal")
+async def get_chat_goal(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read the current durable Goal for a thread."""
+    from api.services.chat_persistence_service import ChatSessionAccessError, get_session_for_user
+    from api.services.chat_goal_service import get_goal_for_user
+
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+        goal = await get_goal_for_user(
+            db, session.id, user=current_user, factory_id=session.factory_id,
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    payload = await _goal_payload_with_metrics(db, goal)
+    return {"object": "goal", "thread_id": session.id, **payload}
+
+
+@router.get("/threads/{session_id}/goal/metrics")
+async def get_chat_goal_metrics(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read the Goal's configured PMC metrics and latest evidence."""
+    from api.services.chat_persistence_service import ChatSessionAccessError, get_session_for_user
+    from api.services.chat_goal_service import get_goal_for_user
+
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+        goal = await get_goal_for_user(
+            db, session.id, user=current_user, factory_id=session.factory_id,
+        )
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if goal is None:
+        raise HTTPException(status_code=404, detail="该线程没有可访问的 Goal")
+    return {"object": "goal.metrics", "thread_id": session.id, **await _goal_payload_with_metrics(db, goal)}
+
+
+@router.put("/threads/{session_id}/goal/metrics")
+async def configure_chat_goal_metrics(
+    session_id: str,
+    request: ChatGoalMetricsRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Configure metric targets without creating a second KPI system."""
+    from api.services.chat_persistence_service import ChatSessionAccessError, get_session_for_user
+    from api.services.chat_goal_service import configure_goal_metrics, get_goal_for_user
+
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+        goal = await get_goal_for_user(
+            db, session.id, user=current_user, factory_id=session.factory_id,
+        )
+        if goal is None:
+            raise HTTPException(status_code=404, detail="该线程没有可访问的 Goal")
+        configs = [item.model_dump() if hasattr(item, "model_dump") else item.dict() for item in request.metrics]
+        await configure_goal_metrics(db, goal, configs, replace=request.replace)
+        payload = await _goal_payload_with_metrics(db, goal)
+        await _emit_goal_event(
+            db, session_id=session.id, event_type="thread/goal/metrics_updated",
+            goal=payload["goal"], extra={"metrics": payload["metrics"]},
+        )
+        await db.commit()
+        return {"object": "goal.metrics", "thread_id": session.id, **payload}
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/threads/{session_id}/goal/check")
+async def check_chat_goal_metrics(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Refresh Goal metrics from the canonical PMC control tower."""
+    from api.services.chat_persistence_service import ChatSessionAccessError, get_session_for_user
+    from api.services.chat_goal_service import get_goal_for_user, goal_to_dict, metric_to_dict, refresh_goal_metrics
+
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user,
+            factory_id=_chat_factory_id(http_request, current_user),
+        )
+        goal = await get_goal_for_user(
+            db, session.id, user=current_user, factory_id=session.factory_id,
+        )
+        if goal is None:
+            raise HTTPException(status_code=404, detail="该线程没有可访问的 Goal")
+        metrics = await refresh_goal_metrics(db, goal)
+        payload = {
+            "goal": goal_to_dict(goal),
+            "metrics": [metric_to_dict(metric) for metric in metrics],
+        }
+        await _emit_goal_event(
+            db, session_id=session.id, event_type="thread/goal/metrics_updated",
+            goal=payload["goal"], extra={"metrics": payload["metrics"]},
+        )
+        await db.commit()
+        return {"object": "goal.metrics", "thread_id": session.id, "checked_at": datetime.utcnow().isoformat(), **payload}
+    except ChatSessionAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.patch("/threads/{session_id}/goal")
+async def update_chat_goal(
+    session_id: str,
+    request: ChatGoalUpdateRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update Goal status/progress without changing its objective."""
+    from api.services.chat_goal_service import (
+        ChatGoalAccessError, goal_to_dict, require_goal_for_user, update_goal,
+    )
+    from api.services.chat_persistence_service import get_session_for_user
+
+    factory_id = _chat_factory_id(http_request, current_user)
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user, factory_id=factory_id,
+        )
+        goal = await require_goal_for_user(
+            db, session.id, user=current_user, factory_id=factory_id,
+        )
+        goal = await update_goal(
+            db, goal, status=request.status, token_budget=request.token_budget,
+            progress_pct=request.progress_pct, summary=request.summary,
+            blocked_reason=request.blocked_reason,
+        )
+        payload = await _goal_payload_with_metrics(db, goal)
+        await _emit_goal_event(
+            db, session_id=session.id, event_type="thread/goal/updated",
+            goal=payload["goal"], extra={"metrics": payload["metrics"]},
+        )
+        await db.commit()
+        return {"object": "goal", **payload}
+    except ChatGoalAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete("/threads/{session_id}/goal")
+async def clear_chat_goal(
+    session_id: str,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Clear the current Goal while preserving the thread and its history."""
+    from api.services.chat_goal_service import (
+        ChatGoalAccessError, clear_goal, get_goal_for_user, goal_to_dict,
+    )
+    from api.services.chat_persistence_service import get_session_for_user
+
+    factory_id = _chat_factory_id(http_request, current_user)
+    try:
+        session = await get_session_for_user(
+            db, session_id, user=current_user, factory_id=factory_id,
+        )
+        goal = await get_goal_for_user(
+            db, session.id, user=current_user, factory_id=factory_id,
+        )
+        if goal is not None:
+            old_goal = goal_to_dict(goal)
+            await clear_goal(db, goal)
+            await _emit_goal_event(
+                db, session_id=session.id, event_type="thread/goal/cleared",
+                goal=old_goal,
+            )
+        await db.commit()
+        return {"object": "goal", "thread_id": session.id, "cleared": goal is not None}
+    except ChatGoalAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @router.get("/plugins")
@@ -3567,6 +4536,7 @@ async def chat_plugins():
             for s in reg.get_all()
         ],
         "tool_count": len(reg.all_tool_definitions()),
+        "runtime": get_harness_plugin_registry().snapshot(),
     }
 
 
@@ -3577,12 +4547,510 @@ async def chat_version():
     from core.agent import event_bus as event_bus_mod
     return {
         "harness": harness_version,
-        "api": "/api/v1/chat (and /v2, /stream)",
-        "phases": [1, 2, 3, 4, 5, 6],
+        "api": "/api/v1/chat/v2",
+        "compatibility_apis": [
+            "/api/v1/chat",
+            "/api/v1/chat/v2",
+            "/api/v1/chat/stream",
+        ],
+        "protocol": {
+            "thread": "chat_sessions",
+            "turn": "request_id",
+            "events": "/api/v1/chat/events/{session_id}",
+            "items": "/api/v1/chat/threads/{session_id}/items?after=&limit=50",
+            "thread_state": "/api/v1/chat/threads/{session_id}",
+            "thread_cancel": "/api/v1/chat/threads/{session_id}/cancel",
+            "thread_fork": "/api/v1/chat/threads/{session_id}/fork",
+            "thread_archive": "/api/v1/chat/threads/{session_id}/archive",
+            "thread_name": "thread/name/set",
+            "thread_metadata": "thread/metadata/update",
+            "thread_delete": "thread/delete",
+            "thread_compact": "/api/v1/chat/threads/{session_id}/compact",
+            "thread_goal": "/api/v1/chat/threads/{session_id}/goal",
+            "app_server": "/api/v1/chat/app-server",
+            "thread_lease": "redis_optional_with_process_fallback",
+            "event_sequence": "redis_atomic_with_process_fallback",
+            "approval_state": "redis_optional_with_local_fallback",
+            "terminal_event_commit": True,
+            "sse_heartbeat_seconds": CHAT_STREAM_HEARTBEAT_SECONDS,
+            "stream_events": [
+                "turn/started", "turn/steered", "item/started", "item/delta", "item/completed",
+                "approval/request", "approval/response", "turn/completed",
+                "turn/failed", "turn/cancelled",
+            ],
+        },
+        "phases": [1, 2, 3, 4, 5, 6, 7, 8],
+        "alignment": {
+            "thread_lifecycle": ["create", "resume", "fork", "archive", "unarchive", "name", "metadata", "delete"],
+            "append_only_history": True,
+            "context_compaction": {
+                "automatic": True,
+                "max_messages": CHAT_CONTEXT_MAX_MESSAGES,
+                "max_chars": CHAT_CONTEXT_MAX_CHARS,
+                "canonical_history_preserved": True,
+            },
+        },
+        "goal": {
+            "persistent": True,
+            "scope": "thread",
+            "statuses": ["active", "paused", "completed", "blocked"],
+            "api": "/api/v1/chat/threads/{session_id}/goal",
+            "metrics_api": "/api/v1/chat/threads/{session_id}/goal/metrics",
+            "evidence_source": "query_pmc_control_tower",
+            "usage_accounting": ["tokensUsed", "timeUsedSeconds"],
+        },
         "event_bus": event_bus_mod.__file__,
         "execution": "HarnessKernel",
         "skill_registry": len(_get_skill_registry().all_tool_definitions()),
     }
+
+
+@router.post("/app-server")
+async def chat_app_server(
+    request: ChatAppServerRequest,
+    http_request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """JSON-RPC adapter over the same Thread/Turn/Item Kernel.
+
+    SSE remains the live notification channel for browser clients; this
+    endpoint gives other clients a stable request/response vocabulary without
+    introducing a second execution engine.
+    """
+    rpc_id = request.id
+
+    def success(result: Any) -> Dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+
+    def error(code: int, message: str, data: Any = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "error": {"code": code, "message": message},
+        }
+        if data is not None:
+            payload["error"]["data"] = data
+        return payload
+
+    if request.jsonrpc != "2.0":
+        return error(-32600, "只支持 JSON-RPC 2.0")
+
+    method = request.method.strip()
+    params = request.params or {}
+    factory_id = _chat_factory_id(http_request, current_user)
+
+    try:
+        if method == "initialize":
+            from core.kernel import __version__ as harness_version
+            return success({
+                "protocol": "enghub.chat.app-server/1",
+                "capabilities": {
+                    "threads": ["start", "resume", "list", "read", "fork", "archive", "unarchive", "compact", "name/set", "metadata/update", "delete"],
+                    "goals": ["set", "get", "clear", "metrics/set", "metrics/get", "check"],
+                    "turns": ["start", "steer", "interrupt"],
+                    "notifications": "sse",
+                    "items": "/api/v1/chat/threads/{thread_id}/items",
+                    "events": "/api/v1/chat/events/{thread_id}",
+                },
+                "harness": harness_version,
+            })
+
+        from api.services.chat_persistence_service import (
+            ChatSessionAccessError,
+            fork_session,
+            get_history,
+            get_session_for_user,
+            list_sessions,
+            session_metadata,
+            set_session_archived,
+        )
+        from core.kernel.thread_manager import get_thread_manager
+
+        if method == "thread/start":
+            session = await _open_chat_session(
+                db,
+                factory_id=factory_id,
+                user=current_user,
+                session_id=None,
+                title=params.get("title") or params.get("name") or "新会话",
+            )
+            await db.commit()
+            return success({
+                "object": "thread",
+                "thread": _app_thread_payload(session),
+                "thread_id": session.id,
+                "session_id": session.id,
+                "title": session.title or "新会话",
+                "goal": None,
+            })
+
+        if method == "thread/list":
+            rows = await list_sessions(
+                db,
+                user=current_user,
+                factory_id=factory_id,
+                limit=max(1, min(int(params.get("limit", 20)), 100)),
+                include_archived=bool(
+                    params.get("include_archived", params.get("includeArchived", False))
+                ),
+            )
+            return success({"object": "list", "data": rows})
+
+        thread_id = _app_thread_id(params)
+        if method in {
+            "thread/read", "thread/resume", "thread/fork", "thread/archive", "thread/unarchive",
+            "thread/name/set", "thread/metadata/update", "thread/delete",
+            "thread/compact", "thread/compact/start", "thread/goal/set", "thread/goal/get",
+            "thread/goal/clear", "thread/goal/metrics/set", "thread/goal/metrics/get",
+            "thread/goal/check", "turn/steer", "turn/interrupt",
+        } and not thread_id:
+            return error(-32602, "缺少 thread_id")
+
+        if method in {"thread/read", "thread/resume"}:
+            from api.services.chat_goal_service import get_goal_for_user
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            metadata = session_metadata(session)
+            return success({
+                "object": "thread",
+                "thread": {
+                    **_app_thread_payload(session),
+                    "status": await get_thread_manager().describe(session.id),
+                },
+                "thread_id": session.id,
+                "session_id": session.id,
+                "factory_id": session.factory_id,
+                "title": session.title or "新会话",
+                "archived": bool(metadata.get("archived")),
+                "parent_thread_id": metadata.get("parent_thread_id"),
+                "goal": await _thread_goal_payload(db, session, current_user),
+                "goal_metrics": (await _goal_payload_with_metrics(
+                    db,
+                    await get_goal_for_user(
+                        db, session.id, user=current_user, factory_id=factory_id,
+                    ),
+                ))["metrics"],
+                "run": await get_thread_manager().describe(session.id),
+            })
+
+        if method == "thread/name/set":
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            name = str(params.get("name") or params.get("title") or "").strip()
+            if not name:
+                return error(-32602, "缺少 name")
+            session.title = name[:255]
+            session.updated_at = datetime.utcnow()
+            await db.commit()
+            return success({
+                "object": "thread",
+                "thread": _app_thread_payload(session),
+                "thread_id": session.id,
+                "session_id": session.id,
+                "title": session.title,
+            })
+
+        if method == "thread/metadata/update":
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            patch = params.get("metadata") or params.get("patch") or {}
+            if not isinstance(patch, dict):
+                return error(-32602, "metadata 必须是对象")
+            metadata = session_metadata(session)
+            metadata.update(patch)
+            session.metadata_ = metadata
+            session.updated_at = datetime.utcnow()
+            await db.commit()
+            return success({
+                "object": "thread.metadata",
+                "thread_id": session.id,
+                "thread": _app_thread_payload(session),
+                "metadata": metadata,
+            })
+
+        if method == "thread/delete":
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            run = await get_thread_manager().describe(session.id)
+            if run.get("state") in {"running", "cancelling"}:
+                return error(-32009, "会话仍有 turn 执行中，不能删除")
+            # Use a bulk delete so PostgreSQL applies the FK cascade to goals,
+            # messages, attachments and harness events without ORM nulling.
+            await db.execute(delete(ChatSession).where(ChatSession.id == session.id))
+            await db.commit()
+            return success({"object": "thread", "thread_id": thread_id, "deleted": True})
+
+        if method in {
+            "thread/goal/set", "thread/goal/get", "thread/goal/clear",
+            "thread/goal/metrics/set", "thread/goal/metrics/get", "thread/goal/check",
+        }:
+            from api.services.chat_goal_service import (
+                clear_goal, configure_goal_metrics, ensure_goal_metrics,
+                get_goal_for_user, goal_to_dict, infer_metric_codes,
+                refresh_goal_metrics, set_goal,
+            )
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            goal = await get_goal_for_user(
+                db, session.id, user=current_user, factory_id=factory_id,
+            )
+            if method == "thread/goal/get":
+                payload = await _goal_payload_with_metrics(db, goal)
+                return success({"object": "goal", **payload})
+            if method == "thread/goal/set":
+                goal = await set_goal(
+                    db, session, user=current_user, factory_id=factory_id,
+                    objective=params.get("objective"),
+                    status=params.get("status"),
+                    token_budget=(
+                        int(params.get("token_budget", params.get("tokenBudget")))
+                        if params.get("token_budget", params.get("tokenBudget")) is not None
+                        else None
+                    ),
+                )
+                metric_codes = (
+                    params.get("metric_codes")
+                    or params.get("metricCodes")
+                    or infer_metric_codes(goal.objective)
+                )
+                if metric_codes:
+                    await ensure_goal_metrics(db, goal, metric_codes)
+                payload = await _goal_payload_with_metrics(db, goal)
+                await _emit_goal_event(
+                    db, session_id=session.id, event_type="thread/goal/updated",
+                    goal=payload["goal"], extra={"metrics": payload["metrics"]},
+                )
+                await db.commit()
+                return success({"object": "goal", **payload})
+            if method == "thread/goal/metrics/get":
+                payload = await _goal_payload_with_metrics(db, goal)
+                return success({"object": "goal.metrics", **payload})
+            if method == "thread/goal/metrics/set":
+                if goal is None:
+                    return error(-32004, "该线程没有可访问的 Goal")
+                await configure_goal_metrics(
+                    db, goal, params.get("metrics") or [],
+                    replace=bool(params.get("replace", False)),
+                )
+                payload = await _goal_payload_with_metrics(db, goal)
+                await _emit_goal_event(
+                    db, session_id=session.id, event_type="thread/goal/metrics_updated",
+                    goal=payload["goal"], extra={"metrics": payload["metrics"]},
+                )
+                await db.commit()
+                return success({"object": "goal.metrics", **payload})
+            if method == "thread/goal/check":
+                if goal is None:
+                    return error(-32004, "该线程没有可访问的 Goal")
+                await refresh_goal_metrics(db, goal)
+                payload = await _goal_payload_with_metrics(db, goal)
+                await _emit_goal_event(
+                    db, session_id=session.id, event_type="thread/goal/metrics_updated",
+                    goal=payload["goal"], extra={"metrics": payload["metrics"]},
+                )
+                await db.commit()
+                return success({"object": "goal.metrics", **payload, "checked_at": datetime.utcnow().isoformat()})
+            old_goal = goal_to_dict(goal)
+            if goal is not None:
+                await clear_goal(db, goal)
+                await _emit_goal_event(
+                    db, session_id=session.id, event_type="thread/goal/cleared",
+                    goal=old_goal,
+                )
+            await db.commit()
+            return success({"object": "goal", "thread_id": session.id, "cleared": goal is not None})
+
+        if method == "thread/fork":
+            source = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            target = await fork_session(
+                db, source, user=current_user, factory_id=factory_id,
+                title=params.get("title") or params.get("name"),
+            )
+            await db.commit()
+            metadata = session_metadata(target)
+            return success({
+                "object": "thread",
+                "thread": _app_thread_payload(target),
+                "thread_id": target.id,
+                "session_id": target.id,
+                "title": target.title or "新会话",
+                "archived": bool(metadata.get("archived")),
+                "parent_thread_id": metadata.get("parent_thread_id"),
+            })
+
+        if method in {"thread/archive", "thread/unarchive"}:
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            if method == "thread/archive":
+                run = await get_thread_manager().describe(session.id)
+                if run.get("state") in {"running", "cancelling"}:
+                    return error(-32009, "会话仍有 turn 执行中，不能归档")
+            archived = method == "thread/archive"
+            await set_session_archived(db, session, archived=archived)
+            await db.commit()
+            return success({
+                "object": "thread",
+                "thread": _app_thread_payload(session),
+                "thread_id": session.id,
+                "archived": archived,
+            })
+
+        if method in {"thread/compact", "thread/compact/start"}:
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            result = compact_messages(
+                await get_history(
+                    db, session.id, limit=500,
+                    include_tools=False, include_tool_calls=False, include_attachments=False,
+                ),
+                max_messages=CHAT_CONTEXT_MAX_MESSAGES,
+                max_chars=CHAT_CONTEXT_MAX_CHARS,
+            )
+            return success({
+                "object": "thread.compaction",
+                "thread_id": session.id,
+                "canonical_history_preserved": True,
+                "compacted": result.compacted,
+                "original_message_count": result.original_message_count,
+                "output_message_count": result.output_message_count,
+                "summarized_message_count": result.summarized_message_count,
+                "estimated_tokens_before": result.estimated_tokens_before,
+                "estimated_tokens_after": result.estimated_tokens_after,
+                "messages": result.messages,
+            })
+
+        if method == "turn/interrupt":
+            run = await get_thread_manager().cancel(
+                thread_id,
+                turn_id=str(params.get("turnId") or params.get("turn_id"))
+                if (params.get("turnId") or params.get("turn_id")) else None,
+            )
+            return success({
+                "thread_id": thread_id,
+                "turnId": run.turn_id if run else None,
+                "turn_id": run.turn_id if run else None,
+                "cancelled": bool(run),
+            })
+
+        if method == "turn/steer":
+            raw_messages = params.get("messages") or params.get("input")
+            messages = _app_input_messages(raw_messages)
+            if not messages:
+                return error(-32602, "turn/steer 缺少 input/messages")
+            session = await get_session_for_user(
+                db, thread_id, user=current_user, factory_id=factory_id,
+            )
+            current = await get_thread_manager().describe(session.id)
+            if current.get("state") not in {"running", "steering"}:
+                return error(-32004, "该线程当前没有可注入的运行中 turn")
+            requested_turn_id = (
+                str(params.get("turnId") or params.get("turn_id"))
+                if (params.get("turnId") or params.get("turn_id")) else None
+            )
+            # Steer input is canonical thread history, not transient RPC data.
+            from api.services.chat_persistence_service import append_message
+            for message in messages:
+                await append_message(
+                    db,
+                    session_id=session.id,
+                    role=message.role,
+                    content=message.content,
+                    request_id=requested_turn_id or str(current.get("turn_id") or ""),
+                )
+            await db.commit()
+            run = await get_thread_manager().steer(
+                session.id,
+                [message.model_dump() for message in messages]
+                if hasattr(messages[0], "model_dump")
+                else [message.dict() for message in messages],
+                turn_id=requested_turn_id,
+            )
+            if run is None:
+                return error(-32004, "turn 在提交 steer 前已结束；输入已保留到线程历史")
+            return success({
+                "object": "turn",
+                "threadId": session.id,
+                "thread_id": session.id,
+                "turnId": run.turn_id,
+                "turn_id": run.turn_id,
+                "status": "steering",
+                "accepted": True,
+                "messageCount": len(messages),
+            })
+
+        if method == "turn/start":
+            raw_messages = params.get("messages") or []
+            messages = (
+                [ChatMessage.model_validate(item) for item in raw_messages]
+                if raw_messages else _app_input_messages(params.get("input"))
+            )
+            if not messages:
+                return error(-32602, "turn/start 缺少 input/messages")
+            param_aliases = {
+                "temperature": ("temperature",),
+                "enable_tools": ("enable_tools", "enableTools"),
+                "attachments": ("attachments",),
+                "agent_key": ("agent_key", "agentKey"),
+                "session_id": ("session_id", "sessionId"),
+                "workbook_id": ("workbook_id", "workbookId"),
+                "approval_mode": ("approval_mode", "approvalMode"),
+                "goal_id": ("goal_id", "goalId"),
+            }
+            allowed = {}
+            for target, aliases in param_aliases.items():
+                for alias in aliases:
+                    if alias in params:
+                        allowed[target] = params[alias]
+                        break
+            if "session_id" not in allowed and thread_id:
+                allowed["session_id"] = thread_id
+            chat_request = ChatRequest(
+                messages=messages,
+                **allowed,
+            )
+            response = await _handle_kernel_chat(
+                chat_request,
+                http_request,
+                db,
+                current_user,
+                request_id=(str(params.get("turnId") or params.get("turn_id"))
+                            if (params.get("turnId") or params.get("turn_id")) else None),
+            )
+            response_payload = response.model_dump() if hasattr(response, "model_dump") else response.dict()
+            return success(
+                {
+                    **response_payload,
+                    "turn": {
+                        "id": response.request_id,
+                        "status": "completed" if response.status == "complete" else response.status,
+                        "items": [],
+                        "error": None,
+                    },
+                }
+            )
+
+        return error(-32601, f"未知方法：{method}")
+    except ChatSessionAccessError as exc:
+        return error(-32003, str(exc))
+    except PermissionError as exc:
+        return error(-32003, str(exc))
+    except HTTPException as exc:
+        return error(-32000, str(exc.detail), {"status_code": exc.status_code})
+    except (TypeError, ValueError) as exc:
+        return error(-32602, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        _logger.exception("[chat-app-server] method=%s failed", method)
+        return error(-32000, f"Harness 执行失败：{type(exc).__name__}")
 
 
 @router.get("/failures")
@@ -3655,7 +5123,6 @@ async def chat_eval_run(
         clean_reply=_clean_model_reply,
         ground_tool_result=_grounded_tool_result,
         verify_reply=None,
-        summarize_actions=_summarize_actions,
         make_tool_action=lambda tool, label, args, res, is_w, is_s, ok: {
             "tool": tool, "success": ok,
         },

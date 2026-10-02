@@ -22,7 +22,7 @@
     "g-hr": "Personnel",
     "/skill-matrix": "Skill Matrix",
     "/simulation": "Simulation Engine",
-    "g-tms": "RCC Task Center",
+    "g-tms": "TMS Tasks",
     "/tms/approval": "Approval Center",
     "/tms/distribution": "Distribution Board",
     "/tms/agent": "Agent Console",
@@ -67,6 +67,5 @@
     "pwdMismatch": "The two passwords do not match",
     "pwdSuccess": "Password changed. Please use the new password next time you log in",
     "pwdFail": "Change failed"
-  },
-  "搜索订单号/客户/产品": "Search order / customer / product"
+  }
 }

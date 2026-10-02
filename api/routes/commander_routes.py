@@ -47,26 +47,24 @@ async def run_commander_cycle(
 @router.get("/status")
 async def commander_status(
     factory_id: str = Query(default="FAC_MECH_001"),
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """获取指挥官当前状态"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(db)
-    return await commander.get_status(factory_id)
+    commander = FactoryCommander(None)
+    return commander.get_status(factory_id)
 
 
 @router.get("/history")
 async def commander_history(
     factory_id: str = Query(default="FAC_MECH_001"),
     limit: int = Query(10, ge=1, le=50),
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """获取指挥官决策历史"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(db)
-    return await commander.get_history(factory_id, limit)
+    commander = FactoryCommander(None)
+    return commander.get_history(factory_id, limit)
 
 
 @router.post("/mode")
@@ -85,29 +83,27 @@ async def set_commander_mode(
 @router.post("/toggle")
 async def toggle_commander(
     req: CommanderToggleRequest,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """开启/关闭当前用户的指挥官（开启后自动接管工作范围内事务）"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(db)
+    commander = FactoryCommander(None)
     user_id = str(current_user.id)
     factory_id = req.factory_id or getattr(current_user, "active_factory_id", None) or "FAC_MECH_001"
 
     if req.enabled:
-        await commander.enable_for_user(user_id, factory_id, req.scope, username=current_user.username)
+        commander.enable_for_user(user_id, factory_id, req.scope, username=current_user.username)
         return {"enabled": True, "user_id": user_id, "factory_id": factory_id, "message": "指挥官已开启，将自动接管您工作范围内的生产调度、接单、排产、交期管理"}
     else:
-        await commander.disable_for_user(user_id)
+        commander.disable_for_user(user_id)
         return {"enabled": False, "user_id": user_id, "message": "指挥官已关闭，恢复手动模式"}
 
 
 @router.get("/my-status")
 async def my_commander_status(
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """获取我的指挥官状态"""
     from api.services.factory_commander import FactoryCommander
-    commander = FactoryCommander(db)
-    return await commander.get_user_status(str(current_user.id))
+    commander = FactoryCommander(None)
+    return commander.get_user_status(str(current_user.id))

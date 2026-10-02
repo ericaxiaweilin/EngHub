@@ -154,11 +154,8 @@ export const confirmPlan = (id: string) => api.post(API_ENDPOINTS.PLAN_CONFIRM(i
 export const releasePlan = (id: string) => api.post(API_ENDPOINTS.PLAN_RELEASE(id), {})
 export const checkCapacityConflict = (id: string) =>
   api.get<any, { has_conflict: boolean; conflicts: any[] }>(API_ENDPOINTS.PLAN_CAPACITY_CONFLICT(id))
-export const calculateMrp = (plan_id: string, bom_version?: string) =>
-  api.post<any, { id: string; status: string; items: any[] }>(API_ENDPOINTS.MRP_CALCULATE, {
-    plan_id,
-    bom_version: bom_version || undefined,
-  })
+export const calculateMrp = (plan_id: string) =>
+  api.post<any, { id: string; status: string; items: any[] }>(`${API_ENDPOINTS.MRP_CALCULATE}?plan_id=${plan_id}`, {})
 
 // ---------------- 基础数据: 工位/工艺/设备 ----------------
 export const listStations = (params?: Record<string, any>) =>

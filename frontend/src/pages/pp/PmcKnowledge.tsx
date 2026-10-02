@@ -1,22 +1,19 @@
 import React, { useCallback, useEffect, useState } from 'react'
-import { Alert, Button, Card, Collapse, Space, Spin, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Collapse, List, Space, Spin, Tag, Typography } from 'antd'
 import { ArrowLeftOutlined, BookOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import api from '../../services/api'
 import { getActiveFactoryId } from '../../utils/factory'
-import PmcKnowledgeGraph, { SkillPanel, NEURAL_COLORS } from './PmcKnowledgeGraph'
 
 const { Text, Title, Paragraph } = Typography
 
-/** PMC 知识库：神经蛛网式 RAG 可视化。内容复用训练包接口。 */
+/** PMC 旧版知识库入口。内容复用训练包接口，避免菜单恢复后再次落到空页面。 */
 const PmcKnowledge: React.FC = () => {
   const navigate = useNavigate()
   const factoryId = getActiveFactoryId()
   const [pack, setPack] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
-  const [themeFilter, setThemeFilter] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -43,97 +40,52 @@ const PmcKnowledge: React.FC = () => {
   ])) as string[]
 
   return (
-    <div style={{ padding: 24, maxWidth: 1280, margin: '0 auto' }}>
+    <div style={{ padding: 24, maxWidth: 1180, margin: '0 auto' }}>
       <Space direction="vertical" style={{ width: '100%' }} size={16}>
         <Space align="center" wrap>
           <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/pmc')}>返回 PMC 工作台</Button>
-          <Title level={3} style={{ margin: 0, color: NEURAL_COLORS.text }}>PMC 知识库</Title>
-          <Tag color="cyan" style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}`, color: NEURAL_COLORS.accent }}>神经蛛网 · RAG 检索式</Tag>
+          <Title level={3} style={{ margin: 0 }}>PMC 知识库</Title>
+          <Tag color="blue">接口驱动</Tag>
         </Space>
 
         {loading && <Card><Spin tip="加载 PMC 知识库" /></Card>}
         {!loading && error && <Alert type="error" showIcon message={error} action={<Button icon={<ReloadOutlined />} onClick={load}>重试</Button>} />}
         {!loading && !error && (
           <>
-            <Card
-              size="small"
-              title={
-                <Space>
-                  <BookOutlined style={{ color: NEURAL_COLORS.accent }} />
-                  <Text style={{ color: NEURAL_COLORS.text }}>PMC 知识图谱</Text>
-                </Space>
-              }
-              extra={<Text style={{ color: NEURAL_COLORS.textDim }}>工厂：{pack?.factory_id || factoryId || '-'}</Text>}
-              style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}
-            >
+            <Card size="small" title={<Space><BookOutlined style={{ color: '#1677ff' }} />PMC 岗位判断框架</Space>} extra={<Text type="secondary">工厂：{pack?.factory_id || factoryId || '-'}</Text>}>
               <Space direction="vertical" style={{ width: '100%' }} size={10}>
-                <Space wrap align="center">
-                  <Title level={4} style={{ margin: 0, color: NEURAL_COLORS.text }}>{position?.title || 'PMC 计划员'}</Title>
-                  <Tag color="blue" style={{ background: NEURAL_COLORS.bg, border: `1px solid ${NEURAL_COLORS.border}`, color: NEURAL_COLORS.accentBlue }}>中心节点</Tag>
-                </Space>
-                <Paragraph style={{ margin: 0, color: NEURAL_COLORS.textDim }}>{position?.duties || '负责订单、物料、产能、交期和异常闭环。'}</Paragraph>
-                <Text style={{ color: NEURAL_COLORS.textDim, fontSize: 12 }}>
-                  悬停节点查看关系，点击技能节点或底部标签下钻该技能题目，中心节点重置视图，顶部标签按主题快速筛选连接。
-                </Text>
-                <PmcKnowledgeGraph
-                  pack={pack}
-                  onSelectSkill={setSelectedSkill}
-                  selectedSkill={selectedSkill}
-                  themeFilter={themeFilter}
-                  onThemeChange={(theme) => { setThemeFilter(theme); setSelectedSkill(null) }}
-                />
+                <Title level={4} style={{ margin: 0 }}>{position?.title || 'PMC 计划员'}</Title>
+                <Paragraph style={{ margin: 0 }}>{position?.duties || '负责订单、物料、产能、交期和异常闭环。'}</Paragraph>
+                <Space wrap>{terms.map((term) => <Tag key={term} color="cyan">{term}</Tag>)}</Space>
               </Space>
             </Card>
 
-            {selectedSkill && (
-              <SkillPanel pack={pack} skill={selectedSkill} onClose={() => setSelectedSkill(null)} />
-            )}
-
-            <Card
-              size="small"
-              title={<Text style={{ color: NEURAL_COLORS.text }}>知识术语索引</Text>}
-              style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}
-            >
-              <Space wrap>{terms.map((term) => <Tag key={term} style={{ background: NEURAL_COLORS.bg, border: `1px solid ${NEURAL_COLORS.accent}66`, color: NEURAL_COLORS.accent, fontWeight: 500 }}>{term}</Tag>)}</Space>
+            <Card size="small" title="标准工作路径">
+              <List
+                dataSource={position?.daily_flow || []}
+                locale={{ emptyText: '暂无标准工作路径' }}
+                renderItem={(item: any) => (
+                  <List.Item>
+                    <Space align="start">
+                      <Tag color="blue">{item.step}</Tag>
+                      <div><Text strong>{item.task}</Text><div><Text type="secondary">{item.detail}</Text></div></div>
+                    </Space>
+                  </List.Item>
+                )}
+              />
             </Card>
 
-            <Card
-              size="small"
-              title={<Text style={{ color: NEURAL_COLORS.text }}>标准工作路径</Text>}
-              style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}
-            >
-              <Space direction="vertical" style={{ width: '100%' }} size={10}>
-                {(position?.daily_flow || []).map((item: any) => (
-                  <div key={item.step} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
-                    <Tag color="blue" style={{ background: NEURAL_COLORS.bg, border: `1px solid ${NEURAL_COLORS.border}`, color: NEURAL_COLORS.accentBlue }}>{item.step}</Tag>
-                    <div>
-                      <Text strong style={{ color: NEURAL_COLORS.text }}>{item.task}</Text>
-                      <div><Text style={{ color: NEURAL_COLORS.textDim }}>{item.detail}</Text></div>
-                    </div>
-                  </div>
-                ))}
-              </Space>
+            <Card size="small" title="异常升级与关联工具">
+              <Paragraph>{position?.escalation || '-'}</Paragraph>
+              <Text type="secondary">{position?.related_tools || '-'}</Text>
             </Card>
 
-            <Card
-              size="small"
-              title={<Text style={{ color: NEURAL_COLORS.text }}>异常升级与关联工具</Text>}
-              style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}
-            >
-              <Paragraph style={{ color: NEURAL_COLORS.textDim }}>{position?.escalation || '-'}</Paragraph>
-              <Text style={{ color: NEURAL_COLORS.textDim }}>{position?.related_tools || '-'}</Text>
-            </Card>
-
-            <Card
-              size="small"
-              title={<Text style={{ color: NEURAL_COLORS.text }}>快速索引</Text>}
-              style={{ background: NEURAL_COLORS.bgCard, border: `1px solid ${NEURAL_COLORS.border}` }}
-            >
+            <Card size="small" title="快速索引">
               <Collapse
                 items={(pack?.quiz?.questions || []).map((question: any, index: number) => ({
                   key: question.id,
-                  label: <Space><Tag color={question.difficulty >= 3 ? 'red' : question.difficulty === 2 ? 'gold' : 'blue'}>{question.skill}</Tag><Text style={{ color: NEURAL_COLORS.text }}>{index + 1}. {question.prompt}</Text></Space>,
-                  children: <Text style={{ color: NEURAL_COLORS.textDim }}>参考术语：{(question.reference_terms || []).join('、') || '-'}</Text>,
+                  label: <Space><Tag color={question.difficulty >= 3 ? 'red' : question.difficulty === 2 ? 'gold' : 'blue'}>{question.skill}</Tag><Text>{index + 1}. {question.prompt}</Text></Space>,
+                  children: <Text type="secondary">参考术语：{(question.reference_terms || []).join('、') || '-'}</Text>,
                 }))}
               />
             </Card>

@@ -24,7 +24,7 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 
-from sqlalchemy import select, and_, text
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import (
@@ -132,71 +132,20 @@ class AgentInterface:
         self.db = db
         self.distribution_engine = DistributionEngine(db)
         self.approval_engine = ApprovalWorkflowEngine(db)
-        # Agent 权限配置（内存缓存，持久化在 tms_agent_registry 表，重启后懒加载）
+        # Agent 权限配置（生产环境应从数据库/配置中心读取）
         self._agent_permissions: Dict[str, int] = {}
         # Agent 白名单（可执行高危操作无需确认）
         self._agent_whitelist: set = set()
-        self._registry_loaded = False
 
-    async def _ensure_registry_table(self) -> None:
-        """确保注册表存在（DDL 单独提交，避免与后续 DML 同事务）"""
-        await self.db.execute(text(
-            "CREATE TABLE IF NOT EXISTS tms_agent_registry ("
-            "agent_id VARCHAR(100) PRIMARY KEY, "
-            "permission_level INTEGER NOT NULL DEFAULT 1, "
-            "whitelisted BOOLEAN NOT NULL DEFAULT FALSE, "
-            "updated_at TIMESTAMP DEFAULT NOW())"
-        ))
-        await self.db.commit()
-
-    async def _load_registry(self) -> None:
-        """从数据库懒加载 Agent 注册信息（重启后恢复权限/白名单）"""
-        if self._registry_loaded:
-            return
-        try:
-            await self._ensure_registry_table()
-            rows = (await self.db.execute(text(
-                "SELECT agent_id, permission_level, whitelisted FROM tms_agent_registry"
-            ))).all()
-            for r in rows:
-                self._agent_permissions[r[0]] = int(r[1])
-                if r[2]:
-                    self._agent_whitelist.add(r[0])
-            self._registry_loaded = True
-        except Exception as e:
-            logger.warning(f"加载 Agent 注册表失败，退回内存默认权限: {e}")
-            try:
-                await self.db.rollback()
-            except Exception:
-                pass
-
-    async def register_agent(self, agent_id: str, permission_level: int = 1, whitelisted: bool = False) -> None:
-        """注册 Agent（内存缓存 + 数据库持久化，重启不丢）"""
+    def register_agent(self, agent_id: str, permission_level: int = 1, whitelisted: bool = False) -> None:
+        """注册 Agent"""
         self._agent_permissions[agent_id] = permission_level
         if whitelisted:
             self._agent_whitelist.add(agent_id)
-        else:
-            self._agent_whitelist.discard(agent_id)
-        try:
-            await self._ensure_registry_table()
-            await self.db.execute(text(
-                "INSERT INTO tms_agent_registry (agent_id, permission_level, whitelisted, updated_at) "
-                "VALUES (:a, :l, :w, NOW()) "
-                "ON CONFLICT (agent_id) DO UPDATE SET permission_level=EXCLUDED.permission_level, "
-                "whitelisted=EXCLUDED.whitelisted, updated_at=NOW()"
-            ), {"a": agent_id, "l": permission_level, "w": whitelisted})
-            await self.db.commit()
-            self._registry_loaded = True
-        except Exception as e:
-            logger.warning(f"Agent 注册持久化失败（仅内存生效）: {e}")
-            try:
-                await self.db.rollback()
-            except Exception:
-                pass
         logger.info(f"Agent registered: {agent_id} | level={permission_level} | whitelisted={whitelisted}")
 
     def get_agent_permission(self, agent_id: str) -> int:
-        """获取 Agent 权限等级（内存缓存）"""
+        """获取 Agent 权限等级"""
         return self._agent_permissions.get(agent_id, 1)
 
     async def execute_command(self, request: AgentCommandRequest) -> AgentCommandResponse:
@@ -227,8 +176,7 @@ class AgentInterface:
                     action_id=str(existing.id),
                 )
 
-        # 2. 权限验证（先从数据库懒加载注册信息，重启后不丢权限配置）
-        await self._load_registry()
+        # 2. 权限验证
         required_level = COMMAND_PERMISSIONS.get(AgentCommand(command), AgentPermissionLevel.LEVEL_3)
         agent_level = self.get_agent_permission(agent_id)
 

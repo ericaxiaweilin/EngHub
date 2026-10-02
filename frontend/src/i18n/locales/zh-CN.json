@@ -22,7 +22,7 @@
     "g-hr": "人员",
     "/skill-matrix": "员工技能矩阵",
     "/simulation": "仿真引擎",
-    "g-tms": "RCC 任务中心",
+    "g-tms": "TMS 任务管理",
     "/tms/approval": "审批中心",
     "/tms/distribution": "分发看板",
     "/tms/agent": "Agent控制台",
@@ -82,6 +82,5 @@
     "pwdMismatch": "两次输入的密码不一致",
     "pwdSuccess": "密码修改成功，下次登录请使用新密码",
     "pwdFail": "修改失败"
-  },
-  "搜索订单号/客户/产品": "搜索订单号/客户/产品"
+  }
 }

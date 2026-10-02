@@ -279,9 +279,8 @@ class FactoryCommander:
     # Per-user 指挥官管理
     # ═══════════════════════════════════════════════════════════
 
-    async def enable_for_user(self, user_id: str, factory_id: str, scope: Optional[Dict] = None, username: Optional[str] = None):
-        """为用户开启指挥官（自动接管其工作范围）。开关持久化到 commander_sessions，
-        服务重启后 watch_loop 仍能从 DB 恢复启用状态（对齐 luaguage commander_prefs）。"""
+    def enable_for_user(self, user_id: str, factory_id: str, scope: Optional[Dict] = None, username: Optional[str] = None):
+        """为用户开启指挥官（自动接管其工作范围）"""
         self._user_commanders[user_id] = {
             "enabled": True,
             "factory_id": factory_id,
@@ -290,64 +289,20 @@ class FactoryCommander:
             "enabled_at": datetime.utcnow().isoformat(),
         }
         _logger.info(f"[commander] 用户 {user_id} 开启指挥官 | scope={scope}")
-        try:
-            from sqlalchemy import text as _t
-            await self.db.execute(_t(
-                "INSERT INTO commander_sessions (user_id, factory_id, enabled, scope, username, enabled_at, updated_at) "
-                "VALUES (:uid, :fid, TRUE, CAST(:scope AS jsonb), :uname, NOW(), NOW()) "
-                "ON CONFLICT (user_id, factory_id) DO UPDATE SET "
-                "enabled=TRUE, scope=EXCLUDED.scope, username=EXCLUDED.username, enabled_at=NOW(), updated_at=NOW()"
-            ), {"uid": str(user_id), "fid": factory_id, "scope": _json_dumps(scope or {}), "uname": username or str(user_id)})
-            await self.db.commit()
-        except Exception as exc:  # noqa: BLE001
-            _logger.warning(f"[commander] 持久化开关失败(不影响内存): {exc}")
 
-    async def disable_for_user(self, user_id: str):
-        """关闭用户指挥官（持久化到 commander_sessions）"""
+    def disable_for_user(self, user_id: str):
+        """关闭用户指挥官"""
         if user_id in self._user_commanders:
             self._user_commanders[user_id]["enabled"] = False
-        try:
-            from sqlalchemy import text as _t
-            await self.db.execute(_t(
-                "UPDATE commander_sessions SET enabled=FALSE, updated_at=NOW() WHERE user_id=:uid"
-            ), {"uid": str(user_id)})
-            await self.db.commit()
-        except Exception as exc:  # noqa: BLE001
-            _logger.warning(f"[commander] 持久化关闭失败: {exc}")
 
-    async def get_user_status(self, user_id: str) -> Dict[str, Any]:
-        """获取用户指挥官状态（DB 优先，重启后仍能查到）"""
-        try:
-            from sqlalchemy import text as _t
-            row = (await self.db.execute(_t(
-                "SELECT enabled, factory_id, scope, username, enabled_at FROM commander_sessions WHERE user_id=:uid"
-            ), {"uid": str(user_id)})).mappings().first()
-            if row is not None:
-                return {
-                    "enabled": bool(row["enabled"]),
-                    "factory_id": row["factory_id"] or "FAC_MECH_001",
-                    "scope": dict(row["scope"] or {}),
-                    "username": row["username"] or user_id,
-                    "enabled_at": row["enabled_at"].isoformat() if row["enabled_at"] else None,
-                    "message": "指挥官运行中" if row["enabled"] else "指挥官已暂停",
-                }
-        except Exception:
-            pass
+    def get_user_status(self, user_id: str) -> Dict[str, Any]:
+        """获取用户指挥官状态"""
         cfg = self._user_commanders.get(user_id)
         if not cfg:
             return {"enabled": False, "message": "指挥官未开启"}
         return {**cfg, "message": "指挥官运行中" if cfg["enabled"] else "指挥官已暂停"}
 
-    async def is_enabled(self, user_id: str) -> bool:
-        try:
-            from sqlalchemy import text as _t
-            row = (await self.db.execute(_t(
-                "SELECT enabled FROM commander_sessions WHERE user_id=:uid"
-            ), {"uid": str(user_id)})).mappings().first()
-            if row is not None:
-                return bool(row["enabled"])
-        except Exception:
-            pass
+    def is_enabled(self, user_id: str) -> bool:
         cfg = self._user_commanders.get(user_id)
         return bool(cfg and cfg.get("enabled"))
 
@@ -392,53 +347,6 @@ class FactoryCommander:
         decisions = await self._decide(state)
         report.decisions = decisions
 
-        # 3.5 AI→审批闭环：高风险决策自动落 RCC 待审批任务（人审批通过才执行）
-        # 需要审批的动作：插单/改期/撤单/下单/拒单/加急（影响资源或资金）
-        APPROVAL_ACTIONS = {
-            "rush_insert", "reschedule", "cancel_order", "place_order",
-            "reject_order", "expedite", "change_priority",
-        }
-        try:
-            from sqlalchemy import text as _t
-            import uuid as _uid
-            for d in decisions:
-                act = getattr(d, "action", None)
-                act_str = act.value if hasattr(act, "value") else str(act)
-                if act_str in APPROVAL_ACTIONS:
-                    # 去重：同动作类型+同 target，24h 内已有非终态任务（pending/approved/in_progress）则跳过。
-                    # 旧版只查 pending：任务一旦获批，下一周期决策又会重复落单（实测同题 13 连刷）。
-                    # 旧版用 title LIKE %target%：target 为空时 %% 误匹配全部同类任务。
-                    _tgt = str(getattr(d, "target", "") or "")
-                    dup = (await self.db.execute(_t("""
-                        SELECT 1 FROM rcc_tasks WHERE task_type=:tt
-                        AND factory_id=:fid
-                        AND COALESCE(affected_params->>'target','') = :tgt
-                        AND status IN ('pending','approved','in_progress')
-                        AND created_at > NOW() - interval '24 hours' LIMIT 1
-                    """), {"tt": act_str, "tgt": _tgt, "fid": factory_id})).scalar_one_or_none()
-                    if not dup:
-                        await self.db.execute(_t("""
-                            INSERT INTO rcc_tasks (id, task_code, factory_id, task_type, title, description,
-                                status, requested_by, affected_params, created_at, updated_at)
-                            VALUES (:id, :code, :fid, :tt, :title, :desc, 'pending', :by,
-                                    CAST(:ap AS jsonb), NOW(), NOW())
-                        """), {
-                            "id": str(_uid.uuid4()),
-                            "code": f"RCC-AI-{_uid.uuid4().hex[:6].upper()}",
-                            "fid": factory_id,
-                            "tt": act_str,
-                            "title": f"[AI决策] {getattr(d, 'reason', '')[:60]}",
-                            "desc": f"AI 指挥官决策，需审批后执行。action={act_str} target={getattr(d, 'target', '')}",
-                            "by": created_by or "ai_commander",
-                            "ap": __import__('json').dumps({"action": act_str,
-                                                            "target": getattr(d, "target", ""),
-                                                            "params": getattr(d, "params", {})},
-                                                           ensure_ascii=False),
-                        })
-            await self.db.commit()
-        except Exception as _ae:
-            _logger.warning(f"[commander] AI决策落RCC任务失败(不阻塞): {_ae}")
-
         # 4. 执行 + 计划（Planner）：是任务就有 plan —— 决策聚合为目标导向的行动计划
         if auto_execute:
             await self._execute_decisions(decisions, factory_id, state)
@@ -474,24 +382,10 @@ class FactoryCommander:
 
         report.duration_ms = (time.time() - start) * 1000
 
-        # 记录历史（内存 + 持久化到 commander_cycles，重启不丢）
+        # 记录历史
         self._history.append(report)
         if len(self._history) > self._history_max:
             self._history = self._history[-self._history_max:]
-        try:
-            from sqlalchemy import text as _t
-            await self.db.execute(_t(
-                "INSERT INTO commander_cycles (factory_id, mode, cycle, created_by, created_at) "
-                "VALUES (:fid, :mode, CAST(:cycle AS jsonb), :cb, NOW())"
-            ), {
-                "fid": factory_id,
-                "mode": report.order_mode.value,
-                "cycle": _json_dumps(report.to_dict()),
-                "cb": created_by or "",
-            })
-            await self.db.commit()
-        except Exception as exc:  # noqa: BLE001
-            _logger.warning(f"[commander] 持久化 cycle 快照失败: {exc}")
 
         _logger.info(
             f"[commander] {factory_id} | mode={state.order_mode.value} | "
@@ -1184,51 +1078,25 @@ class FactoryCommander:
         """手动 override 订单模式（None=自动判断）"""
         self._mode_override[factory_id] = mode
 
-    async def get_status(self, factory_id: str) -> Dict[str, Any]:
-        """获取指挥官当前状态（total_cycles 优先从 DB 统计，重启后不归零）"""
-        db_total = None
-        try:
-            from sqlalchemy import text as _t
-            db_total = int((await self.db.execute(_t(
-                "SELECT COUNT(*) FROM commander_cycles WHERE factory_id=:fid"
-            ), {"fid": factory_id})).scalar() or 0)
-        except Exception:
-            db_total = None
+    def get_status(self, factory_id: str) -> Dict[str, Any]:
+        """获取指挥官当前状态"""
         recent = [r for r in self._history if r.factory_id == factory_id]
         last = recent[-1] if recent else None
-        total = db_total if db_total is not None else len(recent)
         return {
             "factory_id": factory_id,
             "mode_override": self._mode_override.get(factory_id),
-            "total_cycles": total,
+            "total_cycles": len(recent),
             "last_cycle": last.to_dict() if last else None,
             "history_count": len(recent),
         }
 
-    async def get_history(self, factory_id: str, limit: int = 10) -> Dict[str, Any]:
-        # 优先读 DB（重启后仍有历史）；DB 不可用时回退内存
-        try:
-            from sqlalchemy import text as _t
-            rows = (await self.db.execute(_t(
-                "SELECT cycle, created_at FROM commander_cycles "
-                "WHERE factory_id=:fid ORDER BY id DESC LIMIT :lim"
-            ), {"fid": factory_id, "lim": max(1, min(int(limit), 50))})).mappings().all()
-            total = (await self.db.execute(_t(
-                "SELECT COUNT(*) FROM commander_cycles WHERE factory_id=:fid"
-            ), {"fid": factory_id})).scalar() or 0
-            records = []
-            for r in rows:
-                item = dict(r["cycle"] or {})
-                item.setdefault("created_at", r["created_at"])
-                records.append(item)
-            return {"factory_id": factory_id, "total": int(total), "records": records}
-        except Exception:
-            recent = [r for r in self._history if r.factory_id == factory_id][-limit:]
-            return {
-                "factory_id": factory_id,
-                "total": len([r for r in self._history if r.factory_id == factory_id]),
-                "records": [r.to_dict() for r in reversed(recent)],
-            }
+    def get_history(self, factory_id: str, limit: int = 10) -> Dict[str, Any]:
+        recent = [r for r in self._history if r.factory_id == factory_id][-limit:]
+        return {
+            "factory_id": factory_id,
+            "total": len([r for r in self._history if r.factory_id == factory_id]),
+            "records": [r.to_dict() for r in reversed(recent)],
+        }
 
     # ═══════════════════════════════════════════════════════════
     # 数据治理：充足性检查 + 降级策略 + 通知责任人
@@ -1505,34 +1373,8 @@ async def commander_watch_loop() -> None:
     while True:
         try:
             await asyncio.sleep(interval)
-            # 优先从 DB 读启用用户（重启后恢复）；内存作为同步缓存兜底
-            try:
-                from sqlalchemy import text as _t
-                rows = db_config.session_factory
-                async with rows() as _db:
-                    _rows = await _db.execute(_t(
-                        "SELECT user_id, factory_id, scope, username FROM commander_sessions WHERE enabled=TRUE"
-                    ))
-                    db_enabled = []
-                    for r in _rows.mappings().all():
-                        uid = str(r["user_id"] or "")
-                        if not uid:
-                            continue
-                        cfg = FactoryCommander._user_commanders.get(uid) or {
-                            "enabled": True,
-                            "factory_id": r["factory_id"] or "FAC_MECH_001",
-                            "scope": dict(r["scope"] or {}),
-                            "username": r["username"] or uid,
-                        }
-                        db_enabled.append((uid, cfg))
-                        FactoryCommander._user_commanders.setdefault(uid, cfg)
-            except Exception as exc:  # noqa: BLE001
-                _logger.warning(f"[commander-watch] 读 DB 启用用户失败，回退内存: {exc}")
-                db_enabled = []
-            enabled = db_enabled or [
-                (uid, cfg) for uid, cfg in FactoryCommander._user_commanders.items()
-                if cfg.get("enabled")
-            ]
+            enabled = [(uid, cfg) for uid, cfg in FactoryCommander._user_commanders.items()
+                       if cfg.get("enabled")]
             if not enabled:
                 # 无用户开启指挥官时，仍对默认工厂做数据治理巡检（只发缺口通知，
                 # 不执行决策/不挂任务），确保计划主数据缺口提醒自动生效。
@@ -1562,18 +1404,3 @@ async def commander_watch_loop() -> None:
             return
         except Exception as exc:  # noqa: BLE001 — 盯办循环必须常驻
             _logger.warning("指挥官盯办循环异常：%s", exc)
-
-
-def _json_dumps(obj: Any) -> str:
-    """CommanderReport.to_dict 里可能含 datetime/Enum，统一转 JSON 字符串。"""
-    import json as _json
-    from datetime import datetime as _dt
-    from enum import Enum as _Enum
-
-    def _conv(o):
-        if isinstance(o, _Enum):
-            return o.value
-        if isinstance(o, (_dt,)):
-            return o.isoformat()
-        return str(o)
-    return _json.dumps(obj, ensure_ascii=False, default=_conv)

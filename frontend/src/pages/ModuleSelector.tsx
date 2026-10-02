@@ -91,14 +91,6 @@ const MODULES: ModuleDef[] = [
     path: '/rcc?view=org-bubbles',
   },
   {
-    key: 'collab-work',
-    title: '协同',
-    desc: '快速工单 · 标准工单模板（8D/公共） · Agent控制台',
-    icon: <InboxOutlined style={{ fontSize: 36 }} />,
-    color: '#f5222d',
-    path: '/work-order-templates',
-  },
-  {
     key: 'ie',
     title: 'IE',
     desc: '标准工时 · 时间研究 · 线平衡 · 精益指标 · 5S审核',

@@ -10,7 +10,7 @@ import {
   ExperimentOutlined, FireOutlined, SafetyOutlined, ClockCircleOutlined,
   AuditOutlined, SendOutlined, BulbOutlined, RobotOutlined
 } from '@ant-design/icons'
-import axios from '../../services/api'
+import axios from 'axios'
 import { useRcc, COLORS } from './RCCCommandCenter'
 
 const API_BASE = '/api/v1/rcc'
@@ -140,8 +140,8 @@ export default function RCCDecisionHub() {
         )
         const data: any = {}
         results.forEach((r, i) => {
-          if (r.status === 'fulfilled' && (r.value as any)?.success) {
-            data[endpoints[i].key] = (r.value as any)?.data
+          if (r.status === 'fulfilled' && r.value.data?.success) {
+            data[endpoints[i].key] = r.value.data.data
           }
         })
         setDetailedDecisions(data)

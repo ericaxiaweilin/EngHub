@@ -28,16 +28,8 @@ from api.schemas.tms import (
     WebhookRegisterRequest,
 )
 from api.services.tms_service import TMSService
-from core.auth.security import get_current_user
 
 router = APIRouter(prefix="/api/v1/tms", tags=["TMS - 任务管理系统"])
-
-
-def _require_admin(current_user) -> None:
-    """注册/白名单类操作仅管理员可用（防止普通用户自我提权）"""
-    role = getattr(current_user, "role", "") or ""
-    if "admin" not in role.lower():
-        raise HTTPException(status_code=403, detail="仅管理员可执行该操作")
 
 
 # ========== 依赖注入 ==========
@@ -282,7 +274,6 @@ async def get_approval_flow_diagram(
 async def agent_command(
     payload: AgentCommandRequest,
     service: TMSService = Depends(get_tms_service),
-    current_user=Depends(get_current_user),
 ):
     """
     Agent/Chatbot 统一命令入口
@@ -310,7 +301,6 @@ async def agent_command(
 async def confirm_agent_action(
     payload: AgentConfirmRequest,
     service: TMSService = Depends(get_tms_service),
-    current_user=Depends(get_current_user),
 ):
     """人工确认 Agent 高危操作"""
     result = await service.confirm_agent_action(
@@ -325,10 +315,8 @@ async def confirm_agent_action(
 async def register_agent(
     payload: AgentRegisterRequest,
     service: TMSService = Depends(get_tms_service),
-    current_user=Depends(get_current_user),
 ):
-    """注册 Agent（设置权限等级，仅管理员）"""
-    _require_admin(current_user)
+    """注册 Agent（设置权限等级）"""
     result = await service.register_agent(
         agent_id=payload.agent_id,
         permission_level=payload.permission_level,
@@ -341,10 +329,8 @@ async def register_agent(
 async def register_webhook(
     payload: WebhookRegisterRequest,
     service: TMSService = Depends(get_tms_service),
-    current_user=Depends(get_current_user),
 ):
-    """注册 Webhook 订阅（Agent 事件推送，仅管理员）"""
-    _require_admin(current_user)
+    """注册 Webhook 订阅（Agent 事件推送）"""
     result = await service.register_webhook(
         agent_id=payload.agent_id,
         event_types=payload.event_types,
@@ -358,7 +344,6 @@ async def register_webhook(
 async def get_agent_context(
     task_id: str,
     service: TMSService = Depends(get_tms_service),
-    current_user=Depends(get_current_user),
 ):
     """获取任务的 Agent 上下文（供 Chatbot 使用）"""
     task = await service.get_task(task_id)

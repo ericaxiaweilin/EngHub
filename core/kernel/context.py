@@ -8,7 +8,7 @@ Checkpoint / Telemetry 等 Kernel 组件读取与写入。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -29,12 +29,17 @@ class KernelContext:
 
     # ── 可选输入 ──
     session_id: Optional[str] = None
+    goal_id: Optional[str] = None
+    goal: Optional[Dict[str, Any]] = None
     attachments: Optional[List[Any]] = None
     enable_tools: bool = True
     agent_key: Optional[str] = None
     temperature: float = 0.3
     permissions: set = field(default_factory=set)
     operator: str = ""
+    cancel_check: Optional[Callable[[], bool]] = None
+    cancel_wait: Optional[Callable[[], Awaitable[None]]] = None
+    steer_drain: Optional[Callable[[], Awaitable[List[Dict[str, Any]]]]] = None
 
     # ── 执行期中可变（Agent Loop 填充）──
     actions: List[Any] = field(default_factory=list)
@@ -72,6 +77,8 @@ class KernelContext:
             "request_id": self.request_id,
             "factory_id": self.factory_id,
             "session_id": self.session_id,
+            "goal_id": self.goal_id,
+            "goal": dict(self.goal) if isinstance(self.goal, dict) else self.goal,
             "operator": self.operator,
             "agent_key": self.agent_key,
             "enable_tools": self.enable_tools,

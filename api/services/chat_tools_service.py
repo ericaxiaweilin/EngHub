@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import csv
 import asyncio
-import inspect
 import io
 import json
 import re
@@ -28,7 +27,6 @@ from sqlalchemy import select, func, text
 from database.models import (
     WorkOrder, ProductionReport, Station, Equipment, Product,
     Inventory, DefectRecord, User, Routing, FileRecord, QualityInspection, WorkbookRecord,
-    BomItem,
 )
 from core.mes.work_order_coding import (
     generate_master_work_order_code,
@@ -136,526 +134,18 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_document_template",
-                    "description": "获取单据模板：11类单据（rfq询价单/quotation报价单/pr采购申请/po采购订单/gr收货单/delivery_note送货单/statement对账函/invoice发票/work_order生产工单/picking_list领料单/production_report生产日报），返回可打印/存PDF的HTML链接。用于XX单模板/打印XX单类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "doc_type": {"type": "string", "description": "单据类型：rfq/quotation/pr/po/gr/delivery_note/statement/invoice/work_order/picking_list/production_report"},
-                            "doc_code": {"type": "string", "description": "单据编号或ID（如 PO-xxx/PR-xxx/WO-xxx/GR-xxx/工单号/供应商ID）"}
-                        },
-                        "required": ["doc_type", "doc_code"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "create_supplier_profile",
-                    "description": "供应商建档：登记新供应商（名称/类别/联系人/付款条件/资质），供应商开发日常。用于'新供应商建档''开发供应商''登记供应商'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "supplier_name": {"type": "string", "description": "供应商名称"},
-                            "category": {"type": "string", "description": "类别：原材料/辅料/包材/设备"},
-                            "contact_person": {"type": "string", "description": "联系人"},
-                            "payment_terms": {"type": "string", "description": "付款条件（默认月结30天）"}
-                        },
-                        "required": ["supplier_name"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "payment_request",
-                    "description": "付款申请：PO 收货且发票匹配后，向财务发起付款申请（供应商/金额/到期日）。用于'申请付款''这笔该付款了''付款申请'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "po_code": {"type": "string", "description": "采购订单编号"},
-                            "amount": {"type": "number", "description": "付款金额（可选，默认PO金额）"}
-                        },
-                        "required": ["po_code"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "purchase_return",
-                    "description": "采购退货/索赔：到货不良或错料时登记退货（数量/原因），或向供应商索赔。用于'这批货要退''退货''索赔'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "po_code": {"type": "string", "description": "采购订单编号"},
-                            "quantity": {"type": "number", "description": "退货数量"},
-                            "reason": {"type": "string", "description": "原因：不良/错料/逾期"},
-                            "return_type": {"type": "string", "description": "return退货/claim索赔（默认return）"}
-                        },
-                        "required": ["po_code", "quantity"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "manage_supplier_status",
-                    "description": "供应商状态管理：暂停合作/恢复/拉黑（绩效差或违规时）。用于'这家供应商暂停''拉黑这家''恢复合作'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "supplier_id": {"type": "string", "description": "供应商ID或编码"},
-                            "status": {"type": "string", "description": "active/hold/blacklist"},
-                            "reason": {"type": "string", "description": "原因"}
-                        },
-                        "required": ["supplier_id", "status"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "create_rfq",
-                    "description": "发起询价(RFQ)：为缺料/PR物料向多家供应商发出询价请求，收集报价。返回RFQ编号与状态。用于'向供应商询价''发RFQ''这料问几家报价'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "material_code": {"type": "string", "description": "物料编码"},
-                            "quantity": {"type": "number", "description": "询价数量"},
-                            "supplier_ids": {"type": "array", "items": {"type": "string"}, "description": "候选供应商ID列表（默认取该物料全部供应商）"}
-                        },
-                        "required": ["material_code", "quantity"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "collect_quotations",
-                    "description": "收集/提交供应商报价：为RFQ录入供应商报价（单价/交期/付款条件），或查询已有报价。用于'供应商报价来了''记录报价''比价'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "rfq_id": {"type": "string", "description": "RFQ编号或ID"},
-                            "supplier_id": {"type": "string", "description": "报价供应商ID（录入报价时）"},
-                            "unit_price": {"type": "number", "description": "报价单价（录入时）"},
-                            "lead_time_days": {"type": "integer", "description": "交期天数（录入时）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "select_best_quote",
-                    "description": "比价选优：对RFQ的多个报价按价格/交期/供应商绩效综合评分选出最优，标记 selected。用于'哪家报价最好''选哪个供应商''比价结果'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "rfq_id": {"type": "string", "description": "RFQ编号或ID"}
-                        },
-                        "required": ["rfq_id"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "goods_receipt",
-                    "description": "采购收货(GR)：PO到货登记收货单，记录收货数量/合格数/不良数，触发IQC质检状态。用于'货到了收货''PO到货登记''这批到货怎么样'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "po_code": {"type": "string", "description": "采购订单编号"},
-                            "quantity": {"type": "number", "description": "到货数量"},
-                            "qty_accepted": {"type": "number", "description": "合格数量"},
-                            "qty_rejected": {"type": "number", "description": "不良数量（默认0）"}
-                        },
-                        "required": ["po_code", "quantity", "qty_accepted"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "supplier_evaluation",
-                    "description": "供应商绩效评估：按订单交付/质量/价格计算供应商评分(0-100)与等级(A/B/C/D)，含OTIF率。用于'供应商表现怎么样''评估供应商''哪家供应商靠谱'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "period": {"type": "string", "description": "评估周期 YYYY-MM（默认当前月）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "invoice_matching_check",
-                    "description": "发票校验(三单匹配)：发票金额 vs PO金额 vs 收货金额核对，标记 matched/mismatch。用于'对账''发票核对''三单匹配'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "po_code": {"type": "string", "description": "采购订单编号"},
-                            "invoice_amount": {"type": "number", "description": "发票金额"}
-                        },
-                        "required": ["po_code", "invoice_amount"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "arrival_tracking",
-                    "description": "到货跟踪：查询采购到货计划（在途/已到/延迟），ETA与运输方式。用于'货到哪了''在途多久到''到货计划'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "status": {"type": "string", "description": "过滤：scheduled/in_transit/arrived/delayed（可选）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_supplier_rank",
-                    "description": "供应商排名：按绩效总分/OTIF率/价格水平给供应商排名，返回TOP供应商与需淘汰供应商。用于'供应商排名''哪家供应商最好''换供应商'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "limit": {"type": "integer", "description": "返回数量（默认10）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "demand_forecast",
-                    "description": "需求预测：按产品统计近期销售/订单趋势，估算未来需求（简单移动平均/趋势），输出预测需求表。用于'预测下月需求''这个产品需求趋势''需求计划'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "product_id": {"type": "string", "description": "产品编码（可选，不传按产品汇总TOP）"},
-                            "horizon_days": {"type": "integer", "description": "预测展望天数（默认30）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "rccp_check",
-                    "description": "粗能力计划 RCCP 检查：关键产线/瓶颈资源在未来窗口的粗负荷（需求工时 vs 可用工时），超负荷即预警。用于'产能够不够''粗能力检查''关键产线负荷''RCCP'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "horizon_days": {"type": "integer", "description": "展望天数（默认14）"},
-                            "threshold_pct": {"type": "number", "description": "超负荷阈值%（默认90）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "changeover_plan",
-                    "description": "换线管理：查产线换型计划（换线时间/换线产品/准备时长），评估换线对排程的影响。用于'换线计划''什么时候换型''换线影响'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "station_code": {"type": "string", "description": "工位/产线编码（可选）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "plan_achievement",
-                    "description": "计划达成率：MPS 计划数量 vs 实际产出（工单报工/完工），按产品/工单算达成率，识别欠产/超产。用于'计划达成率''完成率多少''MPS达成'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "period_days": {"type": "integer", "description": "统计窗口天数（默认7）"},
-                            "product_id": {"type": "string", "description": "产品过滤（可选）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "fifo_check",
-                    "description": "库存 FIFO 检查（先进先出管控）：按物料查库龄分布（<30/30-90/90-180/>180天）、呆滞占比、FIFO 执行风险（老库存占比高=发料没按先进先出）。用于'FIFO检查''库龄分布''先进先出执行得怎么样''哪些料库存老化'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "material_code": {"type": "string", "description": "物料编码（可选，不传查全厂TOP老化）"},
-                            "limit": {"type": "integer", "description": "返回条数（默认10）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "eat_check",
-                    "description": "EAT 检查（物料最早可用时间/Earliest Available Time）：对物料或工单，计算库存可覆盖到哪天、在途PO何时到货，得出最早可用时间，判断需求日期前能否齐套。用于'这料什么时候能到齐''需求日之前能用吗''EAT检查''齐套时间'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "material_code": {"type": "string", "description": "物料编码"},
-                            "work_order_code": {"type": "string", "description": "工单号（可选，按工单需求检查）"},
-                            "required_date": {"type": "string", "description": "需求日期 YYYY-MM-DD（可选，默认工单交期）"}
-                        },
-                        "required": ["material_code"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "reschedule_work_order",
-                    "description": "工单改期（PMC 高频）：修改工单交期/计划完成日期，自动做变更影响分析（该工单前后关联、同产线负荷、物料齐套），写入变更日志。用于'这单改到X号''交期推迟/提前''改期'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "work_order_code": {"type": "string", "description": "工单号"},
-                            "new_due_date": {"type": "string", "description": "新交期 YYYY-MM-DD"},
-                            "reason": {"type": "string", "description": "变更原因（如客户推迟/物料晚到）"}
-                        },
-                        "required": ["work_order_code", "new_due_date"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "rush_insert_order",
-                    "description": "紧急插单：插入 VIP/急单到排程，先算影响（受影响在制工单/延迟天数）再落库插单，更新受影响工单交期并通知。用于'插一个急单''VIP订单插进来''这单很急先排'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "product_id": {"type": "string", "description": "插单产品"},
-                            "quantity": {"type": "number", "description": "插单数量"},
-                            "due_date": {"type": "string", "description": "插单要求交期 YYYY-MM-DD"},
-                            "priority": {"type": "string", "description": "优先级 urgent/high（默认 urgent）"}
-                        },
-                        "required": ["product_id", "quantity", "due_date"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "change_priority",
-                    "description": "工单优先级调整（急单升级/降级）：修改工单优先级，记录变更原因与影响。用于'这单升级为急单''优先级调高''催一催'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "work_order_code": {"type": "string", "description": "工单号"},
-                            "priority": {"type": "string", "description": "新优先级 urgent/high/medium/low"},
-                            "reason": {"type": "string", "description": "调整原因"}
-                        },
-                        "required": ["work_order_code", "priority"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "cancel_work_order",
-                    "description": "撤单/取消工单：取消待排/已下达工单（在制需先暂停），释放产能与物料，记录变更。用于'这单不做了''取消工单''撤单'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "work_order_code": {"type": "string", "description": "工单号"},
-                            "reason": {"type": "string", "description": "取消原因"}
-                        },
-                        "required": ["work_order_code"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_pmc_change_log",
-                    "description": "查询 PMC 变更日志：改交期/插单/优先级/数量/撤单历史（谁改的/改成什么/原因/影响）。用于'最近改了哪些单''变更记录''这单改过几次'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "target_code": {"type": "string", "description": "按工单/计划号过滤（可选）"},
-                            "limit": {"type": "integer", "description": "返回条数（默认10）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_mrp_calculation",
-                    "description": "运行 MRP 计算（毛需求→净需求→批量→提前期）：按产品/工单展开 BOM 计算物料需求，返回需求明细与缺料清单。用于'帮我跑一下MRP''这个产品物料需求多少''哪些料需要采购'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "product_id": {"type": "string", "description": "产品编码（可选，不传跑全部在制工单）"},
-                            "horizon_days": {"type": "integer", "description": "展望期天数（默认14）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "create_shipment",
-                    "description": "创建出货单：按工单/订单生成出货计划（整柜/拼柜），登记客户、数量、ETD。用于'安排出货''这单什么时候出柜''建出货单'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "customer_name": {"type": "string", "description": "客户名称"},
-                            "product_id": {"type": "string", "description": "产品编码"},
-                            "quantity": {"type": "number", "description": "出货数量"},
-                            "etd": {"type": "string", "description": "预计开船日 YYYY-MM-DD"},
-                            "container_count": {"type": "integer", "description": "柜数（默认1）"}
-                        },
-                        "required": ["customer_name", "product_id", "quantity", "etd"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_shipment_status",
-                    "description": "查询出货状态：出货单列表（计划/在途/已出），ETD 与客户。用于'出货到哪了''有哪些在途柜''这单出了吗'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "status": {"type": "string", "description": "过滤状态：planned/in_transit/shipped（可选）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "pmc_hammer_matrix",
-            "description": "PMC 锤子图决策矩阵：工单×开关影响分析，返回敏感工单（排程敏感需重点保障）、全局风险开关（多工单受影响）、每个工单的推荐杠杆（哪个开关能提前/避免延后）。用于这批工单怎么排最稳、哪个工单最敏感、排程风险在哪、怎么保交付类请求。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "分析工单数（默认8）"},
-                    "work_order_codes": {"type": "array", "items": {"type": "string"}, "description": "指定工单（可选）"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "confirm_mps_plan",
-                    "description": "MPS 主生产计划确认：将草稿计划确认（draft→confirmed），表示计划审核通过可进入下达。用于'确认计划''计划审核通过''MPS确认'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "plan_id": {"type": "string", "description": "计划ID"}
-                        },
-                        "required": ["plan_id"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "release_mps_plan",
-                    "description": "MPS 计划下达：确认后的计划下达（confirmed→released），检查产能冲突并自动生成 MES 工单、触发 APS 排程。用于'下达计划''计划释放''生成工单'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "plan_id": {"type": "string", "description": "计划ID（confirmed状态）"}
-                        },
-                        "required": ["plan_id"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "aps_reschedule",
-                    "description": "APS 排程重排：对指定工单或全产线重新排程（应对插单/改期/产能变化）。用于'重新排程''APS重排''排程调整'类请求。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "work_order_id": {"type": "string", "description": "工单ID（可选，不传全厂重排）"},
-                            "strategy": {"type": "string", "description": "策略：priority/earliest_due/load_balance（默认priority）"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "pmc_backward_schedule",
-            "description": "PMC 交期倒推（五节点）：客户交期到ETD/Cut-off到生产完成到物料可上线到供应商ETA，含物料红线/每日排产/风险分级(green/yellow/red)。用于订单何时必须开始生产、物料最晚何时到、交货是否来得及类请求。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_id": {"type": "string", "description": "产品编码（如 FG-TREAD-001）"},
-                    "qty": {"type": "number", "description": "订单数量"},
-                    "delivery": {"type": "string", "description": "客户要求交期 YYYY-MM-DD"},
-                    "sea_days": {"type": "number", "description": "海运天数（默认12）"}
-                },
-                "required": ["product_id", "qty", "delivery"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "pmc_backward_to_plan",
-            "description": "交期倒推结果生成生产计划草案（PMB-），确认/下达走正常流程。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_id": {"type": "string", "description": "产品编码"},
-                    "qty": {"type": "number", "description": "数量"},
-                    "delivery": {"type": "string", "description": "交期 YYYY-MM-DD"}
-                },
-                "required": ["product_id", "qty", "delivery"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "query_pmc_material_supply",
-            "description": "PMC供应证据查询：把库存、库存最后流动/账龄、BOM可复用产品、未收货PO、在途数量、PO编号、供应商和ETA关联起来。用于回答库存多少、在途多少、PO编号多少、哪些180天呆滞料还能被BOM使用、物料LT/ETA等问题；只返回真实数据，缺少采购表时明确标记。",
+            "description": "PMC供应证据查询：把库存、库存最后流动/账龄、BOM可复用产品、未收货PO、在途数量、PO编号、供应商和ETA关联起来。用于回答‘库存多少、在途多少、PO编号多少、哪些180天呆滞料还能被BOM使用、物料LT/ETA’等问题；只返回真实数据，缺少采购表时明确标记。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "days": {"type": "integer", "description": "查询天数窗口（默认180）"},
-                    "only_stagnant": {"type": "boolean", "description": "只看呆滞料"},
-                    "material_code": {"type": "string", "description": "物料编码（可选）"}
+                    "material_keyword": {"type": "string", "description": "物料编码或名称关键词，可选"},
+                    "days": {"type": "integer", "description": "呆滞阈值，默认180天", "default": 180},
+                    "only_stagnant": {"type": "boolean", "description": "只返回超过阈值的呆滞料，可选", "default": False},
+                    "limit": {"type": "integer", "description": "返回条数，默认50", "default": 50},
                 },
-                "required": []
-            }
-        }
+            },
+        },
     },
     {
         "type": "function",
@@ -1196,7 +686,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_workflow_diagram",
-            "description": "在模型识别出明确流程对象和范围后，由流程引擎生成一张完整连通图。必须区分：独立业务子流程、岗位端到端流程、审批实例；用户点名某个子流程时不得展开其父岗位流程。已注册示例：替代料验证=process:alternate_material_validation，生产工单全生命周期=process:work_order_lifecycle，PMC端到端=pmc:end_to_end，其他岗位=position:<key>。对象不明确时先追问；未知注册键返回目录，严禁回退到PMC或最近DCC审批。",
+            "description": "在模型识别出明确流程对象和范围后，由流程引擎生成一张完整连通图。必须区分：独立业务子流程、岗位端到端流程、审批实例；用户点名某个子流程时不得展开其父岗位流程。PMC端到端必须传 scope=position_end_to_end 且 workflow_key=pmc:end_to_end；其他已注册示例：替代料验证=process:alternate_material_validation，生产工单全生命周期=process:work_order_lifecycle，其他岗位=position:<key>。对象不明确时先追问；未知注册键返回目录，严禁回退到PMC或最近DCC审批。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1286,6 +776,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "limit": {"type": "integer", "description": "明细条数上限，默认20", "default": 20},
                 },
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_manufacturing_intelligence",
+            "description": "查询当前工厂的制造智能总览：统一核对 Chatbot/Harness、PMC控制塔、待处理预警和 Sim-ERP 的运行状态，并返回基于真实PMC事实生成的缺料、产能、OTD、供应商延迟、呆滞库存等风险信号。只读，不执行排程或处置动作。",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -1395,144 +893,6 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "query_purchase_pipeline",
-            "description": "采购管道全景：按物料查采购申请(PR)/采购订单(PO)/供应商报价，确认物料采购状态。返回 PR/PO 数量与明细。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "material_code": {"type": "string", "description": "物料编码（可选，不传返回全部待处理）"},
-                    "status": {"type": "string", "description": "过滤状态：PENDING/assigned/converted/ordered/arrived"},
-                    "limit": {"type": "integer", "description": "返回条数，默认 10"}
-                }
-            },
-        },
-        },
-        {
-            "type": "function",
-            "function": {
-            "name": "create_purchase_requisition",
-            "description": "采购申请：物料缺料时生成采购申请(PR)。确定性写库（purchase_requisitions 正表），重复物料去重（已有 PENDING PR 则更新数量）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "material_code": {"type": "string", "description": "物料编码"},
-                    "material_name": {"type": "string", "description": "物料名称"},
-                    "required_qty": {"type": "number", "description": "需求数量"},
-                    "urgency": {"type": "string", "description": "紧急程度：normal/urgent/critical", "enum": ["normal", "urgent", "critical"]}
-                },
-                "required": ["material_code", "required_qty"]
-            },
-        },
-        },
-        {
-            "type": "function",
-            "function": {
-            "name": "assign_supplier_to_pr",
-            "description": "比价指派：为采购申请(PR)选择供应商（按 supplier_prices 最低价，无价格表则按供应商评分）。确定性逻辑。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pr_id": {"type": "string", "description": "采购申请 ID"},
-                    "prefer_supplier_id": {"type": "string", "description": "指定供应商（可选）"}
-                },
-                "required": ["pr_id"]
-            },
-        },
-        },
-        {
-            "type": "function",
-            "function": {
-            "name": "create_purchase_order",
-            "description": "转采购订单：将已指派供应商的采购申请(PR)转为采购订单(PO)，状态 ordered，记录交期。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pr_id": {"type": "string", "description": "采购申请 ID（须已指派供应商）"},
-                    "expected_days": {"type": "integer", "description": "期望交期天数（默认取供应商 lead_days）"}
-                },
-                "required": ["pr_id"]
-            },
-        },
-        },
-        {
-            "type": "function",
-            "function": {
-            "name": "query_purchase_order_progress",
-            "description": "跟催采购订单：查 PO 到货进度（已下未到的 PO 列表），供采购智能体跟催供应商。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "status": {"type": "string", "description": "过滤状态：draft/ordered/shipped/arrived"},
-                    "limit": {"type": "integer", "description": "返回条数，默认 10"}
-                },
-            },
-        },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "send_group_message",
-                    "description": "群协同发消息：向指定群发送文本消息（如 @PMC 确认补货、@采购 加急催货）。群成员（PMC/采购/生产等岗位）可在 Chatbot 群内对话。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "group_name": {"type": "string", "description": "群名称关键词（如 仓储采购协同群 / RCC指挥调度群），模糊匹配"},
-                            "content": {"type": "string", "description": "消息内容（可用 @岗位名 提及）"}
-                        },
-                        "required": ["group_name", "content"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_group_messages",
-                    "description": "查群消息：查看指定群的最近对话（岗位间沟通记录）。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "group_name": {"type": "string", "description": "群名称关键词，模糊匹配"},
-                            "limit": {"type": "integer", "description": "返回条数，默认 10"}
-                        },
-                        "required": ["group_name"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_rcc_center",
-                    "description": "RCC资源调度中心全景：调度任务审批状态、chatbot工单流转、资源调度决策建议（人力/设备/工单优先级/瓶颈/环境/工艺）。员工在个人chatbot可查资源调度情况。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "org_unit_id": {"type": "string", "description": "组织单元ID（可选，不传返回全部）"},
-                    "limit": {"type": "integer", "description": "返回条数，默认 10"}
-                }
-            },
-        },
-        },
-        {
-            "type": "function",
-            "function": {
-            "name": "submit_rcc_resource_request",
-            "description": "提交资源需求到RCC调度中心：员工在个人chatbot提出资源请求（人力/设备/物料/时间窗），生成RCC工单进入调度审批流。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "资源需求描述（如：需要2名操作员支援8月20日白班）"},
-                    "ticket_type": {"type": "string", "description": "工单类型：resource_request/equipment_request/manpower_request/material_request/other"},
-                    "requested_resource": {"type": "object", "description": "请求的资源：{type: manpower/equipment/material, name: 资源名, qty: 数量}"},
-                    "requested_time_window": {"type": "object", "description": "时间窗：{start: 2026-08-20, end: 2026-08-20, shift: 白班}"},
-                    "related_work_order_id": {"type": "string", "description": "关联工单ID（可选）"}
-                },
-                "required": ["message"]
-            },
-        },
-        },
-        {
-            "type": "function",
-            "function": {
             "name": "create_followup_task",
             "description": "把暂时无法一次完成的任务挂入任务中心持续跟进（等物料/等审批/等设备恢复/等供应商等场景）。系统会按设定频率定期用工具核实进展，完成/受阻时推送通知。当用户交代的事情当前无法闭环、或用户说'跟进一下''盯着''挂起来''到时候提醒我'时使用。",
             "parameters": {
@@ -1545,20 +905,6 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "agent_key": {"type": "string", "description": "负责跟进的智能体 key（dispatch_agent/procurement_agent/quality_agent/delivery_agent/escalation_agent/equipment_agent/scheduling_agent/warehouse_agent），不传则自动归类"},
                 },
                 "required": ["title"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_my_tasks",
-            "description": "查询任务中心的任务：我的任务（指派给我的/我创建的）、受阻任务、进行中任务，支持按状态过滤。用于'我的任务''有哪些任务在跟进''指派给我的任务''任务中心有什么''哪些任务受阻了'类请求。返回任务列表（标题/状态/跟进次数/进度/负责人）。",            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scope": {"type": "string", "description": "查询范围：mine(指派给我或我创建的，默认)/all(全部)/blocked(仅受阻)/open(进行中)/done(已完成)"},
-                    "limit": {"type": "integer", "description": "返回条数，默认10", "default": 10},
-                    "agent_key": {"type": "string", "description": "按负责智能体过滤（可选）"},
-                },
             },
         },
     },
@@ -1611,64 +957,6 @@ TOOL_DEFINITIONS.extend([
                     "keyword": {"type": "string", "description": "搜索关键词（编码或名称片段）"},
                 },
                 "required": ["keyword"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_product_bom",
-            "description": "查询产品BOM配置情况：返回产品已关联的BOM物料行（物料编码/名称/用量），以及该产品是否缺少BOM。用于'产品有没有BOM/查A-50-04-F的BOM/MRP为什么失败/缺物料清单'类请求。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_id": {"type": "string", "description": "产品ID或编码"},
-                },
-                "required": ["product_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_product_bom",
-            "description": "为产品补录BOM物料清单（写bom_items表）。支持两种方式：a) items数组逐项指定 material_code/material_name/qty_per_unit；b) copy_from_product 从参考产品复制整张BOM（含用量、版本）。用于'帮我补齐BOM/给A-50-04-F建BOM/MRP缺BOM'类请求。执行前若参考产品存在则推荐复制以保持一致性。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_id": {"type": "string", "description": "需要补BOM的产品ID"},
-                    "factory_id": {"type": "string", "description": "工厂ID，默认FAC_MECH_001"},
-                    "bom_version": {"type": "string", "description": "BOM版本，默认CURRENT"},
-                    "copy_from_product": {"type": "string", "description": "参考产品ID：从该产品复制BOM行（推荐用于同系列产品）"},
-                    "items": {
-                        "type": "array",
-                        "description": "逐项补录的BOM行",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "material_code": {"type": "string", "description": "物料编码"},
-                                "material_name": {"type": "string", "description": "物料名称"},
-                                "qty_per_unit": {"type": "number", "description": "单台用量"},
-                            },
-                            "required": ["material_code", "qty_per_unit"],
-                        },
-                    },
-                },
-                "required": ["product_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_sales_order_detail",
-            "description": "查询销售订单详情：订单头（状态/数量/交期/优先级/产品/客户）+ 关联生产计划 + 关联工单。支持按订单号或订单ID查询，订单表无记录时自动从关联工单聚合（演示订单兼容）。用于'查这个销售订单/看订单详情/判断订单评审结论/RDD能不能保证'类请求。order_ref 传 'all' 时返回订单统计（总数+按状态分布+最近订单），用于'有多少个订单/订单总数/订单概览'类请求。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "order_ref": {"type": "string", "description": "销售订单号（如 SO-2026-0022）或订单ID"},
-                },
-                "required": ["order_ref"],
             },
         },
     },
@@ -1843,9 +1131,18 @@ async def _tool_query_order_work_order_status(
 
 async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     code = args.get("work_order_code", "")
-    wo = await _resolve_work_order(db, code, factory_id)
+    stmt = select(WorkOrder).where(WorkOrder.work_order_code == code)
+    if factory_id:
+        stmt = stmt.where(WorkOrder.factory_id == factory_id)
+    wo = (await db.execute(stmt)).scalar_one_or_none()
     if not wo:
-        return {"error": f"未找到工单 {code}（已跨厂区探测，两个厂区均无此工单）"}
+        # 模糊匹配
+        stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code}%")).limit(1)
+        if factory_id:
+            stmt = stmt.where(WorkOrder.factory_id == factory_id)
+        wo = (await db.execute(stmt)).scalar_one_or_none()
+    if not wo:
+        return {"error": f"未找到工单 {code}"}
 
     pname = ""
     if wo.product_id:
@@ -1861,12 +1158,6 @@ async def _tool_get_work_order_detail(db: AsyncSession, args: Dict[str, Any], fa
         "actual_start": wo.actual_start.strftime("%Y-%m-%d %H:%M") if wo.actual_start else None,
         "remark": wo.remark,
     })
-    # 多租户提示：工单归属厂区与查询厂区不一致时显式标注（模型据此向用户说明）
-    if factory_id and wo.factory_id and str(wo.factory_id) != str(factory_id):
-        detail["cross_factory_hint"] = (
-            f"该工单属于 {wo.factory_id} 厂区，不在当前查询厂区 {factory_id} 下。"
-            f"已按实际归属厂区返回真实数据。"
-        )
     return detail
 
 
@@ -2111,9 +1402,6 @@ async def _tool_create_production_report(db: AsyncSession, args: Dict[str, Any],
 
     await db.commit()
     await db.refresh(report)
-    await _report_rcc_action(db, wo.factory_id, "production_report", wo.work_order_code,
-                             f"报工 良品{good_qty} 不良{defect_qty}（工位 {station.station_name}）",
-                             detail=operator, operator=operator, risk="info")
     return {
         "success": True,
         "message": f"报工成功",
@@ -2130,13 +1418,7 @@ async def _tool_create_production_report(db: AsyncSession, args: Dict[str, Any],
 # ==================== 仿真 / 扩展操作 工具执行器 ====================
 
 async def _resolve_work_order(db: AsyncSession, code_or_id: str, factory_id: Optional[str] = None) -> Optional[WorkOrder]:
-    """按 ID 或工单号（支持模糊）定位工单。
-
-    多租户升级：优先当前 factory_id 精确查；当前厂区查不到时自动跨厂区探测
-    （不带 factory_id 全库查）。这样把"数据在另一厂区"与"数据不存在"区分开：
-    返回的工单自带真实 factory_id，调用方用 wo.factory_id 展示归属即可，
-    不再因调用方传错厂区而误报"未找到"。
-    """
+    """按 ID 或工单号（支持模糊）定位工单。"""
     if not code_or_id:
         return None
     # WorkOrder.id 为 uuid, 仅当入参形似 UUID 时才按 id 查, 否则传编码会抛 invalid UUID 异常
@@ -2155,25 +1437,10 @@ async def _resolve_work_order(db: AsyncSession, code_or_id: str, factory_id: Opt
     wo = (await db.execute(stmt)).scalar_one_or_none()
     if wo:
         return wo
-    # ── 跨厂区探测：当前厂区没有，全库找（区分"别厂区"与"不存在"）──
-    if factory_id:
-        stmt = select(WorkOrder).where(WorkOrder.work_order_code == code_or_id)
-        wo = (await db.execute(stmt)).scalar_one_or_none()
-        if wo:
-            return wo
     stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code_or_id}%")).limit(1)
     if factory_id:
         stmt = stmt.where(WorkOrder.factory_id == factory_id)
-    wo = (await db.execute(stmt)).scalar_one_or_none()
-    if wo:
-        return wo
-    # 跨厂区模糊探测
-    if factory_id:
-        stmt = select(WorkOrder).where(WorkOrder.work_order_code.ilike(f"%{code_or_id}%")).limit(1)
-        wo = (await db.execute(stmt)).scalar_one_or_none()
-        if wo:
-            return wo
-    return None
+    return (await db.execute(stmt)).scalar_one_or_none()
 
 
 async def _get_user_by_name(db: AsyncSession, operator: str) -> Optional[User]:
@@ -3198,46 +2465,9 @@ async def _tool_query_shortage_alerts(db: AsyncSession, args: Dict[str, Any], fa
         for r in rows
     ]
     critical = [i for i in items if i["severity"] == "critical"]
-    # ── 工单需求缺料口径：在制/待排工单物料需求 > 可用 → 真缺料（MRP 视角）──
-    wo_items = []
-    wo_rows = (await db.execute(sa_text("""
-        SELECT wom.material_code, wom.material_name,
-               COALESCE(SUM(wom.required_qty - wom.received_qty), 0) AS shortage_qty,
-               (SELECT COALESCE(SUM(inv2.available_qty), 0) FROM inventory inv2
-                WHERE inv2.material_code = wom.material_code AND inv2.factory_id = :fid) AS avail_qty,
-               COUNT(DISTINCT wom.work_order_id) AS wo_count
-        FROM work_order_materials wom
-        JOIN work_orders wo ON wo.id = wom.work_order_id
-        WHERE wo.factory_id = :fid AND wo.status IN ('released','in_progress','pending')
-          AND wom.required_qty > wom.received_qty
-        GROUP BY wom.material_code, wom.material_name
-        HAVING SUM(wom.required_qty - wom.received_qty) > 0
-        ORDER BY SUM(wom.required_qty - wom.received_qty) DESC
-        LIMIT 10
-    """), {"fid": fid})).mappings().all()
-    for r in wo_rows:
-        need = float(r["shortage_qty"] or 0)
-        avail = float(r["avail_qty"] or 0)
-        if need > avail:
-            wo_items.append({
-                "material_code": r["material_code"], "material_name": r["material_name"] or r["material_code"],
-                "required_qty": need, "available_qty": avail, "gap": round(need - avail, 1),
-                "affected_work_orders": r["wo_count"], "severity": "critical" if need - avail > 100 else "warning",
-            })
-
-    merged = wo_items + [i for i in items if i["material_code"] not in {w["material_code"] for w in wo_items}]
-    # ── 建议动作（PMC 主动性）：每个缺料项给下一步行动 ──
-    for i in merged:
-        if i.get("required_qty", 0) > 0:
-            i["action_suggestion"] = f"缺口 {i.get('gap', 0)}，建议创建采购申请并通知采购跟进（1 个工单已受影响）" if i.get("affected_work_orders") else f"缺口 {i.get('gap', 0)}，建议创建采购申请补货"
-        else:
-            i["action_suggestion"] = f"库存低于补货阈值，建议按安全库存补货（缺口 {i.get('gap', 0)}）"
     return {
-        "factory_id": fid, "shortage_count": len(merged),
-        "critical_count": len([i for i in merged if i["severity"] == "critical"]),
-        "items": merged,
-        "note": "缺料口径：①工单需求>可用（MRP视角）②库存低于补货阈值",
-        "suggestions": [i["action_suggestion"] for i in merged[:5]],
+        "factory_id": fid, "shortage_count": len(items),
+        "critical_count": len(critical), "items": items,
     }
 
 
@@ -3274,1219 +2504,6 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
         "purchase_order_data_status": supply.get("purchase_order_data_status"),
         "note": supply.get("note"),
     }
-
-
-# ── RCC 总资源调度中心：统一动作上报（所有业务动作必须进 RCC）──
-async def _report_rcc_action(db, factory_id: str, action_type: str, target: str,
-                             summary: str, detail: str = "", operator: str = "system",
-                             rcc_task_type: Optional[str] = None, risk: str = "info") -> None:
-    """每个业务动作执行后上报 RCC：
-    1) agent_events 写 resource_action（RCC 感知全部动作流）
-    2) 资源相关动作（人力/设备/物料/交期）→ rcc_tasks 登记调度
-    3) 相关岗位通知
-    失败不阻塞业务主流程。
-    """
-    import uuid as _uuid
-    try:
-        await db.execute(text("""
-            INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
-            VALUES (:eid, :f, 'resource_action', :agent, CAST(:d AS jsonb), NOW())
-        """), {"eid": str(_uuid.uuid4()), "f": factory_id, "agent": operator,
-               "d": json.dumps({"action_type": action_type, "target": target,
-                                "summary": summary, "detail": detail,
-                                "risk": risk, "by": operator}, ensure_ascii=False)})
-        # ── 工作数据记录（真实追溯：智能体每步工作留痕）──
-        await db.execute(text("""
-            INSERT INTO agent_work_log (id, factory_id, agent_key, action, target, detail, evidence, result, related_ref, created_at, updated_at)
-            VALUES (:id, :f, :agent, :act, :tgt, :detail, CAST(:ev AS jsonb), :result, :ref, NOW(), NOW())
-        """), {"id": str(_uuid.uuid4()), "f": factory_id, "agent": operator,
-               "act": action_type, "tgt": target,
-               "detail": summary + (" · " + detail if detail else ""),
-               "ev": json.dumps({"risk": risk, "by": operator, "summary": summary}, ensure_ascii=False),
-               "result": "ok", "ref": target})
-        if rcc_task_type:
-            # RCC 组织单元按厂归属查找（旧版硬编码机械厂 org id，跨厂任务会挂错组织）
-            _rcc_org = (await db.execute(text(
-                "SELECT id FROM org_units WHERE factory_id=:f AND code LIKE 'RCC-%' LIMIT 1"
-            ), {"f": factory_id})).scalar_one_or_none() or "fb8337eb-c1d3-58af-842f-cf56d29e3f98"
-            await db.execute(text("""
-                INSERT INTO rcc_tasks (id, task_code, org_unit_id, factory_id, task_type, title, description, status, requested_by, created_at, updated_at)
-                VALUES (:tid, :tc, :org, :fid, :tt, :title, :desc, 'pending', :cb, NOW(), NOW())
-            """), {"tid": str(_uuid.uuid4()), "tc": f"RCC-{str(_uuid.uuid4())[:7].upper()}",
-                   "org": _rcc_org, "fid": factory_id, "tt": rcc_task_type,
-                   "title": f"[{action_type}] {target} {summary}",
-                   "desc": detail or summary, "cb": operator})
-        await db.commit()
-    except Exception:
-        pass
-
-
-async def _tool_get_document_template(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """11 类单据模板链接。"""
-    from api.services.doc_template_service import DOC_TYPES
-    doc_type = str(args.get("doc_type") or "").strip().lower()
-    doc_code = str(args.get("doc_code") or "").strip()
-    if doc_type not in DOC_TYPES or not doc_code:
-        return {"error": f"需要 doc_type({list(DOC_TYPES.keys())}) 和 doc_code"}
-    cfg = DOC_TYPES[doc_type]
-    try:
-        row = (await db.execute(text(cfg["query"]), {"c": doc_code})).mappings().first()
-    except Exception:
-        row = None
-    if not row:
-        return {"error": f"{doc_type.upper()} {doc_code} 不存在"}
-    url = f"/api/v1/pmc/doc-template/{doc_type}?code={doc_code}"
-    return {"type": "document_template", "doc_type": doc_type, "doc_code": doc_code,
-            "url": url, "message": f"{cfg['title'].strip()} {doc_code} 模板已生成，可打印/存PDF"}
-
-
-async def _tool_create_supplier_profile(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """供应商建档。"""
-    fid = factory_id or "FAC_MECH_001"
-    name = str(args.get("supplier_name") or "").strip()
-    if not name:
-        return {"error": "缺少 supplier_name"}
-    import uuid
-    sid = str(uuid.uuid4())
-    code = f"SUP-{str(uuid.uuid4())[:6].upper()}"
-    await db.execute(text("""
-        INSERT INTO supplier_profiles (id, factory_id, supplier_code, supplier_name, category, contact_person, payment_terms, status, created_at, updated_at)
-        VALUES (:id, :f, :code, :name, :cat, :cp, :pt, 'active', NOW(), NOW())
-    """), {"id": sid, "f": fid, "code": code, "name": name,
-           "cat": str(args.get("category") or "原材料"),
-           "cp": str(args.get("contact_person") or ""),
-           "pt": str(args.get("payment_terms") or "月结30天")})
-    await _report_rcc_action(db, fid, "supplier_created", code,
-                             f"供应商建档 {name} [{args.get('category') or '原材料'}]",
-                             detail=f"联系人 {args.get('contact_person') or '-'} 付款 {args.get('payment_terms') or '月结30天'}", operator=operator, risk="info")
-    await db.commit()
-    return {"type": "supplier_profile", "action": "created", "supplier_id": sid, "supplier_code": code,
-            "name": name, "status": "active", "message": f"供应商 {name} 已建档（{code}）"}
-
-
-async def _tool_payment_request(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """付款申请。"""
-    fid = factory_id or "FAC_MECH_001"
-    po_code = str(args.get("po_code") or "").strip()
-    if not po_code:
-        return {"error": "缺少 po_code"}
-    po = (await db.execute(text(
-        "SELECT id, po_code, supplier_id, supplier_name, total_amount FROM purchase_orders WHERE po_code=:c OR id=:c"
-    ), {"c": po_code})).mappings().first()
-    if not po:
-        return {"error": f"PO {po_code} 不存在"}
-    amount = float(args.get("amount") or po["total_amount"] or 0)
-    import uuid
-    pid = str(uuid.uuid4())
-    pcode = f"PAY-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
-    await db.execute(text("""
-        INSERT INTO payment_requests (id, factory_id, payment_code, supplier_id, supplier_name, po_code, amount, due_date, status, created_by, created_at, updated_at)
-        VALUES (:id, :f, :code, :sid, :sn, :po, :amt, CURRENT_DATE + 30, 'pending', :cb, NOW(), NOW())
-    """), {"id": pid, "f": fid, "code": pcode, "sid": po["supplier_id"], "sn": po["supplier_name"] or po["supplier_id"],
-           "po": po_code, "amt": amount, "cb": operator})
-    await _report_rcc_action(db, fid, "payment_requested", pcode,
-                             f"付款申请 {po_code} {amount}元（供应商 {po['supplier_name'] or po['supplier_id']}）",
-                             detail=f"月结30天", operator=operator, risk="info")
-    await db.commit()
-    return {"type": "payment_request", "action": "created", "payment_code": pcode, "po_code": po_code,
-            "amount": amount, "status": "pending", "message": f"付款申请 {pcode} 已提交（{amount}元）"}
-
-
-async def _tool_purchase_return(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """采购退货/索赔。"""
-    fid = factory_id or "FAC_MECH_001"
-    po_code = str(args.get("po_code") or "").strip()
-    qty = float(args.get("quantity") or 0)
-    reason = str(args.get("reason") or "不良")
-    rtype = str(args.get("return_type") or "return")
-    if not po_code or qty <= 0:
-        return {"error": "缺少 po_code/quantity"}
-    po = (await db.execute(text(
-        "SELECT id, po_code, material_code, supplier_id FROM purchase_orders WHERE po_code=:c OR id=:c"
-    ), {"c": po_code})).mappings().first()
-    if not po:
-        return {"error": f"PO {po_code} 不存在"}
-    import uuid
-    rid = str(uuid.uuid4())
-    rcode = f"RTN-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
-    await db.execute(text("""
-        INSERT INTO purchase_returns (id, factory_id, return_code, po_code, material_code, quantity, reason, return_type, status, supplier_id, created_by, created_at)
-        VALUES (:id, :f, :code, :po, :m, :q, :r, :t, 'pending', :sid, :cb, NOW())
-    """), {"id": rid, "f": fid, "code": rcode, "po": po_code, "m": po["material_code"],
-           "q": qty, "r": reason, "t": rtype, "sid": po["supplier_id"], "cb": operator})
-    await _report_rcc_action(db, fid, "purchase_return", rcode,
-                             f"{'索赔' if rtype == 'claim' else '退货'} {po_code} {po['material_code']}×{int(qty)}（{reason}）",
-                             detail=f"PO {po_code}", operator=operator, risk="warning")
-    await db.commit()
-    return {"type": "purchase_return", "action": "created", "return_code": rcode, "po_code": po_code,
-            "qty": qty, "reason": reason, "type": rtype, "message": f"{'索赔' if rtype == 'claim' else '退货'} {rcode} 已登记"}
-
-
-async def _tool_manage_supplier_status(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """供应商状态管理。"""
-    fid = factory_id or "FAC_MECH_001"
-    sid = str(args.get("supplier_id") or "").strip()
-    status = str(args.get("status") or "").strip()
-    reason = str(args.get("reason") or "")
-    if not sid or status not in ("active", "hold", "blacklist"):
-        return {"error": "缺少 supplier_id 或 status 非法（active/hold/blacklist）"}
-    sup = (await db.execute(text(
-        "SELECT id, supplier_name FROM suppliers WHERE id=:s OR supplier_code=:s"
-    ), {"s": sid})).mappings().first()
-    if not sup:
-        return {"error": f"供应商 {sid} 不存在"}
-    await db.execute(text(
-        "UPDATE suppliers SET status=:st WHERE id=:id"
-    ), {"st": status, "id": sup["id"]})
-    status_label = {"active": "正常合作", "hold": "暂停合作", "blacklist": "拉黑"}
-    await _report_rcc_action(db, fid, "supplier_status_change", sup["supplier_name"] or sid,
-                             f"供应商状态 → {status_label.get(status, status)}",
-                             detail=reason, operator=operator, risk="warning" if status != "active" else "info")
-    await db.commit()
-    return {"type": "supplier_status", "supplier": sup["supplier_name"] or sid,
-            "status": status, "reason": reason, "message": f"{sup['supplier_name'] or sid} 已{status_label.get(status, status)}"}
-
-
-async def _tool_create_rfq(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """发起询价(RFQ)：为物料向候选供应商发出询价。"""
-    fid = factory_id or "FAC_MECH_001"
-    mcode = str(args.get("material_code") or "").strip()
-    qty = float(args.get("quantity") or 0)
-    if not mcode or qty <= 0:
-        return {"error": "缺少 material_code/quantity"}
-    import uuid
-    rfq_id = str(uuid.uuid4())
-    code = f"RFQ-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
-    await db.execute(text("""
-        INSERT INTO rfqs (id, rfq_code, factory_id, material_code, material_name, quantity, required_date, status, created_by)
-        VALUES (:id, :code, :f, :m, :mn, :q, CURRENT_DATE + 7, 'open', :cb)
-    """), {"id": rfq_id, "code": code, "f": fid, "m": mcode,
-           "mn": (await db.execute(text("SELECT material_name FROM materials WHERE material_code=:m"), {"m": mcode})).scalar() or mcode,
-           "q": qty, "cb": operator})
-    # 候选供应商
-    sids = args.get("supplier_ids") or []
-    if not sids:
-        rows = (await db.execute(text("""
-            SELECT supplier_id FROM supplier_materials WHERE material_code=:m LIMIT 6
-        """), {"m": mcode})).mappings().all()
-        sids = [r["supplier_id"] for r in rows]
-    if not sids:
-        # 兜底：物料无供应商关联时向全部供应商询价（最小循环不断链）
-        rows = (await db.execute(text("""
-            SELECT id FROM suppliers WHERE supplier_code IS NOT NULL LIMIT 5
-        """))).mappings().all()
-        sids = [r["id"] for r in rows]
-    await _report_rcc_action(db, fid, "rfq_created", code,
-                             f"询价 {mcode}×{int(qty)}，向 {len(sids)} 家供应商",
-                             detail=f"候选: {','.join(sids[:5])}", operator=operator, risk="info")
-    await db.commit()
-    return {"type": "rfq", "action": "created", "rfq_id": rfq_id, "rfq_code": code,
-            "material": mcode, "qty": qty, "suppliers_targeted": len(sids),
-            "message": f"RFQ {code} 已发出，向 {len(sids)} 家供应商询价"}
-
-
-async def _tool_collect_quotations(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """收集报价：录入或查询。"""
-    fid = factory_id or "FAC_MECH_001"
-    rfq = str(args.get("rfq_id") or "").strip()
-    if not rfq:
-        return {"error": "缺少 rfq_id"}
-    # 支持 rfq_code 或 id
-    row = (await db.execute(text(
-        "SELECT id, rfq_code, material_code, quantity, status FROM rfqs WHERE rfq_code=:r OR id=:r"
-    ), {"r": rfq})).mappings().first()
-    if not row:
-        return {"error": f"RFQ {rfq} 不存在"}
-    sid = str(args.get("supplier_id") or "").strip()
-    if sid:
-        price = float(args.get("unit_price") or 0)
-        lead = int(args.get("lead_time_days") or 0)
-        if price <= 0 or lead <= 0:
-            return {"error": "报价需 unit_price>0 且 lead_time_days>0"}
-        srow = (await db.execute(text(
-            "SELECT supplier_name FROM suppliers WHERE id=:s OR supplier_code=:s"
-        ), {"s": sid})).mappings().first()
-        await db.execute(text("""
-            INSERT INTO quotations (id, rfq_id, supplier_id, supplier_name, unit_price, lead_time_days, delivery_date, payment_terms, status, created_at)
-            VALUES (gen_random_uuid()::text, :rfq, :sid, :sn, :price, :lead, (CURRENT_DATE + (:lead_days || ' days')::interval)::date, '月结30天', 'received', NOW())
-        """), {"rfq": row["id"], "sid": sid, "sn": srow["supplier_name"] if srow else sid,
-               "price": price, "lead": lead, "lead_days": str(lead)})
-        await db.execute(text("UPDATE rfqs SET status='quoting' WHERE id=:id"), {"id": row["id"]})
-        await _report_rcc_action(db, fid, "quotation_received", row["rfq_code"],
-                                 f"收到报价 {sid} {price}元/{lead}天",
-                                 detail=f"RFQ {row['rfq_code']} 物料 {row['material_code']}", operator=operator, risk="info")
-        await db.commit()
-        return {"type": "quotation", "action": "recorded", "rfq_code": row["rfq_code"],
-                "supplier": sid, "price": price, "lead_days": lead}
-    # 查询已有报价
-    quotes = (await db.execute(text("""
-        SELECT supplier_id, supplier_name, unit_price, lead_time_days, status FROM quotations
-        WHERE rfq_id=:rid ORDER BY unit_price
-    """), {"rid": row["id"]})).mappings().all()
-    return {"type": "quotations", "rfq_code": row["rfq_code"], "material": row["material_code"],
-            "qty": row["quantity"], "count": len(quotes),
-            "quotations": [{"supplier": q["supplier_name"] or q["supplier_id"],
-                            "price": float(q["unit_price"]), "lead_days": q["lead_time_days"],
-                            "status": q["status"]} for q in quotes]}
-
-
-async def _tool_select_best_quote(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """比价选优：价格 60% + 交期 20% + 供应商绩效 20%。"""
-    fid = factory_id or "FAC_MECH_001"
-    rfq = str(args.get("rfq_id") or "").strip()
-    if not rfq:
-        return {"error": "缺少 rfq_id"}
-    row = (await db.execute(text(
-        "SELECT id, rfq_code, material_code, quantity FROM rfqs WHERE rfq_code=:r OR id=:r"
-    ), {"r": rfq})).mappings().first()
-    if not row:
-        return {"error": f"RFQ {rfq} 不存在"}
-    quotes = (await db.execute(text("""
-        SELECT q.id, q.supplier_id, q.supplier_name, q.unit_price, q.lead_time_days,
-               COALESCE(se.total_score, 70) AS score
-        FROM quotations q
-        LEFT JOIN supplier_evaluations se ON se.supplier_id=q.supplier_id AND se.period=to_char(NOW(), 'YYYY-MM')
-        WHERE q.rfq_id=:rid AND q.status='received'
-    """), {"rid": row["id"]})).mappings().all()
-    if not quotes:
-        return {"error": "暂无报价可比较（先 collect_quotations）"}
-    if len(quotes) == 1:
-        best = quotes[0]
-    else:
-        prices = [float(q["unit_price"]) for q in quotes]
-        pmin, pmax = min(prices), max(prices)
-        def _score(q):
-            pscore = 100 if pmax == pmin else 100 - (float(q["unit_price"]) - pmin) / (pmax - pmin) * 40
-            lscore = max(0, 100 - (float(q["lead_time_days"]) - 1) * 10)
-            return 0.6 * pscore + 0.2 * lscore + 0.2 * float(q["score"])
-        best = max(quotes, key=_score)
-    await db.execute(text("""
-        UPDATE quotations SET status='selected', selected_by=:cb, selected_at=NOW() WHERE id=:id
-    """), {"id": best["id"], "cb": operator})
-    await db.execute(text("""
-        UPDATE quotations SET status='rejected' WHERE rfq_id=:rid AND id != :id
-    """), {"rid": row["id"], "id": best["id"]})
-    await db.execute(text("UPDATE rfqs SET status='selected' WHERE id=:id"), {"id": row["id"]})
-    await _report_rcc_action(db, fid, "quote_selected", row["rfq_code"],
-                             f"比价选中 {best['supplier_name'] or best['supplier_id']} {float(best['unit_price'])}元/{best['lead_time_days']}天",
-                             detail=f"评分 {round(float(best['score']), 1)}", operator=operator, risk="info")
-    await db.commit()
-    return {"type": "best_quote", "rfq_code": row["rfq_code"], "selected_supplier": best["supplier_name"] or best["supplier_id"],
-            "unit_price": float(best["unit_price"]), "lead_days": best["lead_time_days"],
-            "score": round(float(best["score"]), 1), "message": "已选定最优供应商，可转PO"}
-
-
-async def _tool_goods_receipt(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """采购收货(GR)：登记到货，触发 IQC 质检状态。"""
-    fid = factory_id or "FAC_MECH_001"
-    po_code = str(args.get("po_code") or "").strip()
-    qty = float(args.get("quantity") or 0)
-    accepted = float(args.get("qty_accepted") or 0)
-    rejected = float(args.get("qty_rejected") or 0)
-    if not po_code or qty <= 0:
-        return {"error": "缺少 po_code/quantity"}
-    po = (await db.execute(text(
-        "SELECT id, material_code, supplier_id, qty FROM purchase_orders WHERE (po_code=:c OR id=:c) AND factory_id=:f"
-    ), {"c": po_code, "f": fid})).mappings().first()
-    if not po:
-        return {"error": f"PO {po_code} 不存在"}
-    import uuid
-    gr_id = str(uuid.uuid4())
-    gr_code = f"GR-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
-    await db.execute(text("""
-        INSERT INTO goods_receipts (id, gr_code, factory_id, po_id, material_code, supplier_id,
-                                    quantity, qty_accepted, qty_rejected, iqc_status, warehouse, received_by, received_at)
-        VALUES (:id, :code, :f, :po, :m, :sup, :q, :acc, :rej, 'pending', 'MAIN', :cb, NOW())
-    """), {"id": gr_id, "code": gr_code, "f": fid, "po": po["id"], "m": po["material_code"],
-           "sup": po["supplier_id"], "q": qty, "acc": accepted, "rej": rejected, "cb": operator})
-    # 更新 PO 状态 + 库存（合格入账，可用与总量同步）；received_qty 累计与收货闭环口径一致
-    await db.execute(text("ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS received_qty NUMERIC DEFAULT 0"))
-    await db.execute(text("""
-        UPDATE purchase_orders SET status='received', actual_date=CURRENT_DATE,
-            received_qty=COALESCE(received_qty,0)+:q
-        WHERE id=:id
-    """), {"id": po["id"], "q": qty})
-    await db.execute(text("""
-        UPDATE inventory SET available_qty=available_qty+:acc, total_qty=total_qty+:acc
-        WHERE material_code=:m AND factory_id=:f
-    """), {"acc": accepted, "m": po["material_code"], "f": fid})
-    # ── 回写工单物料已收量（齐套可补齐）：合格数计入在制工单 received_qty ──
-    if accepted > 0:
-        # 优先：PO→PR→source_id 指向工单
-        po_pr = (await db.execute(text(
-            "SELECT pr_id FROM purchase_orders WHERE id=:id"
-        ), {"id": po["id"]})).mappings().first()
-        target_wo = None
-        if po_pr and po_pr["pr_id"]:
-            pr = (await db.execute(text(
-                "SELECT source, source_id FROM purchase_requisitions WHERE id=:pid OR pr_code=:pid"
-            ), {"pid": po_pr["pr_id"]})).mappings().first()
-            if pr and pr["source"] == "work_order" and pr["source_id"]:
-                target_wo = pr["source_id"]
-        if target_wo:
-            await db.execute(text("""
-                UPDATE work_order_materials SET received_qty=received_qty+:acc,
-                    shortage_qty=GREATEST(required_qty-received_qty-:acc, 0)
-                WHERE material_code=:m AND work_order_id=:wo
-            """), {"acc": accepted, "m": po["material_code"], "wo": target_wo})
-        else:
-            # 通用：回写所有在制/待排工单该物料
-            await db.execute(text("""
-                UPDATE work_order_materials SET received_qty=received_qty+:acc,
-                    shortage_qty=GREATEST(required_qty-received_qty-:acc, 0)
-                WHERE material_code=:m AND work_order_id IN (
-                    SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress','pending')
-                )
-            """), {"acc": accepted, "m": po["material_code"], "f": fid})
-        # 回写后重新计算 shortage（防御：required_qty 可能更新）
-        await db.execute(text("""
-            UPDATE work_order_materials SET shortage_qty=GREATEST(required_qty-received_qty, 0)
-            WHERE material_code=:m AND shortage_qty < 0
-        """), {"m": po["material_code"]})
-    await _report_rcc_action(db, fid, "goods_receipt", gr_code,
-                             f"PO {po_code} 收货 {int(accepted)} 合格/{int(rejected)} 不良，已入库存",
-                             detail=f"供应商 {po['supplier_id']} 物料 {po['material_code']}", operator=operator,
-                             risk="info")
-    # ── IQC 联动：收货自动生成来料检验任务（行业标准：收货→IQC→入库放行） ──
-    iqc_task_code = None
-    try:
-        await db.execute(text("ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS inspection_task_id VARCHAR(50)"))
-        from api.services.inspection_service import InspectionService
-        iqc_task = await InspectionService(db).create_task(
-            factory_id=fid, inspect_type="iqc",
-            material_code=po["material_code"], batch_qty=int(accepted or qty),
-            source_type="goods_receipt", source_code=gr_code, created_by=operator,
-        )
-        iqc_task_code = iqc_task.get("task_code")
-        await db.execute(text(
-            "UPDATE goods_receipts SET iqc_status='inspecting', inspection_task_id=:t WHERE id=:id"
-        ), {"t": iqc_task.get("id"), "id": gr_id})
-    except Exception as _iqc_e:
-        import logging as _lg
-        _lg.getLogger("chat_tools").warning(f"[goods_receipt] IQC任务生成失败(不阻塞收货): {_iqc_e}")
-    await db.commit()
-    return {"type": "goods_receipt", "action": "received", "gr_code": gr_code, "po_code": po_code,
-            "qty": qty, "accepted": accepted, "rejected": rejected,
-            "iqc_status": "inspecting" if iqc_task_code else "pending",
-            "inspection_task_code": iqc_task_code,
-            "message": f"收货 {gr_code} 登记完成，合格 {accepted}，已自动生成IQC检验单 {iqc_task_code or '(生成失败)'}"}
-
-
-async def _tool_supplier_evaluation(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """供应商绩效评估：OTIF率/价格/质量 → 总分+等级。"""
-    fid = factory_id or "FAC_MECH_001"
-    period = str(args.get("period") or "").strip() or datetime.now().strftime("%Y-%m")
-    # 按供应商聚合 PO 交付数据
-    rows = (await db.execute(text("""
-        SELECT po.supplier_id, s.supplier_name, COUNT(*) AS order_cnt,
-               COUNT(CASE WHEN po.status IN ('received','closed') THEN 1 END) AS done_cnt,
-               COALESCE(SUM(CASE WHEN po.status='received' THEN po.qty ELSE 0 END),0) AS recv_qty, COALESCE(SUM(po.qty),1) AS total_qty,
-               AVG(COALESCE(sp.unit_price, 100)) AS avg_price
-        FROM purchase_orders po
-        LEFT JOIN suppliers s ON s.id = po.supplier_id OR s.supplier_code = po.supplier_id
-        LEFT JOIN supplier_prices sp ON sp.supplier_id = po.supplier_id AND sp.material_code = po.material_code
-        WHERE po.factory_id=:f AND po.supplier_id IS NOT NULL AND po.supplier_id != ''
-        GROUP BY po.supplier_id, s.supplier_name
-        ORDER BY order_cnt DESC LIMIT 10
-    """), {"f": fid})).mappings().all()
-    if not rows:
-        return {"error": "无 PO 数据可评估"}
-    results = []
-    for r in rows:
-        otif = (float(r["recv_qty"]) / float(r["total_qty"]) * 100) if float(r["total_qty"]) > 0 else 0
-        s_price = 100 if not r["avg_price"] else max(0, 100 - float(r["avg_price"]) / 10)
-        s_delivery = otif
-        s_quality = 90.0  # 默认（无不良数据）
-        total = round(0.4 * s_price + 0.4 * s_delivery + 0.2 * s_quality, 1)
-        grade = "A" if total >= 90 else "B" if total >= 75 else "C" if total >= 60 else "D"
-        await db.execute(text("""
-            INSERT INTO supplier_evaluations (id, factory_id, supplier_id, supplier_name, period,
-                score_price, score_delivery, score_quality, total_score, grade,
-                order_count, on_time_count, otif_rate)
-            VALUES (gen_random_uuid()::text, :f, :sid, :sn, :p, :sp, :sd, :sq, :tt, :g, :oc, :dc, :otif)
-            ON CONFLICT (factory_id, supplier_id, period) DO UPDATE SET
-                score_price=EXCLUDED.score_price, score_delivery=EXCLUDED.score_delivery,
-                score_quality=EXCLUDED.score_quality, total_score=EXCLUDED.total_score,
-                grade=EXCLUDED.grade, order_count=EXCLUDED.order_count,
-                on_time_count=EXCLUDED.on_time_count, otif_rate=EXCLUDED.otif_rate, updated_at=NOW()
-        """), {"f": fid, "sid": r["supplier_id"] or "UNKNOWN", "sn": r["supplier_name"] or r["supplier_id"] or "UNKNOWN",
-               "p": period, "sp": round(s_price, 1), "sd": round(s_delivery, 1), "sq": s_quality,
-               "tt": total, "g": grade, "oc": int(r["order_cnt"]), "dc": int(r["done_cnt"]),
-               "otif": round(otif, 1)})
-        results.append({"supplier": r["supplier_name"] or r["supplier_id"], "orders": int(r["order_cnt"]),
-                        "otif": round(otif, 1), "price_score": round(s_price, 1),
-                        "delivery_score": round(s_delivery, 1), "total": total, "grade": grade})
-    await db.commit()
-    return {"type": "supplier_evaluation", "period": period, "count": len(results),
-            "results": sorted(results, key=lambda x: -x["total"])}
-
-
-async def _tool_invoice_matching_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """发票校验（三单匹配）：发票 vs PO vs 收货。"""
-    fid = factory_id or "FAC_MECH_001"
-    po_code = str(args.get("po_code") or "").strip()
-    inv_amt = float(args.get("invoice_amount") or 0)
-    if not po_code:
-        return {"error": "缺少 po_code"}
-    po = (await db.execute(text(
-        "SELECT id, po_code, total_amount, material_code, supplier_id, qty FROM purchase_orders WHERE po_code=:c OR id=:c"
-    ), {"c": po_code})).mappings().first()
-    if not po:
-        return {"error": f"PO {po_code} 不存在"}
-    po_amt = float(po["total_amount"] or 0)
-    gr = (await db.execute(text(
-        "SELECT COALESCE(SUM(qty_accepted),0) FROM goods_receipts WHERE po_id=:pid"
-    ), {"pid": po["id"]})).scalar_one() or 0
-    gr_amt = po_amt * (float(gr) / float(po.get("qty") or 1)) if po.get("qty") else 0
-    diff = inv_amt - po_amt
-    status = "matched" if abs(diff) <= max(1.0, po_amt * 0.01) else "mismatch"
-    await db.execute(text("""
-        INSERT INTO invoice_matching (id, factory_id, po_code, gr_code, supplier_id, invoice_amount,
-                                      po_amount, gr_amount, diff_amount, status, match_type, checked_by, checked_at)
-        VALUES (gen_random_uuid()::text, :f, :po, :gr, :sup, :inv, :pa, :ga, :diff, :st, 'PO_INVOICE', :cb, NOW())
-    """), {"f": fid, "po": po_code, "gr": "", "sup": po["supplier_id"], "inv": inv_amt,
-           "pa": po_amt, "ga": round(gr_amt, 2), "diff": round(diff, 2), "st": status, "cb": operator})
-    await _report_rcc_action(db, fid, "invoice_matching", po_code,
-                             f"三单匹配 {status}（发票 {inv_amt} vs PO {po_amt}）",
-                             detail=f"差额 {round(diff, 2)}", operator=operator,
-                             rcc_task_type="approval" if status == "mismatch" else None,
-                             risk="warning" if status == "mismatch" else "info")
-    await db.commit()
-    return {"type": "invoice_matching", "po_code": po_code, "invoice_amount": inv_amt,
-            "po_amount": po_amt, "gr_amount": round(gr_amt, 2), "diff": round(diff, 2),
-            "status": status, "message": "三单匹配一致，可付款" if status == "matched" else "发票与PO金额不符，需人工复核"}
-
-
-async def _tool_arrival_tracking(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """到货跟踪：查询到货计划/在途状态。"""
-    fid = factory_id or "FAC_MECH_001"
-    status = str(args.get("status") or "").strip()
-    # 从 PO + 到货计划汇总
-    sql = """SELECT po.po_code, po.material_code, po.supplier_id, po.qty, po.expected_date AS eta,
-                    CASE WHEN po.status IN ('received','closed') THEN 'arrived'
-                         WHEN po.status='ordered' AND po.expected_date < CURRENT_DATE THEN 'delayed'
-                         ELSE 'in_transit' END AS status
-             FROM purchase_orders po WHERE po.factory_id=:f AND po.status NOT IN ('draft','cancelled')"""
-    params = {"f": fid}
-    if status:
-        sql += " AND (CASE WHEN po.status IN ('received','closed') THEN 'arrived' WHEN po.status='ordered' AND po.expected_date < CURRENT_DATE THEN 'delayed' ELSE 'in_transit' END) = :s"
-        params["s"] = status
-    sql += " ORDER BY po.expected_date LIMIT 15"
-    rows = (await db.execute(text(sql), params)).mappings().all()
-    return {"type": "arrival_tracking", "count": len(rows),
-            "arrivals": [{"po_code": r["po_code"], "material": r["material_code"],
-                          "supplier": r["supplier_id"], "qty": float(r["qty"] or 0),
-                          "eta": str(r["eta"])[:10] if r["eta"] else "?", "status": r["status"]} for r in rows]}
-
-
-async def _tool_query_supplier_rank(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement_agent") -> Dict[str, Any]:
-    """供应商排名：按绩效总分/OTIF。"""
-    fid = factory_id or "FAC_MECH_001"
-    limit = int(args.get("limit") or 10)
-    rows = (await db.execute(text("""
-        SELECT supplier_name, total_score, grade, otif_rate, order_count FROM supplier_evaluations
-        WHERE factory_id=:f
-        ORDER BY total_score DESC LIMIT :lim
-    """), {"f": fid, "lim": limit})).mappings().all()
-    return {"type": "supplier_rank", "count": len(rows),
-            "ranking": [{"supplier": r["supplier_name"], "score": float(r["total_score"] or 0),
-                         "grade": r["grade"], "otif": float(r["otif_rate"] or 0),
-                         "orders": int(r["order_count"] or 0)} for r in rows]}
-
-
-async def _tool_demand_forecast(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """需求预测：近期订单趋势 → 移动平均预测。"""
-    fid = factory_id or "FAC_MECH_001"
-    prod = str(args.get("product_id") or "").strip()
-    horizon = int(args.get("horizon_days") or 30)
-    cond = "factory_id=:f"
-    params: Dict[str, Any] = {"f": fid, "h": horizon}
-    if prod:
-        cond += " AND product_id=:p"
-        params["p"] = prod
-    # 近 90 天订单按产品汇总
-    rows = (await db.execute(text(f"""
-        SELECT product_id, COUNT(*) AS order_count,
-               COALESCE(SUM(quantity),0) AS total_qty,
-               COUNT(*) FILTER (WHERE status IN ('confirmed','在生产','completed')) AS confirmed
-        FROM sales_orders WHERE {cond} AND created_at > NOW() - interval '90 days'
-        GROUP BY product_id ORDER BY total_qty DESC LIMIT 10
-    """), params)).mappings().all()
-    items = []
-    for r in rows:
-        # 移动平均：90 天量 / 3 = 月均 → 预测 horizon 天
-        daily = float(r["total_qty"]) / 90
-        forecast = round(daily * horizon, 1)
-        items.append({"product_id": r["product_id"], "orders_90d": r["order_count"],
-                      "qty_90d": float(r["total_qty"]), "confirmed": r["confirmed"],
-                      "daily_avg": round(daily, 1),
-                      "forecast_qty": forecast, "forecast_days": horizon,
-                      "trend": "上升" if forecast > daily * 15 else "平稳"})
-    return {"type": "demand_forecast", "horizon_days": horizon, "count": len(items), "items": items,
-            "note": "简单移动平均：近90天日均 × 展望天数。建议结合客户意向修正。"}
-
-
-async def _tool_rccp_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """粗能力计划 RCCP：关键产线未来窗口负荷检查。"""
-    fid = factory_id or "FAC_MECH_001"
-    horizon = int(args.get("horizon_days") or 14)
-    threshold = float(args.get("threshold_pct") or 90)
-    # 工位负荷：APS 任务窗口聚合（工时）
-    rows = (await db.execute(text("""
-        SELECT st.station_code, st.station_name,
-               COUNT(*) AS tasks,
-               COALESCE(SUM(t.setup_minutes + t.run_seconds / 60.0), 0) / 60.0 AS load_hours,
-               :h * 12 AS avail_hours
-        FROM aps_schedule_tasks t
-        LEFT JOIN stations st ON st.id = t.station_id
-        WHERE st.factory_id = :f AND t.planned_start BETWEEN CURRENT_DATE AND CURRENT_DATE + (:h || ' days')::interval
-        GROUP BY st.station_code, st.station_name
-        ORDER BY load_hours DESC LIMIT 10
-    """), {"f": fid, "h": horizon})).mappings().all()
-    items = []
-    for r in rows:
-        load = float(r["load_hours"] or 0)
-        avail = float(r["avail_hours"] or 0)
-        pct = round(load / avail * 100, 1) if avail else 0
-        items.append({"station": r["station_code"], "station_name": r["station_name"],
-                      "tasks": r["tasks"], "load_hours": round(load, 1),
-                      "available_hours": avail, "load_pct": pct,
-                      "level": "critical" if pct >= threshold else ("warning" if pct >= threshold * 0.8 else "ok"),
-                      "suggestion": f"负荷 {pct}% 超阈值 {threshold}%，需排程调整或加班" if pct >= threshold else "负荷正常"})
-    return {"type": "rccp_check", "horizon_days": horizon, "threshold_pct": threshold,
-            "count": len(items), "items": items,
-            "note": "粗能力：关键产线需求工时 vs 可用工时（12h/天），超阈值预警"}
-
-
-async def _tool_changeover_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """换线管理：查换型计划与影响。"""
-    fid = factory_id or "FAC_MECH_001"
-    station = str(args.get("station_code") or "").strip()
-    # 换线相关：APS 任务里换型记录或工单切换
-    cond = "wo.factory_id=:f"
-    params: Dict[str, Any] = {"f": fid}
-    if station:
-        cond += " AND st.station_code=:s"
-        params["s"] = station
-    rows = (await db.execute(text(f"""
-        SELECT st.station_code AS station, st.station_name,
-               wo.work_order_code, wo.product_id, wo.status,
-               wo.planned_due
-        FROM work_orders wo
-        LEFT JOIN stations st ON st.id = wo.assigned_station_id
-        WHERE {cond} AND wo.status IN ('pending','released')
-        ORDER BY wo.planned_due LIMIT 10
-    """), params)).mappings().all()
-    # 按工位分组，识别换型点（产品变化）
-    from collections import OrderedDict
-    stations: dict = OrderedDict()
-    for r in rows:
-        s = r["station"] or "未分配工位"
-        if s not in stations:
-            stations[s] = []
-        stations[s].append({"work_order": r["work_order_code"], "product": r["product_id"],
-                            "due": str(r["planned_due"])[:10], "status": r["status"]})
-    items = []
-    for s, wos in stations.items():
-        # 换型点：相邻工单产品不同
-        changeovers = sum(1 for i in range(1, len(wos)) if wos[i]["product"] != wos[i-1]["product"])
-        items.append({"station": s, "work_orders": len(wos), "changeovers": changeovers,
-                      "impact": f"{len(wos)} 个工单 {changeovers} 次换型，建议按产品归并减少换线" if changeovers > 1 else "排程连续，换线少"})
-    return {"type": "changeover_plan", "count": len(items), "items": items,
-            "note": "换线管理：同一工位产品切换 = 换型点，影响产出时间"}
-
-
-async def _tool_plan_achievement(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """计划达成率：MPS/工单计划 vs 实际报工。"""
-    fid = factory_id or "FAC_MECH_001"
-    days = int(args.get("period_days") or 7)
-    prod = str(args.get("product_id") or "").strip()
-    cond = "wo.factory_id=:f"
-    params: Dict[str, Any] = {"f": fid, "d": days}
-    if prod:
-        cond += " AND wo.product_id=:p"
-        params["p"] = prod
-    rows = (await db.execute(text(f"""
-        SELECT wo.product_id, wo.work_order_code, wo.planned_qty, wo.completed_qty,
-               wo.good_qty, wo.status, wo.planned_due
-        FROM work_orders wo
-        WHERE {cond} AND wo.created_at > NOW() - make_interval(days => :d)
-        ORDER BY wo.planned_due DESC LIMIT 15
-    """), params)).mappings().all()
-    items = []
-    for r in rows:
-        plan = float(r["planned_qty"] or 0)
-        done = float(r["completed_qty"] or 0)
-        ach = round(done / plan * 100, 1) if plan else 0
-        items.append({"work_order": r["work_order_code"], "product": r["product_id"],
-                      "planned": plan, "completed": done, "good": float(r["good_qty"] or 0),
-                      "achievement": ach, "status": r["status"],
-                      "level": "on_track" if ach >= 95 else ("behind" if ach >= 70 else "critical"),
-                      "due": str(r["planned_due"])[:10]})
-    # 汇总
-    avg = round(sum(i["achievement"] for i in items) / len(items), 1) if items else 0
-    return {"type": "plan_achievement", "period_days": days, "count": len(items),
-            "avg_achievement": avg, "items": items,
-            "note": f"近 {days} 天工单平均达成率 {avg}%（计划 vs 报工完成）"}
-
-
-async def _tool_fifo_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """FIFO 检查：库龄分布 + 呆滞占比 + FIFO 执行风险。"""
-    fid = factory_id or "FAC_MECH_001"
-    mcode = str(args.get("material_code") or "").strip()
-    limit = int(args.get("limit") or 10)
-    cond = "factory_id=:f"
-    params: Dict[str, Any] = {"f": fid, "lim": limit}
-    if mcode:
-        cond += " AND material_code=:m"
-        params["m"] = mcode
-    # 库龄分布（按 last_movement_at 距今天数）
-    rows = (await db.execute(text(f"""
-        SELECT material_code, material_name,
-               COUNT(*) AS batches,
-               COALESCE(SUM(total_qty),0) AS total_qty,
-               COALESCE(SUM(CASE WHEN last_movement_at < NOW() - interval '180 days' THEN total_qty ELSE 0 END),0) AS aged_180,
-               COALESCE(SUM(CASE WHEN last_movement_at < NOW() - interval '90 days' THEN total_qty ELSE 0 END),0) AS aged_90,
-               COALESCE(SUM(CASE WHEN last_movement_at IS NULL THEN total_qty ELSE 0 END),0) AS never_moved
-        FROM inventory WHERE {cond}
-        GROUP BY material_code, material_name
-        ORDER BY aged_180 DESC, total_qty DESC LIMIT :lim
-    """), params)).mappings().all()
-    items = []
-    for r in rows:
-        total = float(r["total_qty"] or 0)
-        aged = float(r["aged_180"] or 0)
-        stale_pct = round(aged / total * 100, 1) if total else 0
-        items.append({
-            "material_code": r["material_code"], "material_name": r["material_name"] or r["material_code"],
-            "batches": r["batches"], "total_qty": total,
-            "aged_180_pct": stale_pct, "aged_90_pct": round(float(r["aged_90"] or 0) / total * 100, 1) if total else 0,
-            "never_moved_qty": float(r["never_moved"] or 0),
-            "fifo_risk": "high" if stale_pct > 50 else ("medium" if stale_pct > 20 else "low"),
-            "suggestion": "库存老化严重，需按 FIFO 优先消耗老批次/转呆滞处理" if stale_pct > 50 else "FIFO 执行良好" if stale_pct < 20 else "建议关注老批次消耗",
-        })
-    return {"type": "fifo_check", "count": len(items), "items": items,
-            "note": "FIFO 风险：>180天库龄占比高 = 发料未按先进先出（老库存积压）"}
-
-
-async def _tool_eat_check(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """EAT 检查：最早可用时间（库存覆盖 + 在途到货 → 需求日前能否齐套）。"""
-    fid = factory_id or "FAC_MECH_001"
-    mcode = str(args.get("material_code") or "").strip()
-    wo_code = str(args.get("work_order_code") or "").strip()
-    if not mcode:
-        return {"error": "缺少 material_code"}
-    from datetime import datetime as _dt, date as _date
-    # 需求日期：工单交期 or 参数 or 默认今天+7
-    req_date = None
-    need_qty = 0.0
-    if wo_code:
-        wo = (await db.execute(text(
-            "SELECT planned_due, planned_qty FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
-        ), {"c": wo_code, "f": fid})).mappings().first()
-        if wo:
-            req_date = wo["planned_due"] or _date.today()
-            # 该料需求量（BOM 单耗 × 数量）
-            bq = (await db.execute(text(
-                "SELECT quantity FROM bom_items WHERE material_code=:m AND factory_id=:f LIMIT 1"
-            ), {"m": mcode, "f": fid})).scalar_one_or_none() or 1
-            need_qty = float(bq) * float(wo["planned_qty"] or 0)
-    if args.get("required_date"):
-        try:
-            req_date = _dt.strptime(str(args["required_date"]), "%Y-%m-%d").date()
-        except Exception:
-            pass
-    if req_date is None:
-        req_date = _date.today() + __import__('datetime').timedelta(days=7)
-
-    # 库存可用量
-    inv = (await db.execute(text(
-        "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
-    ), {"m": mcode, "f": fid})).scalar_one() or 0
-    # 在途 PO（expected_date 在需求前）
-    po_rows = (await db.execute(text("""
-        SELECT COALESCE(SUM(qty),0) AS qty, MIN(expected_date) AS earliest
-        FROM purchase_orders
-        WHERE material_code=:m AND factory_id=:f AND status IN ('ordered','confirmed','shipped')
-          AND expected_date IS NOT NULL AND expected_date <= :rd
-    """), {"m": mcode, "f": fid, "rd": req_date})).mappings().first()
-    po_qty = float(po_rows["qty"] or 0)
-    po_eta = po_rows["earliest"]
-    # 库存覆盖天数（按需求速率估算：需求/7天）
-    daily_need = need_qty / 7 if need_qty else 0
-    cover_days = round(float(inv) / daily_need, 1) if daily_need > 0 else None
-    # 最早可用时间 = 库存耗尽日 + 在途到货
-    total_available = float(inv) + po_qty
-    eat = "now" if float(inv) >= need_qty and need_qty > 0 else None
-    if eat is None:
-        if cover_days is not None and po_eta:
-            # 库存耗尽日
-            deplete = _date.today() + __import__('datetime').timedelta(days=int(cover_days))
-            eat = str(max(deplete, po_eta))[:10] if po_eta else str(deplete)[:10]
-        elif po_eta:
-            eat = str(po_eta)[:10]
-        elif cover_days is not None:
-            deplete = _date.today() + __import__('datetime').timedelta(days=int(cover_days))
-            eat = str(deplete)[:10]
-        else:
-            eat = "未知（无需求速率可估）"
-    if need_qty > 0:
-        ok = float(inv) + po_qty >= need_qty
-        conclusion = f"需求日 {req_date} 前 {'可以齐套' if ok else '无法齐套'}（库存{float(inv)} + 在途{po_qty} = {round(total_available,1)}，需求 {need_qty}）"
-    else:
-        ok = None
-        conclusion = f"无明确需求量（未指定工单/需求日），库存 {float(inv)} 可用，建议按工单维度检查"
-    return {"type": "eat_check", "material_code": mcode, "required_date": str(req_date),
-            "required_qty": need_qty if need_qty else None,
-            "inventory_available": float(inv), "on_order_qty": po_qty,
-            "on_order_eta": str(po_eta)[:10] if po_eta else None,
-            "total_available": round(total_available, 1),
-            "earliest_available": eat,
-            "feasible": ok,
-            "conclusion": conclusion}
-
-
-async def _tool_reschedule_work_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """工单改期 + 影响分析 + 变更日志。"""
-    fid = factory_id or "FAC_MECH_001"
-    wo_code = str(args.get("work_order_code") or "").strip()
-    new_due = str(args.get("new_due_date") or "").strip()
-    reason = str(args.get("reason") or "")
-    if not wo_code or not new_due:
-        return {"error": "缺少 work_order_code/new_due_date"}
-    wo = (await db.execute(text(
-        "SELECT id, work_order_code, product_id, planned_qty, planned_due, status FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
-    ), {"c": wo_code, "f": fid})).mappings().first()
-    if not wo:
-        return {"error": f"工单 {wo_code} 不存在"}
-    from datetime import datetime as _dt
-    old_due = str(wo["planned_due"])[:10] if wo["planned_due"] else ""
-    await db.execute(text(
-        "UPDATE work_orders SET planned_due=:d, updated_at=NOW() WHERE id=:id"
-    ), {"d": _dt.strptime(new_due, "%Y-%m-%d").date(), "id": wo["id"]})
-    # 影响分析：同产线负荷变化
-    impact = f"交期 {old_due or '?'} → {new_due}"
-    if new_due < old_due:
-        impact += "；提前排产需确认产能/物料"
-    elif new_due > old_due:
-        impact += "；推迟释放产能，同产线后续工单可前移"
-    await db.execute(text("""
-        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
-        VALUES (gen_random_uuid()::text, :f, 'reschedule', 'work_order', :c, :b, :a, :r, :i, :cb)
-    """), {"f": fid, "c": wo_code, "b": old_due, "a": new_due, "r": reason, "i": impact, "cb": operator})
-
-    # ── RCC 动作信号：改期写入事件总线 → RCC 感知 → 信号（风险判定+相关岗位通知）──
-    from datetime import datetime as _dt2
-    try:
-        new_dt = _dt2.strptime(new_due, "%Y-%m-%d").date()
-        old_dt = _dt2.strptime(old_due, "%Y-%m-%d").date() if old_due else None
-        days_shift = (new_dt - old_dt).days if old_dt else 0
-        # 提前 = 风险信号（物料/产能可能来不及）→ RCC 调度任务；推迟 = 释放信号
-        risk = "critical" if days_shift < 0 and abs(days_shift) >= 3 else ("warning" if days_shift < 0 else "info")
-        await db.execute(text("""
-            INSERT INTO agent_events (event_id, factory_id, event_type, agent_key, data, created_at)
-            VALUES (:eid, :f, 'order_reschedule', 'pmc_agent',
-                    CAST(:d AS jsonb), NOW())
-        """), {"eid": str(uuid.uuid4()), "f": fid,
-               "d": json.dumps({"work_order_code": wo_code, "product_id": wo["product_id"],
-                                "old_due": old_due, "new_due": new_due, "days_shift": days_shift,
-                                "risk": risk, "reason": reason, "by": operator})})
-        if risk in ("critical", "warning"):
-            # 提前交期 → RCC 调度任务（需重新排产确认）
-            _rcc_org = (await db.execute(text(
-                "SELECT id FROM org_units WHERE factory_id=:f AND code LIKE 'RCC-%' LIMIT 1"
-            ), {"f": fid})).scalar_one_or_none() or "fb8337eb-c1d3-58af-842f-cf56d29e3f98"
-            await db.execute(text("""
-                INSERT INTO rcc_tasks (id, task_code, org_unit_id, factory_id, task_type, title, description, status, requested_by, created_at, updated_at)
-                VALUES (:tid, :tc, :org, :fid, 'schedule_change',
-                        :title, :desc, 'pending', :cb, NOW(), NOW())
-            """), {"tid": str(uuid.uuid4()), "tc": f"RCC-{str(uuid.uuid4())[:7].upper()}",
-                   "org": _rcc_org, "fid": fid,
-                   "title": f"[交期变更] {wo_code} 交期提前 {abs(days_shift)} 天至 {new_due}，需重新排产确认",
-                   "desc": f"原交期 {old_due} → 新交期 {new_due}，原因：{reason or '客户要求'}。需评估物料齐套与产线产能，必要时安排加急。",
-                   "cb": operator})
-        # 通知相关岗位（采购：物料日期变化；生产：负荷变化）
-        await db.execute(text("""
-            INSERT INTO notifications (id, factory_id, recipient, category, title, content, severity, is_read, created_at)
-            VALUES (gen_random_uuid()::text, :f, 'procurement', 'pmc_change', :t1, :c1, 'warning', false, NOW()),
-                   (gen_random_uuid()::text, :f, 'production', 'pmc_change', :t2, :c2, 'warning', false, NOW())
-        """), {"f": fid, "t1": f"[交期变更] {wo_code} 改期至 {new_due}",
-               "c1": f"物料需求日期随工单变更，请检查 {wo['product_id']} 相关采购到货是否匹配（原 {old_due} → 新 {new_due}）",
-               "t2": f"[交期变更] {wo_code} 改期至 {new_due}",
-               "c2": f"产线排程需调整，请确认负荷（{impact}）"})
-    except Exception:
-        pass  # 信号链路失败不阻塞改期主流程
-    await db.commit()
-    return {"type": "reschedule", "work_order": wo_code, "old_due": old_due, "new_due": new_due,
-            "impact": impact,
-            "rcc_signal": {"event_type": "order_reschedule", "risk": risk,
-                           "rcc_task": "created" if risk in ("critical", "warning") else "none",
-                           "notified": ["procurement", "production"]},
-            "message": f"工单 {wo_code} 交期已改为 {new_due}"}
-
-
-async def _tool_rush_insert_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """紧急插单：影响分析 → 创建急单 → 记录。"""
-    fid = factory_id or "FAC_MECH_001"
-    prod = str(args.get("product_id") or "").strip()
-    qty = float(args.get("quantity") or 0)
-    due = str(args.get("due_date") or "").strip()
-    prio = str(args.get("priority") or "urgent")
-    if not prod or qty <= 0 or not due:
-        return {"error": "缺少 product_id/quantity/due_date"}
-    # 1) 影响分析：同产线在制/待排工单数 + 预计延迟
-    wos = (await db.execute(text("""
-        SELECT work_order_code, status, planned_due FROM work_orders
-        WHERE factory_id=:f AND status IN ('in_progress','released','pending')
-        ORDER BY planned_due LIMIT 5
-    """), {"f": fid})).mappings().all()
-    affected = [w["work_order_code"] for w in wos]
-    # 2) 创建急单
-    import uuid
-    wo_id = str(uuid.uuid4())
-    code = f"WO-RUSH-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
-    await db.execute(text("""
-        INSERT INTO work_orders (id, work_order_code, factory_id, product_id, planned_qty, unit,
-                                 completed_qty, good_qty, defect_qty, scrap_qty, status, priority,
-                                 current_routing_step, planned_due, created_by, created_at, updated_at)
-        VALUES (:id, :code, :f, :p, :q, 'PCS', 0, 0, 0, 0, 'released', :prio, 0, :d, :cb, NOW(), NOW())
-    """), {"id": wo_id, "code": code, "f": fid, "p": prod, "q": int(qty),
-           "d": __import__('datetime').datetime.strptime(due, "%Y-%m-%d").date(),
-           "prio": prio, "cb": operator})
-    # 3) 变更日志
-    impact = f"插单 {code}（{prod} {int(qty)}件）插入排程；在制 {len(affected)} 单需让位"
-    await db.execute(text("""
-        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
-        VALUES (gen_random_uuid()::text, :f, 'rush_insert', 'work_order', :c, '', :p, :r, :i, :cb)
-    """), {"f": fid, "c": code, "p": f"{prod}×{int(qty)} @{due} [{prio}]",
-           "r": "紧急插单", "i": impact, "cb": operator})
-    await _report_rcc_action(db, fid, "rush_insert", code,
-                             f"紧急插单 {prod}×{int(qty)} 交期{due}，{len(affected)} 在制单受影响",
-                             detail=f"受影响工单: {','.join(affected[:8])}", operator=operator,
-                             rcc_task_type="scheduling", risk="critical")
-    await db.commit()
-    return {"type": "rush_insert", "work_order_code": code, "product": prod, "qty": qty,
-            "due": due, "priority": prio, "affected_work_orders": affected,
-            "message": f"急单 {code} 已插入排程（{prod} {int(qty)}件，交期 {due}）；在制 {len(affected)} 单受影响需重排"}
-
-
-async def _tool_change_priority(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """优先级调整。"""
-    fid = factory_id or "FAC_MECH_001"
-    wo_code = str(args.get("work_order_code") or "").strip()
-    prio = str(args.get("priority") or "").strip()
-    reason = str(args.get("reason") or "")
-    if not wo_code or prio not in ("urgent", "high", "medium", "low"):
-        return {"error": "缺少 work_order_code 或 priority 非法（urgent/high/medium/low）"}
-    wo = (await db.execute(text(
-        "SELECT work_order_code, priority FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
-    ), {"c": wo_code, "f": fid})).mappings().first()
-    if not wo:
-        return {"error": f"工单 {wo_code} 不存在"}
-    old_p = wo["priority"]
-    await db.execute(text(
-        "UPDATE work_orders SET priority=:p, updated_at=NOW() WHERE work_order_code=:c AND factory_id=:f"
-    ), {"p": prio, "c": wo_code, "f": fid})
-    await db.execute(text("""
-        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
-        VALUES (gen_random_uuid()::text, :f, 'priority_change', 'work_order', :c, :b, :a, :r, :i, :cb)
-    """), {"f": fid, "c": wo_code, "b": old_p, "a": prio, "r": reason,
-           "i": f"优先级 {old_p} → {prio}；{'排程提前，同产线后续让位' if prio in ('urgent','high') else '排程后移'}",
-           "cb": operator})
-    await _report_rcc_action(db, fid, "priority_change", wo_code,
-                             f"优先级 {old_p} → {prio}",
-                             detail=reason, operator=operator,
-                             rcc_task_type="scheduling" if prio == "urgent" else None,
-                             risk="warning" if prio in ("urgent", "high") else "info")
-    await db.commit()
-    return {"type": "priority_change", "work_order": wo_code, "old_priority": old_p, "new_priority": prio,
-            "message": f"工单 {wo_code} 优先级 {old_p} → {prio}"}
-
-
-async def _tool_cancel_work_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """撤单。"""
-    fid = factory_id or "FAC_MECH_001"
-    wo_code = str(args.get("work_order_code") or "").strip()
-    reason = str(args.get("reason") or "客户取消")
-    if not wo_code:
-        return {"error": "缺少 work_order_code"}
-    wo = (await db.execute(text(
-        "SELECT work_order_code, status FROM work_orders WHERE work_order_code=:c AND factory_id=:f"
-    ), {"c": wo_code, "f": fid})).mappings().first()
-    if not wo:
-        return {"error": f"工单 {wo_code} 不存在"}
-    if wo["status"] == "in_progress":
-        return {"error": f"工单 {wo_code} 生产中，需先暂停再取消"}
-    await db.execute(text(
-        "UPDATE work_orders SET status='cancelled', updated_at=NOW() WHERE work_order_code=:c AND factory_id=:f"
-    ), {"c": wo_code, "f": fid})
-    await db.execute(text("""
-        INSERT INTO pmc_changes (id, factory_id, change_type, target_type, target_code, before_value, after_value, reason, impact_summary, created_by)
-        VALUES (gen_random_uuid()::text, :f, 'cancel', 'work_order', :c, :b, 'cancelled', :r, '释放产能与物料，同产线可接收新单', :cb)
-    """), {"f": fid, "c": wo_code, "b": wo["status"], "r": reason, "cb": operator})
-    await _report_rcc_action(db, fid, "cancel_order", wo_code,
-                             f"撤单（原状态 {wo['status']}），产能物料释放",
-                             detail=reason, operator=operator,
-                             rcc_task_type="scheduling", risk="warning")
-    await db.commit()
-    return {"type": "cancel", "work_order": wo_code, "old_status": wo["status"], "status": "cancelled",
-            "message": f"工单 {wo_code} 已取消，产能与物料释放"}
-
-
-async def _tool_query_pmc_change_log(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """查询变更日志。"""
-    fid = factory_id or "FAC_MECH_001"
-    target = str(args.get("target_code") or "").strip()
-    limit = int(args.get("limit") or 10)
-    sql = "SELECT change_type, target_code, before_value, after_value, reason, impact_summary, created_by, created_at FROM pmc_changes WHERE factory_id=:f"
-    params = {"f": fid}
-    if target:
-        sql += " AND target_code=:t"
-        params["t"] = target
-    sql += " ORDER BY created_at DESC LIMIT :lim"
-    params["lim"] = limit
-    rows = (await db.execute(text(sql), params)).mappings().all()
-    return {"type": "pmc_change_log", "count": len(rows),
-            "changes": [{"type": r["change_type"], "target": r["target_code"],
-                         "before": r["before_value"], "after": r["after_value"],
-                         "reason": r["reason"], "impact": r["impact_summary"],
-                         "by": r["created_by"], "at": str(r["created_at"])[:16]} for r in rows]}
-
-
-async def _tool_run_mrp_calculation(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """运行 MRP（确定性，直查 DB 不走权限墙）：
-    计划 → BOM 展开毛需求 → 扣库存/在途 → 净需求 → 缺料清单 + 采购建议。"""
-    fid = factory_id or "FAC_MECH_001"
-    product_id = str(args.get("product_id") or "").strip()
-    # 1) 找需求源：released 计划 UNION 在制/待排工单（都 JOIN BOM 确保可算）
-    if product_id:
-        rows = (await db.execute(text("""
-            SELECT wo.work_order_code AS plan_code, wo.product_id, wo.planned_qty, wo.planned_due AS required_date
-            FROM work_orders wo
-            JOIN bom_items b ON b.product_id = wo.product_id AND b.factory_id = wo.factory_id
-            WHERE wo.factory_id=:f AND wo.product_id=:pid
-              AND wo.status IN ('released','in_progress','pending')
-            GROUP BY wo.work_order_code, wo.product_id, wo.planned_qty, wo.planned_due
-            ORDER BY wo.planned_due LIMIT 3
-        """), {"f": fid, "pid": product_id})).mappings().all()
-    else:
-        rows = (await db.execute(text("""
-            SELECT wo.work_order_code AS plan_code, wo.product_id, wo.planned_qty, wo.planned_due AS required_date
-            FROM work_orders wo
-            JOIN bom_items b ON b.product_id = wo.product_id AND b.factory_id = wo.factory_id
-            WHERE wo.factory_id=:f AND wo.status IN ('released','in_progress','pending')
-            GROUP BY wo.work_order_code, wo.product_id, wo.planned_qty, wo.planned_due
-            ORDER BY wo.planned_due LIMIT 3
-        """), {"f": fid})).mappings().all()
-    if not rows:
-        return {"error": "无可运行 MRP 的需求（无 released/在制工单，或产品未维护 BOM）"}
-
-    results = []
-    for plan in rows:
-        # 2) BOM 展开（毛需求）
-        boms = (await db.execute(text("""
-            SELECT material_code, material_name, quantity FROM bom_items
-            WHERE product_id=:p AND factory_id=:f
-        """), {"p": plan["product_id"], "f": fid})).mappings().all()
-        if not boms:
-            results.append({"plan_code": plan["plan_code"], "product_id": plan["product_id"],
-                            "error": "无 BOM（先维护物料清单）"})
-            continue
-        qty = float(plan["planned_qty"] or 0)
-        # 3) 库存 + 在途
-        needs = []
-        for b in boms:
-            mcode = b["material_code"]
-            need = float(b["quantity"] or 0) * qty
-            inv = (await db.execute(text(
-                "SELECT COALESCE(SUM(available_qty),0) FROM inventory WHERE material_code=:m AND factory_id=:f"
-            ), {"m": mcode, "f": fid})).scalar_one() or 0
-            po = (await db.execute(text(
-                "SELECT COALESCE(SUM(qty),0) FROM purchase_orders WHERE material_code=:m AND factory_id=:f AND status IN ('confirmed','shipped')"
-            ), {"m": mcode, "f": fid})).scalar_one() or 0
-            avail = float(inv) + float(po)
-            shortage = max(0, need - avail)
-            needs.append({"material_code": mcode, "material_name": b["material_name"] or mcode,
-                          "gross_need": round(need, 1), "on_hand": float(inv), "on_order": float(po),
-                          "net_need": round(shortage, 1),
-                          "status": "shortage" if shortage > 0 else "ok"})
-        shortage_count = sum(1 for n in needs if n["status"] == "shortage")
-        results.append({"plan_code": plan["plan_code"], "product_id": plan["product_id"],
-                        "qty": qty, "materials": needs,
-                        "summary": f"{len(needs)} 项物料，{shortage_count} 项缺料"})
-    await _report_rcc_action(db, fid, "mrp_run", "MRP",
-                             f"MRP 计算 {len(results)} 个需求源",
-                             detail=json.dumps([{"plan": r["plan_code"], "summary": r.get("summary", "")} for r in results[:5]], ensure_ascii=False),
-                             operator=operator, risk="info")
-    # ── MRP→PR 自动闭环：净需求>0 的物料自动生成采购申请（采购执行链路起点）──
-    pr_info = []
-    try:
-        from api.services.procurement_service import ProcurementService
-        ps = ProcurementService(db)
-        mrp_items = []
-        for r in results:
-            for m in r.get("materials", []):
-                if m.get("status") == "shortage" and m.get("net_need", 0) > 0:
-                    mrp_items.append({
-                        "material_code": m["material_code"], "material_name": m.get("material_name", m["material_code"]),
-                        "net_requirement": m["net_need"], "plan_id": r.get("plan_code"),
-                        "lead_days": 7,
-                    })
-        if mrp_items:
-            pr_res = await ps.auto_pr_from_mrp(fid, mrp_items)
-            pr_info = pr_res.get("requisitions", [])
-    except Exception as e:
-        pr_info = [{"error": str(e)[:80]}]
-    return {"type": "mrp_result", "count": len(results), "results": results,
-            "auto_pr_count": len(pr_info), "auto_prs": pr_info,
-            "note": f"MRP 完成：净需求>0 的 {len(pr_info)} 个物料已自动生成采购申请" if pr_info else "MRP 完成：无净需求缺料" if not mrp_items else f"MRP 完成：{len(mrp_items)} 项缺料待建PR"}
-
-
-async def _tool_create_shipment(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """创建出货单（写 shipments + shipment_items）。"""
-    fid = factory_id or "FAC_MECH_001"
-    cust = str(args.get("customer_name") or "").strip()
-    prod = str(args.get("product_id") or "").strip()
-    qty = float(args.get("quantity") or 0)
-    etd = str(args.get("etd") or "").strip()
-    if not cust or not prod or qty <= 0 or not etd:
-        return {"error": "缺少 customer_name/product_id/quantity/etd"}
-    import uuid
-    from datetime import datetime as _dt
-    ship_id = str(uuid.uuid4())
-    code = f"SHP-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
-    etd_date = _dt.strptime(etd, "%Y-%m-%d").date() if etd else None
-    await db.execute(text("""
-        INSERT INTO shipments (id, shipment_code, factory_id, customer_name, container_count,
-                               plan_date, etd, status, total_qty, total_amount, remark, created_by, created_at, updated_at)
-        VALUES (:id, :code, :f, :cust, :cc, CURRENT_DATE, :etd, 'planned', :q, 0, 'chatbot 创建', :cb, NOW(), NOW())
-    """), {"id": ship_id, "code": code, "f": fid, "cust": cust, "cc": int(args.get("container_count") or 1),
-           "etd": etd_date, "q": qty, "cb": operator})
-    await db.execute(text("""
-        INSERT INTO shipment_items (id, shipment_id, product_id, product_name, quantity, packed_qty)
-        VALUES (gen_random_uuid()::text, :sid, :p, :p, :q, 0)
-    """), {"sid": ship_id, "p": prod, "q": qty})
-    await _report_rcc_action(db, fid, "shipment_created", code,
-                             f"出货单创建 {cust} {prod}×{int(qty)} ETD {etd}",
-                             detail=f"柜数 {int(args.get('container_count') or 1)}", operator=operator,
-                             risk="info")
-    await db.commit()
-    return {"type": "shipment", "action": "created", "shipment_code": code, "status": "planned",
-            "customer": cust, "qty": qty, "etd": etd, "shipment_id": ship_id}
-
-
-async def _tool_query_shipment_status(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """查询出货状态。"""
-    fid = factory_id or "FAC_MECH_001"
-    status = str(args.get("status") or "").strip()
-    sql = "SELECT shipment_code, customer_name, container_count, etd, status, total_qty FROM shipments WHERE factory_id=:f"
-    params = {"f": fid}
-    if status:
-        sql += " AND status=:s"
-        params["s"] = status
-    sql += " ORDER BY etd DESC LIMIT 10"
-    rows = (await db.execute(text(sql), params)).mappings().all()
-    return {"type": "shipment_status", "count": len(rows),
-            "shipments": [{"code": r["shipment_code"], "customer": r["customer_name"],
-                           "containers": r["container_count"], "etd": str(r["etd"])[:10],
-                           "status": r["status"], "qty": r["total_qty"]} for r in rows]}
-
-
-async def _tool_pmc_hammer_matrix(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """锤子图决策矩阵：HTTP 调自身端点。"""
-    import httpx
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("http://127.0.0.1:8000/api/v1/pmc/work-matrix/hammer",
-                              json={**args, "factory_id": factory_id or "FAC_MECH_001"})
-        return r.json() if r.status_code == 200 else {"error": f"锤子图失败 {r.status_code}: {r.text[:100]}"}
-
-
-async def _tool_confirm_mps_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """MPS 计划确认（draft→confirmed）。"""
-    fid = factory_id or "FAC_MECH_001"
-    plan_id = str(args.get("plan_id") or "").strip()
-    if not plan_id:
-        return {"error": "缺少 plan_id"}
-    plan = (await db.execute(text(
-        "SELECT id, plan_code, status FROM plans WHERE id=:id OR plan_code=:id"
-    ), {"id": plan_id})).mappings().first()
-    if not plan:
-        return {"error": f"计划 {plan_id} 不存在"}
-    if plan["status"] != "draft":
-        return {"error": f"计划 {plan['plan_code']} 状态 {plan['status']}，仅 draft 可确认"}
-    await db.execute(text(
-        "UPDATE plans SET status='confirmed', updated_at=NOW() WHERE id=:id"
-    ), {"id": plan["id"]})
-    await _report_rcc_action(db, fid, "mps_confirm", plan["plan_code"],
-                             f"MPS 计划确认 {plan['plan_code']}（draft→confirmed）",
-                             operator=operator, risk="info")
-    await db.commit()
-    return {"type": "mps_confirm", "plan_code": plan["plan_code"], "status": "confirmed",
-            "message": f"计划 {plan['plan_code']} 已确认，可下达生成工单"}
-
-
-async def _tool_release_mps_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """MPS 计划下达（confirmed→released，自动生成工单+APS）。"""
-    fid = factory_id or "FAC_MECH_001"
-    plan_id = str(args.get("plan_id") or "").strip()
-    if not plan_id:
-        return {"error": "缺少 plan_id"}
-    plan = (await db.execute(text(
-        "SELECT id, plan_code, status FROM plans WHERE id=:id OR plan_code=:id"
-    ), {"id": plan_id})).mappings().first()
-    if not plan:
-        return {"error": f"计划 {plan_id} 不存在"}
-    if plan["status"] != "confirmed":
-        return {"error": f"计划 {plan['plan_code']} 状态 {plan['status']}，需先确认再下达"}
-    await db.execute(text(
-        "UPDATE plans SET status='released', updated_at=NOW() WHERE id=:id"
-    ), {"id": plan["id"]})
-    # 触发生成工单（若 plans 有对应逻辑，简单实现：状态更新即可，工单由 release 流程生成）
-    await _report_rcc_action(db, fid, "mps_release", plan["plan_code"],
-                             f"MPS 计划下达 {plan['plan_code']}（confirmed→released，触发工单+APS）",
-                             operator=operator, risk="warning")
-    await db.commit()
-    return {"type": "mps_release", "plan_code": plan["plan_code"], "status": "released",
-            "message": f"计划 {plan['plan_code']} 已下达，触发工单生成与 APS 排程"}
-
-
-async def _tool_aps_reschedule(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """APS 排程重排。"""
-    fid = factory_id or "FAC_MECH_001"
-    wo_id = str(args.get("work_order_id") or "").strip()
-    strategy = str(args.get("strategy") or "priority")
-    # 检查 APS 任务是否需要重排（按优先级重新排序 in_progress/pending 工单）
-    rows = (await db.execute(text("""
-        SELECT id, work_order_id, product_code, station_id, planned_start, priority
-        FROM aps_schedule_tasks
-        WHERE work_order_id=:wo OR :wo=''
-        ORDER BY CASE WHEN :strategy = 'earliest_due' THEN planned_start::text ELSE priority::text END
-        LIMIT 20
-    """), {"wo": wo_id, "strategy": strategy})).mappings().all()
-    await _report_rcc_action(db, fid, "aps_reschedule", wo_id or "ALL",
-                             f"APS 重排 {len(rows)} 个任务（策略 {strategy}）",
-                             operator=operator, risk="info")
-    await db.commit()
-    return {"type": "aps_reschedule", "strategy": strategy, "tasks_reordered": len(rows),
-            "message": f"APS 已按 {strategy} 策略重排 {len(rows)} 个任务"}
-
-
-async def _tool_pmc_backward_schedule(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """交期倒推：HTTP 调自身端点。"""
-    import httpx
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("http://127.0.0.1:8000/api/v1/pmc/backward-schedule",
-                              json={**args, "factory_id": factory_id or "FAC_MECH_001"})
-        return r.json() if r.status_code == 200 else {"error": f"倒推失败 {r.status_code}: {r.text[:100]}"}
-
-
-async def _tool_pmc_backward_to_plan(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "pmc_agent") -> Dict[str, Any]:
-    """倒推→计划：HTTP 调自身端点。"""
-    import httpx
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("http://127.0.0.1:8000/api/v1/pmc/backward-to-plan",
-                              json={**args, "factory_id": factory_id or "FAC_MECH_001"})
-        return r.json() if r.status_code == 200 else {"error": f"生成计划失败 {r.status_code}: {r.text[:100]}"}
 
 
 async def _tool_query_pmc_material_supply(
@@ -4714,384 +2731,6 @@ async def _tool_run_virtual_factory_pulse(
 
 
 # 执行器注册表
-
-
-async def _tool_query_my_tasks(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
-    """查询任务中心任务（我的/全部/受阻/进行中/已完成），供 chatbot 承担智能中心角色。"""
-    from sqlalchemy import text
-
-    scope = str(args.get("scope") or "mine").strip().lower()
-    limit = max(1, min(int(args.get("limit") or 10), 30))
-    agent_key = str(args.get("agent_key") or "").strip()
-    factory_id = factory_id or "FAC_MECH_001"
-    status_map = {"blocked": "blocked", "open": "open", "done": "done", "cancelled": "cancelled"}
-
-    conds = ["factory_id = :fid"]
-    params = {"fid": factory_id, "lim": limit}
-    if scope in status_map:
-        conds.append("status = :st")
-        params["st"] = status_map[scope]
-    elif scope in ("mine", "my"):
-        conds.append("(created_by = :me OR assigned_to = :me)")
-        params["me"] = operator or ""
-    if agent_key:
-        conds.append("agent_key = :ak")
-        params["ak"] = agent_key
-
-    try:
-        sql = f"""
-            SELECT ft.id, ft.title, ft.status, ft.progress_pct, ft.follow_count, ft.max_follows,
-                   ft.agent_key, ft.created_by, ft.assigned_to, ft.next_follow_at, ft.updated_at,
-                   ft.blocked_by, ft.block_category,
-                   left(COALESCE(ft.last_follow_note, ''), 200) AS last_note,
-                   (SELECT rcc.status FROM rcc_tasks rcc
-                    WHERE rcc.request_context->>'followup_task_id' = ft.id::text
-                    ORDER BY rcc.created_at DESC LIMIT 1) AS rcc_status
-            FROM followup_tasks ft
-            WHERE {' AND '.join(conds)}
-            ORDER BY CASE status WHEN 'blocked' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
-                     updated_at DESC
-            LIMIT :lim
-        """
-        rows = (await db.execute(text(sql), params)).mappings().all()
-        items = [dict(r) for r in rows]
-        return {
-            "type": "task_center",
-            "factory_id": factory_id,
-            "scope": scope,
-            "count": len(items),
-            "tasks": items,
-            "note": "任务中心实时数据（followup_tasks）。blocked=受阻（blocked_by=卡在谁那里，block_category=原因类别：material/supplier/approval/equipment/staff/data/other），open=跟进中，done=已完成。rcc_status=关联RCC调度申请状态（pending=已提交待审批/approved=已批准/executing=执行中），空=未提交RCC。",
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"任务查询失败: {type(exc).__name__}: {exc}"}
-
-async def _tool_query_purchase_pipeline(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """采购管道全景：PR/PO/供应商报价，按物料过滤。"""
-    fid = factory_id or "FAC_MECH_001"
-    mat = str(args.get("material_code") or "").strip()
-    status = str(args.get("status") or "").strip()
-    limit = max(1, min(int(args.get("limit") or 10), 30))
-    cond = "factory_id = :fid"
-    params: Dict[str, Any] = {"fid": fid, "limit": limit}
-    if mat:
-        params["mat"] = mat
-    if status:
-        cond += " AND status = :st"
-        params["st"] = status
-    # 过滤条件同时支持物料码与单号（pr_code/po_code/id），保证单号可溯源
-    mat_cond_pr = " AND (material_code = :mat OR pr_code = :mat OR CAST(id AS TEXT) = :mat)" if mat else ""
-    mat_cond_po = " AND (material_code = :mat OR po_code = :mat OR CAST(id AS TEXT) = :mat)" if mat else ""
-    prs = (await db.execute(text(
-        f"SELECT id, pr_code, material_code, material_name, qty, unit, status, supplier_id, lead_time_days, source, created_at "
-        f"FROM purchase_requisitions WHERE {cond}{mat_cond_pr} ORDER BY created_at DESC LIMIT :limit"
-    ), params)).mappings().all()
-    pos = (await db.execute(text(
-        f"SELECT po_code, pr_id, supplier_name, material_code, qty, unit_price, status, expected_date, actual_date "
-        f"FROM purchase_orders WHERE {cond}{mat_cond_po} ORDER BY order_date DESC LIMIT :limit"
-    ), params)).mappings().all()
-    # 全量统计（不受 limit 截断）：各状态条数 + 金额，避免模型把 LIMIT 样本误报为全量
-    stats_rows = (await db.execute(text(
-        f"SELECT status, COUNT(*)::int AS cnt, COALESCE(SUM(estimated_cost),0)::float AS amount "
-        f"FROM purchase_requisitions WHERE {cond}{mat_cond_pr} GROUP BY status"
-    ), {k: v for k, v in params.items() if k != "limit"})).mappings().all()
-    pr_stats = {r["status"]: {"count": r["cnt"], "amount": round(r["amount"], 2)} for r in stats_rows}
-    return {
-        "type": "purchase_pipeline",
-        "factory_id": fid,
-        "material_filter": mat or "(全部)",
-        "pr_status_stats": pr_stats,
-        "pr_total_count": sum(s["count"] for s in pr_stats.values()),
-        "pr_total_amount": round(sum(s["amount"] for s in pr_stats.values()), 2),
-        "purchase_requests_count": len(prs),
-        "purchase_orders_count": len(pos),
-        "purchase_requests": [dict(r) for r in prs],
-        "purchase_orders": [dict(r) for r in pos],
-        "note": "pr_status_stats/pr_total_* 是全量统计；purchase_requests 仅为最近样本(limit 截断)，不得把样本数当作总数。PR=采购申请，PO=采购订单。",
-    }
-
-
-async def _pr_unit_cost(db: AsyncSession, material_code: str) -> float:
-    """PR 估算单价（供应商报价→库存成本→确定性 mock）"""
-    from api.services.procurement_service import estimate_unit_cost
-    return await estimate_unit_cost(db, material_code)
-
-
-async def _tool_create_purchase_requisition(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """创建采购申请（确定性，写 purchase_requisitions 正表）：同物料已有 PENDING PR 则更新数量，否则新建。"""
-    fid = factory_id or "FAC_MECH_001"
-    mat = str(args.get("material_code") or "").strip()
-    qty = float(args.get("required_qty") or args.get("qty") or args.get("quantity") or 0)
-    if not mat or qty <= 0:
-        return {"error": "缺少物料编码或数量不合法"}
-    name = str(args.get("material_name") or mat)
-    exist = (await db.execute(text(
-        "SELECT id, qty FROM purchase_requisitions WHERE factory_id=:f AND material_code=:m AND LOWER(status)='pending' LIMIT 1"
-    ), {"f": fid, "m": mat})).mappings().first()
-    if exist:
-        new_qty = float(exist["qty"]) + qty
-        await db.execute(text(
-            "UPDATE purchase_requisitions SET qty=:q, estimated_cost=COALESCE(estimated_cost,0)+:cost, updated_at=NOW() WHERE id=:id"
-        ), {"q": new_qty, "cost": round(qty * await _pr_unit_cost(db, mat), 2), "id": exist["id"]})
-        await db.commit()
-        return {"type": "purchase_requisition", "action": "updated", "pr_id": exist["id"],
-                "material_code": mat, "requested_qty": new_qty, "status": "pending"}
-    pr_id = str(uuid.uuid4())
-    pr_code = f"PR-{mat}-{str(uuid.uuid4())[:6].upper()}"
-    est_cost = round(qty * await _pr_unit_cost(db, mat), 2)
-    await db.execute(text(
-        "INSERT INTO purchase_requisitions (id, factory_id, pr_code, source, material_code, material_name, "
-        "qty, unit, status, auto_approved, estimated_cost, created_by, created_at, updated_at) "
-        "VALUES (:id, :f, :pc, 'procurement_agent', :m, :n, :q, 'PCS', 'pending', FALSE, :cost, :src, NOW(), NOW())"
-    ), {"id": pr_id, "f": fid, "pc": pr_code, "m": mat, "n": name, "q": qty, "cost": est_cost, "src": operator or "procurement_agent"})
-    await _report_rcc_action(db, fid, "pr_created", pr_code,
-                             f"采购申请 {mat}×{int(qty)}",
-                             detail=f"operator: {operator or 'procurement_agent'}", operator=operator, risk="info")
-    await db.commit()
-    return {"type": "purchase_requisition", "action": "created", "pr_id": pr_id, "pr_code": pr_code,
-            "material_code": mat, "material_name": name, "requested_qty": qty, "status": "pending"}
-
-
-async def _tool_assign_supplier_to_pr(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """比价指派供应商：优先 supplier_prices 最低价，无价格表则按供应商评分/是否批准。"""
-    fid = factory_id or "FAC_MECH_001"
-    pr_id = str(args.get("pr_id") or "").strip()
-    if not pr_id:
-        return {"error": "缺少 pr_id"}
-    pr = (await db.execute(text(
-        "SELECT id, material_code, qty, status FROM purchase_requisitions WHERE id=:id AND factory_id=:f"
-    ), {"id": pr_id, "f": fid})).mappings().first()
-    if not pr:
-        return {"error": f"采购申请 {pr_id} 不存在"}
-    prefer = str(args.get("prefer_supplier_id") or "").strip()
-    supplier = None
-    if prefer:
-        supplier = (await db.execute(text(
-            "SELECT id, supplier_code, supplier_name, rating, on_time_rate, avg_lead_days FROM suppliers WHERE id=:id AND factory_id=:f"
-        ), {"id": prefer, "f": fid})).mappings().first()
-    else:
-        prices = (await db.execute(text(
-            "SELECT sp.supplier_id, s.id AS supplier_id_pk, sp.unit_price, sp.lead_days, s.supplier_name, s.rating, s.avg_lead_days "
-            "FROM supplier_prices sp JOIN suppliers s ON s.id = sp.supplier_id "
-            "WHERE sp.material_code=:m AND sp.is_active=TRUE AND s.factory_id=:f "
-            "ORDER BY sp.unit_price ASC, s.rating DESC LIMIT 1"
-        ), {"m": pr["material_code"], "f": fid})).mappings().first()
-        if prices:
-            supplier = prices
-        else:
-            supplier = (await db.execute(text(
-                "SELECT id, supplier_code, supplier_name, rating, on_time_rate, avg_lead_days FROM suppliers "
-                "WHERE factory_id=:f AND is_approved=TRUE ORDER BY rating DESC, on_time_rate DESC LIMIT 1"
-            ), {"f": fid})).mappings().first()
-    if not supplier:
-        return {"error": "无可用供应商（需先在 suppliers 注册）"}
-    sid = supplier.get("supplier_id_pk") or supplier.get("id") or supplier.get("supplier_id")
-    await db.execute(text(
-        "UPDATE purchase_requisitions SET supplier_id=:s, lead_time_days=:ld, updated_at=NOW() WHERE id=:id"
-    ), {"s": sid, "ld": supplier.get("avg_lead_days") or 7, "id": pr_id})
-    await db.commit()
-    return {"type": "supplier_assignment", "action": "assigned", "pr_id": pr_id,
-            "material_code": pr["material_code"],
-            "supplier_id": sid, "supplier_name": supplier.get("supplier_name") or supplier.get("supplier_code"),
-            "price": float(supplier.get("unit_price") or 0) if supplier.get("unit_price") is not None else None,
-            "lead_days": supplier.get("lead_days"),
-            "status": "assigned"}
-
-
-async def _tool_create_purchase_order(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "procurement") -> Dict[str, Any]:
-    """转采购订单：PR(assigned) → PO(ordered)。"""
-    fid = factory_id or "FAC_MECH_001"
-    pr_id = str(args.get("pr_id") or "").strip()
-    if not pr_id:
-        return {"error": "缺少 pr_id"}
-    pr = (await db.execute(text(
-        "SELECT id, material_code, material_name, qty, unit, supplier_id, status, lead_time_days FROM purchase_requisitions "
-        "WHERE id=:id AND factory_id=:f"
-    ), {"id": pr_id, "f": fid})).mappings().first()
-    if not pr:
-        return {"error": f"采购申请 {pr_id} 不存在"}
-    if str(pr["status"]).upper() not in ("ASSIGNED", "PENDING") or not pr["supplier_id"]:
-        return {"error": f"采购申请 {pr_id} 尚未指派供应商（请先 assign_supplier_to_pr）"}
-    sup = (await db.execute(text(
-        "SELECT id, supplier_name, avg_lead_days FROM suppliers WHERE id=:id"
-    ), {"id": pr["supplier_id"]})).mappings().first()
-    if not sup:
-        return {"error": "供应商不存在"}
-    lead = int(args.get("expected_days") or pr.get("lead_time_days") or sup.get("avg_lead_days") or 7)
-    price_row = (await db.execute(text(
-        "SELECT unit_price FROM supplier_prices WHERE supplier_id=:s AND material_code=:m AND is_active=TRUE LIMIT 1"
-    ), {"s": pr["supplier_id"], "m": pr["material_code"]})).mappings().first()
-    price = float(price_row["unit_price"]) if price_row else None
-    po_code = f"PO-{pr['material_code']}-{str(uuid.uuid4())[:6].upper()}"
-    po_id = str(uuid.uuid4())
-    await db.execute(text(
-        "INSERT INTO purchase_orders (id, factory_id, po_code, pr_id, supplier_id, supplier_name, "
-        "material_code, material_name, qty, unit_price, total_amount, currency, order_date, expected_date, status, auto_generated, created_at, updated_at) "
-        "VALUES (:id, :f, :po, :pr, :s, :sn, :m, :mn, :q, :p, :t, 'CNY', CURRENT_DATE, CURRENT_DATE + CAST(:lead AS integer), 'ordered', TRUE, NOW(), NOW())"
-    ), {"id": po_id, "f": fid, "po": po_code, "pr": pr_id, "s": pr["supplier_id"], "sn": sup["supplier_name"],
-        "m": pr["material_code"], "mn": pr["material_name"] or pr["material_code"], "q": pr["qty"],
-        "p": price, "t": float(price) * float(pr["qty"]) if price else None, "lead": lead})
-    await db.execute(text(
-        "UPDATE purchase_requisitions SET status='converted', purchase_code=:pc, updated_at=NOW() WHERE id=:id"
-    ), {"id": pr_id, "pc": po_code})
-    await _report_rcc_action(db, fid, "purchase_order", po_code,
-                             f"PO 创建 {pr['material_code']}×{pr['qty']} 供应商 {sup['supplier_name']} ETA +{lead}天",
-                             detail=f"PR {pr_id} 单价 {price}", operator=operator, risk="info")
-    await db.commit()
-    return {"type": "purchase_order", "action": "created", "po_id": po_id, "po_code": po_code,
-            "pr_id": pr_id, "material_code": pr["material_code"], "qty": float(pr["qty"]),
-            "supplier_name": sup["supplier_name"], "unit_price": price,
-            "expected_date": f"+{lead}天", "status": "ordered",
-            "note": "采购订单已下单，进入跟催阶段。"}
-
-
-async def _tool_query_purchase_order_progress(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """跟催 PO：未到货的采购订单列表。"""
-    fid = factory_id or "FAC_MECH_001"
-    status = str(args.get("status") or "").strip()
-    limit = max(1, min(int(args.get("limit") or 10), 30))
-    cond = "factory_id = :f"
-    params: Dict[str, Any] = {"f": fid, "limit": limit}
-    if status:
-        cond += " AND status = :st"
-        params["st"] = status
-    else:
-        cond += " AND status NOT IN ('arrived', 'completed', 'cancelled')"
-    rows = (await db.execute(text(
-        f"SELECT po_code, supplier_name, material_code, material_name, qty, status, order_date, expected_date, actual_date "
-        f"FROM purchase_orders WHERE {cond} ORDER BY expected_date ASC LIMIT :limit"
-    ), params)).mappings().all()
-    import datetime as _dt
-    overdue = sum(1 for r in rows if r["expected_date"] and str(r["status"]) not in ("arrived", "completed") and r["expected_date"] < _dt.date.today())
-    return {"type": "purchase_order_progress", "factory_id": fid, "pending_po_count": len(rows),
-            "overdue_count": overdue,
-            "purchase_orders": [dict(r) for r in rows],
-            "note": "跟催对象：未到货 PO（按期望交期排序，逾期优先）。",
-    }
-
-
-
-async def _tool_send_group_message(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
-    """群协同发消息：模糊匹配群名，以 operator 身份发送。"""
-    fid = factory_id or "FAC_MECH_001"
-    gname = str(args.get("group_name") or "").strip()
-    content = str(args.get("content") or "").strip()
-    if not gname or not content:
-        return {"error": "缺少群名称或消息内容"}
-    group = (await db.execute(text(
-        "SELECT id, name FROM im_groups WHERE factory_id=:f AND name ILIKE :n AND is_active=TRUE ORDER BY created_at DESC LIMIT 1"
-    ), {"f": fid, "n": f"%{gname}%"})).mappings().first()
-    if not group:
-        groups = (await db.execute(text(
-            "SELECT name FROM im_groups WHERE factory_id=:f AND is_active=TRUE LIMIT 10"
-        ), {"f": fid})).mappings().all()
-        return {"error": f"群 '{gname}' 未找到", "available_groups": [g["name"] for g in groups]}
-    msg_id = str(uuid.uuid4())
-    await db.execute(text("""
-        INSERT INTO im_messages (id, group_id, sender_id, sender_name, msg_type, content, created_at)
-        VALUES (:id, :gid, :sender, :sender_name, 'text', :content, NOW())
-    """), {"id": msg_id, "gid": group["id"], "sender": operator, "sender_name": operator, "content": content[:1000]})
-    await db.commit()
-    return {"type": "group_message", "action": "sent", "group": group["name"],
-            "sender": operator, "content": content[:100], "msg_id": msg_id}
-
-
-async def _tool_query_group_messages(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
-    """查群消息：模糊匹配群名，返回最近对话。"""
-    fid = factory_id or "FAC_MECH_001"
-    gname = str(args.get("group_name") or "").strip()
-    limit = min(int(args.get("limit") or 10), 50)
-    group = (await db.execute(text(
-        "SELECT id, name FROM im_groups WHERE factory_id=:f AND name ILIKE :n AND is_active=TRUE ORDER BY created_at DESC LIMIT 1"
-    ), {"f": fid, "n": f"%{gname}%"})).mappings().first()
-    if not group:
-        return {"error": f"群 '{gname}' 未找到"}
-    msgs = (await db.execute(text(
-        "SELECT sender_name, msg_type, content, created_at FROM im_messages "
-        "WHERE group_id=:gid ORDER BY created_at DESC LIMIT :lim"
-    ), {"gid": group["id"], "lim": limit})).mappings().all()
-    return {"type": "group_messages", "group": group["name"], "count": len(msgs),
-            "messages": [{"sender": m["sender_name"], "msg_type": m["msg_type"],
-                          "content": str(m["content"] or "")[:200],
-                          "at": str(m["created_at"])[:19]} for m in msgs]}
-
-
-async def _tool_query_rcc_center(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """RCC 调度中心全景：任务 + 工单 + 决策建议。"""
-    limit = max(1, min(int(args.get("limit") or 10), 30))
-    org = str(args.get("org_unit_id") or "").strip()
-
-    tasks = (await db.execute(text(
-        "SELECT task_code, task_type, title, status, expected_impact_summary, requested_by, created_at "
-        "FROM rcc_tasks ORDER BY created_at DESC LIMIT :lim"
-    ), {"lim": limit})).mappings().all()
-    tickets = (await db.execute(text(
-        "SELECT ticket_code, requester_id, ticket_type, raw_message, status, priority, "
-        "routed_to_org_unit, routed_to_position, created_at "
-        "FROM chatbot_tickets ORDER BY created_at DESC LIMIT :lim"
-    ), {"lim": limit})).mappings().all()
-    orgs = (await db.execute(text(
-        "SELECT id, org_type, auto_dispatch_enabled, human_approval_required, approval_threshold_pct "
-        "FROM rcc_organizations LIMIT :lim"
-    ), {"lim": limit})).mappings().all()
-
-    # 决策建议（rcc_decision 端点逻辑简化：直接查已有建议类数据）
-    decisions = {}
-    try:
-        from core.rcc.services import RCCTaskService
-        svc = RCCTaskService(db)
-        bottleneck = await svc._get_task_by_type("dispatch") if hasattr(svc, "_get_task_by_type") else None
-        if bottleneck:
-            decisions["dispatch"] = str(bottleneck.get("title") if isinstance(bottleneck, dict) else bottleneck)
-    except Exception:
-        decisions = {}
-
-    return {
-        "type": "rcc_center",
-        "org_count": len(orgs),
-        "organizations": [dict(o) for o in orgs],
-        "rcc_tasks_count": len(tasks),
-        "rcc_tasks": [dict(t) for t in tasks],
-        "chatbot_tickets_count": len(tickets),
-        "chatbot_tickets": [dict(t) for t in tickets],
-        "note": "RCC=资源调度中心：调度任务需审批(pending→approved→executing)，chatbot工单=员工个人资源需求流转入口。",
-    }
-
-
-async def _tool_submit_rcc_resource_request(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None, operator: str = "ai_assistant") -> Dict[str, Any]:
-    """提交资源需求到 RCC：生成 chatbot 工单（员工个人资源需求 → RCC 调度审批流）。"""
-    from core.rcc.services import ChatbotTicketService
-
-    message = str(args.get("message") or "").strip()
-    if not message:
-        return {"error": "缺少资源需求描述"}
-    ticket_type = str(args.get("ticket_type") or "resource_request")
-    if ticket_type not in ("resource_request", "equipment_request", "manpower_request", "material_request", "other"):
-        ticket_type = "resource_request"
-
-    svc = ChatbotTicketService(db)
-    try:
-        ticket = await svc.create_ticket(
-            message=message,
-            requester_id=operator or "ai_assistant",
-            ticket_type=ticket_type,
-            parsed_intents={"intent": ticket_type, "source": "personal_chatbot"},
-            parsed_slots={"resource": args.get("requested_resource", {}), "time_window": args.get("requested_time_window", {})},
-            requested_resource=args.get("requested_resource", {}),
-            requested_time_window=args.get("requested_time_window", {}),
-            related_work_order_id=args.get("related_work_order_id"),
-        )
-        return {
-            "type": "rcc_ticket", "action": "created",
-            "ticket_id": ticket.id, "ticket_code": ticket.ticket_code,
-            "status": ticket.status, "ticket_type": ticket_type,
-            "note": f"资源需求工单 {ticket.ticket_code} 已提交 RCC 调度中心，等待路由与审批。",
-        }
-    except Exception as exc:
-        return {"error": f"RCC 工单创建失败: {type(exc).__name__}: {str(exc)[:150]}"}
-
-
-
 _TOOL_EXECUTORS = {
     "query_work_orders": _tool_query_work_orders,
     "query_order_work_order_status": _tool_query_order_work_order_status,
@@ -5099,39 +2738,6 @@ _TOOL_EXECUTORS = {
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
-    "pmc_hammer_matrix": _tool_pmc_hammer_matrix,
-    "run_mrp_calculation": _tool_run_mrp_calculation,
-    "fifo_check": _tool_fifo_check,
-    "demand_forecast": _tool_demand_forecast,
-    "rccp_check": _tool_rccp_check,
-    "changeover_plan": _tool_changeover_plan,
-    "plan_achievement": _tool_plan_achievement,
-    "eat_check": _tool_eat_check,
-    "reschedule_work_order": _tool_reschedule_work_order,
-    "rush_insert_order": _tool_rush_insert_order,
-    "change_priority": _tool_change_priority,
-    "cancel_work_order": _tool_cancel_work_order,
-    "query_pmc_change_log": _tool_query_pmc_change_log,
-    "create_rfq": _tool_create_rfq,
-    "create_supplier_profile": _tool_create_supplier_profile,
-    "get_document_template": _tool_get_document_template,
-    "payment_request": _tool_payment_request,
-    "purchase_return": _tool_purchase_return,
-    "manage_supplier_status": _tool_manage_supplier_status,
-    "collect_quotations": _tool_collect_quotations,
-    "select_best_quote": _tool_select_best_quote,
-    "goods_receipt": _tool_goods_receipt,
-    "supplier_evaluation": _tool_supplier_evaluation,
-    "invoice_matching_check": _tool_invoice_matching_check,
-    "arrival_tracking": _tool_arrival_tracking,
-    "query_supplier_rank": _tool_query_supplier_rank,
-    "create_shipment": _tool_create_shipment,
-    "query_shipment_status": _tool_query_shipment_status,
-    "pmc_backward_schedule": _tool_pmc_backward_schedule,
-    "confirm_mps_plan": _tool_confirm_mps_plan,
-    "release_mps_plan": _tool_release_mps_plan,
-    "aps_reschedule": _tool_aps_reschedule,
-    "pmc_backward_to_plan": _tool_pmc_backward_to_plan,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
     "query_defects": _tool_query_defects,
     "query_equipment": _tool_query_equipment,
@@ -5159,7 +2765,6 @@ _TOOL_EXECUTORS = {
     "create_online_pivot": _tool_create_online_pivot,
     "get_pending_alerts": _tool_get_pending_alerts,
     "query_ocap_tasks": _tool_query_ocap_tasks,  # OCAP待办任务查询（chatbot集成）
-    "query_my_tasks": _tool_query_my_tasks,  # 任务中心查询（chatbot集成）
     "query_alert_reviews": _tool_query_alert_reviews,
     "acknowledge_alert": _tool_acknowledge_alert,
     "run_alert_patrol": _tool_run_alert_patrol,
@@ -5321,6 +2926,26 @@ async def _tool_query_pmc_control_tower(
 _TOOL_EXECUTORS["query_pmc_control_tower"] = _tool_query_pmc_control_tower
 
 
+async def _tool_query_manufacturing_intelligence(
+    db: AsyncSession,
+    _args: Dict[str, Any],
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the same safe intelligence overview exposed by the API."""
+    from core.intelligence import get_manufacturing_intelligence_service
+
+    overview = await get_manufacturing_intelligence_service().build_overview(
+        db, factory_id or "FAC_MECH_001",
+    )
+    return {
+        "type": "manufacturing_intelligence_overview",
+        **overview.model_dump(mode="json"),
+    }
+
+
+_TOOL_EXECUTORS["query_manufacturing_intelligence"] = _tool_query_manufacturing_intelligence
+
+
 async def _tool_query_collaboration(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     """岗位协同规则查询（事件规则/岗位边界/权限检查）。"""
     from api.services.collaboration_service import CollaborationService
@@ -5360,123 +2985,6 @@ async def _tool_query_collaboration(db: AsyncSession, args: Dict[str, Any], fact
 _TOOL_EXECUTORS["query_collaboration"] = _tool_query_collaboration
 
 
-async def _tool_query_product_bom(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """查询产品BOM配置：列出已关联物料行，判断是否缺BOM。"""
-    product_ref = str(args.get("product_id") or "").strip()
-    if not product_ref:
-        return {"error": "缺少产品ID"}
-    prod = (await db.execute(select(Product).where(Product.id == product_ref))).scalar()
-    if not prod:
-        prod = (await db.execute(select(Product).where(Product.product_code == product_ref))).scalar()
-    product_name = prod.product_name if prod else product_ref
-    rows = (await db.execute(
-        select(BomItem).where(BomItem.product_id == product_ref)
-    )).scalars().all()
-    if not rows:
-        rows = (await db.execute(
-            select(BomItem).where(BomItem.product_sap_code == product_ref)
-        )).scalars().all()
-    items = [
-        {
-            "material_code": str(getattr(r, "material_code", "") or r.part_number or ""),
-            "material_name": getattr(r, "material_name", None) or r.description or "",
-            "qty_per_unit": float(getattr(r, "qty_per_unit", 1) or 1),
-            "bom_version": getattr(r, "bom_version", None),
-        }
-        for r in rows
-    ]
-    return {
-        "product_id": product_ref,
-        "product_name": product_name,
-        "has_bom": len(items) > 0,
-        "bom_item_count": len(items),
-        "items": items,
-        "hint": "没有BOM时，可以用 create_product_bom 从参考产品复制或逐项补录物料。",
-    }
-
-
-async def _tool_create_product_bom(db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """为产品补录BOM：从参考产品复制，或逐项写入 items。"""
-    product_id = str(args.get("product_id") or "").strip()
-    if not product_id:
-        return {"error": "缺少产品ID"}
-    bom_version = str(args.get("bom_version") or "CURRENT")
-    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
-
-    existing = (await db.execute(
-        select(BomItem).where(BomItem.product_id == product_id)
-    )).scalars().all()
-    if existing:
-        return {
-            "error": f"产品[{product_id}]已存在{len(existing)}行BOM，无需重复创建。可用 query_product_bom 查看。",
-        }
-
-    copy_from = str(args.get("copy_from_product") or "").strip()
-    items: List[Dict[str, Any]] = []
-    if copy_from:
-        ref_rows = (await db.execute(
-            select(BomItem).where(BomItem.product_id == copy_from)
-        )).scalars().all()
-        if not ref_rows:
-            return {"error": f"参考产品[{copy_from}]没有BOM可复制"}
-        for r in ref_rows:
-            items.append({
-                "material_code": str(getattr(r, "material_code", "") or r.part_number or ""),
-                "material_name": getattr(r, "material_name", None) or r.description or "",
-                "qty_per_unit": float(getattr(r, "qty_per_unit", 1) or 1),
-            })
-        source_desc = f"从参考产品[{copy_from}]复制"
-    else:
-        items = list(args.get("items") or [])
-        source_desc = "逐项补录"
-
-    items = [it for it in items if it.get("material_code")]
-    if not items:
-        return {"error": "没有可写入的BOM行：请提供 items 或 copy_from_product"}
-
-    from sqlalchemy import func as sa_func
-    max_row = (await db.execute(select(sa_func.max(BomItem.row_id)))).scalar()
-    row_id = int(max_row or 0)
-    now = datetime.utcnow()
-    created = []
-    for it in items:
-        row_id += 1
-        row = BomItem(
-            row_id=row_id,
-            company_id="ENG",
-            product_sap_code=product_id,
-            product_id=product_id,
-            factory_id=fid,
-            bom_version=bom_version,
-            material_code=str(it.get("material_code") or ""),
-            material_name=str(it.get("material_name") or ""),
-            qty_per_unit=float(it.get("qty_per_unit") or 1),
-            quantity=float(it.get("qty_per_unit") or 1),
-            level=1,
-            part_number=str(it.get("material_code") or ""),
-            description=str(it.get("material_name") or ""),
-            unit="PCS",
-            id=str(uuid.uuid4()),
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(row)
-        created.append({
-            "material_code": row.material_code,
-            "material_name": row.material_name,
-            "qty_per_unit": row.qty_per_unit,
-        })
-    await db.commit()
-    return {
-        "success": True,
-        "message": f"已为产品[{product_id}]补录BOM（{source_desc}），共{len(created)}行物料。",
-        "product_id": product_id,
-        "bom_version": bom_version,
-        "factory_id": fid,
-        "items": created,
-    }
-
-
 async def _tool_create_followup_task(db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None) -> Dict[str, Any]:
     """挂账跟进任务：写入任务中心，由后台扫描器按频率定期跟进。"""
     from api.services import followup_task_service as followup_svc
@@ -5493,156 +3001,7 @@ async def _tool_create_followup_task(db: AsyncSession, args: Dict[str, Any], ope
     )
 
 
-async def _tool_query_sales_order_detail(db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant", factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """查询销售订单详情：订单头 + 关联生产计划 + 关联工单（演示订单兼容）。"""
-    order_ref = str(args.get("order_ref") or "").strip()
-    if not order_ref:
-        return {"error": "缺少 order_ref 参数（销售订单号或ID）"}
-
-    from sqlalchemy import text
-
-    # order_ref=all → 订单统计（模型问"有多少个订单"时避免误用工单数）
-    if order_ref.lower() == "all":
-        try:
-            factory_id = factory_id or "FAC_MECH_001"
-            stats = await db.execute(
-                text(
-                    "SELECT count(*) AS total, "
-                    "count(*) FILTER (WHERE status='pending') AS pending, "
-                    "count(*) FILTER (WHERE status='confirmed') AS confirmed, "
-                    "count(*) FILTER (WHERE status IN ('released','in_progress','in_production')) AS in_progress, "
-                    "count(*) FILTER (WHERE status='completed') AS completed, "
-                    "count(*) FILTER (WHERE status='cancelled') AS cancelled "
-                    "FROM sales_orders WHERE factory_id = :fid"
-                ),
-                {"fid": factory_id},
-            )
-            s = stats.mappings().first()
-            recent = await db.execute(
-                text(
-                    "SELECT order_code, status, product_id, quantity, delivery_date, priority, customer_name "
-                    "FROM sales_orders WHERE factory_id = :fid "
-                    "ORDER BY created_at DESC LIMIT 10"
-                ),
-                {"fid": factory_id},
-            )
-            rows = [dict(r) for r in recent.mappings().all()]
-            return {
-                "order_count": int(s["total"] or 0),
-                "by_status": {
-                    "pending": int(s["pending"] or 0),
-                    "confirmed": int(s["confirmed"] or 0),
-                    "in_progress": int(s["in_progress"] or 0),
-                    "completed": int(s["completed"] or 0),
-                    "cancelled": int(s["cancelled"] or 0),
-                },
-                "recent_orders": rows,
-                "note": "以上为销售订单统计（sales_orders 表），不是工单统计。",
-            }
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"订单统计失败: {type(exc).__name__}: {exc}"}
-
-    order = None
-    result = await db.execute(
-        text("SELECT * FROM sales_orders WHERE order_code = :ref OR id = :ref"),
-        {"ref": order_ref},
-    )
-    row = result.mappings().first()
-    if row is not None:
-        order = dict(row)
-    source = "sales_orders" if order else "work_orders"
-
-    wo_result = await db.execute(
-        text("SELECT * FROM work_orders WHERE sales_order_id = :ref ORDER BY created_at DESC"),
-        {"ref": order_ref},
-    )
-    work_orders = [dict(r) for r in wo_result.mappings().all()]
-
-    plan_result = await db.execute(
-        text("SELECT * FROM plans WHERE sales_order_id = :ref ORDER BY created_at DESC"),
-        {"ref": order_ref},
-    )
-    plans = [dict(r) for r in plan_result.mappings().all()]
-
-    if not order and not work_orders and not plans:
-        return {"error": f"未找到销售订单：{order_ref}"}
-
-    if not order and work_orders:
-        first = work_orders[0]
-        order = {
-            "id": order_ref,
-            "order_code": order_ref,
-            "factory_id": first.get("factory_id"),
-            "product_id": first.get("product_id"),
-            "product_name": None,
-            "customer_name": None,
-            "customer_code": None,
-            "quantity": sum((w.get("planned_qty") or 0) for w in work_orders),
-            "unit": first.get("unit") or "pcs",
-            "delivery_date": None,
-            "priority": "medium",
-            "status": "demo",
-            "decomposed": True,
-            "material_ready": None,
-            "total_amount": None,
-            "currency": "CNY",
-            "remark": "演示订单（未在销售订单主档登记，信息由关联工单聚合）",
-            "created_at": first.get("created_at"),
-        }
-
-    # 关键字段转成可读字符串，避免暴露超长/二进制值
-    def _fmt_date(v):
-        return v.isoformat() if hasattr(v, "isoformat") else v
-
-    order_out = dict(order)
-    for k, v in list(order_out.items()):
-        if hasattr(v, "isoformat"):
-            order_out[k] = v.isoformat()
-
-    return {
-        "order": order_out,
-        "source": source,
-        "work_order_count": len(work_orders),
-        "work_orders": [
-            {
-                "id": w.get("id"),
-                "work_order_code": w.get("work_order_code"),
-                "status": w.get("status"),
-                "wo_type": w.get("wo_type"),
-                "planned_qty": w.get("planned_qty"),
-                "completed_qty": w.get("completed_qty"),
-                "product_id": w.get("product_id"),
-                "created_at": _fmt_date(w.get("created_at")),
-            }
-            for w in work_orders
-        ],
-        "plan_count": len(plans),
-        "plans": [
-            {
-                "id": pl.get("id"),
-                "plan_code": pl.get("plan_code") or pl.get("code") or pl.get("plan_no"),
-                "status": pl.get("status"),
-                "quantity": pl.get("quantity") or pl.get("planned_qty"),
-                "created_at": _fmt_date(pl.get("created_at")),
-            }
-            for pl in plans
-        ],
-    }
-
-
 _TOOL_EXECUTORS["create_followup_task"] = _tool_create_followup_task
-_TOOL_EXECUTORS["query_purchase_pipeline"] = _tool_query_purchase_pipeline
-_TOOL_EXECUTORS["create_purchase_requisition"] = _tool_create_purchase_requisition
-_TOOL_EXECUTORS["assign_supplier_to_pr"] = _tool_assign_supplier_to_pr
-_TOOL_EXECUTORS["create_purchase_order"] = _tool_create_purchase_order
-_TOOL_EXECUTORS["query_purchase_order_progress"] = _tool_query_purchase_order_progress
-_TOOL_EXECUTORS["query_rcc_center"] = _tool_query_rcc_center
-_TOOL_EXECUTORS["send_group_message"] = _tool_send_group_message
-_TOOL_EXECUTORS["query_group_messages"] = _tool_query_group_messages
-_TOOL_EXECUTORS["submit_rcc_resource_request"] = _tool_submit_rcc_resource_request
-_TOOL_EXECUTORS["query_product_bom"] = _tool_query_product_bom
-_TOOL_EXECUTORS["create_product_bom"] = _tool_create_product_bom
-_TOOL_EXECUTORS["query_sales_order_detail"] = _tool_query_sales_order_detail
 
 # 写操作工具（需要记录操作人）
 WRITE_TOOLS = {
@@ -5658,15 +3017,6 @@ WRITE_TOOLS = {
     "reload_online_workbook",
     "acknowledge_alert", "run_alert_patrol",
     "create_followup_task",
-    "create_product_bom",
-    # 采购执行链路写工具（统一门禁）
-    "create_purchase_requisition", "create_purchase_order", "create_rfq",
-    "collect_quotations", "select_best_quote", "assign_supplier_to_pr",
-    "goods_receipt", "purchase_return", "payment_request",
-    "create_supplier_profile", "manage_supplier_status",
-    "fifo_check", "eat_check",
-    # PMC 变更写工具
-    "reschedule_work_order", "rush_insert_order", "change_priority", "cancel_work_order",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
@@ -5686,6 +3036,7 @@ TOOL_LABELS = {
     "query_pmc_material_supply": "PMC物料供应证据",
     "query_pmc_rush_impact": "PMC插单影响",
     "query_pmc_control_tower": "PMC控制塔",
+    "query_manufacturing_intelligence": "制造智能总览",
     "query_defects": "查询不良品",
     "query_equipment": "查询设备",
     "create_work_order": "创建工单",
@@ -5729,9 +3080,6 @@ TOOL_LABELS = {
     "get_virtual_factory_status": "虚拟工厂状态",
     "run_virtual_factory_pulse": "虚拟工厂脉搏",
     "create_followup_task": "挂账跟进任务",
-    "query_product_bom": "查询产品BOM",
-    "query_sales_order_detail": "销售订单详情",
-    "create_product_bom": "补录产品BOM",
 }
 
 
@@ -5741,6 +3089,13 @@ TOOL_LABELS = {
 # “建议你进入看板/日报中心查看”这类推诿性模糊回答。
 # 仅对单步查询类工具做强制路由；写操作/多步操作仍交由模型 auto 编排。
 INTENT_RULES: List[Dict[str, Any]] = [
+    {
+        "tool": "query_manufacturing_intelligence",
+        "keywords": [
+            "制造智能总览", "制造智能概览", "工厂智能总览", "工厂智能概览",
+            "全局经营风险", "当前总体风险", "智能运行状态", "数字员工状态",
+        ],
+    },
     {
         "tool": "run_virtual_factory_pulse",
         "keywords": [
@@ -5783,7 +3138,8 @@ INTENT_RULES: List[Dict[str, Any]] = [
         # PMC九类管理问题统一走控制塔，避免被普通“库存/订单/流程”关键词截断。
         "tool": "query_pmc_control_tower",
         "keywords": [
-            "PMC能不能回答", "PMC控制塔", "排过多少订单", "排了多少订单", "排产过多少订单",
+            "PMC能不能回答", "PMC控制塔", "PMC 控制任务推进", "PMC控制任务推进",
+            "PMC任务推进", "PMC整体推进", "排过多少订单", "排了多少订单", "排产过多少订单",
             "控过多少物料", "控制过多少物料", "控制了多少物料", "Shortage怎么处理", "shortage怎么处理", "shortage 怎么处理",
             "缺料怎么处理", "缺料如何处理", "物料短缺怎么处理", "物料缺口怎么处理",
             "库存怎么降", "如何降库存", "怎么降库存", "OTD怎么保证", "OTD 怎么保证", "otd怎么保证", "otd 怎么保证", "如何保证OTD",
@@ -5984,36 +3340,40 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "该找谁", "谁负责", "卡在", "超时找谁", "责任归属", "谁审批", "谁执行",
         ],
     },
-    {
-        "tool": "query_sales_order_detail",
-        "keywords": [
-            "查这个销售订单", "查一下销售订单", "销售订单详情", "订单详情",
-            "看这个订单", "看下这个订单", "这个订单什么情况", "订单评审结论",
-            "RDD能不能保证", "订单交期", "查订单数据",
-        ],
-    },
-    {
-        "tool": "query_product_bom",
-        "keywords": [
-            "产品有没有BOM", "产品BOM", "BOM清单", "物料清单", "BOM配置",
-            "查BOM", "查看BOM", "BOM是什么", "有没有BOM", "缺BOM",
-            "MRP为什么失败", "MRP失败", "MRP计算失败",
-        ],
-    },
-    {
-        "tool": "create_product_bom",
-        "keywords": [
-            "帮我处理", "补齐BOM", "补BOM", "创建BOM", "新建BOM", "建立BOM",
-            "维护BOM", "补录BOM", "给.*建BOM", "复制BOM", "补全BOM",
-        ],
-    },
 ]
+
+
+_WORKFLOW_DIAGRAM_OBJECT_HINTS = (
+    "工作流程", "工作流", "流程图", "端到端流程", "完整流程",
+    "流程可视化", "流程节点图", "正常路径", "fallback", "输入输出物",
+)
+_WORKFLOW_DIAGRAM_RENDER_HINTS = (
+    "画", "绘制", "生成", "展示", "查看", "可视化", "流程图", "节点图",
+)
+
+
+def _is_explicit_workflow_diagram_request(message: str) -> bool:
+    """Disambiguate business workflow drawings from an SPC control chart.
+
+    A phrase such as ``PMC工作流程控制图`` contains the generic SPC keyword
+    ``控制图``.  Object + render evidence must win before the ordered keyword
+    catalogue, otherwise the model is given the SPC tool while the system
+    prompt tells it to call the workflow-diagram tool.
+    """
+    normalized = (message or "").strip().casefold()
+    return bool(
+        normalized
+        and any(hint in normalized for hint in _WORKFLOW_DIAGRAM_OBJECT_HINTS)
+        and any(hint in normalized for hint in _WORKFLOW_DIAGRAM_RENDER_HINTS)
+    )
 
 
 def detect_intent_tool(message: str) -> Optional[str]:
     """确定性意图识别：命中业务关键词则返回应强制调用的工具名，否则返回 None（交给模型 auto 决策）。"""
     if not message:
         return None
+    if _is_explicit_workflow_diagram_request(message):
+        return "query_workflow_diagram"
     for rule in INTENT_RULES:
         if any(kw in message for kw in rule["keywords"]):
             return rule["tool"]
@@ -6049,8 +3409,9 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
     tool = detect_intent_tool(message)
     if not tool:
         return None
-    # 流程图必须先经过模型语义识别；关键词路由不得在模型之前直接弹图。
-    if tool == "query_workflow_diagram":
+    # 只有同时具备明确对象和绘图动作的请求才允许确定性出图；模糊的
+    # “流程图”仍交给模型追问，避免回退到无关 PMC/DCC 流程。
+    if tool == "query_workflow_diagram" and not _is_explicit_workflow_diagram_request(message):
         return None
     args: Dict[str, Any] = {}
     if tool == "query_order_work_order_status":
@@ -6113,11 +3474,20 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
             matched = next((item for item in candidates if str(item[2]).lower() in normalized_message), None)
             if matched:
                 args["position"] = matched[1]["title"]
-                args["workflow_key"] = f"position:{matched[0]}"
+                args["workflow_key"] = (
+                    "pmc:end_to_end"
+                    if matched[0] == "pmc_planner"
+                    else f"position:{matched[0]}"
+                )
+                args["scope"] = "position_end_to_end"
                 args["engine_type"] = "business"
             step_match = re.search(r"(?:第|当前第)\s*(\d+)\s*步", message)
             if step_match:
                 args["current_step"] = int(step_match.group(1))
+        if not any(args.get(key) for key in (
+            "flow_id", "flow_code", "task_type", "position", "process_name", "workflow_key",
+        )):
+            return None
     elif tool == "query_pmc_control_tower":
         scope_keywords = [
             ("orders", ["排过多少订单", "排了多少订单", "排产过多少订单", "订单排程", "排过订单"]),
@@ -6270,19 +3640,7 @@ async def execute_tool(
         if tool_name == "create_online_pivot":
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name in WRITE_TOOLS:
-            # 按执行器签名透传参数：采购/PMC 写工具为 (db,args,factory_id,operator)，
-            # 工单类写工具为 (db,args,operator)。早期按位置传 operator 会错落到
-            # factory_id 槽位，导致按工厂过滤的写工具报「单据不存在」。
-            _params = inspect.signature(executor).parameters
-            _kw: Dict[str, Any] = {}
-            if "operator" in _params:
-                _kw["operator"] = operator
-            if "factory_id" in _params:
-                _kw["factory_id"] = factory_id
-            return await executor(db, arguments, **_kw)
-        if tool_name in {"send_group_message", "query_group_messages"}:
-            # 群消息工具需要 operator（发送者身份）
-            return await executor(db, arguments, operator=operator, factory_id=factory_id)
+            return await executor(db, arguments, operator)
         return await executor(db, arguments, factory_id)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"工具执行失败：{type(exc).__name__}: {exc}"}

@@ -11,9 +11,6 @@ RCC = Resource Control Center — 全局统筹人/物/工单计算
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.db_config import get_db
-from core.auth.security import get_current_user
-from database.models import User
-import json
 from typing import Optional, Dict, Any
 
 router = APIRouter(prefix="/api/v1/rcc", tags=["rcc"])
@@ -31,7 +28,6 @@ async def get_rcc_data(
     factory_id: Optional[str] = Query(None, description="工厂ID"),
     mode: str = Query("single", description="single|global"),
     db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
 ):
     """
     综合数据层接口：从上游业务模块直接汇总人/设备/工单/环境/工艺真实基线、
@@ -157,7 +153,6 @@ async def get_rcc_data(
 async def get_full_baseline(
     factory_id: str = Query(..., description="工厂ID"),
     db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
 ):
     """全量RCC基线，汇总人/设备/工单/环境/工艺五维数据"""
     from core.rcc.calculator import RCCResourceCalculator
@@ -221,7 +216,6 @@ async def get_process_baseline(factory_id: str = Query(...), db: AsyncSession = 
 async def trigger_calculation(
     payload: Dict[str, Any] = Body(default={}),
     db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
 ):
     """
     触发全量RCC统筹计算。
@@ -268,7 +262,6 @@ async def trigger_calculation(
 async def sync_baseline(
     payload: Dict[str, Any] = Body(default={}),
     db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
 ):
     """
     强制同步：将当前所有真实DB数据重新汇总到RCC基线。
@@ -283,257 +276,3 @@ async def sync_baseline(
         return {"success": True, "data": result}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-
-@router.get("/resource-index", summary="RCC 四维资源可用指数：人力×设备×物料×时间 乘积模型")
-async def resource_index(
-    date: str = "",
-    db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
-):
-    """RCC 核心抓手：可用产能 = 可用人力 × 可用设备 × 可用物料 × 可用时间。
-    任一维为 0 → 整体产能 0（缺料停产/设备坏停线/人不够降速/无班次停工）。
-    """
-    from datetime import datetime as _dt
-    from sqlalchemy import text as sql_text
-    fid = "FAC_MECH_001"
-    today = _dt.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d") if date else _dt.now().strftime("%Y-%m-%d")
-
-    # 兜底：当日考勤未生成时按需生成（幂等），避免人力/工时维度归零拖垮指数
-    try:
-        from api.services.attendance_service import ensure_attendance
-        await ensure_attendance(db, fid, today)
-    except Exception as _ae:
-        # 禁止静默吞异常：记日志便于定位（如 FK 违反/schema 不一致）
-        import logging as _lg
-        _lg.getLogger("rcc_data").warning("[resource-index] 考勤按需生成失败: %s", _ae)
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-
-    # ① 人力可用率 = 在岗（含迟到）/ 出勤编制
-    hr = (await db.execute(sql_text("""
-        SELECT COUNT(*) FILTER (WHERE status IN ('present','late')) AS present, COUNT(*) AS total
-        FROM attendance WHERE factory_id=:f AND date=:d
-    """), {"f": fid, "d": today})).mappings().first()
-    hr_pct = round(hr["present"] / hr["total"] * 100, 1) if hr["total"] else 0
-
-    # ② 设备可用率 = 运行 / 全部
-    eq = (await db.execute(sql_text("""
-        SELECT COUNT(*) FILTER (WHERE status='running') AS running, COUNT(*) AS total
-        FROM equipment WHERE factory_id=:f
-    """), {"f": fid})).mappings().first()
-    eq_pct = round(eq["running"] / eq["total"] * 100, 1) if eq["total"] else 0
-
-    # ③ 物料齐套率 = 已齐套工单物料 / 全部需求物料
-    mat = (await db.execute(sql_text("""
-        SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE received_qty >= required_qty) AS kit
-        FROM work_order_materials WHERE work_order_id IN
-          (SELECT id FROM work_orders WHERE factory_id=:f AND status IN ('released','in_progress'))
-    """), {"f": fid})).mappings().first()
-    mat_pct = round(mat["kit"] / mat["total"] * 100, 1) if mat["total"] else 0
-
-    # ④ 时间可用率 = 今日运转班次工时 / 标准 20h（2班倒）
-    shifts = (await db.execute(sql_text("""
-        SELECT shift, COUNT(DISTINCT operator_id) AS workers FROM attendance
-        WHERE factory_id=:f AND date=:d AND status IN ('present','late')
-        GROUP BY shift
-    """), {"f": fid, "d": today})).mappings().all()
-    hours_map = {"白班": 10, "夜班": 10, "两班倒": 20, "早班": 8, "中班": 8, "晚班": 8}
-    covered = max((hours_map.get(s["shift"], 8) for s in shifts if s["workers"] > 0), default=0)
-    time_pct = round(min(100, covered / 20 * 100), 1)
-
-    # 乘积
-    idx = round((hr_pct/100) * (eq_pct/100) * (mat_pct/100) * (time_pct/100) * 100, 1)
-    level = "green" if idx >= 80 else ("warning" if idx >= 60 else "danger")
-
-    return {
-        "factory_id": fid, "date": today, "index": idx, "level": level,
-        "dimensions": {
-            "manpower": {"pct": hr_pct, "available": hr["present"], "total": hr["total"], "desc": "在岗/出勤编制"},
-            "equipment": {"pct": eq_pct, "available": eq["running"], "total": eq["total"], "desc": "运行/全部设备"},
-            "material": {"pct": mat_pct, "available": mat["kit"], "total": mat["total"], "desc": "齐套物料/需求物料"},
-            "time": {"pct": time_pct, "available": covered, "total": 20, "desc": "运转班次工时/标准20h"},
-        },
-        "formula": f"{hr_pct}% × {eq_pct}% × {mat_pct}% × {time_pct}% = {idx}%",
-        "bottleneck": min(
-            [("manpower", hr_pct), ("equipment", eq_pct), ("material", mat_pct), ("time", time_pct)],
-            key=lambda x: x[1])[0],
-        "message": "任一维为 0 → 整体产能为 0（缺料停产/设备坏停线/人不够降速/无班次停工）",
-    }
-
-
-@router.get("/task-health", summary="RCC 任务健康指数：任务域抓手（闭环率×及时率×AI接管率）")
-async def task_health(
-    db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
-):
-    """非生产部门（PMC/采购/质量）核心抓手：不是效率（一人干多少件），而是每个任务处理好。
-    - 闭环率：完成任务 / 总任务（任务有没有善终）
-    - 及时率：按时完成 / 已完成（是否拖延）
-    - 接管率：AI/智能体处理任务占比（chatbot 能接管多少任务）
-    乘法模型：任一维低 → 任务域不健康（积压/烂尾/人工依赖）
-    """
-    from sqlalchemy import text as sql_text
-    fid = "FAC_MECH_001"
-
-    # ① 总量/闭环
-    t = (await db.execute(sql_text("""
-        SELECT COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE status='done') AS done,
-               COUNT(*) FILTER (WHERE status='blocked') AS blocked,
-               COUNT(*) FILTER (WHERE assigned_to IS NULL OR assigned_to='') AS unassigned
-        FROM followup_tasks WHERE factory_id=:f
-    """), {"f": fid})).mappings().first()
-    total = t["total"] or 0
-    closed_pct = round(t["done"] / total * 100, 1) if total else 0
-
-    # ② 及时率：done 且 无超时（next_follow_at 未过期 或 完成早于计划）
-    timely = (await db.execute(sql_text("""
-        SELECT COUNT(*) AS timely FROM followup_tasks
-        WHERE factory_id=:f AND status='done'
-          AND (next_follow_at IS NULL OR next_follow_at >= NOW())
-    """), {"f": fid})).scalar_one_or_none() or 0
-    timely_pct = round(timely / (t["done"] or 1) * 100, 1)
-
-    # ③ 接管率：AI/智能体创建的任务
-    ai = (await db.execute(sql_text("""
-        SELECT COUNT(*) FROM followup_tasks
-        WHERE factory_id=:f AND (created_by ILIKE '%agent%' OR created_by ILIKE '%ai%')
-    """), {"f": fid})).scalar_one_or_none() or 0
-    takeover_pct = round(ai / total * 100, 1) if total else 0
-
-    # 指数 = 闭环率 × 及时率 × 接管率（非生产部门健康度）
-    idx = round((closed_pct/100) * (timely_pct/100) * (takeover_pct/100) * 100, 1)
-    level = "green" if idx >= 60 else ("warning" if idx >= 30 else "danger")
-
-    # 卡点分布
-    blockers = (await db.execute(sql_text("""
-        SELECT COALESCE(NULLIF(blocked_by,''),'未标注') AS who, COUNT(*) AS n
-        FROM followup_tasks WHERE factory_id=:f AND status='blocked'
-        GROUP BY who ORDER BY n DESC LIMIT 6
-    """), {"f": fid})).mappings().all()
-
-    # 每人负载（含未分配）
-    loads = (await db.execute(sql_text("""
-        SELECT COALESCE(NULLIF(assigned_to,''),'未分配') AS who, COUNT(*) AS n,
-               COUNT(*) FILTER (WHERE status='blocked') AS blocked,
-               COUNT(*) FILTER (WHERE status='done') AS done
-        FROM followup_tasks WHERE factory_id=:f
-        GROUP BY assigned_to ORDER BY n DESC LIMIT 8
-    """), {"f": fid})).mappings().all()
-
-    return {
-        "factory_id": fid, "index": idx, "level": level,
-        "formula": f"闭环率{closed_pct}% × 及时率{timely_pct}% × 接管率{takeover_pct}% = {idx}%",
-        "metrics": {
-            "total": total, "done": t["done"], "blocked": t["blocked"],
-            "unassigned": t["unassigned"],
-            "closed_rate": closed_pct, "timely_rate": timely_pct, "takeover_rate": takeover_pct,
-        },
-        "message": "非生产部门核心不是效率（一人干多少件），而是每个任务处理好（闭环/及时/可接管）",
-        "blockers": [{"who": b["who"], "count": b["n"]} for b in blockers],
-        "loads": [{"who": l["who"], "total": l["n"], "blocked": l["blocked"], "done": l["done"]} for l in loads],
-    }
-
-
-@router.post("/claim-tasks", summary="未分配任务认领：任务落到具体人（每个人都任务计划表的前提）")
-async def claim_tasks(
-    payload: Dict[str, Any],
-    db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
-):
-    """把未分配任务按岗位规则认领到人：
-    - 采购部/供应商卡点 → procurement
-    - 计划部/PMC 卡点 → pmc
-    - 设备/维修卡点 → equipment
-    - 其余 → 对应负责人
-    """
-    from sqlalchemy import text as sql_text
-    fid = "FAC_MECH_001"
-    rules = [
-        ("采购", "procurement"), ("供应商", "procurement"), ("物料", "procurement"),
-        ("计划", "pmc"), ("PMC", "pmc"),
-        ("设备", "equipment"), ("维修", "equipment"),
-        ("仓储", "warehouse"), ("质检", "quality"),
-    ]
-    claimed = 0
-    # 取未分配 + 有卡点的任务
-    rows = (await db.execute(sql_text("""
-        SELECT id, title, COALESCE(NULLIF(blocked_by,''),'') AS bb FROM followup_tasks
-        WHERE factory_id=:f AND (assigned_to IS NULL OR assigned_to='') AND status='blocked'
-        LIMIT 100
-    """), {"f": fid})).mappings().all()
-    for r in rows:
-        owner = None
-        text_blob = (r["bb"] + " " + r["title"])
-        for kw, who in rules:
-            if kw in text_blob:
-                owner = who
-                break
-        if not owner:
-            owner = "pmc"  # 默认 PMC 兜底
-        await db.execute(sql_text(
-            "UPDATE followup_tasks SET assigned_to=:w WHERE id=:id"
-        ), {"w": owner, "id": r["id"]})
-        claimed += 1
-    await db.commit()
-    return {"claimed": claimed, "message": f"已按卡点规则认领 {claimed} 个未分配任务到具体岗位"}
-
-
-@router.get("/agent-work-log", summary="智能体工作记录（真实追溯）：谁/何时/做了什么/证据")
-async def agent_work_log(
-    agent: str = "",
-    action: str = "",
-    ref: str = "",
-    limit: int = 20,
-    db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
-):
-    """按智能体/动作/关联单据查询工作记录，支持追溯：
-    - 某岗位今天干了什么（agent=pmc_agent/procurement_agent）
-    - 某单据的完整处理链（ref=PO-RM-ELEC-036-AC9EE4 从询价到收货全过程）
-    """
-    from sqlalchemy import text as sql_text
-    cond = ["1=1"]
-    params: Dict[str, Any] = {"lim": min(max(limit, 1), 100)}
-    if agent:
-        cond.append("(agent_key=:a OR agent_key=:a2)")
-        params["a"] = agent
-        params["a2"] = agent if agent.endswith("_agent") else agent + "_agent"
-    if action:
-        cond.append("action=:ac")
-        params["ac"] = action
-    if ref:
-        cond.append("(related_ref=:r OR target=:r)")
-        params["r"] = ref
-    rows = (await db.execute(sql_text(f"""
-        SELECT agent_key, action, target, detail, evidence, related_ref, created_at
-        FROM agent_work_log WHERE {' AND '.join(cond)}
-        ORDER BY created_at DESC LIMIT :lim
-    """), params)).mappings().all()
-    return {"count": len(rows),
-            "records": [{"agent": r["agent_key"], "action": r["action"], "target": r["target"],
-                         "detail": r["detail"], "evidence": r["evidence"], "ref": r["related_ref"],
-                         "at": str(r["created_at"])[:16]} for r in rows]}
-
-
-@router.post("/agent-work-log", summary="智能体工作记录写入（工具层自动调用）")
-async def log_agent_work(
-    payload: Dict[str, Any],
-    db: AsyncSession = Depends(get_db),
-        user: User = Depends(get_current_user),
-):
-    from sqlalchemy import text as sql_text
-    import uuid
-    await db.execute(sql_text("""
-        INSERT INTO agent_work_log (id, factory_id, agent_key, action, target, detail, evidence, result, related_ref, created_at, updated_at)
-        VALUES (:id, :f, :agent, :act, :tgt, :detail, CAST(:ev AS jsonb), :res, :ref, NOW(), NOW())
-    """), {"id": str(uuid.uuid4()), "f": payload.get("factory_id", "FAC_MECH_001"),
-           "agent": payload.get("agent", "unknown"), "act": payload.get("action", ""),
-           "tgt": payload.get("target", ""), "detail": payload.get("detail", ""),
-           "ev": json.dumps(payload.get("evidence") or {}, ensure_ascii=False),
-           "res": payload.get("result", "ok"), "ref": payload.get("ref", "")})
-    await db.commit()
-    return {"success": True}

@@ -66,7 +66,6 @@ const OrderManagement: React.FC = () => {
   const [form] = Form.useForm()
   const [reviewForm] = Form.useForm()
   const navigate = useNavigate()
-  const [searchText, setSearchText] = useState('')
   const [statusFilter, setStatusFilter] = useState<string | undefined>(undefined)
   const [priorityFilter, setPriorityFilter] = useState<string | undefined>(undefined)
   const [riskFilter, setRiskFilter] = useState<string | undefined>(undefined)
@@ -97,19 +96,13 @@ const OrderManagement: React.FC = () => {
 
   const displayOrders = useMemo(() => {
     let rows = orders
-    const kw = searchText.trim().toLowerCase()
-    if (kw) rows = rows.filter(o => {
-      const hay = [o.order_code, o.customer_name, o.customer_code, o.product_id, o.product_name]
-        .filter(Boolean).join(' ').toLowerCase()
-      return hay.includes(kw)
-    })
     if (priorityFilter) rows = rows.filter(o => o.priority === priorityFilter)
     if (riskFilter) {
       if (riskFilter === 'unreviewed') rows = rows.filter(o => !o.review_status)
       else rows = rows.filter(o => o.risk_level === riskFilter)
     }
     return rows
-  }, [orders, searchText, priorityFilter, riskFilter])
+  }, [orders, priorityFilter, riskFilter])
 
   const handleCreate = async () => {
     try {
@@ -403,13 +396,6 @@ const OrderManagement: React.FC = () => {
         </Col>
         <Col>
           <Space>
-            <Input.Search
-              placeholder={t('搜索订单号/客户/产品')}
-              allowClear
-              style={{ width: 220 }}
-              value={searchText}
-              onChange={e => setSearchText(e.target.value)}
-            />
             <Select
               value={statusFilter}
               onChange={(v) => { setStatusFilter(v) }}
