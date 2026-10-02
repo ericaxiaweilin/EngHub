@@ -349,5 +349,5 @@ class WarehouseAgent:
                 from api.services.agent_supervisor_service import AgentSupervisor
                 supervisor = AgentSupervisor(self.db)
                 await supervisor.complete_task(task_id, result=result)
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.error(f"[warehouse] 任务完成回写失败 {task_id}: {e}")

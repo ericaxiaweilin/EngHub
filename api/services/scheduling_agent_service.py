@@ -501,8 +501,8 @@ class SchedulingAgent:
                 from api.services.agent_supervisor_service import AgentSupervisor
                 supervisor = AgentSupervisor(self.db)
                 await supervisor.complete_task(task_id, result=result)
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.error(f"[scheduling] 任务完成回写失败: {e}")
 
     async def _fail_task(self, task_id: Optional[str], error: str):
         if task_id:
@@ -510,5 +510,5 @@ class SchedulingAgent:
                 from api.services.agent_supervisor_service import AgentSupervisor
                 supervisor = AgentSupervisor(self.db)
                 await supervisor.complete_task(task_id, error=error)
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.error(f"[scheduling] 任务失败回写失败: {e}")
