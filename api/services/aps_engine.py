@@ -37,7 +37,7 @@ class ApsEngine:
         self,
         factory_id: str,
         algorithm: str = "EDD",
-        horizon_days: int = 7,
+        horizon_days: int = 30,
         created_by: str = "system",
     ) -> Dict[str, Any]:
         """

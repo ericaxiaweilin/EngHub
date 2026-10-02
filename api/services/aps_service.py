@@ -322,7 +322,7 @@ class ApsService:
 
         mode: str = "hybrid",
 
-        horizon_days: int = 7,
+        horizon_days: int = 30,
 
         optimize_for: str = "delivery",
 

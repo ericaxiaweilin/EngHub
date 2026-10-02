@@ -29,7 +29,7 @@ const formatDateTime = (value?: string) => {
 /** Phase 2: APS 排程增强面板 */
 const ApsEnhanced: React.FC = () => {
   const [algorithm, setAlgorithm] = useState('EDD')
-  const [horizon, setHorizon] = useState(7)
+  const [horizon, setHorizon] = useState(30)
   const [scheduling, setScheduling] = useState(false)
   const [result, setResult] = useState<any>(null)
   const [conflicts, setConflicts] = useState<any[]>([])
@@ -128,6 +128,7 @@ const ApsEnhanced: React.FC = () => {
           <Select value={algorithm} onChange={setAlgorithm} options={algorithms} style={{ width: 200 }} />
           <Select value={horizon} onChange={setHorizon} options={[
             { value: 3, label: '3天' }, { value: 7, label: '7天' }, { value: 14, label: '14天' },
+            { value: 30, label: '30天' },
           ]} style={{ width: 80 }} />
           <Button type="primary" icon={<ThunderboltOutlined />} loading={scheduling} onClick={handleSchedule}>
             执行排程

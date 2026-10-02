@@ -34,7 +34,7 @@ class SalesOrderCreate(BaseModel):
 class ScheduleRequest(BaseModel):
     factory_id: str
     algorithm: str = "EDD"
-    horizon_days: int = 7
+    horizon_days: int = 30
 
 
 class RescheduleRequest(BaseModel):

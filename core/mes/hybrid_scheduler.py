@@ -255,39 +255,83 @@ class HybridScheduler:
         
         return 60.0  # 默认值
     
-    def _check_resource_availability(
+    def _maintenance_block_end(
+        self,
+        resource: ResourceConstraint,
+        start: datetime.datetime,
+        duration: float,
+    ) -> Optional[datetime.datetime]:
+        """若占用区间撞上保养窗口，返回需要跳到的时间点。"""
+        if not resource.maintenance_schedule:
+            return None
+        span_end = self._work_span_end(resource, start, duration)
+        for maint_start, maint_end in resource.maintenance_schedule:
+            if start < maint_end and span_end > maint_start:
+                return maint_end
+        return None
+    
+    def _find_earliest_start(
         self,
         resource_id: str,
-        start_time: datetime.datetime,
+        not_before: datetime.datetime,
         duration: float,
-    ) -> Tuple[bool, datetime.datetime]:
-        """检查资源可用性，返回 (是否可用，建议开始时间)"""
-        if resource_id not in self.resources:
-            return False, start_time
-            
-        res = self.resources[resource_id]
-        
-        # 1. 检查资源是否故障
+        ignore_horizon: bool = False,
+    ) -> Tuple[Optional[datetime.datetime], Optional[str]]:
+        """沿时间轴单向前推进，直到找到可用开工时刻；排不进时返回具体阻塞原因。
+
+        只要求开工时刻落在计划期内，完工允许延伸到计划期之外：
+        排队靠后的工单因此得到"最早可开工日/超期天数"，而不是笼统的"找不到工位"。
+        """
+        res = self.resources.get(resource_id)
+        if res is None:
+            return None, "该工位未注册为排程资源"
         if res.is_broken:
-            return False, datetime.datetime.max
-        
-        # 2. 检查是否在维护期间 (按跨班次占用区间判断)
-        span_end = self._work_span_end(res, start_time, duration)
-        for maint_start, maint_end in res.maintenance_schedule:
-            if start_time < maint_end and span_end > maint_start:
-                # 与维护时间冲突，跳到维护结束后
-                return False, maint_end
-        
-        # 3. 检查资源时间轴冲突
-        conflict = self._check_timeline_conflict(resource_id, start_time, duration)
-        if conflict:
-            return False, conflict.end_time
-        
-        # 4. 检查工作日历：开工时点必须落在班次内，完工允许跨班次连续占用
-        if not self._can_start_in_calendar(res, start_time):
-            return False, self._find_next_work_slot(res, start_time)
-        
-        return True, start_time
+            return None, "该工位设备全部处于故障或保养状态"
+
+        cursor = not_before
+        blocked_by = "该工位时间轴已被其他工单占满"
+        for _ in range(2000):
+            if not ignore_horizon and res.available_to and cursor > res.available_to:
+                earliest, _ = self._find_earliest_start(
+                    resource_id, not_before, duration, ignore_horizon=True
+                )
+                horizon_end = res.available_to.strftime('%Y-%m-%d')
+                if earliest:
+                    late_days = (earliest.date() - res.available_to.date()).days
+                    if late_days > 0:
+                        return None, (
+                            f"计划期止 {horizon_end}，"
+                            f"最早可开工 {earliest.strftime('%Y-%m-%d')}（超期 {late_days} 天）"
+                        )
+                return None, f"该工位产能已排满至计划期止 {horizon_end}，期内无空档"
+
+            if not self._can_start_in_calendar(res, cursor):
+                nxt = self._find_next_work_slot(res, cursor)
+                if nxt <= cursor:
+                    return None, "资源日历内没有可用开工时段"
+                cursor = nxt
+                blocked_by = "班次日历与休息日限制"
+                continue
+
+            conflict = self._check_timeline_conflict(resource_id, cursor, duration)
+            if conflict is not None:
+                cursor = max(
+                    conflict.end_time, cursor + datetime.timedelta(minutes=1)
+                )
+                blocked_by = "该工位时间轴已被其他工单占满"
+                continue
+
+            maint_end = self._maintenance_block_end(res, cursor, duration)
+            if maint_end is not None:
+                cursor = max(
+                    maint_end, cursor + datetime.timedelta(minutes=1)
+                )
+                blocked_by = "设备保养窗口占用"
+                continue
+
+            return cursor, None
+
+        return None, blocked_by
     
     def _check_timeline_conflict(
         self,
@@ -520,11 +564,13 @@ class HybridScheduler:
             best_station = None
             best_start = None
             best_duration = float('inf')
+            station_blockers: Dict[str, str] = {}
             
             candidate_stations = op.allowed_stations if op.allowed_stations else list(self.resources.keys())
             
             for station_id in candidate_stations:
                 if station_id not in self.resources:
+                    station_blockers[station_id] = "该工位未注册为排程资源"
                     continue
                 
                 # 获取有效工时
@@ -555,20 +601,16 @@ class HybridScheduler:
                 else:
                     check_time = current_time
                 
-                available = False
-                suggested_time = check_time
-                for _retry in range(10):
-                    available, suggested_time = self._check_resource_availability(
-                        station_id,
-                        suggested_time if _retry > 0 else check_time,
-                        total_duration,
-                    )
-                    if available:
-                        break
+                candidate_start, blocker = self._find_earliest_start(
+                    station_id, check_time, total_duration
+                )
+                if candidate_start is None:
+                    station_blockers[station_id] = blocker or "未知约束"
+                    continue
                 
-                if available and suggested_time < (best_start or datetime.datetime.max):
+                if best_start is None or candidate_start < best_start:
                     best_station = station_id
-                    best_start = suggested_time
+                    best_start = candidate_start
                     best_duration = total_duration
             
             if best_station:
@@ -607,7 +649,18 @@ class HybridScheduler:
                 else:
                     current_time = end_time + datetime.timedelta(seconds=op.min_wait_time)
             else:
-                raise ValueError(f"工序 {op.operation_sequence} 无法找到可用工位")
+                if station_blockers:
+                    detail = "；".join(
+                        f"{sid} {reason}"
+                        for sid, reason in list(station_blockers.items())[:3]
+                    )
+                elif not candidate_stations:
+                    detail = "工艺路线该工序未指定工位，且工厂没有可用资源"
+                else:
+                    detail = "该工序没有可选工位"
+                raise ValueError(
+                    f"工序 {op.operation_sequence}({op.operation_name}) 排不进: {detail}"
+                )
         
         return tasks
     

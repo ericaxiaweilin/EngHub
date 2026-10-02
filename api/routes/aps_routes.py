@@ -27,7 +27,7 @@ router = APIRouter(prefix="/api/v1/aps", tags=["aps"])
 class GenerateRequest(BaseModel):
     factory_id: str
     mode: str = "hybrid"  # forward/backward/hybrid
-    horizon_days: int = 7
+    horizon_days: int = 30
     optimize_for: str = "delivery"  # delivery/efficiency/cost
     reason: Optional[str] = None
 
@@ -1037,7 +1037,7 @@ def _rush_recommendation(delayed: list, feasible: bool) -> str:
 class ScheduleWithAlgorithmRequest(BaseModel):
     factory_id: str
     algorithm: str = "EDD"  # EDD/SPT/CR/PRIORITY
-    horizon_days: int = 7
+    horizon_days: int = 30
 
 
 @router.post("/schedule")
