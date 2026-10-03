@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, select, func, and_
 
 from database.models import WorkOrder, Station, Equipment
+from core.mes.capacity_math import load_station_models
 
 _logger = logging.getLogger("scheduling_agent")
 
@@ -384,49 +385,85 @@ class SchedulingAgent:
         }
 
     async def capacity_balance(self, factory_id: str) -> Dict[str, Any]:
-        """产能平衡检查：各工位利用率是否合理"""
-        result = await self.db.execute(text("""
-            SELECT t.station_id,
-                   COUNT(*) as task_count,
-                   SUM(EXTRACT(EPOCH FROM (t.planned_end - t.planned_start)) / 3600) as total_hours
-            FROM aps_schedule_tasks t
-            JOIN aps_schedules s ON t.schedule_id = s.id
-            WHERE s.factory_id = :fid AND s.status IN ('draft', 'confirmed')
-              AND t.planned_start > NOW()
-            GROUP BY t.station_id
-        """), {"fid": factory_id})
+        """产能平衡检查：各工位负荷是否合理
+
+        只统计当前生效版本，并且按班次内的实际工时。以前这里是
+        `SUM(EXTRACT(EPOCH FROM planned_end - planned_start))` 且 status IN
+        ('draft','confirmed') 跨该厂**全部**历史 draft 累加 —— 实测单个工位报
+        26379 小时/833 行，而那个工位未来 30 天只有约 264 个班次小时。
+        智能体和 chatbot 的"产能不平衡"结论就建立在这个虚高数字上。
+        """
+        now = datetime.utcnow()
+        horizon_end = now + timedelta(days=30)
+        schedule_id = await self._live_schedule_id(factory_id)
+        if not schedule_id:
+            return {"balanced": True, "message": "该工厂还没有排程方案，无需平衡检查"}
+
+        rows = (await self.db.execute(text("""
+            SELECT station_id, planned_start, planned_end
+            FROM aps_schedule_tasks
+            WHERE schedule_id = :sid
+              AND planned_end >= :now
+              AND status IN ('planned', 'confirmed', 'released')
+        """), {"sid": str(schedule_id), "now": now})).mappings().all()
+
+        station_ids = sorted({str(row["station_id"]) for row in rows if row["station_id"]})
+        if not station_ids:
+            return {"balanced": True, "message": "当前生效方案没有待执行排程任务"}
+
+        models = await load_station_models(self.db, factory_id, station_ids, now, horizon_end)
+
+        agg: Dict[str, Dict[str, Any]] = {}
+        window_days = [(now + timedelta(offset)).date() for offset in range(30)]
+        for row in rows:
+            station = str(row["station_id"])
+            model = models.get(station)
+            if not model or not row["planned_start"] or not row["planned_end"]:
+                continue
+            bucket = agg.setdefault(station, {"total_hours": 0.0, "task_count": 0})
+            bucket["total_hours"] += model.work_seconds_between(
+                max(row["planned_start"], now), row["planned_end"]
+            ) / 3600
+            bucket["task_count"] += 1
+
         loads = []
-        for row in result.mappings().all():
-            load = dict(row)
-            load["total_hours"] = float(load.get("total_hours") or 0)
-            loads.append(load)
+        for station, bucket in agg.items():
+            model = models[station]
+            capacity_hours = sum(model.capacity_hours_on(day) for day in window_days)
+            loads.append({
+                "station_id": station,
+                "task_count": bucket["task_count"],
+                "total_hours": round(bucket["total_hours"], 1),
+                "capacity_hours": round(capacity_hours, 1),
+                "utilization_pct": round(bucket["total_hours"] / capacity_hours * 100, 1)
+                                    if capacity_hours else None,
+            })
 
         if not loads:
-            return {"balanced": True, "message": "无待执行排程任务"}
+            return {"balanced": True, "message": "当前生效方案的工位都未配置班次日历，无法比较"}
 
-        hours_list = [l["total_hours"] for l in loads]
+        hours_list = [item["total_hours"] for item in loads]
         avg_hours = sum(hours_list) / len(hours_list)
-        max_hours = max(hours_list)
-        min_hours = min(hours_list)
 
         # 不平衡度 = (最大-最小) / 平均
-        imbalance = (max_hours - min_hours) / avg_hours if avg_hours > 0 else 0
-
-        overloaded = [l for l in loads if l["total_hours"] > avg_hours * 1.3]
-        underloaded = [l for l in loads if l["total_hours"] < avg_hours * 0.5]
+        imbalance = (max(hours_list) - min(hours_list)) / avg_hours if avg_hours > 0 else 0
 
         return {
             "balanced": imbalance < 0.3,
             "imbalance_ratio": round(imbalance, 2),
             "stations": [{
-                "station_id": l["station_id"],
-                "task_count": l["task_count"],
-                "total_hours": round(l["total_hours"], 1),
-                "status": "overloaded" if l["total_hours"] > avg_hours * 1.3
-                          else "underloaded" if l["total_hours"] < avg_hours * 0.5
+                "station_id": item["station_id"],
+                "task_count": item["task_count"],
+                "total_hours": item["total_hours"],
+                "capacity_hours": item["capacity_hours"],
+                "utilization_pct": item["utilization_pct"],
+                "status": "overloaded" if (item["utilization_pct"] or 0) > 100
+                          else "underloaded" if item["total_hours"] < avg_hours * 0.5
                           else "normal",
-            } for l in loads],
+            } for item in loads],
             "avg_hours": round(avg_hours, 1),
+            "schedule_id": str(schedule_id),
+            "basis": "当前生效版本 + 班次内实际工时（不含夜间与休息日）",
             "recommendation": "产能平衡" if imbalance < 0.3 else f"不平衡度{imbalance:.0%}，建议重排",
             "auto_action": None if imbalance < 0.3 else "建议执行auto_reschedule",
         }

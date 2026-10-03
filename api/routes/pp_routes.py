@@ -597,56 +597,94 @@ async def analyze_capacity(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """产能负荷分析（连接MES工站数据）"""
-    # 查询工站信息
-    station_res = await db.execute(select(Station).where(Station.id == station_id))
-    station = station_res.scalar()
-    
-    if not station:
-        raise HTTPException(status_code=404, detail="工站不存在")
-    
-    # 计算期间工作小时数
-    from_dt = datetime.fromisoformat(from_date)
-    to_dt = datetime.fromisoformat(to_date)
-    total_days = (to_dt - from_dt).days + 1
-    working_days = sum(1 for i in range(total_days) 
-                     if (from_dt + timedelta(days=i)).weekday() < 5)
-    
-    total_capacity_hours = station.capacity_per_hour * 8 * working_days
-    
-    # 计算已分配的工时（简化：统计该工厂已发布的计划工时）
-    released_plans = await db.execute(
-        select(Plan).where(
-            and_(
-                Plan.factory_id == factory_id,
-                Plan.status.in_(["released", "in_progress"]),
-                Plan.required_date >= from_date,
-                Plan.required_date <= to_date,
-            )
+    """产能负荷分析（连接MES工站数据）
+
+    可用工时来自工厂日历（班次小时 × OEE），已分配工时来自当前生效排程落在该工位的
+    班次内实际工时。这里原来是 `allocated = Σ 计划 estimated_hours × 0.6`，注释写着
+    "假设60%工时在此工站"——用假设数算负荷率，而且 bottleneck_stations 恒为空。
+    """
+    from core.mes.capacity_math import live_schedule_id, load_station_models
+
+    station_res = await db.execute(
+        select(Station).where(
+            Station.factory_id == factory_id,
+            or_(Station.id == station_id, Station.station_code == station_id),
         )
     )
-    plans = released_plans.all()
-    
-    allocated_hours = sum(
-        getattr(p, "estimated_hours", 0) * 0.6 for p in plans  # 假设60%工时在此工站
+    station = station_res.scalar_one_or_none()
+    if not station:
+        raise HTTPException(status_code=404, detail="工站不存在或不属于该工厂")
+
+    try:
+        from_dt = datetime.fromisoformat(from_date)
+        to_dt = datetime.fromisoformat(to_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="from_date/to_date 需为 ISO 日期，例如 2026-10-03")
+    if to_dt < from_dt:
+        raise HTTPException(status_code=400, detail="to_date 不能早于 from_date")
+
+    station_code = str(station.station_code or station.id)
+    days = max(1, (to_dt.date() - from_dt.date()).days + 1)
+    models = await load_station_models(db, factory_id, [station_code], from_dt, to_dt)
+    model = models.get(station_code)
+    window_days = [(from_dt + timedelta(offset)).date() for offset in range(days)]
+    total_capacity_hours = round(
+        sum(model.capacity_hours_on(day) for day in window_days) if model else 0.0, 2
     )
-    
-    available_hours = max(0, total_capacity_hours - allocated_hours)
-    utilization_rate = round((allocated_hours / total_capacity_hours * 100) if total_capacity_hours > 0 else 0, 1)
-    
-    load_analysis = {
+
+    schedule_id = await live_schedule_id(db, factory_id)
+    rows = []
+    if schedule_id:
+        rows = list((await db.execute(text("""
+            SELECT t.planned_start, t.planned_end
+            FROM aps_schedule_tasks t
+            WHERE t.schedule_id = :sid AND t.station_id = :code
+              AND t.planned_start <= :window_to AND t.planned_end >= :window_from
+              AND t.status IN ('planned', 'confirmed', 'released')
+        """), {"sid": schedule_id, "code": station_code,
+                "window_to": to_dt, "window_from": from_dt})).mappings().all())
+
+    allocated_hours = 0.0
+    daily_load: Dict[str, float] = {}
+    for row in rows:
+        start, end = row["planned_start"], row["planned_end"]
+        if not start or not end or not model:
+            continue
+        for key, hours in model.work_hours_by_day(start, end).items():
+            daily_load[key] = daily_load.get(key, 0.0) + hours
+        allocated_hours += model.work_seconds_between(max(start, from_dt), min(end, to_dt)) / 3600
+
+    overloaded_dates = []
+    for day in window_days:
+        key = day.strftime("%Y-%m-%d")
+        capacity = model.capacity_hours_on(day) if model else 0.0
+        load = daily_load.get(key, 0.0)
+        if capacity and load / capacity > 1:
+            overloaded_dates.append(f"{key} 负荷 {round(load, 1)}h / 可用 {round(capacity, 1)}h")
+
+    utilization_rate = (
+        round(allocated_hours / total_capacity_hours * 100, 1) if total_capacity_hours else None
+    )
+
+    return {
         "station_id": station_id,
-        "station_name": station.name if hasattr(station, "name") else station_id,
-        "period": f"{from_date} to {to_date}",
+        "station_code": station_code,
+        "station_name": station.station_name,
+        "period": f"{from_date} 至 {to_date}",
         "total_capacity_hours": total_capacity_hours,
         "allocated_hours": round(allocated_hours, 2),
-        "available_hours": round(available_hours, 2),
+        "available_hours": round(max(0.0, total_capacity_hours - allocated_hours), 2),
         "utilization_rate": utilization_rate,
-        "overloaded_dates": [] if utilization_rate <= 90 else [f"{from_date} 至 {to_date} 负荷率 {utilization_rate}%"],
-        "bottleneck_stations": [],  # 实际项目应扫描所有工站
+        "overloaded_dates": overloaded_dates,
+        "capacity_basis": f"班次日历({model.calendar_source if model else 'unconfigured'}) × OEE",
+        "daily_capacity_pieces": model.daily_pieces if model else None,
+        "data_status": "ready" if rows else "no_schedule_rows",
+        "note": (
+            "已分配工时=当前生效排程在该工位的班次内实际工时"
+            if rows
+            else "当前生效排程在该工位没有任务，负荷按 0 计；不再用假设比例编造占用"
+        ),
     }
-    
-    return load_analysis
 
 
 @router.post("/conflict/detect", description="产能冲突检测。检查指定计划在给定工站的产能分配是否存在过载情况，返回冲突详情和建议的调整方案。在生产计划下达前用于验证可行性。")

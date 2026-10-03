@@ -906,15 +906,28 @@ async def delivery_promise(
                 )
                 route_source = "routing.steps"
 
-    capacity_result = await db.execute(text("""
+    capacities = list((await db.execute(text("""
         SELECT station_id, available_hours_per_day, efficiency_rate
         FROM station_capacity
         WHERE factory_id = :factory_id AND is_active = TRUE
-    """), {"factory_id": req.factory_id})
-    capacities = list(capacity_result.mappings().all())
-    effective_hours_per_day = sum(
-        float(row["available_hours_per_day"] or 0) * float(row["efficiency_rate"] or 0)
-        for row in capacities
+    """), {"factory_id": req.factory_id})).mappings().all())
+
+    # 可用产能按工厂日历算：available_hours_per_day 这列实际是"一天可完成几件产品"，
+    # 以前被当小时累加，全厂日产能因此只有 145 小时（28 个工位 × 12 小时班次应该是 300+）。
+    from core.mes.capacity_math import load_station_models
+
+    capacity_station_ids = sorted({str(row["station_id"]) for row in capacities})
+    capacity_models = await load_station_models(
+        db, req.factory_id, capacity_station_ids, now, now + timedelta(days=120)
+    )
+    probe_day = now.date()
+    for offset in range(8):
+        candidate = (now + timedelta(days=offset)).date()
+        if any(model.capacity_hours_on(candidate) for model in capacity_models.values()):
+            probe_day = candidate
+            break
+    effective_hours_per_day = round(
+        sum(model.capacity_hours_on(probe_day) for model in capacity_models.values()), 2
     )
 
     current_end = (await db.execute(
@@ -951,7 +964,7 @@ async def delivery_promise(
 
     current_load_hours = 0.0
     load_result = await db.execute(
-        select(ApsScheduleTask.planned_start, ApsScheduleTask.planned_end)
+        select(ApsScheduleTask.station_id, ApsScheduleTask.planned_start, ApsScheduleTask.planned_end)
         .join(ApsSchedule, ApsSchedule.id == ApsScheduleTask.schedule_id)
         .where(
             ApsSchedule.factory_id == req.factory_id,
@@ -959,9 +972,20 @@ async def delivery_promise(
             ApsScheduleTask.status.in_(["planned", "confirmed", "released"]),
         )
     )
-    for start, end in load_result.all():
-        if start and end:
-            current_load_hours += (end - start).total_seconds() / 3600
+    # 现有负荷 = 生效方案里还没干完的实际工时（班次内时间，跨夜/跨周末不虚增），
+    # 以前这里是墙钟时长，30 天窗口能算出 2340 小时这种数。
+    for station_id, start, end in load_result.all():
+        if not start or not end:
+            continue
+        model = capacity_models.get(str(station_id))
+        from_now = max(start, now)
+        if end <= from_now:
+            continue
+        if model:
+            current_load_hours += model.work_seconds_between(from_now, end) / 3600
+        else:
+            current_load_hours += (end - from_now).total_seconds() / 3600
+    current_load_hours = round(current_load_hours, 2)
 
     new_order_hours = req.quantity * standard_hours
     new_order_days = new_order_hours / effective_hours_per_day
@@ -996,8 +1020,9 @@ async def delivery_promise(
         "assumptions": {
             "route_source": route_source,
             "standard_hours_per_unit": round(standard_hours, 4),
-            "capacity_source": "station_capacity",
-            "calendar_source": "aps_work_calendars/aps_holidays",
+            "capacity_source": f"aps_work_calendars/{probe_day} 班次 × OEE，共 {len(capacity_models)} 个工位",
+            "capacity_note": "station_capacity.available_hours_per_day 维护的是『一天可完成几件产品』，不参与小时产能计算",
+            "calendar_source": (sorted({model.calendar_source for model in capacity_models.values()}) or ["none"])[0],
             "material_readiness": "not_evaluated_for_new_order",
             "plan_basis": (
                 "当前已下达排程的占用" if current_end

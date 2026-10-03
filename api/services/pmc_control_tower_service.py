@@ -613,22 +613,53 @@ class PmcControlTowerService:
             SELECT product_id, assigned_station_id, planned_qty, planned_due, status
             FROM work_orders WHERE {wo_where}
         """, wo_params)
-        aps_where = "s.factory_id = :fid AND s.status IN ('draft', 'confirmed', 'released', 'active')"
-        aps_params: Dict[str, Any] = {"fid": factory_id}
+        # 负荷只认当前生效那一版：跨全部 draft 累加会把同一工单重复计几十次。
+        live_rows = await self._rows("""
+            SELECT id FROM aps_schedules WHERE factory_id = :fid
+            ORDER BY is_current DESC, version_number DESC, created_at DESC LIMIT 1
+        """, {"fid": factory_id}) if self._has("aps_schedules") else []
+        live_schedule_id = str(live_rows[0].get("id")) if live_rows else None
+        now_dt = datetime.utcnow()
+        aps_where = "t.schedule_id = :sid AND t.planned_end >= :now"
+        aps_params: Dict[str, Any] = {"sid": live_schedule_id, "now": now_dt}
         if work_order_code:
             aps_where += " AND wo.work_order_code = :work_order_code"
             aps_params["work_order_code"] = work_order_code
         aps_rows = await self._rows(f"""
             SELECT t.station_id, t.planned_start, t.planned_end, t.work_order_id
             FROM aps_schedule_tasks t
-            JOIN aps_schedules s ON s.id = t.schedule_id
             JOIN work_orders wo ON wo.id = t.work_order_id
             WHERE {aps_where}
-        """, aps_params) if self._has("aps_schedule_tasks") and self._has("aps_schedules") else []
+        """, aps_params) if live_schedule_id and self._has("aps_schedule_tasks") else []
+
+        # 分子用"落在班次里的实际工时"，不是 planned_end - planned_start 的墙钟跨度：
+        # 跨班次连续排产之后墙钟含夜间与周末，是实际工时的 3~5 倍。
+        from core.mes.capacity_math import load_station_models
+
+        station_codes = sorted({str(row.get("station_code")) for row in stations if row.get("station_code")})
+        horizon_end = max((_date(row.get("planned_due")) for row in wo_rows if _date(row.get("planned_due"))),
+                          default=date.today() + timedelta(days=7))
+        workdays = max(1, (horizon_end - date.today()).days + 1)
+        try:
+            capacity_models = await load_station_models(
+                self.db, factory_id, station_codes, now_dt, now_dt + timedelta(days=workdays)
+            )
+        except SQLAlchemyError:
+            capacity_models = {}
+        window_days = [(now_dt + timedelta(offset)).date() for offset in range(workdays)]
+
         aps_hours = defaultdict(float)
         for row in aps_rows:
-            if row.get("planned_start") and row.get("planned_end"):
-                aps_hours[str(row.get("station_id"))] += max(0, (row["planned_end"] - row["planned_start"]).total_seconds() / 3600)
+            start, end = row.get("planned_start"), row.get("planned_end")
+            if not start or not end:
+                continue
+            model = capacity_models.get(str(row.get("station_id")))
+            from_now = max(start, now_dt)
+            if end <= from_now:
+                continue
+            hours = (model.work_seconds_between(from_now, end) / 3600 if model
+                     else (end - from_now).total_seconds() / 3600)
+            aps_hours[str(row.get("station_id"))] += hours
         required = defaultdict(float)
         for wo in wo_rows:
             steps = route_map.get(str(wo.get("product_id")), [])
@@ -638,26 +669,34 @@ class PmcControlTowerService:
                 if ref and hours is not None:
                     required[ref] += _number(wo.get("planned_qty")) * hours
         station_items = []
-        horizon_end = max((_date(row.get("planned_due")) for row in wo_rows if _date(row.get("planned_due"))), default=date.today() + timedelta(days=7))
-        workdays = max(1, (horizon_end - date.today()).days + 1)
         for station in stations:
             identifiers = {str(station.get("id")), str(station.get("station_code"))}
             required_hours = sum(required[key] for key in identifiers)
             loaded_hours = aps_hours.get(str(station.get("id")), 0) + aps_hours.get(str(station.get("station_code")), 0)
             configured = capacity_map.get(str(station.get("station_code"))) or capacity_map.get(str(station.get("id"))) or {}
+            # 这列名字写着 hours_per_day，用户确认实际维护的是"一天可完成几件产品"，
+            # 因此只作为产量口径展示，不再当小时参与利用率分母。
             configured_hours_per_day = _number(configured.get("available_hours_per_day"))
-            available_hours = (configured_hours_per_day or _number(station.get("capacity_per_hour")) * 8) * workdays
+            model = capacity_models.get(str(station.get("station_code")))
+            if model:
+                available_hours = sum(model.capacity_hours_on(day) for day in window_days)
+                capacity_basis = f"班次日历({model.calendar_source})×OEE"
+            else:
+                available_hours = _number(station.get("capacity_per_hour")) * 8 * workdays
+                capacity_basis = "capacity_per_hour×8（没有该工位班次配置，兜底口径）"
             load_hours = loaded_hours if aps_rows else required_hours
             utilization = load_hours / available_hours * 100 if available_hours else None
             station_items.append({
                 "station_code": station.get("station_code"), "station_name": station.get("station_name"),
                 "capacity_per_hour": _number(station.get("capacity_per_hour")), "horizon_workdays": workdays,
                 "configured_hours_per_day": round(configured_hours_per_day, 2) if configured_hours_per_day else None,
+                "configured_daily_pieces": round(configured_hours_per_day, 2) if configured_hours_per_day else None,
+                "capacity_basis": capacity_basis,
                 "capacity_config_source": configured.get("source") or "station_master_fallback",
                 "available_hours": round(available_hours, 2), "required_hours": round(required_hours, 2),
                 "aps_loaded_hours": round(loaded_hours, 2), "load_hours_used": round(load_hours, 2),
                 "utilization_pct": round(utilization, 1) if utilization is not None else None,
-                "status": "overloaded" if utilization is not None and utilization > 100 else "warning" if utilization is not None and utilization >= 90 else "available",
+                "status": "unknown" if utilization is None else "overloaded" if utilization > 100 else "warning" if utilization >= 90 else "available",
             })
         bottlenecks = sorted(station_items, key=lambda item: item.get("utilization_pct") or 0, reverse=True)[:3]
         return {
