@@ -65,6 +65,7 @@ uploads/
 /backups/
 /enghub.runtime.env
 .last_deployed_commit
+.last_deployed_tree
 /tmp/
 
 # Codex remote working directories (transient agent scratch space)
