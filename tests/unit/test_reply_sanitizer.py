@@ -4,7 +4,8 @@ import pytest
 
 pytestmark = [pytest.mark.unit]
 
-from api.routes.chat_routes import _confirmation_grounding
+from core.kernel.confirmation import confirmation_grounding
+from core.kernel.context_window import compact_messages
 from core.kernel.reply_sanitizer import (
     looks_like_tool_call_leak,
     strip_tool_call_markup,
@@ -28,7 +29,7 @@ def test_tool_use_unclosed_stripped():
 
 def test_tool_call_still_stripped():
     raw = '答复 <tool_call>{"a": 1}</tool_call> 尾巴'
-    assert strip_tool_call_markup(raw) == "答复  尾巴".strip() or "答复" in strip_tool_call_markup(raw)
+    assert "答复" in strip_tool_call_markup(raw)
     assert looks_like_tool_call_leak(raw) is True
 
 
@@ -43,7 +44,7 @@ def test_bare_confirm_after_question_grounded():
         ("assistant", "只有 1 条路线。产品 ID 是否就是 cf72？"),
         ("user", "确认"),
     )
-    note = _confirmation_grounding(h)
+    note = confirmation_grounding(h)
     assert "严禁重复提问" in note
 
 
@@ -52,9 +53,25 @@ def test_confirm_with_instruction_kept():
         ("assistant", "产品 ID 是否就是 cf72？"),
         ("user", "是 确认 你自己安排"),
     )
-    note = _confirmation_grounding(h)
+    note = confirmation_grounding(h)
     assert "严禁重复提问" in note
     assert "你自己安排" in note
+
+
+def test_paraphrase_confirm_grounded():
+    h = _hist(
+        ("assistant", "用这条路线排 500 台可以吗？"),
+        ("user", "那就这样"),
+    )
+    assert "严禁重复提问" in confirmation_grounding(h)
+
+
+def test_question_shaped_confirm_not_grounded():
+    h = _hist(
+        ("assistant", "路线是哪条？"),
+        ("user", "是不是要先建BOM?"),
+    )
+    assert confirmation_grounding(h) == ""
 
 
 def test_new_request_starting_with_can_not_grounded():
@@ -62,11 +79,11 @@ def test_new_request_starting_with_can_not_grounded():
         ("assistant", "还有别的问题吗？"),
         ("user", "可以帮我查一下设备状态"),
     )
-    assert _confirmation_grounding(h) == ""
+    assert confirmation_grounding(h) == ""
 
 
 def test_no_assistant_before_not_grounded():
-    assert _confirmation_grounding(_hist(("user", "确认"))) == ""
+    assert confirmation_grounding(_hist(("user", "确认"))) == ""
 
 
 def test_statement_answer_not_grounded():
@@ -74,4 +91,16 @@ def test_statement_answer_not_grounded():
         ("assistant", "已生成排产建议。"),
         ("user", "确认收到"),
     )
-    assert _confirmation_grounding(h) == ""
+    assert confirmation_grounding(h) == ""
+
+
+def test_grounding_survives_compaction():
+    filler = []
+    for i in range(20):
+        filler.append(("user", f"第{i}轮用户问题内容填充 " + "x" * 200))
+        filler.append(("assistant", f"第{i}轮回答内容填充 " + "y" * 200))
+    h = _hist(*filler)
+    h.append({"role": "assistant", "content": "产品 ID 是否就是 cf72？"})
+    h.append({"role": "user", "content": "确认"})
+    compacted = compact_messages(h, max_messages=24, max_chars=24000).messages
+    assert "严禁重复提问" in confirmation_grounding(compacted)
