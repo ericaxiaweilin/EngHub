@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from api.services.wms_architecture.movements import OUTBOUND_TYPES
 
 from api.services.wms_architecture.executors.base import BaseWmsExecutor
 
@@ -149,7 +150,7 @@ class AbcAnalysisExecutor(BaseWmsExecutor):
             FROM inventory i
             LEFT JOIN inventory_transactions it ON it.material_id = i.material_id 
                 AND it.factory_id = i.factory_id
-                AND it.transaction_type = 'outbound'
+                AND it.transaction_type = ANY(:out_types)
                 AND it.created_at >= :start_date
                 AND it.created_at < :end_date
             WHERE i.factory_id = :fid AND i.available_qty > 0
@@ -160,6 +161,7 @@ class AbcAnalysisExecutor(BaseWmsExecutor):
             "start_date": start_date,
             "end_date": end_date,
             "days": period_days,
+            "out_types": list(OUTBOUND_TYPES),
         })
         
         items = []
@@ -265,8 +267,9 @@ class AbcAnalysisExecutor(BaseWmsExecutor):
                 COALESCE(SUM(i.available_qty), 0) as used_capacity,
                 ROUND(COALESCE(SUM(i.available_qty) * 100.0 / NULLIF(SUM(l.capacity), 0), 0), 2) as utilization_rate
             FROM locations l
+            JOIN warehouses w ON w.id = l.warehouse_id
             LEFT JOIN inventory i ON i.location_id = l.id AND i.status = 'available'
-            WHERE l.factory_id = :fid AND l.status = 'active'
+            WHERE w.factory_id = :fid AND l.status = 'active'
             GROUP BY l.zone
             ORDER BY l.zone
         """), {"fid": factory_id})

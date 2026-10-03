@@ -91,7 +91,7 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 "material_code": item["material_code"],
                 "material_name": item.get("material_name", ""),
                 "current_qty": item["current_qty"],
-                "max_stock": item["max_stock"],
+                "threshold": item["threshold"],
                 "excess_qty": item["excess_qty"],
                 "message": item.get("message", ""),
             })
@@ -116,7 +116,7 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 "material_code": item["material_code"],
                 "batch_code": item["batch_code"],
                 "current_qty": item["current_qty"],
-                "expire_date": item["expire_date"],
+                "expiry_date": item["expiry_date"],
                 "days_until_expiry": item.get("days_until_expiry"),
                 "message": item.get("message", ""),
             })
@@ -200,12 +200,15 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 i.material_code,
                 i.material_name,
                 i.available_qty,
-                i.max_stock,
+                i.safety_stock,
+                i.reorder_point,
+                i.reorder_qty,
                 i.unit
             FROM inventory i
             WHERE i.factory_id = :fid
-              AND i.max_stock IS NOT NULL
-              AND i.available_qty > i.max_stock
+              AND COALESCE(i.reorder_point, i.safety_stock, 0) > 0
+              AND i.available_qty > COALESCE(i.reorder_point, i.safety_stock, 0)
+                                  + COALESCE(i.reorder_qty, 0)
         """), {"fid": factory_id})
         
         items = []
@@ -215,16 +218,22 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 "material_code": r["material_code"],
                 "material_name": r.get("material_name", ""),
                 "current_qty": r["available_qty"],
-                "max_stock": r["max_stock"],
-                "excess_qty": r["available_qty"] - r["max_stock"],
+                "threshold": round(float(r.get("reorder_point") or r.get("safety_stock") or 0)
+                                   + float(r.get("reorder_qty") or 0), 3),
+                "reorder_point": r.get("reorder_point"),
+                "reorder_qty": r.get("reorder_qty"),
+                "excess_qty": round(float(r["available_qty"]) - (
+                    float(r.get("reorder_point") or r.get("safety_stock") or 0)
+                    + float(r.get("reorder_qty") or 0)), 3),
                 "unit": r.get("unit", "pcs"),
-                "message": f"库存超量，当前{r['available_qty']}{r.get('unit', 'pcs')}，最大库存{r['max_stock']}{r.get('unit', 'pcs')}，超量{r['available_qty'] - r['max_stock']}{r.get('unit', 'pcs')}",
+                "message": f"可用量 {r['available_qty']} 已超过再订货点+一次补货量，暂不需要再补",
             })
         
         return {
             "success": True,
             "items": items,
             "total": len(items),
+            "OVERSTOCK_DEFINITION": "过量 = available_qty > COALESCE(reorder_point, safety_stock) + reorder_qty；表内没有 max_stock 列，不虚构该阈值",
         }
     
     async def _get_stagnant(
@@ -291,15 +300,15 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 i.material_name,
                 i.batch_code,
                 i.available_qty,
-                i.expire_date,
-                EXTRACT(DAY FROM i.expire_date - NOW()) as days_until_expiry
+                i.expiry_date,
+                EXTRACT(DAY FROM i.expiry_date - NOW()) as days_until_expiry
             FROM inventory i
             WHERE i.factory_id = :fid
-              AND i.expire_date IS NOT NULL
-              AND i.expire_date > NOW()
-              AND i.expire_date <= NOW() + INTERVAL '30 days'
+              AND i.expiry_date IS NOT NULL
+              AND i.expiry_date > NOW()
+              AND i.expiry_date <= NOW() + INTERVAL '30 days'
               AND i.available_qty > 0
-            ORDER BY i.expire_date ASC
+            ORDER BY i.expiry_date ASC
         """), {"fid": factory_id})
         
         items = []
@@ -310,7 +319,7 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 "material_name": r.get("material_name", ""),
                 "batch_code": r["batch_code"],
                 "current_qty": r["available_qty"],
-                "expire_date": r["expire_date"],
+                "expiry_date": r["expiry_date"],
                 "days_until_expiry": int(r["days_until_expiry"]),
                 "status": "expiring_soon",
                 "message": f"即将过期，{int(r['days_until_expiry'])}天后到期",
@@ -323,14 +332,14 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 i.material_name,
                 i.batch_code,
                 i.available_qty,
-                i.expire_date,
-                EXTRACT(DAY FROM NOW() - i.expire_date) as days_expired
+                i.expiry_date,
+                EXTRACT(DAY FROM NOW() - i.expiry_date) as days_expired
             FROM inventory i
             WHERE i.factory_id = :fid
-              AND i.expire_date IS NOT NULL
-              AND i.expire_date < NOW()
+              AND i.expiry_date IS NOT NULL
+              AND i.expiry_date < NOW()
               AND i.available_qty > 0
-            ORDER BY i.expire_date ASC
+            ORDER BY i.expiry_date ASC
         """), {"fid": factory_id})
         
         for r in result.mappings().all():
@@ -340,7 +349,7 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 "material_name": r.get("material_name", ""),
                 "batch_code": r["batch_code"],
                 "current_qty": r["available_qty"],
-                "expire_date": r["expire_date"],
+                "expiry_date": r["expiry_date"],
                 "days_expired": int(r["days_expired"]),
                 "status": "expired",
                 "message": f"已过期{int(r['days_expired'])}天，建议立即报废",

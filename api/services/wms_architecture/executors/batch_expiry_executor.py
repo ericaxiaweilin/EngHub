@@ -68,15 +68,15 @@ class BatchExpiryExecutor(BaseWmsExecutor):
         result = await db.execute(text("""
             SELECT i.material_code, i.material_name, i.batch_code, 
                    i.available_qty, i.unit,
-                   i.expire_date,
-                   EXTRACT(DAY FROM i.expire_date - NOW()) as days_until_expiry
+                   i.expiry_date,
+                   EXTRACT(DAY FROM i.expiry_date - NOW()) as days_until_expiry
             FROM inventory i
             WHERE i.factory_id = :fid
-              AND i.expire_date IS NOT NULL
-              AND i.expire_date > NOW()
-              AND i.expire_date <= :threshold
+              AND i.expiry_date IS NOT NULL
+              AND i.expiry_date > NOW()
+              AND i.expiry_date <= :threshold
               AND i.available_qty > 0
-            ORDER BY i.expire_date ASC
+            ORDER BY i.expiry_date ASC
         """), {"fid": factory_id, "threshold": threshold_date})
         
         expiring_batches = [dict(r) for r in result.mappings().all()]
@@ -85,12 +85,12 @@ class BatchExpiryExecutor(BaseWmsExecutor):
         result = await db.execute(text("""
             SELECT i.material_code, i.material_name, i.batch_code,
                    i.available_qty, i.unit,
-                   i.expire_date,
-                   EXTRACT(DAY FROM NOW() - i.expire_date) as days_expired
+                   i.expiry_date,
+                   EXTRACT(DAY FROM NOW() - i.expiry_date) as days_expired
             FROM inventory i
             WHERE i.factory_id = :fid
-              AND i.expire_date IS NOT NULL
-              AND i.expire_date < NOW()
+              AND i.expiry_date IS NOT NULL
+              AND i.expiry_date < NOW()
               AND i.available_qty > 0
         """), {"fid": factory_id})
         
@@ -129,7 +129,7 @@ class BatchExpiryExecutor(BaseWmsExecutor):
                 "material_code": batch["material_code"],
                 "batch_code": batch["batch_code"],
                 "qty": batch["available_qty"],
-                "expire_date": batch["expire_date"],
+                "expiry_date": batch["expiry_date"],
                 "days_until_expiry": int(batch["days_until_expiry"]),
                 "suggestion": "建议优先使用" if batch["days_until_expiry"] < 14 else "关注",
             })
@@ -142,7 +142,7 @@ class BatchExpiryExecutor(BaseWmsExecutor):
                 "material_code": batch["material_code"],
                 "batch_code": batch["batch_code"],
                 "qty": batch["available_qty"],
-                "expire_date": batch["expire_date"],
+                "expiry_date": batch["expiry_date"],
                 "days_expired": int(batch["days_expired"]),
                 "suggestion": "建议立即报废处理",
             })

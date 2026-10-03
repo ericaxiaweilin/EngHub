@@ -55,7 +55,7 @@ class DeadStockExecutor(BaseWmsExecutor):
         """Check for dead stock items."""
         result = await db.execute(text("""
             SELECT i.material_code, i.material_name, i.available_qty, i.unit,
-                   i.abc_class,
+                   i.abc_class, i.unit_cost,
                    COALESCE(last_txn.last_activity, i.created_at) as last_activity,
                    EXTRACT(DAY FROM NOW() - COALESCE(last_txn.last_activity, i.created_at)) as idle_days
             FROM inventory i
@@ -80,8 +80,11 @@ class DeadStockExecutor(BaseWmsExecutor):
                 "items": [],
             }
         
-        # Calculate estimated value (simplified: quantity * 10)
-        total_value = sum(d["available_qty"] * 10 for d in dead_stock)
+        # 估值只用真实单价；无单价的物料不计金额，也不用系数编造。
+        costed = [d for d in dead_stock if (d.get("unit_cost") or 0) > 0]
+        total_value = round(sum(float(d["available_qty"]) * float(d["unit_cost"]) for d in costed), 2)
+        uncosted = [d for d in dead_stock if (d.get("unit_cost") or 0) <= 0]
+        uncosted_qty = round(sum(float(d["available_qty"]) for d in uncosted), 3)
         
         return {
             "success": True,
@@ -89,6 +92,12 @@ class DeadStockExecutor(BaseWmsExecutor):
             "threshold_days": days_threshold,
             "total_items": len(dead_stock),
             "estimated_value": total_value,
+            "valuation": {
+                "costed_items": len(costed),
+                "uncosted_items": len(uncosted),
+                "uncosted_qty": uncosted_qty,
+                "note": "仅 unit_cost>0 的物料计入金额，其余只报数量",
+            },
             "items": [{
                 "material_code": d["material_code"],
                 "material_name": d.get("material_name", ""),
@@ -97,7 +106,11 @@ class DeadStockExecutor(BaseWmsExecutor):
                 "abc_class": d.get("abc_class", "C"),
                 "suggestion": "建议处理" if d["idle_days"] > 180 else "关注",
             } for d in dead_stock[:30]],
-            "recommendation": f"{len(dead_stock)}种物料超过{days_threshold}天未动，占用约{total_value}元",
+            "recommendation": (
+                f"{len(dead_stock)}种物料超过{days_threshold}天未动；"
+                f"其中 {len(costed)} 种有单价、金额约 {total_value} 元，"
+                f"其余 {len(uncosted)} 种无单价（数量 {uncosted_qty}）不计入金额"
+            ),
         }
     
     async def _get_alerts(

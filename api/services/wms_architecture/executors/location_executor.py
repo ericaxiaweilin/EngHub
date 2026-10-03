@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from api.services.wms_architecture.movements import OUTBOUND_TYPES
 
 from api.services.wms_architecture.executors.base import BaseWmsExecutor
 
@@ -56,11 +57,11 @@ class LocationExecutor(BaseWmsExecutor):
                    i.location_code, i.abc_class, i.material_code
             FROM inventory_transactions it
             JOIN inventory i ON it.material_id = i.material_id AND i.factory_id = :fid
-            WHERE it.factory_id = :fid AND it.transaction_type = 'outbound'
+            WHERE it.factory_id = :fid AND it.transaction_type = ANY(:out_types)
               AND it.created_at > NOW() - INTERVAL '30 days'
             GROUP BY it.material_id, i.location_code, i.abc_class, i.material_code
             ORDER BY outbound_count DESC
-        """), {"fid": factory_id})
+        """), {"fid": factory_id, "out_types": list(OUTBOUND_TYPES)})
         freq_data = [dict(r) for r in result.mappings().all()]
         
         if not freq_data:
