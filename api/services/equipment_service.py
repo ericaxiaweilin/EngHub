@@ -75,7 +75,7 @@ class EquipmentTpmService:
         # 恢复设备状态
         eq = await self.db.get(Equipment, record.equipment_id)
         if eq and eq.status == "broken":
-            eq.status = "available"
+            eq.status = "idle"
             eq.updated_at = datetime.utcnow()
 
         await self.db.commit()
@@ -104,28 +104,10 @@ class EquipmentTpmService:
         if equipment_id:
             machine_stmt = machine_stmt.where(Equipment.id == equipment_id)
         machines = list((await self.db.execute(machine_stmt)).scalars().all())
-        # station_id 可能是 UUID 也可能是工位编码：先经 stations 折成 station_code，
-        # 再去取日历与按件产能。折不出的键保留原值（模型缺配就如实报缺配，不编数）。
-        from sqlalchemy import text as _sa_text
-        try:
-            _st_rows = list((await self.db.execute(_sa_text(
-                "SELECT id, station_code FROM stations WHERE factory_id = :fid"
-            ), {"fid": factory_id})).mappings().all())
-        except Exception:
-            _st_rows = []
-        _station_alias = {}
-        for _r in _st_rows:
-            if _r.get("station_code"):
-                _station_alias[str(_r.get("id"))] = str(_r.get("station_code"))
-                _station_alias[str(_r.get("station_code"))] = str(_r.get("station_code"))
-        _canon = [_station_alias.get(
-            str(m.station_id or m.equipment_code),
-            str(m.station_id or m.equipment_code),
-        ) for m in machines if (m.station_id or m.equipment_code)]
-        machines_per_station: Dict[str, int] = {}
-        for _c in _canon:
-            machines_per_station[_c] = machines_per_station.get(_c, 0) + 1
-        station_keys = sorted(machines_per_station)
+        station_keys = sorted({
+            str(m.station_id or m.equipment_code) for m in machines
+            if (m.station_id or m.equipment_code)
+        })
         models = await load_station_models(self.db, factory_id, station_keys, start, now)
 
         window_days = [(start + timedelta(days=offset)).date() for offset in range(max(1, days))]
@@ -140,26 +122,16 @@ class EquipmentTpmService:
         expected_pieces = 0.0
         pieces_missing_stations: List[str] = []
         working_dates = set()
-        prorated_single_machine = False
         for key in station_keys:
             model = models.get(key)
             if not model:
-                pieces_missing_stations.append(key + " (无日历/产能模型)")
                 continue
-            machine_count = machines_per_station.get(key, 1)
             day_minutes = {day: _slot_minutes(model, day) for day in window_days}
-            # 计划分钟按台累加（一工位 N 台机就是 N 份班次分钟）；
-            # 应有产出是工位总量（station_capacity 按工位配），全厂口径不按台乘。
-            planned_minutes += sum(day_minutes.values()) * machine_count
+            planned_minutes += sum(day_minutes.values())
             working_here = [day for day, minutes in day_minutes.items() if minutes > 0]
             working_dates.update(working_here)
             if model.daily_pieces:
-                if equipment_id and machine_count > 1:
-                    # 单台口径：工位总量按台均摊，这是均摊假设，调用方必须在界面声明。
-                    expected_pieces += float(model.daily_pieces) * len(working_here) / machine_count
-                    prorated_single_machine = True
-                else:
-                    expected_pieces += float(model.daily_pieces) * len(working_here)
+                expected_pieces += float(model.daily_pieces) * len(working_here)
             else:
                 pieces_missing_stations.append(key)
 
@@ -251,9 +223,7 @@ class EquipmentTpmService:
             "expected_pieces": round(expected_pieces, 1),
             "oee_basis": {
                 "planned_time": "工厂日历班次分钟 × 台份（休息日不计入，不再按 7×12h 硬算）",
-                "performance": ("实际件数 ÷ Σ(工位配置日可完成件数 × 排班天数 ÷ 同工位台数，均摊假设)"
-                                if prorated_single_machine
-                                else "实际件数 ÷ Σ(工位配置日可完成件数 × 排班天数)"), 
+                "performance": "实际件数 ÷ Σ(工位配置日可完成件数 × 排班天数)",
                 "calendar_source": sorted({m.calendar_source for m in models.values()}) if models else [],
                 "machines_in_scope": len(machines),
                 "working_days_in_window": len(working_dates),
@@ -328,7 +298,7 @@ class EquipmentTpmService:
                 # 恢复设备状态
                 eq = await self.db.get(Equipment, order.equipment_id)
                 if eq:
-                    eq.status = "available"
+                    eq.status = "idle"
                     eq.last_maintenance_date = datetime.utcnow()
                     eq.updated_at = datetime.utcnow()
 

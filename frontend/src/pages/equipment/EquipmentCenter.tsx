@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Descriptions } from 'antd';
+import { Card, Table, Button, Tag, Space, Input, Select, Modal, Form, message, Typography, Statistic, Row, Col, Progress } from 'antd';
 import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
@@ -38,6 +38,7 @@ const EquipmentCenter: React.FC = () => {
   const [selectedEquipment, setSelectedEquipment] = useState<Equipment | null>(null);
   
   // Form
+  const [statusCounts, setStatusCounts] = useState<Record<string, number>>({});
   const [createForm] = Form.useForm();
   const [submitLoading, setSubmitLoading] = useState(false);
 
@@ -64,6 +65,7 @@ const EquipmentCenter: React.FC = () => {
       const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/`, { params });
       setEquipment(response.data.equipment || []);
       setTotal(response.data.total || 0);
+      setStatusCounts(response.data.status_counts || {});
     } catch (error) {
       console.error('Failed to fetch equipment:', error);
       message.error('Failed to load equipment');
@@ -127,7 +129,7 @@ const EquipmentCenter: React.FC = () => {
     },
     {
       title: 'Location',
-      dataIndex: 'location',
+      dataIndex: 'station_id',
       key: 'location',
       width: 120,
     },
@@ -137,11 +139,14 @@ const EquipmentCenter: React.FC = () => {
       key: 'status',
       width: 100,
       render: (status: string) => {
+        // 状态字典与 equipment 表实际取值一致（running/maintenance/idle/broken）；
+        // 原来这里按 OPERATIONAL/DOWN 匹配，页面 KPI 与标签全部落到 default，看着像"0 台在运行"
         const statusMap: Record<string, { label: string; color: string }> = {
-          'OPERATIONAL': { label: 'Operational', color: 'green' },
-          'MAINTENANCE': { label: 'Maintenance', color: 'orange' },
-          'DOWN': { label: 'Down', color: 'red' },
-          'INSTALLATION': { label: 'Installation', color: 'blue' }
+          running: { label: '运行中', color: 'green' },
+          available: { label: '可开机', color: 'cyan' },
+          idle: { label: '待机', color: 'blue' },
+          maintenance: { label: '保养中', color: 'orange' },
+          broken: { label: '故障', color: 'red' },
         };
         const config = statusMap[status] || { label: status, color: 'default' };
         return <Tag color={config.color}>{config.label}</Tag>;
@@ -152,11 +157,13 @@ const EquipmentCenter: React.FC = () => {
       dataIndex: 'oee',
       key: 'oee',
       width: 100,
-      render: (oee: number) => (
+      render: (oee: number | null) => (oee == null ? (
+        <span style={{ color: '#bfbfbf' }}>-</span>
+      ) : (
         <span style={{ color: oee >= 85 ? '#52c41a' : oee >= 70 ? '#faad14' : '#ff4d4f', fontWeight: 'bold' }}>
           {oee}%
         </span>
-      ),
+      )),
     },
     {
       title: 'Next Maintenance',
@@ -207,7 +214,9 @@ const EquipmentCenter: React.FC = () => {
           <Card>
             <Statistic
               title="Operational"
-              value={equipment.filter(e => e.status === 'OPERATIONAL').length}
+              value={Object.keys(statusCounts).length
+                ? ['running', 'available', 'idle'].reduce((sum, key) => sum + (statusCounts[key] || 0), 0)
+                : equipment.filter(e => ['running', 'available', 'idle'].includes(e.status)).length}
               prefix={<CheckCircleOutlined />}
               valueStyle={{ color: '#52c41a' }}
             />
@@ -217,7 +226,7 @@ const EquipmentCenter: React.FC = () => {
           <Card>
             <Statistic
               title="Under Maintenance"
-              value={equipment.filter(e => e.status === 'MAINTENANCE').length}
+              value={statusCounts.maintenance ?? equipment.filter(e => e.status === 'maintenance').length}
               prefix={<WarningOutlined />}
               valueStyle={{ color: '#faad14' }}
             />
@@ -227,7 +236,7 @@ const EquipmentCenter: React.FC = () => {
           <Card>
             <Statistic
               title="Down"
-              value={equipment.filter(e => e.status === 'DOWN').length}
+              value={statusCounts.broken ?? equipment.filter(e => e.status === 'broken').length}
               prefix={<CloseCircleOutlined />}
               valueStyle={{ color: '#ff4d4f' }}
             />
@@ -251,11 +260,13 @@ const EquipmentCenter: React.FC = () => {
           style={{ width: 150 }}
           allowClear
         >
-          <Select.Option value="CNC">CNC Machine</Select.Option>
-          <Select.Option value="INJECTION">Injection Molder</Select.Option>
-          <Select.Option value="CONVEYOR">Conveyor</Select.Option>
-          <Select.Option value="ROBOT">Robot</Select.Option>
-          <Select.Option value="PACKAGING">Packaging</Select.Option>
+          <Select.Option value="machining">机加工</Select.Option>
+          <Select.Option value="welding">焊接</Select.Option>
+          <Select.Option value="molding">注塑</Select.Option>
+          <Select.Option value="assembly">装配</Select.Option>
+          <Select.Option value="coating">涂装</Select.Option>
+          <Select.Option value="testing">检测</Select.Option>
+          <Select.Option value="utility">公用动力</Select.Option>
         </Select>
         <Select
           placeholder="Status"
@@ -264,10 +275,10 @@ const EquipmentCenter: React.FC = () => {
           style={{ width: 150 }}
           allowClear
         >
-          <Select.Option value="OPERATIONAL">Operational</Select.Option>
-          <Select.Option value="MAINTENANCE">Maintenance</Select.Option>
-          <Select.Option value="DOWN">Down</Select.Option>
-          <Select.Option value="INSTALLATION">Installation</Select.Option>
+          <Select.Option value="running">运行中</Select.Option>
+          <Select.Option value="idle">待机</Select.Option>
+          <Select.Option value="maintenance">保养中</Select.Option>
+          <Select.Option value="broken">故障</Select.Option>
         </Select>
         <Button type="primary" onClick={handleSearch}>
           Search
@@ -373,9 +384,9 @@ const EquipmentCenter: React.FC = () => {
               <Descriptions.Item label="Location">{selectedEquipment.location}</Descriptions.Item>
               <Descriptions.Item label="Status">
                 <Tag color={
-                  selectedEquipment.status === 'OPERATIONAL' ? 'green' :
-                  selectedEquipment.status === 'MAINTENANCE' ? 'orange' :
-                  selectedEquipment.status === 'DOWN' ? 'red' : 'blue'
+                  ['running', 'available'].includes(selectedEquipment.status) ? 'green' :
+                  selectedEquipment.status === 'maintenance' ? 'orange' :
+                  selectedEquipment.status === 'broken' ? 'red' : 'blue'
                 }>
                   {selectedEquipment.status}
                 </Tag>

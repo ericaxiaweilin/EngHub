@@ -102,6 +102,15 @@ async def list_equipment(
         .offset(offset).limit(limit)
     )).scalars().all()
 
+    # 状态分布按整个工厂算，不按当前页算 —— 否则"运行中"会在翻页时变数字
+    status_counts = {
+        str(st or "unknown"): int(n)
+        for st, n in (await db.execute(
+            select(Equipment.status, func.count()).select_from(Equipment)
+            .where(Equipment.factory_id == factory_id).group_by(Equipment.status)
+        )).all()
+    }
+
     return {
         "total": int(total),
         "limit": limit,
@@ -117,9 +126,14 @@ async def list_equipment(
                 "equipment_type": eq.equipment_type,
                 "last_maintenance_date": eq.last_maintenance_date.isoformat() if eq.last_maintenance_date else None,
                 "next_maintenance_date": eq.next_maintenance_date.isoformat() if eq.next_maintenance_date else None,
+                "next_maintenance": eq.next_maintenance_date.isoformat() if eq.next_maintenance_date else None,
+                "model": eq.manufacturer_model,
+                # 单台 OEE 需要按报工归属逐台折算，列表里不顺手编一个数，页面显示 -
+                "oee": None,
             }
             for eq in rows
         ],
+        "status_counts": status_counts,
     }
 
 
@@ -909,7 +923,9 @@ async def create_equipment(
         equipment_type=(payload.equipment_type or "").lower() or None,
         manufacturer_model=payload.model,
         serial_number=payload.serial_number,
-        status="available",
+        # 台账里实际用到的状态只有 running/maintenance/idle/broken，
+        # 新设备未开机就是 idle，不要造一个字典外的 "available"
+        status="idle",
         responsible_engineer_id=payload.responsible_engineer_id,
     )
     db.add(eq)
