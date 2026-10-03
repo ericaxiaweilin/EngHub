@@ -16,7 +16,7 @@ set -euo pipefail
 
 BACKUP_DIR=/home/eric/enghub_backups/db
 KEEP_DAYS="${KEEP_DAYS:-14}"
-MIN_MB="${MIN_MB:-50}"
+MIN_MB="${MIN_MB:-200}"  # 正常 dump 约 350MB；50 太松，截断到 100MB 也能蒙混过关
 CONTAINER=docker-postgres-1
 LOG=/home/eric/enghub_backups/backup.log
 STAMP="$(date +%Y%m%d_%H%M%S)"

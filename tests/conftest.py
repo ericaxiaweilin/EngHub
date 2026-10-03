@@ -172,6 +172,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: 标记慢速测试（默认跳过）"
     )
+    config.addinivalue_line(
+        "markers", "unit: 标记单元测试（pytest.ini -m unit 选中）"
+    )
 
 
 def pytest_collection_modifyitems(config, items):

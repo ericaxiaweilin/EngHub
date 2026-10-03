@@ -153,6 +153,7 @@ class HybridScheduler:
         self.schedule: List[ScheduleTask] = []
         self.resource_timeline: Dict[str, List[ScheduleTask]] = {}
         self.pinned_tasks: Dict[tuple, ScheduleTask] = {}  # (order_id, op_seq) -> PMC 钉住的任务
+        self.pinned_dropped: List[Dict] = []  # 本轮因工位不可用而放弃的钉住（必须报给计划员，不许静默丢）
         # 被人工/故障停用的工位不进 resources，但排不进时要说清是"被停用"而不是"没注册"
         self.unavailable_notes: Dict[str, str] = {}
         self.process_capability_cache: Dict[str, Dict] = {}  # 工艺能力缓存
@@ -216,6 +217,7 @@ class HybridScheduler:
         锁定是计划员的否决权：它们不参与排序、不移动，其余工序绕开它们排。
         """
         self.pinned_tasks = {}
+        self.pinned_dropped = []
         loaded = 0
         for row in pinned_tasks or []:
             station_id = row.get("station_id")
@@ -224,7 +226,12 @@ class HybridScheduler:
             if not station_id or not start_time or not end_time:
                 continue
             if station_id not in self.resources:
-                continue  # 钉住的工位本轮不是可用资源，只能放弃钉住
+                # 以前这里直接 continue：故障停用工位会让 PMC 的钉住无声消失。
+                # 现在记下来由调用方报给计划员复核。
+                self.pinned_dropped.append(dict(row))
+                logger.warning("钉住工序被放弃：工单 %s 工序 %s，工位 %s 本轮不可用",
+                               row.get("order_id"), row.get("operation_sequence"), station_id)
+                continue
             key = (str(row.get("order_id")), int(row.get("operation_sequence") or 0))
             task = ScheduleTask(
                 task_id=row.get("task_id") or f"PIN-{key[0]}-{key[1]:03d}",

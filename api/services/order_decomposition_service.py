@@ -4,6 +4,7 @@
 """
 import uuid
 import json
+import math
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List
 
@@ -385,7 +386,7 @@ class OrderDecompositionService:
             }
 
         # 只数排了班的日子；超出评估窗口就明说，不钳成窗口最后一天冒充"能交"
-        days_needed = max(1, int(-(-quantity // throughput)))
+        days_needed = max(1, math.ceil(float(quantity) / float(throughput)))
         if days_needed > len(working_days):
             return {
                 "estimated_days": days_needed,

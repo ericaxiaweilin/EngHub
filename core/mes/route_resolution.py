@@ -57,12 +57,30 @@ async def route_ops_for_product(
             {
                 "operation_name": step.get("name") or step.get("operation_name"),
                 "work_center": str(step.get("station") or step.get("work_center") or "") or None,
-                "standard_hours": float(step.get("standard_hours") or step.get("time_min") or 0),
+                "standard_hours": _legacy_step_hours(step),
             }
             for step in sorted(routing.steps, key=lambda s: s.get("sequence") or s.get("seq") or 0)
         ]
 
     return []
+
+
+
+def _legacy_step_hours(step: dict) -> float:
+    if step.get("standard_hours") is not None:
+        try:
+            return float(step.get("standard_hours") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    if step.get("time_min") is not None:
+        try:
+            return float(step.get("time_min") or 0) / 60.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(step.get("standard_time") or 0) / 3600.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 async def route_stations_for_product(

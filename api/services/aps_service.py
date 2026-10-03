@@ -575,6 +575,13 @@ class ApsService:
 
         result = scheduler.schedule_hybrid(sched_mode, optimize_for)
 
+        for _d in getattr(scheduler, "pinned_dropped", None) or []:
+            result.constraint_violations.append(
+                {"order_id": str(_d.get("order_id") or ""),
+                 "reason": "[锁定工序] 工位 %s 本轮不可用（故障停用/未注册），钉住的 %s~%s 已放弃，请复核"
+                 % (_d.get("station_id"), _d.get("start_time"), _d.get("end_time"))}
+            )
+
         # 锁定行不改时刻，只把衔接冲突报给计划员复核
         for task in result.schedule:
             for note in getattr(task, "constraint_violations", None) or []:

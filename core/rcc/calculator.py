@@ -283,21 +283,74 @@ class RCCResourceCalculator:
             production = production_row.mappings().first() or {}
             produced = float(production.get("produced", 0) or 0)
             defects = float(production.get("defects", 0) or 0)
-            # RCC's factory KPI uses the same 12-hour daily production window
-            # as the TPM service; equipment count is shown separately.
-            planned = 7 * 12 * 60
-            running = max(planned - downtime, 1)
-            availability = max(0.0, (planned - downtime) / planned) if planned else 0.0
-            performance = min(1.0, produced * 0.2 / running)
+            # OEE 与设备看板同一口径：计划时间按工厂日历班次分钟（休息日不计），
+            # 性能按 station_capacity 日可完成件数（件/日，不是小时）。
+            # 以前这里 planned=7*12*60 写死 + 产出*0.2min/件，数字是编的。
+            from core.mes.capacity_math import load_station_models
+            _oee_end = datetime.utcnow()
+            _oee_start = _oee_end - timedelta(days=7)
+            try:
+                _st_rows = list((await self.db.execute(sql_text(
+                    "SELECT id, station_code FROM stations WHERE factory_id = :fid"
+                ), {"fid": factory_id})).mappings().all())
+                _cap_rows = list((await self.db.execute(sql_text(
+                    "SELECT station_id FROM station_capacity WHERE factory_id = :fid AND is_active = TRUE"
+                ), {"fid": factory_id})).mappings().all())
+                _eq_rows = list((await self.db.execute(sql_text(
+                    "SELECT station_id FROM equipment WHERE factory_id = :fid"
+                ), {"fid": factory_id})).mappings().all())
+            except Exception:
+                await self._rollback_after_error()
+                _st_rows, _cap_rows, _eq_rows = [], [], []
+            _alias = {}
+            for _r in _st_rows:
+                if _r.get("station_code"):
+                    _alias[str(_r.get("id"))] = str(_r.get("station_code"))
+                    _alias[str(_r.get("station_code"))] = str(_r.get("station_code"))
+            _oee_stations = sorted(
+                {_alias.get(str(_r.get("station_id")), str(_r.get("station_id")))
+                 for _r in _eq_rows if _r.get("station_id")}
+                | {str(_r.get("station_code")) for _r in _st_rows if _r.get("station_code")}
+                | {str(_r.get("station_id")) for _r in _cap_rows if _r.get("station_id")}
+            )
+            try:
+                _oee_models = await load_station_models(
+                    self.db, factory_id, _oee_stations, _oee_start, _oee_end)
+            except Exception:
+                await self._rollback_after_error()
+                _oee_models = {}
+            _oee_days = [(_oee_start + timedelta(days=_o)).date() for _o in range(7)]
+            _planned = 0.0
+            _expected = 0.0
+            _missing = []
+            for _sid, _m in _oee_models.items():
+                _mins = sum(
+                    (_e.hour * 60 + _e.minute) - (_s.hour * 60 + _s.minute)
+                    for _d in _oee_days for _s, _e in _m.slots_on(_d))
+                _planned += _mins
+                _wd = sum(1 for _d in _oee_days if _m.slots_on(_d))
+                if _m.daily_pieces:
+                    _expected += float(_m.daily_pieces) * _wd
+                else:
+                    _missing.append(_sid)
+            availability = (max(0.0, (_planned - downtime) / _planned)
+                            if _planned > 0 else None)
+            performance = (produced / _expected) if _expected > 0 else None
             quality = (produced - defects) / produced if produced else 1.0
-            result["oee_actual_pct"] = round(availability * performance * quality * 100, 1)
+            _oee = (availability * min(performance, 1.0) * quality
+                    if availability is not None and performance is not None else None)
+            result["oee_actual_pct"] = round(_oee * 100, 1) if _oee is not None else None
             result["oee_detail"] = {
-                "availability": round(availability * 100, 1),
-                "performance": round(performance * 100, 1),
+                "availability": round(availability * 100, 1) if availability is not None else None,
+                "performance": round(performance * 100, 1) if performance is not None else None,
                 "quality": round(quality * 100, 1),
                 "downtime_minutes": round(downtime, 1),
                 "produced": int(produced),
                 "defects": int(defects),
+                "planned_minutes": round(_planned, 1),
+                "expected_pieces": round(_expected, 1),
+                "unconfigured_daily_pieces_stations": sorted(_missing),
+                "oee_basis": "计划分钟=工厂日历班次分钟(休息日不计); 性能=实际件数/按件日产能x排班天数",
             }
 
             pm_rows = await self.db.execute(sql_text("""
