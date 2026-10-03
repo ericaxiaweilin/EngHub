@@ -6,6 +6,8 @@
    （8-15 那条 4714 字符里就是半截调用）。
 2. 另一种 provider 的复数标记，内部用分隔标签分行承载工具名与 JSON。
 3. 只残留一个孤立分隔标签。
+4. 另一种 provider 的 tool_use 形态（线上 2026-10-04 泄漏样本）：
+   <tool_use>{"name": "...", ...}</tool_use>，也可能未闭合。
 
 不变量：**只删除调用标记本身，绝不丢弃标记之外的正文**。8-14 的样本是
 "合法答复在前 + 调用标记在后"，任何"从第一个标记处截断"的写法都会把用户
@@ -55,6 +57,16 @@ _HARNESS_UNCLOSED = re.compile(
     _tag("tool_calls") + r".*",
     re.DOTALL | re.IGNORECASE,
 )
+# 4) tool_use 形态：整块删除；未闭合则吃到末尾（JSON 属于调用参数）。
+_TOOL_USE = re.compile(
+    _tag_open("tool_use") + r".*?" + _tag("tool_use", closing=True),
+    re.DOTALL | re.IGNORECASE,
+)
+_TOOL_USE_UNCLOSED = re.compile(
+    _tag_open("tool_use") + r".*",
+    re.DOTALL | re.IGNORECASE,
+)
+
 # 3) 孤立分隔标签。
 _SEP = re.compile(
     r"(?:" + _tag("tool_sep") + r"|" + _tag("tool_sep", closing=True) + r")",
@@ -69,7 +81,9 @@ def strip_tool_call_markup(content: str) -> str:
         return text.strip()
     text = _HARNESS.sub("", text)
     text = _BLOCK.sub("", text)
+    text = _TOOL_USE.sub("", text)
     text = _HARNESS_UNCLOSED.sub("", text)
+    text = _TOOL_USE_UNCLOSED.sub("", text)
     text = _UNCLOSED_BLOCK.sub("", text)
     text = _INNER.sub("", text)
     text = _SEP.sub("", text)
@@ -83,6 +97,7 @@ def looks_like_tool_call_leak(content: str) -> bool:
         return False
     return bool(
         re.search(_tag_open("tool_call"), text, re.IGNORECASE)
+        or re.search(_tag_open("tool_use"), text, re.IGNORECASE)
         or re.search(_tag("tool_calls"), text, re.IGNORECASE)
         or re.search(_tag("tool_call"), text, re.IGNORECASE)
         or _SEP.search(text)
