@@ -167,6 +167,29 @@ class AgentLoop:
             )
             return len(normalized)
 
+        async def retry_text_only() -> tuple[Optional[Dict[str, Any]], bool]:
+            """摘掉 tools 重试一次纯文本轮，返回 (模型消息, 是否被取消)。
+
+            网关/上游在工具轮上返回 4xx 时，旧 chat_architecture 的
+            ToolFallbackExecutor 会降级为自由文本，Kernel 接手时漏掉了这条路径，
+            于是一次工具轮失败就把整轮变成空回复。降级答复不经过工具，
+            因此调用方必须标记为未核实。
+            """
+            if not payload.get("tools"):
+                return None, False
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+            resp, cancelled = await self._await_with_cancel(
+                self._call_llm(payload), cancel_wait,
+            )
+            if cancelled:
+                return None, True
+            if resp.status_code >= 400:
+                return None, False
+            data = resp.json()
+            message = ((data.get("choices") or [{}])[0]).get("message") or None
+            return message, False
+
         for round_no in range(self.max_rounds):
             await append_steering()
             if cancel_check is not None and cancel_check():
@@ -276,6 +299,36 @@ class AgentLoop:
                 tool_calls = message.get("tool_calls") or []
 
             if status_code >= 400:
+                fallback_message, cancelled = await retry_text_only()
+                if cancelled:
+                    return self._cancelled_result(
+                        model=model,
+                        rounds_used=round_no + 1,
+                        actions=actions,
+                    )
+                fallback_reply = self._clean_reply(
+                    (fallback_message or {}).get("content") or "",
+                )
+                if fallback_reply and not (fallback_message or {}).get("tool_calls"):
+                    await notify(
+                        "item/completed",
+                        {
+                            "item_type": "model_call",
+                            "round": round_no + 1,
+                            "status": "tool_fallback",
+                        },
+                        model_item_id,
+                    )
+                    return LoopResult(
+                        reply=fallback_reply,
+                        model=model,
+                        degraded=True,
+                        rounds_used=round_no + 1,
+                        actions=actions,
+                        diagrams=diagrams,
+                        status="tool_fallback",
+                        error=f"gateway returned {status_code}；本轮未经 MES 工具核实",
+                    )
                 await notify(
                     "item/completed",
                     {
@@ -323,6 +376,28 @@ class AgentLoop:
             if not tool_calls:
                 reply = self._clean_reply(message.get("content") or "")
                 if not reply:
+                    # 流式轮可能因上游错误只回来空内容；同样先做一次纯文本重试。
+                    fallback_message, cancelled = await retry_text_only()
+                    if cancelled:
+                        return self._cancelled_result(
+                            model=model,
+                            rounds_used=round_no + 1,
+                            actions=actions,
+                        )
+                    reply = self._clean_reply(
+                        (fallback_message or {}).get("content") or "",
+                    )
+                    if reply and not (fallback_message or {}).get("tool_calls"):
+                        return LoopResult(
+                            reply=reply,
+                            model=model,
+                            degraded=True,
+                            rounds_used=round_no + 1,
+                            actions=actions,
+                            diagrams=diagrams,
+                            status="tool_fallback",
+                            error="工具轮无返回；本轮未经 MES 工具核实",
+                        )
                     return LoopResult(
                         model=model,
                         degraded=True,
