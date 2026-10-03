@@ -100,6 +100,8 @@ class ScheduleTask:
     setup_time: float = 0.0
     run_time: float = 0.0
     quantity: int = 0
+    operation_name: str = ""
+    is_locked: bool = False  # PMC 手动钉住的工序，重排时不得移动
     status: str = "PLANNED"  # PLANNED, CONFIRMED, RUNNING, COMPLETED, CANCELLED
     actual_start: Optional[datetime.datetime] = None
     actual_end: Optional[datetime.datetime] = None
@@ -113,12 +115,14 @@ class ScheduleTask:
             "order_id": self.order_id,
             "product_code": self.product_code,
             "operation_sequence": self.operation_sequence,
+            "operation_name": self.operation_name,
             "station_id": self.station_id,
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat(),
             "setup_time": self.setup_time,
             "run_time": self.run_time,
             "quantity": self.quantity,
+            "is_locked": self.is_locked,
             "status": self.status,
             "actual_start": self.actual_start.isoformat() if self.actual_start else None,
             "actual_end": self.actual_end.isoformat() if self.actual_end else None,
@@ -148,6 +152,7 @@ class HybridScheduler:
         self.processes: Dict[str, Dict[int, ProcessConstraint]] = {}  # key: product_code
         self.schedule: List[ScheduleTask] = []
         self.resource_timeline: Dict[str, List[ScheduleTask]] = {}
+        self.pinned_tasks: Dict[tuple, ScheduleTask] = {}  # (order_id, op_seq) -> PMC 钉住的任务
         self.process_capability_cache: Dict[str, Dict] = {}  # 工艺能力缓存
         
     def load_resource_constraints(
@@ -203,6 +208,44 @@ class HybridScheduler:
             preferred_resources=preferred_resources or [],
         )
         
+    def load_pinned_tasks(self, pinned_tasks: List[Dict]) -> int:
+        """把 PMC 钉住（锁定）的工序原样放回时间轴，重排时保持不动。
+
+        锁定是计划员的否决权：它们不参与排序、不移动，其余工序绕开它们排。
+        """
+        self.pinned_tasks = {}
+        loaded = 0
+        for row in pinned_tasks or []:
+            station_id = row.get("station_id")
+            start_time = row.get("start_time")
+            end_time = row.get("end_time")
+            if not station_id or not start_time or not end_time:
+                continue
+            if station_id not in self.resources:
+                continue  # 钉住的工位本轮不是可用资源，只能放弃钉住
+            key = (str(row.get("order_id")), int(row.get("operation_sequence") or 0))
+            task = ScheduleTask(
+                task_id=row.get("task_id") or f"PIN-{key[0]}-{key[1]:03d}",
+                order_id=key[0],
+                product_code=row.get("product_code") or "",
+                operation_sequence=key[1],
+                operation_name=row.get("operation_name") or "",
+                station_id=station_id,
+                start_time=start_time,
+                end_time=end_time,
+                setup_time=float(row.get("setup_time") or 0.0),
+                run_time=float(row.get("run_time") or 0.0),
+                quantity=int(row.get("quantity") or 0),
+                is_locked=True,
+                status=row.get("status") or "planned",
+            )
+            self.pinned_tasks[key] = task
+            self.resource_timeline.setdefault(station_id, []).append(task)
+            loaded += 1
+        if loaded:
+            logger.info("载入 %d 道锁定工序，重排时保持不动", loaded)
+        return loaded
+
     def load_process_constraints(
         self,
         product_code: str,
@@ -455,7 +498,10 @@ class HybridScheduler:
         
         self.schedule = []
         for rid in self.resource_timeline:
-            self.resource_timeline[rid] = []
+            # 锁定工序是计划员的否决权，重排只清自动分配，不动钉住的行。
+            self.resource_timeline[rid] = [
+                t for t in self.resource_timeline[rid] if t.is_locked
+            ]
         
         unscheduled = []
         violations = []
@@ -506,7 +552,9 @@ class HybridScheduler:
                 if scheduled_tasks:
                     self.schedule.extend(scheduled_tasks)
                     for task in scheduled_tasks:
-                        self.resource_timeline[task.station_id].append(task)
+                        # 锁定任务在 load_pinned_tasks 里已占好时间轴，重复塞会自我冲突
+                        if not task.is_locked:
+                            self.resource_timeline[task.station_id].append(task)
                 else:
                     unscheduled.append(order.order_id)
                     violations.append({
@@ -560,6 +608,23 @@ class HybridScheduler:
         last_task = None
         
         for op in sorted_ops:
+            pinned = self.pinned_tasks.get((order.order_id, op.operation_sequence))
+            if pinned is not None:
+                # PMC 钉住的工序不参与计算：原样保留，只把衔接时间让给它
+                if mode != SchedulingMode.BACKWARD and pinned.start_time < current_time:
+                    pinned.constraint_violations.append(
+                        f"锁定开工 {pinned.start_time:%m-%d %H:%M} 早于前道工序完工 "
+                        f"{current_time:%m-%d %H:%M}，系统未改动锁定行，请人工复核衔接"
+                    )
+                tasks.append(pinned)
+                last_task = pinned
+                if mode != SchedulingMode.BACKWARD:
+                    current_time = max(current_time, pinned.end_time)
+                else:
+                    current_time = min(current_time, pinned.start_time)
+                current_time += datetime.timedelta(seconds=op.min_wait_time)
+                continue
+
             # 寻找最佳工位
             best_station = None
             best_start = None
@@ -632,6 +697,7 @@ class HybridScheduler:
                     order_id=order.order_id,
                     product_code=order.product_code,
                     operation_sequence=op.operation_sequence,
+                    operation_name=op.operation_name,
                     station_id=best_station,
                     start_time=start_time,
                     end_time=end_time,

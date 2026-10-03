@@ -621,11 +621,55 @@ class ApsService:
 
             )
 
+        # 4.5 PMC 手动钉住的工序先占回时间轴，本次重排只动没钉住的部分
+
+        pinned_rows = await self.db.execute(
+            text("""
+                WITH latest_per_op AS (
+                    SELECT DISTINCT ON (t.work_order_id, t.operation_seq)
+                           t.id AS task_id,
+                           t.work_order_id AS order_id,
+                           t.operation_seq AS operation_sequence,
+                           t.operation_name,
+                           t.station_id,
+                           t.planned_start AS start_time,
+                           t.planned_end AS end_time,
+                           t.setup_seconds AS setup_time,
+                           t.run_seconds AS run_time,
+                           t.quantity,
+                           t.status,
+                           t.is_locked
+                    FROM aps_schedule_tasks t
+                    JOIN aps_schedules s ON s.id = t.schedule_id
+                    WHERE s.factory_id = :factory_id
+                      AND COALESCE(t.status, '') NOT IN ('completed', 'cancelled')
+                    ORDER BY t.work_order_id, t.operation_seq,
+                             s.version_number DESC, t.created_at DESC
+                )
+                SELECT task_id, order_id, operation_sequence, operation_name, station_id,
+                       start_time, end_time, setup_time, run_time, quantity, status
+                FROM latest_per_op
+                WHERE is_locked = true AND end_time >= :now
+            """),
+            {"factory_id": factory_id, "now": now},
+        )
+
+        pinned_count = scheduler.load_pinned_tasks(
+            [dict(row) for row in pinned_rows.mappings().all()]
+        )
+
         # 5. 执行排程
 
         sched_mode = SchedulingMode(mode) if mode in ("forward", "backward", "hybrid") else SchedulingMode.HYBRID
 
         result = scheduler.schedule_hybrid(sched_mode, optimize_for)
+
+        # 锁定行不改时刻，只把衔接冲突报给计划员复核
+        for task in result.schedule:
+            for note in getattr(task, "constraint_violations", None) or []:
+                result.constraint_violations.append(
+                    {"order_id": str(task.order_id), "reason": f"[锁定工序] {note}"}
+                )
 
         if unrouted_orders:
             result.unscheduled_orders = list(dict.fromkeys(result.unscheduled_orders + unrouted_orders))
@@ -710,6 +754,7 @@ class ApsService:
             "scheduled_orders": len(scheduled_order_ids),
             "unscheduled_orders": len(result.unscheduled_orders),
             "scheduled_tasks": len(result.schedule),
+            "pinned_tasks": pinned_count,
         }
 
         # 6. 持久化排程方案
@@ -821,7 +866,7 @@ class ApsService:
 
                 operation_seq=task.operation_sequence,
 
-                operation_name=None,
+                operation_name=task.operation_name or f"工序{task.operation_sequence}",
 
                 station_id=task.station_id,
 
@@ -835,9 +880,9 @@ class ApsService:
 
                 quantity=task.quantity,
 
-                status="planned",
+                status=(task.status.lower() if task.is_locked and task.status else "planned"),
 
-                is_locked=False,
+                is_locked=bool(task.is_locked),
 
                 priority=PRIORITY_MAP.get(wo.priority if wo else "medium", SchedulingPriority.NORMAL).value,
                 material_ready=material_ready_map.get(str(task.order_id), True),
@@ -880,6 +925,8 @@ class ApsService:
 
             "total_tasks": len(result.schedule),
 
+            "pinned_tasks": pinned_count,
+
             "unscheduled_orders": result.unscheduled_orders,
 
             "unscheduled_count": len(result.unscheduled_orders),
@@ -909,6 +956,48 @@ class ApsService:
 
             "message": result.message,
 
+        }
+
+    async def set_task_lock(
+        self,
+        task_id: str,
+        locked: bool,
+        actor: str,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """PMC 手动钉住/放开一道工序：锁定行在后续重排中原样保留。"""
+        task = await self.db.get(ApsScheduleTask, task_id)
+        if not task:
+            return {"success": False, "message": f"排程任务 {task_id} 不存在"}
+        if not task.schedule_id:
+            return {"success": False, "message": "该任务没有归属方案，无法记录锁定"}
+        schedule = await self.db.get(ApsSchedule, task.schedule_id)
+        task.is_locked = locked
+        await self._record_event(
+            factory_id=schedule.factory_id,
+            event_type="task_locked" if locked else "task_unlocked",
+            actor=actor,
+            schedule_id=task.schedule_id,
+            work_order_id=task.work_order_id,
+            reason=note or ("PMC 锁定工序" if locked else "PMC 解锁工序"),
+            payload={
+                "task_id": task_id,
+                "operation_seq": task.operation_seq,
+                "operation_name": task.operation_name,
+                "station_id": task.station_id,
+                "planned_start": task.planned_start.isoformat() if task.planned_start else None,
+                "planned_end": task.planned_end.isoformat() if task.planned_end else None,
+            },
+        )
+        await self.db.commit()
+        return {
+            "success": True,
+            "task_id": task_id,
+            "is_locked": locked,
+            "station_id": task.station_id,
+            "operation_seq": task.operation_seq,
+            "operation_name": task.operation_name,
+            "message": "已锁定，重排时保持不动" if locked else "已解锁，可参与重排",
         }
 
     async def _record_event(
@@ -1126,6 +1215,7 @@ class ApsService:
         insert_wo_id: Optional[str] = None,
         created_by: str = "system",
         change_reason: Optional[str] = None,
+        optimize_for: Optional[str] = None,
     ) -> Dict[str, Any]:
 
         """插单/重排：校验插单归属后生成新版本，并保留审计原因。"""
@@ -1139,6 +1229,7 @@ class ApsService:
         result = await self.generate_schedule(
             factory_id,
             mode="hybrid",
+            optimize_for=optimize_for or "delivery",
             created_by=created_by,
             change_reason=change_reason or (f"insert:{insert_wo_id}" if insert_wo_id else "manual_reschedule"),
         )

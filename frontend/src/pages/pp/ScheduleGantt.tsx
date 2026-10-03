@@ -41,7 +41,8 @@ const ScheduleGantt: React.FC = () => {
   const [generating, setGenerating] = useState(false)
   const [taskDrawer, setTaskDrawer] = useState<ApsTask | null>(null)
   const [genModal, setGenModal] = useState(false)
-  const [horizonDays, setHorizonDays] = useState(7)
+  const [horizonDays, setHorizonDays] = useState(30)
+  const [locking, setLocking] = useState(false)
   const [mode, setMode] = useState('hybrid')
 
   // 加载方案列表
@@ -113,18 +114,40 @@ const ScheduleGantt: React.FC = () => {
     }
   }
 
-  // 重排
+  // 重排：不带 insert_wo_id 即整盘重算，已钉住的工序保持不动
   const handleReschedule = async () => {
     setGenerating(true)
     try {
-      const res: any = await apsApi.reschedule({ factory_id: FACTORY })
-      message.success(`重排完成：${res.total_tasks} 个任务`)
+      const res: any = await apsApi.reschedule({
+        factory_id: FACTORY,
+        reason: lockedCount ? `PMC 手动重排（保留 ${lockedCount} 道锁定工序）` : 'PMC 手动重排',
+      })
+      message.success(`重排完成：${res.total_tasks} 个任务，保留锁定 ${res.pinned_tasks ?? 0} 道`)
       await loadSchedules()
       if (res.schedule_id) setSelectedId(res.schedule_id)
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '重排失败')
     } finally {
       setGenerating(false)
+    }
+  }
+
+  // 钉住 / 放开当前查看的工序
+  const handleToggleLock = async () => {
+    if (!taskDrawer) return
+    setLocking(true)
+    try {
+      const res: any = await apsApi.lockTask(taskDrawer.id, {
+        locked: !taskDrawer.is_locked,
+        note: taskDrawer.is_locked ? 'PMC 放开这道工序' : 'PMC 钉住这道工序',
+      })
+      message.success(res?.message || (taskDrawer.is_locked ? '已解锁' : '已锁定'))
+      setTaskDrawer(null)
+      if (selectedId) loadGantt(selectedId)
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '锁定操作失败')
+    } finally {
+      setLocking(false)
     }
   }
 
@@ -139,6 +162,11 @@ const ScheduleGantt: React.FC = () => {
   }, [gantt])
 
   const currentSchedule = schedules.find(s => s.id === selectedId)
+
+  const lockedCount = useMemo(
+    () => (gantt ? Object.values(gantt.resources).flat().filter(t => t.is_locked).length : 0),
+    [gantt]
+  )
 
   // 时间刻度（每12小时一格）
   const timeTicks = useMemo(() => {
@@ -211,7 +239,7 @@ const ScheduleGantt: React.FC = () => {
                 下达
               </Button>
               <Button icon={<ReloadOutlined />} onClick={handleReschedule} loading={generating}>
-                插单重排
+                一键重排（保留锁定）
               </Button>
             </Space>
           </Col>
@@ -246,7 +274,12 @@ const ScheduleGantt: React.FC = () => {
       <Card
         size="small"
         title={<Space><FieldTimeOutlined />排程甘特图</Space>}
-        extra={gantt && <Tag>{gantt.total_tasks} 个任务 · {ganttMeta?.stations.length} 个工位</Tag>}
+        extra={gantt && (
+          <Space size={4}>
+            <Tag>{gantt.total_tasks} 个任务 · {ganttMeta?.stations.length} 个工位</Tag>
+            {lockedCount > 0 && <Tag color="red" icon={<LockOutlined />}>已钉住 {lockedCount} 道</Tag>}
+          </Space>
+        )}
       >
         <Spin spinning={loading}>
           {!gantt || !ganttMeta || ganttMeta.stations.length === 0 ? (
@@ -339,7 +372,7 @@ const ScheduleGantt: React.FC = () => {
           </div>
           <div>
             <div style={{ marginBottom: 4, fontWeight: 500 }}>排程天数</div>
-            <InputNumber value={horizonDays} onChange={v => setHorizonDays(v || 7)} min={1} max={30} style={{ width: '100%' }} addonAfter="天" />
+            <InputNumber value={horizonDays} onChange={v => setHorizonDays(v || 30)} min={1} max={180} style={{ width: '100%' }} addonAfter="天" />
           </div>
         </Space>
       </Modal>
@@ -374,6 +407,19 @@ const ScheduleGantt: React.FC = () => {
               {taskDrawer.is_locked ? <Tag icon={<LockOutlined />} color="error">已锁定</Tag> : <Tag icon={<UnlockOutlined />} color="success">可调整</Tag>}
             </Descriptions.Item>
           </Descriptions>
+        )}
+        {taskDrawer && (
+          <Space style={{ marginTop: 12 }} align="center">
+            <Button
+              type={taskDrawer.is_locked ? 'default' : 'primary'}
+              icon={taskDrawer.is_locked ? <UnlockOutlined /> : <LockOutlined />}
+              loading={locking}
+              onClick={handleToggleLock}
+            >
+              {taskDrawer.is_locked ? '解除锁定' : '钉住这道工序'}
+            </Button>
+            <span style={{ fontSize: 12, color: '#888' }}>钉住后重排只动未钉住的工序</span>
+          </Space>
         )}
       </Drawer>
     </div>

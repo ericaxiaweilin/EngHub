@@ -144,9 +144,14 @@ export const apsApi = {
     return api.post(`/api/v1/aps/schedules/${id}/release`)
   },
 
-  /** 插单重排 */
-  reschedule(params: { factory_id: string; insert_wo_id?: string; reason?: string }) {
+  /** 插单重排：带 insert_wo_id 需要已批准的 approval_id；不带则是整盘重排 */
+  reschedule(params: { factory_id: string; insert_wo_id?: string; reason?: string; approval_id?: string }) {
     return api.post('/api/v1/aps/reschedule', params)
+  },
+
+  /** 钉住/放开某道工序：锁定行在后续重排中原样保留 */
+  lockTask(taskId: string, data: { locked: boolean; note?: string }) {
+    return api.post(`/api/v1/aps/tasks/${taskId}/lock`, data)
   },
 
   /** 甘特图数据 */

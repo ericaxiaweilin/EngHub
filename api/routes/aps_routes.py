@@ -37,6 +37,12 @@ class RescheduleRequest(BaseModel):
     insert_wo_id: Optional[str] = None
     reason: Optional[str] = None
     approval_id: Optional[str] = None  # 插单审批单ID（Q4：要求已批准）
+    algorithm: Optional[str] = None  # EDD/SPT/CR/PRIORITY，与 /schedule 同一套语义
+
+
+class TaskLockRequest(BaseModel):
+    locked: bool = True
+    note: Optional[str] = None
 
 
 class CalendarCreate(BaseModel):
@@ -267,35 +273,72 @@ async def release_schedule(
     return result
 
 
+@router.post("/tasks/{task_id}/lock")
+async def lock_schedule_task(
+    task_id: str,
+    req: TaskLockRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pp", "edit")),
+):
+    """PMC 钉住/放开一道工序：锁定行在重排中原样保留，其余工序绕开它排。"""
+    svc = ApsService(db)
+    result = await svc.set_task_lock(
+        task_id=task_id,
+        locked=req.locked,
+        actor=current_user.username,
+        note=req.note,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message", "锁定操作失败"))
+    return result
+
+
 @router.post("/reschedule")
 async def reschedule(
     req: RescheduleRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pp", "edit")),
 ):
-    """插单/急单重排"""
+    """插单/急单重排。
+
+    审批只卡"插单"这一件事：订单集合变了才需要 approval。
+    不带 insert_wo_id 的纯重排不改变接单范围，只是在锁定约束下重算，直接放行并留审计原因。
+    """
     from core.pp.rush_approval_service import RushApprovalService
 
-    if not req.approval_id:
+    insert_wo_id = req.insert_wo_id
+    approval_code = None
+    if req.approval_id:
+        appr_svc = RushApprovalService(db)
+        approval = await appr_svc.get(req.approval_id)
+        if not approval or approval.status != "executed":
+            raise HTTPException(
+                status_code=403,
+                detail=f"插单审批单 {req.approval_id} 状态为 {getattr(approval, 'status', '不存在')}，仅 executed 可触发重排",
+            )
+        insert_wo_id = insert_wo_id or approval.target_wo_id
+        approval_code = approval.approval_code
+    elif insert_wo_id:
         raise HTTPException(
             status_code=403,
-            detail="Q4 插单审批流：重排必须携带已批准的插单审批单 approval_id，请先走 rush-order-impact 评估并审批",
-        )
-
-    appr_svc = RushApprovalService(db)
-    approval = await appr_svc.get(req.approval_id)
-    if not approval or approval.status != "executed":
-        raise HTTPException(
-            status_code=403,
-            detail=f"插单审批单 {req.approval_id} 状态为 {getattr(approval, 'status', '不存在')}，仅 executed 可触发重排",
+            detail="Q4 插单审批流：带 insert_wo_id 的插单重排必须携带已批准的 approval_id，"
+                   "请先走 rush-order-impact 评估并审批；不插单的整盘重排不需审批",
         )
 
     svc = ApsService(db)
     result = await svc.reschedule(
         factory_id=req.factory_id,
-        insert_wo_id=req.insert_wo_id or approval.target_wo_id,
+        insert_wo_id=insert_wo_id,
         created_by=current_user.username,
-        change_reason=req.reason or f"插单审批 {approval.approval_code} 执行",
+        optimize_for={
+            "EDD": "delivery",
+            "SPT": "efficiency",
+            "CR": "critical_ratio",
+            "PRIORITY": "priority",
+        }.get((req.algorithm or "").upper()),
+        change_reason=req.reason or (
+            f"插单审批 {approval_code} 执行" if approval_code else "PMC 手动重排（保留锁定工序）"
+        ),
     )
     if not result.get("success") and not result.get("schedule_id"):
         raise HTTPException(status_code=400, detail=result.get("message", "重排失败"))
