@@ -85,6 +85,14 @@ MODEL_COLD_START_RETRY_TIMEOUT = max(
 MODEL_WARMUP_ENABLED = os.getenv("LLM_WARMUP_ENABLED", "1").lower() not in {
     "0", "false", "no", "off",
 }
+# 免费档 provider 的额度是按天计的（实测 gemini-2.5-flash 20 次/天）。
+# 预热撞上 402/429/503 时继续打只会把当天额度烧光并让用户也跟着失败，
+# 所以退避一段时间，让路由与额度有机会恢复。
+MODEL_WARMUP_BACKOFF_SECONDS = max(
+    60.0,
+    float(os.getenv("LLM_WARMUP_BACKOFF_SECONDS", "1800")),
+)
+MODEL_WARMUP_QUOTA_STATUSES = frozenset({402, 403, 429, 502, 503})
 MODEL_WARMUP_INTERVAL_SECONDS = max(
     60.0,
     float(os.getenv("LLM_WARMUP_INTERVAL_SECONDS", "600")),
@@ -657,6 +665,14 @@ async def _warm_model_once(reason: str = "interval") -> bool:
     """
     if not MODEL_WARMUP_ENABLED or not MODEL_STACK_CHAT_TASK_ID:
         return False
+    paused_until = _model_warmup_state.get("paused_until")
+    if paused_until and time.monotonic() < paused_until:
+        _model_warmup_state["skipped_paused"] = _model_warmup_state.get("skipped_paused", 0) + 1
+        _logger.info(
+            "[model-warmup] 跳过 reason=%s remaining_seconds=%.0f（上游额度/可用性退避中）",
+            reason, paused_until - time.monotonic(),
+        )
+        return False
     async with _model_warmup_lock:
         started = time.monotonic()
         _model_warmup_state["last_started_at"] = time.time()
@@ -684,6 +700,7 @@ async def _warm_model_once(reason: str = "interval") -> bool:
             )
             response.raise_for_status()
             _model_warmup_state["last_ok"] = True
+            _model_warmup_state["paused_until"] = None
             _logger.info(
                 "[model-warmup] ok reason=%s model=%s elapsed_ms=%.0f",
                 reason,
@@ -694,12 +711,21 @@ async def _warm_model_once(reason: str = "interval") -> bool:
         except Exception as exc:  # noqa: BLE001
             _model_warmup_state["last_ok"] = False
             _model_warmup_state["last_error"] = type(exc).__name__
-            _logger.warning(
-                "[model-warmup] failed reason=%s error=%s elapsed_ms=%.0f",
-                reason,
-                type(exc).__name__,
-                (time.monotonic() - started) * 1000,
-            )
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if status_code in MODEL_WARMUP_QUOTA_STATUSES:
+                _model_warmup_state["paused_until"] = (
+                    time.monotonic() + MODEL_WARMUP_BACKOFF_SECONDS
+                )
+                _logger.warning(
+                    "[model-warmup] 上游不可用 reason=%s status=%s 退避 %.0fs elapsed_ms=%.0f",
+                    reason, status_code, MODEL_WARMUP_BACKOFF_SECONDS, elapsed_ms,
+                )
+            else:
+                _logger.warning(
+                    "[model-warmup] failed reason=%s error=%s elapsed_ms=%.0f",
+                    reason, type(exc).__name__, elapsed_ms,
+                )
             return False
         finally:
             _model_warmup_state["last_finished_at"] = time.time()
