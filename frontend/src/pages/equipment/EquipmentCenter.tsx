@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, Modal, Form, message, Typography, Statistic, Row, Col, Progress } from 'antd';
+import { Card, Table, Button, Tag, Space, Input, Select, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Descriptions } from 'antd';
 import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
@@ -139,8 +139,8 @@ const EquipmentCenter: React.FC = () => {
       key: 'status',
       width: 100,
       render: (status: string) => {
-        // 状态字典与 equipment 表实际取值一致（running/maintenance/idle/broken）；
-        // 原来这里按 OPERATIONAL/DOWN 匹配，页面 KPI 与标签全部落到 default，看着像"0 台在运行"
+        // 状态字典跟 equipment 表实际取值一致（running/maintenance/idle/broken）；
+        // 原来按 OPERATIONAL/DOWN 匹配，KPI 与标签全部落到 default，看着像"0 台在运行"
         const statusMap: Record<string, { label: string; color: string }> = {
           running: { label: '运行中', color: 'green' },
           available: { label: '可开机', color: 'cyan' },
@@ -334,11 +334,13 @@ const EquipmentCenter: React.FC = () => {
             rules={[{ required: true, message: 'Please select type' }]}
           >
             <Select>
-              <Select.Option value="CNC">CNC Machine</Select.Option>
-              <Select.Option value="INJECTION">Injection Molder</Select.Option>
-              <Select.Option value="CONVEYOR">Conveyor</Select.Option>
-              <Select.Option value="ROBOT">Robot</Select.Option>
-              <Select.Option value="PACKAGING">Packaging</Select.Option>
+              <Select.Option value="machining">机加工</Select.Option>
+              <Select.Option value="welding">焊接</Select.Option>
+              <Select.Option value="molding">注塑</Select.Option>
+              <Select.Option value="assembly">装配</Select.Option>
+              <Select.Option value="coating">涂装</Select.Option>
+              <Select.Option value="testing">检测</Select.Option>
+              <Select.Option value="utility">公用动力</Select.Option>
             </Select>
           </Form.Item>
           <Form.Item
