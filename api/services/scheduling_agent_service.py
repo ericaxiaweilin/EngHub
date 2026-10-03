@@ -87,14 +87,34 @@ class SchedulingAgent:
 
         # 找到该设备上正在排程的工单
         affected = await self.db.execute(text("""
-            SELECT t.id, t.work_order_id, t.planned_start, t.planned_end, w.work_order_code
+            SELECT t.id, t.work_order_id, t.planned_start, t.planned_end, w.work_order_code,
+                   t.operation_seq, t.station_id, COALESCE(t.is_locked, false) AS is_locked
             FROM aps_schedule_tasks t
             JOIN work_orders w ON t.work_order_id = w.id::text
             JOIN aps_schedules s ON t.schedule_id = s.id
             WHERE t.station_id = :eid AND s.factory_id = :fid AND s.status IN ('draft', 'confirmed')
               AND t.planned_end > NOW()
         """), {"eid": equipment_id, "fid": factory_id})
-        affected_tasks = [dict(r) for r in affected.mappings().all()]
+        all_tasks = [dict(r) for r in affected.mappings().all()]
+        # PMC 钉住的工序是计划员的决定，智能体不自动搬走，交人工复核
+        locked_tasks = [t for t in all_tasks if t.get("is_locked")]
+        affected_tasks = [t for t in all_tasks if not t.get("is_locked")]
+
+        if not affected_tasks and locked_tasks:
+            return {
+                "action": "blocked",
+                "affected_orders": len(locked_tasks),
+                "locked_tasks": [
+                    {
+                        "work_order": t["work_order_code"],
+                        "operation_seq": t["operation_seq"],
+                        "station_id": t["station_id"],
+                    }
+                    for t in locked_tasks
+                ],
+                "reason": "故障工位上只剩已钉住的工序，系统不自动迁移，请先解除锁定或人工改派",
+                "escalate": True,
+            }
 
         if not affected_tasks:
             return {"action": "none", "reason": "该设备无待执行排程任务"}
@@ -136,7 +156,9 @@ class SchedulingAgent:
             "action": "migrated",
             "affected_orders": len(affected_tasks),
             "migrated": migrated,
-            "note": f"已将{len(migrated)}个工单从故障设备迁移到替代工位",
+            "locked_skipped": len(locked_tasks),
+            "note": f"已将{len(migrated)}个工单从故障设备迁移到替代工位"
+                    + (f"；另有 {len(locked_tasks)} 道已钉住工序未自动迁移，需人工复核" if locked_tasks else ""),
         }
 
     async def on_material_delay(self, factory_id: str, material_code: str, delay_days: int) -> Dict[str, Any]:
@@ -165,10 +187,23 @@ class SchedulingAgent:
                     planned_end = planned_end + :delay * INTERVAL '1 day'
                 WHERE work_order_id = :wo_id
                   AND planned_start > NOW()
+                  AND COALESCE(is_locked, false) = false
                 RETURNING id
             """), {"delay": delay_days, "wo_id": wo["id"]})
             if result.first():
                 postponed.append(wo["work_order_code"])
+
+        locked_skipped = int((await self.db.execute(text("""
+            SELECT COUNT(*) FROM aps_schedule_tasks t
+            WHERE t.planned_start > NOW()
+              AND COALESCE(t.is_locked, false) = true
+              AND t.work_order_id IN (
+                  SELECT w.id::text FROM work_orders w
+                  JOIN bom_items b ON w.product_id = b.product_id AND w.factory_id = b.factory_id
+                  WHERE b.material_code = :mc AND w.factory_id = :fid
+                    AND w.status IN ('released', 'pending')
+              )
+        """), {"mc": material_code, "fid": factory_id})).scalar() or 0)
 
         await self.db.commit()
 
@@ -178,7 +213,9 @@ class SchedulingAgent:
             "delay_days": delay_days,
             "affected_orders": len(affected_wos),
             "postponed": postponed,
-            "note": f"物料{material_code}延迟{delay_days}天，已推迟{len(postponed)}个工单",
+            "locked_skipped": locked_skipped,
+            "note": f"物料{material_code}延迟{delay_days}天，已推迟{len(postponed)}个工单"
+                    + (f"；{locked_skipped} 道已钉住工序保持原时刻" if locked_skipped else ""),
         }
 
     # ═══════════════════════════════════════════════════════════
