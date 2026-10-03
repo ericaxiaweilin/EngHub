@@ -278,6 +278,23 @@ async def get_delivery_alerts(
     return await T3DeliveryService(db).overdue_alerts(factory_id)
 
 
+@router.get("/delivery/risk", summary="获取交期风险（按实际生产速度推算）")
+async def get_delivery_risk(
+    factory_id: str = Query(...),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """在制工单按已完成量的实际速度推算，预计晚于 planned_due 即为交期风险。
+
+    与 `/delivery/countdown` 的日历红黄绿灯是两件事：那边看距交期还有几天，
+    这里看按当前速度来不来得及。chatbot、PMC 控制塔、交期智能体共用同一实现。
+    """
+    del current_user
+    from api.services.pmc_control_tower_service import PmcControlTowerService
+    return await PmcControlTowerService(db).delivery_risk(factory_id, limit=limit)
+
+
 @router.get("/capabilities", summary="获取 PMC 能力与接口清单")
 async def get_pmc_capabilities(
     current_user: User = Depends(get_current_user),
@@ -294,6 +311,7 @@ async def get_pmc_capabilities(
             {"key": "delivery_countdown", "name": "交期倒计时", "path": "/api/v1/pmc/delivery/countdown", "mode": "read_only"},
             {"key": "delivery_progress", "name": "生产进度汇总", "path": "/api/v1/pmc/delivery/progress", "mode": "read_only"},
             {"key": "delivery_alerts", "name": "交期与供应异常", "path": "/api/v1/pmc/delivery/alerts", "mode": "read_only"},
+            {"key": "delivery_risk", "name": "交期风险（按实际速度推算，与智能体同源）", "path": "/api/v1/pmc/delivery/risk", "mode": "read_only"},
             {"key": "data_readiness", "name": "PMC 数据完整性与补数清单", "path": "/api/v1/pmc/data-readiness", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
