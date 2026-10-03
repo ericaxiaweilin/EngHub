@@ -81,29 +81,50 @@ class SchedulingAgent:
             result = await self._append_to_schedule(factory_id, wo_id)
             return {"action": "append", "trigger": "new_order", **result}
 
+    async def _live_schedule_id(self, factory_id: str) -> Optional[str]:
+        """当前生效的那一版：优先 is_current，否则取版本号最新的一版。
+
+        APS 事件处理只能作用在一版方案上。不带 schedule 范围的话，历史 draft 有上百份，
+        按行 UPDATE 会把同一工单在每一版里各改一遍，统计口径也跟着失真。
+        """
+        return (await self.db.execute(text("""
+            SELECT id FROM aps_schedules
+            WHERE factory_id = :fid
+            ORDER BY is_current DESC, version_number DESC, created_at DESC
+            LIMIT 1
+        """), {"fid": factory_id})).scalar()
+
     async def on_equipment_breakdown(self, factory_id: str, equipment_id: str) -> Dict[str, Any]:
         """事件：设备故障 → 受影响工单自动迁移到其他工位"""
         _logger.info(f"[scheduling] 设备故障: {equipment_id}")
 
-        # 找到该设备上正在排程的工单
+        # 只认当前生效的那一版。原来把所有历史 draft 的行都算进来（ST-JG-01 报 556，
+        # 实际工单池 55 张），而且下达后的 released 方案反而被 status 条件排除在外。
+        live_schedule_id = await self._live_schedule_id(factory_id)
+        if not live_schedule_id:
+            return {"action": "none", "reason": "该工厂还没有排程方案，无需迁移"}
+
         affected = await self.db.execute(text("""
             SELECT t.id, t.work_order_id, t.planned_start, t.planned_end, w.work_order_code,
                    t.operation_seq, t.station_id, COALESCE(t.is_locked, false) AS is_locked
             FROM aps_schedule_tasks t
             JOIN work_orders w ON t.work_order_id = w.id::text
-            JOIN aps_schedules s ON t.schedule_id = s.id
-            WHERE t.station_id = :eid AND s.factory_id = :fid AND s.status IN ('draft', 'confirmed')
-              AND t.planned_end > NOW()
-        """), {"eid": equipment_id, "fid": factory_id})
+            WHERE t.station_id = :eid AND t.schedule_id = :sid AND t.planned_end > NOW()
+        """), {"eid": equipment_id, "sid": str(live_schedule_id)})
         all_tasks = [dict(r) for r in affected.mappings().all()]
         # PMC 钉住的工序是计划员的决定，智能体不自动搬走，交人工复核
         locked_tasks = [t for t in all_tasks if t.get("is_locked")]
         affected_tasks = [t for t in all_tasks if not t.get("is_locked")]
 
+        # affected_orders 数的是工单，不是排程行
+        def order_count(rows):
+            return len({str(r["work_order_id"]) for r in rows})
+
         if not affected_tasks and locked_tasks:
             return {
                 "action": "blocked",
-                "affected_orders": len(locked_tasks),
+                "affected_orders": order_count(locked_tasks),
+                "affected_tasks": len(locked_tasks),
                 "locked_tasks": [
                     {
                         "work_order": t["work_order_code"],
@@ -130,7 +151,9 @@ class SchedulingAgent:
         if not alternatives:
             return {
                 "action": "blocked",
-                "affected_orders": len(affected_tasks),
+                "affected_orders": order_count(affected_tasks),
+                "affected_tasks": len(affected_tasks),
+                "schedule_id": str(live_schedule_id),
                 "reason": "无可用替代工位，需人工调度",
                 "escalate": True,
             }
@@ -154,7 +177,9 @@ class SchedulingAgent:
 
         return {
             "action": "migrated",
-            "affected_orders": len(affected_tasks),
+            "affected_orders": order_count(affected_tasks),
+            "affected_tasks": len(affected_tasks),
+            "schedule_id": str(live_schedule_id),
             "migrated": migrated,
             "locked_skipped": len(locked_tasks),
             "note": f"已将{len(migrated)}个工单从故障设备迁移到替代工位"
@@ -178,7 +203,12 @@ class SchedulingAgent:
         if not affected_wos:
             return {"action": "none", "reason": f"无工单使用物料 {material_code}"}
 
-        # 推迟排程
+        # 推迟排程：只动当前生效那一版，历史 draft 的行不是执行依据，跟着改只会把
+        # affected/postponed 数字放大几十倍（原来 ST-JG-01 一次报 556）。
+        live_schedule_id = await self._live_schedule_id(factory_id)
+        if not live_schedule_id:
+            return {"action": "none", "reason": "该工厂还没有排程方案，无需顺延"}
+
         postponed = []
         for wo in affected_wos:
             result = await self.db.execute(text("""
@@ -186,16 +216,18 @@ class SchedulingAgent:
                 SET planned_start = planned_start + :delay * INTERVAL '1 day',
                     planned_end = planned_end + :delay * INTERVAL '1 day'
                 WHERE work_order_id = :wo_id
+                  AND schedule_id = :sid
                   AND planned_start > NOW()
                   AND COALESCE(is_locked, false) = false
                 RETURNING id
-            """), {"delay": delay_days, "wo_id": wo["id"]})
+            """), {"delay": delay_days, "wo_id": wo["id"], "sid": str(live_schedule_id)})
             if result.first():
                 postponed.append(wo["work_order_code"])
 
         locked_skipped = int((await self.db.execute(text("""
             SELECT COUNT(*) FROM aps_schedule_tasks t
-            WHERE t.planned_start > NOW()
+            WHERE t.schedule_id = :sid
+              AND t.planned_start > NOW()
               AND COALESCE(t.is_locked, false) = true
               AND t.work_order_id IN (
                   SELECT w.id::text FROM work_orders w
@@ -203,7 +235,7 @@ class SchedulingAgent:
                   WHERE b.material_code = :mc AND w.factory_id = :fid
                     AND w.status IN ('released', 'pending')
               )
-        """), {"mc": material_code, "fid": factory_id})).scalar() or 0)
+        """), {"sid": str(live_schedule_id), "mc": material_code, "fid": factory_id})).scalar() or 0)
 
         await self.db.commit()
 
