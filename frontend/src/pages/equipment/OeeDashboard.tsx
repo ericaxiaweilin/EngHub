@@ -4,6 +4,7 @@ import { ThunderboltOutlined, CheckCircleOutlined, WarningOutlined, ClockCircleO
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
 import dayjs from 'dayjs';
+import { getActiveFactoryId } from '../../utils/factory';
 
 const { Title, Text } = Typography;
 const { RangePicker } = DatePicker;
@@ -34,7 +35,7 @@ const OeeDashboard: React.FC = () => {
   const [oeeData, setOeeData] = useState<OEEData | null>(null);
   const [downtimeRecords, setDowntimeRecords] = useState<DowntimeRecord[]>([]);
   const [dateRange, setDateRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>(null);
-  const [factoryId] = useState('demo-factory');
+  const [factoryId] = useState(getActiveFactoryId());
 
   // Fetch OEE data
   const fetchOEE = async () => {
