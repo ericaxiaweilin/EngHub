@@ -120,6 +120,9 @@ export const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => 
   ]
 
   const sortedByAvg = [...result.sections].sort((a, b) => b.avg_load_rate - a.avg_load_rate)
+  const byPressure = [...result.sections].sort((a, b) => b.pressure_rate - a.pressure_rate)
+  const pressSec = byPressure[0] || ({} as any)
+  const unmetSecs = result.sections.filter((s) => s.unmet_hours > 0.5).sort((a, b) => b.unmet_hours - a.unmet_hours)
   const delayed = result.orders.filter((o) => !o.on_time)
   const onTimeCnt = result.orders.length - delayed.length
   const peakSec = sortedByAvg.reduce((m, s) => (s.peak_load_rate > m.peak_load_rate ? s : m), sortedByAvg[0] || ({} as any))
@@ -153,8 +156,22 @@ export const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => 
     }),
     bottleneck: () => ({
       title: '瓶颈工段 · 追溯', headline: `${k.bottleneck_sections} 个`,
-      formula: `${k.bottleneck_sections} = 峰值负荷率超过 100% 的工段数`,
-      columns: secCols, records: result.sections.filter((s) => s.is_bottleneck).sort((a, b) => b.peak_load_rate - a.peak_load_rate),
+      formula: `${k.bottleneck_sections} = 峰值负荷率或需求压力率超过 100% 的工段数（负荷率最高只能显示到 120%，超载倍数看压力率）`,
+      columns: secCols, records: byPressure.filter((s) => s.is_bottleneck),
+    }),
+    pressure: () => ({
+      title: '需求压力峰值 · 追溯', headline: pct(k.max_pressure_rate, 0),
+      formula: pct(k.max_pressure_rate, 0)
+        + ` = 最紧工段「${pressSec.name || '-'}」需求 ${Number(pressSec.demand_hours).toFixed(0)}h ÷ 基准产能 ${Number(pressSec.total_capacity_hours).toFixed(0)}h`
+        + '（不设上限；负荷率受加班上限钳位在 120%，看不出 5 倍超载）',
+      columns: secCols, records: byPressure,
+    }),
+    unmet: () => ({
+      title: '缺口工时 · 追溯', headline: `${k.total_unmet_hours.toFixed(0)} h`,
+      formula: unmetSecs.length > 0
+        ? `${k.total_unmet_hours.toFixed(0)}h = ${unmetSecs.map((s) => `${s.name} ${s.unmet_hours.toFixed(0)}h`).join(' + ')}（计划期内排不下、必须延期完成的工时）`
+        : '全部需求都能在计划期内排下，无缺口',
+      columns: secCols, records: unmetSecs.length > 0 ? unmetSecs : byPressure,
     }),
     imbalance: () => ({
       title: '负荷不均衡指数 · 追溯', headline: k.imbalance_index.toFixed(2),
@@ -274,9 +291,21 @@ export const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => 
   const items: { title: string; value: string; suffix?: string; color: string; tip?: string; drill: string }[] = [
     { title: '平均负荷率', value: pct(k.avg_load_rate), color: k.avg_load_rate > 0.9 ? '#fa8c16' : '#1890ff', drill: 'avg_load' },
     { title: '峰值负荷率', value: pct(k.peak_load_rate, 0), color: k.peak_load_rate > 1 ? '#f5222d' : '#52c41a', drill: 'peak_load' },
+    {
+      title: '需求压力峰值', value: pct(k.max_pressure_rate, 0),
+      color: k.max_pressure_rate > 1 ? '#f5222d' : '#52c41a',
+      tip: '最紧工段 需求÷基准产能，不设上限。负荷率被加班上限钳死在 120%，超载倍数只看这里',
+      drill: 'pressure',
+    },
     { title: '订单准时率', value: pct(k.on_time_rate, 0), color: k.on_time_rate >= 0.8 ? '#52c41a' : '#f5222d', drill: 'on_time' },
     { title: '延期订单', value: `${k.delayed_orders}`, suffix: `/ ${result.order_count}`, color: k.delayed_orders > 0 ? '#f5222d' : '#52c41a', drill: 'delayed' },
     { title: '瓶颈工段', value: `${k.bottleneck_sections}`, color: k.bottleneck_sections > 0 ? '#f5222d' : '#52c41a', drill: 'bottleneck' },
+    {
+      title: '缺口工时', value: k.total_unmet_hours.toFixed(0), suffix: 'h',
+      color: k.total_unmet_hours > 0 ? '#fa541c' : '#52c41a',
+      tip: '计划期内排不下、必须延期到期外的工时合计（=0 才说明订单真的吃得下）',
+      drill: 'unmet',
+    },
     {
       title: '负荷不均衡指数', value: k.imbalance_index.toFixed(2),
       color: k.imbalance_index > 0.4 ? '#fa8c16' : '#52c41a',
@@ -354,15 +383,17 @@ export const LoadHeatmap: React.FC<{ result: FactorySimResult }> = ({ result }) 
         <Space size={4} style={{ fontSize: 11 }}>
           <span>低</span>
           <div style={{ width: 110, height: 10, borderRadius: 5, background: 'linear-gradient(90deg, hsl(120,72%,88%), hsl(60,72%,72%), hsl(25,72%,58%), hsl(0,72%,52%))' }} />
-          <span>130%+</span>
+          <span>120%（加班上限，再高也是深色）</span>
           <Divider type="vertical" />
           <div style={{ width: 14, height: 10, background: '#f0f0f0', borderRadius: 2 }} />
           <span>休息日</span>
+          <Divider type="vertical" />
+          <span>超载倍数看行末 <Tag color="volcano" style={{ margin: 0, fontSize: 10, lineHeight: '15px', padding: '0 3px' }}>压</Tag> 标</span>
         </Space>
       }
       styles={{ body: { padding: 12, overflowX: 'auto' } }}
     >
-      <div style={{ display: 'grid', gridTemplateColumns: `170px repeat(${horizon}, minmax(16px, 1fr))`, gap: 2, minWidth: 170 + horizon * 18 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: `210px repeat(${horizon}, minmax(16px, 1fr))`, gap: 2, minWidth: 210 + horizon * 18 }}>
         <div />
         {Array.from({ length: horizon }, (_, d) => (
           <div key={d} style={{ textAlign: 'center', fontSize: 10, lineHeight: 1.2, paddingBottom: 2 }}>
@@ -377,13 +408,22 @@ export const LoadHeatmap: React.FC<{ result: FactorySimResult }> = ({ result }) 
             </div>
             {secs.map((s) => (
               <React.Fragment key={s.section_id}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, paddingRight: 8, whiteSpace: 'nowrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, paddingRight: 6, whiteSpace: 'nowrap' }}
+                  title={`需求 ${s.demand_hours}h / 基准产能 ${s.total_capacity_hours}h · 期内排不下 ${s.unmet_hours}h · 加班 ${s.overtime_used_hours}h\n`
+                    + ((({ labor: '人力钳位：加人或加班次可直接增产', machine: '机台钳位：加人不会增产，需加机台或外协', both: '人机同时钳位：需按同一比例投入' } as Record<string, string>)[s.binding_resource]) || '钳位来源未知')}>
                   <Tag color={s.strategy === 'mts' ? 'cyan' : 'blue'} style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>
                     {s.strategy.toUpperCase()}
                   </Tag>
                   <span style={{ fontWeight: 600 }}>{s.name}</span>
-                  {s.is_bottleneck && (
-                    <Tag color="red" style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>瓶颈</Tag>
+                  {(s.pressure_rate > 1 || s.is_bottleneck) && (
+                    <Tag color={s.pressure_rate > 1 ? 'volcano' : 'red'} style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>
+                      {s.pressure_rate > 1 ? `压 ${pct(s.pressure_rate, 0)}` : '瓶颈'}
+                    </Tag>
+                  )}
+                  {s.unmet_hours > 0.5 && (
+                    <Tag color="orange" style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>
+                      缺{s.unmet_hours.toFixed(0)}h
+                    </Tag>
                   )}
                 </div>
                 {s.series.map((cell) => {
@@ -605,7 +645,11 @@ export const AlertPanel: React.FC<{ result: FactorySimResult }> = ({ result }) =
 
 /* ==================== 工段参数编辑器 ==================== */
 
-const SectionEditor: React.FC<{ section: SectionConfig; onPatch: (p: Partial<SectionConfig>) => void }> = ({ section: s, onPatch }) => (
+const SectionEditor: React.FC<{
+  section: SectionConfig
+  onPatch: (p: Partial<SectionConfig>) => void
+  stat?: { pressure_rate: number; unmet_hours: number; binding_resource: string } | null
+}> = ({ section: s, onPatch, stat }) => (
   <div style={{ border: '1px solid #f0f0f0', borderRadius: 4, padding: '8px 10px', height: '100%', background: '#fff' }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
       <Space size={6}>
@@ -658,6 +702,13 @@ const SectionEditor: React.FC<{ section: SectionConfig; onPatch: (p: Partial<Sec
         </Field>
       </Col>
     </Row>
+    {stat && (
+      <div style={{ fontSize: 11, color: '#8c8c8c', marginTop: 4 }}>
+        压力 <b style={{ color: stat.pressure_rate >= 1 ? '#f5222d' : '#52c41a' }}>{pct(stat.pressure_rate, 0)}</b>
+        {stat.unmet_hours > 0.5 && <> · 缺口 <b style={{ color: '#fa541c' }}>{stat.unmet_hours.toFixed(0)}h</b></>}
+        {' · '}{(({ labor: '人力钳位，加人有效', machine: '机台钳位，加人不会增产', both: '人机同钳，需同比投入' } as Record<string, string>)[stat.binding_resource]) || '钳位来源未知'}
+      </div>
+    )}
     {s.description && <div style={{ fontSize: 11, color: '#8c8c8c', marginTop: 2 }}>{s.description}</div>}
   </div>
 )
@@ -992,7 +1043,7 @@ export const BlockingAnalysisPanel: React.FC<{ result: FactorySimResult }> = ({ 
   return (
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
       <Card size="small" title={<Space size={6}><AimOutlined />卡点排行榜<Tag color="red">{bps.length} 处</Tag></Space>}
-        extra={<Text type="secondary" style={{ fontSize: 11 }}>严重度 = 0.5×过载 + 0.3×积压 + 0.2×等待</Text>}>
+        extra={<Text type="secondary" style={{ fontSize: 11 }}>严重度 = 0.5×过载[峰值与需求压力取大] + 0.3×积压 + 0.2×等待</Text>}>
         {bps.length === 0 && <AntAlert type="success" showIcon message="未检测到卡点，物流顺畅" />}
         {bps.map((bp) => (
           <div key={bp.section_id} style={{ display: 'flex', gap: 12, alignItems: 'flex-start', padding: '10px 0', borderBottom: '1px dashed #f0f0f0' }}>
@@ -1018,6 +1069,7 @@ export const BlockingAnalysisPanel: React.FC<{ result: FactorySimResult }> = ({ 
                 format={() => `严重度 ${bp.severity}`} />
             </div>
             <div style={{ width: 150, flexShrink: 0, fontSize: 11, color: '#595959', lineHeight: 1.7, textAlign: 'right' }}>
+              <div>需求压力 <b style={{ color: bp.pressure_rate > 1 ? '#f5222d' : '#52c41a' }}>{pct(bp.pressure_rate, 0)}</b>{bp.unmet_hours > 0.5 && <> · 缺 <b style={{ color: '#fa541c' }}>{bp.unmet_hours.toFixed(0)}h</b></>}</div>
               <div>峰值负荷 <b style={{ color: bp.peak_load_rate > 1 ? '#f5222d' : '#52c41a' }}>{pct(bp.peak_load_rate, 0)}</b>（D{bp.peak_day + 1}）</div>
               <div>过载 <b>{bp.overload_days}</b> 天 · 积压 <b style={{ color: '#fa8c16' }}>{bp.wip_peak.toLocaleString()}</b> 件</div>
               <div>平均等待 <b>{bp.avg_wait_days}</b> 天</div>
@@ -1504,7 +1556,8 @@ const FactoryLoadSim: React.FC = () => {
                         <Row gutter={[10, 10]}>
                           {config.sections.filter((s) => s.workshop_id === ws.workshop_id).map((s) => (
                             <Col xs={24} md={12} xl={8} key={s.section_id}>
-                              <SectionEditor section={s} onPatch={(p) => patchSection(s.section_id, p)} />
+                              <SectionEditor section={s} onPatch={(p) => patchSection(s.section_id, p)}
+                                stat={result?.sections.find((x) => x.section_id === s.section_id)} />
                             </Col>
                           ))}
                         </Row>
