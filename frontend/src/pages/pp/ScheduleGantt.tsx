@@ -45,6 +45,7 @@ const ScheduleGantt: React.FC = () => {
   const [locking, setLocking] = useState(false)
   const [savingMove, setSavingMove] = useState(false)
   const [moveForm, setMoveForm] = useState<{ station_id: string; start: string; end: string } | null>(null)
+  const [taskStation, setTaskStation] = useState('')
   const [mode, setMode] = useState('hybrid')
 
   // 加载方案列表
@@ -173,6 +174,7 @@ const ScheduleGantt: React.FC = () => {
   // 打开任务详情时同步初始化改派表单（甘特数据里工位是分组键，不在任务对象上）
   const openTask = (task: ApsTask, station: string) => {
     setTaskDrawer(task)
+    setTaskStation(task.station_id || station)
     setMoveForm({
       station_id: task.station_id || station,
       start: task.planned_start,
@@ -440,7 +442,7 @@ const ScheduleGantt: React.FC = () => {
             <Descriptions.Item label="工单编码">{taskDrawer.order_code || '-'}</Descriptions.Item>
             <Descriptions.Item label="产品">{taskDrawer.product_code || '-'}</Descriptions.Item>
             <Descriptions.Item label="工序">{taskDrawer.operation_name || `OP${taskDrawer.operation_seq}`}</Descriptions.Item>
-            <Descriptions.Item label="工位">{taskDrawer.station_id}</Descriptions.Item>
+            <Descriptions.Item label="工位">{taskStation || '-'}</Descriptions.Item>
             <Descriptions.Item label="计划开始">{dayjs(taskDrawer.planned_start).format('YYYY-MM-DD HH:mm')}</Descriptions.Item>
             <Descriptions.Item label="计划结束">{dayjs(taskDrawer.planned_end).format('YYYY-MM-DD HH:mm')}</Descriptions.Item>
             <Descriptions.Item label="换型时间">{((taskDrawer.setup_seconds || 0) / 60).toFixed(1)} 分钟</Descriptions.Item>
