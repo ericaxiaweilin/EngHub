@@ -748,6 +748,30 @@ async def stock_alerts(
     return await svc.get_stock_alerts(factory_id)
 
 
+@router.get("/inventory/health", summary="库存专业健康度汇总（只读）")
+async def inventory_health(
+    factory_id: str,
+    dead_stock_days: int = 60,
+    expiry_warn_days: int = 30,
+    turnover_days: int = 90,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """编排已有 WMS 分析执行器，并披露覆盖率与不可计算项。
+
+    不在这里重复实现口径：ABC、周转、呆滞、效期、低库存、过量、补货建议
+    全部来自 wms_architecture/executors。
+    """
+    del current_user
+    from api.services.wms_inventory_health_service import WmsInventoryHealthService
+    return await WmsInventoryHealthService(db).collect(
+        factory_id,
+        dead_stock_days=max(7, min(int(dead_stock_days or 60), 730)),
+        expiry_warn_days=max(1, min(int(expiry_warn_days or 30), 365)),
+        turnover_days=max(7, min(int(turnover_days or 90), 365)),
+    )
+
+
 @router.get("/inventory/fifo-check")
 async def fifo_check(
     factory_id: str,

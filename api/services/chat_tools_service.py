@@ -851,6 +851,21 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_wms_inventory_health",
+            "description": "WMS 库存健康度汇总：SKU 数、有单价的库存金额覆盖、周转（按真实消耗口径 production_out/outbound）、呆滞、效期、低库存、过量、补货建议，并同批返回覆盖率与不可计算项（库位容量、满载率、入库流水缺失、效期无值等）。用于'库存健康''周转''呆滞''该补什么''是否过量''库位满载'类问题；不要用 query_inventory 的行级明细替代这个汇总。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dead_stock_days": {"type": "integer", "description": "呆滞天数阈值，默认60", "default": 60},
+                    "expiry_warn_days": {"type": "integer", "description": "效期预警提前天数，默认30", "default": 30},
+                    "turnover_days": {"type": "integer", "description": "周转统计窗口天数，默认90", "default": 90}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_shortage_alerts",
             "description": "查询缺料预警：当前库存低于补货阈值（min_level）的物料清单。返回物料、当前库存、安全库存、最低水位、缺口量。用于'缺料''补货''低于安全库存'类请求。",
             "parameters": {"type": "object", "properties": {}},
@@ -2432,6 +2447,50 @@ async def _tool_query_maintenance_due(db: AsyncSession, args: Dict[str, Any], fa
     }
 
 
+async def _tool_query_wms_inventory_health(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """库存健康度汇总（只读）：给模型汇总与缺口，不把上万行明细灌进上下文。"""
+    from api.services.wms_inventory_health_service import WmsInventoryHealthService
+
+    fid = factory_id or "FAC_ELEC_DEMO_2026"
+    data = await WmsInventoryHealthService(db).collect(
+        fid,
+        dead_stock_days=int(args.get("dead_stock_days") or 60),
+        expiry_warn_days=int(args.get("expiry_warn_days") or 30),
+        turnover_days=int(args.get("turnover_days") or 90),
+    )
+
+    def _top(entry, n=8):
+        res = (entry or {}).get("result") or {}
+        for key in ("items", "suggestions", "top_items", "zones", "top_cost_items"):
+            if isinstance(res.get(key), list):
+                return res[key][:n]
+        return []
+
+    analyses = data.get("analyses") or {}
+    from api.services.wms_inventory_health_service import _json_safe
+
+    return _json_safe({
+        "type": "wms_inventory_health",
+        "factory_id": data["factory_id"],
+        "thresholds": data["thresholds"],
+        "headline": data["headline"],
+        "coverage": data["coverage"],
+        "samples": {
+            "low_stock": _top(analyses.get("low_stock") or {}),
+            "overstock": _top(analyses.get("overstock") or {}),
+            "dead_stock": _top(analyses.get("dead_stock") or {}),
+            "turnover": _top(analyses.get("turnover") or {}, 5),
+        },
+        "not_computable": data["not_computable"],
+        "data_note": (
+            "结论只能引用本结果里出现的数字。coverage 显示阈值或流水不足时，"
+            "必须说明该项不可判定，不能把 0 或全量计数当成业务事实。"
+        ),
+    })
+
+
 async def _tool_query_shortage_alerts(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     """缺料预警：库存 < 补货阈值 min_level"""
     from sqlalchemy import text as sa_text
@@ -2775,6 +2834,7 @@ _TOOL_EXECUTORS = {
     # 5M1E 预警数据工具
     "query_downtime": _tool_query_downtime,
     "query_maintenance_due": _tool_query_maintenance_due,
+    "query_wms_inventory_health": _tool_query_wms_inventory_health,
     "query_shortage_alerts": _tool_query_shortage_alerts,
     "query_stagnant": _tool_query_stagnant,
     "query_spc_anomalies": _tool_query_spc_anomalies,
@@ -3073,6 +3133,7 @@ TOOL_LABELS = {
     # 5M1E 预警数据工具
     "query_downtime": "停机记录",
     "query_maintenance_due": "保养到期",
+    "query_wms_inventory_health": "库存健康度",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",

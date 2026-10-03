@@ -220,6 +220,7 @@ _TOOL_SELECTION_ACTION_HINTS: Dict[str, tuple[str, ...]] = {
     "search_entity": ("属于哪个部门", "是什么", "在哪", "查找编码", "search entity"),
     # 交期风险/交付达成率的唯一口径在 PMC 控制塔，必须能被自然问法选到。
     "query_pmc_control_tower": ("pmc", "控制塔", "交期风险", "交付风险", "准时交付", "otd"),
+    "query_wms_inventory_health": ("库存健康", "周转", "呆滞", "呆滞料", "该补什么", "补货建议", "过量", "满载", "库存结构", "效期"),
 }
 
 _WORKBOOK_SELECTION_HINTS = (
