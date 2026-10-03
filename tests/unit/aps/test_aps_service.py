@@ -1,16 +1,19 @@
-"""
-APS排程服务完整工作流测试 - 覆盖从计划生成到发布的全流程
-"""
+"""APS 服务状态机与负荷口径回归：只测真实存在的方法，不 mock 不存在的类。"""
+
+from datetime import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+
+pytestmark = [pytest.mark.unit]
+
+from api.services.aps_service import PRIORITY_MAP, ApsService
 from database.models import ApsSchedule, WorkOrder
-from api.services.aps_service import ApsService
 
 
 @pytest.fixture(scope="function")
 def mock_aps_db():
-    """模拟数据库会话用于APS测试"""
     db = MagicMock()
     db.execute = AsyncMock()
     db.get = AsyncMock()
@@ -21,148 +24,136 @@ def mock_aps_db():
     return db
 
 
-@pytest.mark.asyncio
-async def test_aps_full_workflow_generation_to_release(mock_aps_db):
-    """测试：APS完整工作流 - 生成→确认→下达→工单创建"""
-    from api.services.aps_service import ApsService
-    
-    # mock计划对象
-    mock_schedule = MagicMock(spec=ApsSchedule)
-    mock_schedule.id = "sched-001"
-    mock_schedule.status = "draft"
-    mock_schedule.factory_id = "F001"
-    
-    mock_aps_db.get.return_value = mock_schedule
-    
-    # mock APS引擎
-    with patch('api.services.aps_service.ApsEngine') as mock_engine_cls:
-        mock_engine = mock_engine_cls.return_value
-        
-        # 阶段1: 生成计划
-        mock_engine.schedule.return_value = {
-            "success": True,
-            "schedule_id": "sched-001",
-            "plan_count": 5,
-            "tasks_generated": 42
-        }
-        
-        service = ApsService(mock_aps_db)
-        gen_result = await service.generate_schedule(
-            factory_id="F001",
-            priority="high"
-        )
-        
-        assert gen_result["success"] is True
-        assert gen_result["data"]["plan_count"] == 5
-        
-        # 阶段2: 确认计划
-        mock_engine.confirm_schedule = AsyncMock(return_value={"success": True})
-        confirm_result = await service.confirm_schedule("sched-001", "scheduler")
-        assert confirm_result["success"] is True
-        assert mock_schedule.status == "confirmed"
-        
-        # 阶段3: 下达计划（触发生成工单）
-        with patch('api.services.aps_service.WorkOrderService') as mock_wos_cls:
-            mock_wos = mock_wos_cls.return_value
-            mock_wos.create_from_schedule = AsyncMock(return_value={"success": True, "wo_count": 8})
-            
-            release_result = await service.release_schedule("sched-001")
-            assert release_result["success"] is True
-            assert release_result["message"] == "计划已下达，生成8个工单"
-            assert mock_schedule.status == "released"
+def _empty_scalars(db):
+    res = MagicMock()
+    res.scalars.return_value.all.return_value = []
+    res.scalar_one_or_none.return_value = None
+    res.mappings.return_value.all.return_value = []
+    res.all.return_value = []
+    db.execute = AsyncMock(return_value=res)
+    return db
+
+
+def _schedule(status="draft"):
+    s = SimpleNamespace(
+        id="sched-001", factory_id="F001", status=status,
+        unscheduled_count=0, version_number=3,
+        confirmed_by=None, approved_by=None, is_current=False,
+        released_by=None, released_at=None, updated_at=None,
+    )
+    return s
 
 
 @pytest.mark.asyncio
-async def test_aps_reschedule_with_new_wo_insertion(mock_aps_db):
-    """测试：新增工单触发重排 - 插入新工单后局部重算"""
-    from api.services.aps_service import ApsService
-    
-    with patch('api.services.aps_service.ApsEngine') as mock_engine_cls:
-        mock_engine = mock_engine_cls.return_value
-        mock_engine.reschedule.return_value = {
-            "success": True,
-            "affected_wo_count": 3,
-            "tasks_revised": 15,
-            "diff_report": {"added": 1, "modified": 2}
-        }
-        
-        service = ApsService(mock_aps_db)
-        result = await service.reschedule(
-            factory_id="F001",
-            insert_wo_id="WO-New001",
-            created_by="planner"
-        )
-        
-        assert result["success"] is True
-        assert result["affected_wo_count"] == 3
-        assert result["diff_report"]["added"] == 1
+async def test_confirm_schedule_draft_to_confirmed(mock_aps_db):
+    sched = _schedule("draft")
+    mock_aps_db.get = AsyncMock(return_value=sched)
+    _empty_scalars(mock_aps_db)
+    out = await ApsService(mock_aps_db).confirm_schedule("sched-001", "planner")
+    assert out["success"] is True
+    assert sched.status == "confirmed"
+    assert out["updated_orders"] == 0
 
 
 @pytest.mark.asyncio
-async def test_aps_priority_score_calculation():
-    """测试：优先级分数计算算法 - 基于交期和客户等级"""
-    from api.services.aps_service import ApsService, PRIORITY_MAP
-    
-    # 使用静态方法或直接测试逻辑
-    # Priority score = min(due_score + level_score + base_priority, 150)
-    
-    # 测试用例1：紧急订单 + VIP客户 + 高基础优先级
-    due_score = 100  # 逾期
-    level_score = 50  # VIP
-    base_priority = 90
-    expected = min(100 + 50 + 90, 150)  # = 150 (上限)
-    
-    # 实际测试需要通过patch调用内部方法或复制逻辑
-    assert isinstance(expected, int)
-    assert expected == 150
-    
-    # 测试用例2：普通订单
-    due_score = 70  # 提前7天
-    level_score = 20  # C级
-    base_priority = 50
-    expected = min(70 + 20 + 50, 150)  # = 140
-    assert expected == 140
+async def test_confirm_schedule_rejects_non_draft(mock_aps_db):
+    mock_aps_db.get = AsyncMock(return_value=_schedule("released"))
+    out = await ApsService(mock_aps_db).confirm_schedule("sched-001", "planner")
+    assert out["success"] is False
 
 
 @pytest.mark.asyncio
-async def test_aps_schedule_confirmation_protect_draft_status():
-    """测试：确认计划 - 仅草稿状态可确认"""
-    from api.services.aps_service import ApsService
-    
-    with patch('api.services.aps_service.ApsEngine') as mock_engine_cls:
-        mock_engine = mock_engine_cls.return_value
-        
-        # draft状态 - 应允许确认
-        mock_sched_draft = MagicMock(spec=ApsSchedule)
-        mock_sched_draft.status = "draft"
-        mock_engine._get_schedule = AsyncMock(return_value=mock_sched_draft)
-        
-        service = ApsService(MagicMock())
-        # 这里用mock绕过实际的DB获取
-        result = await service.confirm_schedule_mock_test("sched-123", "user")  # 假设有一个内部检查
-        # 这只是一个概念验证 - 实际需依赖真实服务实现
+async def test_release_schedule_requires_confirmed_then_releases(mock_aps_db):
+    mock_aps_db.get = AsyncMock(return_value=_schedule("draft"))
+    _empty_scalars(mock_aps_db)
+    svc = ApsService(mock_aps_db)
+    denied = await svc.release_schedule("sched-001")
+    assert denied["success"] is False
+
+    sched = _schedule("confirmed")
+    mock_aps_db.get = AsyncMock(return_value=sched)
+    ok = await svc.release_schedule("sched-001")
+    assert ok["success"] is True
+    assert sched.status == "released"
+    assert sched.is_current is True
+    assert ok["released_orders"] == 0
 
 
 @pytest.mark.asyncio
-async def test_aps_capacity_conflict_resolve_suggestion():
-    """测试：产能冲突解决建议 - 提供具体操作方案"""
-    from api.services.aps_service import ApsService
-    
-    # 模拟冲突检测结果
-    conflict_result = {
-        "station": "STN-003",
-        "load_pct": 125,
-        "overload_duration_hrs": 6,
-        "recommendations": [
-            "将WO-001移至STN-004",
-            "增加夜班班次",
-            "降低优先级订单"
-        ]
-    }
-    
-    # 验证建议数量足够多
-    assert len(conflict_result["recommendations"]) >= 2
-    # 每条建议应有明确的操作描述
-    for rec in conflict_result["recommendations"]:
-        assert isinstance(rec, str)
-        assert len(rec) > 10
+async def test_reschedule_rejects_foreign_work_order(mock_aps_db):
+    wo = SimpleNamespace(id="WO-1", factory_id="OTHER", status="pending")
+    mock_aps_db.get = AsyncMock(return_value=wo)
+    out = await ApsService(mock_aps_db).reschedule("F001", insert_wo_id="WO-1")
+    assert out["success"] is False
+    assert out["schedule_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_reschedule_delegates_to_generate_schedule(mock_aps_db):
+    wo = SimpleNamespace(id="WO-1", factory_id="F001", status="pending")
+    mock_aps_db.get = AsyncMock(return_value=wo)
+    svc = ApsService(mock_aps_db)
+    with patch.object(
+        ApsService, "generate_schedule",
+        AsyncMock(return_value={"success": True, "schedule_id": "s-new"}),
+    ) as gen:
+        out = await svc.reschedule("F001", insert_wo_id="WO-1", created_by="planner")
+    assert out["schedule_id"] == "s-new"
+    assert gen.await_count == 1
+    assert mock_aps_db.commit.await_count >= 1
+
+
+class _Model:
+    daily_pieces = 10.0
+    oee = 0.9
+    max_concurrent = 1
+    calendar_source = "aps_work_calendars"
+
+    def slots_on(self, day):
+        return [(time(8, 0), time(20, 0))]
+
+    def capacity_hours_on(self, day):
+        return 12.0 * self.oee
+
+
+@pytest.mark.asyncio
+async def test_get_capacity_load_empty_factory_has_no_resources(mock_aps_db):
+    _empty_scalars(mock_aps_db)
+    with patch(
+        "api.services.aps_service.load_station_models", AsyncMock(return_value={})
+    ):
+        out = await ApsService(mock_aps_db).get_capacity_load("F001", days=7)
+    assert out["resources"] == []
+    assert out["data_integrity"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_capacity_load_zero_load_math(mock_aps_db):
+    res = MagicMock()
+    res.scalar_one_or_none.return_value = None  # 无生效版本
+    res.scalars.return_value.all.return_value = []  # 无任务、无工位
+    res.mappings.return_value.all.return_value = [
+        {"station_id": "ST-A", "available_hours_per_day": 10}
+    ]
+    res.all.return_value = []
+    mock_aps_db.execute = AsyncMock(return_value=res)
+    with patch(
+        "api.services.aps_service.load_station_models",
+        AsyncMock(return_value={"ST-A": _Model()}),
+    ):
+        out = await ApsService(mock_aps_db).get_capacity_load("F001", days=7)
+    assert [r["station_id"] for r in out["resources"]] == ["ST-A"]
+    row = out["resources"][0]
+    assert row["avg_utilization"] == 0.0
+    assert row["is_bottleneck"] is False
+    assert row["daily_capacity_pieces"] == 10.0
+    assert all(d["is_rest_day"] is False for d in row["daily_load"])
+    assert out["data_integrity"] == [
+        w for w in out["data_integrity"] if w["issue"] == "not_registered"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_priority_map_covers_all_levels():
+    assert set(PRIORITY_MAP) == {"low", "medium", "high", "urgent", "emergency"}
+    assert PRIORITY_MAP["urgent"].value > PRIORITY_MAP["high"].value
