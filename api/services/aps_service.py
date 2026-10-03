@@ -103,78 +103,6 @@ class ApsService:
         result["tasks_processed"] = result.get("total_tasks", 0)
         return result
 
-        from datetime import datetime, timedelta
-        import uuid
-        
-        if not affected_wo_ids:
-            return {
-                "success": True,
-                "schedule_id": None,
-                "affected_wo_count": 0,
-                "tasks_processed": 0,
-                "message": "无工单需要重排",
-                "diff_report": {},
-                "metrics": {},
-            }
-        
-        schedule_id = f"INCR-{factory_id[:6]}-{int(uuid.uuid4().hex[:8], 16)}"
-        
-        tasks = []
-        current_time = datetime.now()
-        
-        for idx, wo_id in enumerate(affected_wo_ids):
-            for op_seq in range(1, 4):
-                setup_sec = 300 + idx * 30
-                run_sec = 600 + idx * 100 + op_seq * 100
-                
-                planned_start = current_time + timedelta(hours=idx * 2 + op_seq * 0.5)
-                planned_end = planned_start + timedelta(seconds=setup_sec + run_sec)
-                
-                tasks.append({
-                    "work_order_id": wo_id,
-                    "order_code": f"WO-{wo_id[-4:]}",
-                    "product_code": f"PROD-{idx}",
-                    "operation_seq": op_seq,
-                    "operation_name": f"工序{op_seq}",
-                    "station_id": f"STA-{(idx+op_seq)%3+1}",
-                    "planned_start": planned_start,
-                    "planned_end": planned_end,
-                    "setup_seconds": setup_sec,
-                    "run_seconds": run_sec,
-                    "quantity": 100 + idx * 50,
-                    "status": "planned",
-                    "is_locked": False,
-                    "priority": 50 + idx * 10,
-                })
-        
-        total_run = sum(t["run_seconds"] for t in tasks)
-        stations = set(t["station_id"] for t in tasks)
-        
-        diff_report = {
-            "affected_wo_count": len(affected_wo_ids),
-            "operations_replanned": len(tasks),
-            "stations_affected": list(stations),
-            "total_processing_seconds": total_run,
-            "change_summary": f"对 {len(affected_wo_ids)} 个工单执行局部重算，生成 {len(tasks)} 条操作计划",
-        }
-        
-        metrics = {
-            "total_tasks": len(tasks),
-            "avg_setup_time_seconds": round(sum(t["setup_seconds"] for t in tasks) / len(tasks)) if tasks else 0,
-            "max_station_utilization": min(95.0, 70.0 + len(affected_wo_ids) * 5),
-            "estimated_on_time_delivery": 92.0,
-        }
-        
-        return {
-            "success": True,
-            "schedule_id": schedule_id,
-            "affected_wo_count": len(affected_wo_ids),
-            "tasks_processed": len(tasks),
-            "message": f"成功处理 {len(affected_wo_ids)} 个工单的增量重排",
-            "diff_report": diff_report,
-            "metrics": metrics,
-        }
-
     def _get_mock_routing_for_product(self, product_code: str) -> List[Dict]:
         """获取产品的模拟工艺路线"""
         # 实际应从 RoutingTable 查询
@@ -198,30 +126,6 @@ class ApsService:
         base = 50
         quantity_bonus = min(50, max(0, (operation["quantity"] - 100) // 10))
         return base + quantity_bonus
-    
-    def _generate_incremental_diff_report(
-        self,
-        work_orders,
-        operations,
-        tasks,
-    ) -> Dict:
-        """生成增量变更对比报告"""
-        # 统计关键指标
-        stations_involved = set(op["station_id"] for op in operations)
-        total_run_time = sum(t["run_seconds"] for t in tasks) if tasks else 0
-        avg_cycle = total_run_time / len(tasks) if tasks else 0
-        
-        return {
-            "schedule_code": f"INC-DIFF-{int(datetime.utcnow().timestamp())}",
-            "timestamp": datetime.utcnow().isoformat(),
-            "affected_work_orders": len(work_orders),
-            "affected_operations": len(operations),
-            "stations_modified": list(stations_involved),
-            "tasks_updated": len(tasks),
-            "average_cycle_time_minutes": round(avg_cycle / 60, 2),
-            "total_processing_seconds": total_run_time,
-            "change_summary": f"对 {len(work_orders)} 个工单执行局部重排，涉及 {len(stations_involved)} 个工位，共更新 {len(tasks)} 条操作计划",
-        }
     
     def _calculate_metrics(self, tasks, station_loads) -> Dict:
         """计算排程性能指标"""
@@ -1421,28 +1325,6 @@ class ApsService:
         
 
     
-
-    def _generate_diff_report(self, work_orders, operations) -> Dict:
-
-        """生成变更影响分析报告"""
-
-        unchanged = len(work_orders) * 2  # 假设部分操作不变
-
-        changed = len(operations) - unchanged
-
-        return {
-
-            "total_operations": len(operations),
-
-            "unchanged_operations": unchanged,
-
-            "replanned_operations": changed,
-
-            "stations_affected": len(set(op["station_id"] for op in operations)),
-
-            "time_impact_hours": round(changed * 0.5, 2),  # 估算影响时长
-
-        }
 
     async def get_gantt_data(self, schedule_id: str) -> Dict[str, Any]:
 
