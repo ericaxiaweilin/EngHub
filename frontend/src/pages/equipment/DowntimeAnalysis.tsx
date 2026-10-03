@@ -75,7 +75,7 @@ const DowntimeAnalysis: React.FC = () => {
         params.date_to = dateRange[1].format('YYYY-MM-DD');
       }
       
-      const response = await axios.get(`${API_BASE_URL}/equipment/downtime/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/downtime/`, { params });
       setRecords(response.data.records || []);
       setTotal(response.data.total || 0);
     } catch (error) {
@@ -95,7 +95,7 @@ const DowntimeAnalysis: React.FC = () => {
         params.date_to = dateRange[1].format('YYYY-MM-DD');
       }
       
-      const response = await axios.get(`${API_BASE_URL}/equipment/downtime/stats/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/downtime/stats/`, { params });
       setStats(response.data);
     } catch (error) {
       console.error('Failed to fetch downtime stats:', error);
@@ -123,7 +123,7 @@ const DowntimeAnalysis: React.FC = () => {
   const handleCreate = async (values: any) => {
     setSubmitLoading(true);
     try {
-      await axios.post(`${API_BASE_URL}/equipment/downtime/`, values);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/downtime/`, values);
       message.success('Downtime record created successfully');
       setCreateModalVisible(false);
       createForm.resetFields();
@@ -140,7 +140,7 @@ const DowntimeAnalysis: React.FC = () => {
   // Handle resolve
   const handleResolve = async (id: string, resolutionNotes: string) => {
     try {
-      await axios.post(`${API_BASE_URL}/equipment/downtime/${id}/resolve`, {
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/downtime/${id}/resolve`, {
         resolution_notes: resolutionNotes
       });
       message.success('Downtime record resolved');

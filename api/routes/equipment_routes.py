@@ -78,6 +78,8 @@ async def list_equipment(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="按设备编码或名称模糊匹配"),
+    equipment_type: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_async_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -85,6 +87,11 @@ async def list_equipment(
     conditions = [Equipment.factory_id == factory_id]
     if status:
         conditions.append(Equipment.status == status)
+    if equipment_type:
+        conditions.append(func.lower(Equipment.equipment_type) == equipment_type.lower())
+    if search:
+        like = f"%{search.strip()}%"
+        conditions.append(or_(Equipment.equipment_code.ilike(like), Equipment.equipment_name.ilike(like)))
 
     total = (await db.execute(
         select(func.count()).select_from(Equipment).where(*conditions)
@@ -844,6 +851,78 @@ async def list_autonomous_tasks():
 @router.get("/autonomous-maintenance/stats", summary="Get autonomous maintenance statistics")
 async def get_autonomous_stats():
     raise AM_UNIMPLEMENTED
+
+
+class EquipmentCreate(BaseModel):
+    factory_id: str
+    equipment_name: str
+    equipment_type: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    location: Optional[str] = Field(None, description="工位编码，必须是本厂 stations 里已登记的工位")
+    responsible_engineer_id: Optional[str] = None
+
+
+@router.post("/", summary="Create equipment")
+@router.post("", summary="Create equipment", include_in_schema=False)
+async def create_equipment(
+    payload: EquipmentCreate,
+    db: AsyncSession = Depends(get_async_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """新建设备。location 只有能对上本厂台账工位才会写入 station_id ——
+    否则宁可 422，也不让一个不存在的工位编码进入排程（那正是跨厂借用那类问题的来源）。"""
+    name = (payload.equipment_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="设备名称不能为空")
+
+    station_id = None
+    if payload.location and payload.location.strip():
+        location = payload.location.strip()
+        station = (await db.execute(text("""
+            SELECT station_code FROM stations
+            WHERE factory_id = :fid AND (station_code = :loc OR station_name = :loc)
+            LIMIT 1
+        """), {"fid": payload.factory_id, "loc": location})).scalar()
+        if not station:
+            raise HTTPException(
+                status_code=422,
+                detail=f"工位 {location} 不在工厂 {payload.factory_id} 的台账里；先在 stations 登记，再绑定设备",
+            )
+        station_id = str(station)
+
+    seq = (await db.execute(
+        select(func.count()).select_from(Equipment).where(Equipment.factory_id == payload.factory_id)
+    )).scalar() or 0
+    code = f"EQ-{payload.factory_id[-4:]}-{int(seq) + 1:03d}"
+    while (await db.execute(
+        select(func.count()).select_from(Equipment).where(Equipment.equipment_code == code)
+    )).scalar():
+        seq += 1
+        code = f"EQ-{payload.factory_id[-4:]}-{seq + 1:03d}"
+
+    eq = Equipment(
+        equipment_code=code,
+        factory_id=payload.factory_id,
+        station_id=station_id,
+        equipment_name=name,
+        equipment_type=(payload.equipment_type or "").lower() or None,
+        manufacturer_model=payload.model,
+        serial_number=payload.serial_number,
+        status="available",
+        responsible_engineer_id=payload.responsible_engineer_id,
+    )
+    db.add(eq)
+    await db.commit()
+    await db.refresh(eq)
+    return {
+        "success": True,
+        "id": str(eq.id),
+        "equipment_code": eq.equipment_code,
+        "equipment_name": eq.equipment_name,
+        "station_id": eq.station_id,
+        "status": eq.status,
+    }
 
 
 @router.get("/{equipment_id}", summary="Get equipment details")

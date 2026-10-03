@@ -75,7 +75,7 @@ const PreventiveMaintenance: React.FC = () => {
         params.date_to = dateRange[1].format('YYYY-MM-DD');
       }
       
-      const response = await axios.get(`${API_BASE_URL}/equipment/maintenance/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/maintenance/`, { params });
       setTasks(response.data.tasks || []);
       setTotal(response.data.total || 0);
     } catch (error) {
@@ -89,7 +89,7 @@ const PreventiveMaintenance: React.FC = () => {
   // Fetch statistics
   const fetchStats = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/equipment/maintenance/stats/`);
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/maintenance/stats/`);
       setStats(response.data);
     } catch (error) {
       console.error('Failed to fetch maintenance stats:', error);
@@ -116,7 +116,7 @@ const PreventiveMaintenance: React.FC = () => {
   const handleCreate = async (values: any) => {
     setSubmitLoading(true);
     try {
-      await axios.post(`${API_BASE_URL}/equipment/maintenance/`, values);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/maintenance/`, values);
       message.success('Maintenance task created successfully');
       setCreateModalVisible(false);
       createForm.resetFields();
@@ -133,7 +133,7 @@ const PreventiveMaintenance: React.FC = () => {
   // Handle complete task
   const handleComplete = async (id: string) => {
     try {
-      await axios.post(`${API_BASE_URL}/equipment/maintenance/${id}/complete`);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/maintenance/${id}/complete`);
       message.success('Task marked as completed');
       fetchTasks();
       fetchStats();

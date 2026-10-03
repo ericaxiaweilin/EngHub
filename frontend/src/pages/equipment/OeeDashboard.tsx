@@ -47,7 +47,7 @@ const OeeDashboard: React.FC = () => {
         params.date_to = dateRange[1].format('YYYY-MM-DD');
       }
 
-      const response = await axios.get(`${API_BASE_URL}/equipment/oee/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/oee/`, { params });
       setOeeData(response.data);
     } catch (error) {
       console.error('Failed to fetch OEE data:', error);
@@ -65,7 +65,7 @@ const OeeDashboard: React.FC = () => {
         params.date_to = dateRange[1].format('YYYY-MM-DD');
       }
 
-      const response = await axios.get(`${API_BASE_URL}/equipment/downtime/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/downtime/`, { params });
       setDowntimeRecords(response.data.records || []);
     } catch (error) {
       console.error('Failed to fetch downtime data:', error);

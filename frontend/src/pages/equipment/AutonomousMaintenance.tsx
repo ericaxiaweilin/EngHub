@@ -82,7 +82,7 @@ const AutonomousMaintenance: React.FC = () => {
         params.date_to = dateRange[1].format('YYYY-MM-DD');
       }
       
-      const response = await axios.get(`${API_BASE_URL}/equipment/autonomous-maintenance/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/autonomous-maintenance/`, { params });
       setTasks(response.data.tasks || []);
       setTotal(response.data.total || 0);
     } catch (error) {
@@ -96,7 +96,7 @@ const AutonomousMaintenance: React.FC = () => {
   // Fetch statistics
   const fetchStats = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/equipment/autonomous-maintenance/stats/`);
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/autonomous-maintenance/stats/`);
       setStats(response.data);
     } catch (error) {
       console.error('Failed to fetch stats:', error);
@@ -128,7 +128,7 @@ const AutonomousMaintenance: React.FC = () => {
         checklist_items: checklist.filter(item => item.item.trim()),
         performed_by: values.performed_by
       };
-      await axios.post(`${API_BASE_URL}/equipment/autonomous-maintenance/`, payload);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/autonomous-maintenance/`, payload);
       message.success('Autonomous maintenance task created successfully');
       setCreateModalVisible(false);
       createForm.resetFields();

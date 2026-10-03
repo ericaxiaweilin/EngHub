@@ -75,7 +75,7 @@ const MaintenanceCenter: React.FC = () => {
         params.date_to = dateRange[1].format('YYYY-MM-DD');
       }
       
-      const response = await axios.get(`${API_BASE_URL}/equipment/maintenance-orders/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/maintenance-orders/`, { params });
       setOrders(response.data.orders || []);
       setTotal(response.data.total || 0);
     } catch (error) {
@@ -89,7 +89,7 @@ const MaintenanceCenter: React.FC = () => {
   // Fetch statistics
   const fetchStats = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/equipment/maintenance-orders/stats/`);
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/maintenance-orders/stats/`);
       setStats(response.data);
     } catch (error) {
       console.error('Failed to fetch stats:', error);
@@ -116,7 +116,7 @@ const MaintenanceCenter: React.FC = () => {
   const handleCreate = async (values: any) => {
     setSubmitLoading(true);
     try {
-      await axios.post(`${API_BASE_URL}/equipment/maintenance-orders/`, values);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/maintenance-orders/`, values);
       message.success('Maintenance order created successfully');
       setCreateModalVisible(false);
       createForm.resetFields();
@@ -133,7 +133,7 @@ const MaintenanceCenter: React.FC = () => {
   // Handle assign
   const handleAssign = async (id: string, assignedTo: string) => {
     try {
-      await axios.post(`${API_BASE_URL}/equipment/maintenance-orders/${id}/assign`, {
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/maintenance-orders/${id}/assign`, {
         assigned_to: assignedTo
       });
       message.success('Order assigned successfully');
@@ -147,7 +147,7 @@ const MaintenanceCenter: React.FC = () => {
   // Handle start
   const handleStart = async (id: string) => {
     try {
-      await axios.post(`${API_BASE_URL}/equipment/maintenance-orders/${id}/start`);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/maintenance-orders/${id}/start`);
       message.success('Maintenance started');
       fetchOrders();
     } catch (error) {
@@ -159,7 +159,7 @@ const MaintenanceCenter: React.FC = () => {
   // Handle complete
   const handleComplete = async (id: string) => {
     try {
-      await axios.post(`${API_BASE_URL}/equipment/maintenance-orders/${id}/complete`);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/maintenance-orders/${id}/complete`);
       message.success('Maintenance completed');
       fetchOrders();
       fetchStats();

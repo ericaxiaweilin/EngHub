@@ -3,6 +3,7 @@ import { Card, Table, Button, Tag, Space, Input, Select, Modal, Form, message, T
 import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
+import { getActiveFactoryId } from '../../utils/factory';
 
 const { Title, Text } = Typography;
 const { TextArea } = Input;
@@ -45,6 +46,7 @@ const EquipmentCenter: React.FC = () => {
     setLoading(true);
     try {
       const params: any = {
+        factory_id: getActiveFactoryId(),
         limit: pagination.pageSize,
         offset: (pagination.current - 1) * pagination.pageSize
       };
@@ -59,7 +61,7 @@ const EquipmentCenter: React.FC = () => {
         params.status = statusFilter;
       }
       
-      const response = await axios.get(`${API_BASE_URL}/equipment/`, { params });
+      const response = await axios.get(`${API_BASE_URL}/api/v1/equipment/`, { params });
       setEquipment(response.data.equipment || []);
       setTotal(response.data.total || 0);
     } catch (error) {
@@ -89,7 +91,7 @@ const EquipmentCenter: React.FC = () => {
   const handleCreate = async (values: any) => {
     setSubmitLoading(true);
     try {
-      await axios.post(`${API_BASE_URL}/equipment/`, values);
+      await axios.post(`${API_BASE_URL}/api/v1/equipment/`, { ...values, factory_id: getActiveFactoryId() });
       message.success('Equipment created successfully');
       setCreateModalVisible(false);
       createForm.resetFields();
