@@ -164,8 +164,13 @@ class SectionSummary(BaseModel):
     avg_load_rate: float
     peak_load_rate: float
     peak_day: int
-    is_bottleneck: bool       # 峰值 > 1.0（含加班仍过载）
+    is_bottleneck: bool       # 峰值 > 1.0（含加班仍过载）或需求压力率 > 1.0
     overtime_used_hours: float
+    # ---- 需求缺口口径（load 受加班上限钳位，无法表达超载倍数，缺口单独计） ----
+    unmet_hours: float = 0.0      # 计划期内排不下、必须延期的工时
+    demand_hours: float = 0.0     # 期内已排 + 缺口 = 该工段真实需求工时
+    pressure_rate: float = 0.0    # demand_hours / 基准产能，不设上限
+    binding_resource: str = ""    # labor / machine / both —— 加人有没有用的判据
     series: List[SectionDayLoad]
 
 
@@ -326,6 +331,8 @@ class BlockingPoint(BaseModel):
     wip_peak: int                   # 在制积压峰值（件）
     avg_wait_days: float            # 平均工序等待天数
     delayed_orders: int             # 经此工段且延期的订单数
+    unmet_hours: float = 0.0        # 排不进计划期的工时（缺口）
+    pressure_rate: float = 0.0      # 需求压力率（不设上限）
     detail: str                     # 卡点说明
 
 
@@ -377,6 +384,9 @@ class FactoryKPIs(BaseModel):
     wip_peak: int
     imbalance_index: float    # 各工段平均负荷率的极差，越大说明订单结构对部门负荷分化越明显
     overtime_hours: float
+    # ---- 需求缺口（load 会被加班上限钳位，缺口只能这样表达）----
+    total_unmet_hours: float = 0.0   # 全厂计划期内排不下的工时合计
+    max_pressure_rate: float = 0.0   # 最紧工段的需求压力率（不设上限）
     # ---- 产出 / 人力 / PO 扩展 ----
     total_output: int = 0          # 计划期成品产出总量
     good_output: int = 0           # 良品产出

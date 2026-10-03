@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert as AntAlert, Badge, Button, Card, Col, Divider, Empty, InputNumber, Progress, Rate, Row, Segmented,
   Select, Slider, Space, Switch, Table, Tabs, Tag, Tooltip, Typography, message,
@@ -11,7 +11,7 @@ import {
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import {
-  BLOCKING_TYPE_COLOR, BLOCKING_TYPE_LABEL, FactoryScenarioMeta, FactorySimConfig,
+  BLOCKING_TYPE_COLOR, BLOCKING_TYPE_LABEL, FactoryKPIs, FactoryScenarioMeta, FactorySimConfig,
   FactorySimResult, OrderInput, OrderResult, OrderSectionLoad, OutboundOrder, PRIORITY_COLOR,
   PRIORITY_LABEL, Priority, ProductionOrderResult, ProductionStrategy, SectionConfig, STRATEGY_LABEL,
   WorkshopConfig, getFactoryScenario, getFactoryScenarios, runFactorySimulation,
@@ -77,6 +77,20 @@ export const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => 
     { title: '产能工时', dataIndex: 'total_capacity_hours', key: 'ch', width: 90, render: (v: number) => `${v}h` },
     { title: '平均负荷', dataIndex: 'avg_load_rate', key: 'ar', width: 90, render: (v: number) => pct(v) },
     { title: '峰值负荷', dataIndex: 'peak_load_rate', key: 'pr', width: 120, render: (v: number, r: any) => `${pct(v, 0)}（第${(r.peak_day ?? 0) + 1}天）` },
+    { title: '需求工时', dataIndex: 'demand_hours', key: 'dh', width: 90, render: (v: number) => `${v}h` },
+    {
+      title: '缺口', dataIndex: 'unmet_hours', key: 'uh', width: 76,
+      render: (v: number) => (v > 0.5 ? <span style={{ color: '#f5222d' }}>{v.toFixed(0)}h</span> : '-'),
+    },
+    {
+      // 负荷率受加班上限钳位（最高 1.2），压力率才是真实超载倍数
+      title: '需求压力', dataIndex: 'pressure_rate', key: 'pp', width: 88,
+      render: (v: number) => <span style={{ color: v >= 1 ? '#f5222d' : '#52c41a', fontWeight: v >= 1 ? 700 : 400 }}>{pct(v, 0)}</span>,
+    },
+    {
+      title: '产能钳位', dataIndex: 'binding_resource', key: 'br', width: 80,
+      render: (v: string) => ({ labor: '人力', machine: '机台', both: '人机' } as Record<string, string>)[v] || '-',
+    },
   ]
   const orderCols: ColumnsType<any> = [
     { title: '订单', dataIndex: 'order_code', key: 'code', render: (v: string, r: any) => v || r.order_id },
@@ -92,6 +106,14 @@ export const KpiStrip: React.FC<{ result: FactorySimResult }> = ({ result }) => 
     { title: '工段', dataIndex: 'section_name', key: 'sn' },
     { title: '类型', dataIndex: 'blocking_type', key: 'bt', width: 90, render: (v: string) => <Tag color={(BLOCKING_TYPE_COLOR as Record<string, string>)[v]}>{(BLOCKING_TYPE_LABEL as Record<string, string>)[v] || v}</Tag> },
     { title: '峰值负荷', dataIndex: 'peak_load_rate', key: 'pl', width: 90, render: (v: number) => pct(v, 0) },
+    {
+      title: '需求压力', dataIndex: 'pressure_rate', key: 'bp', width: 88,
+      render: (v: number) => <span style={{ color: v >= 1 ? '#f5222d' : '#52c41a', fontWeight: v >= 1 ? 700 : 400 }}>{pct(v, 0)}</span>,
+    },
+    {
+      title: '缺口', dataIndex: 'unmet_hours', key: 'bu', width: 76,
+      render: (v: number) => (v > 0.5 ? <span style={{ color: '#f5222d' }}>{v.toFixed(0)}h</span> : '-'),
+    },
     { title: '过载天数', dataIndex: 'overload_days', key: 'od', width: 80 },
     { title: '积压峰值', dataIndex: 'wip_peak', key: 'wp', width: 90, render: (v: number) => `${v} 件` },
     { title: '说明', dataIndex: 'detail', key: 'dt' },
@@ -1049,6 +1071,30 @@ export const BlockingAnalysisPanel: React.FC<{ result: FactorySimResult }> = ({ 
   )
 }
 
+/* ==================== WHAT-IF 推演辅助 ==================== */
+
+/** 参数合法性：返回错误文案，null 表示可提交 */
+const configError = (cfg: FactorySimConfig): string | null => {
+  if (!cfg.orders.length) return '至少保留一张订单'
+  for (const o of cfg.orders) {
+    if (o.release_day >= cfg.horizon_days) {
+      return `订单 ${o.order_id}：投放日(D${o.release_day + 1})超出计划期(${cfg.horizon_days}天)`
+    }
+    if (o.due_day <= o.release_day) return `订单 ${o.order_id}：交期日必须晚于投放日`
+  }
+  return null
+}
+
+/** 只取影响解算的字段并规范化顺序：拖拽排序/改布局不会触发重算 */
+const configSignature = (cfg: FactorySimConfig): string => JSON.stringify({
+  h: cfg.horizon_days, v: cfg.demand_variability_pct, ot: cfg.overtime_allowed, sd: cfg.seed,
+  ws: [...cfg.workshops].sort((a, b) => a.workshop_id.localeCompare(b.workshop_id)),
+  sec: [...cfg.sections].sort((a, b) => a.section_id.localeCompare(b.section_id)),
+  rt: [...cfg.routings].sort((a, b) => a.routing_id.localeCompare(b.routing_id))
+    .map((r) => ({ id: r.routing_id, ops: [...r.operations].sort((a, b) => a.op_no - b.op_no) })),
+  ord: [...cfg.orders].sort((a, b) => a.order_id.localeCompare(b.order_id)),
+})
+
 /* ==================== 主面板 ==================== */
 
 const FactoryLoadSim: React.FC = () => {
@@ -1064,30 +1110,33 @@ const FactoryLoadSim: React.FC = () => {
   const [tags, setTags] = useState<string[]>([])
   /* 三区工作台视图：产线组态 / 参数配置 / 仿真结果 */
   const [view, setView] = useState<'topology' | 'config' | 'results'>('topology')
+  /* WHAT-IF 后台自动推演状态 */
+  const [recomputing, setRecomputing] = useState(false)
+  const [recomputeError, setRecomputeError] = useState<string | null>(null)
+  const [baseline, setBaseline] = useState<FactoryKPIs | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const appliedSig = useRef('')
 
-  /* ---------- 运行仿真（成功返回 true） ---------- */
-  const runSim = useCallback(async (cfg: FactorySimConfig): Promise<boolean> => {
-    if (!cfg.orders.length) { message.warning('至少保留一张订单'); return false }
-    for (const o of cfg.orders) {
-      if (o.release_day >= cfg.horizon_days) {
-        message.error(`订单 ${o.order_id}：投放日(D${o.release_day + 1})超出计划期(${cfg.horizon_days}天)`)
-        return false
-      }
-      if (o.due_day <= o.release_day) {
-        message.error(`订单 ${o.order_id}：交期日必须晚于投放日`)
-        return false
-      }
-    }
+  /* ---------- 运行仿真（返回解算结果，失败返回 null） ---------- */
+  const runSim = useCallback(async (cfg: FactorySimConfig): Promise<FactorySimResult | null> => {
+    const err = configError(cfg)
+    if (err) { message.warning(err); return null }
+    appliedSig.current = configSignature(cfg)
+    abortRef.current?.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
     setLoading(true)
     try {
-      const res = await runFactorySimulation(cfg)
+      const res = await runFactorySimulation(cfg, ac.signal)
       setResult(res)
-      return true
+      setRecomputeError(null)
+      return res
     } catch (e: any) {
-      message.error(e?.response?.data?.detail || '仿真运行失败')
-      return false
+      if (!ac.signal.aborted) message.error(e?.response?.data?.detail || '仿真运行失败')
+      return null
     } finally {
       setLoading(false)
+      if (abortRef.current === ac) setRecomputing(false)
     }
   }, [])
 
@@ -1101,7 +1150,9 @@ const FactoryLoadSim: React.FC = () => {
       setTags(sc.tags || [])
       setActiveId(sc.scenario_id)
       setResult(null)
-      await runSim(sc.config)
+      setBaseline(null)
+      const res = await runSim(sc.config)
+      setBaseline(res?.kpis ?? null)
     } catch {
       message.error('场景加载失败')
     } finally {
@@ -1114,6 +1165,29 @@ const FactoryLoadSim: React.FC = () => {
     getFactoryScenarios().then(setScenarios).catch(() => { /* 列表拉取失败不阻塞 */ })
   }, [])
   useEffect(() => { loadScenario() }, [loadScenario])
+
+  /* ---------- WHAT-IF：参数一变即自动重算（debounce 180ms + 丢弃过期响应） ---------- */
+  useEffect(() => {
+    if (!config) return
+    const sig = configSignature(config)
+    if (sig === appliedSig.current || configError(config)) return
+    const t = setTimeout(() => {
+      appliedSig.current = sig
+      abortRef.current?.abort()
+      const ac = new AbortController()
+      abortRef.current = ac
+      setRecomputing(true)
+      runFactorySimulation(config, ac.signal)
+        .then((res) => { setResult(res); setRecomputeError(null) })
+        .catch((e: any) => {
+          if (ac.signal.aborted) return
+          appliedSig.current = ''
+          setRecomputeError(e?.response?.data?.detail || '自动推演失败，画面为上一版结果')
+        })
+        .finally(() => { if (abortRef.current === ac) setRecomputing(false) })
+    }, 180)
+    return () => clearTimeout(t)
+  }, [config])
 
   /* ---------- 参数修改 ---------- */
   const patch = useCallback((p: Partial<FactorySimConfig>) => setConfig((c) => (c ? { ...c, ...p } : c)), [])
@@ -1225,6 +1299,23 @@ const FactoryLoadSim: React.FC = () => {
     })
   }, [])
 
+  /** 自动布局用：按工艺层级重排各车间内的工段顺序（不改变归属） */
+  const reorderSections = useCallback((order: Record<string, string[]>) => {
+    setConfig((c) => {
+      if (!c) return c
+      const pos = (wid: string, sid: string) => {
+        const i = (order[wid] || []).indexOf(sid)
+        return i < 0 ? Number.MAX_SAFE_INTEGER : i
+      }
+      const known = c.workshops.flatMap((w) => c.sections
+        .filter((s) => s.workshop_id === w.workshop_id)
+        .sort((a, b) => pos(w.workshop_id, a.section_id) - pos(w.workshop_id, b.section_id)
+          || a.section_id.localeCompare(b.section_id)))
+      const orphan = c.sections.filter((s) => !c.workshops.some((w) => w.workshop_id === s.workshop_id))
+      return { ...c, sections: [...known, ...orphan] }
+    })
+  }, [])
+
   if (!config) {
     return <Card><Empty description={booting ? '场景加载中…' : '场景加载失败'} /></Card>
   }
@@ -1313,6 +1404,13 @@ const FactoryLoadSim: React.FC = () => {
           </Col>
           <Col>
             <Space>
+              {recomputing && <Tag color="processing" style={{ marginRight: 0 }}>WHAT-IF 推演中</Tag>}
+              {!recomputing && recomputeError && (
+                <Tooltip title={recomputeError}><Tag color="error" style={{ marginRight: 0 }}>自动推演失败</Tag></Tooltip>
+              )}
+              {!recomputing && !!configError(config) && (
+                <Tooltip title={configError(config) || ''}><Tag color="warning" style={{ marginRight: 0 }}>参数待修正</Tag></Tooltip>
+              )}
               <Button icon={<ReloadOutlined />} onClick={() => loadScenario(activeId)}>重置场景</Button>
               <Button type="primary" icon={<ThunderboltOutlined />} loading={loading}
                 onClick={async () => { if (await runSim(config)) setView('results') }}>
@@ -1333,11 +1431,12 @@ const FactoryLoadSim: React.FC = () => {
             label: <span><DeploymentUnitOutlined /> 产线组态</span>,
             children: (
               <FlowTopology
-                config={config} result={result} scenarioId={activeId}
+                config={config} result={result} scenarioId={activeId} computing={recomputing}
+                baseline={baseline}
                 onPatchSection={patchSection} onPatchWorkshop={patchWorkshop}
                 onAddWorkshop={addWorkshop} onAddSection={addSection}
                 onRemoveWorkshop={removeWorkshop} onRemoveSection={removeSection}
-                onMoveSection={moveSection}
+                onMoveSection={moveSection} onReorderSections={reorderSections}
               />
             ),
           },

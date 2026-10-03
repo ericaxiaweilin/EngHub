@@ -49,7 +49,7 @@ EPS = 1e-6
 
 
 class FactoryLoadEngine:
-    VERSION = "1.0.0"
+    VERSION = "1.1.0"
 
     # ------------------------------------------------------------------ #
     # 主入口
@@ -74,6 +74,7 @@ class FactoryLoadEngine:
 
         base_cap: Dict[str, List[float]] = {}
         ot_cap: Dict[str, List[float]] = {}
+        binding: Dict[str, str] = {}
         for s in config.sections:
             # 技能影响产能：携带真实员工花名册时，按平均技能等级修正人力产能
             # （无 real_workers 的既有合成场景 sf=1.0，行为不变）
@@ -88,6 +89,13 @@ class FactoryLoadEngine:
                 if s.machines > 0 else float("inf")
             )
             daily = min(labor, machine)
+            # 钳位来源：告诉使用者"加人有没有用"——machine 钳位时加人无效，反之有效
+            if machine < labor - EPS:
+                binding[s.section_id] = "machine"
+            elif labor < machine - EPS:
+                binding[s.section_id] = "labor"
+            else:
+                binding[s.section_id] = "both"
             ot_factor = 1.0 + s.max_overtime_pct if config.overtime_allowed else 1.0
             base_cap[s.section_id] = [
                 daily if is_workday(s.workshop_id, d) else 0.0 for d in range(horizon)
@@ -95,6 +103,9 @@ class FactoryLoadEngine:
             ot_cap[s.section_id] = [c * ot_factor for c in base_cap[s.section_id]]
 
         load: Dict[str, List[float]] = {sid: [0.0] * horizon for sid in sections}
+        # 排不进计划期的需求工时（正排溢出 / MTS 池延展到计划期外）——
+        # load 因受加班产能钳位永远 ≤1.2，缺口只能记在这里，否则"13 倍超载"显示成"接近满载"
+        unmet: Dict[str, float] = {sid: 0.0 for sid in sections}
 
         # ---------- 2. 订单展开为工序工时 ---------- #
         expanded: List[Tuple[OrderInput, list]] = []
@@ -139,7 +150,7 @@ class FactoryLoadEngine:
         for order, ops in expanded:
             sched = self._schedule_order(order, ops, mts_pool, mts_cursor,
                                          base_cap, ot_cap, load, sections,
-                                         is_workday, nominal_daily, horizon)
+                                         is_workday, nominal_daily, horizon, unmet)
             completion_day = max(item["end_day"] for item in sched.values())
             delay = max(0, completion_day - order.due_day)
             total_wh = sum(i["work_hours"] for i in ops)
@@ -201,7 +212,8 @@ class FactoryLoadEngine:
 
         # ---------- 6. 汇总 ---------- #
         section_summaries = self._summarize_sections(
-            config, sections, workshops, base_cap, load, is_workday, horizon, wip_matrix
+            config, sections, workshops, base_cap, load, is_workday, horizon, wip_matrix,
+            unmet, binding,
         )
         order_section_loads = self._order_section_loads(order_op_hours, sections, load)
         wip_curve = self._wip_curve(order_results, horizon)
@@ -330,9 +342,10 @@ class FactoryLoadEngine:
             ))
 
         # ---------- 9c. 卡点检测（过载 / WIP 积压 / 工序等待 三信号） ---------- #
+        summary_by_id = {s.section_id: s for s in section_summaries}
         blocking_points = self._blocking_points(
             config, sections, workshops, base_cap, load, wip_matrix, section_wait,
-            order_results, horizon,
+            order_results, horizon, summary_by_id,
         )
 
         # ---------- 10. 工人花名册 ---------- #
@@ -393,7 +406,7 @@ class FactoryLoadEngine:
         ops: list,
         mts_pool: Dict[str, float],
         mts_cursor: Dict[str, float],
-        base_cap, ot_cap, load, sections, is_workday, nominal_daily, horizon,
+        base_cap, ot_cap, load, sections, is_workday, nominal_daily, horizon, unmet,
     ) -> Dict[int, dict]:
         """
         返回 {op_no: op item(含 start_day/end_day)}
@@ -411,7 +424,7 @@ class FactoryLoadEngine:
                 start_day, end_day, end_float = self._consume_mts(
                     sid, item["work_hours"], start_float,
                     base_cap, load, sections[sid].workshop_id,
-                    is_workday, nominal_daily, horizon,
+                    is_workday, nominal_daily, horizon, unmet,
                 )
                 mts_cursor[sid] = end_float
                 item["start_day"] = start_day
@@ -457,7 +470,7 @@ class FactoryLoadEngine:
                     if cursor is not None:
                         from_day = max(from_day, cursor)
                     start_day, end_day = self._pour_forward(
-                        sid, item["work_hours"], from_day, ot_cap, load, horizon
+                        sid, item["work_hours"], from_day, ot_cap, load, horizon, unmet
                     )
                     item["start_day"], item["end_day"] = start_day, end_day
                     sched[item["op"].op_no] = item
@@ -466,7 +479,7 @@ class FactoryLoadEngine:
         return sched
 
     def _consume_mts(self, sid, work_hours, start_float, base_cap, load,
-                     workshop_id, is_workday, nominal_daily, horizon):
+                     workshop_id, is_workday, nominal_daily, horizon, unmet):
         """MTS 池按产能节拍消耗：每个工作日最多消耗基准产能（负荷恒定=均衡生产）。
         池清空即完成；总工时超出计划期产能时按名义产能虚拟延展（返回超出计划期的结束日）。"""
         remaining = work_hours
@@ -489,6 +502,8 @@ class FactoryLoadEngine:
                     take = min(remaining, avail)
                     if d < horizon:
                         load[sid][d] += take
+                    else:
+                        unmet[sid] += take  # 计划期外才能做完的工时 = 真实缺口
                     if first_day is None:
                         first_day = d
                     remaining -= take
@@ -496,6 +511,8 @@ class FactoryLoadEngine:
                     day_start_frac = frac if d == int(floor(start_float)) else 0.0
                     end_float = float(d) + day_start_frac + take / base
             d += 1
+        if remaining > EPS:  # 迭代保护上限触发：未消耗的池内工时同样计为缺口
+            unmet[sid] += remaining
         if first_day is None:
             first_day = last_day = max(0, int(floor(start_float)))
         return first_day, last_day, end_float
@@ -527,7 +544,7 @@ class FactoryLoadEngine:
             start_day = end_day = max(earliest_day, 0)
         return start_day, end_day, placed
 
-    def _pour_forward(self, sid, work_hours, from_day, ot_cap, load, horizon):
+    def _pour_forward(self, sid, work_hours, from_day, ot_cap, load, horizon, unmet):
         """从 from_day 向后正排。容量耗尽 → 剩余工时延伸到计划期外（完工日延后）。"""
         remaining = work_hours
         start_day = end_day = None
@@ -545,7 +562,8 @@ class FactoryLoadEngine:
             d += 1
         if remaining > EPS:
             # 计划期内产能已饱和 → 剩余工时延伸到计划期之外（不伪造负荷尖峰，
-            # 通过完工日延后、延期告警如实反映）
+            # 通过完工日延后、延期告警如实反映；工时本身计入缺口，避免凭空消失）
+            unmet[sid] += remaining
             workday_caps = [c for c in ot_cap[sid] if c > EPS]
             daily = sum(workday_caps) / len(workday_caps) if workday_caps else 8.0
             ext = ceil(remaining / daily)
@@ -561,7 +579,10 @@ class FactoryLoadEngine:
     # 汇总
     # ------------------------------------------------------------------ #
     def _summarize_sections(self, config, sections, workshops, base_cap, load,
-                            is_workday, horizon, wip_matrix=None) -> List[SectionSummary]:
+                            is_workday, horizon, wip_matrix=None,
+                            unmet=None, binding=None) -> List[SectionSummary]:
+        unmet = unmet or {}
+        binding = binding or {}
         summaries: List[SectionSummary] = []
         for s in config.sections:
             ws = workshops[s.workshop_id]
@@ -585,6 +606,12 @@ class FactoryLoadEngine:
             total_load = sum(load[s.section_id])
             total_cap = sum(base_cap[s.section_id])
             avg_rate = total_load / total_cap if total_cap > EPS else 0.0
+            # 需求压力率 = (期内已排工时 + 排不进计划期的工时) / 基准产能。
+            # 负荷率被加班上限钳死（最高 1.2），只有压力率能表达"5 倍超载"这类真实缺口。
+            unmet_h = unmet.get(s.section_id, 0.0)
+            demand_total = total_load + unmet_h
+            pressure = (demand_total / total_cap if total_cap > EPS
+                        else (999.0 if demand_total > EPS else 0.0))
             summaries.append(SectionSummary(
                 section_id=s.section_id, name=s.name,
                 workshop_id=s.workshop_id, workshop_name=ws.name,
@@ -597,8 +624,12 @@ class FactoryLoadEngine:
                 avg_load_rate=round(avg_rate, 3),
                 peak_load_rate=round(peak_rate, 2),
                 peak_day=peak_day,
-                is_bottleneck=peak_rate > 1.0 + EPS,
+                is_bottleneck=peak_rate > 1.0 + EPS or pressure > 1.0 + EPS,
                 overtime_used_hours=round(ot_used, 1),
+                unmet_hours=round(unmet_h, 1),
+                demand_hours=round(demand_total, 1),
+                pressure_rate=round(pressure, 3),
+                binding_resource=binding.get(s.section_id, ""),
                 series=series,
             ))
         return summaries
@@ -677,20 +708,29 @@ class FactoryLoadEngine:
                     order_id=o.order_id,
                 ))
 
-        # 瓶颈工段
+        # 瓶颈工段（压力率 > 峰值时以压力率为准，并给出"加人还是加设备"的可行建议）
         for s in summaries:
             if s.is_bottleneck:
+                gap = (f"，需求为产能的 {s.pressure_rate * 100:.0f}%"
+                       f"（{s.unmet_hours:.0f}h 排不进计划期）" if s.unmet_hours > EPS else "")
+                if s.binding_resource == "machine":
+                    advice = "该工段受人机配比中的机台钳位，增员不增产，需增设备/外协或拆分批次"
+                elif s.binding_resource == "labor":
+                    advice = "该工段由人力钳位，增员或加班次可直接增产"
+                else:
+                    advice = "人力与机台同时钳位，增员与增设备需按同一比例投入"
                 alerts.append(FactoryAlert(
                     level="warning", category="bottleneck",
-                    title=f"瓶颈工段：{s.name}（峰值负荷 {s.peak_load_rate * 100:.0f}%）",
+                    title=f"瓶颈工段：{s.name}（峰值负荷 {s.peak_load_rate * 100:.0f}%{gap}）",
                     detail=(f"峰值出现在第{s.peak_day + 1}天；平均负荷 {s.avg_load_rate * 100:.0f}%，"
-                            f"加班 {s.overtime_used_hours:.0f}h；建议增员/增设备或拆分批次"),
+                            f"加班 {s.overtime_used_hours:.0f}h；{advice}"),
                     section_id=s.section_id,
                 ))
 
-        # 闲置工段
+        # 闲置工段（负荷低但需求压力也低才算真闲置；缺口工段负荷为 0 是排不下，不是没事干）
         for s in summaries:
-            if s.avg_load_rate < 0.35 and s.total_capacity_hours > 0:
+            if (s.avg_load_rate < 0.35 and s.pressure_rate < 0.35
+                    and s.total_capacity_hours > 0):
                 alerts.append(FactoryAlert(
                     level="info", category="idle",
                     title=f"{s.name} 负荷偏低（平均 {s.avg_load_rate * 100:.0f}%）",
@@ -716,7 +756,9 @@ class FactoryLoadEngine:
     # 卡点检测（过载 / WIP 积压 / 工序等待 三信号 → 综合严重度排行）
     # ------------------------------------------------------------------ #
     def _blocking_points(self, config, sections, workshops, base_cap, load,
-                         wip_matrix, section_wait, order_results, horizon) -> List[BlockingPoint]:
+                         wip_matrix, section_wait, order_results, horizon,
+                         summary_by_id=None) -> List[BlockingPoint]:
+        summary_by_id = summary_by_id or {}
         # 经此工段且延期的订单数
         delayed_by_section: Dict[str, int] = {sid: 0 for sid in sections}
         for res in order_results:
@@ -742,10 +784,13 @@ class FactoryLoadEngine:
             wip_peak = max(wip_matrix[sid]) if wip_matrix[sid] else 0
             waits = section_wait.get(sid, [])
             avg_wait = sum(waits) / len(waits) if waits else 0.0
+            sm = summary_by_id.get(sid)
             raw.append({
                 "s": s, "peak_rate": peak_rate, "peak_day": peak_day,
                 "overload_days": overload_days, "wip_peak": wip_peak,
                 "avg_wait": avg_wait, "delayed": delayed_by_section.get(sid, 0),
+                "pressure": sm.pressure_rate if sm else 0.0,
+                "unmet": sm.unmet_hours if sm else 0.0,
             })
 
         max_wip = max((r["wip_peak"] for r in raw), default=0)
@@ -753,7 +798,10 @@ class FactoryLoadEngine:
 
         # 归一化到 0~100 后加权：severity = 0.5×过载 + 0.3×积压 + 0.2×等待
         for r in raw:
-            overload_norm = min(100.0, max(0.0, r["peak_rate"] - 1.0) * 100.0)
+            # 过载信号取 max(日峰值, 需求压力率)：日峰值被加班上限钳死（最高 1.2），
+            # 长期超载的工段（如涂装 13 倍）只有压力率能反映
+            pressure = max(r["peak_rate"], r.get("pressure", r["peak_rate"]))
+            overload_norm = min(100.0, max(0.0, pressure - 1.0) * 100.0)
             wip_norm = (r["wip_peak"] / max_wip * 100.0) if max_wip > 0 else 0.0
             wait_norm = (r["avg_wait"] / max_wait * 100.0) if max_wait > EPS else 0.0
             r["severity"] = round(0.5 * overload_norm + 0.3 * wip_norm + 0.2 * wait_norm, 1)
@@ -775,7 +823,10 @@ class FactoryLoadEngine:
                 peak_day=r["peak_day"], peak_load_rate=round(r["peak_rate"], 2),
                 overload_days=r["overload_days"], wip_peak=r["wip_peak"],
                 avg_wait_days=round(r["avg_wait"], 1),
-                delayed_orders=r["delayed"], detail=self._blocking_detail(r),
+                delayed_orders=r["delayed"],
+                unmet_hours=round(r.get("unmet", 0.0), 1),
+                pressure_rate=round(r.get("pressure", 0.0), 2),
+                detail=self._blocking_detail(r),
             ))
         return points
 
@@ -784,6 +835,10 @@ class FactoryLoadEngine:
         parts = []
         if r["overload_days"] > 0:
             parts.append(f"过载 {r['overload_days']} 天，峰值负荷 {r['peak_rate'] * 100:.0f}%（第{r['peak_day'] + 1}天）")
+        unmet = r.get("unmet", 0.0)
+        pressure = r.get("pressure", 0.0)
+        if unmet > EPS:
+            parts.append(f"需求为产能的 {pressure * 100:.0f}%，{unmet:.0f}h 排不进计划期")
         if r["wip_peak"] > 0:
             parts.append(f"WIP 积压峰值 {r['wip_peak']} 件")
         if r["avg_wait"] > EPS:
@@ -798,6 +853,8 @@ class FactoryLoadEngine:
               blocking_points, outbound_orders, wip_matrix, section_wait) -> FactoryKPIs:
         total_load = sum(s.total_load_hours for s in summaries)
         total_cap = sum(s.total_capacity_hours for s in summaries)
+        total_unmet = sum(s.unmet_hours for s in summaries)
+        max_pressure = max((s.pressure_rate for s in summaries), default=0.0)
         peak = max((s.peak_load_rate for s in summaries), default=0.0)
         rates = [s.avg_load_rate for s in summaries if s.total_capacity_hours > 0]
         on_time = sum(1 for o in order_results if o.on_time)
@@ -823,6 +880,8 @@ class FactoryLoadEngine:
             wip_peak=max((p.wip_qty for p in wip_curve), default=0),
             imbalance_index=round(max(rates) - min(rates), 3) if rates else 0.0,
             overtime_hours=round(sum(s.overtime_used_hours for s in summaries), 1),
+            total_unmet_hours=round(total_unmet, 1),
+            max_pressure_rate=round(max_pressure, 3),
             total_output=total_output,
             good_output=good_output,
             scrap_output=scrap_output,

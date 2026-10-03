@@ -116,6 +116,14 @@ export interface SectionSummary {
   peak_day: number
   is_bottleneck: boolean
   overtime_used_hours: number
+  /** 计划期内排不下的工时（引擎 v1.1 起如实统计，负荷率受加班上限钳位无法表达） */
+  unmet_hours: number
+  /** 期内已排 + 缺口 = 工段真实需求工时 */
+  demand_hours: number
+  /** demand / 基准产能，不设上限（1.04 = 需略超产能，13.2 = 13 倍超载） */
+  pressure_rate: number
+  /** 产能钳位来源：labor 加人有效 / machine 加机台有效 / both 需同比投入 */
+  binding_resource: 'labor' | 'machine' | 'both' | ''
   series: SectionDayLoad[]
 }
 
@@ -277,6 +285,10 @@ export interface BlockingPoint {
   wip_peak: number
   avg_wait_days: number
   delayed_orders: number
+  /** 排不进计划期的工时 */
+  unmet_hours: number
+  /** 需求压力率（不设上限） */
+  pressure_rate: number
   detail: string
 }
 
@@ -314,6 +326,10 @@ export interface FactoryKPIs {
   wip_peak: number
   imbalance_index: number
   overtime_hours: number
+  /** 全厂计划期内排不下的工时合计 */
+  total_unmet_hours: number
+  /** 最紧工段的需求压力率 */
+  max_pressure_rate: number
   total_output: number
   good_output: number
   scrap_output: number
@@ -397,8 +413,8 @@ export const getFactoryScenarios = () =>
 export const getFactoryScenario = (scenarioId?: string) =>
   api.get<any, FactorySimScenarioResponse>(API_ENDPOINTS.SIM_FACTORY_SCENARIO(scenarioId))
 
-export const runFactorySimulation = (config: FactorySimConfig) =>
-  api.post<any, FactorySimResult>(API_ENDPOINTS.SIM_FACTORY_RUN, config)
+export const runFactorySimulation = (config: FactorySimConfig, signal?: AbortSignal) =>
+  api.post<any, FactorySimResult>(API_ENDPOINTS.SIM_FACTORY_RUN, config, { signal })
 
 export const getFactorySimDashboardResult = (scenarioId?: string) =>
   api.get<any, SimDashboardFullResult>(API_ENDPOINTS.SIM_FACTORY_DASHBOARD_SUMMARY(scenarioId))

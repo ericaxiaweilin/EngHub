@@ -331,16 +331,108 @@ body {
   border-left: 7px solid rgba(54, 207, 201, 0.75);
 }
 
-/* ==================== 组态编辑器（可拖拽画布） ==================== */
+/* ==================== 组态编辑器（无限画布拓扑） ==================== */
 
-/* 点阵网格画布 */
-.topo-canvas {
+/* 视口：裁剪 + 平移/缩放的承载层 */
+.topo-viewport {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(94, 140, 180, 0.28);
+  border-radius: 6px;
+  background: rgba(6, 17, 30, 0.55);
+  cursor: grab;
+  touch-action: none;
+}
+
+.topo-viewport.panning { cursor: grabbing; }
+
+/* 世界层：点阵网格画布，由 translate()/scale() 驱动 */
+.topo-bg {
   position: absolute;
   top: 0;
   left: 0;
   background-image: radial-gradient(circle, rgba(255, 255, 255, 0.09) 1px, transparent 1.5px);
   background-size: 22px 22px;
+  transform-origin: 0 0;
+  will-change: transform;
 }
+
+/* Mini-map 视口导航 */
+.topo-mm {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 196px;
+  height: 126px;
+  z-index: 4;
+  border: 1px solid rgba(94, 140, 180, 0.45);
+  border-radius: 6px;
+  background: rgba(5, 15, 26, 0.82);
+  cursor: crosshair;
+  touch-action: none;
+  overflow: hidden;
+}
+
+.topo-mm-node {
+  position: absolute;
+  border: 1px solid;
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.topo-mm-view {
+  position: absolute;
+  border: 1.5px solid rgba(255, 255, 255, 0.72);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.07);
+  pointer-events: none;
+}
+
+/* 画布左下角平移/导航开关 */
+.topo-stage-tools {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 4;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* WHAT-IF 增量对比条 */
+.topo-whatif {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px dashed rgba(54, 207, 201, 0.35);
+  border-radius: 6px;
+  background: rgba(54, 207, 201, 0.05);
+  font-size: 11px;
+  transition: opacity 0.2s ease;
+}
+
+.topo-whatif.dim { opacity: 0.45; }
+
+.topo-whatif-label {
+  color: #36cfc9;
+  font-weight: 800;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+}
+
+.topo-whatif-item { display: inline-flex; align-items: baseline; gap: 4px; color: rgba(255, 255, 255, 0.75); }
+.topo-whatif-item em { font-style: normal; color: rgba(255, 255, 255, 0.45); }
+.topo-whatif-item i { font-style: normal; color: rgba(255, 255, 255, 0.28); }
+.topo-whatif-item b, .topo-whatif-item strong, .topo-whatif-delta {
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+}
+.topo-whatif-item b { font-weight: 600; color: rgba(255, 255, 255, 0.45); }
+.topo-whatif-item strong { font-weight: 700; color: #fff; }
+.topo-whatif-delta { font-weight: 800; }
+.topo-whatif-hint { margin-left: auto; font-size: 10px; color: rgba(255, 255, 255, 0.35); }
 
 /* 车间容器 */
 .topo-ws {
@@ -415,9 +507,12 @@ body {
 
 .topo-end:active { cursor: grabbing; }
 
-/* SVG 连线流动动画 */
+/* SVG 连线流动动画：时长由边速（工时/堵塞）逐条内联指定 */
 @keyframes topo-dash { to { stroke-dashoffset: -28; } }
-.topo-edge { animation: topo-dash 1.4s linear infinite; }
+.topo-edge {
+  animation: topo-dash 1.4s linear infinite;
+  transition: stroke 0.35s ease, stroke-width 0.35s ease;
+}
 
 /* ==================== PMC 工作台布局 ==================== */
 .pmc-workbench-shell .ant-card {

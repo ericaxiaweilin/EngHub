@@ -35,6 +35,8 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
+    // 主动取消的请求不弹全局提示（组态 WHAT-IF 防抖会丢弃过期解算请求）
+    if (axios.isCancel(error)) return Promise.reject(error);
     const status = error.response?.status;
     // 未认证/登录过期：清除 token 并跳转登录页（保留记住密码供自动填充）
     if (status === 401) {

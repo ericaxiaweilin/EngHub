@@ -174,14 +174,36 @@ def _check_feasibility(result: FactorySimResult, checks: List[InvariantCheck]) -
         f"load_rate≠load/cap 违例(工段,日): {bad[:5]}" if bad else "负荷率核算自洽",
     ))
 
-    # 瓶颈识别 = 峰值负荷率 > 1.0
+    # 瓶颈识别 = 峰值负荷率 > 1.0 或 需求压力率 > 1.0
+    # （负荷率被加班上限钳位在 1.2，超载数倍的工段只能靠压力率识别，否则永远"看起来还行"）
     bad_b = [
         sec.section_id for sec in result.sections
-        if sec.is_bottleneck != (sec.peak_load_rate > 1.0 + EPS)
+        if sec.is_bottleneck != (
+            sec.peak_load_rate > 1.0 + EPS or sec.pressure_rate > 1.0 + EPS
+        )
     ]
     checks.append(_mk(
         "bottleneck_identification", "feasibility", not bad_b,
-        f"is_bottleneck≠(peak>1.0) 违例工段: {bad_b}" if bad_b else "瓶颈识别自洽",
+        f"is_bottleneck≠(peak>1.0 或 pressure>1.0) 违例工段: {bad_b}" if bad_b else "瓶颈识别自洽",
+    ))
+
+    # 需求守恒：需求工时 = 期内已排 + 计划期外缺口；压力率 = 需求 / 基准产能
+    bad_d, bad_p = [], []
+    for sec in result.sections:
+        if abs(sec.demand_hours - (sec.total_load_hours + sec.unmet_hours)) > 0.2:
+            bad_d.append(sec.section_id)
+        if sec.unmet_hours < -EPS:
+            bad_d.append(f"{sec.section_id}(负缺口)")
+        if sec.total_capacity_hours > EPS:
+            expect = sec.demand_hours / sec.total_capacity_hours
+            if abs(sec.pressure_rate - expect) > 0.02:
+                bad_p.append((sec.section_id, sec.pressure_rate, round(expect, 3)))
+        if sec.binding_resource not in ("labor", "machine", "both"):
+            bad_p.append((sec.section_id, "钳位来源缺失"))
+    checks.append(_mk(
+        "demand_hours_accounting", "feasibility", not bad_d and not bad_p,
+        f"需求守恒违例: {bad_d[:5]} 压力率违例: {bad_p[:5]}" if (bad_d or bad_p)
+        else f"需求=已排+缺口 守恒，{len(result.sections)} 个工段压力率/钳位来源自洽",
     ))
 
 
@@ -313,6 +335,17 @@ def _check_kpis(config: FactorySimConfig, result: FactorySimResult, checks: List
     checks.append(_mk(
         "headcount_consistent", "kpi", k.headcount == expect_hc,
         f"headcount={k.headcount} expect={expect_hc}",
+    ))
+
+    # 缺口 KPI = Σ各工段缺口；压力峰值 = max(工段压力率)
+    expect_unmet = round(sum(s.unmet_hours for s in result.sections), 1)
+    expect_press = round(max((s.pressure_rate for s in result.sections), default=0.0), 3)
+    checks.append(_mk(
+        "unmet_and_pressure_consistent", "kpi",
+        abs(k.total_unmet_hours - expect_unmet) < 0.2
+        and abs(k.max_pressure_rate - expect_press) < 0.001,
+        f"total_unmet={k.total_unmet_hours} expect={expect_unmet}; "
+        f"max_pressure={k.max_pressure_rate} expect={expect_press}",
     ))
 
     # 总产出 = Σ日产出 = 末日累计
