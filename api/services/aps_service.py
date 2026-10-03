@@ -313,6 +313,55 @@ class ApsService:
 
                 needed_stations.update(op.get("allowed_stations", []))
 
+        # 工艺路线里的 work_center 必须是本厂登记的工位。跨厂借用（机械厂的工序
+        # 指向电子厂的台账）不会报错，但负荷、设备归属、产能全部对不上，必须显式报给计划员。
+        used_station_codes = sorted({str(code) for code in needed_stations if code})
+        station_ownership: Dict[str, str] = {}
+        if used_station_codes:
+            ownership_result = await self.db.execute(
+                select(Station.station_code, Station.factory_id).where(
+                    Station.station_code.in_(used_station_codes)
+                )
+            )
+            station_ownership = {
+                str(row[0]): str(row[1]) for row in ownership_result.all() if row[0]
+            }
+
+        data_integrity_warnings: List[Dict[str, Any]] = []
+        for code in used_station_codes:
+            owner = station_ownership.get(code)
+            if owner is None:
+                data_integrity_warnings.append({
+                    "station_code": code,
+                    "issue": "not_registered",
+                    "severity": "warning",
+                    "detail": (
+                        f"工艺路线引用工位 {code}，但 stations 主数据里没有这个编码，"
+                        "排程只能把它当虚拟资源用，没有设备、没有日历来源。"
+                    ),
+                })
+            elif owner != factory_id:
+                data_integrity_warnings.append({
+                    "station_code": code,
+                    "issue": "owned_by_other_factory",
+                    "severity": "error",
+                    "owner_factory_id": owner,
+                    "detail": (
+                        f"工艺路线引用工位 {code}，但它登记在工厂 {owner} 名下，"
+                        f"本厂（{factory_id}）并没有该工位；工序会排到别的厂的台账上。"
+                    ),
+                })
+            if code not in capacity_map:
+                data_integrity_warnings.append({
+                    "station_code": code,
+                    "issue": "no_capacity_record",
+                    "severity": "warning",
+                    "detail": (
+                        f"工位 {code} 在本厂没有 station_capacity 记录，"
+                        "排程按默认 OEE 与单件流估算，产能数字不可信。"
+                    ),
+                })
+
         # 加载设备作为资源：按工位聚合其下所有设备，只要还有可用设备该工位就可排，
         # 避免扫到哪台设备就决定整个工位健康度。
         station_equipment: Dict[str, List] = {}
@@ -618,6 +667,8 @@ class ApsService:
             "scheduled_tasks": len(result.schedule),
             "pinned_tasks": pinned_count,
             "excluded_resources": sorted(excluded),
+            "data_integrity_warning_count": len(data_integrity_warnings),
+            "data_integrity_checked_stations": used_station_codes,
             # 只排进了部分工序（其余工序被产能挡住，但钉住的行按计划员意愿保留）
             "partial_orders": len(scheduled_order_ids & {str(o) for o in result.unscheduled_orders}),
         }
@@ -811,6 +862,7 @@ class ApsService:
             "diagnostics": {
                 "unscheduled": unscheduled_details,
                 "constraint_violations": violation_details,
+                "data_integrity": data_integrity_warnings,
             },
 
             "station_loads": station_loads,
@@ -1617,11 +1669,44 @@ class ApsService:
 
         resources.sort(key=lambda x: (-x["avg_utilization"], x["station_id"]))
 
+        # 负荷表里混进"别的厂的工位"时，利用率看着正常但归属是错的，必须单列告警
+        load_station_codes = [r["station_id"] for r in resources]
+        ownership: Dict[str, str] = {}
+        if load_station_codes:
+            own_rows = await self.db.execute(
+                select(Station.station_code, Station.factory_id).where(
+                    Station.station_code.in_(load_station_codes)
+                )
+            )
+            ownership = {str(row[0]): str(row[1]) for row in own_rows.all() if row[0]}
+        integrity_warnings = [
+            {
+                "station_code": code,
+                "issue": "owned_by_other_factory",
+                "owner_factory_id": ownership[code],
+                "detail": (
+                    f"工位 {code} 登记在工厂 {ownership[code]} 名下，"
+                    f"不属于本厂（{factory_id}），它的负荷不应计入本厂产能。"
+                ),
+            }
+            for code in load_station_codes
+            if ownership.get(code) and ownership[code] != factory_id
+        ] + [
+            {
+                "station_code": code,
+                "issue": "not_registered",
+                "detail": f"工位 {code} 在 stations 主数据里没有登记，产能取自默认日历估算。",
+            }
+            for code in load_station_codes
+            if code not in ownership
+        ]
+
         return {
             "factory_id": factory_id,
             "horizon_days": days,
             "daily_capacity_hours": round(sum(r["capacity_hours_per_day"] for r in resources), 2),
             "resources": resources,
+            "data_integrity": integrity_warnings,
             "bottleneck_count": sum(1 for r in resources if r["is_bottleneck"]),
             "load_basis": (
                 f"生效方案 {current_schedule.schedule_code}（V{current_schedule.version_number}）"

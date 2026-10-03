@@ -103,11 +103,16 @@ const ApsEnhanced: React.FC = () => {
       ...item,
       issue_type: '约束违规',
     })),
+    ...(diagnostics.data_integrity || []).map((item: any) => ({
+      ...item,
+      issue_type: '主数据',
+      reason: item.detail,
+    })),
   ]
 
   const issueColumns = [
-    { title: '类型', dataIndex: 'issue_type', key: 'issue_type', render: (value: string) => <Tag color={value === '未排工单' ? 'red' : 'orange'}>{value}</Tag> },
-    { title: '工单', dataIndex: 'work_order_code', key: 'work_order_code', render: (value: string, row: any) => value || row.order_id || '-' },
+    { title: '类型', dataIndex: 'issue_type', key: 'issue_type', render: (value: string) => <Tag color={value === '未排工单' ? 'red' : value === '主数据' ? 'volcano' : 'orange'}>{value}</Tag> },
+    { title: '工单/工位', dataIndex: 'work_order_code', key: 'work_order_code', render: (value: string, row: any) => value || row.order_id || row.station_code || '-' },
     { title: '产品', dataIndex: 'product_id', key: 'product_id', render: (value: string) => value || '-' },
     { title: '原因', dataIndex: 'reason', key: 'reason', render: (value: string) => <Text type="danger">{value || '未满足排程约束'}</Text> },
   ]
@@ -192,7 +197,7 @@ const ApsEnhanced: React.FC = () => {
             <Col xs={12} sm={8} md={4}><Statistic title="换型时间" value={metrics.total_setup_time ?? 0} suffix="分钟" /></Col>
           </Row>
 
-          {issueRows.length > 0 && <Card type="inner" title="异常工单与约束原因" size="small" style={{ marginBottom: 16 }}>
+          {issueRows.length > 0 && <Card type="inner" title="异常工单、约束违规与主数据问题" size="small" style={{ marginBottom: 16 }}>
             <Table columns={issueColumns} dataSource={issueRows} rowKey={(row: any, index) => `${row.issue_type}-${row.order_id || index}`} size="small" pagination={{ pageSize: 5, showSizeChanger: false }} />
           </Card>}
 
