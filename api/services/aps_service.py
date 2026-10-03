@@ -913,6 +913,118 @@ class ApsService:
             },
         }
 
+    async def backfill_missing_routings(
+        self,
+        factory_id: str,
+        dry_run: bool = True,
+        actor: str = "system",
+    ) -> Dict[str, Any]:
+        """给没绑工艺路线的工单补上"同产品其他工单已经在用的那一条"。
+
+        判据只来自库里已有的主数据，不猜：同一产品在本厂的其他 master 工单必须
+        指向唯一一条模板路线，且那条模板真的有工序行。只要有一个分歧就交回计划员选，
+        绝不替客户编一条工艺路线 —— 排产喂假路线比排不出来更糟。
+        """
+        rows = (await self.db.execute(text("""
+            WITH bound AS (
+                SELECT w.product_id,
+                       COUNT(DISTINCT w.routing_template_id::text) AS variants,
+                       MIN(w.routing_template_id::text) AS template_id
+                FROM work_orders w
+                WHERE w.factory_id = :fid
+                  AND COALESCE(w.wo_type, 'master') = 'master'
+                  AND w.routing_template_id IS NOT NULL
+                GROUP BY w.product_id
+            )
+            SELECT w.id AS work_order_id, w.work_order_code, w.product_id, w.status,
+                   COALESCE(b.variants, 0) AS variants,
+                   b.template_id,
+                   rt.template_code, rt.template_name,
+                   (SELECT COUNT(*) FROM routing_template_steps s
+                     WHERE s.template_id = b.template_id) AS step_count
+            FROM work_orders w
+            LEFT JOIN bound b ON b.product_id = w.product_id
+            LEFT JOIN routing_templates rt ON rt.id::text = b.template_id
+            WHERE w.factory_id = :fid
+              AND COALESCE(w.wo_type, 'master') = 'master'
+              AND w.status IN ('pending', 'released', 'in_progress')
+              AND w.routing_template_id IS NULL
+              AND w.routing_id IS NULL
+            ORDER BY w.product_id, w.work_order_code
+        """), {"fid": factory_id})).mappings().all()
+
+        fillable, ambiguous, no_evidence = [], [], []
+        for row in rows:
+            item = {
+                "work_order_id": str(row["work_order_id"]),
+                "work_order_code": row["work_order_code"],
+                "product_id": row["product_id"],
+                "status": row["status"],
+                "template_id": row["template_id"],
+                "template_code": row["template_code"],
+                "template_name": row["template_name"],
+                "step_count": int(row["step_count"] or 0),
+                "sibling_template_variants": int(row["variants"] or 0),
+            }
+            if item["sibling_template_variants"] == 1 and item["step_count"] >= 1:
+                fillable.append(item)
+            elif item["sibling_template_variants"] > 1:
+                item["reason"] = f"同产品在用 {item['sibling_template_variants']} 条不同模板路线，需人工选定"
+                ambiguous.append(item)
+            else:
+                item["reason"] = (
+                    "该产品在本厂没有任何工单绑定模板路线"
+                    if not item["sibling_template_variants"]
+                    else "候选模板没有工序行，补了也排不进"
+                )
+                no_evidence.append(item)
+
+        applied = 0
+        if not dry_run:
+            for item in fillable:
+                wo = await self.db.get(WorkOrder, item["work_order_id"])
+                if not wo:
+                    continue
+                wo.routing_template_id = item["template_id"]
+                wo.updated_at = datetime.utcnow()
+                await self._record_event(
+                    factory_id=factory_id,
+                    event_type="routing_backfilled",
+                    actor=actor,
+                    work_order_id=item["work_order_id"],
+                    reason=f"按同产品在用模板补挂工艺路线 {item['template_code'] or item['template_id']}",
+                    payload={
+                        "product_id": item["product_id"],
+                        "template_id": item["template_id"],
+                        "template_code": item["template_code"],
+                        "step_count": item["step_count"],
+                        "basis": "sibling_orders_same_unique_template",
+                    },
+                )
+                applied += 1
+            await self.db.commit()
+
+        return {
+            "success": True,
+            "factory_id": factory_id,
+            "dry_run": dry_run,
+            "unrouted_total": len(rows),
+            "fillable_count": len(fillable),
+            "ambiguous_count": len(ambiguous),
+            "no_evidence_count": len(no_evidence),
+            "applied_count": applied,
+            "fillable": fillable,
+            "ambiguous": ambiguous,
+            "no_evidence": no_evidence,
+            "message": (
+                f"预览：可安全补挂 {len(fillable)} 张（同产品只用一条模板且有工序行），"
+                f"{len(ambiguous)} 张需人工选路线，{len(no_evidence)} 张没有可推导依据"
+                if dry_run
+                else f"已补挂 {applied} 张工单的工艺路线；"
+                     f"{len(ambiguous)} 张需人工选路线，{len(no_evidence)} 张没有依据不代填"
+            ),
+        }
+
     async def set_task_lock(
         self,
         task_id: str,

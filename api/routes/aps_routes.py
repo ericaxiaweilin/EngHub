@@ -58,6 +58,11 @@ class ReleaseRequest(BaseModel):
     note: Optional[str] = None
 
 
+class RoutingBackfillRequest(BaseModel):
+    factory_id: str
+    dry_run: bool = True
+
+
 class CalendarCreate(BaseModel):
     factory_id: str
     resource_id: str
@@ -303,6 +308,25 @@ async def release_schedule(
             },
         )
     return result
+
+
+@router.post("/routings/backfill")
+async def backfill_work_order_routings(
+    req: RoutingBackfillRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pp", "edit")),
+):
+    """给缺工艺路线的工单补挂路线。
+
+    只认一种推导：同一产品在本厂的其他工单都用同一条模板路线、且那条路线有工序行。
+    有分歧或压根没有依据的一律列出来交人工决定，不替客户编工艺路线。
+    """
+    svc = ApsService(db)
+    return await svc.backfill_missing_routings(
+        factory_id=req.factory_id,
+        dry_run=req.dry_run,
+        actor=current_user.username,
+    )
 
 
 @router.post("/tasks/{task_id}/lock")
