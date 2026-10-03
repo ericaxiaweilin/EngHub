@@ -30,6 +30,9 @@ router = APIRouter(prefix="/api/v1/production-dashboard", tags=["production-dash
 SHIFTS_PER_DAY = 2
 HOURS_PER_SHIFT = 8
 
+# 缺口/压力口径与仿真引擎一致（engine.EPS = 1e-6）
+_CAL_EPS = 1e-6
+
 
 def _day_index(dt: Optional[datetime], base_date) -> int:
     """日期 → 相对于窗口起始日的天索引"""
@@ -106,10 +109,15 @@ async def production_dashboard_summary(
     # ===== 2. 工位 → 段汇总（使用预聚合提升性能）=====
     # 注意：ProductionReport.station_id / Equipment.station_id 都是 String(50)，应与 Station.station_code 匹配
     station_map = {s.station_code: s for s in stations}
+    station_uuid_by_code = {s.station_code: s.id for s in stations if s.station_code}
     eq_per_station: Dict[str, int] = defaultdict(int)
     for eq in equipment:
         if eq.station_id:
             eq_per_station[eq.station_id] += 1
+            # 编码与 UUID 双记：累加时是什么键，取值时就可能是什么键
+            canonical = station_uuid_by_code.get(str(eq.station_id))
+            if canonical and canonical != str(eq.station_id):
+                eq_per_station[canonical] += 1
 
     # 报工按工位×日聚合（负荷 = 产出耗时 / 可用工时）
     station_day_hours: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
@@ -175,7 +183,28 @@ async def production_dashboard_summary(
                 "wip_qty": station_output.get(s.id, {}).get("good", 0) if d == horizon_days - 1 else 0,
             })
         avg_rate = total_load / total_cap if total_cap else 0
+        # 真实数据的"需求"=实际发生的负荷；超额定产能部分记缺口（与加班消化口径一致）。
+        # 压力率不钳位：5 倍超载必须显示 5，不能藏进负荷率里（与引擎注释同理）。
+        unmet_h = max(0.0, total_load - total_cap)
+        demand_total = total_load
+        pressure = (demand_total / total_cap if total_cap > _CAL_EPS
+                    else (999.0 if demand_total > _CAL_EPS else 0.0))
+        machine_n = eq_per_station.get(s.id, 0)
         workers_in_ws = len(workshop_workers.get(ws_name, []))
+        if machine_n > 0 and workers_in_ws > 0:
+            binding = "both"
+        elif machine_n > 0:
+            binding = "machine"
+        elif workers_in_ws > 0:
+            binding = "labor"
+        else:
+            binding = ""
+        wip_peak_sec = max((c["wip_qty"] for c in series), default=0)
+        overload_days_sec = sum(
+            1 for c in series
+            if c["capacity_hours"] > _CAL_EPS
+            and c["load_hours"] / c["capacity_hours"] > 1.0 + _CAL_EPS
+        )
         sections_out.append({
             "section_id": s.id,
             "name": s.station_name,
@@ -194,6 +223,12 @@ async def production_dashboard_summary(
             "peak_day": peak_day,
             "is_bottleneck": peak_rate > 1.0,
             "overtime_used_hours": round(max(0, total_load - total_cap), 1),
+            "demand_hours": round(demand_total, 1),
+            "unmet_hours": round(unmet_h, 1),
+            "pressure_rate": round(pressure, 3),
+            "binding_resource": binding,
+            "wip_peak": wip_peak_sec,
+            "overload_days": overload_days_sec,
             "series": series,
         })
 
@@ -507,6 +542,7 @@ async def production_dashboard_summary(
         "wip_peak": max((p["wip_qty"] for p in wip_curve), default=0),
         "imbalance_index": round(max(rates) - min(rates), 3) if rates else 0,
         "overtime_hours": round(sum(s["overtime_used_hours"] for s in sections_out), 1),
+        "total_unmet_hours": round(sum(s["unmet_hours"] for s in sections_out), 1),
         "total_output": total_output,
         "good_output": total_good,
         "scrap_output": total_scrap,
