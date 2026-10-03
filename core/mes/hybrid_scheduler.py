@@ -153,6 +153,8 @@ class HybridScheduler:
         self.schedule: List[ScheduleTask] = []
         self.resource_timeline: Dict[str, List[ScheduleTask]] = {}
         self.pinned_tasks: Dict[tuple, ScheduleTask] = {}  # (order_id, op_seq) -> PMC 钉住的任务
+        # 被人工/故障停用的工位不进 resources，但排不进时要说清是"被停用"而不是"没注册"
+        self.unavailable_notes: Dict[str, str] = {}
         self.process_capability_cache: Dict[str, Dict] = {}  # 工艺能力缓存
         
     def load_resource_constraints(
@@ -327,7 +329,7 @@ class HybridScheduler:
         """
         res = self.resources.get(resource_id)
         if res is None:
-            return None, "该工位未注册为排程资源"
+            return None, self.unavailable_notes.get(resource_id, "该工位未注册为排程资源")
         if res.is_broken:
             return None, "该工位设备全部处于故障或保养状态"
 
@@ -643,7 +645,8 @@ class HybridScheduler:
             
             for station_id in candidate_stations:
                 if station_id not in self.resources:
-                    station_blockers[station_id] = "该工位未注册为排程资源"
+                    station_blockers[station_id] = self.unavailable_notes.get(
+                        station_id, "该工位未注册为排程资源")
                     continue
                 
                 # 获取有效工时

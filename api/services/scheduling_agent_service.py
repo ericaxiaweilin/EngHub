@@ -95,97 +95,140 @@ class SchedulingAgent:
             LIMIT 1
         """), {"fid": factory_id})).scalar()
 
-    async def on_equipment_breakdown(self, factory_id: str, equipment_id: str) -> Dict[str, Any]:
-        """事件：设备故障 → 受影响工单自动迁移到其他工位"""
-        _logger.info(f"[scheduling] 设备故障: {equipment_id}")
+    async def on_equipment_breakdown(
+        self,
+        factory_id: str,
+        equipment_id: str,
+        horizon_days: int = 30,
+    ) -> Dict[str, Any]:
+        """事件：设备故障 → 停用该工位并重排一版（PMC 钉住的工序保持不动）。
 
-        # 只认当前生效的那一版。原来把所有历史 draft 的行都算进来（ST-JG-01 报 556，
-        # 实际工单池 55 张），而且下达后的 released 方案反而被 status 条件排除在外。
+        原实现是把该工位的任务按 id 轮询塞进 stations.status='idle' 的工位。库里 28 个
+        工位全是 'active'，所以它永远返回"无可用替代工位"；而一旦真出现 idle，它会把
+        机加工工序搬到包装线，还会与目标工位已有任务在时间轴上重叠 —— 那不叫改派。
+        现在把故障工位作为 exclude_resources 交给排程引擎：受影响工序只会落到工艺路线
+        允许、班次日历允许、时间轴不冲突的其他工位；排不进的如实列出来交人工。
+        """
         live_schedule_id = await self._live_schedule_id(factory_id)
         if not live_schedule_id:
-            return {"action": "none", "reason": "该工厂还没有排程方案，无需迁移"}
+            return {"action": "none", "reason": "该工厂还没有排程方案，无需处理故障"}
 
-        affected = await self.db.execute(text("""
-            SELECT t.id, t.work_order_id, t.planned_start, t.planned_end, w.work_order_code,
-                   t.operation_seq, t.station_id, COALESCE(t.is_locked, false) AS is_locked
+        previous_total_tasks = int((await self.db.execute(text(
+            "SELECT COUNT(*) FROM aps_schedule_tasks WHERE schedule_id = :sid"
+        ), {"sid": str(live_schedule_id)})).scalar() or 0)
+
+        affected = (await self.db.execute(text("""
+            SELECT t.work_order_id, t.operation_seq, t.station_id,
+                   COALESCE(t.is_locked, false) AS is_locked, w.work_order_code
             FROM aps_schedule_tasks t
-            JOIN work_orders w ON t.work_order_id = w.id::text
-            WHERE t.station_id = :eid AND t.schedule_id = :sid AND t.planned_end > NOW()
-        """), {"eid": equipment_id, "sid": str(live_schedule_id)})
-        all_tasks = [dict(r) for r in affected.mappings().all()]
-        # PMC 钉住的工序是计划员的决定，智能体不自动搬走，交人工复核
-        locked_tasks = [t for t in all_tasks if t.get("is_locked")]
-        affected_tasks = [t for t in all_tasks if not t.get("is_locked")]
+            JOIN work_orders w ON w.id::text = t.work_order_id
+            WHERE t.schedule_id = :sid AND t.station_id = :eid AND t.planned_end > NOW()
+        """), {"sid": str(live_schedule_id), "eid": equipment_id})).mappings().all()
+        affected_keys = {(str(r["work_order_id"]), int(r["operation_seq"])) for r in affected}
+        locked_keys = {(str(r["work_order_id"]), int(r["operation_seq"])) for r in affected if r["is_locked"]}
 
-        # affected_orders 数的是工单，不是排程行
-        def order_count(rows):
-            return len({str(r["work_order_id"]) for r in rows})
+        if not affected_keys:
+            return {"action": "none", "reason": "该工位上没有未来排程任务，无需改派"}
 
-        if not affected_tasks and locked_tasks:
+        from api.services.aps_service import ApsService
+
+        result = await ApsService(self.db).generate_schedule(
+            factory_id=factory_id,
+            mode="hybrid",
+            horizon_days=horizon_days,
+            created_by="scheduling_agent",
+            change_reason=f"equipment_breakdown:{equipment_id}",
+            exclude_resources=[equipment_id],
+        )
+        new_schedule_id = result.get("schedule_id")
+        if not new_schedule_id:
             return {
                 "action": "blocked",
-                "affected_orders": order_count(locked_tasks),
-                "affected_tasks": len(locked_tasks),
-                "locked_tasks": [
-                    {
-                        "work_order": t["work_order_code"],
-                        "operation_seq": t["operation_seq"],
-                        "station_id": t["station_id"],
-                    }
-                    for t in locked_tasks
-                ],
-                "reason": "故障工位上只剩已钉住的工序，系统不自动迁移，请先解除锁定或人工改派",
                 "escalate": True,
+                "affected_tasks": len(affected_keys),
+                "reason": f"停用 {equipment_id} 后重排失败，原方案保持不变：{result.get('message')}",
             }
 
-        if not affected_tasks:
-            return {"action": "none", "reason": "该设备无待执行排程任务"}
+        placed = (await self.db.execute(text("""
+            SELECT n.work_order_id, n.operation_seq, n.station_id,
+                   n.planned_start, n.planned_end, COALESCE(n.is_locked, false) AS is_locked
+            FROM aps_schedule_tasks n
+            WHERE n.schedule_id = :sid
+              AND (n.work_order_id, n.operation_seq) IN (
+                  SELECT o.work_order_id, o.operation_seq FROM aps_schedule_tasks o
+                  WHERE o.schedule_id = :old_sid AND o.station_id = :eid AND o.planned_end > NOW()
+              )
+        """), {"sid": str(new_schedule_id), "old_sid": str(live_schedule_id),
+               "eid": equipment_id})).mappings().all()
 
-        # 找可用替代工位
-        alt_stations = await self.db.execute(text("""
-            SELECT id, station_code FROM stations
-            WHERE factory_id = :fid AND status = 'idle' AND id != :eid
-            LIMIT 3
-        """), {"fid": factory_id, "eid": equipment_id})
-        alternatives = [dict(r) for r in alt_stations.mappings().all()]
-
-        if not alternatives:
-            return {
-                "action": "blocked",
-                "affected_orders": order_count(affected_tasks),
-                "affected_tasks": len(affected_tasks),
-                "schedule_id": str(live_schedule_id),
-                "reason": "无可用替代工位，需人工调度",
-                "escalate": True,
+        moved, held_in_place = [], []
+        for row in placed:
+            key = (str(row["work_order_id"]), int(row["operation_seq"]))
+            entry = {
+                "work_order_id": key[0],
+                "operation_seq": key[1],
+                "from_station": equipment_id,
+                "to_station": str(row["station_id"]),
+                "planned_start": row["planned_start"].isoformat() if row["planned_start"] else None,
+                "planned_end": row["planned_end"].isoformat() if row["planned_end"] else None,
+                "is_locked": bool(row["is_locked"]),
             }
+            if entry["to_station"] == equipment_id:
+                held_in_place.append(entry)
+            else:
+                moved.append(entry)
 
-        # 自动迁移
-        migrated = []
-        alt_idx = 0
-        for task in affected_tasks:
-            target = alternatives[alt_idx % len(alternatives)]
-            await self.db.execute(text("""
-                UPDATE aps_schedule_tasks SET station_id = :new_sid WHERE id = :tid
-            """), {"new_sid": target["id"], "tid": task["id"]})
-            migrated.append({
-                "work_order": task["work_order_code"],
-                "from": equipment_id,
-                "to": target["station_code"],
-            })
-            alt_idx += 1
+        placed_keys = {(str(r["work_order_id"]), int(r["operation_seq"])) for r in placed}
+        dropped = sorted(affected_keys - placed_keys)
+        reasons = {}
+        for detail in (result.get("diagnostics") or {}).get("unscheduled") or []:
+            reasons[str(detail.get("order_id"))] = detail.get("reasons") or []
+        dropped_detail = [
+            {
+                "work_order_id": wo,
+                "operation_seq": seq,
+                "was_locked": (wo, seq) in locked_keys,
+                "reason": reasons.get(wo) or ["新方案里该工序未生成任务"],
+            }
+            for wo, seq in dropped
+        ]
 
-        await self.db.commit()
+        if dropped_detail:
+            _logger.warning(
+                "[scheduling] 故障重排后仍有 %d 道工序排不进（工位 %s）", len(dropped_detail), equipment_id
+            )
 
+        new_total_tasks = int(result.get("total_tasks") or 0)
         return {
-            "action": "migrated",
-            "affected_orders": order_count(affected_tasks),
-            "affected_tasks": len(affected_tasks),
-            "schedule_id": str(live_schedule_id),
-            "migrated": migrated,
-            "locked_skipped": len(locked_tasks),
-            "note": f"已将{len(migrated)}个工单从故障设备迁移到替代工位"
-                    + (f"；另有 {len(locked_tasks)} 道已钉住工序未自动迁移，需人工复核" if locked_tasks else ""),
+            "action": "replanned",
+            # 停用关键工位可能让整盘塌掉（该厂多数工序只有一个可做工位），
+            # 这时"挪了 0 道"不等于"没事发生"，必须把版本间任务数差摆出来。
+            "escalate": bool(dropped_detail) or new_total_tasks < previous_total_tasks,
+            "impact": {
+                "previous_schedule_id": str(live_schedule_id),
+                "previous_total_tasks": previous_total_tasks,
+                "new_total_tasks": new_total_tasks,
+                "unscheduled_after": result.get("unscheduled_count"),
+            },
+            "previous_schedule_id": str(live_schedule_id),
+            "schedule_id": str(new_schedule_id),
+            "schedule_code": result.get("schedule_code"),
+            "station_excluded": equipment_id,
+            "affected_tasks": len(affected_keys),
+            "moved_count": len(moved),
+            "moved": moved,
+            "still_on_excluded_station": held_in_place,
+            "unresolved_count": len(dropped_detail),
+            "unresolved": dropped_detail,
+            "locked_preserved_count": len([m for m in moved if m["is_locked"]]),
+            "note": (
+                f"已停用 {equipment_id} 并重排：{len(moved)} 道工序改派到其他工位"
+                + (f"，{len(dropped_detail)} 道工序在工艺路线允许的工位里排不下，需人工处理" if dropped_detail else "")
+                + f"；方案任务数 {previous_total_tasks} -> {new_total_tasks}"
+                + "；PMC 钉住的工序未被自动挪动"
+            ),
         }
+
 
     async def on_material_delay(self, factory_id: str, material_code: str, delay_days: int) -> Dict[str, Any]:
         """事件：物料延迟 → 推迟使用该物料的工单"""

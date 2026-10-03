@@ -168,9 +168,18 @@ class ApsService:
 
         change_reason: str = "manual_generation",
 
+        exclude_resources: Optional[List[str]] = None,
+
     ) -> Dict[str, Any]:
 
-        """生成排程方案"""
+        """生成排程方案
+
+        exclude_resources 用于"某工位今天停用/设备故障"这类约束：这些工位不进本轮资源，
+        受影响工序只会被排到工艺路线允许的其他工位上，排不进就带着原因报出来，
+        而不是被随手塞到任意空闲工位。
+        """
+
+        excluded = {str(x).strip() for x in (exclude_resources or []) if str(x).strip()}
 
         now = datetime.utcnow()
 
@@ -201,6 +210,9 @@ class ApsService:
         # 2. 加载工艺路线约束
 
         scheduler = HybridScheduler()
+
+        for _excluded in sorted(excluded):
+            scheduler.unavailable_notes[_excluded] = "该工位本轮被停用（设备故障或人工排除），不参与排程"
 
         product_routings: Dict[str, List[Dict]] = {}
         unrouted_orders: List[str] = []
@@ -313,6 +325,10 @@ class ApsService:
 
         for resource_id, eq_rows in station_equipment.items():
 
+            if resource_id in excluded:
+
+                continue
+
             if resource_id not in loaded_resources:
 
                 is_broken = all(
@@ -350,6 +366,10 @@ class ApsService:
         # 如果没有设备数据，用工艺路线中的工位创建虚拟资源
 
         for station in needed_stations:
+
+            if station in excluded:
+
+                continue
 
             if station and station not in loaded_resources:
                 capacity = capacity_map.get(station, {})
@@ -396,6 +416,10 @@ class ApsService:
             for st in st_result.scalars().all():
 
                 rid = st.station_code or str(st.id)
+
+                if rid in excluded:
+
+                    continue
 
                 if rid not in loaded_resources:
                     capacity = capacity_map.get(rid, {})
@@ -593,6 +617,7 @@ class ApsService:
             "unscheduled_orders": len(result.unscheduled_orders),
             "scheduled_tasks": len(result.schedule),
             "pinned_tasks": pinned_count,
+            "excluded_resources": sorted(excluded),
             # 只排进了部分工序（其余工序被产能挡住，但钉住的行按计划员意愿保留）
             "partial_orders": len(scheduled_order_ids & {str(o) for o in result.unscheduled_orders}),
         }
