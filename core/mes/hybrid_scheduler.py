@@ -567,6 +567,14 @@ class HybridScheduler:
                     "order_id": order.order_id,
                     "reason": str(e),
                 })
+                # 钉住的是计划员的决定：即使这单后面的工序排不进产能，已钉住的工序也必须
+                # 留在方案里。否则PMC一改派，整单从甘特图上蒸发，锁反而变成丢单。
+                for pinned_order, _seq in self.pinned_tasks:
+                    if str(pinned_order) != str(order.order_id):
+                        continue
+                    pinned = self.pinned_tasks[(pinned_order, _seq)]
+                    if pinned not in self.schedule:
+                        self.schedule.append(pinned)
         
         # 计算性能指标
         metrics = self._calculate_performance_metrics(optimize_for)

@@ -155,6 +155,11 @@ export const apsApi = {
     return api.post(`/api/v1/aps/tasks/${taskId}/lock`, data)
   },
 
+  /** PMC 手工改派工序的工位/时刻（后端校验班次与占用，改完自动钉住） */
+  overrideTask(taskId: string, data: { station_id?: string; planned_start?: string; planned_end?: string; note?: string }) {
+    return api.patch(`/api/v1/aps/tasks/${taskId}`, data)
+  },
+
   /** 甘特图数据 */
   getGantt(id: string): Promise<GanttData> {
     return api.get(`/api/v1/aps/gantt/${id}`)

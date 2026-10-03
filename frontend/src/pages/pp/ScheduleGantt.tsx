@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react'
 import {
   Card, Button, Select, Space, Tag, message, Drawer, Descriptions,
-  Row, Col, Statistic, Empty, Spin, Tooltip, Modal, InputNumber,
+  Row, Col, Statistic, Empty, Spin, Tooltip, Modal, InputNumber, DatePicker,
 } from 'antd'
 import {
   ThunderboltOutlined, CheckCircleOutlined, SendOutlined,
@@ -43,6 +43,8 @@ const ScheduleGantt: React.FC = () => {
   const [genModal, setGenModal] = useState(false)
   const [horizonDays, setHorizonDays] = useState(30)
   const [locking, setLocking] = useState(false)
+  const [savingMove, setSavingMove] = useState(false)
+  const [moveForm, setMoveForm] = useState<{ station_id: string; start: string; end: string } | null>(null)
   const [mode, setMode] = useState('hybrid')
 
   // 加载方案列表
@@ -165,6 +167,38 @@ const ScheduleGantt: React.FC = () => {
       message.error(e?.response?.data?.detail || '锁定操作失败')
     } finally {
       setLocking(false)
+    }
+  }
+
+  // 打开任务详情时同步初始化改派表单（甘特数据里工位是分组键，不在任务对象上）
+  const openTask = (task: ApsTask, station: string) => {
+    setTaskDrawer(task)
+    setMoveForm({
+      station_id: task.station_id || station,
+      start: task.planned_start,
+      end: task.planned_end,
+    })
+  }
+
+  // 手工改派：工位/时刻由计划员指定，后端校验不过就原样把理由退回
+  const handleOverride = async () => {
+    if (!taskDrawer || !moveForm) return
+    setSavingMove(true)
+    try {
+      const res: any = await apsApi.overrideTask(taskDrawer.id, {
+        station_id: moveForm.station_id,
+        planned_start: dayjs(moveForm.start).format('YYYY-MM-DDTHH:mm:ss'),
+        planned_end: dayjs(moveForm.end).format('YYYY-MM-DDTHH:mm:ss'),
+        note: 'PMC 界面手工改派',
+      })
+      message.success(res?.message || '已改派并自动钉住')
+      setTaskDrawer(null)
+      if (selectedId) loadGantt(selectedId)
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail
+      message.error(typeof detail === 'string' ? detail : detail?.message || '改派失败')
+    } finally {
+      setSavingMove(false)
     }
   }
 
@@ -337,7 +371,7 @@ const ScheduleGantt: React.FC = () => {
                         title={`${task.order_code || task.product_code} | OP${task.operation_seq} | ${dayjs(task.planned_start).format('HH:mm')}-${dayjs(task.planned_end).format('HH:mm')}`}
                       >
                         <div
-                          onClick={() => setTaskDrawer(task)}
+                          onClick={() => openTask(task, station)}
                           style={{
                             position: 'absolute',
                             top: 4,
@@ -437,6 +471,39 @@ const ScheduleGantt: React.FC = () => {
             </Button>
             <span style={{ fontSize: 12, color: '#888' }}>钉住后重排只动未钉住的工序</span>
           </Space>
+        )}
+        {taskDrawer && moveForm && (
+          <Card size="small" title="手工改派（保存后自动钉住）" style={{ marginTop: 12 }}>
+            <Space direction="vertical" style={{ width: '100%' }} size={8}>
+              <Select
+                value={moveForm.station_id}
+                style={{ width: '100%' }}
+                showSearch
+                onChange={v => setMoveForm({ ...moveForm, station_id: v })}
+                options={(ganttMeta?.stations || []).map(s => ({ value: s, label: s }))}
+              />
+              <DatePicker
+                showTime={{ format: 'HH:mm' }}
+                format="YYYY-MM-DD HH:mm"
+                style={{ width: '100%' }}
+                value={dayjs(moveForm.start)}
+                onChange={v => v && setMoveForm({ ...moveForm, start: v.format('YYYY-MM-DDTHH:mm:ss') })}
+              />
+              <DatePicker
+                showTime={{ format: 'HH:mm' }}
+                format="YYYY-MM-DD HH:mm"
+                style={{ width: '100%' }}
+                value={dayjs(moveForm.end)}
+                onChange={v => v && setMoveForm({ ...moveForm, end: v.format('YYYY-MM-DDTHH:mm:ss') })}
+              />
+              <Button type="primary" icon={<ScheduleOutlined />} loading={savingMove} onClick={handleOverride}>
+                保存改派
+              </Button>
+              <span style={{ fontSize: 12, color: '#888' }}>
+                系统会校验班次、休息日与该工位已有占用；不合法会说明原因，不会默默照做
+              </span>
+            </Space>
+          </Card>
         )}
       </Drawer>
     </div>

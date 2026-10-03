@@ -755,6 +755,8 @@ class ApsService:
             "unscheduled_orders": len(result.unscheduled_orders),
             "scheduled_tasks": len(result.schedule),
             "pinned_tasks": pinned_count,
+            # 只排进了部分工序（其余工序被产能挡住，但钉住的行按计划员意愿保留）
+            "partial_orders": len(scheduled_order_ids & {str(o) for o in result.unscheduled_orders}),
         }
 
         # 6. 持久化排程方案
@@ -956,6 +958,121 @@ class ApsService:
 
             "message": result.message,
 
+        }
+
+    async def override_task_schedule(
+        self,
+        task_id: str,
+        actor: str,
+        station_id: Optional[str] = None,
+        planned_start: Optional[datetime] = None,
+        planned_end: Optional[datetime] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """PMC 手工改派一道工序的工位/时刻。
+
+        改完自动置 is_locked：计划员的干预是决定，不能被下一轮算法重排悄悄冲掉。
+        拒绝而不是纠正非法输入，理由原样返回，让计划员知道系统为什么不照做。
+        """
+        task = await self.db.get(ApsScheduleTask, task_id)
+        if not task:
+            return {"success": False, "message": f"排程任务 {task_id} 不存在"}
+        schedule = await self.db.get(ApsSchedule, task.schedule_id)
+        if not schedule:
+            return {"success": False, "message": "该任务没有归属方案，无法改派"}
+
+        new_station = str(station_id).strip() if station_id else str(task.station_id)
+        new_start = planned_start or task.planned_start
+        new_end = planned_end or task.planned_end
+        if new_end <= new_start:
+            return {"success": False, "message": "完工时刻必须晚于开工时刻"}
+
+        if new_station != str(task.station_id):
+            known = (await self.db.execute(
+                select(Station.id).where(
+                    Station.factory_id == schedule.factory_id,
+                    or_(Station.station_code == new_station, Station.id == new_station),
+                )
+            )).first()
+            if not known:
+                return {"success": False,
+                        "message": f"工位 {new_station} 不属于工厂 {schedule.factory_id}，不能改到该工位"}
+
+        cal = await self._load_calendar_constraints(schedule.factory_id, new_station, new_start, new_end)
+        if new_start.date() in cal["blocked_dates"] and new_start.date() not in cal["working_dates"]:
+            return {"success": False, "message": f"{new_start:%Y-%m-%d} 是厂里登记的假期，不能安排开工"}
+        slots = sorted(cal["calendar_by_weekday"].get(new_start.weekday(), []))
+        if not slots:
+            return {"success": False,
+                    "message": f"{new_start:%Y-%m-%d}（周{'一二三四五六日'[new_start.weekday()]}）"
+                               f"工厂日历没有排班次，按休息日处理，不能安排开工"}
+        if not any(shift_start <= new_start.time() <= shift_end for shift_start, shift_end in slots):
+            shifts = "、".join(f"{s:%H:%M}-{e:%H:%M}" for s, e in slots)
+            return {"success": False,
+                    "message": f"开工时刻 {new_start:%m-%d %H:%M} 不在 {new_station} 的班次内（当日班次 {shifts}）"}
+
+        clash_stmt = select(ApsScheduleTask).where(
+            ApsScheduleTask.schedule_id == task.schedule_id,
+            ApsScheduleTask.id != task.id,
+            ApsScheduleTask.station_id == new_station,
+            ApsScheduleTask.planned_start < new_end,
+            ApsScheduleTask.planned_end > new_start,
+        ).limit(3)
+        clashes = list((await self.db.execute(clash_stmt)).scalars().all())
+        if clashes:
+            detail = "；".join(
+                f"{c.order_code or c.work_order_id} 工序{c.operation_seq}({c.operation_name or '-'}) "
+                f"{c.planned_start:%m-%d %H:%M}-{c.planned_end:%H:%M}"
+                for c in clashes
+            )
+            return {
+                "success": False,
+                "message": f"{new_station} 在 {new_start:%m-%d %H:%M}-{new_end:%H:%M} 已有占用：{detail}",
+                "conflicts": [str(c.id) for c in clashes],
+            }
+
+        before = {
+            "station_id": task.station_id,
+            "planned_start": task.planned_start.isoformat() if task.planned_start else None,
+            "planned_end": task.planned_end.isoformat() if task.planned_end else None,
+            "is_locked": bool(task.is_locked),
+        }
+        task.station_id = new_station
+        task.planned_start = new_start
+        task.planned_end = new_end
+        task.is_locked = True
+        await self._record_event(
+            factory_id=schedule.factory_id,
+            event_type="task_overridden",
+            actor=actor,
+            schedule_id=task.schedule_id,
+            work_order_id=task.work_order_id,
+            reason=note or "PMC 手工改派工序",
+            payload={
+                "task_id": task_id,
+                "operation_seq": task.operation_seq,
+                "operation_name": task.operation_name,
+                "before": before,
+                "after": {
+                    "station_id": task.station_id,
+                    "planned_start": task.planned_start.isoformat(),
+                    "planned_end": task.planned_end.isoformat(),
+                    "is_locked": True,
+                },
+            },
+        )
+        await self.db.commit()
+        return {
+            "success": True,
+            "message": "已改派并自动钉住，重排时保持不动",
+            "task_id": task_id,
+            "before": before,
+            "after": {
+                "station_id": task.station_id,
+                "planned_start": task.planned_start.isoformat(),
+                "planned_end": task.planned_end.isoformat(),
+                "is_locked": True,
+            },
         }
 
     async def set_task_lock(

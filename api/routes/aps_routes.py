@@ -45,6 +45,14 @@ class TaskLockRequest(BaseModel):
     note: Optional[str] = None
 
 
+class TaskOverrideRequest(BaseModel):
+    """PMC 手工改派：工位/开工/完工可只传要改的字段"""
+    station_id: Optional[str] = None
+    planned_start: Optional[datetime] = None
+    planned_end: Optional[datetime] = None
+    note: Optional[str] = None
+
+
 class ReleaseRequest(BaseModel):
     allow_partial: bool = False
     note: Optional[str] = None
@@ -314,6 +322,34 @@ async def lock_schedule_task(
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("message", "锁定操作失败"))
+    return result
+
+
+@router.patch("/tasks/{task_id}")
+async def override_schedule_task(
+    task_id: str,
+    req: TaskOverrideRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pp", "edit")),
+):
+    """PMC 手工改派工序的工位/时刻；改完自动钉住，非法时段直接拒绝并说明原因。"""
+    svc = ApsService(db)
+    result = await svc.override_task_schedule(
+        task_id=task_id,
+        actor=current_user.username,
+        station_id=req.station_id,
+        planned_start=req.planned_start,
+        planned_end=req.planned_end,
+        note=req.note,
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": result.get("message", "改派失败"),
+                "conflicts": result.get("conflicts") or [],
+            },
+        )
     return result
 
 
