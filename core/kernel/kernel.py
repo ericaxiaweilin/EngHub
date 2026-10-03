@@ -48,6 +48,9 @@ class KernelResponse:
     tables: List[Dict[str, Any]] = field(default_factory=list)
     request_id: str = ""
     status: str = "complete"
+    # 失败原因必须穿过内核边界：丢了它，前端只能说"未返回内容"，
+    # 用户和值班同学都看不出是网关 4xx、路由超时还是工具失败。
+    error: Optional[str] = None
     telemetry: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -277,6 +280,7 @@ class HarnessKernel:
                     diagrams=loop_result.diagrams,
                     request_id=request_id,
                     status=loop_result.status,
+                    error=loop_result.error,
                 )
                 if review_result is not None:
                     response.telemetry["review"] = review_result.to_dict()

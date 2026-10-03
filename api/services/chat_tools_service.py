@@ -1224,14 +1224,21 @@ async def _tool_get_production_summary(db: AsyncSession, args: Dict[str, Any], f
 
 async def _tool_query_inventory(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     limit = min(int(args.get("limit", 10)), 50)
-    stmt = select(Inventory).order_by(Inventory.updated_at.desc()).limit(limit)
+    conds = []
     if factory_id:
-        stmt = stmt.where(Inventory.factory_id == factory_id)
+        conds.append(Inventory.factory_id == factory_id)
     kw = args.get("material_keyword")
     if kw:
-        stmt = stmt.where(
+        conds.append(
             (Inventory.material_code.ilike(f"%{kw}%")) | (Inventory.material_id.ilike(f"%{kw}%"))
         )
+    stmt = select(Inventory).order_by(Inventory.updated_at.desc()).limit(limit)
+    for cond in conds:
+        stmt = stmt.where(cond)
+    total_stmt = select(func.count()).select_from(Inventory)
+    for cond in conds:
+        total_stmt = total_stmt.where(cond)
+    total_matches = (await db.execute(total_stmt)).scalar() or 0
     rows = (await db.execute(stmt)).scalars().all()
     items = [
         {
@@ -1246,7 +1253,19 @@ async def _tool_query_inventory(db: AsyncSession, args: Dict[str, Any], factory_
         }
         for inv in rows
     ]
-    return {"count": len(items), "inventory": items}
+    return {
+        "count": len(items),
+        "returned": len(items),
+        "total_matches": total_matches,
+        "truncated": len(items) < total_matches,
+        "inventory": items,
+        "note": (
+            "本工具只返回最近更新的若干行，不是库存全貌。"
+            f"本次条件命中 {total_matches} 行、返回 {len(items)} 行。"
+            "SKU 总数、金额覆盖、周转、呆滞、低库存、过量、库位与效期可用性请用 "
+            "query_wms_inventory_health；不要把返回行数当成物料总数。"
+        ),
+    }
 
 
 async def _tool_query_defects(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2483,6 +2502,7 @@ async def _tool_query_wms_inventory_health(
             "dead_stock": _top(analyses.get("dead_stock") or {}),
             "turnover": _top(analyses.get("turnover") or {}, 5),
         },
+        "reconciliation": data["reconciliation"],
         "not_computable": data["not_computable"],
         "data_note": (
             "结论只能引用本结果里出现的数字。coverage 显示阈值或流水不足时，"

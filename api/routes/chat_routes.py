@@ -2388,8 +2388,14 @@ async def _handle_kernel_chat(
         except Exception:  # noqa: BLE001
             _logger.exception("[chat-goal] metric refresh failed session=%s", session_id)
 
+    reply_text = (result.reply or "").strip()
+    if not reply_text:
+        reply_text = _fallback_reply_for(
+            getattr(result, "status", "degraded"), getattr(result, "error", None),
+        )
+
     return ChatResponse(
-        reply=result.reply,
+        reply=reply_text,
         model=result.model,
         degraded=result.degraded,
         actions=result.actions,
@@ -2433,6 +2439,29 @@ async def chat_v2(
 ) -> ChatResponse:
     """兼容入口；与 V1 共用同一个 HarnessKernel 处理器。"""
     return await _handle_kernel_chat(request, http_request, db, current_user)
+
+
+def _fallback_reply_for(status: str, error: Optional[str]) -> str:
+    """把内核的失败状态翻译成用户能看懂的一句话。
+
+    空 reply 在界面上等同于"机器人坏了"，而且会把真实原因（底座没答 vs 本轮没查到
+    数据）一起吞掉。状态到文案的映射单独成函数，便于确定性验证。
+    """
+    reason = (error or "").strip()
+    if status == "gateway_error":
+        # 只有这一类才是模型底座问题，才让用户去查控制面/网关。
+        return _degraded_message(
+            "模型底座本轮未返回内容" + (f"：{reason}" if reason else "")
+        )
+    if status == "no_reply":
+        return "模型本轮没有给出可用答复。请补充问题范围（工厂、时间、物料或工单号）后重试。"
+    if status == "max_rounds":
+        return "本轮工具调用已达上限，请缩小问题范围后重试。"
+    if status == "tool_error":
+        return "业务工具执行失败" + (f"：{reason}" if reason else "") + "，本轮未使用未核实的数据。"
+    if status == "exception":
+        return "本轮处理异常" + (f"：{reason}" if reason else "") + "，请重试或换一种问法。"
+    return _degraded_message(status)
 
 
 def _degraded_message(reason: str) -> str:
