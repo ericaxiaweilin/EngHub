@@ -57,7 +57,6 @@ from core.kernel.context_window import compact_messages
 from core.kernel.events import get_harness_event_bus
 from core.kernel.plugins import HarnessProfile, PluginSpec, get_harness_plugin_registry
 from core.kernel.reply_sanitizer import looks_like_tool_call_leak, strip_tool_call_markup
-from core.kernel.confirmation import confirmation_grounding
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 _logger = logging.getLogger("enghub.chat")
@@ -1736,19 +1735,6 @@ async def _legacy_chat_disabled(
         # 历史中无用户消息（异常场景）：补一条多模态用户消息
         history.append({"role": "user", "content": _build_multimodal_content(last_user, image_records)})
     messages += history
-    confirm_note = confirmation_grounding(history)
-    if confirm_note:
-        messages.append({"role": "system", "content": confirm_note})
-        _logger.info("[chat] confirmation grounding injected turn=%s", turn_id)
-        try:
-            from core.kernel.telemetry import Telemetry, TelemetryEvent
-            Telemetry.get_instance().record(TelemetryEvent(
-                request_id=turn_id,
-                phase="grounding",
-                task_id=route.get("task_id", "") if isinstance(route, dict) else "",
-            ))
-        except Exception:
-            pass
 
     payload: Dict[str, Any] = {
         "model": route["gateway_model"],

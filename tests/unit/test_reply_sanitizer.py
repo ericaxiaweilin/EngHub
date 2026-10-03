@@ -7,6 +7,7 @@ pytestmark = [pytest.mark.unit]
 from core.kernel.confirmation import confirmation_grounding
 from core.kernel.context_window import compact_messages
 from core.kernel.reply_sanitizer import (
+    StreamSanitizer,
     looks_like_tool_call_leak,
     strip_tool_call_markup,
 )
@@ -104,3 +105,32 @@ def test_grounding_survives_compaction():
     h.append({"role": "user", "content": "确认"})
     compacted = compact_messages(h, max_messages=24, max_chars=24000).messages
     assert "严禁重复提问" in confirmation_grounding(compacted)
+
+def test_stream_sanitizer_splits_tag_across_chunks():
+    s = StreamSanitizer()
+    assert s.feed("先给结论") == "先给结论"
+    assert s.feed("，查到 3 条。<tool_use>{") == "，查到 3 条。"
+    assert s.feed('"name": "q"}') == ""
+    assert s.feed("</tool_use>后续正文") == "后续正文"
+    assert s.flush() == ""
+
+
+def test_stream_sanitizer_keeps_bare_angle_bracket():
+    s = StreamSanitizer()
+    assert s.feed("当 a<") == "当 a"
+    assert s.feed("b 时成立") == ""
+    assert s.flush() == "<b 时成立"
+
+
+def test_stream_sanitizer_drops_think_block():
+    s = StreamSanitizer()
+    assert s.feed("答复<think>内部推理") == "答复"
+    assert s.feed("继续推理</think>正文") == "正文"
+    assert s.flush() == ""
+
+
+def test_stream_sanitizer_flush_emits_held_tail():
+    s = StreamSanitizer()
+    assert s.feed("尾巴<") == "尾巴"
+    assert s.flush() == "<"
+

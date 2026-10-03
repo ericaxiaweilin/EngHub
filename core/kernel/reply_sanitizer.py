@@ -67,6 +67,15 @@ _TOOL_USE_UNCLOSED = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+_THINK_CLOSED = re.compile(
+    r"<think>.*?</think>",
+    re.DOTALL | re.IGNORECASE,
+)
+_THINK_UNCLOSED = re.compile(
+    r"<think>.*",
+    re.DOTALL | re.IGNORECASE,
+)
+
 # 3) 孤立分隔标签。
 _SEP = re.compile(
     r"(?:" + _tag("tool_sep") + r"|" + _tag("tool_sep", closing=True) + r")",
@@ -102,3 +111,53 @@ def looks_like_tool_call_leak(content: str) -> bool:
         or re.search(_tag("tool_call"), text, re.IGNORECASE)
         or _SEP.search(text)
     )
+
+
+def strip_complete_blocks(text: str) -> str:
+    """只删已经闭合的调用/推理标记块；跨 chunk 的半截标签原样保留待后续判定。"""
+    out = text or ""
+    if _LT not in out:
+        return out
+    out = _HARNESS.sub("", out)
+    out = _BLOCK.sub("", out)
+    out = _TOOL_USE.sub("", out)
+    out = _THINK_CLOSED.sub("", out)
+    out = _INNER.sub("", out)
+    out = _SEP.sub("", out)
+    return out
+
+
+class StreamSanitizer:
+    """SSE 流式逐块过滤：已闭合的标记块直接吃掉，未闭合的尾巴暂扣。
+
+    用法：每来一个 delta 调 feed()，返回值是可直接展示/落库的安全前缀；
+    流结束调 flush() 拿暂扣尾巴的完整清洗结果。普通文本（含单独的 "<"）
+    只延迟一个 chunk，不丢字；flush 时原样放出。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, text: str) -> str:
+        """输入一块增量，返回可安全外发的前缀（可能为空字符串）。"""
+        if not text:
+            return ""
+        buf = strip_complete_blocks(self._buf + text)
+        idx = buf.rfind(_LT)
+        if idx == -1:
+            self._buf = ""
+            return buf
+        self._buf = buf[idx:]
+        return buf[:idx]
+
+    def flush(self) -> str:
+        """流结束：对暂扣尾巴做完整清洗（含未闭合块与 think）并返回。"""
+        out, self._buf = self._buf, ""
+        if not out or _LT not in out:
+            return out
+        out = strip_complete_blocks(out)
+        out = _THINK_UNCLOSED.sub("", out)
+        out = _HARNESS_UNCLOSED.sub("", out)
+        out = _TOOL_USE_UNCLOSED.sub("", out)
+        out = _UNCLOSED_BLOCK.sub("", out)
+        return out.strip()

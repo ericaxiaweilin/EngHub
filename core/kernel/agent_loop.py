@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from core.kernel.checkpoint import CheckpointManager
 from core.kernel.events import new_item_id
+from core.kernel.reply_sanitizer import StreamSanitizer
 
 MAX_TOOL_ROUNDS = 5
 
@@ -190,6 +191,9 @@ class AgentLoop:
             message = ((data.get("choices") or [{}])[0]).get("message") or None
             return message, False
 
+        # 流式标记过滤器在本轮所有 round 间保持：调用标记可能横跨多个 chunk，
+        # 必须在整轮结束时才做最终判定，半截标签绝不外发。
+        stream_sanitizer = StreamSanitizer()
         for round_no in range(self.max_rounds):
             await append_steering()
             if cancel_check is not None and cancel_check():
@@ -239,16 +243,18 @@ class AgentLoop:
                             continue
                         text = delta.get("content") or ""
                         if text:
-                            streamed_content.append(text)
-                            await notify(
-                                "item/delta",
-                                {
-                                    "item_type": "assistant_text",
-                                    "round": round_no + 1,
-                                    "delta": text,
-                                },
-                                model_item_id,
-                            )
+                            safe = stream_sanitizer.feed(text)
+                            if safe:
+                                streamed_content.append(safe)
+                                await notify(
+                                    "item/delta",
+                                    {
+                                        "item_type": "assistant_text",
+                                        "round": round_no + 1,
+                                        "delta": safe,
+                                    },
+                                    model_item_id,
+                                )
                         self._merge_tool_call_deltas(
                             streamed_tool_calls,
                             delta.get("tool_calls") or [],
@@ -270,6 +276,18 @@ class AgentLoop:
                         rounds_used=round_no + 1,
                         status="gateway_error",
                         error=f"{type(exc).__name__}: {exc}",
+                    )
+                tail = stream_sanitizer.flush()
+                if tail:
+                    streamed_content.append(tail)
+                    await notify(
+                        "item/delta",
+                        {
+                            "item_type": "assistant_text",
+                            "round": round_no + 1,
+                            "delta": tail,
+                        },
+                        model_item_id,
                     )
                 tool_calls = [
                     streamed_tool_calls[index]

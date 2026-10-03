@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from core.kernel.confirmation import confirmation_grounding
 from core.kernel.context import KernelContext
 from core.kernel.agent_loop import AgentLoop, LoopResult
 from core.kernel.checkpoint import CheckpointManager
@@ -461,6 +462,15 @@ class HarnessKernel:
             )
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         messages += ctx.messages
+        confirm_note = confirmation_grounding(ctx.messages)
+        if confirm_note:
+            messages.append({"role": "system", "content": confirm_note})
+            try:
+                self._telemetry.record(
+                    self._telemetry_trace_event(ctx, phase="grounding")
+                )
+            except Exception:  # noqa: BLE001 - 遥测绝不能打断对话
+                pass
 
         payload: Dict[str, Any] = {
             "model": route.get("gateway_model"),
