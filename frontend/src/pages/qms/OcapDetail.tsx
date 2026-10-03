@@ -35,7 +35,7 @@ const OcapDetail: React.FC = () => {
   useEffect(() => {
     if (!id) return
     setLoading(true)
-    getDefect(id).then(data => {
+    getDefect(id).then((data: DefectWithOCAP) => {
       setDefect(data)
       form.setFieldsValue({
         ocapan_status: data.ocap_status || 'triggered',
@@ -53,6 +53,10 @@ const OcapDetail: React.FC = () => {
   }, [id, navigate, form])
 
   const handleSubmit = async (values: any) => {
+    if (!id) {
+      message.error('缺少缺陷 ID，无法提交')
+      return
+    }
     try {
       await updateDefectOCAP(id, values)
       message.success('OCAP信息已更新')
@@ -71,7 +75,7 @@ const OcapDetail: React.FC = () => {
           form={form}
           labelCol={{ span: 4 }}
           wrapperCol={{ span: 16 }}
-          onSubmit={handleSubmit}
+          onFinish={handleSubmit}
           layout="horizontal"
           disabled={loading}
         >

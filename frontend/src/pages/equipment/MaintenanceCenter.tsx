@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Timeline, Progress } from 'antd';
+import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Timeline, Progress, Descriptions, Divider } from 'antd';
 import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, ToolOutlined, CalendarOutlined, CheckCircleOutlined, ClockCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
@@ -513,7 +513,7 @@ const MaintenanceCenter: React.FC = () => {
                   {selectedOrder.priority}
                 </Tag>
               </Descriptions.Item>
-              <Descriptions.Item label="Status" colspan={2}>
+              <Descriptions.Item label="Status" span={2}>
                 <Tag color={
                   selectedOrder.status === 'COMPLETED' ? 'green' :
                   selectedOrder.status === 'IN_PROGRESS' ? 'orange' :
@@ -539,10 +539,10 @@ const MaintenanceCenter: React.FC = () => {
                 {selectedOrder.actual_end ? new Date(selectedOrder.actual_end).toLocaleString() : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="Duration">{selectedOrder.duration_hours ? `${selectedOrder.duration_hours} hours` : '-'}</Descriptions.Item>
-              <Descriptions.Item label="Description" colspan={2}>
+              <Descriptions.Item label="Description" span={2}>
                 {selectedOrder.description}
               </Descriptions.Item>
-              <Descriptions.Item label="Notes" colspan={2}>
+              <Descriptions.Item label="Notes" span={2}>
                 {selectedOrder.notes || '-'}
               </Descriptions.Item>
             </Descriptions>

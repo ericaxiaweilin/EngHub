@@ -156,9 +156,9 @@ export default function RCCAnalysis() {
 
   // 瓶颈数据
   const bottlenecks = useMemo(() => {
-    const people = baseline.people || baseline?.baseline?.people || {}
-    const equipment = baseline.equipment || baseline?.baseline?.equipment || {}
-    const items: { name: string; loadRate: number; type: string }[] = []
+    const people = baseline.people || baseline?.baseline?.people || {};
+    const equipment = baseline.equipment || baseline?.baseline?.equipment || {};
+    const items: { name: string; loadRate: number; type: string }[] = [];
 
     // 工位负荷瓶颈
     (people.work_center_load || []).forEach((wc: any) => {

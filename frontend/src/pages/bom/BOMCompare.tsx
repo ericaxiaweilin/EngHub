@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Card, Row, Col, Select, Button, Table, Spin, Empty, message, Input, Form,
+  Tag
 } from 'antd';
 import { RightOutlined } from '@ant-design/icons';
 import api from '../../services/api';
@@ -72,7 +73,7 @@ const BOMCompare: React.FC = () => {
             <Select
               loading={loading && models.length === 0}
               style={{ width: 200 }}
-              onChange={(v) => form.getFieldValue().model = v}
+              onChange={(v) => form.setFieldValue('model', v)}
             >
               {models.map((m) => (
                 <Option key={m.id} value={m.id}>{m.name}</Option>
@@ -105,7 +106,7 @@ const BOMCompare: React.FC = () => {
               { title: '数量(B)', dataIndex: 'qty_b', key: 'qty_b' },
               {
                 title: '差异',
-                render: (_, record) => (
+                render: (_: any, record: any) => (
                   <Tag color={
                     record.diff === 'added' ? 'green' :
                     record.diff === 'removed' ? 'red' :
@@ -127,7 +128,7 @@ const BOMCompare: React.FC = () => {
           <Empty description="请选择对比参数后点击开始对比" />
         )}
         {!loading && models.length === 0 && (
-          <Spin centerTip="加载中..." />
+          <Spin tip="加载中..." />
         )}
       </Card>
     </div>

@@ -51,7 +51,7 @@ const ProcessAnalyses: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_PROCESS_ANALYSES, { params: { factory_id: factory, limit: 200 } })
-      const items = res.items || res || []
+      const items = res.data?.items ?? (Array.isArray(res.data) ? res.data : [])
       setData(items)
     } catch { setData([]) } finally { setLoading(false) }
   }

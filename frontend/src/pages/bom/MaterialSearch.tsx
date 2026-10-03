@@ -5,6 +5,8 @@ import {
 import { SearchOutlined } from '@ant-design/icons';
 import api from '../../services/api';
 
+const { Option } = Select;
+
 interface MaterialItem {
   part_number: string;
   name: string;
@@ -40,7 +42,7 @@ const MaterialSearch: React.FC = () => {
 
   const handleSearch = async () => {
     if (!searchParams.q) {
-      message.warn('请输入搜索关键词');
+      message.warning('请输入搜索关键词');
       return;
     }
     setLoading(true);
@@ -62,12 +64,6 @@ const MaterialSearch: React.FC = () => {
     }
   };
 
-  const handleEnter = (e: any) => {
-    if (e.key === 'Enter') {
-      handleSearch();
-    }
-  };
-
   return (
     <div style={{ padding: 24 }}>
       <Card title="BOM 物料搜索" bordered={false}>
@@ -76,8 +72,7 @@ const MaterialSearch: React.FC = () => {
             placeholder="输入物料号或名称搜索"
             value={searchParams.q}
             onChange={(e) => setSearchParams((prev) => ({ ...prev, q: e.target.value }))}
-            onEnterPressKey={handleEnter}
-            onPressButton
+            onSearch={() => handleSearch()}
             style={{ flex: 1 }}
             allowClear
           />
@@ -97,7 +92,7 @@ const MaterialSearch: React.FC = () => {
         </div>
 
         {loading ? (
-          <Spin centerTip="正在查询..." />
+          <Spin tip="正在查询..." />
         ) : results.length > 0 ? (
           <Table
             dataSource={results.map((r) => ({ ...r, key: r.part_number }))}
@@ -114,7 +109,7 @@ const MaterialSearch: React.FC = () => {
         ) : !loading && modelOptions.length > 0 ? (
           <Empty description="请输入搜索关键词后点击搜索" />
         ) : (
-          <Spin centerTip="加载中..." />
+          <Spin tip="加载中..." />
         )}
       </Card>
     </div>

@@ -45,7 +45,7 @@ const MOCK_PLANS = [
 ]
 
 const PlanList: React.FC = () => {
-  const [factory] = useState(getActiveFactoryId())
+  const [factory, setFactory] = useState(getActiveFactoryId())
   const [data, setData] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)

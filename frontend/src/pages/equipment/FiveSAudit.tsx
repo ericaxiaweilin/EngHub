@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Steps } from 'antd';
+import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Steps, Descriptions, Divider } from 'antd';
 import { PlusOutlined, CheckCircleOutlined, ClockCircleOutlined, ExclamationCircleOutlined, TrophyOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
@@ -515,7 +515,7 @@ const FiveSAudit: React.FC = () => {
             {selectedAudit.items && selectedAudit.items.length > 0 ? (
               <Table
                 dataSource={selectedAudit.items}
-                rowKey={(record, index) => index}
+                rowKey={(record, index) => index ?? 0}
                 pagination={false}
                 size="small"
                 columns={[

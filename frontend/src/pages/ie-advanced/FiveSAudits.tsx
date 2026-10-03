@@ -58,7 +58,7 @@ const FiveSAudits: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_5S_AUDITS, { params: { factory_id: factory, limit: 200 } })
-      const items = res.items || res || []
+      const items = res.data?.items ?? (Array.isArray(res.data) ? res.data : [])
       setData(items.map(normalizeFiveSAudit))
     } catch { setData([]) } finally { setLoading(false) }
   }

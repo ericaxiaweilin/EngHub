@@ -7,7 +7,7 @@ import dayjs from 'dayjs';
 import RedTagList from './RedTagList';
 
 const { RangePicker } = DatePicker;
-const { TextArea, Text } = Input;
+const { TextArea } = Input;
 
 interface Defect {
   id: string;
@@ -22,10 +22,11 @@ interface Defect {
 }
 
 interface DefectListProps {
-  factoryId: string;
+  factoryId?: string;
 }
 
-const DefectList: React.FC<DefectListProps> = ({ factoryId }) => {
+const DefectList: React.FC<DefectListProps> = ({ factoryId: propFactoryId }) => {
+  const factoryId = propFactoryId ?? localStorage.getItem('active_factory_id') ?? '';
   const [defects, setDefects] = useState<Defect[]>([]);
   const [loading, setLoading] = useState(false);
   const [total, setTotal] = useState(0);
@@ -146,7 +147,7 @@ const DefectList: React.FC<DefectListProps> = ({ factoryId }) => {
       dataIndex: 'id',
       key: 'id',
       width: 100,
-      render: (id: string) => <Text copyable>{id}</Text>
+      render: (id: string) => <Typography.Text copyable>{id}</Typography.Text>
     },
     {
       title: 'Type',

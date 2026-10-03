@@ -46,7 +46,7 @@ const StandardTimes: React.FC = () => {
       const res = await api.get(API_ENDPOINTS.IE_STANDARD_TIMES, {
         params: { factory_id: factory, limit: 500 },
       })
-      const items = res.items || res || []
+      const items = res.data?.items ?? (Array.isArray(res.data) ? res.data : [])
       setData(items)
     } catch {
       setData([])

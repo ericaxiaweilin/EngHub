@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Steps, Progress } from 'antd';
-import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, SettingOutlined, CheckCircleOutlined, ClockCircleOutlined, WarningOutlined } from '@ant-design/icons';
+import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Steps, Progress, Descriptions, Divider, Timeline } from 'antd';
+import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, SettingOutlined, CheckCircleOutlined, ClockCircleOutlined, WarningOutlined, TrophyOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
 import dayjs from 'dayjs';
@@ -23,6 +23,7 @@ interface EarlyEquipmentProject {
     completed_at?: string;
     notes?: string;
   }>;
+  expected_cost?: number;
   reliability_target: number;
   maintainability_target: number;
   cost_target: number;
@@ -195,9 +196,11 @@ const EarlyEquipmentManagement: React.FC = () => {
       key: 'cost',
       width: 100,
       render: (_: any, record: EarlyEquipmentProject) => {
-        const variance = record.expected_cost > 0 
-          ? ((record.actual_cost - record.expected_cost) / record.expected_cost * 100).toFixed(1)
-          : 0;
+        const expected = record.expected_cost ?? 0
+        const actual = record.actual_cost ?? 0
+        const variance = expected > 0
+          ? ((actual - expected) / expected * 100).toFixed(1)
+          : '0';
         return (
           <span style={{ color: parseFloat(variance) > 0 ? '#ff4d4f' : '#52c41a' }}>
             {variance}%

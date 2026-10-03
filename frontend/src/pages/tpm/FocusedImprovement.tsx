@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Timeline, Avatar } from 'antd';
+import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Timeline, Avatar, Descriptions, Divider } from 'antd';
 import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, TrophyOutlined, TeamOutlined, CheckCircleOutlined, ClockCircleOutlined, FireOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
@@ -536,7 +536,7 @@ const FocusedImprovement: React.FC = () => {
               <Descriptions.Item label="End Date">
                 {selectedProject.end_date ? new Date(selectedProject.end_date).toLocaleDateString() : '-'}
               </Descriptions.Item>
-              <Descriptions.Item label="Problem Statement" colspan={2}>
+              <Descriptions.Item label="Problem Statement" span={2}>
                 {selectedProject.problem_statement}
               </Descriptions.Item>
             </Descriptions>

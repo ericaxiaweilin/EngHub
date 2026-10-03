@@ -67,7 +67,7 @@ const ActionStudies: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_ACTION_STUDIES, { params: { factory_id: factory, limit: 200 } })
-      const items = res.items || res || []
+      const items = res.data?.items ?? (Array.isArray(res.data) ? res.data : [])
       setData(items.map(normalizeActionStudy))
     } catch { setData([]) } finally { setLoading(false) }
   }

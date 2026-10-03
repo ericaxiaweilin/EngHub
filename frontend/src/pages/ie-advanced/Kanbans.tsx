@@ -56,7 +56,7 @@ const Kanbans: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_ADVANCED_KANBANS, { params: { factory_id: factory, limit: 200 } })
-      const items = res.items || res || []
+      const items = res.data?.items ?? (Array.isArray(res.data) ? res.data : [])
       setData(items.map(normalizeKanban))
     } catch { setData([]) } finally { setLoading(false) }
   }

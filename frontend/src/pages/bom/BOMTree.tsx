@@ -17,33 +17,21 @@ interface Props {
 
 const BOMTree: React.FC<Props> = ({ data }) => {
 
-  const treeData = data?.map((item) => ({
-    key: item.key || item.part_number,
-    title: (
-      <div style={{ display: 'flex', alignItems: 'center' }}>
-        <span style={{ marginRight: 8 }}>{item.part_number}</span>
-        <span style={{ color: '#888', fontSize: 12 }}>{item.quantity} / 层 {item.level}</span>
-      </div>
-    ),
-    children: item.children ? treeData(item.children) : undefined,
-  }));
-
-  const renderTreeNode = (node: any) => (
-    <Tree.Node key={node.key} {...node}>
-      <div style={{ display: 'flex', alignItems: 'center' }}>
-        {node.title}
-      </div>
-      {node.children && node.children.length > 0 && (
-        <Tree.List>
-          {node.children.map(renderTreeNode)}
-        </Tree.List>
-      )}
-    </Tree.Node>
-  );
+  const buildTreeData = (items: BOMNode[]): any[] =>
+    (items || []).map((item) => ({
+      key: item.key || item.part_number,
+      title: (
+        <div style={{ display: 'flex', alignItems: 'center' }}>
+          <span style={{ marginRight: 8 }}>{item.part_number}</span>
+          <span style={{ color: '#888', fontSize: 12 }}>{item.quantity} / 层 {item.level}</span>
+        </div>
+      ),
+      children: item.children ? buildTreeData(item.children) : undefined,
+    }));
 
   return (
     <Tree
-      treeData={treeData || []}
+      treeData={buildTreeData(data)}
       defaultExpandAll
       showIcon
       fieldNames={{ title: 'title', children: 'children', key: 'key' }}

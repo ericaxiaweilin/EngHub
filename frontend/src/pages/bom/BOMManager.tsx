@@ -8,6 +8,8 @@ import {
 import BOMTree from './BOMTree';
 import api from '../../services/api';
 
+const { Option } = Select;
+
 const FACTORY = 'factory-sh-01';
 
 interface BOMModel {
@@ -182,19 +184,17 @@ const BOMManager: React.FC = () => {
       </Card>
 
       <div style={{ marginTop: 16 }}>
-        <Tabs defaultActiveKey="1">
-          <TabPane tab="产品结构BOM" key="1">
+        <Tabs defaultActiveKey="1" items={[{ key: '1', label: '产品结构BOM', children: (
             <Card title="BOM 结构树">
               {loading ? (
-                <Spin centerTip="正在加载BOM..." />
+                <Spin tip="正在加载BOM..." />
               ) : bomData ? (
                 <BOMTree data={bomData.bom_tree} />
               ) : (
                 <Empty description="请先选择产品型号" />
               )}
             </Card>
-          </TabPane>
-          <TabPane tab="工单关联BOM" key="2">
+          ) }, { key: '2', label: '工单关联BOM', children: (
             <Card title="工单BOM查询">
               <Row gutter={[8, 8]} style={{ marginBottom: 16 }}>
                 <Col span={16}>
@@ -240,23 +240,19 @@ const BOMManager: React.FC = () => {
                 <Empty description="请输入工单号后点击查询" />
               )}
             </Card>
-          </TabPane>
-        </Tabs>
+          ) }]} />
       </div>
 
       <div style={{ marginTop: 16 }}>
-        <Tabs defaultActiveKey="1">
-          <TabPane tab="版本对比" key="1">
+        <Tabs defaultActiveKey="1" items={[{ key: '1', label: '版本对比', children: (
             <Button type="primary" icon={<CopyOutlined />} onClick={() => window.location.href = '/bom/compare'}>
               进入对比页面
             </Button>
-          </TabPane>
-          <TabPane tab="物料搜索" key="2">
+          ) }, { key: '2', label: '物料搜索', children: (
             <Button type="primary" icon={<SearchOutlined />} onClick={() => window.location.href = '/bom/search'}>
               搜索物料
             </Button>
-          </TabPane>
-        </Tabs>
+          ) }]} />
       </div>
     </div>
   );

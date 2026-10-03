@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Avatar } from 'antd';
+import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Progress, Avatar, Descriptions } from 'antd';
 import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, TeamOutlined, CheckCircleOutlined, ClockCircleOutlined, StarOutlined, TrophyOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
@@ -561,7 +561,7 @@ const TrainingEducation: React.FC = () => {
                   <Tag color="default">Not Issued</Tag>
                 )}
               </Descriptions.Item>
-              <Descriptions.Item label="Status" colspan={2}>
+              <Descriptions.Item label="Status" span={2}>
                 <Tag color={
                   selectedTraining.status === 'COMPLETED' ? 'green' :
                   selectedTraining.status === 'IN_PROGRESS' ? 'blue' :
@@ -570,7 +570,7 @@ const TrainingEducation: React.FC = () => {
                   {selectedTraining.status}
                 </Tag>
               </Descriptions.Item>
-              <Descriptions.Item label="Description" colspan={2}>
+              <Descriptions.Item label="Description" span={2}>
                 {selectedTraining.description || '-'}
               </Descriptions.Item>
             </Descriptions>

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Timeline, Progress } from 'antd';
+import { Card, Table, Button, Tag, Space, Input, Select, DatePicker, Modal, Form, message, Typography, Statistic, Row, Col, Timeline, Progress, Descriptions } from 'antd';
 import { PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, ToolOutlined, CalendarOutlined, CheckCircleOutlined, ClockCircleOutlined, ExclamationCircleOutlined, TrophyOutlined } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
@@ -20,6 +20,7 @@ interface OfficeTPMItem {
   status: string;
   owner: string;
   created_at: string;
+  notes?: string;
 }
 
 interface OfficeTPMStats {
@@ -551,10 +552,10 @@ const OfficeTPM: React.FC = () => {
               <Descriptions.Item label="Created At">
                 {selectedItem.created_at ? new Date(selectedItem.created_at).toLocaleString() : '-'}
               </Descriptions.Item>
-              <Descriptions.Item label="Improvement Action" colspan={2}>
+              <Descriptions.Item label="Improvement Action" span={2}>
                 {selectedItem.improvement_action}
               </Descriptions.Item>
-              <Descriptions.Item label="Notes" colspan={2}>
+              <Descriptions.Item label="Notes" span={2}>
                 {selectedItem.notes || '-'}
               </Descriptions.Item>
             </Descriptions>

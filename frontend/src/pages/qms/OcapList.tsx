@@ -41,7 +41,7 @@ const OcapList: React.FC = () => {
     { title: '不良单号', dataIndex: 'defect_code', key: 'code', width: 140, render: (v: string, r: Defect) => v || r.id },
     { title: '缺陷类型', dataIndex: 'defect_type', key: 'type', width: 100, render: (v: string) => v || '-' },
     { title: '严重等级', dataIndex: 'severity', key: 'sev', width: 90, render: (v: string) => {
-      const map = { critical: 'red', major: 'orange', minor: 'default', observation: 'blue' }
+      const map: Record<string, string> = { critical: 'red', major: 'orange', minor: 'default', observation: 'blue' }
       return <Tag color={map[v] || 'default'}>{v || '-'}</Tag>
     }},
     { title: 'OCAP状态', dataIndex: 'ocap_status', key: 'ocap', width: 100, render: (v: string) => {

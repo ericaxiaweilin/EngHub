@@ -16,7 +16,8 @@ import {
 } from '@ant-design/icons';
 import axios from 'axios';
 import { API_BASE_URL } from '../../config/api';
-import { redTagApi, RedTagCreate } from '../../services/modules/qms';
+import { redTagApi } from '../../services/modules/qms';
+import type { RedTagCreate as RedTagCreatePayload } from '../../services/modules/qms';
 
 const { Title } = Typography;
 const { TextArea } = Input;
@@ -54,7 +55,7 @@ const RedTagCreate: React.FC<RedTagCreateProps> = ({ factoryId, defectId, onCrea
   const handleSubmit = async (values: any) => {
     setLoading(true);
     try {
-      const payload: RedTagCreate = {
+      const payload: RedTagCreatePayload = {
         factory_id: factoryId,
         defect_id: values.defect_id || defectId,
         red_tag_type: values.red_tag_type,

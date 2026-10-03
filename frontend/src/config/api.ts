@@ -52,6 +52,7 @@ export const API_ENDPOINTS = {
   SIM_FACTORY_SCENARIO: (scenarioId?: string) =>
     `${API_BASE_URL}/api/v1/sim-factory/scenario${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
   SIM_FACTORY_RUN: `${API_BASE_URL}/api/v1/sim-factory/run`,
+  SIM_FACTORY_SELF_TEST: `${API_BASE_URL}/api/v1/sim-factory/self-test`,
   SIM_FACTORY_DASHBOARD_SUMMARY: (scenarioId?: string) =>
     `${API_BASE_URL}/api/v1/sim-factory/dashboard${scenarioId ? `?scenario_id=${scenarioId}` : ''}`,
   PRODUCTION_DASHBOARD_SUMMARY: (factoryId?: string, horizonDays?: number) => {

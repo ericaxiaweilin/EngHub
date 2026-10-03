@@ -60,7 +60,7 @@ const LineBalanceAnalyses: React.FC = () => {
     setLoading(true)
     try {
       const res = await api.get(API_ENDPOINTS.IE_LINE_BALANCE_ANALYSES, { params: { factory_id: factory, limit: 200 } })
-      const items = res.items || res || []
+      const items = res.data?.items ?? (Array.isArray(res.data) ? res.data : [])
       setData(items.map(normalizeLineBalance))
     } catch { setData([]) } finally { setLoading(false) }
   }
