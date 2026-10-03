@@ -159,9 +159,9 @@ DATA_GUARD_BASELINE="$REMOTE_DIR/backups/$BACKUP_TAG/data_guard_before.json"
 
 # ━━━ 数据水位快照（关键！）━━━
 info "记录部署前数据水位"
-scp -q "$ROOT_DIR/scripts/data_guard.py" "$DEPLOY_HOST:/tmp/enghub-data-guard.py"
+scp -q "$ROOT_DIR/scripts/data_guard.py" "$DEPLOY_HOST:/dev/shm/enghub-data-guard.py"
 ssh "$DEPLOY_HOST" \
-  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' DATA_GUARD_FACTORIES='$DATA_GUARD_FACTORIES' python3 /tmp/enghub-data-guard.py snapshot --output '$DATA_GUARD_BASELINE'" \
+  "PG_CONTAINER='$DB_CONTAINER' PG_USER='$DB_USER' PG_DB='$DB_NAME' DATA_GUARD_FACTORIES='$DATA_GUARD_FACTORIES' python3 /dev/shm/enghub-data-guard.py snapshot --output '$DATA_GUARD_BASELINE'" \
   || fail "部署前数据水位快照失败"
 ok "数据水位快照完成: $DATA_GUARD_BASELINE"
 
@@ -169,9 +169,10 @@ ok "数据水位快照完成: $DATA_GUARD_BASELINE"
 info "━━━ 阶段 5/6：部署新版本 ━━━"
 ROLLBACK_NEEDED=true  # 从此处开始，失败则回滚
 
-# 打包
-ARCHIVE="/tmp/enghub-source-${SHORT_SHA}.tgz"
-FRONTEND_ARCHIVE="/tmp/enghub-frontend-${SHORT_SHA}.tgz"
+# 打包（中间产物放内存盘：几十 MB，用完即弃，不落磁盘）
+mkdir -p /dev/shm/enghub_deploy
+ARCHIVE="/dev/shm/enghub_deploy/enghub-source-${SHORT_SHA}.tgz"
+FRONTEND_ARCHIVE="/dev/shm/enghub_deploy/enghub-frontend-${SHORT_SHA}.tgz"
 git archive --format=tar.gz -o "$ARCHIVE" HEAD
 COPYFILE_DISABLE=1 tar --no-xattrs -C frontend/dist -czf "$FRONTEND_ARCHIVE" .
 
@@ -188,11 +189,11 @@ REMOTE_DIR="$1"; CONTAINER="$2"; HEALTH_URL="$3"
 DB_CONTAINER="$4"; DB_USER="$5"; DB_NAME="$6"
 COMMIT_SHA="$7"; MAX_WAIT="$8"
 SHORT="${COMMIT_SHA:0:7}"
-RELEASE="/tmp/enghub-release-${COMMIT_SHA}"
+RELEASE="/dev/shm/enghub_deploy/release-${COMMIT_SHA}"
 
 mkdir -p "$RELEASE/source" "$RELEASE/frontend"
-tar -xzf "/tmp/enghub-source-${SHORT}.tgz" -C "$RELEASE/source"
-tar -xzf "/tmp/enghub-frontend-${SHORT}.tgz" -C "$RELEASE/frontend"
+tar -xzf "/dev/shm/enghub_deploy/enghub-source-${SHORT}.tgz" -C "$RELEASE/source"
+tar -xzf "/dev/shm/enghub_deploy/enghub-frontend-${SHORT}.tgz" -C "$RELEASE/frontend"
 
 # 同步代码到 volume 挂载目录
 echo "  同步后端代码..."
@@ -255,7 +256,7 @@ echo "  容器健康 ✓"
 printf '%s\n' "$COMMIT_SHA" > "$REMOTE_DIR/.last_deployed_commit"
 
 # 清理临时文件
-rm -rf "$RELEASE" "/tmp/enghub-source-${SHORT}.tgz" "/tmp/enghub-frontend-${SHORT}.tgz"
+rm -rf "$RELEASE" "/dev/shm/enghub_deploy/enghub-source-${SHORT}.tgz" "/dev/shm/enghub_deploy/enghub-frontend-${SHORT}.tgz"
 DEPLOY
 
 ok "部署完成: $SHORT_SHA"
