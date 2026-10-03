@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import json
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from core.kernel.checkpoint import CheckpointManager
@@ -390,6 +391,18 @@ class AgentLoop:
                 payload["messages"] = messages
                 continue
 
+            # 无工具调用 → 先看正文里是否漏了裸 tool-JSON，有则回读执行。
+            if not tool_calls:
+                recovered = self._recover_readonly_calls(
+                    message.get("content") or "", round_no,
+                )
+                if recovered:
+                    tool_calls = recovered
+                    message = {
+                        "role": "assistant",
+                        "content": self._clean_reply(message.get("content") or ""),
+                        "tool_calls": tool_calls,
+                    }
             # 无工具调用 → 最终回复
             if not tool_calls:
                 reply = self._clean_reply(message.get("content") or "")
@@ -621,6 +634,29 @@ class AgentLoop:
                 target["function"]["name"] += function_delta["name"]
             if function_delta.get("arguments"):
                 target["function"]["arguments"] += function_delta["arguments"]
+
+    def _recover_readonly_calls(self, content: str, round_no: int) -> List[Dict[str, Any]]:
+        """把正文里漏写的裸 tool-JSON 回读成可执行调用。
+
+        弱模型有时不走 function-call 协议，直接把调用写成正文。
+        只读工具可安全代执行；写/仿真工具绝不代执行（仍走审批与确认）。
+        每轮最多回读 3 个，多了也执行不完（max_rounds 兜底）。
+        """
+        from core.kernel.reply_sanitizer import extract_tool_json_spans
+
+        calls: List[Dict[str, Any]] = []
+        for _start, _end, name, args in extract_tool_json_spans(content or ""):
+            if not name or name in self._write_tools or name in self._sim_tools:
+                continue
+            if len(calls) >= 3:
+                break
+            calls.append({
+                "id": f"recovered-r{round_no}-{len(calls)}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+                "recovered": True,
+            })
+        return calls
 
     @staticmethod
     def _parse_arguments(raw: Any) -> Dict[str, Any]:

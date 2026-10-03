@@ -6,8 +6,10 @@ pytestmark = [pytest.mark.unit]
 
 from core.kernel.confirmation import confirmation_grounding
 from core.kernel.context_window import compact_messages
+from core.kernel.agent_loop import AgentLoop
 from core.kernel.reply_sanitizer import (
     StreamSanitizer,
+    extract_tool_json_spans,
     looks_like_tool_call_leak,
     strip_tool_call_markup,
 )
@@ -133,4 +135,64 @@ def test_stream_sanitizer_flush_emits_held_tail():
     s = StreamSanitizer()
     assert s.feed("尾巴<") == "尾巴"
     assert s.flush() == "<"
+
+LEAKED_SAMPLE = (
+    '{"tool":"query_wip_work_orders",'
+    '"arguments":{"status":"in_progress","page":1,"page_size":200}}'
+)
+
+
+def test_bare_tool_json_stripped_from_prose():
+    raw = "我来查一下在制工单。" + LEAKED_SAMPLE + "稍等。"
+    cleaned = strip_tool_call_markup(raw)
+    assert "query_wip_work_orders" not in cleaned
+    assert "我来查一下在制工单" in cleaned
+    assert looks_like_tool_call_leak(raw) is True
+
+
+def test_bare_tool_json_whole_reply_stripped():
+    assert strip_tool_call_markup(LEAKED_SAMPLE) == ""
+
+
+def test_legit_json_untouched():
+    raw = '接口返回示例：{"code": 200, "data": []} 请参考。'
+    assert strip_tool_call_markup(raw) == raw
+    assert looks_like_tool_call_leak(raw) is False
+
+
+def test_extract_tool_json_spans_parses_stringified_args():
+    spans = extract_tool_json_spans(LEAKED_SAMPLE)
+    assert len(spans) == 1
+    _s, _e, name, args = spans[0]
+    assert name == "query_wip_work_orders"
+    assert args == {"status": "in_progress", "page": 1, "page_size": 200}
+
+
+def test_stream_holds_partial_tool_json():
+    s = StreamSanitizer()
+    assert s.feed("正在查询") == "正在查询"
+    assert s.feed('{"tool":"query_wip') == ""
+    assert s.feed('_work_orders","arguments":{}}后续') == "后续"
+    assert s.flush() == ""
+
+
+def _loop_with(write=(), sim=()):
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._write_tools = frozenset(write)
+    loop._sim_tools = frozenset(sim)
+    return loop
+
+
+def test_recover_readonly_call():
+    calls = _loop_with()._recover_readonly_calls(LEAKED_SAMPLE, 0)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "query_wip_work_orders"
+    assert calls[0]["id"].startswith("recovered-")
+
+
+def test_recover_never_takes_write_tools():
+    calls = _loop_with(write=("create_work_order",))._recover_readonly_calls(
+        '{"tool":"create_work_order","arguments":{"a":1}}', 1,
+    )
+    assert calls == []
 

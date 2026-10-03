@@ -14,6 +14,7 @@
 已经拿到的答案吃掉。
 """
 
+import json
 import re
 
 _LT = "<"
@@ -86,7 +87,7 @@ _SEP = re.compile(
 def strip_tool_call_markup(content: str) -> str:
     """去掉误混入正文的工具调用标记，返回仍然可读的答复文本。"""
     text = content or ""
-    if _LT not in text:
+    if _LT not in text and '"tool"' not in text:
         return text.strip()
     text = _HARNESS.sub("", text)
     text = _BLOCK.sub("", text)
@@ -96,17 +97,19 @@ def strip_tool_call_markup(content: str) -> str:
     text = _UNCLOSED_BLOCK.sub("", text)
     text = _INNER.sub("", text)
     text = _SEP.sub("", text)
+    text = strip_tool_json(text)
     return text.strip()
 
 
 def looks_like_tool_call_leak(content: str) -> bool:
     """判断文本里是否混进了调用标记（用于告警，不改语义）。"""
     text = content or ""
-    if _LT not in text:
+    if _LT not in text and '"tool"' not in text:
         return False
     return bool(
         re.search(_tag_open("tool_call"), text, re.IGNORECASE)
         or re.search(_tag_open("tool_use"), text, re.IGNORECASE)
+        or bool(_TOOL_JSON_START.search(text))
         or re.search(_tag("tool_calls"), text, re.IGNORECASE)
         or re.search(_tag("tool_call"), text, re.IGNORECASE)
         or _SEP.search(text)
@@ -127,6 +130,90 @@ def strip_complete_blocks(text: str) -> str:
     return out
 
 
+_TOOL_JSON_START = re.compile(r'\{\s*"tool"\s*:')
+
+
+def _scan_json_span(text: str, start: int):
+    """从 start（应为 '{'）按括号配平找 JSON 结束位置；字符串与转义被正确跳过。
+
+    返回 (end_exclusive, parsed)；配不平或解析失败返回 (None, None)。
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    raw = text[start:i + 1]
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        return None, None
+                    return i + 1, parsed
+        i += 1
+    return None, None
+
+
+def _is_tool_call_json(parsed) -> bool:
+    return (
+        isinstance(parsed, dict)
+        and isinstance(parsed.get("tool"), str)
+        and isinstance(parsed.get("arguments"), (dict, str))
+    )
+
+
+def extract_tool_json_spans(text: str):
+    """找出文本里完整的裸 tool-JSON 调用，返回 [(start, end, name, args_dict)]。
+
+    arguments 可能是对象，也可能是二次序列化的字符串，统一转成 dict。
+    """
+    spans = []
+    for m in _TOOL_JSON_START.finditer(text or ""):
+        start = m.start()
+        end, parsed = _scan_json_span(text, start)
+        if end is None or not _is_tool_call_json(parsed):
+            continue
+        args = parsed.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:  # noqa: BLE001
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        spans.append((start, end, str(parsed.get("tool")), args))
+    return spans
+
+
+def strip_tool_json(text: str) -> str:
+    """删除完整的裸 tool-JSON 调用；末尾截断的半截调用也一并吃掉。"""
+    out = text or ""
+    if '"tool"' not in out:
+        return out
+    for start, end, _name, _args in reversed(extract_tool_json_spans(out)):
+        out = out[:start] + out[end:]
+    m = list(_TOOL_JSON_START.finditer(out))
+    if m:
+        out = out[:m[0].start()]
+    return out
+
+
 class StreamSanitizer:
     """SSE 流式逐块过滤：已闭合的标记块直接吃掉，未闭合的尾巴暂扣。
 
@@ -143,21 +230,29 @@ class StreamSanitizer:
         if not text:
             return ""
         buf = strip_complete_blocks(self._buf + text)
-        idx = buf.rfind(_LT)
-        if idx == -1:
-            self._buf = ""
-            return buf
-        self._buf = buf[idx:]
-        return buf[:idx]
+        for start, end, _name, _args in reversed(extract_tool_json_spans(buf)):
+            buf = buf[:start] + buf[end:]
+        hold = len(buf)
+        lt_idx = buf.rfind(_LT)
+        if lt_idx != -1:
+            hold = min(hold, lt_idx)
+        m = list(_TOOL_JSON_START.finditer(buf))
+        if m:
+            hold = min(hold, m[0].start())
+        self._buf = buf[hold:]
+        return buf[:hold]
 
     def flush(self) -> str:
         """流结束：对暂扣尾巴做完整清洗（含未闭合块与 think）并返回。"""
         out, self._buf = self._buf, ""
-        if not out or _LT not in out:
+        if not out:
+            return out
+        if _LT not in out and '"tool"' not in out:
             return out
         out = strip_complete_blocks(out)
         out = _THINK_UNCLOSED.sub("", out)
         out = _HARNESS_UNCLOSED.sub("", out)
         out = _TOOL_USE_UNCLOSED.sub("", out)
         out = _UNCLOSED_BLOCK.sub("", out)
+        out = strip_tool_json(out)
         return out.strip()
