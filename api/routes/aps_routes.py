@@ -45,6 +45,11 @@ class TaskLockRequest(BaseModel):
     note: Optional[str] = None
 
 
+class ReleaseRequest(BaseModel):
+    allow_partial: bool = False
+    note: Optional[str] = None
+
+
 class CalendarCreate(BaseModel):
     factory_id: str
     resource_id: str
@@ -262,14 +267,33 @@ async def confirm_schedule(
 @router.post("/schedules/{schedule_id}/release")
 async def release_schedule(
     schedule_id: str,
+    req: Optional[ReleaseRequest] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pp", "release")),
 ):
-    """下达排程 → 工单状态 released"""
+    """下达排程 → 工单状态 released
+
+    有工单未排产/物料未齐套时默认拒绝；计划员确认风险后传 allow_partial=true
+    只下达已排产部分，未排进的工单留在池子里并被如实记录。
+    """
     svc = ApsService(db)
-    result = await svc.release_schedule(schedule_id, released_by=current_user.username)
+    result = await svc.release_schedule(
+        schedule_id,
+        released_by=current_user.username,
+        allow_partial=bool(req and req.allow_partial),
+        note=(req.note if req else None),
+    )
     if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("message", "下达失败"))
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": result.get("message", "下达失败"),
+                "partial_releasable": bool(result.get("partial_releasable")),
+                "blockers": result.get("blockers") or [],
+                "unscheduled_count": result.get("unscheduled_count"),
+                "material_shortage_tasks": result.get("material_shortage_tasks"),
+            },
+        )
     return result
 
 
@@ -809,6 +833,23 @@ async def delivery_promise(
             route_id = wo.routing_template_id or wo.routing_id
     if not route_id and product:
         route_id = product.current_routing_id
+    if not route_id:
+        # products.current_routing_id 基本没维护（581 个产品只有 5 个有值，且那 5 个模板没有工序行），
+        # 但待排工单上挂着排程真正在用的路线。ATP 必须和排程同口径，否则同一产品在两个页面
+        # 一个算得出交期、一个说"缺基础数据"。
+        wo_route = (await db.execute(
+            select(WorkOrder.routing_template_id, WorkOrder.routing_id)
+            .where(
+                WorkOrder.factory_id == req.factory_id,
+                WorkOrder.product_id == req.product_id,
+                WorkOrder.status.in_(("pending", "released", "in_progress")),
+                or_(WorkOrder.routing_template_id.isnot(None), WorkOrder.routing_id.isnot(None)),
+            )
+            .order_by(WorkOrder.created_at.desc())
+            .limit(1)
+        )).first()
+        if wo_route:
+            route_id = wo_route[0] or wo_route[1]
 
     standard_hours = 0.0
     route_source = None
@@ -893,6 +934,11 @@ async def delivery_promise(
     feasible = earliest_end <= requested_due if requested_due else None
     confidence = "medium" if not requested_due else ("high" if feasible else "low")
 
+    # 没有已下达方案时，现有负荷只能按 0 计，承诺必然偏乐观 —— 要说出来而不是装作很准
+    no_current_plan = current_end is None
+    if no_current_plan:
+        confidence = "low"
+
     return {
         "product_id": req.product_id,
         "quantity": req.quantity,
@@ -917,6 +963,10 @@ async def delivery_promise(
             "capacity_source": "station_capacity",
             "calendar_source": "aps_work_calendars/aps_holidays",
             "material_readiness": "not_evaluated_for_new_order",
+            "plan_basis": (
+                "当前已下达排程的占用" if current_end
+                else "工厂没有已下达(is_current)的排程方案，现有负荷按 0 计——承诺偏乐观，请先下达方案"
+            ),
         },
         "calculated_at": now.isoformat(),
     }

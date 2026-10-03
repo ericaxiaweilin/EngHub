@@ -101,18 +101,35 @@ const ScheduleGantt: React.FC = () => {
     }
   }
 
-  // 下达
-  const handleRelease = async () => {
+  // 下达（未排产/未齐套时让计划员确认是否只下达已排产部分）
+  const doRelease = async (allowPartial: boolean) => {
     if (!selectedId) return
     try {
-      const res: any = await apsApi.releaseSchedule(selectedId)
+      const res: any = await apsApi.releaseSchedule(selectedId, {
+        allow_partial: allowPartial,
+        note: allowPartial ? 'PMC 确认部分下达' : undefined,
+      })
       message.success(res.message || '已下达')
       loadSchedules()
       loadGantt(selectedId)
     } catch (e: any) {
-      message.error(e?.response?.data?.detail || '下达失败')
+      const detail = e?.response?.data?.detail
+      const msg = typeof detail === 'string' ? detail : detail?.message || '下达失败'
+      if (typeof detail === 'object' && detail?.partial_releasable && !allowPartial) {
+        Modal.confirm({
+          title: '这版方案不能整盘下达',
+          content: `${msg}。确定后只下达已排产部分，未排进去的工单继续留在待排池，方案仍会成为当前生效版本。`,
+          okText: '只下达已排产部分',
+          cancelText: '返回继续调整',
+          onOk: () => doRelease(true),
+        })
+      } else {
+        message.error(msg)
+      }
     }
   }
+
+  const handleRelease = () => doRelease(false)
 
   // 重排：不带 insert_wo_id 即整盘重算，已钉住的工序保持不动
   const handleReschedule = async () => {

@@ -1046,6 +1046,20 @@ class ApsService:
 
         tasks = list(tasks_result.scalars().all())
 
+        # aps_schedule_tasks.station_id 存的是工位编码（ST-JG-01），而
+        # work_orders.assigned_station_id 是指向 stations.id(UUID) 的外键；
+        # 直接把编码写进去会撞外键，整个确认接口 500。
+        codes = sorted({str(t.station_id) for t in tasks if t.station_id})
+        station_id_by_code: Dict[str, str] = {}
+        if codes:
+            mapped = await self.db.execute(
+                select(Station.id, Station.station_code).where(
+                    Station.factory_id == schedule.factory_id,
+                    Station.station_code.in_(codes),
+                )
+            )
+            station_id_by_code = {str(code): str(sid) for sid, code in mapped.all()}
+
         # 按工单聚合：取最早开始和最晚结束
 
         wo_times: Dict[str, Dict] = {}
@@ -1066,6 +1080,9 @@ class ApsService:
 
                     wo_times[t.work_order_id]["start"] = t.planned_start
 
+                    # 工单上记的工位应是首道工序（最早开工）的，原来留的是遍历到的任意一行
+                    wo_times[t.work_order_id]["station"] = t.station_id
+
                 if t.planned_end > wo_times[t.work_order_id]["end"]:
 
                     wo_times[t.work_order_id]["end"] = t.planned_end
@@ -1073,6 +1090,8 @@ class ApsService:
         # 回写工单
 
         updated_count = 0
+
+        unmapped_stations: List[str] = []
 
         for wo_id, times in wo_times.items():
 
@@ -1085,7 +1104,11 @@ class ApsService:
                 if wo.planned_start is None:
                     wo.planned_start = times["start"]
 
-                wo.assigned_station_id = times["station"]
+                mapped_station = station_id_by_code.get(str(times["station"]))
+                if mapped_station:
+                    wo.assigned_station_id = mapped_station
+                else:
+                    unmapped_stations.append(str(times["station"]))
 
                 wo.updated_at = datetime.utcnow()
 
@@ -1110,17 +1133,37 @@ class ApsService:
             actor=confirmed_by,
             schedule_id=schedule.id,
             reason="APS 方案确认",
-            payload={"updated_orders": updated_count},
+            payload={
+                "updated_orders": updated_count,
+                "unmapped_station_codes": sorted(set(unmapped_stations)),
+            },
         )
 
         await self.db.commit()
 
-        return {"success": True, "message": f"已确认，回写 {updated_count} 个工单", "updated_orders": updated_count}
+        message = f"已确认，回写 {updated_count} 个工单"
+        if unmapped_stations:
+            message += f"；{len(set(unmapped_stations))} 个工位编码在 stations 表查不到，已跳过工位回写"
+        return {
+            "success": True,
+            "message": message,
+            "updated_orders": updated_count,
+            "unmapped_station_codes": sorted(set(unmapped_stations)),
+        }
 
-    async def release_schedule(self, schedule_id: str, released_by: str = "system") -> Dict[str, Any]:
+    async def release_schedule(
+        self,
+        schedule_id: str,
+        released_by: str = "system",
+        allow_partial: bool = False,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
 
-        """下达排程 → 工单状态 released"""
+        """下达排程 → 工单状态 released
 
+        allow_partial 是计划员对"这版还有工单没排进去/物料没齐"的显式认可：
+        下达的是已排产部分，未排进的工单留在池子里，不能默默当成已下达。
+        """
         schedule = await self.db.get(ApsSchedule, schedule_id)
 
         if not schedule:
@@ -1138,17 +1181,19 @@ class ApsService:
         tasks = list(tasks_result.scalars().all())
 
         not_ready = [t for t in tasks if t.material_ready is False]
+        blockers = []
         if not_ready:
-            return {
-                "success": False,
-                "message": f"有 {len(not_ready)} 条排程任务物料未齐套，不能下达",
-                "material_shortage_tasks": len(not_ready),
-            }
+            blockers.append(f"{len(not_ready)} 条排程任务物料未齐套")
         if schedule.unscheduled_count:
+            blockers.append(f"{schedule.unscheduled_count} 个工单未排产")
+        if blockers and not allow_partial:
             return {
                 "success": False,
-                "message": f"方案仍有 {schedule.unscheduled_count} 个工单未排产，不能下达",
+                "message": "、".join(blockers) + "，不能下达；确认风险后可传 allow_partial=true 只下达已排产部分",
+                "blockers": blockers,
+                "material_shortage_tasks": len(not_ready),
                 "unscheduled_count": schedule.unscheduled_count,
+                "partial_releasable": True,
             }
 
         previous_result = await self.db.execute(
@@ -1194,17 +1239,27 @@ class ApsService:
             event_type="schedule_released",
             actor=released_by,
             schedule_id=schedule.id,
-            reason="APS 方案下达",
-            payload={"released_orders": released},
+            reason=("APS 方案部分下达" if blockers else "APS 方案下达") + (f"：{note}" if note else ""),
+            payload={
+                "released_orders": released,
+                "allow_partial": allow_partial,
+                "blockers": blockers,
+                "unscheduled_count": schedule.unscheduled_count,
+                "material_shortage_tasks": len(not_ready),
+            },
         )
 
         await self.db.commit()
 
         return {
             "success": True,
-            "message": f"已下达 {released} 个工单",
+            "message": f"已下达 {released} 个工单"
+                       + (f"；未下达：{'、'.join(blockers)}" if blockers else ""),
             "schedule_id": schedule.id,
             "version_number": schedule.version_number,
+            "released_orders": released,
+            "is_current": True,
+            "blockers": blockers,
         }
 
     

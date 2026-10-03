@@ -140,8 +140,9 @@ export const apsApi = {
   },
 
   /** 下达方案 */
-  releaseSchedule(id: string) {
-    return api.post(`/api/v1/aps/schedules/${id}/release`)
+  /** 下达方案：allow_partial=true 表示计划员确认只下达已排产部分 */
+  releaseSchedule(id: string, data?: { allow_partial?: boolean; note?: string }) {
+    return api.post(`/api/v1/aps/schedules/${id}/release`, data ?? {})
   },
 
   /** 插单重排：带 insert_wo_id 需要已批准的 approval_id；不带则是整盘重排 */
