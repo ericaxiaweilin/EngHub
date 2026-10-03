@@ -562,10 +562,16 @@ const OrderManagement: React.FC = () => {
                 </div>
                 <Row gutter={8} style={{ marginTop: 12 }}>
                   <Col span={6}><Card size="small"><Statistic title={t('预计最早完工')} value={String(reviewPack.delivery?.estimate?.earliest_delivery || '未估算').slice(0, 10)} valueStyle={{ fontSize: 18 }} /></Card></Col>
-                  <Col span={6}><Card size="small"><Statistic title={t('产能利用率')} value={reviewPack.capacity?.utilization ?? 0} suffix={reviewPack.capacity?.utilization != null ? '%' : '未计算'} valueStyle={{ fontSize: 18 }} /></Card></Col>
+                  <Col span={6}><Card size="small"><Statistic title={t('产能利用率')} value={reviewPack.capacity?.utilization ?? '-'} suffix={reviewPack.capacity?.utilization != null ? '%' : t('无路线，未计算')} valueStyle={{ fontSize: 18 }} /></Card></Col>
                   <Col span={6}><Card size="small"><Statistic title={t('同产品在制')} value={reviewPack.wip?.open_qty ?? 0} suffix={t('件')} valueStyle={{ fontSize: 18 }} /></Card></Col>
                   <Col span={6}><Card size="small"><Statistic title={t('历史不良率')} value={reviewPack.quality?.defect_rate ?? 0} suffix={reviewPack.quality?.defect_rate != null ? '%' : '暂无'} valueStyle={{ fontSize: 18 }} /></Card></Col>
                 </Row>
+                <Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+                  {t('产能口径')}：{reviewPack.capacity?.station_count ?? 0} {t('个工位合计日产能')}{' '}
+                  {reviewPack.capacity?.daily_capacity_pieces ?? 0} {t('件/日')}
+                  {reviewPack.delivery?.estimate?.capacity_basis ? ` · ${reviewPack.delivery.estimate.capacity_basis}` : ''}
+                  {reviewPack.delivery?.estimate?.note ? ` · ${reviewPack.delivery.estimate.note}` : ''}
+                </Text>
                 {!!reviewPack.materials?.items?.length && (
                   <Card size="small" title={<Space><WarningOutlined />{t('物料明细')}</Space>} style={{ marginTop: 12 }}>
                     <Table

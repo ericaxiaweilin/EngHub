@@ -403,63 +403,126 @@ class SchedulingAgent:
         What-if模拟：如果加入这个新工单，对现有排程有什么影响？
         不实际修改数据，只返回模拟结果。
         """
-        # 获取当前排程状态
-        current = await self.db.execute(text("""
-            SELECT COUNT(*) as cnt,
-                   MAX(planned_end) as latest_end
+        # 这一版 what-if 原来有三处编数：(1) 排程状态用 status IN ('draft','confirmed')
+        # 跨该厂**全部**历史 draft 累加（现存 277 版），任务数与最晚完工都被推高；
+        # (2) 新单工作量按"每件 0.5 小时"凭空估算；(3) 日产能把
+        # station_capacity.available_hours_per_day 当小时用（该列口径是"一天可完成几件产品"），
+        # 再除以 8 当作"天"。现在三处都换成可追溯的真实来源，取不到就明确说取不到。
+        now = datetime.utcnow()
+        horizon_end = now + timedelta(days=30)
+        schedule_id = await self._live_schedule_id(factory_id)
+        qty = int(new_wo.get("planned_qty") or 0)
+        product_id = str(new_wo.get("product_id") or "")
+
+        state = (await self.db.execute(text("""
+            SELECT COUNT(*) AS cnt, MAX(t.planned_end) AS latest_end
             FROM aps_schedule_tasks t
-            JOIN aps_schedules s ON t.schedule_id = s.id
-            WHERE s.factory_id = :fid AND s.status IN ('draft', 'confirmed')
-        """), {"fid": factory_id})
-        cur = dict(current.first()._mapping)
+            WHERE t.schedule_id = :sid
+              AND t.planned_start >= :now AND t.planned_end <= :horizon
+        """), {"sid": schedule_id, "now": now, "horizon": horizon_end})).mappings().first() or {}
+        current_latest = state.get("latest_end")
+        schedule_basis = "该厂没有任何排程方案"
+        if schedule_id:
+            is_current = (await self.db.execute(
+                text("SELECT is_current FROM aps_schedules WHERE id = :sid"), {"sid": schedule_id}
+            )).scalar()
+            schedule_basis = (
+                "已下达生效版本(is_current)" if is_current
+                else "没有已下达方案，取版本号最新的那一版草稿"
+            )
 
-        # 获取产能
-        cap_result = await self.db.execute(text("""
-            SELECT station_id, available_hours_per_day, efficiency_rate
-            FROM station_capacity WHERE factory_id = :fid AND is_active = TRUE
-        """), {"fid": factory_id})
-        capacities = [dict(r) for r in cap_result.mappings().all()]
+        # 新单的真实工作量：路线 standard_hours 累加 × 数量。路线解析走唯一口径
+        from core.mes.route_resolution import route_ops_for_product
+        route_ops = await route_ops_for_product(self.db, factory_id, product_id)
+        station_codes = list(dict.fromkeys(
+            str(op["work_center"]) for op in route_ops if op["work_center"]
+        ))
+        if not station_codes:
+            return {
+                "simulation": True,
+                "new_order": new_wo,
+                "confidence": "unavailable",
+                "current_schedule": {
+                    "schedule_id": schedule_id,
+                    "total_tasks": int(state.get("cnt") or 0),
+                    "latest_end": str(current_latest) if current_latest else None,
+                },
+                "impact": {
+                    "orders_at_risk": 0,
+                    "at_risk_list": [],
+                    "recommendation": (
+                        f"产品 {product_id or '(未填)'} 没有可解析的工艺路线工位，"
+                        "无法模拟插单影响；先补工艺路线再评估，不给凭假设的数字"
+                    ),
+                },
+                "assumptions": {"route_basis": "no_routing_resolved"},
+            }
 
-        total_daily_capacity = sum(
-            float(c.get("available_hours_per_day") or 16)
-            * float(c.get("efficiency_rate") or 0.85)
-            for c in capacities
-        ) or 16
+        models = await load_station_models(self.db, factory_id, station_codes, now, horizon_end)
+        piece_capacity = {
+            code: float(models[code].daily_pieces)
+            for code in station_codes
+            if code in models and models[code].daily_pieces
+        }
+        workload_hours = round(sum(float(op["standard_hours"] or 0) for op in route_ops) * qty, 1)
 
-        # 估算新工单需要的工时
-        qty = new_wo.get("planned_qty", 100)
-        estimated_hours = qty * 0.5 / 0.85  # 简化：每件0.5h / 效率
+        if piece_capacity:
+            bottleneck = min(piece_capacity, key=lambda c: piece_capacity[c])
+            daily_pieces = piece_capacity[bottleneck]
+            # 插一张单真正压上去的是"瓶颈工位要占几个排班日"
+            impact_days = max(1, int(-(-qty // daily_pieces)))
+            basis = (
+                f"路线 {len(station_codes)} 道工位，瓶颈 {bottleneck} 日产能 {daily_pieces:g} 件/天，"
+                f"{qty} 件需占 {impact_days} 个排班日"
+            )
+            confidence = "medium"
+        else:
+            bottleneck = None
+            impact_days = None
+            basis = "路线上的工位都没有按件日产能配置，无法折算占用天数"
+            confidence = "low"
 
-        # 影响分析
-        impact_days = estimated_hours / (total_daily_capacity / 8)  # 大约需要几天
-        current_latest = cur.get("latest_end")
-
-        # 检查对交期的影响
-        at_risk = await self.db.execute(text("""
-            SELECT w.work_order_code, w.planned_due, t.planned_end
-            FROM aps_schedule_tasks t
-            JOIN work_orders w ON t.work_order_id = w.id::text
-            JOIN aps_schedules s ON t.schedule_id = s.id
-            WHERE s.factory_id = :fid AND s.status IN ('draft', 'confirmed')
-              AND w.planned_due IS NOT NULL
-              AND t.planned_end + :impact * INTERVAL '1 hour' > w.planned_due
-        """), {"fid": factory_id, "impact": estimated_hours})
-        at_risk_orders = [dict(r) for r in at_risk.mappings().all()]
+        at_risk_orders = []
+        if impact_days:
+            at_risk = await self.db.execute(text("""
+                SELECT DISTINCT w.work_order_code, w.planned_due, t.planned_end
+                FROM aps_schedule_tasks t
+                JOIN work_orders w ON t.work_order_id = w.id::text
+                WHERE t.schedule_id = :sid
+                  AND w.planned_due IS NOT NULL
+                  AND t.planned_end + :impact * INTERVAL '1 day' > w.planned_due
+            """), {"sid": schedule_id, "impact": impact_days})
+            at_risk_orders = [dict(r) for r in at_risk.mappings().all()]
 
         return {
             "simulation": True,
             "new_order": new_wo,
-            "estimated_hours": round(estimated_hours, 1),
-            "estimated_days": round(impact_days, 1),
+            "confidence": confidence,
+            "workload_hours": workload_hours,
+            "estimated_days": impact_days,
             "current_schedule": {
-                "total_tasks": cur.get("cnt", 0),
+                "schedule_id": schedule_id,
+                "basis": schedule_basis,
+                "total_tasks": int(state.get("cnt") or 0),
                 "latest_end": str(current_latest) if current_latest else None,
             },
-            "total_daily_capacity_hours": round(total_daily_capacity, 1),
+            "route_stations": station_codes,
+            "daily_capacity_pieces": {c: piece_capacity.get(c) for c in station_codes},
+            "bottleneck_station": bottleneck,
             "impact": {
                 "orders_at_risk": len(at_risk_orders),
                 "at_risk_list": [r["work_order_code"] for r in at_risk_orders[:10]],
-                "recommendation": "可以插入" if len(at_risk_orders) == 0 else f"会影响{len(at_risk_orders)}个工单交期",
+                "recommendation": (
+                    "影响无法量化：" + basis if impact_days is None
+                    else ("可以插入（按瓶颈工位排班日折算后没有压到交期）"
+                          if not at_risk_orders
+                          else f"会把 {len(at_risk_orders)} 个工单推出交期")
+                ),
+            },
+            "assumptions": {
+                "capacity_basis": basis,
+                "workload_basis": "Σ 模板工序 standard_hours × 数量（不是每件 0.5 小时的假设）",
+                "note": "未考虑插单后其余工序的重排，仅按瓶颈工位占用天数顺延估算",
             },
         }
 

@@ -319,36 +319,91 @@ class OrderDecompositionService:
         routing_result = await self.db.execute(routing_stmt)
         routing = routing_result.scalars().first()
 
-        # 获取工位产能
+        # 产能：`station_capacity.available_hours_per_day` 这一列维护的是"一天可完成几件产品"
+        # （用户确认的口径），不是小时。原来这里把它当小时、再乘一个平均 OEE、并按
+        # "每件 0.5 小时"编一个需求工时，得到的日数是三层假设的乘积。
+        # 现在按件算：瓶颈工位一天的可完成件数决定产出节拍，天数只数工厂日历上真正排了班的日子。
         from sqlalchemy import text
-        cap_result = await self.db.execute(text(
-            "SELECT * FROM station_capacity WHERE factory_id = :fid AND is_active = TRUE"
-        ), {"fid": factory_id})
-        capacities = cap_result.mappings().all()
+        from core.mes.capacity_math import load_station_models
 
-        if not capacities:
-            # 默认产能估算
-            days_needed = max(1, quantity // 100)  # 假设日产100件
-            earliest = date.today() + timedelta(days=days_needed)
+        cap_rows = (await self.db.execute(text(
+            "SELECT station_id, available_hours_per_day FROM station_capacity"
+            " WHERE factory_id = :fid AND is_active = TRUE"
+        ), {"fid": factory_id})).mappings().all()
+        piece_capacity = {
+            str(r["station_id"]): float(r["available_hours_per_day"] or 0)
+            for r in cap_rows if float(r["available_hours_per_day"] or 0) > 0
+        }
+        if not piece_capacity:
             return {
-                "estimated_days": days_needed,
-                "earliest_delivery": earliest.isoformat(),
-                "confidence": "low",
-                "note": "无产能数据，使用默认估算",
+                "estimated_days": None,
+                "earliest_delivery": None,
+                "confidence": "unavailable",
+                "note": "该工厂没有任何按件计的日产能配置（station_capacity），无法给出交期承诺",
             }
 
-        # 简单估算：总工时 / 日产能
-        avg_efficiency = sum(c["efficiency_rate"] for c in capacities) / len(capacities)
-        total_hours_available = sum(c["available_hours_per_day"] for c in capacities)
-        # 假设每件产品需要 0.5 小时（简化）
-        hours_needed = quantity * 0.5
-        days_needed = max(1, int(hours_needed / (total_hours_available * avg_efficiency)) + 1)
-        earliest = date.today() + timedelta(days=days_needed)
+        # 路线工位与排程同一口径（core.mes.route_resolution）：排程排得出几道，这里就能算几道。
+        # 解析不出工位时**拒绝给日期** —— 以前这里退回"全厂最慢工位"，那个 0.07 件/天
+        # 的工位跟本产品毫无关系，却把交期算成 286 天，数字看着精确其实是错的。
+        from core.mes.route_resolution import route_stations_for_product
+
+        route_stations = await route_stations_for_product(self.db, factory_id, product_id)
+        usable = [c for c in route_stations if c in piece_capacity]
+        if not usable:
+            return {
+                "estimated_days": None,
+                "earliest_delivery": None,
+                "confidence": "unavailable",
+                "route_stations": route_stations,
+                "note": (
+                    f"产品 {product_id} 解析不出带产能配置的工艺路线工位"
+                    + ("（路线工位 " + "、".join(route_stations) + " 都没有日产能记录）" if route_stations else "（没有可用的工艺路线）")
+                    + "，不给按假设拼出来的交期"
+                ),
+            }
+        throughput = min(piece_capacity[c] for c in usable)
+        basis = f"工艺路线 {len(usable)} 个工位里的瓶颈 {min(usable, key=lambda c: piece_capacity[c])} 日产能 {throughput:g} 件/天"
+        confidence = "medium"
+
+        start_day = date.today()
+        horizon = start_day + timedelta(days=365)
+        start_dt = datetime.now()
+        models = await load_station_models(
+            self.db, factory_id, sorted(usable or piece_capacity), start_dt, start_dt + timedelta(days=365)
+        )
+        working_days = [
+            (start_day + timedelta(days=offset))
+            for offset in range((horizon - start_day).days + 1)
+            if any(m.is_working_day(start_day + timedelta(days=offset)) for m in models.values())
+        ]
+        if not working_days:
+            return {
+                "estimated_days": None,
+                "earliest_delivery": None,
+                "confidence": "unavailable",
+                "note": "工厂日历在未来一年内没有任何排班日，无法排产",
+            }
+
+        # 只数排了班的日子；超出评估窗口就明说，不钳成窗口最后一天冒充"能交"
+        days_needed = max(1, int(-(-quantity // throughput)))
+        if days_needed > len(working_days):
+            return {
+                "estimated_days": days_needed,
+                "earliest_delivery": None,
+                "confidence": "low",
+                "daily_capacity_pieces": throughput,
+                "capacity_basis": basis,
+                "note": f"按 {throughput:g} 件/天需要 {days_needed} 个排班日，超出 365 天评估窗口",
+            }
+        earliest = working_days[days_needed - 1]
 
         return {
             "estimated_days": days_needed,
             "earliest_delivery": earliest.isoformat(),
-            "confidence": "medium",
-            "capacity_utilization": round(hours_needed / (total_hours_available * days_needed) * 100, 1),
-            "stations_available": len(capacities),
+            "confidence": confidence,
+            "capacity_utilization": round(quantity / (throughput * days_needed) * 100, 1),
+            "stations_available": len(piece_capacity),
+            "daily_capacity_pieces": throughput,
+            "capacity_basis": basis,
+            "capacity_note": "日产能取自 station_capacity 的『一天可完成几件产品』口径；天数为工厂日历排班日",
         }

@@ -127,6 +127,11 @@ async def load_station_models(
     window_end: datetime.datetime,
 ) -> Dict[str, StationModel]:
     """按工位组装产能口径。资源级日历优先于工厂级('*')，工厂没配则回落到平台 'default'。"""
+    # 本函数只用窗口的日期部分（日历生效区间与假期都按日比较），所以也接受 date
+    if isinstance(window_start, datetime.date) and not isinstance(window_start, datetime.datetime):
+        window_start = datetime.datetime.combine(window_start, datetime.time.min)
+    if isinstance(window_end, datetime.date) and not isinstance(window_end, datetime.datetime):
+        window_end = datetime.datetime.combine(window_end, datetime.time.min)
     wanted = [str(s) for s in station_ids if s]
     models: Dict[str, StationModel] = {
         sid: StationModel(station_id=sid) for sid in wanted

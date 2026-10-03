@@ -321,7 +321,12 @@ class RCCResourceDecisionEngine:
         }
 
         try:
-            # 获取各工位实际产量和产能利用率
+            # 各工位今日实际完成件数 ÷ 配置的日可完成件数 = 真实利用率。
+            # 这里原来有两处致命错误：(1) station_capacity.station_id 存的是工位**编码**
+            # (ST-JG-01)，而 JOIN 用的是 s.id::text(UUID)，38 行产能一条都没匹配上，
+            # 于是每个工位都落到 `available_hours or 16` 的兜底值上；(2) 所谓利用率是
+            # `报工数 × 良品数 / 10000 ÷ (16×0.85)` 编出来的分数，再钳到 100，
+            # 于是"瓶颈"从来不是瓶颈。日产量这一列的含义由用户确认为"一天可完成几件产品"。
             station_rows = await self.db.execute(sql_text("""
                 SELECT
                     s.station_code,
@@ -329,42 +334,55 @@ class RCCResourceDecisionEngine:
                     COUNT(CASE WHEN pr.created_at >= CURRENT_DATE THEN 1 END)::int AS today_reports,
                     SUM(CASE WHEN pr.created_at >= CURRENT_DATE THEN pr.good_qty ELSE 0 END)::int AS today_good_qty,
                     MAX(pr.created_at) AS last_report_time,
-                    sc.available_hours_per_day,
+                    sc.available_hours_per_day AS daily_pieces,
                     sc.efficiency_rate
                 FROM stations s
                 LEFT JOIN production_reports pr ON pr.station_id = s.id::text AND pr.factory_id = s.factory_id
-                LEFT JOIN station_capacity sc ON sc.station_id = s.id::text AND sc.factory_id = s.factory_id
+                LEFT JOIN station_capacity sc ON sc.station_id = s.station_code
+                     AND sc.factory_id = s.factory_id AND sc.is_active = TRUE
                 WHERE s.factory_id = :fid
                 GROUP BY s.station_code, s.station_name, sc.available_hours_per_day, sc.efficiency_rate
-                ORDER BY sc.efficiency_rate DESC NULLS LAST
+                ORDER BY s.station_code
             """), {"fid": factory_id})
-            
+
             stations = []
             for r in station_rows.mappings().all():
-                efficiency = r["efficiency_rate"] or 0.85
-                available_hours = r["available_hours_per_day"] or 16
-                
-                # 简化估算：报告数越多说明该工位越忙
-                workload_score = (r["today_reports"] or 0) * (r["today_good_qty"] or 0) / 10000
-                utilization = min(100, round(workload_score / (available_hours * efficiency) * 100, 1))
-                
+                daily_pieces = r["daily_pieces"]
+                good_qty = r["today_good_qty"] or 0
+                if daily_pieces and float(daily_pieces) > 0:
+                    utilization = round(good_qty / float(daily_pieces) * 100, 1)
+                    capacity_status = "configured"
+                else:
+                    # 没有产能配置就不要给数字：报 unknown 比拿 16 兜底编一个利用率诚实
+                    utilization = None
+                    capacity_status = "no_capacity_record"
+
                 stations.append({
                     "station_code": r["station_code"],
                     "station_name": r["station_name"],
                     "today_reports": r["today_reports"] or 0,
-                    "today_good_qty": r["today_good_qty"] or 0,
+                    "today_good_qty": good_qty,
                     "last_report_time": r["last_report_time"],
-                    "efficiency_rate": efficiency,
-                    "available_hours_per_day": available_hours,
+                    "efficiency_rate": r["efficiency_rate"],
+                    "daily_capacity_pieces": float(daily_pieces) if daily_pieces else None,
+                    "capacity_status": capacity_status,
                     "utilization_pct": utilization,
-                    "is_bottleneck": utilization > 90,
+                    "is_over_capacity": bool(utilization is not None and utilization > 100),
+                    "is_bottleneck": bool(utilization is not None and utilization > 90),
                 })
+
+            result["bottleneck_stations"] = [s for s in stations if s["is_bottleneck"]]
+            result["capacity_missing_stations"] = [
+                s["station_code"] for s in stations if s["capacity_status"] == "no_capacity_record"
+            ]
+            result["utilization_basis"] = (
+                "今日良品报工件数 ÷ station_capacity 日可完成件数；没有产能配置的工位不参与排名"
+            )
             
-            result["bottleneck_stations"] = stations
-            
-            # 识别瓶颈和高负载
-            high_load = [s for s in stations if s["utilization_pct"] > 90]
-            low_load = [s for s in stations if s["utilization_pct"] < 30]
+            # 识别瓶颈和高负载（没有产能配置的工位不参与）
+            measured = [s for s in stations if s["utilization_pct"] is not None]
+            high_load = [s for s in measured if s["utilization_pct"] > 90]
+            low_load = [s for s in measured if s["utilization_pct"] < 30]
             
             if high_load and low_load:
                 for hl in high_load:
@@ -382,7 +400,7 @@ class RCCResourceDecisionEngine:
             if oee_target:
                 try:
                     target = float(oee_target)
-                    for station in stations:
+                    for station in measured:
                         if station["utilization_pct"] < target:
                             result["oee_alerts"].append({
                                 "station_code": station["station_code"],

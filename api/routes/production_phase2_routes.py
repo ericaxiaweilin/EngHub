@@ -260,7 +260,7 @@ async def order_review_pack(
         delivery_estimate = {"error": str(exc), "confidence": "unavailable"}
     capacity_row = (await db.execute(
         _sa_text(
-            "SELECT COUNT(*) AS station_count, COALESCE(SUM(available_hours_per_day), 0) AS hours_per_day, "
+            "SELECT COUNT(*) AS station_count, COALESCE(SUM(available_hours_per_day), 0) AS pieces_per_day, "
             "COALESCE(AVG(efficiency_rate), 0) AS efficiency_rate "
             "FROM station_capacity WHERE factory_id = :fid AND is_active = TRUE"
         ),
@@ -277,7 +277,10 @@ async def order_review_pack(
     elif capacity_utilization is not None and capacity_utilization > 85:
         capacity_status, capacity_detail = "warning", f"预计产能利用率 {capacity_utilization:g}%，接近瓶颈"
     else:
-        capacity_status, capacity_detail = "pass", f"{station_count} 个激活工位，可用 {float(capacity_row.get('hours_per_day') or 0):g} h/日"
+        capacity_status, capacity_detail = "pass", (
+            f"{station_count} 个激活工位，合计日产能 {float(capacity_row.get('pieces_per_day') or 0):g} 件/日"
+            "（station_capacity 该列口径为一天可完成几件产品，不是小时）"
+        )
 
     earliest_delivery = delivery_estimate.get("earliest_delivery")
     requested_delivery = str(order.get("delivery_date"))[:10] if order.get("delivery_date") else None
@@ -359,7 +362,8 @@ async def order_review_pack(
         "materials": {"ready": bool(bom_rows) and not shortage_items, "total": len(materials), "shortage_count": len(shortage_items), "items": materials},
         "routing": {"found": bool(routing), "routing_code": routing.get("routing_code") if routing else None, "version": routing.get("version") if routing else None, "steps": routing_steps},
         "delivery": {"requested": requested_delivery, "estimate": delivery_estimate},
-        "capacity": {"station_count": station_count, "hours_per_day": float(capacity_row.get("hours_per_day") or 0), "efficiency_rate": float(capacity_row.get("efficiency_rate") or 0), "utilization": capacity_utilization},
+        # 这一列口径是"一天可完成几件产品"，键名不再叫 hours_per_day（叫错名就是这个数字被当小时用的原因）
+        "capacity": {"station_count": station_count, "daily_capacity_pieces": round(float(capacity_row.get("pieces_per_day") or 0), 1), "avg_oee": float(capacity_row.get("efficiency_rate") or 0), "utilization": capacity_utilization, "capacity_unit": "件/日"},
         "quality": {"inspection_count": int(quality_row.get("inspection_count") or 0), "sample_qty": sample_qty, "defect_qty": defect_qty, "defect_rate": round(defect_rate, 2) if defect_rate is not None else None, "fail_count": int(quality_row.get("fail_count") or 0), "last_inspected_at": quality_row.get("last_inspected_at")},
         "wip": {"order_count": int(wip_row.get("order_count") or 0), "open_qty": int(wip_row.get("open_qty") or 0)},
         "recommended_items": [f"{c['label']}：{c['detail']}" for c in failed + warnings],
