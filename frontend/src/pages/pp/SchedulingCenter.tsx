@@ -94,6 +94,11 @@ const ApsEnhanced: React.FC = () => {
   const metrics = result?.metrics || {}
   const diagnostics = result?.diagnostics || {}
   const issueRows = [
+    ...(diagnostics.data_integrity || []).map((item: any) => ({
+      ...item,
+      issue_type: '主数据',
+      reason: item.detail,
+    })),
     ...(diagnostics.unscheduled || []).map((item: any) => ({
       ...item,
       issue_type: '未排工单',
@@ -102,11 +107,6 @@ const ApsEnhanced: React.FC = () => {
     ...(diagnostics.constraint_violations || []).map((item: any) => ({
       ...item,
       issue_type: '约束违规',
-    })),
-    ...(diagnostics.data_integrity || []).map((item: any) => ({
-      ...item,
-      issue_type: '主数据',
-      reason: item.detail,
     })),
   ]
 
