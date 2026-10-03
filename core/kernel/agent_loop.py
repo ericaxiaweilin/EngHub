@@ -516,9 +516,8 @@ class AgentLoop:
             if self._final_grounding_prompt:
                 messages.append({"role": "system", "content": self._final_grounding_prompt})
             payload["messages"] = messages
-            if not steered_after_tools:
-                payload.pop("tools", None)
-                payload.pop("tool_choice", None)
+            # 工具保留给后续轮次：摘掉 tools 会让想再查一次数的模型把调用写成正文，
+            # 前端于是看到工具调用文本（或清洗后的空回复）。轮数仍受 max_rounds 约束。
 
             if checkpoint is not None and request_id:
                 last_checkpoint_key = await checkpoint.save_async(

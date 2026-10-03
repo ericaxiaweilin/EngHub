@@ -56,6 +56,7 @@ from api.services.workbook_service import apply_workbook_operations, xlsx_to_wor
 from core.kernel.context_window import compact_messages
 from core.kernel.events import get_harness_event_bus
 from core.kernel.plugins import HarnessProfile, PluginSpec, get_harness_plugin_registry
+from core.kernel.reply_sanitizer import looks_like_tool_call_leak, strip_tool_call_markup
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 _logger = logging.getLogger("enghub.chat")
@@ -711,9 +712,18 @@ async def model_warmup_loop() -> None:
         await asyncio.sleep(MODEL_WARMUP_INTERVAL_SECONDS)
 
 
+def _strip_tool_call_leak(reply: str) -> str:
+    """模型偶尔把工具调用当成正文吐出来；只删标记，标记外的合法答复必须保留。"""
+    if not looks_like_tool_call_leak(reply):
+        return reply
+    _logger.warning("[chat] 模型把工具调用写进了正文，已剥离标记")
+    return strip_tool_call_markup(reply)
+
+
 def _clean_model_reply(content: str) -> str:
     """清除模型协议中误混入 content 的推理区块，不改变最终答案语义."""
     reply = (content or "").strip()
+    reply = _strip_tool_call_leak(reply)
     return re.sub(
         r"<think>.*?</think>",
         "",
