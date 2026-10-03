@@ -109,6 +109,42 @@ class SchedulingAgent:
         现在把故障工位作为 exclude_resources 交给排程引擎：受影响工序只会落到工艺路线
         允许、班次日历允许、时间轴不冲突的其他工位；排不进的如实列出来交人工。
         """
+        # 先分清"一台设备故障"和"整个工位没有可用设备"。
+        # 工位是排程里的一个资源槽，一台机床坏了不该让整条加工车间停工。
+        machine = (await self.db.execute(text("""
+            SELECT COALESCE(NULLIF(t.station_id, ''), t.equipment_code) AS resource_id,
+                   t.status AS this_status,
+                   COUNT(*) AS machines_on_resource,
+                   COUNT(*) FILTER (
+                       WHERE COALESCE(m.status, 'running') NOT IN ('broken', 'maintenance')
+                   ) AS usable_machines
+            FROM equipment t
+            LEFT JOIN equipment m
+                   ON COALESCE(NULLIF(m.station_id, ''), m.equipment_code)
+                      = COALESCE(NULLIF(t.station_id, ''), t.equipment_code)
+                  AND m.factory_id = t.factory_id
+            WHERE t.factory_id = :fid AND (t.id = :eid OR t.equipment_code = :eid)
+            GROUP BY 1, 2
+        """), {"fid": factory_id, "eid": equipment_id})).mappings().first()
+
+        if machine and int(machine["usable_machines"]) > 0:
+            return {
+                "action": "none",
+                "station": str(machine["resource_id"]),
+                "equipment_status": machine["this_status"],
+                "usable_machines": int(machine["usable_machines"]),
+                "machines_on_station": int(machine["machines_on_resource"]),
+                "reason": (
+                    f"{machine['this_status']} 的设备只是 {machine['resource_id']} 名下 "
+                    f"{machine['machines_on_resource']} 台里的 1 台，"
+                    f"仍有 {machine['usable_machines']} 台可用，工位不停、排程不变"
+                ),
+                "note": (
+                    "当前资源模型里一个工位是一个占用槽，不区分同一工位内几台设备并行，"
+                    "所以单台设备故障不会改变排程；要按设备台数算产能需要另做资源模型"
+                ),
+            }
+
         live_schedule_id = await self._live_schedule_id(factory_id)
         if not live_schedule_id:
             return {"action": "none", "reason": "该工厂还没有排程方案，无需处理故障"}
