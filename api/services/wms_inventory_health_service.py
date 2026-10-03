@@ -96,6 +96,46 @@ class WmsInventoryHealthService:
             },
         }
 
+    async def _reconciliation(self, factory_id: str) -> Dict[str, Any]:
+        """单据与台账的对账：有多少"已完成"单据真的过了账。
+
+        库存量只有经过流水才可追溯。已完工单据没有任何对应流水时，
+        账面数量与实物之间就没有链路，自动补货/成本核算都会建立在悬空数上。
+        历史单据不回填流水（造历史流水等于假账），只做标记。
+        """
+        inbound = (await self.db.execute(text("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+                   COUNT(*) FILTER (WHERE status = 'completed' AND EXISTS (
+                       SELECT 1 FROM inventory_transactions it
+                       WHERE it.factory_id = inbound_orders.factory_id
+                         AND (it.reference_id::text = inbound_orders.id::text
+                              OR it.reference_doc_no = inbound_orders.inbound_code)
+                   )) AS posted
+            FROM inbound_orders WHERE factory_id = :fid
+        """), {"fid": factory_id})).mappings().first()
+
+        outbound = (await self.db.execute(text("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+                   COUNT(*) FILTER (WHERE status = 'completed' AND EXISTS (
+                       SELECT 1 FROM inventory_transactions it
+                       WHERE it.factory_id = outbound_orders.factory_id
+                         AND (it.reference_id::text = outbound_orders.id::text
+                              OR it.reference_doc_no = outbound_orders.outbound_code)
+                   )) AS posted
+            FROM outbound_orders WHERE factory_id = :fid
+        """), {"fid": factory_id})).mappings().first()
+
+        in_unposted = (inbound or {}).get("completed", 0) - (inbound or {}).get("posted", 0)
+        out_unposted = (outbound or {}).get("completed", 0) - (outbound or {}).get("posted", 0)
+        return {
+            "inbound_orders": dict(inbound or {}),
+            "outbound_orders": dict(outbound or {}),
+            "completed_but_unposted": max(0, in_unposted) + max(0, out_unposted),
+            "note": "已完工但无对应流水的单据只标记，不回填历史流水；回填等于造账。",
+        }
+
     async def _run(self, label: str, executor, context: Dict[str, Any]) -> Dict[str, Any]:
         try:
             result = await executor.execute(self.db, self.factory_id, context)
@@ -117,6 +157,7 @@ class WmsInventoryHealthService:
     ) -> Dict[str, Any]:
         self.factory_id = factory_id
         coverage = await self._coverage(factory_id)
+        reconciliation = await self._reconciliation(factory_id)
 
         abc = AbcAnalysisExecutor()
         alerts = InventoryAlertExecutor()
@@ -169,6 +210,18 @@ class WmsInventoryHealthService:
                 "reason": f"inventory.unit_cost>0 仅 {inv.get('rows_with_cost') or 0}/{inv.get('inventory_rows')} 行，金额口径只覆盖这一部分，其余只报数量。",
                 "needed": "采购/入库单价落库。",
             })
+        if reconciliation["completed_but_unposted"]:
+            gaps.append({
+                "item": "单据与台账链路",
+                "reason": (
+                    f"已完工单据中 {reconciliation['completed_but_unposted']} 张没有任何对应流水"
+                    f"（入库 {(reconciliation['inbound_orders'] or {}).get('completed')}/"
+                    f"{(reconciliation['inbound_orders'] or {}).get('posted')} 已过账，"
+                    f"出库 {(reconciliation['outbound_orders'] or {}).get('completed')}/"
+                    f"{(reconciliation['outbound_orders'] or {}).get('posted')} 已过账）。"
+                ),
+                "needed": "收货/出库确认必须落 inventory_transactions（带单据号与批次），否则账面数量与实物无链路。",
+            })
         if not coverage["replenishment_threshold_rows"]:
             gaps.append({
                 "item": "过量(max_level)阈值",
@@ -210,6 +263,7 @@ class WmsInventoryHealthService:
                 "expiry_warning_items": _items("batch_expiry"),
             },
             "coverage": coverage,
+            "reconciliation": reconciliation,
             "analyses": analyses,
             "not_computable": gaps,
             "policy": "只读汇总；不修改库存、阈值或工单。任一分析器口径以 wms_architecture/executors 为唯一实现。",
