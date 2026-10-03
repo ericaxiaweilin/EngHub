@@ -758,14 +758,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_pmc_control_tower",
-            "description": "PMC统一控制塔事实查询。一次查询可回答：排过多少订单、控过多少物料、Shortage如何处理、库存如何降低、OTD如何保证、产能如何平衡、紧急插单如何排、EC/BOM变更如何处理、supplier delay如何处理。返回当前工厂真实记录、统计口径、数据缺口和处理流程；只读不修改排程，不把建议说成已执行动作。",
+            "description": "PMC统一控制塔事实查询。一次查询可回答：排过多少订单、控过多少物料、Shortage如何处理、库存如何降低、OTD如何保证、产能如何平衡、紧急插单如何排、EC/BOM变更如何处理、supplier delay如何处理。问“交期风险/会不会迟到”用 scope=otd：其中的 at_risk_in_progress_count 是按实际生产速度推算赶不上交期的在制工单数（与交期智能体同一实现），at_risk_high_count 是其中距交期不足 3 天的数量。返回当前工厂真实记录、统计口径、数据缺口和处理流程；只读不修改排程，不把建议说成已执行动作。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "scope": {
                         "type": "string",
                         "enum": ["all", "orders", "materials", "shortage", "inventory", "otd", "capacity", "rush", "engineering_change", "supplier_delay"],
-                        "description": "问题范围；复合问题用 all",
+                        "description": "问题范围；交期风险/会不会迟到属于 otd；复合问题用 all",
                         "default": "all",
                     },
                     "material_keyword": {"type": "string", "description": "物料编码或名称关键词，可选"},
@@ -3143,6 +3143,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "控过多少物料", "控制过多少物料", "控制了多少物料", "Shortage怎么处理", "shortage怎么处理", "shortage 怎么处理",
             "缺料怎么处理", "缺料如何处理", "物料短缺怎么处理", "物料缺口怎么处理",
             "库存怎么降", "如何降库存", "怎么降库存", "OTD怎么保证", "OTD 怎么保证", "otd怎么保证", "otd 怎么保证", "如何保证OTD",
+            "交期风险", "交付风险", "交期有风险的工单", "会迟到的工单", "准时交付",
             "产能怎么平衡", "产能如何平衡", "如何平衡产能", "紧急插单怎么排", "紧急插单如何排", "急单怎么排", "EC/BOM change", "ec/bom change",
             "EC/BOM变更", "ECN怎么处理", "工程变更怎么处理", "BOM变更怎么处理", "supplier delay",
             "supplier delay怎么处理", "供应商 delay 怎么处理", "供应商延迟怎么处理", "供应商延期怎么处理", "供应延迟怎么处理",
@@ -3494,7 +3495,7 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
             ("materials", ["控过多少物料", "控制过多少物料", "物料控制"]),
             ("shortage", ["shortage", "缺料", "缺口"]),
             ("inventory", ["库存怎么降", "如何降库存", "怎么降库存", "降库存", "呆滞库存"]),
-            ("otd", ["otd", "交期怎么保证", "准时交付"]),
+            ("otd", ["otd", "交期怎么保证", "准时交付", "交期风险", "交付风险"]),
             ("capacity", ["产能怎么平衡", "产能如何平衡", "如何平衡产能", "产能平衡", "瓶颈"]),
             ("rush", ["紧急插单", "急单怎么排", "插单怎么排", "插单"]),
             ("engineering_change", ["ec/bom", "ecn", "工程变更", "bom变更", "bom change"]),

@@ -422,6 +422,62 @@ class PmcControlTowerService:
             ],
         }
 
+    DELIVERY_RISK_METHOD = (
+        "只看 in_progress 且有 planned_due 的工单：按已完成量算出的实际速度推算剩余工期天数，"
+        "预计完成晚于 planned_due 即计为交期风险；距交期不足 3 天记 high。"
+        "交期智能体与本方法共用同一实现，口径不分叉。"
+    )
+
+    async def delivery_risk(self, factory_id: str, *, limit: int = 20) -> Dict[str, Any]:
+        """前瞻交期风险（唯一实现）：控制塔、chatbot、交期智能体都取这里。"""
+        await self._load_tables()
+        if not self._has("work_orders"):
+            return {
+                "data_status": "missing",
+                "risk_count": 0,
+                "high_risk_count": 0,
+                "items": [],
+                "data_note": "没有 work_orders 表，不能判断交期风险。",
+            }
+        rows = await self._rows("""
+            SELECT wo.work_order_code, wo.planned_qty, wo.completed_qty,
+                   wo.planned_due, wo.priority,
+                   CASE WHEN wo.completed_qty > 0 AND wo.actual_start IS NOT NULL
+                        THEN (wo.planned_qty - wo.completed_qty) *
+                             EXTRACT(EPOCH FROM (NOW() - wo.actual_start)) / wo.completed_qty / 86400.0
+                        ELSE NULL END as estimated_remaining_days
+            FROM work_orders wo
+            WHERE wo.factory_id = :fid AND wo.status = 'in_progress'
+              AND wo.planned_due IS NOT NULL
+            ORDER BY wo.planned_due
+        """, {"fid": factory_id})
+
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            remaining_days = _number(row.get("estimated_remaining_days"))
+            due = _date(row.get("planned_due"))
+            if remaining_days <= 0 or due is None:
+                continue
+            days_to_due = (due - date.today()).total_seconds() / 86400.0
+            if remaining_days > days_to_due and days_to_due > 0:
+                items.append({
+                    "work_order_code": row.get("work_order_code"),
+                    "severity": "high" if days_to_due < 3 else "medium",
+                    "days_to_due": round(days_to_due, 1),
+                    "estimated_remaining_days": round(remaining_days, 1),
+                    "planned_due": _iso(due),
+                    "priority": row.get("priority"),
+                })
+
+        high_count = len([item for item in items if item["severity"] == "high"])
+        return {
+            "data_status": "ready",
+            "risk_count": len(items),
+            "high_risk_count": high_count,
+            "items": items[:max(1, min(int(limit or 20), 100))],
+            "method": self.DELIVERY_RISK_METHOD,
+        }
+
     async def _otd(self, factory_id: str, *, work_order_code: Optional[str] = None, **_: Any) -> Dict[str, Any]:
         if not self._has("work_orders"):
             return {"data_status": "missing", "source": "work_orders", "missing_sources": ["work_orders"], "data_note": "没有交付执行来源，不能计算OTD。", "otd_pct": None}
@@ -501,6 +557,8 @@ class PmcControlTowerService:
                 {"work_order_code": row.get("work_order_code"), "planned_due": _iso(row.get("planned_due")), "status": row.get("status")}
                 for row in open_overdue[:20]
             ]
+        # 历史达成率之外，给出同一个前瞻口径（与交期智能体共用实现）
+        risk = await self.delivery_risk(factory_id)
         result = {
             "data_status": "ready" if has_sales_order_evidence else "partial",
             "source": "sales_orders.actual_ship_date + sales_orders.delivery_date" if has_sales_order_evidence else "work_orders.actual_complete + work_orders.planned_due",
@@ -515,6 +573,10 @@ class PmcControlTowerService:
             "due_order_count": due_order_count, "completed_order_count": len(completed), "on_time_order_count": len(on_time),
             "otd_pct": round(len(on_time) / len(completed) * 100, 1) if completed else None,
             "open_overdue_count": len(open_overdue),
+            "at_risk_in_progress_count": risk["risk_count"],
+            "at_risk_high_count": risk["high_risk_count"],
+            "at_risk_orders": risk["items"],
+            "at_risk_method": risk["method"],
             "overdue_orders": overdue_orders,
             "guarantee_controls": [
                 "订单进入MPS前做ATP：物料齐套、产能可行、RDD可行三项同时核对",

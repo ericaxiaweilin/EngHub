@@ -213,6 +213,8 @@ _TOOL_SELECTION_ACTION_HINTS: Dict[str, tuple[str, ...]] = {
     "create_followup_task": ("跟进一下", "持续跟进", "盯着", "挂起来", "到时候提醒", "follow up"),
     "run_workflow": ("日报", "日度复盘", "生产复盘", "一键建单", "一键下达", "自动编排"),
     "search_entity": ("属于哪个部门", "是什么", "在哪", "查找编码", "search entity"),
+    # 交期风险/交付达成率的唯一口径在 PMC 控制塔，必须能被自然问法选到。
+    "query_pmc_control_tower": ("pmc", "控制塔", "交期风险", "交付风险", "准时交付", "otd"),
 }
 
 _WORKBOOK_SELECTION_HINTS = (
@@ -977,6 +979,16 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
             f"- 口径：{otd.get('otd_scope')}；到期订单 {n(otd.get('due_order_count'))}；已完工 {n(otd.get('completed_order_count'))}；准时 {n(otd.get('on_time_order_count'))}；OTD：{f'{pct}%' if pct is not None else '暂无已完工样本'}；未完工逾期 {n(otd.get('open_overdue_count'))} 张",
             "- 保证方法：MPS前同时核对ATP/物料齐套/产能/RDD；每日重算计划完工与实际完工；插单、缺料、ECN、供应延迟均触发影响评估和重排。",
         ])
+        # “会不会迟到”的前瞻计数与交期智能体同源，必须显式给到模型，否则它答不出数。
+        lines.append(
+            f"- 交期风险（按实际速度推算赶不上 planned_due 的在制工单）：{n(otd.get('at_risk_in_progress_count'))} 张，"
+            f"其中距交期不足3天 {n(otd.get('at_risk_high_count'))} 张；口径：{otd.get('at_risk_method')}"
+        )
+        for item in (otd.get("at_risk_orders") or [])[:10]:
+            lines.append(
+                f"- {item.get('work_order_code')}: {item.get('severity')}，距交期 {n(item.get('days_to_due'))} 天，"
+                f"按当前速度还需 {n(item.get('estimated_remaining_days'))} 天"
+            )
 
     capacity = facts.get("capacity")
     if capacity is not None:

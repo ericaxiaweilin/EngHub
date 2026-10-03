@@ -39,34 +39,15 @@ class DeliveryAgent:
         risks: List[Dict[str, Any]] = []
         escalated: List[str] = []
         try:
-            # 与 supervisor predict 同一口径：按当前速度估算剩余天数
-            result = await self.db.execute(text("""
-                SELECT wo.id, wo.work_order_code, wo.planned_qty, wo.completed_qty,
-                       wo.planned_due, wo.priority, wo.actual_start,
-                       CASE WHEN wo.completed_qty > 0 AND wo.actual_start IS NOT NULL
-                            THEN (wo.planned_qty - wo.completed_qty) *
-                                 EXTRACT(EPOCH FROM (NOW() - wo.actual_start)) / wo.completed_qty / 86400.0
-                            ELSE NULL END as estimated_remaining_days
-                FROM work_orders wo
-                WHERE wo.factory_id = :fid AND wo.status = 'in_progress'
-                  AND wo.planned_due IS NOT NULL
-            """), {"fid": factory_id})
+            # 交期风险的唯一实现在 PMC 控制塔：页面、chatbot、这里必须是同一个数。
+            from api.services.pmc_control_tower_service import PmcControlTowerService
 
-            for row in result.fetchall():
-                r = dict(row._mapping)
-                remaining_days = r.get("estimated_remaining_days")
-                due_date = r.get("planned_due")
-                if not (remaining_days and due_date):
-                    continue
-                days_to_due = (due_date - datetime.utcnow()).total_seconds() / 86400
-                if remaining_days > days_to_due and days_to_due > 0:
-                    severity = "high" if days_to_due < 3 else "medium"
-                    risks.append({
-                        "work_order_code": r["work_order_code"],
-                        "severity": severity,
-                        "days_to_due": round(days_to_due, 1),
-                        "estimated_remaining_days": round(remaining_days, 1),
-                    })
+            risk = await PmcControlTowerService(self.db).delivery_risk(
+                factory_id, limit=100,
+            )
+            risks = list(risk["items"])
+            if risk["data_status"] == "missing":
+                _logger.warning("[delivery] %s 无 work_orders 来源，跳过风险判定", factory_id)
 
             await svc.update_progress(task_id, 1, f"扫描完成，{len(risks)} 个风险工单")
 
