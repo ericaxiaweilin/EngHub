@@ -210,8 +210,9 @@ done
 
 # 前端产物
 echo "  同步前端产物..."
-rm -rf "$REMOTE_DIR/frontend_dist"
 mkdir -p "$REMOTE_DIR/frontend_dist"
+# bind-mount 的目录不能 rm 重建（会断挂载，容器内变空目录），只清内容
+find "$REMOTE_DIR/frontend_dist" -mindepth 1 -delete
 cp -r "$RELEASE/frontend/." "$REMOTE_DIR/frontend_dist/"
 
 # 权限修正（volume 挂载必须）

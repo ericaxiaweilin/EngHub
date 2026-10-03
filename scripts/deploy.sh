@@ -193,8 +193,9 @@ while IFS=$'\t' read -r status path extra; do
 done < "$MANIFEST"
 
 # 前端产物直接写入 volume 挂载目录
-rm -rf "$REMOTE_DIR/frontend_dist"
 mkdir -p "$REMOTE_DIR/frontend_dist"
+# bind-mount 的目录不能 rm 重建（会断挂载，容器内变空目录），只清内容
+find "$REMOTE_DIR/frontend_dist" -mindepth 1 -delete
 cp -r "$RELEASE_DIR/frontend_dist/." "$REMOTE_DIR/frontend_dist/"
 chmod -R 755 "$REMOTE_DIR/frontend_dist"
 
