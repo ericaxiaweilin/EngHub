@@ -10,7 +10,6 @@ from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from core.pp.mrp import MRPService
 
 try:
     from api.services.aps_service import ApsService
@@ -18,53 +17,6 @@ try:
 except ImportError:
     APS_AVAILABLE = False
 
-
-class MockApsService:
-    """APS 服务的 mock 版本，用于测试和内存模式"""
-    
-    async def generate_schedule(
-        self,
-        factory_id: str,
-        mode: str = "hybrid",
-        horizon_days: int = 7,
-        optimize_for: str = "delivery",
-        created_by: str = "system",
-    ) -> Dict[str, Any]:
-        """模拟 APS 排程结果"""
-        return {
-            "success": True,
-            "schedule_id": str(uuid4()),
-            "schedule_code": f"APS-{factory_id[:6]}-MOCK",
-            "total_tasks": 0,
-            "unscheduled_orders": 0,
-            "message": "Mock APS service in test mode (no real DB connection)",
-            "metrics": {
-                "on_time_delivery_rate": 95.0,
-                "avg_resource_utilization": 75.0,
-                "total_setup_time": 30,
-                "avg_manufacturing_cycle": 2.5,
-            }
-        }
-
-
-
-    async def reschedule_incremente(self, factory_id, affected_wo_ids, created_by="system"):
-        """增量重排的 Mock 实现"""
-        return {
-            "success": True,
-            "schedule_id": f"INCR-{factory_id}-{len(affected_wo_ids)}",
-            "affected_wo_count": len(affected_wo_ids),
-            "tasks_processed": len(affected_wo_ids) * 2,
-            "message": f"Incremental re-schedule for {len(affected_wo_ids)} WOs",
-            "diff_report": {
-                "total_operations": len(affected_wo_ids) * 3,
-                "unchanged_operations": 0,
-                "replanned_operations": len(affected_wo_ids) * 3,
-                "stations_affected": 2,
-                "time_impact_hours": 0.5
-            },
-            "metrics": {"avg_cycle_time": 2.5, "resource_utilization": 85.0}
-        }
 
 class PPAPSLinker:
     """
@@ -79,20 +31,11 @@ class PPAPSLinker:
     def __init__(self, db_session: Optional[AsyncSession] = None):
         self.db = db_session
         
-        # 初始化内部服务（如果可用）
-        if APS_AVAILABLE and db_session:
-            try:
-                self._aps_service = ApsService(db_session)
-            except Exception:
-                self._aps_service = MockApsService()
-        elif APS_AVAILABLE and not db_session:
-            # 无 DB session 时使用 mock
-            self._aps_service = MockApsService()
-        else:
-            self._aps_service = None
+        # 只认真实数据库会话。原来 db_session 为 None 时会落到 MockApsService，
+        # 返回 success=True + 随机 schedule_id + 写死的 95% 准时率/75% 利用率，
+        # 界面看起来"已自动重排"，实际库里什么都没发生。
+        self._aps_service = ApsService(db_session) if (APS_AVAILABLE and db_session) else None
         
-        # MRP 服务（独立实例，实际项目应注入相同 session）
-        self._mrp_service = MRPService()
     
     async def trigger_aps_after_mrp(
         self,
@@ -290,26 +233,6 @@ class PPAPSLinker:
         except Exception as e:
             return {"success": False, "message": str(e)}
     
-    async def get_schedule_performance_report(
-        self,
-        schedule_id: str,
-        include_history: bool = False,
-    ) -> Dict[str, Any]:
-        """获取排程方案的绩效报告"""
-        return {
-            "schedule_id": schedule_id,
-            "status": "pending",
-            "metrics": {},
-            "tasks": [],
-        }
-    
-    async def _get_pending_work_orders(self, factory_id: str) -> List[Any]:
-        """获取工厂内待排的工单（内存模式下返回空列表）"""
-        return []  # 实际应查询数据库
-
-
-# ============ APS Job Queue ============
-
 class APSJobQueue:
     """APS排程任务队列处理器（支持事件驱动）"""
     
@@ -345,19 +268,3 @@ class APSJobQueue:
 
 
 # ============ 后台任务支持 ============
-
-async def run_aps_background_job(
-    factory_id: str,
-    interval_seconds: int = 300,
-):
-    """APS后台轮询任务 - 周期性检查待排工单"""
-    import asyncio
-    
-    while True:
-        try:
-            # 实际实现应连接到数据库检查待排工单
-            print(f"[APS Background Job] Checking factory {factory_id} for pending work orders...")
-            await asyncio.sleep(interval_seconds)
-        except Exception as e:
-            print(f"[APS Background Job] Error: {e}")
-            await asyncio.sleep(60)  # 出错后等待再试

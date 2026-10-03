@@ -95,13 +95,24 @@ class MPSService:
         plan_id = str(uuid.uuid4())
         plan_code = self.generate_plan_code(plan_data["factory_id"])
         plan_data["id"] = plan_id
-        plan_data["plan_code"] = f"{plan_code}-{self._get_next_plan_number(plan_data['factory_id']):03d}"
+        next_number = await self._get_next_plan_number(plan_data["factory_id"])
+        plan_data["plan_code"] = f"{plan_code}-{next_number:03d}"
+        # 两个 uvicorn worker 同时建计划会拿到同一个序号，而 plan_code 上没有唯一约束，
+        # 所以这里让开已占用的编号，保证编号在库里唯一指代一张计划。
+        taken = (await self.db.execute(
+            select(Plan.plan_code).where(Plan.plan_code == plan_data["plan_code"])
+        )).scalars().first()
+        while taken is not None:
+            next_number += 1
+            plan_data["plan_code"] = f"{plan_code}-{next_number:03d}"
+            taken = (await self.db.execute(
+                select(Plan.plan_code).where(Plan.plan_code == plan_data["plan_code"])
+            )).scalars().first()
         plan_data["created_at"] = datetime.utcnow()
         plan_data["updated_at"] = datetime.utcnow()
         
-        # 从 plan_data 构建 Plan ORM 对象
-        from database.models import Plan
-        # 注意：需要根据 Plan model 的属性映射数据
+        # 从 plan_data 构建 Plan ORM 对象（模块顶部已 import Plan，函数内不再重复
+        # import —— 否则 Plan 变成局部变量，上面的编号查重会 UnboundLocalError）
         plan_obj = Plan(
             id=plan_id,
             factory_id=plan_data["factory_id"],
@@ -219,11 +230,25 @@ class MPSService:
             "updated_at": plan_obj.updated_at,
         }
     
-    def _get_next_plan_number(self, factory_id: str) -> int:
-        """获取下一个计划编号（内存模拟）"""
-        # 实际应从数据库计数获取
-        return 1  # 简化处理
-    
+    async def _get_next_plan_number(self, factory_id: str) -> int:
+        """计划编号取自库里该厂已用过的最大序号 + 1。
+
+        这里原来写死 `return 1  # 简化处理`，于是每个新计划都拿到 -001；线上 57 张计划
+        只剩 14 个不同 plan_code，同一编号对应 8~9 张不同计划，计划员用编号沟通/追溯
+        就指错单。
+        """
+        prefix = self.generate_plan_code(factory_id)
+        codes = (await self.db.execute(
+            select(Plan.plan_code).where(Plan.plan_code.like(f"{prefix}-%"))
+        )).scalars().all()
+
+        highest = 0
+        for code in codes:
+            tail = str(code).rsplit("-", 1)[-1]
+            if tail.isdigit():
+                highest = max(highest, int(tail))
+        return highest + 1
+
     def generate_plan_code(self, factory_id: str) -> str:
         """生成计划编码前缀"""
         return f"MPS-{factory_id}"
