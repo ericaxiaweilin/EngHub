@@ -130,6 +130,7 @@ const PLAN_MODE_META: Record<string, { color: string; label: string }> = {
   surplus: { color: 'green', label: '订单充足' },
   normal: { color: 'blue', label: '产销平衡' },
   deficit: { color: 'gold', label: '订单欠缺' },
+  blocked: { color: 'red', label: '生产阻塞' },
 }
 
 const DISPOSITION_META: Record<string, { color: string; label: string }> = {

@@ -28,8 +28,9 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,11 +39,30 @@ from sqlalchemy import text
 
 _logger = logging.getLogger("factory_commander")
 
+# 指挥官策略版本号：每次改动 _assess_order_mode / _decide 的阈值或规则就 +1。
+# 决策轨迹落盘时一并记录，否则无法区分“当时的策略”与“现在的策略”，A/B 没有基线。
+COMMANDER_POLICY_VERSION = "cmd-2026.10.04"
+
+
+def _json_default(obj: Any) -> Any:
+    """JSONB 序列化兜底。
+
+    DB 聚合（COUNT/AVG/SUM）在 asyncpg 下回来的是 Decimal 而不是 float，直接
+    json.dumps 会抛 "Object of type Decimal is not JSON serializable"，真实
+    run_cycle 路径上会导致整条落盘失败（合成状态测不出来，因为手写的是 float）。
+    """
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, Enum):
+        return obj.value
+    return str(obj)
+
 
 class OrderMode(str, Enum):
     SURPLUS = "surplus"    # 订单充足（>120%产能）
     NORMAL = "normal"      # 正常（80-120%）
     DEFICIT = "deficit"    # 欠缺（<80%）
+    BLOCKED = "blocked"    # 生产阻塞/主数据异常（负荷虽低但产线被卡住，禁止接单）
 
 
 class CommanderAction(str, Enum):
@@ -53,7 +73,8 @@ class CommanderAction(str, Enum):
     EXPEDITE = "expedite"                  # 加急
     DELAY_DELIVERY = "delay_delivery"      # 延交
     OVERTIME = "overtime"                  # 加班
-    PROCUREMENT = "procurement"            # 采购
+    PROCUREMENT = "procurement"            # 采购（仅缺料补货）
+    MAINTAIN = "maintain"                  # 设备维保/维修（派设备工程师，不走采购）
     DATA_GAP = "data_gap"                  # 计划主数据缺口（补BOM/路由/计划）
     HOLD = "hold"                          # 按兵不动
 
@@ -195,8 +216,9 @@ class CommanderReport:
 
     def to_chatbot_reply(self) -> str:
         """格式化为用户可读的指挥官汇报"""
-        mode_emoji = {"surplus": "🟢", "normal": "🔵", "deficit": "🟡"}
-        mode_label = {"surplus": "订单充足", "normal": "产销平衡", "deficit": "订单欠缺"}
+        mode_emoji = {"surplus": "🟢", "normal": "🔵", "deficit": "🟡", "blocked": "⛔"}
+        mode_label = {"surplus": "订单充足", "normal": "产销平衡", "deficit": "订单欠缺",
+                      "blocked": "生产阻塞/主数据异常"}
 
         parts = [
             f"🎖️ 工厂指挥官态势汇报",
@@ -209,7 +231,15 @@ class CommanderReport:
         if self.decisions:
             parts.append(f"\n🎯 本轮决策（{len(self.decisions)} 项）：")
             for i, d in enumerate(self.decisions, 1):
-                icon = "✅" if d.executed else "📋"
+                _st = (d.result or {}).get("status") if d.executed else None
+                if not d.executed:
+                    icon = "📋"
+                elif _st in ("blocked", "skipped"):
+                    icon = "⚠️"
+                elif _st == "error":
+                    icon = "❌"
+                else:
+                    icon = "✅"
                 parts.append(f"  {icon} {i}. [{d.priority}] {d.reason}")
                 if d.result and d.result.get("message"):
                     parts.append(f"      → {d.result['message']}")
@@ -332,12 +362,17 @@ class FactoryCommander:
         state = await self._sense(factory_id)
 
         # 2. 判断订单模式
+        # mode_source 必须区分策略决策与人工干预：force_mode / _mode_override 不是
+        # 策略输出，重放时若混在一起会把人工干预算成策略效果。
         if force_mode:
             state.order_mode = OrderMode(force_mode)
+            mode_source = "forced"
         elif factory_id in self._mode_override and self._mode_override[factory_id]:
             state.order_mode = OrderMode(self._mode_override[factory_id])
+            mode_source = "override"
         else:
             state.order_mode = self._assess_order_mode(state)
+            mode_source = "policy"
 
         report.order_mode = state.order_mode
         report.state_summary = self._build_state_summary(state)
@@ -392,7 +427,109 @@ class FactoryCommander:
             f"decisions={len(decisions)} | {report.duration_ms:.0f}ms"
         )
 
+        # 7. 决策轨迹落盘（数据驱动策略评估的原料）：放在执行之后才能带上
+        #    result.status；无决策的纯巡检轮次不写全量快照，避免表膨胀。
+        if decisions:
+            await self._record_decision_log(report, state, mode_source)
+
         return report
+
+    # ═══════════════════════════════════════════════════════════
+    # 决策轨迹落盘（Decision Trail）—— 数据驱动策略评估的原料
+    # ═══════════════════════════════════════════════════════════
+
+    def _snapshot_state(self, state: FactoryState) -> Dict[str, Any]:
+        """FactoryState 的【原始数值】快照。
+
+        刻意不用 ``state.to_dict()``：那是给前端看的展示版（数值被格式化成
+        字符串并四舍五入，如 utilization="0%"、stations="3/5"），无法无损重建
+        FactoryState，也就无法重放。
+        """
+        data = asdict(state)
+        data["order_mode"] = state.order_mode.value
+        # DB 聚合回来的数值可能是 Decimal —— 归一成 float，既是 JSONB 能接受的形式，
+        # 也与字段声明的 float 一致。
+        # 注意：float 无法精确表示所有 Decimal（Decimal("0.93") != 0.93），所以快照
+        # 不是逐位相等，而是【决策等价】—— 重建后 _assess_order_mode / _decide 必须给出
+        # 同一结果。这才是重放真正需要的保证，也是测试断言的对象。
+        for key, value in list(data.items()):
+            if isinstance(value, Decimal):
+                data[key] = float(value)
+        return data
+
+    def _mode_reason(self, state: FactoryState, mode_source: str) -> str:
+        """模式判定的依据。
+
+        策略判定才记判别量；人工干预（force_mode / override）只标来源——
+        否则重放时会把人工干预算成策略效果。
+        """
+        if mode_source != "policy":
+            return f"{mode_source}={state.order_mode.value}"
+        if state.order_mode == OrderMode.BLOCKED:
+            parts = [
+                f"{name}={value}" for name, value in (
+                    ("pending", state.pending_orders),
+                    ("overdue", state.overdue_orders),
+                    ("so_unplanned", state.so_unplanned),
+                    ("no_routing", state.products_no_routing),
+                    ("no_bom", state.products_no_bom),
+                ) if value
+            ]
+            return "blockers: " + (", ".join(parts) or "none")
+        return f"load_ratio={state.order_load_ratio:.2f}"
+
+    async def _record_decision_log(
+        self, report: CommanderReport, state: FactoryState, mode_source: str,
+    ) -> None:
+        """把本轮决策轨迹写进 commander_decision_log，供离线重放与策略 A/B。
+
+        用独立 session 落盘：不参与调用方事务，失败也不可能影响主链路。
+        """
+        try:
+            from database.db_config import db_config
+
+            decisions = [{
+                "decision_id": d.decision_id,
+                "action": (
+                    d.action.value if isinstance(d.action, CommanderAction)
+                    else str(d.action)
+                ),
+                "priority": d.priority,
+                "reason": d.reason,
+                "target": d.target,
+                "executed": d.executed,
+                "status": (d.result or {}).get("status") if d.executed else None,
+                "message": (d.result or {}).get("message") if d.executed else None,
+            } for d in report.decisions]
+
+            async with db_config.session_factory() as session:
+                await session.execute(text(
+                    "INSERT INTO commander_decision_log "
+                    "(id, factory_id, cycle_id, mode, mode_source, mode_reason, "
+                    " state_snapshot, decisions, policy_version, duration_ms) "
+                    "VALUES (:id, :factory_id, :cycle_id, :mode, :mode_source, "
+                    " :mode_reason, CAST(:state_snapshot AS JSONB), "
+                    " CAST(:decisions AS JSONB), :policy_version, :duration_ms)"
+                ), {
+                    "id": str(uuid.uuid4()),
+                    "factory_id": report.factory_id,
+                    "cycle_id": report.cycle_id,
+                    "mode": state.order_mode.value,
+                    "mode_source": mode_source,
+                    "mode_reason": self._mode_reason(state, mode_source)[:500],
+                    "state_snapshot": json.dumps(
+                        self._snapshot_state(state), ensure_ascii=False,
+                        default=_json_default,
+                    ),
+                    "decisions": json.dumps(
+                        decisions, ensure_ascii=False, default=_json_default,
+                    ),
+                    "policy_version": COMMANDER_POLICY_VERSION,
+                    "duration_ms": int(report.duration_ms or 0),
+                })
+                await session.commit()
+        except Exception as e:  # noqa: BLE001 —— 落盘绝不影响主链路
+            _logger.warning(f"[commander] 决策轨迹落盘失败（不影响主链路）: {e}")
 
     # ═══════════════════════════════════════════════════════════
     # 感知（Sense）
@@ -632,9 +769,31 @@ class FactoryCommander:
     # 判断（Assess）
     # ═══════════════════════════════════════════════════════════
 
+    def _has_production_blockers(self, state: FactoryState) -> bool:
+        """是否存在「先把活干完」级别的阻塞：待排 / 逾期 / 主数据缺口。
+
+        只要其中任一条成立，就说明产能空闲并不等于可以接单——产线被卡住了。
+        """
+        return bool(
+            state.pending_orders > 0
+            or state.overdue_orders > 0
+            or state.so_unplanned > 0
+            or state.products_no_routing > 0
+            or state.products_no_bom > 0
+        )
+
     def _assess_order_mode(self, state: FactoryState) -> OrderMode:
-        """根据订单负荷比判断模式"""
+        """根据订单负荷比判断模式。
+
+        前置熔断（2026-10-04 修正）：负荷率低**不等于**欠单。线上实测出现过
+        「在制 36 单（待排 22 / 执行中 14）+ 逾期 12 单，却因负荷率 0% 被判
+        『订单欠缺』并去接新单」的逻辑倒错。因此只要存在待排/逾期/主数据缺口，
+        且产能并未真正吃满（负荷 <=120%），就强制进入 BLOCKED
+        （生产阻塞/主数据异常），决策重心转为疏通积压 + 补主数据，**禁止接单**。
+        """
         ratio = state.order_load_ratio
+        if ratio <= 1.2 and self._has_production_blockers(state):
+            return OrderMode.BLOCKED
         if ratio > 1.2:
             return OrderMode.SURPLUS
         elif ratio < 0.8:
@@ -665,7 +824,17 @@ class FactoryCommander:
         mode = state.order_mode
 
         # ─── 模式驱动决策 ───
-        if mode == OrderMode.DEFICIT:
+        if mode == OrderMode.BLOCKED:
+            # 生产阻塞/主数据异常：产能虽空但产线被卡住，先疏通积压，绝不接新单
+            if state.overdue_orders > 0:
+                decisions.append(CommanderDecision(
+                    action=CommanderAction.EXPEDITE,
+                    priority="urgent",
+                    reason=f"生产阻塞且已积压{state.overdue_orders}单逾期，优先加急疏通",
+                    target="overdue_orders",
+                ))
+
+        elif mode == OrderMode.DEFICIT:
             # 订单欠缺 → 主动接单
             decisions.append(CommanderDecision(
                 action=CommanderAction.ACCEPT_ORDER,
@@ -712,10 +881,12 @@ class FactoryCommander:
                 target="aps_schedule",
             ))
 
-        # 设备故障 → 维修
+        # 设备故障 → 维保（派设备工程师/维保智能体生成维修工单）。
+        # 修：此前误用 PROCUREMENT，导致「设备故障」直接触发采购补货。
+        # 采购只应由维保智能体在「需更换核心备件且库存不足」时二次发起。
         if state.equipment_broken > 0:
             decisions.append(CommanderDecision(
-                action=CommanderAction.PROCUREMENT,
+                action=CommanderAction.MAINTAIN,
                 priority="high",
                 reason=f"{state.equipment_broken}台设备故障，安排维修并评估产能影响",
                 target="broken_equipment",
@@ -790,6 +961,12 @@ class FactoryCommander:
                 decision.result = await self._exec_schedule(factory_id)
             elif decision.action == CommanderAction.EXPEDITE:
                 decision.result = await self._exec_expedite(factory_id)
+            elif decision.action == CommanderAction.MAINTAIN:
+                decision.result = {
+                    "message": "已生成设备维修工单并派发设备工程师（缺备件时才由维保转采购）",
+                    "status": "dispatched",
+                    "recipient": "equipment_engineer",
+                }
             elif decision.action == CommanderAction.PROCUREMENT:
                 decision.result = {"message": "已标记补货需求，采购智能体跟进", "status": "delegated"}
             elif decision.action == CommanderAction.OVERTIME:
@@ -826,7 +1003,13 @@ class FactoryCommander:
             )
             result = await svc.pulse(cfg)
             created = len(result.get("created_orders", []))
-            return {"message": f"已承接{created}个新订单并分解为工单", "created": created}
+            if created:
+                return {"message": f"已承接{created}个新订单并分解为工单", "created": created}
+            return {
+                "message": "⚠️ 未承接新订单：订单池无可承接订单，本轮接单已跳过",
+                "created": 0,
+                "status": "skipped",
+            }
         except Exception as e:
             try:
                 await self.db.rollback()
@@ -841,7 +1024,15 @@ class FactoryCommander:
             agent = SchedulingAgent(self.db)
             result = await agent.auto_schedule(factory_id)
             tasks_count = result.get("tasks_created", result.get("total_tasks", 0))
-            return {"message": f"自动排程完成，{tasks_count}个任务已排入", "tasks": tasks_count}
+            if tasks_count:
+                return {"message": f"自动排程完成，{tasks_count}个任务已排入", "tasks": tasks_count}
+            # 排入 0 个不是成功：通常是待排工单缺工艺路线/BOM 导致排程被跳过。
+            return {
+                "message": "⚠️ 排程受阻：本次自动排程未排入任何任务"
+                           "（待排工单可能缺工艺路线/BOM），已挂起并通知工艺/IE 与工程处理",
+                "tasks": 0,
+                "status": "blocked",
+            }
         except Exception as e:
             try:
                 await self.db.rollback()
@@ -874,9 +1065,9 @@ class FactoryCommander:
             return {"agent_key": "scheduling_agent", "interval": 30, "title": "跟进自动排程落地"}
         if a == CommanderAction.EXPEDITE:
             return {"agent_key": "delivery_agent", "interval": 30, "title": "跟进逾期工单加急处理"}
+        if a == CommanderAction.MAINTAIN:
+            return {"agent_key": "equipment_agent", "interval": 60, "title": "跟进设备故障维修与产能恢复"}
         if a == CommanderAction.PROCUREMENT:
-            if d.target == "broken_equipment":
-                return {"agent_key": "equipment_agent", "interval": 60, "title": "跟进设备故障维修与产能恢复"}
             return {"agent_key": "procurement_agent", "interval": 60, "title": "跟催缺料采购补货到位"}
         if a == CommanderAction.OVERTIME:
             return {"agent_key": "hr_agent", "interval": 120, "title": "跟进加班安排确认落实"}
@@ -991,7 +1182,8 @@ class FactoryCommander:
             goals.append(f"保{state.due_7d_orders}个7天内到期工单准时交付")
         if not goals:
             goals.append("维持生产节奏并持续监控态势变化")
-        mode_label = {"surplus": "订单充足", "normal": "产销平衡", "deficit": "订单欠缺"}
+        mode_label = {"surplus": "订单充足", "normal": "产销平衡", "deficit": "订单欠缺",
+                      "blocked": "生产阻塞/主数据异常"}
         return f"[{mode_label.get(state.order_mode.value, '')}] " + "；".join(goals)
 
     def _preview_plan(self, state: FactoryState, decisions: List[CommanderDecision]) -> Optional[Dict[str, Any]]:
@@ -1050,7 +1242,10 @@ class FactoryCommander:
     def _plan_next_actions(self, state: FactoryState, decisions: List[CommanderDecision]) -> List[str]:
         next_actions = []
         mode = state.order_mode
-        if mode == OrderMode.DEFICIT:
+        if mode == OrderMode.BLOCKED:
+            next_actions.append("先疏通积压：加急逾期工单、消化待排工单")
+            next_actions.append("补齐主数据（BOM/工艺路线/未计划销售订单）后再评估是否接单")
+        elif mode == OrderMode.DEFICIT:
             next_actions.append("持续监控订单流入，产能空闲时主动承接")
             next_actions.append("评估是否可承接外部协作订单")
         elif mode == OrderMode.SURPLUS:

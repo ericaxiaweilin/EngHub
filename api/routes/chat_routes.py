@@ -47,7 +47,7 @@ from database.models import (
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
     TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, detect_intent_tool,
-    execute_tool, resolve_intent,
+    execute_tool, resolve_intent_async, DETERMINISTIC_INTENT_TOOLS,
 )
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
@@ -56,7 +56,11 @@ from api.services.workbook_service import apply_workbook_operations, xlsx_to_wor
 from core.kernel.context_window import compact_messages
 from core.kernel.events import get_harness_event_bus
 from core.kernel.plugins import HarnessProfile, PluginSpec, get_harness_plugin_registry
-from core.kernel.reply_sanitizer import looks_like_tool_call_leak, strip_tool_call_markup
+from core.kernel.reply_sanitizer import (
+    looks_like_tool_call_leak,
+    strip_reasoning_markup,
+    strip_tool_call_markup,
+)
 
 router = APIRouter(prefix="/api/v1/chat", tags=["ai-assistant"])
 _logger = logging.getLogger("enghub.chat")
@@ -257,7 +261,7 @@ _GENERIC_READ_TOOL_NAMES = (
 )
 
 
-def _select_tool_names_for_message(message: str) -> set[str]:
+async def _select_tool_names_for_message(message: str) -> set[str]:
     """Return the smallest useful capability set for one user turn.
 
     Deterministic intent rules remain the source of truth.  The extra action
@@ -272,7 +276,7 @@ def _select_tool_names_for_message(message: str) -> set[str]:
         return set()
 
     selected: set[str] = set()
-    resolved = resolve_intent(text)
+    resolved = await resolve_intent_async(text)
     if resolved and resolved.get("tool"):
         selected.add(str(resolved["tool"]))
     else:
@@ -299,7 +303,7 @@ def _select_tool_names_for_message(message: str) -> set[str]:
     return selected
 
 
-def _chat_tool_definitions(
+async def _chat_tool_definitions(
     *,
     has_spreadsheet_attachment: bool,
     workbook_id: Optional[str] = None,
@@ -318,7 +322,7 @@ def _chat_tool_definitions(
         # Import/startup fallback only; normal requests always use the registry.
         tool_catalog = TOOL_DEFINITIONS
     if not has_spreadsheet_attachment:
-        selected_names = _select_tool_names_for_message(user_message)
+        selected_names = await _select_tool_names_for_message(user_message)
         return [
             definition for definition in tool_catalog
             if definition.get("function", {}).get("name") in selected_names
@@ -755,15 +759,16 @@ def _strip_tool_call_leak(reply: str) -> str:
 
 
 def _clean_model_reply(content: str) -> str:
-    """清除模型协议中误混入 content 的推理区块，不改变最终答案语义."""
+    """清除模型协议中误混入 content 的推理/调用标记，不改变最终答案语义.
+
+    推理区块走 strip_reasoning_markup 这条**无条件**通道：线上真实残留里的
+    孤立 </think>（2026-10-03）、<thinking> 变体、带属性的 <think type="...">，
+    都逃得过 looks_like_tool_call_leak 的预判，只靠预判会整段放行给用户。
+    标记之外的正文一律保留，与 strip_tool_call_markup 同一不变量。
+    """
     reply = (content or "").strip()
     reply = _strip_tool_call_leak(reply)
-    return re.sub(
-        r"<think>.*?</think>",
-        "",
-        reply,
-        flags=re.DOTALL | re.IGNORECASE,
-    ).strip()
+    return strip_reasoning_markup(reply).strip()
 
 
 def _grounded_tool_result(result: Dict[str, Any]) -> str:
@@ -1588,7 +1593,7 @@ async def _legacy_chat_disabled(
 
     # 这组 PMC 管理问题必须有确定性事实答复；不让模型自行决定是否查数。
     direct_intent = (
-        resolve_intent(last_user)
+        await resolve_intent_async(last_user)
         if request.enable_tools and not image_records and not has_spreadsheet_attachment
         else None
     )
@@ -1732,7 +1737,7 @@ async def _legacy_chat_disabled(
         _workbook_context_prompt(bound_workbook_id)
         if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
     )
-    tool_definitions = _chat_tool_definitions(
+    tool_definitions = await _chat_tool_definitions(
         has_spreadsheet_attachment=bool(spreadsheet_tables),
         workbook_id=bound_workbook_id,
         user_message=last_user,
@@ -2155,7 +2160,7 @@ async def _handle_kernel_chat(
         _workbook_context_prompt(bound_workbook_id)
         if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
     )
-    tool_definitions = _chat_tool_definitions(
+    tool_definitions = await _chat_tool_definitions(
         has_spreadsheet_attachment=bool(spreadsheet_tables),
         workbook_id=bound_workbook_id,
         user_message=last_user,
@@ -2180,16 +2185,11 @@ async def _handle_kernel_chat(
             or spreadsheet_tables
         ):
             return None
-        intent = resolve_intent(ctx.last_user_content)
+        intent = await resolve_intent_async(ctx.last_user_content)
         if not intent:
             return None
         tool_name = intent.get("tool")
-        if tool_name not in {
-            "query_pmc_control_tower",
-            "query_order_work_order_status",
-            "query_manufacturing_intelligence",
-            "query_workflow_diagram",
-        }:
+        if tool_name not in DETERMINISTIC_INTENT_TOOLS:
             return None
         arguments = intent.get("args") or {}
         result = await execute(tool_name, arguments)
@@ -2301,18 +2301,13 @@ async def _handle_kernel_chat(
     )
 
     deterministic_intent = (
-        resolve_intent(last_user)
+        await resolve_intent_async(last_user)
         if request.enable_tools and not image_records and not spreadsheet_tables
         else None
     )
     route_not_required = bool(
         (unsupported_attachment and _is_attachment_analysis_request(last_user))
-        or (deterministic_intent and deterministic_intent.get("tool") in {
-            "query_pmc_control_tower",
-            "query_order_work_order_status",
-            "query_manufacturing_intelligence",
-            "query_workflow_diagram",
-        })
+        or (deterministic_intent and deterministic_intent.get("tool") in DETERMINISTIC_INTENT_TOOLS)
     )
     try:
         thread_manager = get_thread_manager()
@@ -3088,7 +3083,7 @@ async def _legacy_stream_disabled(
 
         # Stream 是前端主链路；PMC九类问题在这里直接执行统一事实工具，保证不依赖模型是否正确选工具。
         direct_intent = (
-            resolve_intent(last_user)
+            await resolve_intent_async(last_user)
             if request.enable_tools and not image_records and not has_spreadsheet_attachment
             else None
         )
@@ -3257,7 +3252,7 @@ async def _legacy_stream_disabled(
             _workbook_context_prompt(bound_workbook_id)
             if spreadsheet_tables else _workbook_context_prompt(request.workbook_id)
         )
-        tool_definitions = _chat_tool_definitions(
+        tool_definitions = await _chat_tool_definitions(
             has_spreadsheet_attachment=bool(spreadsheet_tables),
             workbook_id=bound_workbook_id,
             user_message=last_user,

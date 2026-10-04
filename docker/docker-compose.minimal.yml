@@ -63,6 +63,12 @@ services:
       # EngFlow Chat V2 运行时持久化：生产默认开启，数据库需先执行 082/083/084。
       - AGENT_EVENT_PERSISTENCE_ENABLED=${AGENT_EVENT_PERSISTENCE_ENABLED:-1}
       - CHECKPOINT_PERSISTENCE_ENABLED=${CHECKPOINT_PERSISTENCE_ENABLED:-1}
+      # Laya System-1 意图路由（实现见 api/services/laya_intent_service.py）
+      # primary=Laya优先 / fallback=仅关键词未命中时介入 / off=关闭
+      - LAYA_INTENT_MODE=${LAYA_INTENT_MODE:-primary}
+      - LAYA_SIDECAR_URL=${LAYA_SIDECAR_URL:-http://host.docker.internal:14200}
+      - LAYA_MIN_CONFIDENCE=${LAYA_MIN_CONFIDENCE:-0.6}
+      - LAYA_TIMEOUT_SECONDS=${LAYA_TIMEOUT_SECONDS:-0.5}
     ports:
       - "18888:8000"
     depends_on:

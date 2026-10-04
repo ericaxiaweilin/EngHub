@@ -1060,7 +1060,7 @@ export default function AIAssistantWidget() {
           const mat = st.material || {}
           const del = st.delivery || {}
           const qual = st.quality || {}
-          const modeLabel: Record<string, string> = { surplus: '🟢 订单充足（挑单/延交低优）', normal: '🔵 产销平衡（维持节奏）', deficit: '🟡 订单欠缺（主动接单补产）' }
+          const modeLabel: Record<string, string> = { surplus: '🟢 订单充足（挑单/延交低优）', normal: '🔵 产销平衡（维持节奏）', deficit: '🟡 订单欠缺（主动接单补产）', blocked: '⛔ 生产阻塞（先疏通积压，不接新单）' }
 
           const lines: string[] = [
             '✅ 首轮态势感知完成，已接管您的工作范围：',

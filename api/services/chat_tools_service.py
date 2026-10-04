@@ -3474,7 +3474,7 @@ def _extract_wo_code(message: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
+def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
     """确定性意图解析：命中业务关键词返回 {"tool", "args"}，否则 None。
 
     后端可据此直接执行工具取真实数据（不依赖模型决策），args 通过轻量关键词规则提取。
@@ -3695,6 +3695,81 @@ def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
     return {"tool": tool, "args": args}
 
 
+# 必须由确定性规则给出事实答复的工具（PMC 四类）。概率路由（Laya）不得覆盖。
+# chat_routes 的 deterministic_handler / route_not_required 直接引用本集合，
+# 不要再在别处内联一份，否则会漂移。
+DETERMINISTIC_INTENT_TOOLS = frozenset({
+    "query_pmc_control_tower",
+    "query_order_work_order_status",
+    "query_manufacturing_intelligence",
+    "query_workflow_diagram",
+})
+
+
+def resolve_intent(message: str) -> Optional[Dict[str, Any]]:
+    """确定性意图解析：关键词路由为主，Laya（System 1 决策引擎）可选介入。
+
+    模式见 ``api/services/laya_intent_service.py``：
+
+    * ``off``      —— 纯关键词，等价于历史行为；
+    * ``fallback`` —— 关键词**没命中**时才问 Laya（默认，零回归）；
+    * ``primary``  —— 先问 Laya，够自信就用它，否则回退关键词；但 PMC 四类
+      （``DETERMINISTIC_INTENT_TOOLS``）是硬性确定性契约，关键词命中即优先，
+      Laya 不得覆盖。
+
+    Laya 只提供「意图 → 工具」的映射，args 仍由关键词规则提取；映射表刻意只
+    覆盖能一一对应的意图（查库存/查工单/设备状态），其余交回模型编排。任何
+    Laya 异常（超时/连不上/熔断）都被吞掉，绝不影响本函数原有的确定性行为。
+    """
+    from api.services import laya_intent_service as laya  # 懒加载，避免循环导入
+
+    laya_mode = laya.mode() if laya.is_enabled() else "off"
+
+    if laya_mode == "primary":
+        # 硬性确定性契约优先：PMC 四类必须由关键词规则给出确定性事实答复
+        # （见 chat_routes 的系统提示与 deterministic_handler 白名单）。
+        # Laya 是概率路由，不得覆盖这四类：否则「库存怎么降」「控过多少物料」
+        # 会被降级成 query_inventory，既答非所问，又落不进确定性执行白名单，
+        # 等于把确定性答复整条丢掉。
+        kw = _resolve_intent_keyword(message)
+        if kw and kw.get("tool") in DETERMINISTIC_INTENT_TOOLS:
+            return kw
+        hit = laya.resolve_tool(message)
+        if hit:
+            # Laya 与关键词指向同一个工具时，保留关键词提取的更精确 args
+            # （例如「在制工单」-> status=in_progress），只借用 Laya 的意图判定。
+            if kw and kw.get("tool") == hit["tool"]:
+                return kw
+            return {"tool": hit["tool"], "args": hit.get("args") or {}}
+
+    resolved = _resolve_intent_keyword(message)
+    if resolved:
+        return resolved
+
+    if laya_mode in ("fallback", "primary"):
+        hit = laya.resolve_tool(message)
+        if hit:
+            import logging
+            logging.getLogger(__name__).info(
+                "[laya] 关键词未命中，Laya 路由 -> %s (intent=%s conf=%s)",
+                hit["tool"], hit.get("intent"), hit.get("confidence"),
+            )
+            return {"tool": hit["tool"], "args": hit.get("args") or {}}
+
+    return None
+
+
+async def resolve_intent_async(message: str) -> Optional[Dict[str, Any]]:
+    """``resolve_intent`` 的 async 包装：把同步实现（可能含最多
+    ``LAYA_TIMEOUT_SECONDS`` 的 Laya HTTP 调用）放到线程池执行，避免阻塞事件循环。
+
+    **async 调用点必须用这个**（``chat_routes._handle_kernel_chat`` 等）；同步版
+    保留给单元测试与纯同步上下文。线程安全：Laya 客户端的熔断计数由
+    ``laya_intent_service._lock`` 保护，可安全跨线程调用。
+    """
+    return await asyncio.to_thread(resolve_intent, message)
+
+
 async def execute_tool(
     db: AsyncSession,
     tool_name: str,
@@ -3728,4 +3803,4 @@ async def execute_tool(
         return {"error": f"工具执行失败：{type(exc).__name__}: {exc}"}
 
 
-__all__ = ["TOOL_DEFINITIONS", "TOOL_LABELS", "WRITE_TOOLS", "SIM_TOOLS", "execute_tool", "detect_intent_tool", "resolve_intent", "INTENT_RULES"]
+__all__ = ["TOOL_DEFINITIONS", "TOOL_LABELS", "WRITE_TOOLS", "SIM_TOOLS", "execute_tool", "detect_intent_tool", "resolve_intent", "resolve_intent_async", "INTENT_RULES", "DETERMINISTIC_INTENT_TOOLS"]

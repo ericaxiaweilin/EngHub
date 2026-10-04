@@ -11,6 +11,7 @@ from core.kernel.reply_sanitizer import (
     StreamSanitizer,
     extract_tool_json_spans,
     looks_like_tool_call_leak,
+    strip_reasoning_markup,
     strip_tool_call_markup,
 )
 
@@ -195,4 +196,140 @@ def test_recover_never_takes_write_tools():
         '{"tool":"create_work_order","arguments":{"a":1}}', 1,
     )
     assert calls == []
+
+
+# ── 推理区块泄漏（线上 chat_messages 残留样本 2026-08-16 / 2026-10-03） ──
+# 旧实现只匹配字面量 "<think>.*?</think>"，于是三类真实样本全部放行给用户：
+#   a. 孤立闭标签 </think>（开标签已被前一轮剥掉）
+#   b. 变体标签名 <thinking>
+#   c. 带属性的开标签 <think type="...">
+# 用户 2026-10-03 因此关闭了展示。以下每条都对应一个线上形态。
+
+
+def test_orphan_close_think_stripped_text_kept():
+    raw = "库存 120 件。\n</think>"
+    assert strip_tool_call_markup(raw) == "库存 120 件。"
+    # strip_reasoning_markup 只删标记、不做 strip（收尾去空白由 _clean_model_reply 负责）
+    assert strip_reasoning_markup(raw).strip() == "库存 120 件。"
+
+
+def test_orphan_close_think_alone_does_not_survive():
+    assert strip_tool_call_markup("</think>") == ""
+    assert strip_reasoning_markup("</think>") == ""
+
+
+def test_orphan_close_think_mid_text_keeps_both_sides():
+    raw = "结论 120 件。\n</think>\n以上。"
+    out = strip_reasoning_markup(raw)
+    assert "结论 120 件。" in out
+    assert "以上。" in out
+    assert "think" not in out.lower()
+
+
+def test_thinking_variant_stripped():
+    assert strip_tool_call_markup("<thinking>内部推理</thinking>\n库存 120 件。") == "库存 120 件。"
+    assert strip_reasoning_markup("<thinking>内部推理</thinking>\n库存 120 件。").strip() == "库存 120 件。"
+
+
+def test_think_with_attributes_stripped():
+    raw = '<think type="reasoning">内部推理</think>\n库存 120 件。'
+    assert strip_tool_call_markup(raw) == "库存 120 件。"
+    assert strip_reasoning_markup(raw).strip() == "库存 120 件。"
+
+
+def test_reasoning_markup_escapes_tool_call_gate():
+    """孤立闭标签与变体标签名都逃得过 looks_like_tool_call_leak 的预判。
+
+    所以推理区块必须有一条**无条件**通道（strip_reasoning_markup）；
+    只靠 _strip_tool_call_leak 的预判会整段放行给用户。
+    """
+    for raw in ("</think>", "<thinking>x</thinking>", '<think type="a">x</think>'):
+        assert looks_like_tool_call_leak(raw) is False, raw
+        assert strip_reasoning_markup(raw) == "", raw
+
+
+def test_orphan_close_tool_tag_stripped():
+    raw = "库存 120 件。\n</tool_call>"
+    assert strip_tool_call_markup(raw) == "库存 120 件。"
+    assert looks_like_tool_call_leak(raw) is True
+
+
+def test_stream_sanitizer_drops_orphan_close_think():
+    s = StreamSanitizer()
+    out = s.feed("库存 120 件。\n</think>") + s.flush()
+    assert "think" not in out.lower()
+    assert "库存 120 件。" in out
+
+
+def test_stream_sanitizer_drops_thinking_variant():
+    s = StreamSanitizer()
+    out = s.feed("<thinking>内部推理</thinking>库存 120 件。") + s.flush()
+    assert "thinking" not in out.lower()
+    assert "库存 120 件。" in out
+
+
+def test_reasoning_cleanup_keeps_legit_prose_and_json():
+    """不变量：清推理标记不得吃掉正文里的合法尖括号或合法 JSON。"""
+    keep = "当 a<b 时成立"
+    assert strip_reasoning_markup(keep) == keep
+    assert strip_tool_call_markup(keep) == keep
+    legit = '接口返回示例：{"code": 200, "data": []} 请参考。'
+    assert strip_tool_call_markup(legit) == legit
+    assert strip_reasoning_markup(legit) == legit
+
+
+# ── 线上 2026-08-15 两条残留（此前只在流式路径漏出） ──
+# cadee6e4（4714 字符）：连续几百个 <tool_call> 开标签、零闭标签。旧 feed()
+#   只从「最后一个 <」暂扣，前面几百个开标签当场外发给用户。
+# 9ce9c3bb（104 字符）：<invoke name="…"> **开标签**无人覆盖，只删孤立
+#   </invoke> 会把开标签留给用户。
+
+BARE_TOOL_CALL_OPENERS = "结论如下。\n\n" + "<tool_call>\n" * 40
+INVOKE_ORPHANS = (
+    '我来查一下。\n\n</invoke>\n'
+    '<invoke name="query_pmc_work_matrix">\n\n</invoke>\n\n</invoke>'
+)
+
+
+def test_stream_bare_tool_call_openers_do_not_leak():
+    """多个未闭合 <tool_call> 开标签：流式路径不得外发任何一个。"""
+    s = StreamSanitizer()
+    out = s.feed(BARE_TOOL_CALL_OPENERS) + s.flush()
+    assert "<tool_call" not in out
+    assert "结论如下。" in out
+
+
+def test_nonstream_bare_tool_call_openers_do_not_leak():
+    out = strip_tool_call_markup(BARE_TOOL_CALL_OPENERS)
+    assert "<tool_call" not in out
+    assert "结论如下。" in out
+
+
+def test_invoke_opener_stripped_both_paths():
+    """<invoke name="…"> 开标签：此前只删 </invoke>，开标签会漏给用户。"""
+    ns = strip_tool_call_markup(INVOKE_ORPHANS)
+    assert "invoke" not in ns.lower()
+    assert "我来查一下。" in ns
+    s = StreamSanitizer()
+    streamed = s.feed(INVOKE_ORPHANS) + s.flush()
+    assert "invoke" not in streamed.lower()
+    assert "我来查一下。" in streamed
+
+
+def test_invoke_opener_opens_the_gate():
+    assert looks_like_tool_call_leak('<invoke name="x">') is True
+
+
+def test_truncated_protocol_tag_at_tail_stripped():
+    """流末尾断在半截开标签上：只删半截标签，不吃正文。"""
+    for raw in ("<tool_call", "<tool_use", "<invoke", "<think", "<tool"):
+        assert strip_tool_call_markup(raw) == "", raw
+    s = StreamSanitizer()
+    assert (s.feed("结论。<tool") + s.flush()) == "结论。"
+
+
+def test_truncated_tag_rule_keeps_legit_angle_brackets():
+    """半截标签规则只认协议标签前缀（>=3 字符），正文里的 <b / <y 一律保留。"""
+    for raw in ("当 a<b", "x<y", "5 < 10"):
+        assert strip_tool_call_markup(raw) == raw, raw
 

@@ -1,6 +1,6 @@
 """Strip tool-call markup that reasoning models sometimes emit as plain text.
 
-真实形态取自线上 chat_messages 泄漏样本（2026-08-14 ~ 2026-10-03）：
+真实形态取自线上 chat_messages 泄漏样本（2026-08-14 ~ 2026-10-04）：
 
 1. 一整块 harness 风格调用标记，可能连续多段，也可能在文本中途被截断
    （8-15 那条 4714 字符里就是半截调用）。
@@ -8,10 +8,24 @@
 3. 只残留一个孤立分隔标签。
 4. 另一种 provider 的 tool_use 形态（线上 2026-10-04 泄漏样本）：
    <tool_use>{"name": "...", ...}</tool_use>，也可能未闭合。
+5. 推理区块（线上 2026-08-16 / 2026-10-03 泄漏样本）：<think>…</think>、
+   <thinking>…</thinking>、带属性的 <think type="…">，以及**只有闭标签的
+   孤立 </think>**。最后一种最隐蔽——它既没有开标签可配对，也逃得过
+   looks_like_tool_call_leak 的预判，两条路都会放行。
+6. invoke 形态（线上 2026-08-15 泄漏样本）：<invoke name="…">…</invoke>，
+   常与孤立 </invoke> 混在一起。**开标签**此前没有任何规则覆盖，
+   只删孤立闭标签会把 <invoke name="…"> 留给用户。
+7. 流末尾被截断的开标签（8-15 那条 4714 字符样本的真实成因）：
+   模型连续吐出几百个 <tool_call> 开标签、一个闭标签都没有。流式路径
+   若只从「最后一个 <」开始暂扣，前面几百个开标签会当场外发；收尾时
+   若流正好断在 <tool_call 这种半截标签上，连暂扣尾巴本身也清不掉。
 
 不变量：**只删除调用标记本身，绝不丢弃标记之外的正文**。8-14 的样本是
 "合法答复在前 + 调用标记在后"，任何"从第一个标记处截断"的写法都会把用户
 已经拿到的答案吃掉。
+
+同理，合法的尖括号文本（"当 a<b 时成立"）与合法 JSON
+（{"code": 200}）必须原样保留——tests/unit/test_reply_sanitizer.py 有钉子。
 """
 
 import json
@@ -67,14 +81,42 @@ _TOOL_USE_UNCLOSED = re.compile(
     _tag_open("tool_use") + r".*",
     re.DOTALL | re.IGNORECASE,
 )
+# 6) invoke 形态：与 tool_use 同构。**开标签**此前无人覆盖，只删 </invoke>
+# 会把 <invoke name="…"> 留给用户（线上 2026-08-15 样本）。
+_INVOKE = re.compile(
+    _tag_open("invoke") + r".*?" + _tag("invoke", closing=True),
+    re.DOTALL | re.IGNORECASE,
+)
+_INVOKE_UNCLOSED = re.compile(
+    _tag_open("invoke") + r".*",
+    re.DOTALL | re.IGNORECASE,
+)
 
+# 推理区块。线上残留（2026-08-14 ~ 2026-10-04）里形态不止一种，只匹配字面量
+# "<think>" 会漏掉三类真实样本：
+#   a. 变体标签名 <thinking>…</thinking>；
+#   b. 带属性的开标签 <think type="reasoning">…</think>；
+#   c. 孤立的闭标签 </think>——开标签被前一轮剥掉后剩下的尾巴，
+#      既没有开标签可配对，也不在 looks_like_tool_call_leak 的预判范围内。
+# 因此闭标签单独一条规则，且必须无条件执行（见 strip_reasoning_markup）。
+_REASONING_NAMES = "think|thinking|reasoning"
 _THINK_CLOSED = re.compile(
-    r"<think>.*?</think>",
+    r"<(?:" + _REASONING_NAMES + r")(?:\s[^>]*)?>.*?</(?:" + _REASONING_NAMES + r")\s*>",
     re.DOTALL | re.IGNORECASE,
 )
 _THINK_UNCLOSED = re.compile(
-    r"<think>.*",
+    r"<(?:" + _REASONING_NAMES + r")(?:\s[^>]*)?>.*",
     re.DOTALL | re.IGNORECASE,
+)
+_THINK_ORPHAN_CLOSE = re.compile(
+    r"</(?:" + _REASONING_NAMES + r")\s*>",
+    re.IGNORECASE,
+)
+
+# 4) 协议标签的孤立闭标签：同上，开标签已被剥掉时只剩尾巴。
+_ORPHAN_CLOSE = re.compile(
+    r"</(?:tool_call|tool_calls|tool_use|function|parameter|tool_sep|invoke)\s*>",
+    re.IGNORECASE,
 )
 
 # 3) 孤立分隔标签。
@@ -83,22 +125,80 @@ _SEP = re.compile(
     re.IGNORECASE,
 )
 
+# 7) 流式暂扣点：所有「块开标签」的并集。feed() 只从最后一个 "<" 暂扣是不够的——
+# 连续多个未闭合开标签时（8-15 那条 4714 字符样本），前面的开标签会被当成
+# 普通文本外发。因此还要从「最早的一个未闭合开标签」开始暂扣；这些内容在
+# flush() 里由 *_UNCLOSED 规则整段吃掉。
+_HOLD_OPENER = re.compile(
+    r"(?:"
+    + _tag_open("tool_call")          # 同时覆盖 <tool_calls>（[^>]* 吃掉 "s"）
+    + r"|" + _tag_open("tool_use")
+    + r"|" + _tag_open("invoke")
+    + r"|" + r"<(?:" + _REASONING_NAMES + r")(?:\s[^>]*)?>"
+    + r")",
+    re.IGNORECASE,
+)
+
+# 7b) 流末尾被截断的开标签：<tool_call / <tool_use / <invoke / <think … 半截，
+# 没有 ">"。只在「字符串末尾」生效（$ 锚定），且标签名前缀至少 3 个字符——
+# 单个字母前缀（<t / <i / <f / <p）太容易撞上正文里的合法尖括号
+# （"当 a<b 时成立" 里的 "<b"），不放行。
+_PROTOCOL_TAGS = (
+    "tool_call", "tool_calls", "tool_use", "tool_sep",
+    "think", "thinking", "reasoning", "invoke", "function", "parameter",
+)
+_MIN_PARTIAL = 3
+_PARTIAL_ALTS = sorted(
+    {re.escape(n[:i]) for n in _PROTOCOL_TAGS for i in range(_MIN_PARTIAL, len(n) + 1)},
+    key=len,
+    reverse=True,
+)
+_PARTIAL_TAG = re.compile(
+    r"</?(?:" + "|".join(_PARTIAL_ALTS) + r")(?![a-zA-Z_])[^>]*$",
+    re.IGNORECASE,
+)
+
 
 def strip_tool_call_markup(content: str) -> str:
-    """去掉误混入正文的工具调用标记，返回仍然可读的答复文本。"""
+    """去掉误混入正文的调用/推理标记，返回仍然可读的答复文本。"""
     text = content or ""
     if _LT not in text and '"tool"' not in text:
         return text.strip()
     text = _HARNESS.sub("", text)
     text = _BLOCK.sub("", text)
     text = _TOOL_USE.sub("", text)
+    text = _INVOKE.sub("", text)
     text = _HARNESS_UNCLOSED.sub("", text)
     text = _TOOL_USE_UNCLOSED.sub("", text)
+    text = _INVOKE_UNCLOSED.sub("", text)
     text = _UNCLOSED_BLOCK.sub("", text)
     text = _INNER.sub("", text)
     text = _SEP.sub("", text)
+    text = _THINK_CLOSED.sub("", text)
+    text = _THINK_UNCLOSED.sub("", text)
+    text = _THINK_ORPHAN_CLOSE.sub("", text)
+    text = _ORPHAN_CLOSE.sub("", text)
+    text = _PARTIAL_TAG.sub("", text)
     text = strip_tool_json(text)
     return text.strip()
+
+
+def strip_reasoning_markup(text: str) -> str:
+    """无条件清一遍推理区块（闭合 / 未闭合 / 带属性 / 变体标签名 / 孤立闭标签）。
+
+    与 ``strip_tool_call_markup`` 的分工：那个走 ``looks_like_tool_call_leak`` 预判，
+    而孤立闭标签与变体标签名恰好都逃得过那个预判，所以推理区块必须单独一条
+    无条件通道，否则 ``_clean_model_reply`` 会整段放行。
+
+    不变量与调用标记一致：**只删标记本身，标记之外的正文一律保留**。
+    """
+    out = text or ""
+    if _LT not in out:
+        return out
+    out = _THINK_CLOSED.sub("", out)
+    out = _THINK_UNCLOSED.sub("", out)
+    out = _THINK_ORPHAN_CLOSE.sub("", out)
+    return out
 
 
 def looks_like_tool_call_leak(content: str) -> bool:
@@ -109,10 +209,13 @@ def looks_like_tool_call_leak(content: str) -> bool:
     return bool(
         re.search(_tag_open("tool_call"), text, re.IGNORECASE)
         or re.search(_tag_open("tool_use"), text, re.IGNORECASE)
+        or re.search(_tag_open("invoke"), text, re.IGNORECASE)
         or bool(_TOOL_JSON_START.search(text))
         or re.search(_tag("tool_calls"), text, re.IGNORECASE)
         or re.search(_tag("tool_call"), text, re.IGNORECASE)
         or _SEP.search(text)
+        or _ORPHAN_CLOSE.search(text)
+        or _PARTIAL_TAG.search(text)
     )
 
 
@@ -124,7 +227,10 @@ def strip_complete_blocks(text: str) -> str:
     out = _HARNESS.sub("", out)
     out = _BLOCK.sub("", out)
     out = _TOOL_USE.sub("", out)
+    out = _INVOKE.sub("", out)
     out = _THINK_CLOSED.sub("", out)
+    out = _THINK_ORPHAN_CLOSE.sub("", out)
+    out = _ORPHAN_CLOSE.sub("", out)
     out = _INNER.sub("", out)
     out = _SEP.sub("", out)
     return out
@@ -236,6 +342,12 @@ class StreamSanitizer:
         lt_idx = buf.rfind(_LT)
         if lt_idx != -1:
             hold = min(hold, lt_idx)
+        # 关键：不能只从「最后一个 <」暂扣。连续多个未闭合开标签时，前面的
+        # 开标签会被当成普通文本外发（线上 8-15 那条 4714 字符样本）。
+        # 从「最早的未闭合开标签」起一并暂扣，交由 flush() 整段吃掉。
+        mo = _HOLD_OPENER.search(buf)
+        if mo:
+            hold = min(hold, mo.start())
         m = list(_TOOL_JSON_START.finditer(buf))
         if m:
             hold = min(hold, m[0].start())
@@ -243,7 +355,7 @@ class StreamSanitizer:
         return buf[:hold]
 
     def flush(self) -> str:
-        """流结束：对暂扣尾巴做完整清洗（含未闭合块与 think）并返回。"""
+        """流结束：对暂扣尾巴做完整清洗（含未闭合块、推理标记与半截标签）并返回。"""
         out, self._buf = self._buf, ""
         if not out:
             return out
@@ -253,6 +365,10 @@ class StreamSanitizer:
         out = _THINK_UNCLOSED.sub("", out)
         out = _HARNESS_UNCLOSED.sub("", out)
         out = _TOOL_USE_UNCLOSED.sub("", out)
+        out = _INVOKE_UNCLOSED.sub("", out)
         out = _UNCLOSED_BLOCK.sub("", out)
+        out = _THINK_ORPHAN_CLOSE.sub("", out)
+        out = _ORPHAN_CLOSE.sub("", out)
+        out = _PARTIAL_TAG.sub("", out)
         out = strip_tool_json(out)
         return out.strip()
