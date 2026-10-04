@@ -1470,20 +1470,61 @@ export default function AIAssistantWidget() {
     sendMessage(cmd.command_text, cmd.agent_key || undefined)
   }
 
+  // 统一剪贴板写入：优先 Clipboard API，退回 execCommand（非安全上下文 / 旧浏览器）。
+  const writeClipboard = async (text: string) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return
+    }
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    textarea.remove()
+  }
+
   const copyChatMessage = async (chatMessage: ChatMsg) => {
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(chatMessage.content)
-      } else {
-        const textarea = document.createElement('textarea')
-        textarea.value = chatMessage.content
-        textarea.style.position = 'fixed'
-        textarea.style.opacity = '0'
-        document.body.appendChild(textarea)
-        textarea.select()
-        document.execCommand('copy')
-        textarea.remove()
+      await writeClipboard(chatMessage.content)
+      message.success('消息已复制')
+    } catch {
+      message.error('复制失败，请检查浏览器权限')
+    }
+  }
+
+  // 历史会话：拉回整段对话并复制为文本（与 openMemorySession 共用 replay 接口）。
+  const copyMemorySession = async (item: ChatMemoryResult['sessions'][number]) => {
+    setMemoryLoading(true)
+    try {
+      const trace: any = await api.get(`/api/v1/chat/replay/${item.session_id}`)
+      const msgs: any[] = (Array.isArray(trace?.messages) ? trace.messages : [])
+        .filter((m: any) => m.role === 'user' || m.role === 'assistant')
+      if (!msgs.length) {
+        message.warning('该会话没有可复制的对话内容')
+        return
       }
+      const lines: string[] = [`# ${item.title || '新会话'}`, `会话 ID：${item.session_id}`, '']
+      for (const m of msgs) {
+        lines.push(m.role === 'user' ? '【用户】' : '【助手】')
+        lines.push((m.content || '').trim())
+        lines.push('')
+      }
+      await writeClipboard(lines.join('\n'))
+      message.success(`已复制 ${msgs.length} 条对话`)
+    } catch {
+      message.error('复制失败，请检查浏览器权限')
+    } finally {
+      setMemoryLoading(false)
+    }
+  }
+
+  // 单条历史消息：直接复制其内容
+  const copyMemoryMessage = async (item: ChatMemoryResult['messages'][number]) => {
+    try {
+      await writeClipboard(item.content || '')
       message.success('消息已复制')
     } catch {
       message.error('复制失败，请检查浏览器权限')
@@ -2576,7 +2617,10 @@ export default function AIAssistantWidget() {
                               dataSource={memoryResults.sessions}
                               renderItem={item => (
                                 <List.Item
-                                  actions={[<Button key="open" type="link" size="small" onClick={() => void openMemorySession(item)}>打开</Button>]}
+                                  actions={[
+                                    <Button key="open" type="link" size="small" onClick={() => void openMemorySession(item)}>打开</Button>,
+                                    <Button key="copy" type="link" size="small" onClick={() => void copyMemorySession(item)}>复制</Button>,
+                                  ]}
                                 >
                                   <List.Item.Meta
                                     title={<Text ellipsis style={{ maxWidth: 320, display: 'inline-block' }}>{item.title || '新会话'}</Text>}
@@ -2620,7 +2664,10 @@ export default function AIAssistantWidget() {
                               dataSource={memoryResults.messages}
                               renderItem={item => (
                                 <List.Item
-                                  actions={[<Button key="open" type="link" size="small" onClick={() => void openMemorySession({ session_id: item.session_id, title: item.session_title })}>打开会话</Button>]}
+                                  actions={[
+                                    <Button key="open" type="link" size="small" onClick={() => void openMemorySession({ session_id: item.session_id, title: item.session_title })}>打开会话</Button>,
+                                    <Button key="copy" type="link" size="small" onClick={() => void copyMemoryMessage(item)}>复制</Button>,
+                                  ]}
                                 >
                                   <List.Item.Meta
                                     avatar={<Tag color={item.role === 'user' ? 'blue' : 'purple'}>{item.role === 'user' ? '我' : 'AI'}</Tag>}
