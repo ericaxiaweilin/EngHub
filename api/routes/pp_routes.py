@@ -26,6 +26,7 @@ from api.services.bom_source import (
     rollup_status,
     subassembly_suspects,
 )
+from api.services.production_part_master import register_make_part_masters
 
 router = APIRouter(prefix="/api/v1", tags=["pp"])
 
@@ -217,6 +218,7 @@ async def release_plan(
                 raise HTTPException(status_code=409, detail=f"产能冲突: {c['message']}")
     
     work_order = await db.get(WorkOrder, p.work_order_id) if p.work_order_id else None
+    master_receipt = None
     if not work_order:
         product = await db.get(Product, p.product_id)
         work_order = WorkOrder(
@@ -273,6 +275,14 @@ async def release_plan(
                 item_type=item["item_type"],
             ))
 
+        # 自制件得先有主档才谈得上工单：缺的那一半按 BOM 上传行自带的料号/品名/单位登记，
+        # 工艺路线一律不建（路线是工艺事实，不在 BOM 里，系统不替工厂编一条）。
+        master_receipt = await register_make_part_masters(
+            db, p.factory_id,
+            str(getattr(product, "product_code", None) or p.product_id),
+            [dict(item) for item in mrp_items],
+        )
+
     p.status = "released"
     p.release_status = "released"
     p.released_by = current_user.username if current_user else "system"
@@ -294,6 +304,9 @@ async def release_plan(
     await db.refresh(p)
     result = _serialize_plan(p)
     result["aps"] = aps_result
+    if master_receipt is not None:
+        # 建了多少、跳过多少、哪些建不了，要能对账；静默补主数据等于没人知道主档是谁造的
+        result["production_part_masters"] = master_receipt
     return result
 
 
