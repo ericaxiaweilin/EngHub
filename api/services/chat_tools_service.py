@@ -3083,6 +3083,94 @@ async def _tool_create_followup_task(db: AsyncSession, args: Dict[str, Any], ope
 
 _TOOL_EXECUTORS["create_followup_task"] = _tool_create_followup_task
 
+# ── 计划清单（to-do 模式）──────────────────────────────────────────────────
+# 模型用 update_plan 声明/更新本轮多步任务的执行计划。计划不另建表：它随
+# tool_call result 落在 assistant 消息的 tool_calls 上，replay 接口原样返回，
+# 因此断线重开/历史回放都能看到当时的计划，无需接 checkpoint 或新增事件词汇。
+TOOL_DEFINITIONS.append({
+    "type": "function",
+    "function": {
+        "name": "update_plan",
+        "description": (
+            "声明或更新本次任务的执行计划清单（to-do）。当你接到需要 3 步以上才能完成的任务"
+            "（排查/整改/跨系统核对/汇总分析等），先调用一次列出全部步骤，之后每完成一步再调用"
+            "一次更新状态。每次传入完整清单（含已完成项），不是增量。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "计划标题，如「排查 A 线停机原因」"},
+                "items": {
+                    "type": "array",
+                    "description": "计划项（全量）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "稳定标识，同一项多次调用保持一致，如 step1"},
+                            "title": {"type": "string", "description": "这一步要做什么"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed", "cancelled"],
+                                "description": "状态，默认 pending",
+                            },
+                        },
+                        "required": ["id", "title"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
+})
+
+
+async def _tool_update_plan(
+    db: AsyncSession,
+    args: Dict[str, Any],
+    operator: str = "ai_assistant",
+    factory_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """校验并返回计划清单结构。只读工具：不查库、不写库。"""
+    raw = args.get("items")
+    if not isinstance(raw, list) or not raw:
+        return {"error": "items 必须是非空数组，每项形如 {id, title, status}"}
+
+    valid = ("pending", "in_progress", "completed", "cancelled")
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for idx, it in enumerate(raw[:20]):
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title") or "").strip()
+        if not title:
+            continue
+        sid = str(it.get("id") or f"step{idx + 1}").strip() or f"step{idx + 1}"
+        if sid in seen:  # id 必须唯一，否则前端打勾会串行
+            sid = f"{sid}-{idx + 1}"
+        seen.add(sid)
+        status = str(it.get("status") or "pending").strip().lower()
+        if status not in valid:
+            status = "pending"
+        items.append({"id": sid, "title": title[:120], "status": status})
+
+    if not items:
+        return {"error": "items 里没有可用的计划项（每项至少要有 title）"}
+
+    total = len(items)
+    done = sum(1 for i in items if i["status"] == "completed")
+    return {
+        "type": "plan",
+        "title": str(args.get("title") or "").strip()[:120] or "执行计划",
+        "items": items,
+        "total": total,
+        "done": done,
+        "in_progress": sum(1 for i in items if i["status"] == "in_progress"),
+        "progress_pct": round(done / total * 100),
+    }
+
+
+_TOOL_EXECUTORS["update_plan"] = _tool_update_plan
+
 # 写操作工具（需要记录操作人）
 WRITE_TOOLS = {
     "create_work_order", "release_work_order", "create_production_report",
@@ -3108,6 +3196,7 @@ SIM_TOOLS = {
 
 # 工具的中文标签（供前端展示）
 TOOL_LABELS = {
+    "update_plan": "执行计划",
     "query_work_orders": "查询工单",
     "query_order_work_order_status": "订单-工单下发核对",
     "get_work_order_detail": "工单详情",
@@ -3795,6 +3884,9 @@ async def execute_tool(
         if tool_name == "export_online_workbook":
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "create_online_pivot":
+            return await executor(db, arguments, operator=operator, factory_id=factory_id)
+        if tool_name == "update_plan":
+            # 只读工具：仍走显式分支，避免落进默认分支把 factory_id 按位置塞给 operator
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name in WRITE_TOOLS:
             return await executor(db, arguments, operator)

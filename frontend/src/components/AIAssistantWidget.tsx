@@ -2208,6 +2208,49 @@ export default function AIAssistantWidget() {
                                       </div>
                                     )
                                   }
+                                  // 计划清单 → 逐项打勾卡片（to-do 模式）
+                                  if (a.tool === 'update_plan' && a.result && Array.isArray(a.result.items)) {
+                                    const plan = a.result
+                                    const statusIcon = (st: string) => {
+                                      if (st === 'completed') return <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                                      if (st === 'in_progress') return <ReloadOutlined spin style={{ color: '#1677ff' }} />
+                                      if (st === 'cancelled') return <CloseCircleOutlined style={{ color: '#bfbfbf' }} />
+                                      return <CarryOutOutlined style={{ color: '#bfbfbf' }} />
+                                    }
+                                    return (
+                                      <div key={idx} style={{
+                                        marginTop: 4,
+                                        background: '#f0f5ff',
+                                        border: '1px solid #adc6ff',
+                                        borderRadius: 6,
+                                        padding: '6px 8px',
+                                        fontSize: 11,
+                                      }}>
+                                        <Space size={4}>
+                                          <UnorderedListOutlined />
+                                          <Text strong style={{ fontSize: 11 }}>{plan.title || '执行计划'}</Text>
+                                          <Tag color="blue" style={{ fontSize: 10, lineHeight: '16px', margin: 0 }}>
+                                            {plan.done}/{plan.total}
+                                          </Tag>
+                                        </Space>
+                                        <div style={{ marginTop: 4 }}>
+                                          {plan.items.map((it: any, pi: number) => (
+                                            <div key={it.id || pi} style={{ display: 'flex', alignItems: 'flex-start', gap: 4, marginTop: 2 }}>
+                                              <span style={{ fontSize: 11, marginTop: 3 }}>{statusIcon(it.status)}</span>
+                                              <Text
+                                                style={{
+                                                  fontSize: 11,
+                                                  lineHeight: '18px',
+                                                  color: it.status === 'cancelled' ? '#bfbfbf' : undefined,
+                                                  textDecoration: it.status === 'cancelled' ? 'line-through' : undefined,
+                                                }}
+                                              >{it.title}</Text>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )
+                                  }
                                   // 色标：仿真=紫 / 写操作=绿 / 查询=蓝
                                   const tone = a.is_sim
                                     ? { bg: '#f9f0ff', bd: '#d3adf7', tag: 'purple' as const, text: '仿真' }
