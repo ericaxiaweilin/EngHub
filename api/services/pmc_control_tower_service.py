@@ -26,6 +26,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.services.bom_source import production_readiness
 
 
+READINESS_ACTION_LABELS = {
+    "missing_master": "缺产品主档",
+    "master_other_factory": "主档在其他厂区",
+    "no_routing": "缺工艺路线",
+    "empty_routing": "工艺路线没有工步",
+}
+
 SCOPES = {
     "all",
     "orders",
@@ -221,6 +228,17 @@ class PmcControlTowerService:
         shortage = facts.get("shortage", {})
         if shortage.get("total_shortage_qty", 0) > 0:
             actions.append("Shortage：先锁定缺口物料与受影响工单；补齐PO/供应商ETA或完成替代料验证后再放行。")
+        # 自制件开不出工单时要点名卡在哪一样，否则"缺 20731"没人能接手
+        blocked = {k: v for k, v in (shortage.get("selfmade_readiness") or {}).items() if k != "ready"}
+        if blocked:
+            detail = "、".join(
+                f"{READINESS_ACTION_LABELS.get(status, status)} {int(bucket.get('parts') or 0)} 种"
+                for status, bucket in blocked.items()
+            )
+            actions.append(
+                f"自制件排不动：{detail}开不出工单。"
+                "主档可以由计划下达按 BOM 自动登记，工艺路线与工步只能由工艺给 —— 系统不会替工厂编路线。"
+            )
         inventory = facts.get("inventory", {})
         if inventory.get("stagnant_count", 0) > 0:
             actions.append("库存：优先把呆滞料与当前BOM复用需求匹配，停止无需求补货，再处理调拨/退供应商/报废审批。")

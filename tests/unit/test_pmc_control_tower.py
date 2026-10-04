@@ -2,6 +2,7 @@
 
 from api.routes.chat_routes import _direct_tool_reply
 from api.services.chat_tools_service import TOOL_DEFINITIONS, resolve_intent
+from api.services.pmc_control_tower_service import PmcControlTowerService
 
 
 def _tool_names():
@@ -70,3 +71,21 @@ def test_control_tower_is_exposed_and_direct_reply_contains_all_sections():
     reply = _direct_tool_reply("query_pmc_control_tower", result)
     for heading in ("订单排程", "物料控制", "Shortage", "库存下降", "OTD", "产能平衡", "紧急插单", "EC/BOM变更", "Supplier delay"):
         assert heading in reply
+
+
+def test_selfmade_blocker_names_the_missing_master_data_object():
+    """自制件开不出工单时，建议动作要点名卡在哪一样，并说清哪一样系统能自己补。"""
+    facts = {
+        "shortage": {
+            "total_shortage_qty": 20731,
+            "selfmade_readiness": {
+                "no_routing": {"parts": 123, "shortage_qty": 20731},
+                "ready": {"parts": 4, "shortage_qty": 0},
+            },
+        }
+    }
+    actions = PmcControlTowerService(None)._actions(facts)
+    blocker = [a for a in actions if "自制件排不动" in a]
+    assert blocker and "缺工艺路线 123 种" in blocker[0]
+    assert "ready" not in blocker[0], "已就绪的件不该混进阻塞清单"
+    assert "工艺路线与工步只能由工艺给" in blocker[0], "要说清系统不会替工厂编路线"
