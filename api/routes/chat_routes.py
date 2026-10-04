@@ -156,9 +156,10 @@ SYSTEM_PROMPT = (
     "当用户交代的事情当前无法闭环、或用户说'跟进一下''盯着这个''挂起来''到时候提醒我'时，"
     "调用 create_followup_task 把任务挂入任务中心，系统会按频率（默认2小时，用户可指定）定期自动跟进并推送通知；"
     "挂账成功后告知用户可在「任务中心」页面查看进度。不要把能立即完成的查询/操作挂账。\n"
-    "【计划清单】当用户交代的是多步任务（排查/整改/核对/跨系统汇总等需要 3 步以上的事），"
-    "先调用 update_plan 声明完整步骤再动手，每完成一步调用一次把该步标为 completed，"
-    "全部完成后再调用一次收尾。计划只通过工具声明，不要把计划清单写进答复正文。\n"
+    "【计划清单·必须】当用户交代的是多步任务（排查/整改/核对/规划/跨系统汇总等需要 3 步以上的事），"
+    "你要做的第一件事就是调用 update_plan 声明完整步骤，之后每完成一步调用一次把该步标为 completed，"
+    "全部完成后再调用一次收尾。禁止只在答复正文里用 1./2./3. 罗列步骤 —— "
+    "不调用 update_plan，用户就看不到可打勾的计划清单。计划只通过工具声明，不要再重复写进正文。\n"
     "【回答边界】工具结果未提供的信息不得猜测，不得擅自补充故障、缺料、同步异常等可能原因。"
     "最终回答只输出面向用户的结论，禁止输出 <think>、推理过程、内部分析或工具选择过程。\n"
     "【确认承接】用户回复确认/同意/可以/好的/是的时，表示接受你上一轮的提议或回答，"
@@ -236,6 +237,9 @@ _TOOL_SELECTION_ACTION_HINTS: Dict[str, tuple[str, ...]] = {
     # 交期风险/交付达成率的唯一口径在 PMC 控制塔，必须能被自然问法选到。
     "query_pmc_control_tower": ("pmc", "控制塔", "交期风险", "交付风险", "准时交付", "otd"),
     "query_wms_inventory_health": ("库存健康", "周转", "呆滞", "呆滞料", "该补什么", "补货建议", "过量", "满载", "库存结构", "效期"),
+    # 计划清单：措辞与提示词【计划清单·必须】里的"多步任务"口径对齐
+    "update_plan": ("计划", "步骤", "分步", "分几步", "先列", "先拉", "再逐步", "逐步",
+                    "梳理一下", "规划一下", "排查一下", "整改", "方案", "流程", "update plan"),
 }
 
 _WORKBOOK_SELECTION_HINTS = (
@@ -261,6 +265,8 @@ _GENERIC_READ_TOOL_NAMES = (
     "query_inventory",
     "get_pending_alerts",
     "search_entity",
+    # 未分类的数据请求也常常是多步任务，给模型声明计划的机会
+    "update_plan",
 )
 
 
@@ -300,7 +306,7 @@ async def _select_tool_names_for_message(message: str) -> set[str]:
         selected.add("search_entity")
 
     # An otherwise unclassified data request keeps a small read-only discovery
-    # set.  It is deliberately six tools, not the old 53-tool universal list.
+    # set.  It is deliberately seven tools, not the old 53-tool universal list.
     if not selected and any(hint in normalized for hint in _DATA_REQUEST_HINTS):
         selected.update(_GENERIC_READ_TOOL_NAMES)
     return selected
