@@ -1244,6 +1244,13 @@ class FactoryCommander:
             alerts.append(f"{state.products_no_routing}个产品缺工艺路线，APS 排程会卡住")
         if state.products_no_bom > 0:
             alerts.append(f"{state.products_no_bom}个产品缺已生效 BOM，齐套率/ETA 无法计算")
+        # 待排工单在 SURPLUS 下不产生排程决策（见 _decide 的 mode != SURPLUS 排除），
+        # 于是「N 单待排」会整份汇报里一次都不出现。这里补上，避免高负荷厂被读成
+        # 「订单充足、一切正常」。
+        if state.pending_orders > 0 and state.order_mode == OrderMode.SURPLUS:
+            alerts.append(
+                f"{state.pending_orders}个工单待排产但未入计划，需人工确认排程/挂起/转外协"
+            )
         return alerts
 
     def _plan_next_actions(self, state: FactoryState, decisions: List[CommanderDecision]) -> List[str]:
@@ -1258,6 +1265,12 @@ class FactoryCommander:
         elif mode == OrderMode.SURPLUS:
             next_actions.append("评估逾期工单加急方案")
             next_actions.append("低优先级订单协商延交")
+            if state.pending_orders > 0:
+                # 与 NORMAL 分支对齐：待排工单必须被明确处置，不能因为模式是
+                # 「订单充足」就当作不存在。
+                next_actions.append(
+                    f"确认{state.pending_orders}个待排工单的处置（排程/挂起/转外协）"
+                )
         else:
             next_actions.append("维持当前生产节奏")
             if state.pending_orders > 0:

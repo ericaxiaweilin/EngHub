@@ -65,7 +65,11 @@ services:
       - CHECKPOINT_PERSISTENCE_ENABLED=${CHECKPOINT_PERSISTENCE_ENABLED:-1}
       # Laya System-1 意图路由（实现见 api/services/laya_intent_service.py）
       # primary=Laya优先 / fallback=仅关键词未命中时介入 / off=关闭
-      - LAYA_INTENT_MODE=${LAYA_INTENT_MODE:-primary}
+      # 默认 fallback：关键词优先，Laya 只在关键词未命中时补位。
+      # 实测 primary 的收益（关键词漏判补位）在 fallback 下同样能拿到，而 primary
+      # 额外带来 8 处降级 vs 1 处精化（净 -7），并会覆盖 PMC 确定性契约。
+      # 需要线上实验 Laya 主路由时，用 LAYA_INTENT_MODE=primary 显式覆盖。
+      - LAYA_INTENT_MODE=${LAYA_INTENT_MODE:-fallback}
       - LAYA_SIDECAR_URL=${LAYA_SIDECAR_URL:-http://host.docker.internal:14200}
       - LAYA_MIN_CONFIDENCE=${LAYA_MIN_CONFIDENCE:-0.6}
       - LAYA_TIMEOUT_SECONDS=${LAYA_TIMEOUT_SECONDS:-0.5}

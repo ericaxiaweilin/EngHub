@@ -251,3 +251,50 @@ def test_primary_mode_never_overrides_deterministic_pmc_tools(monkeypatch):
     # 非确定性工具仍允许 Laya 补位（否则就是把 Laya 整个关掉）
     assert _resolve_intent_keyword("有没有欠料的") is None
     assert resolve_intent("有没有欠料的")["tool"] == "query_inventory"
+
+
+# ═══════════════ 待排工单不得隐身（SURPLUS 的可见性补丁） ═══════════════
+
+def _heavy_surplus_state():
+    """FAC_MECH_001 的真实量级：高负荷 + 大积压 + 主数据缺口。"""
+    return FactoryState(
+        factory_id="FAC_MECH_001",
+        active_orders=85, pending_orders=69, in_progress_orders=16,
+        overdue_orders=63, due_7d_orders=4,
+        order_load_ratio=16.819541474001678,
+        so_unplanned=53, products_no_routing=575, products_no_bom=473,
+        low_stock_items=371, equipment_broken=1,
+    )
+
+
+def test_surplus_reports_pending_backlog_it_cannot_schedule():
+    """SURPLUS 不产生排程决策，所以待排工单必须在 alert / next_actions 里出现。
+
+    回归背景：实测 pending=69 在 SURPLUS 下决策、预警、下一步三处全无，
+    整份汇报读起来像"订单充足、一切正常"。
+    """
+    cmd = _commander()
+    st = _heavy_surplus_state()
+    st.order_mode = cmd._assess_order_mode(st)
+    assert st.order_mode == OrderMode.SURPLUS
+
+    # 确认排程决策确实被 SURPLUS 排除（这是补丁存在的前提）
+    decisions = _run(cmd._decide(st))
+    assert not any(d.target == "aps_schedule" for d in decisions)
+
+    alerts = cmd._generate_alerts(st)
+    actions = cmd._plan_next_actions(st, decisions)
+    assert any("69个工单待排产" in a for a in alerts), alerts
+    assert any("69个待排工单的处置" in a for a in actions), actions
+
+
+def test_pending_backlog_alert_is_scoped_to_surplus():
+    """只在 SURPLUS 补这条 —— 其它模式下待排工单本来就有排程决策，不必重复提醒。"""
+    cmd = _commander()
+    st = _heavy_surplus_state()
+
+    st.order_mode = OrderMode.BLOCKED
+    assert not any("待排产但未入计划" in a for a in cmd._generate_alerts(st))
+
+    st.order_mode = OrderMode.NORMAL
+    assert not any("待排产但未入计划" in a for a in cmd._generate_alerts(st))
