@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.services.wms_architecture.movements import (
@@ -822,47 +822,23 @@ class InventoryService:
         created_by: Optional[str] = None,
     ) -> OutboundOrder:
         """创建出库单并扣减库存"""
-        # 生成出库单号
-        outbound_code = f"OUT-{datetime.now().strftime('%Y%m%d')}-{await self._get_next_out_number(factory_id)}"
-        
-        outbound = OutboundOrder(
-            outbound_code=outbound_code,
+        # 先确认类型认得出来，再分配批次：别让一半的库存被扣掉才发现记不了账
+        document_movement_type("out", outbound_type)
+        allocations = await self._allocate_fifo_batches(
             factory_id=factory_id,
             warehouse_id=warehouse_id,
             material_id=material_id,
             quantity=quantity,
-            work_order_id=work_order_id,
             batch_code=batch_code,
-            outbound_type=outbound_type,
-            status="completed",
-            created_by=created_by,
-            completed_at=datetime.utcnow(),
         )
-        
-        self.db.add(outbound)
-        await self.db.flush()  # 先拿到 outbound.id，流水才能挂单据锚点
-        
-        # FIFO 先分配批次，再逐批次记账：一批一条流水，才回溯得到扣了哪个批次
-        movement_type = document_movement_type("out", outbound_type)
-        for inventory, deduct_qty in await self._allocate_fifo_batches(
+        outbound = await self._issue_batches(
             factory_id=factory_id,
-            warehouse_id=warehouse_id,
             material_id=material_id,
-            quantity=quantity,
-            batch_code=batch_code,
-        ):
-            await apply_movement(
-                self.db,
-                inventory=inventory,
-                transaction_type=movement_type,
-                quantity=deduct_qty,
-                reference_type="outbound_order",
-                reference_id=outbound.id,
-                reference_doc_no=outbound.outbound_code,
-                work_order_id=work_order_id,
-                operator=created_by,
-                remark=f"出库过账（{outbound_type}）",
-            )
+            outbound_type=outbound_type,
+            allocations=allocations,
+            work_order_id=work_order_id,
+            created_by=created_by,
+        )
         
         await self.db.commit()
         await self.db.refresh(outbound)
@@ -872,14 +848,16 @@ class InventoryService:
     async def _allocate_fifo_batches(
         self,
         factory_id: str,
-        warehouse_id: str,
+        warehouse_id: Optional[str],
         material_id: str,
         quantity: int,
         batch_code: Optional[str] = None,
+        allow_partial: bool = False,
     ) -> List[tuple]:
         """按 FIFO 决定每个批次扣多少 —— 只分配，不改数量。
         
         数量的变更统一交给 apply_movement，避免"库存扣两次、流水记一条"。
+        allow_partial=True 用于领料欠料：能扣多少给多少，缺口由调用方如实上报。
         """
         if quantity <= 0:
             raise ValueError(f"出库数量必须是正整数，收到 {quantity!r}")
@@ -887,11 +865,12 @@ class InventoryService:
         # 查找库存记录（FIFO 策略：优先使用最早批次）
         query = select(Inventory).where(
             Inventory.factory_id == factory_id,
-            Inventory.warehouse_id == warehouse_id,
             Inventory.material_id == material_id,
             Inventory.available_qty > 0,
         )
         
+        if warehouse_id:
+            query = query.where(Inventory.warehouse_id == warehouse_id)
         if batch_code:
             query = query.where(Inventory.batch_code == batch_code)
         
@@ -910,9 +889,138 @@ class InventoryService:
             allocations.append((inventory, deduct_qty))
             remaining_qty -= deduct_qty
         
-        if remaining_qty > 0:
+        if remaining_qty > 0 and not allow_partial:
             raise ValueError(f"Insufficient inventory. Short by {remaining_qty}")
         return allocations
+    
+    async def _issue_batches(
+        self,
+        *,
+        factory_id: str,
+        material_id: str,
+        outbound_type: str,
+        allocations: List[tuple],
+        work_order_id: Optional[str] = None,
+        created_by: Optional[str] = None,
+        remark: Optional[str] = None,
+    ) -> OutboundOrder:
+        """出库唯一的"建单 + 逐批次过账"入口：一张单、若干条流水、同一个事务。"""
+        first_inv = allocations[0][0] if allocations else None
+        outbound_code = f"OUT-{datetime.now().strftime('%Y%m%d')}-{await self._get_next_out_number(factory_id)}"
+        
+        outbound = OutboundOrder(
+            outbound_code=outbound_code,
+            factory_id=factory_id,
+            warehouse_id=first_inv.warehouse_id if first_inv else None,
+            material_id=material_id,
+            quantity=sum(q for _, q in allocations),
+            work_order_id=work_order_id,
+            batch_code=first_inv.batch_code if first_inv else None,
+            outbound_type=outbound_type,
+            status="completed",
+            created_by=created_by,
+            completed_at=datetime.utcnow(),
+        )
+        
+        self.db.add(outbound)
+        await self.db.flush()  # 先拿到 id，流水才挂得住这张单
+        
+        movement_type = document_movement_type("out", outbound_type)
+        for inventory, deduct_qty in allocations:
+            await apply_movement(
+                self.db,
+                inventory=inventory,
+                transaction_type=movement_type,
+                quantity=deduct_qty,
+                reference_type="outbound_order",
+                reference_id=outbound.id,
+                reference_doc_no=outbound.outbound_code,
+                work_order_id=work_order_id,
+                operator=created_by,
+                remark=remark or f"出库过账（{outbound_type}）",
+            )
+        return outbound
+    
+    async def _latest_bom_lines(self, factory_id: str, product_code: str) -> List[Any]:
+        """该产品最新一版单层 BOM。没传 BOM 就返回空，让调用方明说"无 BOM 不领料"。"""
+        return list((await self.db.execute(text("""
+            SELECT material_code, material_name, qty_per_unit, unit
+            FROM bom_items
+            WHERE factory_id = :fid AND product_id = :pid AND level = 1
+              AND bom_version = (
+                  SELECT bom_version FROM bom_items
+                  WHERE factory_id = :fid AND product_id = :pid AND level = 1
+                  GROUP BY bom_version
+                  ORDER BY max(created_at) DESC
+                  LIMIT 1
+              )
+            ORDER BY material_code
+        """), {"fid": factory_id, "pid": product_code})).mappings().all())
+    
+    async def issue_materials_for_production(
+        self,
+        *,
+        factory_id: str,
+        work_order_id: str,
+        product_code: str,
+        output_qty: int,
+        created_by: str = "virtual_factory",
+    ) -> Dict[str, Any]:
+        """按上传的 BOM 领料：产出多少合格品，就按 qty_per_unit 扣多少物料并记流水。
+        
+        能扣多少扣多少、缺口原样上报（欠料挂账），不把已经发生的生产打回失败：
+        账要如实写"应领 50、实扣 40、欠 10"，而不是整笔不进账。
+        """
+        if output_qty <= 0:
+            return {"issued_lines": 0, "issued_qty": 0, "shortages": [], "reason": "no_output"}
+        lines = await self._latest_bom_lines(factory_id, product_code)
+        if not lines:
+            return {"issued_lines": 0, "issued_qty": 0, "shortages": [],
+                    "reason": "no_bom", "bom_product": product_code}
+        
+        shortages: List[Dict[str, Any]] = []
+        issued_lines = 0
+        issued_qty = 0
+        for line in lines:
+            code = line["material_code"]
+            required = int(round(float(line["qty_per_unit"] or 0) * output_qty))
+            if required <= 0:
+                continue
+            material_id = (await self.db.execute(text("""
+                SELECT material_id FROM inventory
+                WHERE factory_id = :fid AND material_code = :code
+                GROUP BY material_id LIMIT 1
+            """), {"fid": factory_id, "code": code})).scalar()
+            if not material_id:
+                shortages.append({"material_code": code, "required": required,
+                                  "issued": 0, "reason": "库存里没有这个物料"})
+                continue
+            allocations = await self._allocate_fifo_batches(
+                factory_id, None, material_id, required, allow_partial=True
+            )
+            got = sum(q for _, q in allocations)
+            if allocations:
+                await self._issue_batches(
+                    factory_id=factory_id,
+                    material_id=material_id,
+                    outbound_type="production",
+                    allocations=allocations,
+                    work_order_id=work_order_id,
+                    created_by=created_by,
+                    remark=f"BOM 领料 {product_code}，产出 {output_qty}",
+                )
+                issued_lines += 1
+                issued_qty += got
+            if got < required:
+                shortages.append({"material_code": code, "required": required,
+                                  "issued": got, "reason": "可用量不足，欠料挂账"})
+        
+        return {
+            "issued_lines": issued_lines,
+            "issued_qty": issued_qty,
+            "bom_lines": len(lines),
+            "shortages": shortages,
+        }
     
     async def reserve_inventory(
         self,

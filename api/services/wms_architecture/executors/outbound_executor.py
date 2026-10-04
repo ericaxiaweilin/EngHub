@@ -101,7 +101,6 @@ class OutboundExecutor(BaseWmsExecutor):
             factory_id=factory_id,
             warehouse_id=inv.warehouse_id,
             material_id=material_id,
-            material_code=inv.material_code,
             quantity=quantity,
             batch_code=inv.batch_code,
             outbound_type=outbound_type,

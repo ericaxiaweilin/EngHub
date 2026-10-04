@@ -26,10 +26,41 @@ class _Inv:
         self.id = "inv-1"
         self.factory_id = "FAC_TEST"
         self.material_id = "MAT-1"
+        self.material_code = "MAT-1"
+        self.warehouse_id = "WH-1"
         self.batch_code = batch_code
         self.total_qty = total_qty
         self.available_qty = available_qty
         self.last_movement_at = None
+
+
+def _result(rows=None, scalars=None, scalar=None):
+    r = MagicMock()
+    r.mappings.return_value.all.return_value = rows or []
+    r.scalars.return_value.all.return_value = scalars or []
+    r.scalars.return_value.first.return_value = (scalars or [None])[0]
+    r.scalar.return_value = scalar
+    return r
+
+
+class _QueueSession:
+    """按调用顺序回放查询结果 —— 领料一次要打好几种形状的返回。"""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.added = []
+
+    async def execute(self, statement, params=None):
+        assert self._results, "查询次数超出预期：写入路径多绕了一次 DB"
+        return self._results.pop(0)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def flush(self):
+        for i, obj in enumerate(self.added):
+            if getattr(obj, "id", None) is None:
+                obj.id = f"gen-{i}"
 
 
 def _db():
@@ -226,3 +257,91 @@ async def test_fifo_allocation_refuses_non_positive_quantity():
         await svc._allocate_fifo_batches(
             factory_id="FAC_TEST", warehouse_id="WH-1", material_id="MAT-1", quantity=0
         )
+
+
+def _bom_row(code="RM-STEEL", per_unit=1.2):
+    return {"material_code": code, "material_name": "钢材", "qty_per_unit": per_unit, "unit": "pcs"}
+
+
+@pytest.mark.asyncio
+async def test_issue_uses_uploaded_bom_quantity_and_anchors_the_ledger():
+    """领料量 = qty_per_unit × 合格产出；流水必须挂得住这张领料单和这张工单。"""
+    inv = _Inv(total_qty=100, available_qty=100)
+    session = _QueueSession([
+        _result(rows=[_bom_row()]),          # 最新一版 BOM
+        _result(scalar="MAT-RM-STEEL"),      # material_code -> material_id
+        _result(scalars=[inv]),              # FIFO 批次
+        _result(scalar=3),                   # 出库单序号
+    ])
+    svc = InventoryService(session)
+
+    out = await svc.issue_materials_for_production(
+        factory_id="FAC_TEST", work_order_id="wo-9",
+        product_code="A-50-04-F", output_qty=50,
+    )
+
+    assert (out["issued_lines"], out["issued_qty"]) == (1, 60)
+    assert inv.total_qty == 40  # 只扣一次：100 - round(1.2*50)
+    docs = [o for o in session.added if type(o).__name__ == "OutboundOrder"]
+    txns = [o for o in session.added if type(o).__name__ == "InventoryTransaction"]
+    assert len(docs) == 1 and docs[0].work_order_id == "wo-9"
+    assert docs[0].outbound_type == "production" and docs[0].quantity == 60
+    assert len(txns) == 1
+    assert txns[0].transaction_type == "production_out"
+    assert (txns[0].quantity, txns[0].before_qty, txns[0].after_qty) == (60, 100, 40)
+    assert txns[0].reference_id == docs[0].id
+    assert txns[0].reference_doc_no == docs[0].outbound_code
+
+
+@pytest.mark.asyncio
+async def test_partial_stock_issues_what_exists_and_reports_the_shortage():
+    inv = _Inv(total_qty=20, available_qty=20)
+    session = _QueueSession([
+        _result(rows=[_bom_row()]),
+        _result(scalar="MAT-RM-STEEL"),
+        _result(scalars=[inv]),
+        _result(scalar=4),
+    ])
+    svc = InventoryService(session)
+
+    out = await svc.issue_materials_for_production(
+        factory_id="FAC_TEST", work_order_id="wo-9",
+        product_code="A-50-04-F", output_qty=50,
+    )
+
+    assert out["issued_qty"] == 20 and inv.total_qty == 0
+    assert out["shortages"] == [{
+        "material_code": "RM-STEEL", "required": 60, "issued": 20,
+        "reason": "可用量不足，欠料挂账",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_product_without_uploaded_bom_issues_nothing():
+    """没传 BOM 就一条都不扣：宁可报 no_bom，也不按系数编需求量。"""
+    session = _QueueSession([_result(rows=[])])
+    svc = InventoryService(session)
+
+    out = await svc.issue_materials_for_production(
+        factory_id="FAC_TEST", work_order_id="wo-9",
+        product_code="VF-DEMO2026-40HQ", output_qty=50,
+    )
+
+    assert out["reason"] == "no_bom"
+    assert out["issued_lines"] == 0
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_bom_material_missing_from_stock_is_reported_not_invented():
+    session = _QueueSession([_result(rows=[_bom_row()]), _result(scalar=None)])
+    svc = InventoryService(session)
+
+    out = await svc.issue_materials_for_production(
+        factory_id="FAC_TEST", work_order_id="wo-9",
+        product_code="A-50-04-F", output_qty=10,
+    )
+
+    assert out["issued_lines"] == 0
+    assert out["shortages"][0]["reason"] == "库存里没有这个物料"
+    assert session.added == []

@@ -845,9 +845,10 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 仿真时钟：推进到 {result.get('sim_now', '未知')}，"
             f"本次发出 {result.get('events_emitted', 0)} 个事件"
             f"（队列后端 {result.get('clock_backend', '未知')}，内存不落库）\n"
-            f"- 物料扣库：{result.get('advanced', {}).get('material_consumption_posted', 0)} —— "
-            f"{result.get('advanced', {}).get('reported_orders_without_material_requirement', 0)} "
-            "张报工工单没有物料需求，本轮报工不等于领料消耗"
+            f"- 物料领用：按 BOM 扣库 {result.get('advanced', {}).get('materials_issued_lines', 0)} 行 / "
+            f"{result.get('advanced', {}).get('materials_issued_qty', 0)} 件，"
+            f"欠料 {len(result.get('advanced', {}).get('material_shortages') or [])} 行，"
+            f"无 BOM 工单 {result.get('advanced', {}).get('orders_without_bom', 0)} 张"
         )
     if tool_name == "query_order_work_order_status":
         orders = result.get("orders", [])
@@ -873,9 +874,9 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 事件队列：最近 {len(events)} 条"
             f"（{('、'.join(sorted({str(e.get('type')) for e in events})) or '空')}），"
             "只在内存里，不落库\n"
-            f"- 物料扣库：{(result.get('material_consumption') or {}).get('without_material_requirement', 0)}"
-            f"/{(result.get('material_consumption') or {}).get('in_progress_orders', 0)} 张在制工单"
-            "没有物料需求，报工不会扣减库存"
+            f"- 物料领用：在制 {(result.get('material_consumption') or {}).get('active_products', 0)} "
+            f"个产品，其中 {(result.get('material_consumption') or {}).get('products_with_bom', 0)} "
+            "个有 BOM 可按 qty_per_unit×合格产出 扣库领料"
         )
     if tool_name == "query_workflow_diagram":
         if result.get("error"):
