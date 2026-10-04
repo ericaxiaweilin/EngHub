@@ -145,16 +145,8 @@ def health():
 _SCHEDULER_INTERVAL = int(os.getenv("SCHEDULER_INTERVAL_SEC", "300"))  # 默认 5 分钟
 _logger = logging.getLogger("scheduler")
 
-# asyncio 只持有任务的弱引用：不存住返回的 Task，跑一半就可能被 GC 掉，
-# 后台循环会静默消失（2026-10-04 重启后虚拟工厂脉搏和 BOM 镜像同步都没跑，就是这个）。
-_BACKGROUND_TASKS = set()
-
-
-def _spawn_background(coro, name: str) -> None:
-    """起一个后台循环并强引用住它，避免任务被垃圾回收。"""
-    task = asyncio.create_task(coro, name=name)
-    _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
+# 循环体只在 engine_runner（独立进程）里跑，API worker 不再启动它，见 engine_asgi.py；
+# 心跳间隔的判据在 api/services/engine_heartbeat.py 的 LOOP_INTERVAL_SECONDS。
 
 
 async def _periodic_scheduler():
@@ -436,6 +428,8 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 排产智能体任务异常: {e}")
 
+        from api.services.engine_heartbeat import record as _heartbeat
+        await _heartbeat("periodic-scheduler", "tick")
         await asyncio.sleep(_SCHEDULER_INTERVAL)
 
 
@@ -463,25 +457,10 @@ async def _start_scheduler():
         "enabled" if checkpoint_persistence_enabled else "disabled",
     )
 
-    _spawn_background(_periodic_scheduler(), "periodic-scheduler")
-    _logger.info(f"[scheduler] 后台调度器已启动，间隔 {_SCHEDULER_INTERVAL}s")
-
-    # Chatbot 模型预热：避免上游空闲后首个用户请求撞上冷启动超时。
-    from api.routes.chat_routes import model_warmup_loop
-    _spawn_background(model_warmup_loop(), "model-warmup")
-
-    # 幂等技能种子：确保 skills + hr_employee_skills 数据存在（防 DB 重建后丢失）
-    from scripts.seed_skills_startup import run_skill_seed
-    _spawn_background(run_skill_seed(), "skill-seed")
-
-    # 任务中心定期扫描：到期待办任务自动跟进（FOLLOWUP_SCANNER_ENABLED=0 可关）
-    from api.services.followup_task_service import followup_scanner_loop
-    _spawn_background(followup_scanner_loop(), "followup-scanner")
-
-    # 工厂指挥官持续盯办：为已开启指挥官的用户定期巡检，把新决策挂入任务中心
-    # （COMMANDER_WATCH_ENABLED=0 可关；COMMANDER_WATCH_INTERVAL_SECONDS 调间隔）
-    from api.services.factory_commander import commander_watch_loop
-    _spawn_background(commander_watch_loop(), "commander-watch")
+    # 引擎后台循环不在这里起：uvicorn --workers 2 会让每个 worker 各起一套
+    # （重复下单/重复报工），而且 create_task 的返回值没人存，任务可能被 GC ——
+    # 实测 API 全部正常而引擎静默停摆。循环改由独立进程 engine_asgi.py 持有，
+    # API 侧只通过 engine_loop_state 心跳表看它活没活。
 
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------

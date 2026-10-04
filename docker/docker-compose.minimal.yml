@@ -1,3 +1,40 @@
+x-backend-env: &backend-env
+    - DATABASE_URL=postgresql://enghub:enghub123@postgres:5432/enghub
+    - REDIS_URL=redis://redis:6379
+    # BOM 的真相在 engflow 项目（库 bom_intelligence）。DSN 只放 docker/.env，
+    # 账号是只读角色 enghub_bom_ro；没配就跳过同步，不会拿本地表冒充源。
+    - ENGFLOW_DATABASE_URL=${ENGFLOW_DATABASE_URL:-}
+    - ENGFLOW_BOM_FACTORY_ID=${ENGFLOW_BOM_FACTORY_ID:-FAC_MECH_001}
+    - BOM_SYNC_BATCH=${BOM_SYNC_BATCH:-5000}
+    - SECRET_KEY=your-secret-key-here
+    # 测试模式：启用角色快捷切换（生产环境务必改为 false）
+    - TEST_MODE=true
+    # AI 助手 -> litellm 网关 (通过 model-stack 内网直连)
+    # 密钥通过 docker/.env 提供 (见 .env.example)，不提交到仓库
+    - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-stack-gateway:4000}
+    - LLM_API_KEY=${LLM_API_KEY:-}
+    # 模型名称由公共模型底座按业务任务动态路由，业务容器只持有任务 ID。
+    - MODEL_STACK_CONTROL_PLANE_URL=${MODEL_STACK_CONTROL_PLANE_URL:-http://model-stack-control-plane:8080}
+    - MODEL_STACK_CHAT_TASK_ID=${MODEL_STACK_CHAT_TASK_ID:-data_coin.advisor.chat}
+    - MODEL_STACK_VISION_TASK_ID=${MODEL_STACK_VISION_TASK_ID:-luaguage.vision.content_analysis}
+    - MODEL_STACK_ROUTE_TIMEOUT=${MODEL_STACK_ROUTE_TIMEOUT:-5}
+    # 控制面在线 provider 探测会把路由请求堵到 20s，缓存路由必须比预热更耐久，否则重试耗尽后无兜底。
+    - MODEL_STACK_ROUTE_CACHE_TTL_SECONDS=${MODEL_STACK_ROUTE_CACHE_TTL_SECONDS:-1800}
+    - LLM_WARMUP_INTERVAL_SECONDS=${LLM_WARMUP_INTERVAL_SECONDS:-600}
+    # EngFlow Chat V2 运行时持久化：生产默认开启，数据库需先执行 082/083/084。
+    - AGENT_EVENT_PERSISTENCE_ENABLED=${AGENT_EVENT_PERSISTENCE_ENABLED:-1}
+    - CHECKPOINT_PERSISTENCE_ENABLED=${CHECKPOINT_PERSISTENCE_ENABLED:-1}
+    # Laya System-1 意图路由（实现见 api/services/laya_intent_service.py）
+    # primary=Laya优先 / fallback=仅关键词未命中时介入 / off=关闭
+    # 默认 fallback：关键词优先，Laya 只在关键词未命中时补位。
+    # 实测 primary 的收益（关键词漏判补位）在 fallback 下同样能拿到，而 primary
+    # 额外带来 8 处降级 vs 1 处精化（净 -7），并会覆盖 PMC 确定性契约。
+    # 需要线上实验 Laya 主路由时，用 LAYA_INTENT_MODE=primary 显式覆盖。
+    - LAYA_INTENT_MODE=${LAYA_INTENT_MODE:-fallback}
+    - LAYA_SIDECAR_URL=${LAYA_SIDECAR_URL:-http://host.docker.internal:14200}
+    - LAYA_MIN_CONFIDENCE=${LAYA_MIN_CONFIDENCE:-0.6}
+    - LAYA_TIMEOUT_SECONDS=${LAYA_TIMEOUT_SECONDS:-0.5}
+
 # 生产部署配置 - 适合6GB内存服务器
 services:
   postgres:
@@ -36,48 +73,16 @@ services:
         reservations:
           memory: 256M
 
-  backend:
+  backend: &backend
+    # 镜像固定用现成的：compose 一旦认为某个服务需要 build，就会去 bake
+    # （2 个月前的 Dockerfile + 整仓 context），引擎服务本来只是要复用同一个镜像。
+    image: docker-backend:latest
     container_name: enghub-backend-1
     logging: *logrotate
     build:
       context: ..
       dockerfile: docker/Dockerfile.backend
-    environment:
-      - DATABASE_URL=postgresql://enghub:enghub123@postgres:5432/enghub
-      - REDIS_URL=redis://redis:6379
-      # BOM 的真相在 engflow 项目（库 bom_intelligence）。DSN 只放 docker/.env，
-      # 账号是只读角色 enghub_bom_ro；没配就跳过同步，不会拿本地表冒充源。
-      - ENGFLOW_DATABASE_URL=${ENGFLOW_DATABASE_URL:-}
-      - ENGFLOW_BOM_FACTORY_ID=${ENGFLOW_BOM_FACTORY_ID:-FAC_MECH_001}
-      - BOM_SYNC_BATCH=${BOM_SYNC_BATCH:-5000}
-      - SECRET_KEY=your-secret-key-here
-      # 测试模式：启用角色快捷切换（生产环境务必改为 false）
-      - TEST_MODE=true
-      # AI 助手 -> litellm 网关 (通过 model-stack 内网直连)
-      # 密钥通过 docker/.env 提供 (见 .env.example)，不提交到仓库
-      - LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-http://model-stack-gateway:4000}
-      - LLM_API_KEY=${LLM_API_KEY:-}
-      # 模型名称由公共模型底座按业务任务动态路由，业务容器只持有任务 ID。
-      - MODEL_STACK_CONTROL_PLANE_URL=${MODEL_STACK_CONTROL_PLANE_URL:-http://model-stack-control-plane:8080}
-      - MODEL_STACK_CHAT_TASK_ID=${MODEL_STACK_CHAT_TASK_ID:-data_coin.advisor.chat}
-      - MODEL_STACK_VISION_TASK_ID=${MODEL_STACK_VISION_TASK_ID:-luaguage.vision.content_analysis}
-      - MODEL_STACK_ROUTE_TIMEOUT=${MODEL_STACK_ROUTE_TIMEOUT:-5}
-      # 控制面在线 provider 探测会把路由请求堵到 20s，缓存路由必须比预热更耐久，否则重试耗尽后无兜底。
-      - MODEL_STACK_ROUTE_CACHE_TTL_SECONDS=${MODEL_STACK_ROUTE_CACHE_TTL_SECONDS:-1800}
-      - LLM_WARMUP_INTERVAL_SECONDS=${LLM_WARMUP_INTERVAL_SECONDS:-600}
-      # EngFlow Chat V2 运行时持久化：生产默认开启，数据库需先执行 082/083/084。
-      - AGENT_EVENT_PERSISTENCE_ENABLED=${AGENT_EVENT_PERSISTENCE_ENABLED:-1}
-      - CHECKPOINT_PERSISTENCE_ENABLED=${CHECKPOINT_PERSISTENCE_ENABLED:-1}
-      # Laya System-1 意图路由（实现见 api/services/laya_intent_service.py）
-      # primary=Laya优先 / fallback=仅关键词未命中时介入 / off=关闭
-      # 默认 fallback：关键词优先，Laya 只在关键词未命中时补位。
-      # 实测 primary 的收益（关键词漏判补位）在 fallback 下同样能拿到，而 primary
-      # 额外带来 8 处降级 vs 1 处精化（净 -7），并会覆盖 PMC 确定性契约。
-      # 需要线上实验 Laya 主路由时，用 LAYA_INTENT_MODE=primary 显式覆盖。
-      - LAYA_INTENT_MODE=${LAYA_INTENT_MODE:-fallback}
-      - LAYA_SIDECAR_URL=${LAYA_SIDECAR_URL:-http://host.docker.internal:14200}
-      - LAYA_MIN_CONFIDENCE=${LAYA_MIN_CONFIDENCE:-0.6}
-      - LAYA_TIMEOUT_SECONDS=${LAYA_TIMEOUT_SECONDS:-0.5}
+    environment: *backend-env
     ports:
       - "18888:8000"
     depends_on:
@@ -90,7 +95,7 @@ services:
       - model-stack
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
+    volumes: &backend-code
       # 代码持久化挂载：容器重建不丢代码
       - ${CODE_DIR:-..}/api:/app/api
       - ${CODE_DIR:-..}/core:/app/core
@@ -98,6 +103,8 @@ services:
       - ${CODE_DIR:-..}/integrations:/app/integrations
       - ${CODE_DIR:-..}/main.py:/app/main.py
       - ${CODE_DIR:-..}/frontend_dist:/app/frontend_dist
+      # 引擎进程的 ASGI 入口（engine 服务用它当 command 目标）
+      - ${CODE_DIR:-..}/engine_asgi.py:/app/engine_asgi.py
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
@@ -112,6 +119,32 @@ services:
           memory: 2G
         reservations:
           memory: 1G
+
+  # 引擎进程：无人任务中心的后台循环只跑在这里（单进程，--workers 1）。
+  # 原先这些循环写在 API 的 startup handler 里，而 API 是 --workers 2 ——
+  # 每个 worker 各起一套会重复下单/重复报工，且 create_task 返回值没人存，
+  # asyncio 弱引用可能把任务 GC 掉：实测表现为 API 正常、引擎静默停摆。
+  engine:
+    # 继承 backend 的镜像/挂载/环境变量/网络，只换命令与端口：
+    # 两个服务用的是同一份代码，配置分两份写迟早会漂移。
+    <<: *backend
+    container_name: enghub-engine
+    command: ["python", "-m", "uvicorn", "engine_asgi:app", "--host", "0.0.0.0", "--port", "9999"]
+    ports:
+      - "18889:9999"
+    volumes: *backend-code
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9999/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
 
   # frontend 容器已废弃：前端由 FastAPI 同源托管（见 main.py 末尾 StaticFiles + SPA fallback）
   # frontend:

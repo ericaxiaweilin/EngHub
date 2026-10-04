@@ -49,6 +49,30 @@ async def virtual_factory_status(
     return await VirtualFactoryService(db).status(fid)
 
 
+@router.get("/engine/health")
+async def engine_health(current_user: User = Depends(get_current_user)):
+    """引擎（后台循环）到底有没有在跑 —— 心跳表实测，不再靠"应该在下一次调度里"。
+
+    循环已搬进独立进程 enghub-engine，这里只读它写的心跳；
+    停摆时 API 依然全是 200，所以这个接口是唯一能证伪"无人"的地方。
+    """
+    from api.services.engine_heartbeat import read_states
+
+    states = await read_states()
+    heart = next((s for s in states if s["loop"] == "periodic-scheduler"), None)
+    return {
+        "engine_alive": bool(heart and heart.get("alive")),
+        "reason": (
+            "心跳表里没有 periodic-scheduler 记录：引擎进程没起来或迁移 097 未执行"
+            if heart is None
+            else ("心跳新鲜" if heart["alive"] else
+                  f"心跳已 {heart['stale_seconds']} 秒未更新（阈值 {heart['interval_seconds'] * 2} 秒）")
+        ),
+        "loops": states,
+        "engine_endpoint": "http://<host>:18889/health",
+    }
+
+
 @router.post("/pulse")
 async def virtual_factory_pulse(
     body: VirtualFactoryPulseRequest,
