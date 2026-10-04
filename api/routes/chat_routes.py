@@ -841,7 +841,10 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 新建订单：{len(result.get('created_orders', []))} 个\n"
             f"- 本次报工：{advanced.get('containers_reported', 0)} 柜，"
             f"{advanced.get('reports_created', 0)} 条报工\n"
-            f"- 节奏预警：{len(result.get('alerts', []))} 条"
+            f"- 节奏预警：{len(result.get('alerts', []))} 条\n"
+            f"- 仿真时钟：推进到 {result.get('sim_now', '未知')}，"
+            f"本次发出 {result.get('events_emitted', 0)} 个事件"
+            f"（队列后端 {result.get('clock_backend', '未知')}，内存不落库）"
         )
     if tool_name == "query_order_work_order_status":
         orders = result.get("orders", [])
@@ -856,11 +859,17 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             "结论：订单是否已经生成生产工单，与工序工单是否全部 released 是两件事；请按上面两个口径判断。"
         )
     if tool_name == "get_virtual_factory_status":
+        events = result.get("recent_events") or []
         return (
             "虚拟工厂当前状态：\n"
             f"- 虚拟销售订单：{result.get('virtual_sales_orders', 0)} 个\n"
             f"- 在制虚拟主工单：{result.get('active_virtual_orders', 0)} 个\n"
-            f"- 虚拟报工记录：{result.get('virtual_report_count', 0)} 条"
+            f"- 虚拟报工记录：{result.get('virtual_report_count', 0)} 条\n"
+            f"- 仿真时钟：{result.get('sim_now', '未知')}"
+            f"（后端 {result.get('clock_backend', '未知')}）\n"
+            f"- 事件队列：最近 {len(events)} 条"
+            f"（{('、'.join(sorted({str(e.get('type')) for e in events})) or '空')}），"
+            "只在内存里，不落库"
         )
     if tool_name == "query_workflow_diagram":
         if result.get("error"):
