@@ -43,6 +43,13 @@ _logger = logging.getLogger("factory_commander")
 # 决策轨迹落盘时一并记录，否则无法区分“当时的策略”与“现在的策略”，A/B 没有基线。
 COMMANDER_POLICY_VERSION = "cmd-2026.10.04"
 
+# 订单模式判定的策略参数（原先写死在 _assess_order_mode 里的 1.2 / 0.8）。
+# 提出来是为了让「策略参数」本身成为可评估对象：commander_decision_log 存了全精度
+# 输入态，scripts/commander_policy_replay.py 就能在真实历史状态上对这两个阈值做 A/B。
+# 改动这里的值 → 必须同时 +1 COMMANDER_POLICY_VERSION。
+SURPLUS_RATIO_THRESHOLD = 1.2   # 负荷 > 此值 → 订单充足
+DEFICIT_RATIO_THRESHOLD = 0.8   # 负荷 < 此值 → 订单欠缺
+
 
 def _json_default(obj: Any) -> Any:
     """JSONB 序列化兜底。
@@ -788,15 +795,15 @@ class FactoryCommander:
         前置熔断（2026-10-04 修正）：负荷率低**不等于**欠单。线上实测出现过
         「在制 36 单（待排 22 / 执行中 14）+ 逾期 12 单，却因负荷率 0% 被判
         『订单欠缺』并去接新单」的逻辑倒错。因此只要存在待排/逾期/主数据缺口，
-        且产能并未真正吃满（负荷 <=120%），就强制进入 BLOCKED
+        且产能并未真正吃满（负荷 <= SURPLUS_RATIO_THRESHOLD），就强制进入 BLOCKED
         （生产阻塞/主数据异常），决策重心转为疏通积压 + 补主数据，**禁止接单**。
         """
         ratio = state.order_load_ratio
-        if ratio <= 1.2 and self._has_production_blockers(state):
+        if ratio <= SURPLUS_RATIO_THRESHOLD and self._has_production_blockers(state):
             return OrderMode.BLOCKED
-        if ratio > 1.2:
+        if ratio > SURPLUS_RATIO_THRESHOLD:
             return OrderMode.SURPLUS
-        elif ratio < 0.8:
+        elif ratio < DEFICIT_RATIO_THRESHOLD:
             return OrderMode.DEFICIT
         return OrderMode.NORMAL
 
