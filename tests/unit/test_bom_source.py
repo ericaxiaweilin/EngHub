@@ -221,3 +221,41 @@ async def test_merged_placement_keeps_level_and_parent_together():
     assert len(shared) == 1, "同一料号的多处位置要汇总成一行"
     assert shared[0]["level"] == 2 and shared[0]["parent_code"] in {"ASSY-A", "ASSY-B"}
     assert shared[0]["required_qty"] == 70, "2×10 + 5×10 两处毛需求都要算进来"
+
+
+@pytest.mark.asyncio
+async def test_readiness_names_the_missing_master_data_piece():
+    """自制件开不出工单时，要说清缺的是主档、路线还是工步 —— 三种缺法补法不一样。"""
+    masters = [
+        {"material_code": "HAS-MASTER-OTHER-FACTORY", "master_factory_id": "FAC_ELEC_DEMO_2026",
+         "routing_id": "rt-1", "routing_steps": 3},
+        {"material_code": "NO-ROUTING", "master_factory_id": "FAC_MECH_001",
+         "routing_id": None, "routing_steps": 0},
+        {"material_code": "EMPTY-ROUTING", "master_factory_id": "FAC_MECH_001",
+         "routing_id": "rt-2", "routing_steps": 0},
+        {"material_code": "READY", "master_factory_id": "FAC_MECH_001",
+         "routing_id": "rt-3", "routing_steps": 6},
+    ]
+    db = _session(masters)
+    out = await bom_source.production_readiness(
+        db, "FAC_MECH_001",
+        ["NO-MASTER", "HAS-MASTER-OTHER-FACTORY", "NO-ROUTING", "EMPTY-ROUTING", "READY"],
+    )
+    assert out["NO-MASTER"] == "missing_master"
+    assert out["HAS-MASTER-OTHER-FACTORY"] == "master_other_factory"
+    assert out["NO-ROUTING"] == "no_routing"
+    assert out["EMPTY-ROUTING"] == "empty_routing"
+    assert out["READY"] == "ready"
+
+
+def test_readiness_rollup_only_counts_selfmade_and_drops_empty_buckets():
+    items = [
+        {"material_code": "A", "item_type": "make", "production_readiness": "missing_master", "net_qty": 68},
+        {"material_code": "B", "item_type": "make", "production_readiness": "missing_master", "net_qty": 132},
+        {"material_code": "C", "item_type": "make", "production_readiness": "ready", "net_qty": 0},
+        {"material_code": "D", "item_type": "buy", "production_readiness": None, "net_qty": 500},
+    ]
+    roll = bom_source.readiness_rollup(items)
+    assert roll["missing_master"] == {"parts": 2, "shortage_qty": 200}
+    assert "ready" not in roll, "没有缺口的自制件不算待办，种数要和缺口对齐"
+    assert "no_routing" not in roll, "没有自制件的桶不该出现在读数里"

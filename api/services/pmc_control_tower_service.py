@@ -23,6 +23,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.services.bom_source import production_readiness
+
 
 SCOPES = {
     "all",
@@ -371,17 +373,33 @@ class PmcControlTowerService:
                 item[key] = round(item[key], 2)
         for key in list(by_type):
             by_type[key] = round(by_type[key], 2)
+
+        # 自制缺口只有开出工单才是可执行任务：主档 + 工艺路线 + 工步，缺一样就卡在哪一样
+        make_codes = [c for c, i in grouped.items() if i.get("item_type") == "make"]
+        readiness = await production_readiness(self.db, factory_id, make_codes)
+        readiness_roll: Dict[str, Dict[str, Any]] = {}
+        for code in make_codes:
+            status = readiness.get(code) or "missing_master"
+            grouped[code]["production_readiness"] = status
+            bucket = readiness_roll.setdefault(status, {"parts": 0, "shortage_qty": 0})
+            bucket["parts"] += 1
+            bucket["shortage_qty"] += grouped[code]["shortage_qty"]
+        for bucket in readiness_roll.values():
+            bucket["shortage_qty"] = round(bucket["shortage_qty"], 2)
+
         return {
             "data_status": "ready",
-            "source": "work_order_materials.shortage_qty + work_orders",
+            "source": "work_order_materials.shortage_qty + work_orders + products + routing_steps",
             "missing_sources": [],
             # 自制装配件的缺口不能下 PO，要排产把上层的工单排出来才行
             "data_note": (
                 "当前结果是已落库的工单物料缺口；PO/在途覆盖量需看供应商数据。"
                 "shortage_by_item_type 里 buy=可下采购单的采购件、"
                 "make=要先排产自制的装配件、unknown=来源 BOM 只有一层判不出自制还是采购。"
+                "selfmade_readiness 按主档/工艺路线/工步判自制件能不能真开出工单。"
             ),
             "shortage_by_item_type": by_type,
+            "selfmade_readiness": readiness_roll,
             "affected_work_order_count": len(affected),
             "shortage_material_count": len(grouped),
             "total_shortage_qty": round(sum(item["shortage_qty"] for item in grouped.values()), 2),

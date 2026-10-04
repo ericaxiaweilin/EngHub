@@ -204,6 +204,71 @@ def build_tree(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[s
     return nodes, problems
 
 
+# ── 自制件能不能真开出一张工单 ───────────────────────────────────────
+#
+# MRP 报出"自制件缺 9,788"只是数字；要把它变成可执行任务，前提是
+# 这个料号在产品主档里存在、有工艺路线、而且路线真的有工步。
+# 三样缺一样，APS 就排不动它 —— 这时候批量开工单只会造出一堆开不了的工单。
+
+READINESS_SQL = text("""
+    SELECT p.product_code AS material_code, p.factory_id AS master_factory_id,
+           p.current_routing_id AS routing_id,
+           (SELECT count(*) FROM routing_steps rs WHERE rs.routing_id = p.current_routing_id) AS routing_steps
+    FROM products p
+    WHERE p.product_code = ANY(:codes)
+""")
+
+READINESS_LABELS = {
+    "ready": "主档、工艺路线、工步齐全，可以直接开子工单",
+    "missing_master": "没有产品主档：工单无处挂靠，自制缺口还只是一个数字",
+    "master_other_factory": "主档挂在别的厂区：本厂区开不出这张工单",
+    "no_routing": "有主档、没有工艺路线：APS 排不了",
+    "empty_routing": "工艺路线存在但没有工步：APS 排不了",
+}
+
+
+async def production_readiness(
+    db: Any, factory_id: str, material_codes: List[str]
+) -> Dict[str, str]:
+    """返回 {料号: 就绪状态}。判据是主档+路线+工步三样齐全，缺一样就如实说是哪一样。"""
+    codes = [str(c) for c in dict.fromkeys(material_codes) if c]
+    if not codes:
+        return {}
+    rows = (await db.execute(READINESS_SQL, {"codes": codes})).mappings().all()
+    by_code = {str(r["material_code"]): r for r in rows}
+    out: Dict[str, str] = {}
+    for code in codes:
+        row = by_code.get(code)
+        if row is None:
+            out[code] = "missing_master"
+        elif str(row["master_factory_id"] or "") != str(factory_id):
+            out[code] = "master_other_factory"
+        elif not row["routing_id"]:
+            out[code] = "no_routing"
+        elif int(row["routing_steps"] or 0) <= 0:
+            out[code] = "empty_routing"
+        else:
+            out[code] = "ready"
+    return out
+
+
+def readiness_rollup(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """自制件按就绪状态汇总：几种**有缺口的**料号、缺口多少。空桶不报，免得读数的人去数零。"""
+    out: Dict[str, Dict[str, float]] = {}
+    for item in items:
+        if item.get("item_type") != "make":
+            continue
+        if float(item.get("net_qty") or 0) <= 0:
+            # 没有缺口的自制件不是一项待办，数进去会让"种数"和"缺口"对不上
+            continue
+        status = item.get("production_readiness") or "missing_master"
+        bucket = out.setdefault(status, {"parts": 0, "shortage_qty": 0})
+        bucket["parts"] += 1
+        bucket["shortage_qty"] += float(item.get("net_qty") or 0)
+    return {k: {"parts": int(v["parts"]), "shortage_qty": round(v["shortage_qty"], 2)}
+            for k, v in out.items() if v["parts"]}
+
+
 async def stock_and_supply(
     db: Any, factory_id: str, material_codes: List[str], target_date=None
 ) -> Dict[str, Dict[str, float]]:

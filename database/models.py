@@ -2004,7 +2004,9 @@ class EngHubBomItem(Base):
     # 这两列在库里早就有了（唯一键就用 factory_id），模型一直缺声明，
     # ORM 路径写进去的镜像 factory_id 恒为 NULL
     factory_id = Column(String(50), index=True)
-    is_production = Column(Boolean)
+    # 表里残留的 is_production 不再声明：engflow 的 bom_items 没有这一列，
+    # 现行同步也不写它，留着只会被当成"来源自己声明的自制标记"用
+    # （实测它与 BOM 结构对不上：450 个叶子件被标成 production）。
     # 层级 BOM 的父子结构只体现在行序里（engflow 不写 parent_sap）：
     # 按 (source_file, original_row_number) 排序后层深每次最多加 1，
     # 丢掉行序就等于丢掉产品结构，多层 MRP 展开做不了。

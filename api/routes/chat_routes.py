@@ -1044,6 +1044,23 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
                 )
                 + "。只有 buy 能直接下 PO，make 要先排出上层的装配件工单。"
             )
+        readiness = shortage.get("selfmade_readiness") or {}
+        if readiness:
+            label_map = {
+                "ready": "可直接开工单",
+                "missing_master": "缺产品主档",
+                "master_other_factory": "主档在别的厂区",
+                "no_routing": "缺工艺路线",
+                "empty_routing": "路线没有工步",
+            }
+            lines.append(
+                "- 自制件开工单就绪度："
+                + "；".join(
+                    f"{label_map.get(k, k)} {int(v.get('parts') or 0)} 种（缺口 {n(v.get('shortage_qty'))}）"
+                    for k, v in readiness.items()
+                )
+                + "。只有就绪度为 ready 的自制件能开成工单，其余要先补主数据。"
+            )
         for item in (shortage.get("items") or [])[:10]:
             lines.append(f"- {item.get('material_code')}: 缺 {n(item.get('shortage_qty'))}，影响工单 {','.join(map(str, item.get('affected_work_orders') or [])) or '暂无'}")
         lines.append("- 处理闭环：锁定缺口与受影响工单 → 核实库存/在途/PO ETA → 替代料验证或调整排程 → 齐套后放行。")

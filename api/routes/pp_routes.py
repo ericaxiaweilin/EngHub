@@ -21,6 +21,8 @@ from api.services.bom_source import (
     explode_requirement,
     latest_bom_lines,
     label as bom_source_label,
+    production_readiness,
+    readiness_rollup,
     rollup_status,
     subassembly_suspects,
 )
@@ -993,6 +995,13 @@ async def calculate_mrp(
             "supplier": supplier_map.get(material_code) or b.get("vendor_code") or "",
         })
     
+    # 自制缺口要变成工单才叫任务：主档、工艺路线、工步三样齐全才开得出来。
+    # 判不出就绪度就报数字，等于让 PMC 去排一张不存在的工单。
+    make_codes = [i["material_code"] for i in items if i["item_type"] == "make"]
+    readiness_map = await production_readiness(db, p.factory_id, make_codes)
+    for item in items:
+        item["production_readiness"] = readiness_map.get(item["material_code"])
+    
     mrp_result_id = str(uuid.uuid4())
     calculated_at = datetime.utcnow()
     await db.execute(text("""
@@ -1080,6 +1089,8 @@ async def calculate_mrp(
             "shortage_by_item_type": shortage_by_type,
             "make_part_count": sum(1 for i in items if i["item_type"] == "make"),
             "buy_part_count": sum(1 for i in items if i["item_type"] == "buy"),
+            # 自制缺口里真正能开工单的部分（按就绪状态分桶，缺哪一样说哪一样）
+            "selfmade_readiness": readiness_rollup(items),
         },
     }
     
