@@ -45,6 +45,11 @@ services:
     environment:
       - DATABASE_URL=postgresql://enghub:enghub123@postgres:5432/enghub
       - REDIS_URL=redis://redis:6379
+      # BOM 的真相在 engflow 项目（库 bom_intelligence）。DSN 只放 docker/.env，
+      # 账号是只读角色 enghub_bom_ro；没配就跳过同步，不会拿本地表冒充源。
+      - ENGFLOW_DATABASE_URL=${ENGFLOW_DATABASE_URL:-}
+      - ENGFLOW_BOM_FACTORY_ID=${ENGFLOW_BOM_FACTORY_ID:-FAC_MECH_001}
+      - BOM_SYNC_BATCH=${BOM_SYNC_BATCH:-5000}
       - SECRET_KEY=your-secret-key-here
       # 测试模式：启用角色快捷切换（生产环境务必改为 false）
       - TEST_MODE=true

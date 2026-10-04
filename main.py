@@ -145,6 +145,17 @@ def health():
 _SCHEDULER_INTERVAL = int(os.getenv("SCHEDULER_INTERVAL_SEC", "300"))  # 默认 5 分钟
 _logger = logging.getLogger("scheduler")
 
+# asyncio 只持有任务的弱引用：不存住返回的 Task，跑一半就可能被 GC 掉，
+# 后台循环会静默消失（2026-10-04 重启后虚拟工厂脉搏和 BOM 镜像同步都没跑，就是这个）。
+_BACKGROUND_TASKS = set()
+
+
+def _spawn_background(coro, name: str) -> None:
+    """起一个后台循环并强引用住它，避免任务被垃圾回收。"""
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
 
 async def _periodic_scheduler():
     """后台循环：每 N 秒执行安灯超时检测 + 提醒推送 + 预警巡检 + 日报自动生成。"""
@@ -373,6 +384,37 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 虚拟工厂任务异常: {e}")
 
+        # BOM 镜像跟随 engflow —— 每 6 小时按水位线增量补一次
+        # 源在 engflow 项目的库里（481,557 行），本地 enghub_bom_items 只是镜像；
+        # 没有这一步镜像就会一直停在某次手动同步的日子，领料读到过期需求。
+        try:
+            import time as _t_bom
+            if not hasattr(_periodic_scheduler, "_last_bom_sync"):
+                _periodic_scheduler._last_bom_sync = 0
+            if _t_bom.time() - _periodic_scheduler._last_bom_sync > 21600:  # 6h
+                _periodic_scheduler._last_bom_sync = _t_bom.time()
+                from api.services.bom_sync_service import BomSyncService
+                async with db_config.session_factory() as db:
+                    svc = BomSyncService(db)
+                    if not svc.source_configured:
+                        _logger.warning(
+                            "[bom-sync] 未配置 ENGFLOW_DATABASE_URL，跳过本轮"
+                            "（不会退回本地表当源）"
+                        )
+                    else:
+                        res = await svc.incremental_sync()
+                        if res.get("status") == "success":
+                            _logger.info(
+                                f"[bom-sync] 增量完成：写 {res.get('rows_upserted')} 行，"
+                                f"镜像 {res.get('mirror', {}).get('mirrored')} / "
+                                f"源 {res.get('source', {}).get('total')} 行"
+                            )
+                        else:
+                            _logger.warning(f"[bom-sync] 增量失败: {res.get('error')}")
+                        await db.commit()
+        except Exception as e:
+            _logger.warning(f"[scheduler] BOM 镜像同步异常: {e}")
+
         # 排产智能体：产能平衡检查 —— 每 30 分钟
         try:
             import time as _t9
@@ -421,25 +463,25 @@ async def _start_scheduler():
         "enabled" if checkpoint_persistence_enabled else "disabled",
     )
 
-    asyncio.create_task(_periodic_scheduler())
+    _spawn_background(_periodic_scheduler(), "periodic-scheduler")
     _logger.info(f"[scheduler] 后台调度器已启动，间隔 {_SCHEDULER_INTERVAL}s")
 
     # Chatbot 模型预热：避免上游空闲后首个用户请求撞上冷启动超时。
     from api.routes.chat_routes import model_warmup_loop
-    asyncio.create_task(model_warmup_loop())
+    _spawn_background(model_warmup_loop(), "model-warmup")
 
     # 幂等技能种子：确保 skills + hr_employee_skills 数据存在（防 DB 重建后丢失）
     from scripts.seed_skills_startup import run_skill_seed
-    asyncio.create_task(run_skill_seed())
+    _spawn_background(run_skill_seed(), "skill-seed")
 
     # 任务中心定期扫描：到期待办任务自动跟进（FOLLOWUP_SCANNER_ENABLED=0 可关）
     from api.services.followup_task_service import followup_scanner_loop
-    asyncio.create_task(followup_scanner_loop())
+    _spawn_background(followup_scanner_loop(), "followup-scanner")
 
     # 工厂指挥官持续盯办：为已开启指挥官的用户定期巡检，把新决策挂入任务中心
     # （COMMANDER_WATCH_ENABLED=0 可关；COMMANDER_WATCH_INTERVAL_SECONDS 调间隔）
     from api.services.factory_commander import commander_watch_loop
-    asyncio.create_task(commander_watch_loop())
+    _spawn_background(commander_watch_loop(), "commander-watch")
 
 
 # ---------- 前端静态托管（FastAPI 同源服务，替代 nginx） ----------

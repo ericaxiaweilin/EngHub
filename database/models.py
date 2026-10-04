@@ -1996,6 +1996,10 @@ class EngHubBomItem(Base):
     component_type = Column(String(100))
     synced_at = Column(DateTime, default=datetime.utcnow)
     source_updated_at = Column(DateTime)                         # 源表 updated_at 快照
+    # 这两列在库里早就有了（唯一键就用 factory_id），模型一直缺声明，
+    # ORM 路径写进去的镜像 factory_id 恒为 NULL
+    factory_id = Column(String(50), index=True)
+    is_production = Column(Boolean)
 
     __table_args__ = (
         Index("idx_enghub_bom_model_part", "product_model", "part_number"),
@@ -2391,6 +2395,7 @@ class EngHubBomSyncLog(Base):
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     error_message = Column(Text)
+    factory_id = Column(String(50))          # 镜像归属厂区（库里有列，模型之前没声明）
 
 
 class RushOrderApproval(Base):
