@@ -15,9 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
 from core.auth.security import get_current_user, require_permission
-from database.models import User, Plan, Product, BomItem, Inventory, Station, WorkOrder, WorkOrderMaterial
+from database.models import User, Plan, Product, Inventory, Station, WorkOrder, WorkOrderMaterial
 from core.pp.plan import MPSService
-from core.pp.mrp import MRPService
+from api.services.bom_source import latest_bom_lines, label as bom_source_label
 
 router = APIRouter(prefix="/api/v1", tags=["pp"])
 
@@ -815,28 +815,28 @@ async def calculate_mrp(
     product = prod_res.scalar()
     product_name = product.product_name if product else p.product_id
     
-    # BOM展开：同时按工厂和生效版本过滤，避免同一产品在不同工厂/版本
-    # 的物料被串进本次 MRP。
-    bom_filters = [BomItem.product_id == p.product_id, BomItem.factory_id == p.factory_id]
+    # BOM 展开走唯一入口：engflow 上传的 BOM（镜像）优先，本地 bom_items 兜底。
+    # 以前这里只查 bom_items，而领料只查镜像 —— 同一个产品 MRP 与领料会给出两套需求。
+    # 镜像不分版本，所以显式点名版本时才回落本地表。
+    product_code = str(getattr(product, "product_code", None) or p.product_id)
     selected_bom_version = request.bom_version or (product.current_bom_version if product else None)
-    if selected_bom_version:
-        bom_filters.append(BomItem.bom_version == selected_bom_version)
-    else:
-        bom_filters.append(or_(BomItem.bom_version.is_(None), BomItem.bom_version == "CURRENT"))
-    bom_res = await db.execute(select(BomItem).where(*bom_filters))
-    bom_items = bom_res.scalars().all()
-    
+    bom_items, bom_source = await latest_bom_lines(
+        db, p.factory_id, product_code, version=request.bom_version
+    )
     if not bom_items:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"MRP计算失败：产品[{product_name}]未配置BOM（物料清单）。"
-                f"MRP需要：计划→产品→BOM→库存数据，请先为基础数据中的产品维护BOM。"
+                f"MRP计算失败：产品[{product_name}]没有可用的 BOM 物料清单"
+                f"（{bom_source_label(bom_source)}；厂区 {p.factory_id}"
+                f"{'，指定版本 ' + str(selected_bom_version) if selected_bom_version else ''}）。"
+                f"MRP 需要：计划→产品→BOM→库存数据，请先维护 BOM；"
+                f"不会按经验系数编造物料需求。"
             ),
         )
     
     # 库存可用量：按 material_code 汇总（跨仓库），按厂区过滤。
-    mat_codes = [str(getattr(b, "material_code", "") or "") for b in bom_items]
+    mat_codes = [str(b.get("material_code") or "") for b in bom_items]
     mat_codes = [code for code in mat_codes if code]
     inv_res = await db.execute(
         select(Inventory.material_code, func.sum(Inventory.available_qty))
@@ -902,8 +902,8 @@ async def calculate_mrp(
     total_shortage = 0
     
     for b in bom_items:
-        material_code = str(getattr(b, "material_code", "") or "")
-        qty_per_unit = float(getattr(b, "qty_per_unit", 1) or 1)
+        material_code = str(b.get("material_code") or "")
+        qty_per_unit = float(b.get("qty_per_unit") or 1)
         required = math.ceil(p.quantity * qty_per_unit)
         on_hand = on_hand_map.get(material_code, 0)
         on_order = on_order_map.get(material_code, 0)
@@ -921,8 +921,8 @@ async def calculate_mrp(
         items.append({
             "material_id": material_code,
             "material_code": material_code,
-            "material_name": getattr(b, "material_name", None) or material_code,
-            "unit": getattr(b, "unit", None) or "pcs",
+            "material_name": b.get("material_name") or material_code,
+            "unit": b.get("unit") or "pcs",
             "qty_per_unit": qty_per_unit,
             "required_qty": required,
             "on_hand_qty": on_hand,
@@ -930,7 +930,7 @@ async def calculate_mrp(
             "net_qty": net,
             "suggested_order_qty": suggested,
             "moq": moq,
-            "supplier": supplier_map.get(material_code) or getattr(b, "vendor_code", "") or "",
+            "supplier": supplier_map.get(material_code) or b.get("vendor_code") or "",
         })
     
     mrp_result_id = str(uuid.uuid4())
@@ -986,7 +986,14 @@ async def calculate_mrp(
         "status": "calculated",
         "calculated_at": calculated_at.isoformat(),
         "target_date": p.required_date.isoformat() if p.required_date else None,
-        "bom_version": request.bom_version or "CURRENT",
+        "bom_version": selected_bom_version or "CURRENT",
+        # 需求数是从哪份 BOM 算的要写在结果里：镜像和本地表是两套结构，
+        # 不标来源就没人知道这 2 行不代表整个产品结构。
+        "bom_source": bom_source,
+        "bom_source_label": bom_source_label(bom_source),
+        "bom_product_code": product_code,
+        # 只展开 level=1 直接组件，多层 rolled-up 还没做，别被读成"全部物料"
+        "bom_expansion": "level-1",
         "items": items,
         "summary": {
             "total_materials": len(items),

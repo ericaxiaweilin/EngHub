@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.services import bom_source
 from api.services.wms_architecture.movements import (
     apply_movement,
     document_movement_type,
@@ -942,37 +943,12 @@ class InventoryService:
         return outbound
     
     async def _latest_bom_lines(self, factory_id: str, product_code: str) -> tuple:
-        """BOM 取数：先认 engflow 上传的 BOM（镜像在 enghub_bom_items），再回落本地 bom_items。
+        """BOM 取数走 bom_source 唯一入口：engflow 镜像优先，本地 bom_items 兜底。
 
-        返回 (需求行, 来源)。领料单必须写清这次按哪份 BOM 扣的 —— 两套需求口径
-        混在一张单上，事后没人能复核。
+        MRP 展开、齐套检查和领料必须读同一份口径，否则同一个产品两套需求数。
         """
-        mirror = (await self.db.execute(text("""
-            SELECT part_number AS material_code, description AS material_name,
-                   quantity AS qty_per_unit, unit
-            FROM enghub_bom_items
-            WHERE factory_id = :fid AND product_model = :pid AND level = 1
-              AND quantity IS NOT NULL
-            ORDER BY part_number
-        """), {"fid": factory_id, "pid": product_code})).mappings().all()
-        if mirror:
-            return list(mirror), "engflow_mirror"
+        return await bom_source.latest_bom_lines(self.db, factory_id, product_code)
 
-        local = (await self.db.execute(text("""
-            SELECT material_code, material_name, qty_per_unit, unit
-            FROM bom_items
-            WHERE factory_id = :fid AND product_id = :pid AND level = 1
-              AND bom_version = (
-                  SELECT bom_version FROM bom_items
-                  WHERE factory_id = :fid AND product_id = :pid AND level = 1
-                  GROUP BY bom_version
-                  ORDER BY max(created_at) DESC
-                  LIMIT 1
-              )
-            ORDER BY material_code
-        """), {"fid": factory_id, "pid": product_code})).mappings().all()
-        return list(local), ("mes_bom_items" if local else "none")
-    
     async def issue_materials_for_production(
         self,
         *,
