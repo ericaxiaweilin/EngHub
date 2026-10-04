@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict
 
 from sqlalchemy import text
@@ -31,8 +32,16 @@ from api.services.routing_from_family import derive_routing_for_product
 logger = logging.getLogger(__name__)
 
 BACKFILL_INTERVAL_SECONDS = 900
-# 一轮最多处理几个产品：路线推导要读整个型号的 BOM 文本，批量太大既慢又难对账
-BATCH_PRODUCTS = 40
+# 开发/测试阶段的规模闸门（用户 10-04 定的口径：从小到大，别一把推成全量）：
+# - 一轮只看几个产品；
+# - 推导出来的路线总数有预算，用完就停，要继续得显式改环境变量。
+#   没有预算的话这个循环会在后台一路把 473 个型号全推一遍。
+BATCH_PRODUCTS = max(1, int(os.getenv("ROUTING_BACKFILL_BATCH", "5")))
+MAX_DERIVED_ROUTES = max(0, int(os.getenv("ROUTING_BACKFILL_MAX_ROUTES", "20")))
+
+COUNT_DERIVED_SQL = text("""
+    SELECT count(*) FROM routings WHERE created_by = 'bom-family-derived'
+""")
 
 # 回填只针对"还没排动"的主工单；子工单/已完工/已取消一概不动
 TARGET_WO_SQL = text("""
@@ -58,16 +67,30 @@ BIND_WO_SQL = text("""
 
 async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]:
     """补一轮路线。返回可对账的凭据：看了几个、套上几个、回填了几张工单、为什么没套上。"""
-    targets = (await db.execute(TARGET_WO_SQL, {"limit": BATCH_PRODUCTS})).mappings().all()
+    already_derived = int((await db.execute(COUNT_DERIVED_SQL)).scalar() or 0)
     receipt: Dict[str, Any] = {
-        "examined": len(targets),
+        "examined": 0,
         "by_status": {},
         "derived": 0,
         "routed_products": 0,
         "routed_work_orders": 0,
         "rejected": [],
+        "derived_routes_in_db": already_derived,
+        "route_budget": MAX_DERIVED_ROUTES,
     }
+    if already_derived >= MAX_DERIVED_ROUTES:
+        # 预算用完了就停手，并把"为什么这轮没干活"写进心跳，别让人以为循环挂了
+        receipt["status"] = "budget_exhausted"
+        return receipt
+
+    targets = (await db.execute(
+        TARGET_WO_SQL, {"limit": BATCH_PRODUCTS}
+    )).mappings().all()
+    receipt["examined"] = len(targets)
     for row in targets:
+        if already_derived + receipt["derived"] >= MAX_DERIVED_ROUTES:
+            receipt["status"] = "budget_reached"
+            break
         fid = str(row["factory_id"])
         product_code = str(row["product_id"])
         result = await derive_routing_for_product(db, fid, product_code)
@@ -89,6 +112,7 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
                 "reason": result.get("reason"),
                 "coverage": result.get("coverage"),
             })
+    receipt.setdefault("status", "ok")
     if apply:
         await db.commit()
     else:

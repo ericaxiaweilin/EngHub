@@ -28,7 +28,7 @@ class _Result:
         return self._rows[0][0] if self._rows else None
 
 
-def _db(targets, derive_results, update_rowcount=3):
+def _db(targets, derive_results, update_rowcount=3, existing_derived=0):
     """按 SQL 文本分派的假会话：查目标 / 回填工单，其余交给 derive 自己处理。"""
     db = MagicMock()
     db.calls = []
@@ -37,6 +37,8 @@ def _db(targets, derive_results, update_rowcount=3):
     async def execute(statement, params=None):
         sql = str(statement)
         db.calls.append((sql, params))
+        if "count(*) FROM routings" in sql:
+            return _Result([[(existing_derived if existing_derived is not None else 0)]])
         if "DISTINCT wo.factory_id" in sql:
             return _Result(targets)
         if "UPDATE work_orders" in sql:
@@ -68,6 +70,7 @@ async def test_backfill_binds_only_when_route_is_available(monkeypatch):
     monkeypatch.setattr(rb, "derive_routing_for_product", fake_derive)
     db, _ = _db(targets, [])
     receipt = await rb.backfill_missing_routings(db)
+    assert receipt["status"] == "ok"
 
     assert receipt["examined"] == 2
     assert receipt["routed_products"] == 1
@@ -93,6 +96,25 @@ async def test_dry_run_does_not_write(monkeypatch):
     assert receipt["routed_products"] == 1, "预演要说清会回填几个产品"
     assert not [c for c in db.calls if "UPDATE work_orders" in c[0]], "预演不能改工单"
     assert ("ROLLBACK", None) in db.calls
+
+
+@pytest.mark.asyncio
+async def test_derived_route_budget_stops_the_loop_from_going_full_scale(monkeypatch):
+    """开发/测试阶段不能后台把 473 个型号全推一遍：用完预算就停，并说明为什么没干活。"""
+    calls = []
+
+    async def fake_derive(db, fid, code):
+        calls.append(code)
+        return {"status": "derived", "routing_id": f"rt-bom-{code}"}
+
+    monkeypatch.setattr(rb, "derive_routing_for_product", fake_derive)
+    db, _ = _db([{"factory_id": "F", "product_id": "X"}], [], existing_derived=999)
+    receipt = await rb.backfill_missing_routings(db)
+
+    assert receipt["status"] == "budget_exhausted"
+    assert receipt["examined"] == 0 and calls == [], "预算满了就不该再去读源数据"
+    assert receipt["route_budget"] == rb.MAX_DERIVED_ROUTES
+    assert receipt["derived_routes_in_db"] == 999, "心跳里要能看出已经推了多少条"
 
 
 @pytest.mark.asyncio

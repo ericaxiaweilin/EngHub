@@ -37,6 +37,19 @@ logger = logging.getLogger(__name__)
 SOURCE_TABLE = os.getenv("ENGFLOW_BOM_SOURCE_TABLE", "bom_items")
 PART_MASTER_TABLE = os.getenv("ENGFLOW_BOM_PART_MASTER_TABLE", "part_master")
 BATCH_SIZE = max(100, int(os.getenv("BOM_SYNC_BATCH", "5000")))
+# 开发/测试阶段的规模闸门（用户 10-04 明确定下的口径：不要随便全量）：
+# - BOM_SYNC_MODEL_ALLOWLIST：只跟这几个型号（逗号或空格分隔，`*` = 全跟）。
+#   收窄只影响"以后还同步进来什么"，**不删任何已有镜像行**；
+#   范围外的型号在 EngHub 里会照实走本地 bom_items 兜底并说明来源。
+# - BOM_SYNC_ALLOW_FULL：全量重建（48 万行级）必须显式打开，默认拒绝，
+#   防止一次误操作把磁盘和源库连接打满。
+MODEL_ALLOWLIST: tuple = tuple(
+    m.strip() for m in os.getenv("BOM_SYNC_MODEL_ALLOWLIST", "").replace(",", " ").split()
+    if m.strip()
+)
+FULL_SYNC_REQUIRES_FLAG = os.getenv("BOM_SYNC_ALLOW_FULL", "0").lower() not in {
+    "0", "false", "no", "off"
+}
 # asyncpg 单条语句最多 32,767 个绑定参数：二十几列 × 5,000 行会直接爆，
 # 所以 executemany 的块大小按"实际写多少列"反推，而不是跟拉取块一样大。
 MIRROR_FACTORY_ID = os.getenv("ENGFLOW_BOM_FACTORY_ID", "FAC_MECH_001")
@@ -105,6 +118,9 @@ class BomSyncService:
         bom = _table_or_die(SOURCE_TABLE)
         pm = _table_or_die(PART_MASTER_TABLE)
         updated_filter = "AND bi.updated_at > :since" if since else ""
+        # 开发阶段只跟白名单型号；空 = 全跟（现状）。注意这是"少拉进来"，不是删已有行
+        scope = "*" in MODEL_ALLOWLIST or not MODEL_ALLOWLIST
+        model_filter = "" if scope else "AND bi.model_name = ANY(:models)"
         sql = text(f"""
             SELECT
                 bi.row_id, bi.model_name, bi.part_number, bi.description, bi.level,
@@ -115,18 +131,22 @@ class BomSyncService:
             FROM {bom} bi
             LEFT JOIN {pm} pm
                 ON pm.part_number = bi.part_number AND pm.company_id = bi.company_id
-            WHERE bi.row_id > :after {updated_filter}
+            WHERE bi.row_id > :after {updated_filter} {model_filter}
             ORDER BY bi.row_id
             LIMIT :limit
         """)
         params: Dict[str, Any] = {"after": after_row_id, "limit": limit}
         if since:
             params["since"] = since
+        if not scope:
+            params["models"] = list(MODEL_ALLOWLIST)
         async with self._source().connect() as conn:
             rows = (await conn.execute(sql, params)).mappings().all()
         return [dict(r) for r in rows]
 
-    async def _source_summary(self) -> Dict[str, Any]:
+    async def _source_summary(self, *, scoped: bool = True) -> Dict[str, Any]:
+        scope = (not scoped) or "*" in MODEL_ALLOWLIST or not MODEL_ALLOWLIST
+        model_filter = "" if scope else "WHERE model_name = ANY(:models)"
         async with self._source().connect() as conn:
             row = (await conn.execute(text(f"""
                 SELECT count(*) AS total,
@@ -134,8 +154,12 @@ class BomSyncService:
                        count(DISTINCT model_name) AS models,
                        max(updated_at) AS max_updated_at
                 FROM {_table_or_die(SOURCE_TABLE)}
-            """))).mappings().first()
-        return dict(row or {})
+                {model_filter}
+            """), {} if scope else {"models": list(MODEL_ALLOWLIST)})).mappings().first()
+        out = dict(row or {})
+        if not scope:
+            out["model_allowlist"] = list(MODEL_ALLOWLIST)
+        return out
 
     # ── 镜像写入 ──────────────────────────────────────────────────────
     async def _upsert_page(self, rows: List[Dict[str, Any]]) -> int:
@@ -206,6 +230,13 @@ class BomSyncService:
     async def sync(self, mode: str = "incremental") -> Dict[str, Any]:
         if mode not in ("full", "incremental"):
             raise ValueError(f"未知同步模式 {mode!r}（只支持 full/incremental）")
+        if mode == "full" and not FULL_SYNC_REQUIRES_FLAG:
+            # 全量重建是 48 万行级的读写；开发阶段默认拒绝，要跑得显式开 BOM_SYNC_ALLOW_FULL=1
+            raise BomSyncNotConfigured(
+                "全量 BOM 重建默认关闭（开发/测试阶段不跑全量）。"
+                "确认要重建镜像时设 BOM_SYNC_ALLOW_FULL=1 再触发；"
+                "增量同步不受影响，会自己跟到源表水位线。"
+            )
         if not self.source_configured:
             raise BomSyncNotConfigured(
                 "未配置 ENGFLOW_DATABASE_URL，跳过 BOM 同步：拿本地表当源会把镜像写歪"
