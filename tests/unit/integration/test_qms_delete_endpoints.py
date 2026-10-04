@@ -4,7 +4,7 @@ QMS DELETE端点集成测试 - 端到端验证路由->服务->数据库交互
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
-from starlette.test_client import TestClient
+from starlette.testclient import TestClient
 from main import app  # 假设您的FastAPI应用入口是main.py
 from database.db_config import get_db
 

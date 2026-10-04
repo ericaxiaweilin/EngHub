@@ -18,7 +18,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import select
 
-from database.models import Base, ChatSession, ChatMessage, ChatTelemetry
+from database.models import Base, ChatSession, ChatMessage, ChatTelemetry, ChatMessageAttachment, FileRecord
 from api.services import chat_persistence_service as cp
 
 
@@ -41,7 +41,8 @@ async def db():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     # 只建本测试用到的 3 张表（其余模型含 SQLite 不支持的 JSONB）
     async with engine.begin() as conn:
-        for table in (ChatSession.__table__, ChatMessage.__table__, ChatTelemetry.__table__):
+        tables = [ChatSession.__table__, ChatMessage.__table__, ChatTelemetry.__table__, ChatMessageAttachment.__table__, FileRecord.__table__]
+        for table in tables:
             await conn.execute(CreateTable(table))
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with factory() as session:

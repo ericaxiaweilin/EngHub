@@ -3,8 +3,10 @@ WMS库存服务单元测试 - 测试入库、出库、库存查询等核心功�
 """
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
 from datetime import datetime, date
+from sqlalchemy.ext.asyncio import AsyncSession
 from core.wms.inventory import InventoryService, TransactionType, InventoryStatus
 from database.models import Inventory, InboundOrder, OutboundOrder
 
@@ -36,7 +38,9 @@ async def test_get_inventory_no_records(mock_inventory_service):
     """测试：获取无库存物料信息"""
     # Arrange
     mock_inventory_service.db.execute = AsyncMock()
-    mock_inventory_service.db.execute.return_value = MagicMock(scalas=MagicMock(all=lambda: []))
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = []
+    mock_inventory_service.db.execute.return_value = mock__res
     
     # Act
     result = await mock_inventory_service.get_inventory("MAT-999", warehouse_id="WH-001")
@@ -75,9 +79,9 @@ async def test_get_inventory_with_records(mock_inventory_service):
     inv2.created_at = datetime(2026, 7, 2, 10, 0, 0)
     
     mock_inventory_service.db.execute = AsyncMock()
-    mock_inventory_service.db.execute.return_value = MagicMock(
-        scalas=MagicMock(all=lambda: [inv1, inv2])
-    )
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = [inv1, inv2]
+    mock_inventory_service.db.execute.return_value = mock__res
     
     # Act
     result = await mock_inventory_service.get_inventory("MAT-001")
@@ -116,9 +120,9 @@ async def test_list_inventory(mock_inventory_service):
     inv.updated_at = datetime.now()
     
     mock_inventory_service.db.execute = AsyncMock()
-    mock_inventory_service.db.execute.return_value = MagicMock(
-        scalas=MagicMock(all=lambda: [inv])
-    )
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = [inv]
+    mock_inventory_service.db.execute.return_value = mock__res
     
     # Act
     result = await mock_inventory_service.list_inventory(
@@ -261,7 +265,9 @@ async def test_outbound_valid(mock_inventory_service):
     mock_inventory_service._get_fifo_batches = AsyncMock(
         return_value=[{"batch_code": "BATCH-001", "qty": 100, "location_id": "LOC-001"}]
     )
-    mock_inventory_service._get_inventory_record = AsyncMock(return_value=MagicMock())
+    mock_inventory_service._get_inventory_record = AsyncMock(
+        return_value=SimpleNamespace(available_qty=100, total_qty=100)
+    )
     mock_inventory_service.db.commit = AsyncMock()
     
     # Act
@@ -302,9 +308,9 @@ async def test_get_fifo_batches(mock_inventory_service):
     inv2.created_at = datetime(2026, 7, 2, 10, 0, 0)  # Later than inv1
     
     mock_inventory_service.db.execute = AsyncMock()
-    mock_inventory_service.db.execute.return_value = MagicMock(
-        scalas=MagicMock(all=lambda: [inv1, inv2])
-    )
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = [inv1, inv2]
+    mock_inventory_service.db.execute.return_value = mock__res
     
     # Act
     batches = await mock_inventory_service._get_fifo_batches(
@@ -324,19 +330,14 @@ async def test_get_fifo_batches(mock_inventory_service):
 @pytest.mark.asyncio
 async def test_reserve_inventory_success(mock_inventory_service):
     """测试：预留库存成功 - 从可用库存中扣除并设置预留量"""
-    # Arrange
-    mock_inventory_service.get_inventory = AsyncMock(return_value={
-        "material_id": "MAT-001",
-        "warehouse_id": "WH-001",
-        "available_qty": 100,
-        "reserved_qty": 20,
-        "batches": [{"batch_code": "BATCH-001", "available_qty": 100}]
-    })
-    mock_inventory_service._get_inventory_records_for_reserve = AsyncMock(
-        return_value=[MagicMock(available_qty=100, reserved_qty=None)]
-    )
+    # Arrange：两条可用记录共 150，预留 50 全从第一条扣
+    rec1 = SimpleNamespace(available_qty=100, reserved_qty=10)
+    rec2 = SimpleNamespace(available_qty=50, reserved_qty=0)
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = [rec1, rec2]
+    mock_inventory_service.db.execute = AsyncMock(return_value=mock__res)
     mock_inventory_service.db.commit = AsyncMock()
-    
+
     # Act
     result = await mock_inventory_service.reserve_inventory(
         material_id="MAT-001",
@@ -345,28 +346,27 @@ async def test_reserve_inventory_success(mock_inventory_service):
         work_order_id="WO-001",
         reserved_by="operator"
     )
-    
+
     # Assert
     assert result["quantity"] == 50
     assert result["work_order_id"] == "WO-001"
     assert result["status"] == "reserved"
-    assert result["inventory_updated"] > 0
+    assert result["inventory_updated"] == 2
+    assert rec1.available_qty == 50 and rec1.reserved_qty == 60
+    assert rec2.available_qty == 50 and rec2.reserved_qty == 0
     mock_inventory_service.db.commit.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_reserve_inventory_insufficient_stock(mock_inventory_service):
     """测试：预留库存不足 - 应抛出异常"""
-    # Arrange
-    mock_inventory_service.get_inventory = AsyncMock(return_value={
-        "material_id": "MAT-001",
-        "warehouse_id": "WH-001",
-        "available_qty": 30,
-        "reserved_qty": 0,
-        "batches": []
-    })
-    
-    # Act
+    # Arrange：可用 30，要 50
+    rec = SimpleNamespace(available_qty=30, reserved_qty=0)
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = [rec]
+    mock_inventory_service.db.execute = AsyncMock(return_value=mock__res)
+
+    # Act - should raise ValueError
     with pytest.raises(ValueError) as exc_info:
         await mock_inventory_service.reserve_inventory(
             material_id="MAT-001",
@@ -374,7 +374,7 @@ async def test_reserve_inventory_insufficient_stock(mock_inventory_service):
             quantity=50,  # More than available
             work_order_id="WO-001"
         )
-    
+
     assert "库存不足" in str(exc_info.value)
 
 
@@ -383,9 +383,9 @@ async def test_get_material_trace_inbound_records(mock_inventory_service):
     """测试：物料追溯 - 获取入库记录历史"""
     # Arrange
     mock_inventory_service.db.execute = AsyncMock()
-    mock_inventory_service.db.execute.return_value = MagicMock(
-        scalas=MagicMock(return_value=[])
-    )
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = []
+    mock_inventory_service.db.execute.return_value = mock__res
     
     # Act
     result = await mock_inventory_service.get_material_trace("MAT-001")
@@ -408,9 +408,9 @@ async def test_get_current_location(mock_inventory_service):
     inv.status = InventoryStatus.AVAILABLE.value
     
     mock_inventory_service.db.execute = AsyncMock()
-    mock_inventory_service.db.execute.return_value = MagicMock(
-        scalar_one_or_none=MagicMock(return_value=inv)
-    )
+    mock__loc = MagicMock()
+    mock__loc.scalar_one_or_none.return_value = inv
+    mock_inventory_service.db.execute.return_value = mock__loc
     
     # Act
     location = await mock_inventory_service._get_current_location("MAT-001")
@@ -439,11 +439,11 @@ async def test_list_inventory_with_filters(mock_inventory_service):
     inv2.status = "qc_hold"
     
     mock_inventory_service.db.execute = AsyncMock()
-    mock_inventory_service.db.execute.return_value = MagicMock(
-        scalas=MagicMock(all=lambda: [inv1, inv2])
-    )
+    mock__res = MagicMock()
+    mock__res.scalars.return_value.all.return_value = [inv1]
+    mock_inventory_service.db.execute.return_value = mock__res
     
-    # Act with filter
+    # Act with filter (过滤发生在 SQL 层，mock 返回过滤后行)
     results = await mock_inventory_service.list_inventory(
         factory_id="FACT-001",
         warehouse_id="WH-001",
@@ -460,8 +460,8 @@ async def test_submit_count_result_with_adjustments(mock_inventory_service):
     """测试：提交盘点结果 - 包含差异调整建议"""
     # Arrange
     items = [
-        {"material_id": "MAT-001", "system_qty": 100, "counted_qty": 105, "difference": 5},
-        {"material_id": "MAT-002", "system_qty": 200, "counted_qty": 198, "difference": -2},
+        {"material_id": "MAT-001", "batch_code": "B1", "system_qty": 100, "counted_qty": 105, "difference": 5},
+        {"material_id": "MAT-002", "batch_code": "B2", "system_qty": 200, "counted_qty": 198, "difference": -2},
     ]
     
     # Act

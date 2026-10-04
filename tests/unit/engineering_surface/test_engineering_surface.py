@@ -53,7 +53,7 @@ async def test_chat_version_returns_harness():
     data = await mod.chat_version()
     assert data["harness"].startswith("0.")
     assert data["api"] == "/api/v1/chat/v2"
-    assert data["phases"] == [1, 2, 3, 4, 5, 6]
+    assert data["phases"] == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 # ──────────────────────────────────────────────

@@ -17,6 +17,7 @@ from enum import Enum
 
 from sqlalchemy import select, func, update, delete, insert, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from core.wms.inventory import TransactionType
 
 from database.models import (
     WorkOrder,
@@ -170,19 +171,18 @@ class CostingService:
         """
         db = await self._get_db()
         
-        # 查询该工单的所有生产报工记录，汇总实际工时
-        # 假设 ProductionReport 包含 actual_hours 字段（需要确认 schema）
-        # 如果没有，需要从其他来源获取工时数据
-        
-        # 方案1：从 ProductionReport 汇总工时
+        # 报工表没有 actual_hours 列（只有 start_time/end_time），按起止差汇总。
+        # 以前这里直接引用不存在的列，整个方法必抛 AttributeError。
         labor_hours_query = select(
-            func.sum(ProductionReport.actual_hours).label("total_labor_hours")
+            ProductionReport.start_time, ProductionReport.end_time
         ).where(
             ProductionReport.work_order_id == work_order_id
         )
-        
         labor_hours_result = await db.execute(labor_hours_query)
-        labor_hours = labor_hours_result.scalar() or 0.0
+        labor_hours = 0.0
+        for start_time, end_time in labor_hours_result.all():
+            if start_time and end_time and end_time > start_time:
+                labor_hours += (end_time - start_time).total_seconds() / 3600.0
         
         # 如果实际小时数为0，尝试从生产报告推算（基于计划工时）
         if labor_hours <= 0:

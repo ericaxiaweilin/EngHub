@@ -80,7 +80,9 @@ class TestRedTagService:
         
         mock_result = MagicMock()
         mock_result.scalar_one_or_none.return_value = mock_red_tag
-        mock_db.execute.return_value = mock_result
+        mock_no_defect = MagicMock()
+        mock_no_defect.scalar_one_or_none.return_value = None
+        mock_db.execute.side_effect = [mock_result, mock_no_defect]
         
         # Call get
         result = await red_tag_service.get_red_tag("test-id-123")
@@ -137,7 +139,9 @@ class TestRedTagService:
         
         mock_result = MagicMock()
         mock_result.scalar_one_or_none.return_value = mock_red_tag
-        mock_db.execute.return_value = mock_result
+        mock_no_defect = MagicMock()
+        mock_no_defect.scalar_one_or_none.return_value = None
+        mock_db.execute.side_effect = [mock_result, mock_result, mock_no_defect]
         mock_db.refresh = AsyncMock()
         
         # Call submit disposition

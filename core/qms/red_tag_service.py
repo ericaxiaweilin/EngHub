@@ -287,6 +287,7 @@ class RedTagService:
             {
                 "id": rt.id,
                 "red_tag_no": rt.red_tag_no,
+                "defect_id": rt.defect_id,
                 "red_tag_type": rt.red_tag_type,
                 "defect_description": rt.defect_description,
                 "nonconforming_qty": float(rt.nonconforming_qty),

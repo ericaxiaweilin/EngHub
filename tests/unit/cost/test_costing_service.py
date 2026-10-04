@@ -56,7 +56,7 @@ async def test_calculate_material_cost_from_transactions(mock_costing_service):
     
     # Mock query execution for material cost calculation
     mock_result = MagicMock()
-    mock_result.scalar = MagicMock(return_value=15000.50)
+    mock_result.scalar.return_value = 15000.50
     db.execute = AsyncMock(return_value=mock_result)
     
     # Act
@@ -77,17 +77,20 @@ async def test_calculate_labor_cost_from_production_report(mock_costing_service)
     db.execute = AsyncMock()
     
     mock_result = MagicMock()
-    mock_result.scalar = MagicMock(return_value=150.0)  # 150 hours
+    mock_result.all.return_value = [
+        (datetime(2026, 8, 1, 8, 0), datetime(2026, 8, 1, 10, 0)),
+        (datetime(2026, 8, 1, 10, 0), datetime(2026, 8, 1, 11, 0)),
+    ]
     db.execute = AsyncMock(return_value=mock_result)
     
     # Mock _get_default_labor_rate
     mock_costing_service._get_default_labor_rate = AsyncMock(return_value=50.0)
     
-    # Act
+    # Act: 2h + 1h = 3h * 50
     labor_cost = await mock_costing_service._calculate_labor_cost("WO-001")
     
     # Assert
-    assert labor_cost == 7500.0  # 150 hours * 50 rate
+    assert labor_cost == 150.0
 
 
 @pytest.mark.asyncio
@@ -128,7 +131,7 @@ async def test_calculate_product_standard_cost(mock_costing_service):
     # Assert
     assert std_cost["product_id"] == "PROD-001"
     assert std_cost["material_cost"] == 600.0  # (10*50) + (5*20)
-    assert abs(std_cost["labor_cost"] - 67.5) < 0.01  # (1*45 + 0.5*50) = 45 + 25 = 70 approx
+    assert abs(std_cost["labor_cost"] - 70.0) < 0.01  # (1*45 + 0.5*50) = 45 + 25 = 70
     assert std_cost["overhead_cost"] > 0
     assert std_cost["total_standard_cost"] > 0
 
@@ -288,7 +291,7 @@ async def test_variance_interpretation_edge_cases(mock_costing_service):
     
     # Standard cost is 0
     result = service._interpret_variance(100, 0)
-    assert result == "无法分析"
+    assert result == "无标准成本参考"
     
     # Moderate positive variance (>5%, <=10%)
     result = service._interpret_variance(10, 100)  # 10% variance

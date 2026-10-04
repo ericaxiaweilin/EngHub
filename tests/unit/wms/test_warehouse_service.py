@@ -59,7 +59,9 @@ async def test_get_warehouse_exists(mock_db_session):
     mock_plan.updated_at = None
     
     mock_db.execute = AsyncMock()
-    mock_db.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_plan))
+    mock__one = MagicMock()
+    mock__one.scalar_one_or_none.return_value = mock_plan
+    mock_db.execute.return_value = mock__one
     
     # Act
     result = await service.get_warehouse("wh-123")
@@ -79,7 +81,9 @@ async def test_get_warehouse_not_found(mock_db_session):
     service = WarehouseService(mock_db)
     
     mock_db.execute = AsyncMock()
-    mock_db.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+    mock__one = MagicMock()
+    mock__one.scalar_one_or_none.return_value = None
+    mock_db.execute.return_value = mock__one
     
     # Act
     result = await service.get_warehouse("non-existent-id")
@@ -115,9 +119,9 @@ async def test_list_warehouses_by_factory(mock_db_session):
     wh2.created_by = "admin"
     
     mock_db.execute = AsyncMock()
-    mock_db.execute.return_value = MagicMock(
-        scalars=MagicMock(all=lambda: [wh1, wh2])
-    )
+    mock__all = MagicMock()
+    mock__all.scalars.return_value.all.return_value = [wh1, wh2]
+    mock_db.execute.return_value = mock__all
     
     # Act
     result = await service.list_warehouses(factory_id="FACT-001")
@@ -141,13 +145,13 @@ async def test_list_warehouses_with_type_filter(mock_db_session):
     wh2.warehouse_type = WarehouseType.FINISHED_GOODS.value
     
     mock_db.execute = AsyncMock()
-    mock_db.execute.return_value = MagicMock(scalas=MagicMock(all=lambda: [wh1, wh2]))
-    # Need to properly mock the where clause chain
-    original_where = Warehouse.where
-    warehouse_mock = MagicMock()
-    warehouse_mock.where.return_value = warehouse_mock
-    warehouse_mock.execute = AsyncMock()
-    warehouse_mock.execute.return_value = MagicMock(scalas=MagicMock(all=lambda: [wh1]))
+    mock__all = MagicMock()
+    mock__all.scalars.return_value.all.return_value = [wh1, wh2]
+    mock_db.execute.return_value = mock__all
+    # 过滤发生在 SQL 层：mock 直接返回过滤后的行
+    mock__f = MagicMock()
+    mock__f.scalars.return_value.all.return_value = [wh1]
+    mock_db.execute.return_value = mock__f
     
     # Simplified test: verify filter param would be passed
     result = await service.list_warehouses(
@@ -243,7 +247,9 @@ async def test_get_location_exists(mock_db_session):
     mock_loc.created_at = None
     
     mock_db.execute = AsyncMock()
-    mock_db.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_loc))
+    mock__one = MagicMock()
+    mock__one.scalar_one_or_none.return_value = mock_loc
+    mock_db.execute.return_value = mock__one
     
     # Act
     result = await service.get_location("loc-123")
@@ -269,9 +275,9 @@ async def test_list_locations_by_warehouse(mock_db_session):
     loc2.warehouse_id = "wh-123"
     
     mock_db.execute = AsyncMock()
-    mock_db.execute.return_value = MagicMock(
-        scalas=MagicMock(all=lambda: [loc1, loc2])
-    )
+    mock__all = MagicMock()
+    mock__all.scalars.return_value.all.return_value = [loc1, loc2]
+    mock_db.execute.return_value = mock__all
     
     # Act
     result = await service.list_locations(warehouse_id="wh-123")
@@ -314,7 +320,10 @@ async def test_create_warehouse_status_default():
         mock_instance = MagicMock()
         mock_warehouse_cls.return_value = mock_instance
         
-        service = WarehouseService(MagicMock())
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock()
+        mock_db.commit = AsyncMock()
+        service = WarehouseService(mock_db)
         result = await service.create_warehouse(
             factory_id="FACT-001",
             warehouse_code="TEST-WH",

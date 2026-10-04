@@ -1061,6 +1061,7 @@ class Warehouse(Base):
     factory_id = Column(String(50), nullable=False, index=True)
     warehouse_type = Column(String(20), nullable=False)  # raw_material, finished_goods, in_transit
     address = Column(String(255))
+    manager_id = Column(String(36), nullable=True)
     status = Column(String(20), default="active")
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -1083,6 +1084,8 @@ class Location(Base):
     location_type = Column(String(20), default="rack")
     zone = Column(String(50))
     aisle = Column(String(30), nullable=True)
+    row = Column(String(30), nullable=True)
+    column = Column(String(30), nullable=True)
     rack = Column(String(30), nullable=True)
     level = Column(String(30), nullable=True)
     bin_code = Column(String(30), nullable=True)
@@ -1142,6 +1145,7 @@ class InboundOrder(Base):
     batch_code = Column(String(50))
     supplier_id = Column(String(50))
     purchase_order_id = Column(String(50))
+    production_order_id = Column(String(50), nullable=True)
     unit_cost = Column(Numeric(10, 2))
     location_id = Column(String(36), ForeignKey("locations.id"))
     inbound_type = Column(String(20), default="purchase")
@@ -1163,6 +1167,7 @@ class OutboundOrder(Base):
     material_id = Column(String(50), nullable=False)
     quantity = Column(Integer, nullable=False)
     work_order_id = Column(String(50), index=True)
+    sales_order_id = Column(String(50), nullable=True)
     batch_code = Column(String(50))
     outbound_type = Column(String(20), default="production")
     status = Column(String(20), default="pending")
@@ -2661,4 +2666,54 @@ class ChatEvalCase(Base):
     model = Column(String(64), nullable=True)                  # 指定模型（空=默认路由）
     factory_id = Column(String(32), default="F01")
     enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class QualityRedTag(Base):
+    """质量红单（只读映射已存在的 quality_red_tag 表；表由迁移创建）"""
+
+    __tablename__ = "quality_red_tag"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    factory_id = Column(String(36), nullable=False, index=True)
+    red_tag_no = Column(String(50), nullable=False, unique=True, index=True)
+    defect_id = Column(String(36), ForeignKey("defect_records.id", ondelete="CASCADE"), nullable=False, index=True)
+    inspection_id = Column(String(36), nullable=True)
+    red_tag_type = Column(String(20), nullable=False, index=True)
+    defect_description = Column(Text, nullable=True)
+    nonconforming_qty = Column(Numeric(12, 4), nullable=False)
+    batch_no = Column(String(100), nullable=True)
+    work_order_id = Column(String(36), ForeignKey("work_orders.id", ondelete="SET NULL"), nullable=True)
+    station_id = Column(String(36), ForeignKey("stations.id", ondelete="SET NULL"), nullable=True)
+    discovered_by = Column(String(36), nullable=True)
+    discovered_at = Column(DateTime, default=datetime.utcnow)
+    severity = Column(String(20), default="MINOR")
+    quarantine_status = Column(String(20), default="SEATED", index=True)
+    disposition = Column(String(20), nullable=True)
+    disposition_by = Column(String(36), nullable=True)
+    disposition_date = Column(DateTime, nullable=True)
+    disposition_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    is_deleted = Column(Boolean, default=False)
+    created_by = Column(String(36), nullable=True)
+
+    attachments = relationship(
+        "QualityRedTagAttachment",
+        backref="red_tag",
+        cascade="all, delete-orphan",
+    )
+
+
+class QualityRedTagAttachment(Base):
+    """红单附件（只读映射已存在的 quality_red_tag_attachments 表）"""
+
+    __tablename__ = "quality_red_tag_attachments"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    red_tag_id = Column(String(36), ForeignKey("quality_red_tag.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_id = Column(String(36), nullable=False, index=True)
+    attachment_type = Column(String(20), default="PHOTO")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

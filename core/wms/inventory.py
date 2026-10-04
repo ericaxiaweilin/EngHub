@@ -35,6 +35,7 @@ class TransactionType(str, Enum):
     RETURN_IN = "return_in"           # 退货入库
     TRANSFER_IN = "transfer_in"        # 调拨入库
     ADJUSTMENT_IN = "adjustment_in"   # 盘盈入库
+    QC_HOLD = "qc_hold"             # 质检入库（待验状态，不直接可用）
     
     PRODUCTION_OUT = "production_out" # 生产领料
     SALES_OUT = "sales_out"           # 销售出库
@@ -290,7 +291,11 @@ class InventoryService:
                 available_qty=int(quantity),
                 unit_cost=unit_cost,
                 unit="pcs",
-                status=InventoryStatus.AVAILABLE.value,
+                status=(
+                    InventoryStatus.QC_HOLD.value
+                    if transaction_type == TransactionType.QC_HOLD.value
+                    else InventoryStatus.AVAILABLE.value
+                ),
                 last_movement_at=datetime.now(),
                 created_at=datetime.now(),
             )
