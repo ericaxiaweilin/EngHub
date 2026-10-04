@@ -11,7 +11,7 @@ from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, text
 
-from database.models import WorkOrder, Station, Equipment, ApsSchedule
+from database.models import WorkOrder, Station, Equipment, ApsSchedule, BomItem
 
 
 def _gen_id() -> str:
