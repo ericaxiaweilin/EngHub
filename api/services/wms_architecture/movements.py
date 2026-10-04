@@ -6,7 +6,9 @@
   return_in/transfer_in/adjustment_in 与 production_out/sales_out/scrap_out/
   transfer_out/adjustment_out），成本核算 core/cost/costing.py 按它统计消耗。
 - api 层写入方各自用字面量 inbound/outbound/transfer，绕过了枚举。
-- 虚拟工厂脉搏写 production_out（与枚举一致）和 scenario_hold（枚举里没有）。
+- 种子脚本 scripts/seed_mech_workflows.py 直接 INSERT 枚举外的 scenario_hold，
+  以及没有 before/after、没有单据号的 production_out（线上 93 条 production_out
+  全部来自这个脚本，虚拟工厂脉搏一条流水都不写）。
 
 读取侧任何一处手抄列表都会随写入方漂移，所以本模块只从枚举派生，
 遗留字面量显式标注为 legacy 并等待迁移。

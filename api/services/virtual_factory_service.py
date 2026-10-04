@@ -103,6 +103,14 @@ class VirtualFactoryService:
                 "reports_created": advanced["reports_created"],
                 "containers_reported": advanced["containers_reported"],
             })
+            if advanced.get("reported_orders_without_material_requirement"):
+                events.append({
+                    "type": "material_not_consumed",
+                    "at": sim_now.isoformat(),
+                    "work_orders": advanced["reported_orders_without_material_requirement"],
+                    "reason": "工单没有物料需求（work_order_materials 为空），"
+                              "报工不会扣减库存，成本归集拿不到领料依据",
+                })
         for alert in alerts:
             events.append({"type": "rhythm_lag", "at": sim_now.isoformat(), **alert})
         await clock.push_events(cfg.factory_id, events, max_len=cfg.event_queue_max)
@@ -144,8 +152,20 @@ class VirtualFactoryService:
         """), {"table_name": table_name})).fetchall()
         return {str(r[0]) for r in rows}
 
+    async def _count_without_material_requirements(self, work_order_ids: List[str]) -> int:
+        """有多少工单一条物料需求都没有 —— 这些工单的报工不会扣减任何库存。"""
+        ids = [i for i in work_order_ids if i]
+        if not ids:
+            return 0
+        with_req = set((await self.db.execute(text("""
+            SELECT DISTINCT work_order_id FROM work_order_materials
+            WHERE work_order_id = ANY(:ids)
+        """), {"ids": ids})).scalars().all())
+        return len([i for i in ids if i not in with_req])
+
     async def status(self, factory_id: str = DEFAULT_FACTORY_ID) -> Dict[str, Any]:
         active = await self._active_virtual_masters(factory_id)
+        without_bom = await self._count_without_material_requirements([wo.id for wo in active])
         open_rows = [
             {
                 "work_order_code": wo.work_order_code,
@@ -178,6 +198,13 @@ class VirtualFactoryService:
             "sim_now": (await clock.now(factory_id)).isoformat(),
             "clock_backend": clock.backend,
             "recent_events": await clock.recent_events(factory_id, limit=20),
+            # 报工不等于领料：没有物料需求的工单扣不到库存，先把它说明白
+            "material_consumption": {
+                "in_progress_orders": len(active),
+                "without_material_requirement": without_bom,
+                "note": "无 work_order_materials/BOM 的工单，报工不会扣减库存；"
+                        "补齐物料需求之前生产消耗不会进台账。",
+            },
         }
 
     async def _ensure_virtual_product(self, factory_id: str, operator: str) -> Product:
@@ -479,6 +506,7 @@ class VirtualFactoryService:
         # 订单状态先攒起来，循环结束后按状态各合成一条 UPDATE
         done_order_ids: List[str] = []
         wip_order_ids: List[str] = []
+        reported_order_ids: List[str] = []
 
         for master in masters:
             if master.planned_start and master.planned_start > today_end:
@@ -533,6 +561,7 @@ class VirtualFactoryService:
 
             reports_created += 1
             containers_reported += qty
+            reported_order_ids.append(master.id)
 
         # 原来是每个工单一句 UPDATE，这里按状态各合成一句
         batch_stmt = text("""
@@ -547,11 +576,15 @@ class VirtualFactoryService:
                     batch_stmt, {"status": status_value, "now": datetime.utcnow(), "ids": ids}
                 )
 
+        without_bom = await self._count_without_material_requirements(reported_order_ids)
         return {
             "reports_created": reports_created,
             "containers_reported": containers_reported,
             "work_orders_touched": reports_created,
             "daily_capacity_containers": cfg.daily_capacity,
+            # 本轮报工没有一条会扣库存：这些工单没有物料需求可扣
+            "material_consumption_posted": 0,
+            "reported_orders_without_material_requirement": without_bom,
         }
 
     async def _guard_and_notify(self, cfg: PulseConfig) -> List[Dict[str, Any]]:

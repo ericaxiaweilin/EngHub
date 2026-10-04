@@ -92,7 +92,10 @@ class WmsInventoryHealthService:
             "movement_vocabulary": {
                 "counted_as_consumption": list(OUTBOUND_TYPES),
                 "counted_as_receipt": list(INBOUND_TYPES),
-                "note": "流水写入方历史上用了多套词汇（服务写 outbound/inbound，虚拟工厂写 production_out/scenario_hold），读取侧按词表匹配，否则消耗会被静默算成 0。",
+                "note": "流水写入方历史上用了多套词汇（api 服务写 outbound/inbound/transfer，"
+                        "种子脚本写 production_out/scenario_hold 且不带单据号），"
+                        "读取侧按词表匹配，否则消耗会被静默算成 0。"
+                        "新写入统一走 movements.apply_movement。",
             },
         }
 
