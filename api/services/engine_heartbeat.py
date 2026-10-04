@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 TABLE = "engine_loop_state"
 
-# 循环名 -> 期望间隔（秒）。心跳超过 2 个间隔没更新就算掉线。
+# 循环名 -> 期望间隔（秒），心跳超过 2 个间隔没更新就算掉线。
+# 循环自己上报 interval_seconds 时以数据库里的值为准，这里只是兜底。
 LOOP_INTERVAL_SECONDS: Dict[str, int] = {
     # 30 是循环自己的 sleep 间隔，一轮真实耗时会叠加在上面（实测 50 秒一跳），
     # 判死阈值取 2 倍会误报，所以这里给心脏循环留更宽的容差。
     "periodic-scheduler": 120,
+    # 这三个循环现在每轮都自己报心跳（10-04 补的），不再是"只证明起了没崩"
     "model-warmup": 600,
     "skill-seed": 300,
     "followup-scanner": 120,

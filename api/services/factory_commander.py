@@ -1581,15 +1581,19 @@ async def commander_watch_loop() -> None:
     import os
     if os.getenv("COMMANDER_WATCH_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
         _logger.info("指挥官盯办循环已禁用（COMMANDER_WATCH_ENABLED=0）")
+        from api.services.engine_heartbeat import record as _heartbeat
+        await _heartbeat("commander-watch", "disabled")
         return
     interval = max(60, int(os.getenv("COMMANDER_WATCH_INTERVAL_SECONDS", "300") or 300))
     _logger.info("工厂指挥官盯办循环启动，每 %s 秒为已开启用户巡检一次", interval)
+    from api.services.engine_heartbeat import record as _heartbeat
     from database.db_config import db_config
     while True:
         try:
             await asyncio.sleep(interval)
             enabled = [(uid, cfg) for uid, cfg in FactoryCommander._user_commanders.items()
                        if cfg.get("enabled")]
+            watched = errors = 0
             if not enabled:
                 # 无用户开启指挥官时，仍对默认工厂做数据治理巡检（只发缺口通知，
                 # 不执行决策/不挂任务），确保计划主数据缺口提醒自动生效。
@@ -1601,6 +1605,9 @@ async def commander_watch_loop() -> None:
                         _logger.info("[commander-watch] 默认工厂数据治理巡检 | 缺口=%d", len(gaps))
                 except Exception as exc:  # noqa: BLE001
                     _logger.warning("[commander-watch] 默认工厂巡检异常：%s", exc)
+                # 没有开启用户时这轮只做数据治理巡检，也算干活，照样跳心跳
+                await _heartbeat("commander-watch", "tick", interval_seconds=interval,
+                                 detail={"mode": "governance", "watched": 0})
                 continue
             for uid, cfg in enabled:
                 fid = cfg.get("factory_id") or "FAC_MECH_001"
@@ -1612,8 +1619,12 @@ async def commander_watch_loop() -> None:
                         _logger.info(
                             "[commander-watch] 用户 %s 巡检完成 | mode=%s | decisions=%d | 盯办任务=%d",
                             uid, report.order_mode.value, len(report.decisions), len(report.followup_tasks))
+                        watched += 1
                 except Exception as exc:  # noqa: BLE001 — 单用户巡检失败不影响其他用户
                     _logger.warning("[commander-watch] 用户 %s 巡检异常：%s", uid, exc)
+                    errors += 1
+            await _heartbeat("commander-watch", "tick", interval_seconds=interval,
+                             detail={"mode": "watch", "watched": watched, "errors": errors})
         except asyncio.CancelledError:
             _logger.info("工厂指挥官盯办循环停止")
             return

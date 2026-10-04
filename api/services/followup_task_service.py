@@ -586,8 +586,11 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 async def followup_scanner_loop() -> None:
     """后台扫描循环（main.py startup 启动）。每分钟看一眼有没有到期任务。"""
+    from api.services.engine_heartbeat import record as _heartbeat
+
     if not _env_flag("FOLLOWUP_SCANNER_ENABLED", True):
         _logger.info("任务中心扫描器已禁用（FOLLOWUP_SCANNER_ENABLED=0）")
+        await _heartbeat("followup-scanner", "disabled")
         return
     interval = max(15, int(os.getenv("FOLLOWUP_SCAN_INTERVAL_SECONDS", "60") or 60))
     _logger.info("任务中心扫描器启动，每 %s 秒检查到期任务", interval)
@@ -599,6 +602,10 @@ async def followup_scanner_loop() -> None:
                 result = await scan_due_tasks(db)
                 if result["scanned"]:
                     _logger.info("任务中心本轮跟进 %s 个任务", result["scanned"])
+                # 扫完就跳一次心跳：证明"在按节奏干活"，不是只"起了没崩"
+                await _heartbeat("followup-scanner", "tick", interval_seconds=interval,
+                                 detail={"scanned": result.get("scanned", 0),
+                                         "acted": len(result.get("outcomes") or [])})
         except asyncio.CancelledError:
             _logger.info("任务中心扫描器停止")
             return

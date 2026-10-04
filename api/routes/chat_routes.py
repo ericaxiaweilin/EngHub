@@ -746,8 +746,12 @@ async def _warm_model_once(reason: str = "interval") -> bool:
 
 async def model_warmup_loop() -> None:
     """Keep the selected Chatbot route warm across upstream idle periods."""
+    from api.services.engine_heartbeat import record as _heartbeat
+
     if not MODEL_WARMUP_ENABLED:
         _logger.info("[model-warmup] disabled by LLM_WARMUP_ENABLED")
+        # 禁用也要落心跳：否则运维只能看到"没心跳"，分不清"关了"还是"死了"
+        await _heartbeat("model-warmup", "disabled")
         return
     _logger.info(
         "[model-warmup] started interval=%ss retry_timeout=%ss",
@@ -755,7 +759,12 @@ async def model_warmup_loop() -> None:
         int(MODEL_COLD_START_RETRY_TIMEOUT),
     )
     while True:
-        await _warm_model_once("startup" if _model_warmup_state["last_finished_at"] is None else "interval")
+        reason = "startup" if _model_warmup_state["last_finished_at"] is None else "interval"
+        await _warm_model_once(reason)
+        await _heartbeat("model-warmup", "tick",
+                         interval_seconds=int(MODEL_WARMUP_INTERVAL_SECONDS),
+                         detail={"reason": reason,
+                                 "last_status_code": _model_warmup_state.get("last_status_code")})
         await asyncio.sleep(MODEL_WARMUP_INTERVAL_SECONDS)
 
 
