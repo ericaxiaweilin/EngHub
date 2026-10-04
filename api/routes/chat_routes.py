@@ -846,7 +846,8 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"本次发出 {result.get('events_emitted', 0)} 个事件"
             f"（队列后端 {result.get('clock_backend', '未知')}，内存不落库）\n"
             f"- 物料领用：按 BOM 扣库 {result.get('advanced', {}).get('materials_issued_lines', 0)} 行 / "
-            f"{result.get('advanced', {}).get('materials_issued_qty', 0)} 件，"
+            f"{result.get('advanced', {}).get('materials_issued_qty', 0)} 件"
+            f"（来源 {result.get('advanced', {}).get('bom_sources') or '无'}），"
             f"欠料 {len(result.get('advanced', {}).get('material_shortages') or [])} 行，"
             f"无 BOM 工单 {result.get('advanced', {}).get('orders_without_bom', 0)} 张"
         )

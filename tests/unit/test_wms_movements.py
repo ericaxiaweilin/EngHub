@@ -34,6 +34,13 @@ class _Inv:
         self.last_movement_at = None
 
 
+def _record_query(session, needle):
+    for statement, _ in session.queries:
+        if needle in statement:
+            return statement
+    return ""
+
+
 def _result(rows=None, scalars=None, scalar=None):
     r = MagicMock()
     r.mappings.return_value.all.return_value = rows or []
@@ -49,9 +56,11 @@ class _QueueSession:
     def __init__(self, results):
         self._results = list(results)
         self.added = []
+        self.queries = []
 
     async def execute(self, statement, params=None):
         assert self._results, "查询次数超出预期：写入路径多绕了一次 DB"
+        self.queries.append((str(statement), params))
         return self._results.pop(0)
 
     def add(self, obj):
@@ -291,6 +300,31 @@ async def test_issue_uses_uploaded_bom_quantity_and_anchors_the_ledger():
     assert (txns[0].quantity, txns[0].before_qty, txns[0].after_qty) == (60, 100, 40)
     assert txns[0].reference_id == docs[0].id
     assert txns[0].reference_doc_no == docs[0].outbound_code
+    # BOM 第一来源是 engflow 的上传数据在 EngHub 的镜像表
+    assert out["bom_source"] == "engflow_mirror"
+    assert "enghub_bom_items" in _record_query(session, "enghub_bom_items")
+
+
+@pytest.mark.asyncio
+async def test_issue_falls_back_to_local_bom_only_when_mirror_misses():
+    inv = _Inv(total_qty=100, available_qty=100)
+    session = _QueueSession([
+        _result(rows=[]),                    # engflow 镜像没这个型号
+        _result(rows=[_bom_row(per_unit=2.0)]),  # 本地 bom_items 有
+        _result(scalar="MAT-RM-STEEL"),
+        _result(scalars=[inv]),
+        _result(scalar=9),
+    ])
+    svc = InventoryService(session)
+
+    out = await svc.issue_materials_for_production(
+        factory_id="FAC_TEST", work_order_id="wo-9",
+        product_code="VF-CMECH001-40HQ", output_qty=10,
+    )
+
+    assert out["bom_source"] == "mes_bom_items"
+    assert out["issued_qty"] == 20 and inv.total_qty == 80
+    assert len(session.queries) == 5
 
 
 @pytest.mark.asyncio
@@ -318,8 +352,8 @@ async def test_partial_stock_issues_what_exists_and_reports_the_shortage():
 
 @pytest.mark.asyncio
 async def test_product_without_uploaded_bom_issues_nothing():
-    """没传 BOM 就一条都不扣：宁可报 no_bom，也不按系数编需求量。"""
-    session = _QueueSession([_result(rows=[])])
+    """两份 BOM 都没有就一条都不扣：宁可报 no_bom，也不按系数编需求量。"""
+    session = _QueueSession([_result(rows=[]), _result(rows=[])])
     svc = InventoryService(session)
 
     out = await svc.issue_materials_for_production(
@@ -327,7 +361,7 @@ async def test_product_without_uploaded_bom_issues_nothing():
         product_code="VF-DEMO2026-40HQ", output_qty=50,
     )
 
-    assert out["reason"] == "no_bom"
+    assert (out["reason"], out["bom_source"]) == ("no_bom", "none")
     assert out["issued_lines"] == 0
     assert session.added == []
 

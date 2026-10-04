@@ -111,6 +111,7 @@ class VirtualFactoryService:
                     "at": sim_now.isoformat(),
                     "material_lines": issued_lines,
                     "quantity": advanced.get("materials_issued_qty", 0),
+                    "bom_sources": advanced.get("bom_sources") or {},
                 })
             shortages = advanced.get("material_shortages") or []
             if shortages:
@@ -169,20 +170,27 @@ class VirtualFactoryService:
         """), {"table_name": table_name})).fetchall()
         return {str(r[0]) for r in rows}
 
-    async def _bom_backed_products(self, factory_id: str, product_codes: List[str]) -> set:
-        """这些产品里哪些真的上传过 BOM —— 没 BOM 的产品领不了料，也不该编需求。"""
+    async def _bom_backed_products(self, factory_id: str, product_codes: List[str]) -> Dict[str, set]:
+        """这些产品在两份 BOM 里各覆盖了哪些：engflow 上传的镜像优先，本地 bom_items 兜底。"""
         codes = [c for c in set(product_codes) if c]
         if not codes:
-            return set()
-        return set((await self.db.execute(text("""
+            return {"engflow_mirror": set(), "mes_bom_items": set()}
+        mirror = set((await self.db.execute(text("""
+            SELECT DISTINCT product_model FROM enghub_bom_items
+            WHERE factory_id = :fid AND product_model = ANY(:codes) AND level = 1
+              AND quantity IS NOT NULL
+        """), {"fid": factory_id, "codes": codes})).scalars().all())
+        local = set((await self.db.execute(text("""
             SELECT DISTINCT product_id FROM bom_items
             WHERE factory_id = :fid AND product_id = ANY(:codes) AND level = 1
         """), {"fid": factory_id, "codes": codes})).scalars().all())
+        return {"engflow_mirror": mirror, "mes_bom_items": local}
 
     async def status(self, factory_id: str = DEFAULT_FACTORY_ID) -> Dict[str, Any]:
         active = await self._active_virtual_masters(factory_id)
         codes = [wo.product_id for wo in active if wo.product_id]
-        with_bom = await self._bom_backed_products(factory_id, codes)
+        covered = await self._bom_backed_products(factory_id, codes)
+        backed = covered["engflow_mirror"] | covered["mes_bom_items"]
         open_rows = [
             {
                 "work_order_code": wo.work_order_code,
@@ -218,10 +226,14 @@ class VirtualFactoryService:
             # 报工不等于领料：只有上传过 BOM 的产品才扣得到库存，先把它说明白
             "material_consumption": {
                 "active_products": len(set(codes)),
-                "products_with_bom": len(with_bom),
-                "products_without_bom": sorted(set(codes) - with_bom),
-                "note": "领料按 bom_items 的 qty_per_unit × 合格产出计算并记 production_out；"
-                        "没上传 BOM 的产品不扣库存、也不编造物料需求。",
+                "bom_coverage": {
+                    "engflow_mirror": len(covered["engflow_mirror"]),
+                    "mes_bom_items": len(covered["mes_bom_items"]),
+                },
+                "products_without_bom": sorted(set(codes) - backed),
+                "note": "领料第一来源是 engflow 上传的 BOM（本地镜像 enghub_bom_items 的 level=1 组件"
+                        "× 合格产出），镜像没这个型号才回落本地 bom_items；"
+                        "两处都没有就不扣库存、也不编造物料需求。",
             },
         }
 
@@ -527,6 +539,7 @@ class VirtualFactoryService:
         issued_lines = 0
         issued_qty = 0
         orders_without_bom = 0
+        bom_sources: Dict[str, int] = {}
         material_shortages: List[Dict[str, Any]] = []
 
         for master in masters:
@@ -593,6 +606,8 @@ class VirtualFactoryService:
             )
             issued_lines += issue.get("issued_lines", 0)
             issued_qty += issue.get("issued_qty", 0)
+            if issue.get("bom_source") not in (None, "none"):
+                bom_sources[issue["bom_source"]] = bom_sources.get(issue["bom_source"], 0) + 1
             if issue.get("reason") == "no_bom" and good_qty > 0:
                 orders_without_bom += 1
             for short in issue.get("shortages") or []:
@@ -627,6 +642,7 @@ class VirtualFactoryService:
             "materials_issued_qty": issued_qty,
             "material_shortages": material_shortages,
             "orders_without_bom": orders_without_bom,
+            "bom_sources": bom_sources,
         }
 
     async def _guard_and_notify(self, cfg: PulseConfig) -> List[Dict[str, Any]]:
