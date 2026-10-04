@@ -595,6 +595,10 @@ class Routing(Base):
     factory_id = Column(String(50), nullable=False, index=True)
     product_id = Column(String(50), nullable=False, index=True)
     version = Column(String(20), default="v1")
+    # status/remark 在表里（status 还是 NOT NULL），模型一直没声明：
+    # 走 ORM 建工艺路线必然撞 not-null 约束，mes_services.create_routing 也是这样
+    status = Column(String(20), nullable=False, default="active")
+    remark = Column(Text)
     steps = Column(JSONB, nullable=False, default=list)
     is_active = Column(Boolean, default=True)
     created_by = Column(String(50))

@@ -27,6 +27,7 @@ from api.services.bom_source import (
     subassembly_suspects,
 )
 from api.services.production_part_master import register_make_part_masters
+from api.services.routing_from_family import derive_routing_for_product
 
 router = APIRouter(prefix="/api/v1", tags=["pp"])
 
@@ -219,8 +220,13 @@ async def release_plan(
     
     work_order = await db.get(WorkOrder, p.work_order_id) if p.work_order_id else None
     master_receipt = None
+    routing_receipt = None
     if not work_order:
         product = await db.get(Product, p.product_id)
+        # 先给这个型号定工艺路线（同族标准路线套用 + BOM 文本佐证），
+        # 否则工单没有 routing，APS 只会把它列进 unrouted，一条任务都排不出来。
+        model_code = str(getattr(product, "product_code", None) or p.product_id)
+        routing_receipt = await derive_routing_for_product(db, p.factory_id, model_code)
         work_order = WorkOrder(
             work_order_code=f"WO-{p.plan_code}",
             factory_id=p.factory_id,
@@ -307,6 +313,8 @@ async def release_plan(
     if master_receipt is not None:
         # 建了多少、跳过多少、哪些建不了，要能对账；静默补主数据等于没人知道主档是谁造的
         result["production_part_masters"] = master_receipt
+    if routing_receipt is not None:
+        result["routing_derivation"] = routing_receipt
     return result
 
 
