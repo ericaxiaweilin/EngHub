@@ -235,14 +235,23 @@ async def release_plan(
         await db.flush()
         p.work_order_id = work_order.id
 
-        # 将最近一次 MRP 结果复制到工单物料齐套表，APS 释放时据此拦截缺料。
+        # 把最近一次 MRP 结果复制到工单物料齐套表，APS 释放时据此拦截缺料。
+        # 只取最后一次计算：一个计划可以反复跑 MRP，全取会把历史结果也当成当前需求。
+        # 层级结构（level/parent_code/item_type）一并复制，PMC 才能区分采购件与自制装配件。
         mrp_items = (await db.execute(text("""
             SELECT mi.material_id, mi.material_code, mi.material_name,
-                   mi.required_qty, mi.available_qty, mi.shortage_qty, mi.unit
+                   mi.required_qty, mi.available_qty, mi.shortage_qty, mi.unit,
+                   mi.level, mi.parent_code, mi.allocated_qty,
+                   mi.item_type
             FROM mrp_items mi
             JOIN mrp_results mr ON mr.id = mi.mrp_result_id
             WHERE mr.plan_id = :plan_id
-            ORDER BY mr.calculated_at DESC
+              AND mr.id = (
+                  SELECT id FROM mrp_results
+                  WHERE plan_id = :plan_id
+                  ORDER BY calculated_at DESC LIMIT 1
+              )
+            ORDER BY mi.level NULLS FIRST, mi.material_code
         """), {"plan_id": plan_id})).mappings().all()
         for item in mrp_items:
             db.add(WorkOrderMaterial(
@@ -256,6 +265,10 @@ async def release_plan(
                 received_qty=int(item["available_qty"] or 0),
                 shortage_qty=int(item["shortage_qty"] or 0),
                 unit=item["unit"],
+                level=item["level"],
+                parent_code=item["parent_code"],
+                allocated_qty=int(item["allocated_qty"] or 0),
+                item_type=item["item_type"],
             ))
 
     p.status = "released"
@@ -920,6 +933,7 @@ async def calculate_mrp(
     items = []
     shortage_count = 0
     total_shortage = 0
+    shortage_by_type: Dict[str, int] = {}
     
     for b in demand_rows:
         material_code = str(b.get("material_code") or "")
@@ -931,12 +945,20 @@ async def calculate_mrp(
             on_order = int(b.get("on_order_qty") or 0)
             net = int(b.get("net_qty") or 0)
             allocated = int(b.get("allocated_qty") or 0)
+            item_type = b.get("item_type")
         else:
             required = math.ceil(p.quantity * qty_per_unit)
             on_hand = on_hand_map.get(material_code, 0)
             on_order = on_order_map.get(material_code, 0)
             net = max(0, required - on_hand - on_order)
             allocated = required - net
+            if bom_source == "engflow_mirror":
+                # 树拼不起来时退回单层：只有"这个料号在同型号更深层出现过"这个事实
+                # 还判得出它是自制总成，其余按采购件处理
+                item_type = "make" if material_code in suspect_parts else "buy"
+            else:
+                # 本地 bom_items 只有一层，判不出自制/采购，如实留空
+                item_type = None
         
         # 采购建议：按供应商 MOQ 向上取整；没有供应商主数据时明确使用
         # 兼容默认 MOQ=100，不能悄悄把默认值当成真实供应商承诺。
@@ -946,6 +968,8 @@ async def calculate_mrp(
         if net > 0:
             shortage_count += 1
             total_shortage += net
+            key = item_type or "unknown"
+            shortage_by_type[key] = shortage_by_type.get(key, 0) + net
         
         items.append({
             "material_id": material_code,
@@ -955,6 +979,8 @@ async def calculate_mrp(
             "qty_per_unit": qty_per_unit,
             "level": b.get("level"),
             "parent_code": b.get("parent_code"),
+            # make=有下级的自制装配件，buy=没有下级的采购件，None=来源结构判不出
+            "item_type": item_type,
             "subassembly_suspect": material_code in suspect_parts,
             "required_qty": required,
             "on_hand_qty": on_hand,
@@ -991,10 +1017,13 @@ async def calculate_mrp(
             INSERT INTO mrp_items
                 (id, mrp_result_id, material_id, material_code, material_name,
                  required_qty, available_qty, reserved_qty, on_order_qty,
-                 shortage_qty, unit)
+                 shortage_qty, unit,
+                 level, parent_code, allocated_qty, item_type)
             VALUES
                 (:id, :mrp_result_id, :material_id, :material_code, :material_name,
-                 :required_qty, :available_qty, 0, :on_order_qty, :shortage_qty, :unit)
+                 :required_qty, :available_qty, 0, :on_order_qty,
+                 :shortage_qty, :unit,
+                 :level, :parent_code, :allocated_qty, :item_type)
         """), {
             "id": str(uuid.uuid4()),
             "mrp_result_id": mrp_result_id,
@@ -1006,6 +1035,11 @@ async def calculate_mrp(
             "on_order_qty": item["on_order_qty"],
             "shortage_qty": item["net_qty"],
             "unit": item["unit"],
+            # 层级结构必须一起落库：下达工单时照原样复制，PMC 才能和 MRP 看同一份口径
+            "level": item["level"],
+            "parent_code": item["parent_code"],
+            "allocated_qty": item["allocated_qty"],
+            "item_type": item["item_type"],
         })
     p.mrp_status = "calculated"
     p.updated_at = calculated_at
@@ -1026,14 +1060,15 @@ async def calculate_mrp(
         "bom_source": bom_source,
         "bom_source_label": bom_source_label(bom_source),
         "bom_product_code": product_code,
-        # 只展开 level=1 直接组件，多层 rolled-up 还没做，别被读成"全部物料"
+        # 展开口径写在结果里：多层展开的是整棵产品结构，单层兜底只到直接组件，
+        # 两者数量差一个量级，不标出来就会被读成同一回事。
         "bom_expansion": (
             f"multi-level-low-level-coding(x{explosion['max_level']}层"
             f"/{explosion['nodes']}节点/{explosion['parts']}料号)"
             if use_multi else "level-1"
         ),
         "bom_expansion_problems": bom_expansion_problems,
-        # 多层 rolled-up 做不了不是漏实现：上传的 BOM 没有父子链，这里把原因和层级分布摊开
+        # 层级分布与"能不能重建父子链"的判据（判据是行序，不是有没有 parent_sap）
         "bom_rollup": await rollup_status(db, p.factory_id, product_code),
         "subassembly_suspect_count": len(suspect_parts),
         "items": items,
@@ -1041,6 +1076,10 @@ async def calculate_mrp(
             "total_materials": len(items),
             "shortage_count": shortage_count,
             "total_shortage_qty": total_shortage,
+            # 缺口按"要买的"和"要自己装的"分开：混在一起就没法直接派活
+            "shortage_by_item_type": shortage_by_type,
+            "make_part_count": sum(1 for i in items if i["item_type"] == "make"),
+            "buy_part_count": sum(1 for i in items if i["item_type"] == "buy"),
         },
     }
     

@@ -12,15 +12,15 @@
 - 显式指定 `version` 时只在本地 `bom_items` 里取该版本（镜像表不分版本）；
 - 两处都没有就返回 ([], "none")：**由调用方决定拒绝还是如实说明，绝不按系数编需求量**。
 
-只展开 `level=1` 的直接组件，**不是暂时没做多层展开，是这份数据做不了**：
-engflow 481,557 行 BOM 里 `parent_sap`（直接父级）**全为空**，473 个型号一个都没有，
-只有 `level` 与 `l2_parent_group` 这种粗分组 —— 没有父子链就没法把单耗沿层连乘，
-硬要 roll-up 等于替用户编造产品结构。要支持真正的多层 MRP，得由 engflow 导入侧
-把父级保留下来（源 Excel 的层级缩进解析成 parent_sap），不是在这里猜。
+多层展开（`explode_requirement`）用前序行序重建父子链，不依赖 `parent_sap`：
+engflow 481,557 行里 `parent_sap` 全为空，但层级 BOM 的结构本来就写在缩进顺序里 ——
+按 `(source_file, original_row_number)` 排好后层深每次最多 +1，
+"某行的直接父级 = 前面最近的一条 level 恰好小 1 的行"。重建结果对 engflow 自己声明的
+`l2_parent_group` 复核过：6 个大型号 25,991 行、一致率 100%、冲突 0。
+行序断掉的行如实进 `problems`，不静默补父级；跨上传文件的型号不做展开（顺序拼不出树）。
 
-所以调用方必须把 `bom_expansion="level-1"` 与 `bom_rollup` 的原因说出去，
-并且用 `subassembly_suspect` 标出那些"在一层出现、在同型号更深层也出现"的件 ——
-它们很可能是装配件而不是原料，按一层净需求直接下采购单会买错东西。
+调用方必须把 `bom_expansion` / `bom_rollup` / `problems` 原样说出去，
+并用 `item_type` 区分采购件（make/buy）—— 自制装配件的缺口不能当采购缺口下 PO。
 """
 
 from __future__ import annotations
@@ -298,6 +298,9 @@ async def explode_requirement(
         net_by_row[node["_index"]] = node["net_qty"]
 
     # 同一料号可能出现在多个位置：按料号汇总毛/净需求，保留最浅层级作为代表
+    # 有下级的是自制装配件（缺口要排产自装），没下级的是采购件（缺口下 PO）。
+    # 混在一个缺口总数里，PMC 就没法把活直接派给对的人。
+    parent_codes = {n["parent_code"] for n in nodes if n["parent_code"]}
     merged: Dict[str, Dict[str, Any]] = {}
     for node in nodes:
         key = node["material_code"]
@@ -311,6 +314,7 @@ async def explode_requirement(
                 "qty_per_unit": node["qty_per_parent"],
                 "level": node["level"],
                 "parent_code": node["parent_code"],
+                "item_type": "make" if key in parent_codes else "buy",
                 "required_qty": math.ceil(node["gross_qty"]),
                 "on_hand_qty": int(node["on_hand_qty"]),
                 "on_order_qty": int(node["on_order_qty"]),
@@ -323,13 +327,19 @@ async def explode_requirement(
             row["required_qty"] += math.ceil(node["gross_qty"])
             row["net_qty"] += int(math.ceil(node["net_qty"]))
             row["allocated_qty"] += int(round(node["allocated_qty"]))
-            row["level"] = min(row["level"], node["level"])
+            # level 与 parent_code 必须成套：报哪一层就写那一层的父级
+            if node["level"] < row["level"]:
+                row["level"] = node["level"]
+                row["parent_code"] = node["parent_code"]
+                row["qty_per_unit"] = node["qty_per_parent"]
 
     return {
         "lines": sorted(merged.values(), key=lambda r: (r["level"], r["material_code"])),
         "nodes": len(nodes),
         "parts": len(merged),
         "max_level": max(n["level"] for n in nodes),
+        "make_parts": sum(1 for r in merged.values() if r["item_type"] == "make"),
+        "buy_parts": sum(1 for r in merged.values() if r["item_type"] == "buy"),
         "problems": problems,
     }
 

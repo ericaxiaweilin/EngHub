@@ -42,7 +42,7 @@ PMC_DATA_CONTRACT = [
         "question": "Shortage怎么处理",
         "source_tables": ["work_order_materials", "purchase_orders", "supplier_materials"],
         "minimum_fields": {
-            "work_order_materials": ["work_order_id", "material_code", "required_qty", "available_qty", "received_qty", "shortage_qty"],
+            "work_order_materials": ["work_order_id", "material_code", "required_qty", "available_qty", "received_qty", "shortage_qty", "level", "parent_code", "item_type"],
             "purchase_orders": ["material_code", "qty", "expected_date", "status"],
         },
         "why": "缺口、在途、ETA和替代供应必须在同一条物料证据链上。",

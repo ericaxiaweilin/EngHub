@@ -1029,6 +1029,21 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
             "\n3. Shortage",
             f"- 受影响工单：{n(shortage.get('affected_work_order_count'))} 张；缺料物料：{n(shortage.get('shortage_material_count'))} 种；缺口合计：{n(shortage.get('total_shortage_qty'))}",
         ])
+        by_type = shortage.get("shortage_by_item_type") or {}
+        if by_type:
+            lines.append(
+                "- 缺口分流："
+                + "；".join(
+                    f"{label} {n(qty)}"
+                    for label, qty in (
+                        ("可采购(buy)", by_type.get("buy")),
+                        ("需自制装配件(make)", by_type.get("make")),
+                        ("来源结构判不出(unknown)", by_type.get("unknown")),
+                    )
+                    if qty
+                )
+                + "。只有 buy 能直接下 PO，make 要先排出上层的装配件工单。"
+            )
         for item in (shortage.get("items") or [])[:10]:
             lines.append(f"- {item.get('material_code')}: 缺 {n(item.get('shortage_qty'))}，影响工单 {','.join(map(str, item.get('affected_work_orders') or [])) or '暂无'}")
         lines.append("- 处理闭环：锁定缺口与受影响工单 → 核实库存/在途/PO ETA → 替代料验证或调整排程 → 齐套后放行。")

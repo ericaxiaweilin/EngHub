@@ -243,6 +243,11 @@ class WorkOrderMaterial(Base):
     received_qty = Column(Integer, default=0)
     available_qty = Column(Integer, default=0)
     shortage_qty = Column(Integer, default=0)
+    # 层级结构随齐套快照一起落库：PMC 要能区分采购件与自制装配件
+    level = Column(Integer, nullable=True)
+    parent_code = Column(String(100), nullable=True)
+    allocated_qty = Column(Integer, nullable=False, default=0)
+    item_type = Column(String(10), nullable=True)
     remark = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 

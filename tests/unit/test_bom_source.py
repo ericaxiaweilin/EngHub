@@ -170,3 +170,54 @@ async def test_no_parent_column_does_not_block_explosion():
     assert by_code["ASSY-A"]["required_qty"] == 20
     assert by_code["RAW-B"]["required_qty"] == 60
     assert by_code["RAW-B"]["parent_code"] == "ASSY-A"
+
+
+@pytest.mark.asyncio
+async def test_item_type_splits_selfmade_from_purchased():
+    """有下级的料号是自制装配件，没下级的才是采购件。
+
+    混成一个缺口总数就派不了活：装配件的缺口要排产自装，不是下 PO。
+    """
+    rows = [_row(1, "ASSY-A", 2, 0), _row(2, "SUB-B", 3, 1), _row(3, "RAW-C", 1, 2)]
+
+    async def execute(statement, params=None):
+        r = MagicMock()
+        if "enghub_bom_items" in str(statement) and "SUM" not in str(statement):
+            r.mappings.return_value.all.return_value = rows
+        else:
+            r.mappings.return_value.all.return_value = []
+        r.scalars.return_value.all.return_value = []
+        return r
+
+    db = MagicMock()
+    db.execute = execute
+    out = await bom_source.explode_requirement(db, "FAC_MECH_001", "A-50-04-F", 10)
+    by_code = {l["material_code"]: l for l in out["lines"]}
+    assert by_code["ASSY-A"]["item_type"] == "make"
+    assert by_code["SUB-B"]["item_type"] == "make"      # 它也有下级
+    assert by_code["RAW-C"]["item_type"] == "buy"
+    assert out["make_parts"] == 2 and out["buy_parts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_merged_placement_keeps_level_and_parent_together():
+    """同一料号出现在多处时，报哪一层就写那一层的父级，不能层与父级来自不同位置。"""
+    rows = [_row(1, "ASSY-A", 1, 0), _row(2, "SHARED", 2, 1), _row(3, "RAW-X", 1, 2),
+            _row(1, "ASSY-B", 1, 3), _row(2, "RAW-Y", 1, 4), _row(2, "SHARED", 5, 5)]
+
+    async def execute(statement, params=None):
+        r = MagicMock()
+        if "enghub_bom_items" in str(statement) and "SUM" not in str(statement):
+            r.mappings.return_value.all.return_value = rows
+        else:
+            r.mappings.return_value.all.return_value = []
+        r.scalars.return_value.all.return_value = []
+        return r
+
+    db = MagicMock()
+    db.execute = execute
+    out = await bom_source.explode_requirement(db, "FAC_MECH_001", "A-50-04-F", 10)
+    shared = [l for l in out["lines"] if l["material_code"] == "SHARED"]
+    assert len(shared) == 1, "同一料号的多处位置要汇总成一行"
+    assert shared[0]["level"] == 2 and shared[0]["parent_code"] in {"ASSY-A", "ASSY-B"}
+    assert shared[0]["required_qty"] == 70, "2×10 + 5×10 两处毛需求都要算进来"

@@ -335,7 +335,8 @@ class PmcControlTowerService:
             params["work_order_code"] = work_order_code
         rows = await self._rows(f"""
             SELECT wom.work_order_id, wo.work_order_code, wo.status, wom.material_code,
-                   wom.material_name, wom.required_qty, wom.available_qty, wom.received_qty, wom.shortage_qty
+                   wom.material_name, wom.required_qty, wom.available_qty, wom.received_qty,
+                   wom.shortage_qty, wom.item_type, wom.level
             FROM work_order_materials wom
             JOIN work_orders wo ON wo.id = wom.work_order_id
             WHERE {where}
@@ -343,6 +344,7 @@ class PmcControlTowerService:
         """, params)
         grouped: Dict[str, Dict[str, Any]] = {}
         affected: Set[str] = set()
+        by_type: Dict[str, float] = {}
         for row in rows:
             code = str(row.get("material_code") or "unknown")
             item = grouped.setdefault(code, {
@@ -351,11 +353,15 @@ class PmcControlTowerService:
                 "shortage_qty": 0,
                 "required_qty": 0,
                 "available_qty": 0,
+                "item_type": row.get("item_type"),
+                "level": row.get("level"),
                 "affected_work_orders": [],
             })
             item["shortage_qty"] += _number(row.get("shortage_qty"))
             item["required_qty"] += _number(row.get("required_qty"))
             item["available_qty"] += _number(row.get("available_qty"))
+            key = str(row.get("item_type") or "unknown")
+            by_type[key] = by_type.get(key, 0) + _number(row.get("shortage_qty"))
             if row.get("work_order_code") not in item["affected_work_orders"]:
                 item["affected_work_orders"].append(row.get("work_order_code"))
             if row.get("work_order_code"):
@@ -363,11 +369,19 @@ class PmcControlTowerService:
         for item in grouped.values():
             for key in ("shortage_qty", "required_qty", "available_qty"):
                 item[key] = round(item[key], 2)
+        for key in list(by_type):
+            by_type[key] = round(by_type[key], 2)
         return {
             "data_status": "ready",
             "source": "work_order_materials.shortage_qty + work_orders",
             "missing_sources": [],
-            "data_note": "当前结果是已落库的工单物料缺口；PO/在途覆盖量需看供应商数据。",
+            # 自制装配件的缺口不能下 PO，要排产把上层的工单排出来才行
+            "data_note": (
+                "当前结果是已落库的工单物料缺口；PO/在途覆盖量需看供应商数据。"
+                "shortage_by_item_type 里 buy=可下采购单的采购件、"
+                "make=要先排产自制的装配件、unknown=来源 BOM 只有一层判不出自制还是采购。"
+            ),
+            "shortage_by_item_type": by_type,
             "affected_work_order_count": len(affected),
             "shortage_material_count": len(grouped),
             "total_shortage_qty": round(sum(item["shortage_qty"] for item in grouped.values()), 2),
