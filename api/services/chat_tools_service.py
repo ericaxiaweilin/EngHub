@@ -2512,41 +2512,131 @@ async def _tool_query_wms_inventory_health(
 
 
 async def _tool_query_shortage_alerts(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
-    """缺料预警：库存 < 补货阈值 min_level"""
+    """缺料预警：可用量低于再订货点的物料。
+
+    原来只遍历 replenishment_thresholds（该表 0 行），于是永远报"没有缺料"，
+    而同一份库存数据按行级水位能算出 371 项低于再订货点 —— 对话与智能体因此
+    互相矛盾。现在与补货建议、过量告警共用 policy.resolve_target 同一口径：
+    物料级配置表有启用行时优先，否则回落到 inventory 行级 reorder_point/
+    safety_stock/reorder_qty。没有水位可判定的物料不参与告警，不做猜测。
+    """
     from sqlalchemy import text as sa_text
+    from api.services.wms_architecture.policy import (
+        CONSUMPTION_TYPES,
+        policy_provenance,
+        resolve_target,
+    )
+
     fid = factory_id or "FAC_ELEC_DEMO_2026"
+    limit = max(1, min(int(args.get("limit") or 50), 200))
+    window_days = max(1, int(args.get("consumption_window_days") or 30))
+
+    cfg_rows = (await db.execute(sa_text("""
+        SELECT material_code, max_stock, safety_stock, reorder_point
+        FROM safety_stock_config
+        WHERE factory_id = :fid AND is_active = TRUE
+    """), {"fid": fid})).mappings().all()
+    configs = {r["material_code"]: dict(r) for r in cfg_rows}
 
     rows = (await db.execute(sa_text("""
-        SELECT rt.material_id, rt.min_level, rt.safety_stock, rt.max_level,
-               rt.reorder_lot_size, rt.reorder_lead_time_hours,
-               COALESCE(inv.total_qty, 0) as current_qty,
-               COALESCE(inv.material_code, rt.material_id) as material_code
-        FROM replenishment_thresholds rt
-        LEFT JOIN (
-            SELECT material_id, material_code, sum(total_qty) as total_qty
-            FROM inventory WHERE factory_id = :fid
-            GROUP BY material_id, material_code
-        ) inv ON inv.material_id = rt.material_id
-        WHERE rt.factory_id = :fid AND rt.active = true
-          AND COALESCE(inv.total_qty, 0) < rt.min_level
-        ORDER BY (rt.min_level - COALESCE(inv.total_qty, 0)) DESC
-    """), {"fid": fid})).fetchall()
+        WITH policy AS (
+            SELECT i.material_id, i.material_code,
+                   MAX(i.material_name) AS material_name,
+                   SUM(COALESCE(i.available_qty, 0)) AS avail,
+                   SUM(COALESCE(i.total_qty, 0)) AS total_qty,
+                   SUM(COALESCE(i.reserved_qty, 0)) AS reserved_qty,
+                   MAX(COALESCE(NULLIF(i.reorder_point, 0), i.safety_stock, 0)) AS reorder_point,
+                   MAX(COALESCE(i.safety_stock, 0)) AS safety_stock,
+                   MAX(COALESCE(i.reorder_qty, 0)) AS reorder_qty,
+                   MAX(i.unit) AS unit
+            FROM inventory i
+            WHERE i.factory_id = :fid
+            GROUP BY i.material_id, i.material_code
+        ),
+        cons AS (
+            SELECT m.material_code, SUM(ABS(t.quantity)) AS consumed
+            FROM inventory_transactions t
+            JOIN (
+                SELECT DISTINCT material_id, material_code
+                FROM inventory WHERE factory_id = :fid
+            ) m ON m.material_id = t.material_id
+            WHERE t.factory_id = :fid
+              AND t.transaction_type = ANY(:types)
+              AND t.created_at >= NOW() - make_interval(days => :days)
+            GROUP BY m.material_code
+        )
+        SELECT p.material_id, p.material_code, p.material_name, p.avail, p.total_qty,
+               p.reserved_qty, p.reorder_point, p.safety_stock, p.reorder_qty, p.unit,
+               COALESCE(c.consumed, 0) AS consumed_window,
+               COUNT(*) OVER () AS total_below,
+               COUNT(*) FILTER (WHERE p.avail <= p.safety_stock) OVER () AS total_critical
+        FROM policy p
+        LEFT JOIN cons c ON c.material_code = p.material_code
+        WHERE p.avail <= p.reorder_point
+        ORDER BY (p.reorder_point - p.avail) DESC
+        LIMIT :cap
+    """), {
+        "fid": fid,
+        "types": list(CONSUMPTION_TYPES),
+        "days": window_days,
+        "cap": limit,
+    })).mappings().all()
 
-    items = [
-        {
-            "material_id": r[0], "material_name": r[7],
-            "current_qty": r[6], "min_level": r[1],
-            "safety_stock": r[2], "max_level": r[3],
-            "gap": r[1] - r[6],
-            "reorder_lot": r[4], "lead_time_hours": r[5],
-            "severity": "critical" if r[6] < r[2] else "warning",
-        }
-        for r in rows
-    ]
+    total_below = int(rows[0]["total_below"]) if rows else 0
+    total_critical = int(rows[0]["total_critical"]) if rows else 0
+    items = []
+    for r in rows:
+        cfg = configs.get(r["material_code"]) or {}
+        reorder_point = float(cfg.get("reorder_point") or r["reorder_point"] or 0)
+        safety_stock = float(cfg.get("safety_stock") or r["safety_stock"] or 0)
+        avail = float(r["avail"] or 0)
+        target, basis = resolve_target(
+            reorder_point=reorder_point,
+            safety_stock=safety_stock,
+            reorder_qty=r["reorder_qty"],
+            max_level=cfg.get("max_stock"),
+        )
+        if target <= 0 or avail > reorder_point:
+            continue
+        consumed = float(r["consumed_window"] or 0)
+        daily = consumed / window_days
+        lot = float(r["reorder_qty"] or 0)
+        items.append({
+            "material_id": r["material_id"],
+            "material_code": r["material_code"],
+            "material_name": r["material_name"] or "",
+            "current_qty": int(avail),
+            "total_qty": int(r["total_qty"] or 0),
+            "reserved_qty": int(r["reserved_qty"] or 0),
+            "min_level": int(reorder_point),
+            "safety_stock": int(safety_stock),
+            "max_level": int(target),
+            "gap": int(reorder_point - avail),
+            "shortage_to_target": int(max(target - avail, 0)),
+            "reorder_lot": int(lot),
+            "unit": r["unit"] or "",
+            "consumed_in_window": int(consumed),
+            "daily_consumption": round(daily, 2),
+            "cover_days": round(avail / daily, 1) if daily > 0 else None,
+            "severity": "critical" if avail <= safety_stock else "warning",
+            "policy_basis": basis,
+        })
+
+    provenance = policy_provenance(len(configs), len(rows))
     critical = [i for i in items if i["severity"] == "critical"]
     return {
-        "factory_id": fid, "shortage_count": len(items),
-        "critical_count": len(critical), "items": items,
+        "factory_id": fid,
+        "shortage_count": total_below,
+        "returned_count": len(items),
+        "critical_count": total_critical,
+        "critical_in_returned": len(critical),
+        "items": items,
+        **provenance,
+        "data_note": (
+            f"低于再订货点共 {total_below} 项（其中 critical {total_critical} 项），"
+            f"按缺口大小返回前 {len(items)} 项；"
+            "cover_days 为 null 表示统计窗口内没有真实消耗流水，不编料需求速度。"
+        ),
     }
 
 
@@ -3426,6 +3516,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "tool": "query_shortage_alerts",
         "keywords": [
             "缺料", "补货", "低于安全库存", "缺料预警", "物料不足",
+            "低于再订货点", "再订货点", "该补多少", "补多少", "水位",
             "库存不足", "低于最低水位", "补货预警", "缺料清单",
         ],
     },

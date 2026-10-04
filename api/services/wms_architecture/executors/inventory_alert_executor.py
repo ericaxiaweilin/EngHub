@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from api.services.wms_architecture.executors.base import BaseWmsExecutor
+from api.services.wms_architecture.policy import resolve_target
 
 
 class InventoryAlertExecutor(BaseWmsExecutor):
@@ -218,8 +219,11 @@ class InventoryAlertExecutor(BaseWmsExecutor):
                 "material_code": r["material_code"],
                 "material_name": r.get("material_name", ""),
                 "current_qty": r["available_qty"],
-                "threshold": round(float(r.get("reorder_point") or r.get("safety_stock") or 0)
-                                   + float(r.get("reorder_qty") or 0), 3),
+                "threshold": resolve_target(
+                    reorder_point=r.get("reorder_point"),
+                    safety_stock=r.get("safety_stock"),
+                    reorder_qty=r.get("reorder_qty"),
+                )[0],
                 "reorder_point": r.get("reorder_point"),
                 "reorder_qty": r.get("reorder_qty"),
                 "excess_qty": round(float(r["available_qty"]) - (
@@ -233,7 +237,7 @@ class InventoryAlertExecutor(BaseWmsExecutor):
             "success": True,
             "items": items,
             "total": len(items),
-            "OVERSTOCK_DEFINITION": "过量 = available_qty > COALESCE(reorder_point, safety_stock) + reorder_qty；表内没有 max_stock 列，不虚构该阈值",
+            "OVERSTOCK_DEFINITION": "过量 = 可用量 > 目标水位（与补货建议同一 resolve_target 口径）；表内没有 max_stock 列，不虚构该阈值",
         }
     
     async def _get_stagnant(
