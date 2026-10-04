@@ -5,12 +5,17 @@ sales outbound, and scrap outbound.
 """
 
 from typing import Any, Dict, Optional
+import uuid
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 
 from api.services.wms_architecture.executors.base import BaseWmsExecutor
-from database.models import Inventory, InventoryTransaction, OutboundOrder
+from api.services.wms_architecture.movements import (
+    apply_movement,
+    document_movement_type,
+)
+from database.models import Inventory, OutboundOrder
 
 
 class OutboundExecutor(BaseWmsExecutor):
@@ -35,8 +40,7 @@ class OutboundExecutor(BaseWmsExecutor):
                 "quantity": int,
                 "warehouse_id": Optional[str],
                 "batch_code": Optional[str],
-                "reference_type": Optional[str],
-                "reference_id": Optional[str],
+                "work_order_id": Optional[str],  # production 领料必填，否则拒绝记账
                 "operator": str,
                 "remark": Optional[str],
                 "outbound_type": str,  # production/sales/scrap
@@ -55,8 +59,6 @@ class OutboundExecutor(BaseWmsExecutor):
         quantity = context.get("quantity", 0)
         warehouse_id = context.get("warehouse_id")
         batch_code = context.get("batch_code")
-        reference_type = context.get("reference_type")
-        reference_id = context.get("reference_id")
         operator = context.get("operator", "system")
         remark = context.get("remark")
         outbound_type = context.get("outbound_type", "production")
@@ -88,35 +90,14 @@ class OutboundExecutor(BaseWmsExecutor):
                 "required_qty": quantity,
             }
         
-        before_qty = inv.total_qty
-        inv.total_qty -= quantity
-        inv.available_qty -= quantity
-        inv.last_movement_at = now
-        inv.updated_at = now
-        
-        # Record transaction
-        txn = InventoryTransaction(
-            id=str(__import__('uuid').uuid4()),
-            factory_id=factory_id,
-            inventory_id=inv.id,
-            material_id=material_id,
-            batch_code=inv.batch_code,
-            transaction_type="outbound",
-            quantity=-quantity,
-            before_qty=before_qty,
-            after_qty=before_qty - quantity,
-            reference_type=reference_type,
-            reference_id=reference_id,
-            operator=operator,
-            remark=remark or f"快速出库 ({outbound_type})",
-            created_at=now,
-        )
-        db.add(txn)
-        
-        # Create outbound order
+        quantity = int(context.get("quantity", 0))
+        work_order_id = context.get("work_order_id")
+        before_qty = int(inv.total_qty or 0)
+
+        # 先立单据，再记账：流水挂的就是这张出库单
         outbound_order = OutboundOrder(
-            id=str(__import__('uuid').uuid4()),
-            outbound_code=f"OUT-{factory_id[:3].upper()}{datetime.now().strftime('%Y%m%d')}-{str(__import__('uuid').uuid4())[:6].upper()}",
+            id=str(uuid.uuid4()),
+            outbound_code=f"OUT-{factory_id[:3].upper()}{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}",
             factory_id=factory_id,
             warehouse_id=inv.warehouse_id,
             material_id=material_id,
@@ -124,13 +105,29 @@ class OutboundExecutor(BaseWmsExecutor):
             quantity=quantity,
             batch_code=inv.batch_code,
             outbound_type=outbound_type,
+            work_order_id=work_order_id,
             status="completed",
             created_by=operator,
             created_at=now,
             completed_at=now,
         )
         db.add(outbound_order)
-        
+        await db.flush()
+
+        txn = await apply_movement(
+            db,
+            inventory=inv,
+            transaction_type=document_movement_type("out", outbound_type),
+            quantity=quantity,
+            reference_type="outbound_order",
+            reference_id=outbound_order.id,
+            reference_doc_no=outbound_order.outbound_code,
+            work_order_id=work_order_id,
+            operator=operator,
+            remark=remark or f"出库过账 ({outbound_type})",
+        )
+        inv.updated_at = now
+
         await db.commit()
         await db.refresh(inv)
         
@@ -141,12 +138,13 @@ class OutboundExecutor(BaseWmsExecutor):
             "material_code": inv.material_code,
             "quantity": quantity,
             "before_qty": before_qty,
-            "after_qty": before_qty - quantity,
+            "after_qty": txn.after_qty,
             "warehouse_id": inv.warehouse_id,
             "batch_code": inv.batch_code,
             "operator": operator,
             "time": now.isoformat(),
             "outbound_order_id": outbound_order.id,
+            "transaction_id": txn.id,
         }
     
     def can_handle(self, operation: str) -> bool:

@@ -77,12 +77,21 @@ class InboundCreate(BaseModel):
     purchase_order_id: Optional[str] = None
     unit_cost: Optional[float] = None
     location_id: Optional[str] = None
+    # 端点文档写着支持采购/生产/退货入库，但模型一直没这个字段，
+    # 调用方传了会被 pydantic 丢掉、一律按 purchase 走 IQC 门。
+    inbound_type: str = "purchase"
 
 
 class OutboundCreate(BaseModel):
     factory_id: str
     warehouse_id: str
     material_id: str
+    # 原来只有 3 个字段，而路由读 outbound.quantity -> AttributeError，
+    # 线上 POST /inventory/outbound 恒 500（实测 500 "'OutboundCreate' object has no attribute 'quantity'"）
+    quantity: float
+    work_order_id: Optional[str] = None
+    batch_code: Optional[str] = None
+    outbound_type: str = "production"
 
 # ============== Inventory Pydantic Models ==============
 
@@ -114,12 +123,6 @@ class InventoryDeleteResponse(BaseModel):
 
 
 # --- Existing models continue below ---
-class InboundCreate(BaseModel):
-    quantity: float
-    work_order_id: Optional[str] = None
-    batch_code: Optional[str] = None
-
-
 class CountItem(BaseModel):
     material_id: str
     batch_code: Optional[str] = None
@@ -513,6 +516,7 @@ async def create_inbound(
             purchase_order_id=inbound.purchase_order_id,
             unit_cost=inbound.unit_cost,
             location_id=inbound.location_id,
+            inbound_type=inbound.inbound_type,
             created_by=current_user.username,
         )
         
@@ -549,6 +553,7 @@ async def create_outbound(
             quantity=int(outbound.quantity),
             work_order_id=outbound.work_order_id,
             batch_code=outbound.batch_code,
+            outbound_type=outbound.outbound_type,
             created_by=current_user.username,
         )
         
@@ -556,7 +561,6 @@ async def create_outbound(
             "id": result.id,
             "outbound_code": result.outbound_code,
             "status": result.status,
-            "outbound_batches": []
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

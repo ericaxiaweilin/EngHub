@@ -9,6 +9,10 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.services.wms_architecture.movements import (
+    apply_movement,
+    document_movement_type,
+)
 from database.models import (
     Inventory, InboundOrder, OutboundOrder,
     InventoryTransaction, InventoryCount, InventoryCountItem,
@@ -722,17 +726,30 @@ class InventoryService:
         )
         
         self.db.add(inbound)
+        await self.db.flush()  # 先拿到 inbound.id，流水才能挂上单据锚点
         
-        # 更新或创建库存记录
-        await self._update_inventory_after_inbound(
+        # 定位库存行（数量由下面的记账原语统一变更）
+        inventory = await self._resolve_inbound_inventory_row(
             factory_id=factory_id,
             warehouse_id=warehouse_id,
             material_id=material_id,
             material_code=material_code,
-            quantity=quantity,
             batch_code=batch_code,
             location_id=location_id,
             unit_cost=unit_cost,
+        )
+        
+        # 数量与流水同事务落库：过账失败就让整单回滚，不留"有单无账"
+        await apply_movement(
+            self.db,
+            inventory=inventory,
+            transaction_type=document_movement_type("in", inbound_type),
+            quantity=quantity,
+            reference_type="inbound_order",
+            reference_id=inbound.id,
+            reference_doc_no=inbound.inbound_code,
+            operator=created_by,
+            remark=f"入库过账（{inbound_type}）",
         )
         
         await self.db.commit()
@@ -740,49 +757,58 @@ class InventoryService:
         
         return inbound
     
-    async def _update_inventory_after_inbound(
+    async def _resolve_inbound_inventory_row(
         self,
         factory_id: str,
         warehouse_id: str,
         material_id: str,
         material_code: str,
-        quantity: int,
         batch_code: Optional[str] = None,
         location_id: Optional[str] = None,
         unit_cost: Optional[float] = None,
-    ):
-        """入库后更新库存"""
-        # 查找现有库存记录
+    ) -> Inventory:
+        """找出这笔入库该落到哪一行库存；没有就建一条 0 量的新批次行。
+
+        数量的唯一变更入口是 movements.apply_movement —— 这里再加一次 quantity
+        就会出现"库存涨两遍、流水只记一条"。
+        """
+        # batch_code 为空时必须用 IS NULL：`= NULL` 永远不成立，
+        # 原来每笔无批次入库都会另建一行库存，而不是累加。
+        batch_match = (
+            Inventory.batch_code.is_(None)
+            if batch_code is None
+            else Inventory.batch_code == batch_code
+        )
         query = select(Inventory).where(
             Inventory.factory_id == factory_id,
             Inventory.warehouse_id == warehouse_id,
             Inventory.material_id == material_id,
-            Inventory.batch_code == batch_code,
+            batch_match,
         )
         
         if location_id:
             query = query.where(Inventory.location_id == location_id)
         
-        result = await self.db.execute(query)
-        inventory = result.scalar_one_or_none()
-        
+        inventory = (
+            await self.db.execute(query.order_by(Inventory.created_at.asc()))
+        ).scalars().first()
         if inventory:
-            inventory.total_qty += quantity
-            inventory.available_qty += quantity
-        else:
-            # 创建新库存记录
-            inventory = Inventory(
-                material_id=material_id,
-                material_code=material_code,
-                factory_id=factory_id,
-                warehouse_id=warehouse_id,
-                location_id=location_id,
-                batch_code=batch_code,
-                total_qty=quantity,
-                available_qty=quantity,
-                unit_cost=unit_cost,
-            )
-            self.db.add(inventory)
+            return inventory
+        
+        inventory = Inventory(
+            material_id=material_id,
+            material_code=material_code,
+            factory_id=factory_id,
+            warehouse_id=warehouse_id,
+            location_id=location_id,
+            batch_code=batch_code,
+            total_qty=0,
+            available_qty=0,
+            unit_cost=unit_cost,
+        )
+        self.db.add(inventory)
+        await self.db.flush()  # 流水要引用 inventory_id，新建行得先有主键
+        return inventory
     
     async def create_outbound(
         self,
@@ -814,30 +840,50 @@ class InventoryService:
         )
         
         self.db.add(outbound)
+        await self.db.flush()  # 先拿到 outbound.id，流水才能挂单据锚点
         
-        # 扣减库存
-        await self._update_inventory_after_outbound(
+        # FIFO 先分配批次，再逐批次记账：一批一条流水，才回溯得到扣了哪个批次
+        movement_type = document_movement_type("out", outbound_type)
+        for inventory, deduct_qty in await self._allocate_fifo_batches(
             factory_id=factory_id,
             warehouse_id=warehouse_id,
             material_id=material_id,
             quantity=quantity,
             batch_code=batch_code,
-        )
+        ):
+            await apply_movement(
+                self.db,
+                inventory=inventory,
+                transaction_type=movement_type,
+                quantity=deduct_qty,
+                reference_type="outbound_order",
+                reference_id=outbound.id,
+                reference_doc_no=outbound.outbound_code,
+                work_order_id=work_order_id,
+                operator=created_by,
+                remark=f"出库过账（{outbound_type}）",
+            )
         
         await self.db.commit()
         await self.db.refresh(outbound)
         
         return outbound
     
-    async def _update_inventory_after_outbound(
+    async def _allocate_fifo_batches(
         self,
         factory_id: str,
         warehouse_id: str,
         material_id: str,
         quantity: int,
         batch_code: Optional[str] = None,
-    ):
-        """出库后扣减库存"""
+    ) -> List[tuple]:
+        """按 FIFO 决定每个批次扣多少 —— 只分配，不改数量。
+        
+        数量的变更统一交给 apply_movement，避免"库存扣两次、流水记一条"。
+        """
+        if quantity <= 0:
+            raise ValueError(f"出库数量必须是正整数，收到 {quantity!r}")
+        
         # 查找库存记录（FIFO 策略：优先使用最早批次）
         query = select(Inventory).where(
             Inventory.factory_id == factory_id,
@@ -854,17 +900,19 @@ class InventoryService:
         inventories = result.scalars().all()
         
         remaining_qty = quantity
+        allocations: List[tuple] = []
         for inventory in inventories:
             if remaining_qty <= 0:
                 break
-            
-            deduct_qty = min(remaining_qty, inventory.available_qty)
-            inventory.available_qty -= deduct_qty
-            inventory.total_qty -= deduct_qty
+            deduct_qty = min(remaining_qty, int(inventory.available_qty or 0))
+            if deduct_qty <= 0:
+                continue
+            allocations.append((inventory, deduct_qty))
             remaining_qty -= deduct_qty
         
         if remaining_qty > 0:
             raise ValueError(f"Insufficient inventory. Short by {remaining_qty}")
+        return allocations
     
     async def reserve_inventory(
         self,

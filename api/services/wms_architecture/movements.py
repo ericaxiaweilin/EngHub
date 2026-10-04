@@ -1,4 +1,4 @@
-"""库存流水类型词表 —— 从唯一枚举派生，不再手抄字符串。
+"""库存流水的唯一词表 + 唯一写入原语 —— 数量与流水必须同时落。
 
 历史上这里有三套词汇并存：
 
@@ -12,9 +12,13 @@
 遗留字面量显式标注为 legacy 并等待迁移。
 """
 
+import uuid
+from datetime import datetime
 from enum import Enum
+from typing import Any, Dict, Optional
 
 from core.wms.inventory import TransactionType
+from database.models import InventoryTransaction
 
 
 def _values(suffix: str) -> tuple:
@@ -49,6 +53,124 @@ ALL_TYPES = CONSUMPTION_TYPES + RECEIPT_TYPES + INTERNAL_TYPES
 # 待迁移的遗留字面量（写入侧应改用枚举值，之后从这里删除）。
 LEGACY_WRITE_STRINGS = ("inbound", "outbound", "transfer")
 
+
+# ── 写入侧唯一原语 ─────────────────────────────────────────────────────
+#
+# "有单无账"的根因：单据落了库、库存数量也改了，唯独流水没写。
+# 所以这里把"改数量 + 记流水"合成一个动作，并强制要求可追溯锚点：
+# 宁可让收货/出库当场失败，也不留一笔回溯不到的库存量。
+
+# 领料必须挂到工单（成本与齐套要归到对象）；销售出库的锚点是单据本身。
+WORK_ORDER_ANCHORED_TYPES = (TransactionType.PRODUCTION_OUT.value,)
+
+INBOUND_TYPE_BY_DOC: Dict[str, TransactionType] = {
+    "purchase": TransactionType.PURCHASE_IN,
+    "production": TransactionType.PRODUCTION_IN,
+    "return": TransactionType.RETURN_IN,
+    "adjustment": TransactionType.ADJUSTMENT_IN,
+}
+OUTBOUND_TYPE_BY_DOC: Dict[str, TransactionType] = {
+    "production": TransactionType.PRODUCTION_OUT,
+    "sales": TransactionType.SALES_OUT,
+    "shipment": TransactionType.SALES_OUT,
+    "scrap": TransactionType.SCRAP_OUT,
+    "adjustment": TransactionType.ADJUSTMENT_OUT,
+}
+
+
+class MovementError(ValueError):
+    """记不了账：锚点缺失、数量不合法或类型认不出来。"""
+
+
+def document_movement_type(direction: str, doc_type: Optional[str]) -> str:
+    """单据类型 -> 规范流水类型。认不出来就拒，不再新增第 4 套写法。"""
+    table = {"in": INBOUND_TYPE_BY_DOC, "out": OUTBOUND_TYPE_BY_DOC}.get(direction)
+    if table is None:
+        raise MovementError(f"未知的记账方向 {direction!r}（只支持 in/out）")
+    member = table.get((doc_type or "").strip().lower())
+    if member is None:
+        raise MovementError(
+            f"{'入库' if direction == 'in' else '出库'}类型 {doc_type!r} 无法映射到流水词表，"
+            f"可用值：{'、'.join(sorted(table))}"
+        )
+    return member.value
+
+
+async def apply_movement(
+    db: Any,
+    *,
+    inventory: Any,
+    transaction_type: str,
+    quantity: int,
+    reference_type: str,
+    reference_id: str,
+    reference_doc_no: str,
+    work_order_id: Optional[str] = None,
+    operator: Optional[str] = None,
+    remark: Optional[str] = None,
+) -> Any:
+    """同一事务里改一处库存并记一条流水。quantity 恒为正，方向由流水类型决定。
+
+    线上已有的 183 条流水就是"正数量 + 类型带方向"的约定，沿用它，不改成有符号数。
+    """
+    qty = int(quantity)
+    if qty <= 0:
+        raise MovementError(f"流水数量必须是正整数，收到 {quantity!r}")
+    if not (reference_id or "").strip() or not (reference_doc_no or "").strip():
+        raise MovementError("流水缺少单据锚点（reference_id / reference_doc_no），拒绝记账")
+    if transaction_type in LEGACY_WRITE_STRINGS:
+        raise MovementError(
+            f"{transaction_type!r} 是待迁移的遗留字面量，新流水一律写规范类型"
+            f"（{TransactionType.PURCHASE_IN.value}/{TransactionType.PRODUCTION_OUT.value} 等）"
+        )
+    if transaction_type in WORK_ORDER_ANCHORED_TYPES and not (work_order_id or "").strip():
+        raise MovementError(f"{transaction_type} 必须挂 work_order_id，否则领料归不到工单")
+    if transaction_type in CONSUMPTION_TYPES:
+        delta = -qty
+    elif transaction_type in RECEIPT_TYPES:
+        delta = qty
+    else:
+        raise MovementError(
+            f"{transaction_type} 既不是收货也不是消耗类型；调拨/盘点要成对记账，走各自路径"
+        )
+
+    before = int(inventory.total_qty or 0)
+    after = before + delta
+    if after < 0:
+        raise MovementError(
+            f"库存 {inventory.id} 不足以扣减 {qty}（当前 total_qty={before}）"
+        )
+    available = int(inventory.available_qty or 0)
+    if available + delta < 0:
+        raise MovementError(
+            f"可用量不足：batch={inventory.batch_code} available={available} 需扣 {qty}"
+        )
+    inventory.total_qty = after
+    inventory.available_qty = available + delta
+    inventory.last_movement_at = datetime.utcnow()
+
+    txn = InventoryTransaction(
+        id=str(uuid.uuid4()),
+        factory_id=inventory.factory_id,
+        inventory_id=inventory.id,
+        material_id=inventory.material_id,
+        batch_code=inventory.batch_code,
+        transaction_type=transaction_type,
+        quantity=qty,
+        before_qty=before,
+        after_qty=after,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        reference_doc_no=reference_doc_no,
+        work_order_id=work_order_id,
+        operator=operator,
+        remark=remark,
+        created_at=datetime.utcnow(),
+    )
+    db.add(txn)
+    return txn
+
+
 __all__ = [
     "CONSUMPTION_TYPES",
     "RECEIPT_TYPES",
@@ -57,5 +179,9 @@ __all__ = [
     "INBOUND_TYPES",
     "ALL_TYPES",
     "LEGACY_WRITE_STRINGS",
+    "WORK_ORDER_ANCHORED_TYPES",
+    "MovementError",
+    "document_movement_type",
+    "apply_movement",
     "TransactionType",
 ]

@@ -5,12 +5,17 @@ production inbound, and return inbound.
 """
 
 from typing import Any, Dict, Optional
+import uuid
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 
 from api.services.wms_architecture.executors.base import BaseWmsExecutor
-from database.models import Inventory, InventoryTransaction, InboundOrder
+from api.services.wms_architecture.movements import (
+    apply_movement,
+    document_movement_type,
+)
+from database.models import Inventory, InboundOrder
 
 
 class InboundExecutor(BaseWmsExecutor):
@@ -76,71 +81,13 @@ class InboundExecutor(BaseWmsExecutor):
         inbound_type = context.get("inbound_type", "purchase")
         
         now = datetime.utcnow()
-        
-        # Find or create inventory record
-        inv_stmt = select(Inventory).where(
-            and_(
-                Inventory.factory_id == factory_id,
-                Inventory.material_id == material_id,
-                Inventory.warehouse_id == warehouse_id,
-                Inventory.batch_code == batch_code,
-            )
-        )
-        inv_result = await db.execute(inv_stmt)
-        inv = inv_result.scalar_one_or_none()
-        
-        before_qty = 0
-        if inv:
-            before_qty = inv.total_qty
-            inv.total_qty += quantity
-            inv.available_qty += quantity
-            inv.last_movement_at = now
-            inv.updated_at = now
-        else:
-            inv = Inventory(
-                id=str(__import__('uuid').uuid4()),
-                material_id=material_id,
-                material_code=material_code,
-                material_name=material_name,
-                factory_id=factory_id,
-                warehouse_id=warehouse_id,
-                location_id=location_id,
-                batch_code=batch_code,
-                total_qty=quantity,
-                available_qty=quantity,
-                reserved_qty=0,
-                unit=unit,
-                status="available",
-                last_movement_at=now,
-                created_at=now,
-                updated_at=now,
-            )
-            db.add(inv)
-        
-        # Record transaction
-        txn = InventoryTransaction(
-            id=str(__import__('uuid').uuid4()),
-            factory_id=factory_id,
-            inventory_id=inv.id,
-            material_id=material_id,
-            batch_code=batch_code,
-            transaction_type="inbound",
-            quantity=quantity,
-            before_qty=before_qty,
-            after_qty=before_qty + quantity,
-            reference_type=reference_type,
-            reference_id=reference_id,
-            reference_doc_no=purchase_order_id,
-            operator=operator,
-            remark=remark or f"快速入库 ({inbound_type})",
-            created_at=now,
-        )
-        db.add(txn)
-        
-        # Create inbound order
+        inbound_type = context.get("inbound_type", "purchase")
+        quantity = int(context.get("quantity", 0))
+
+        # 先立单据：流水要挂得住这张单，数量与流水才不会分家
         inbound_order = InboundOrder(
-            id=str(__import__('uuid').uuid4()),
-            inbound_code=f"IN-{factory_id[:3].upper()}{datetime.now().strftime('%Y%m%d')}-{str(__import__('uuid').uuid4())[:6].upper()}",
+            id=str(uuid.uuid4()),
+            inbound_code=f"IN-{factory_id[:3].upper()}{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}",
             factory_id=factory_id,
             warehouse_id=warehouse_id,
             material_id=material_id,
@@ -156,17 +103,68 @@ class InboundExecutor(BaseWmsExecutor):
             completed_at=now,
         )
         db.add(inbound_order)
-        
+        await db.flush()
+
+        # Find or create inventory record（数量只由记账原语改，这里建行给 0）
+        inv_stmt = select(Inventory).where(
+            and_(
+                Inventory.factory_id == factory_id,
+                Inventory.material_id == material_id,
+                Inventory.warehouse_id == warehouse_id,
+                Inventory.batch_code == batch_code,
+            )
+        )
+        inv_result = await db.execute(inv_stmt)
+        inv = inv_result.scalar_one_or_none()
+
+        if not inv:
+            inv = Inventory(
+                id=str(uuid.uuid4()),
+                material_id=material_id,
+                material_code=material_code,
+                material_name=material_name,
+                factory_id=factory_id,
+                warehouse_id=warehouse_id,
+                location_id=location_id,
+                batch_code=batch_code,
+                total_qty=0,
+                available_qty=0,
+                reserved_qty=0,
+                unit=unit,
+                status="available",
+                last_movement_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(inv)
+            await db.flush()
+
+        before_qty = int(inv.total_qty or 0)
+        txn = await apply_movement(
+            db,
+            inventory=inv,
+            transaction_type=document_movement_type("in", inbound_type),
+            quantity=quantity,
+            reference_type="inbound_order",
+            reference_id=inbound_order.id,
+            reference_doc_no=inbound_order.inbound_code,
+            work_order_id=context.get("work_order_id"),
+            operator=operator,
+            remark=remark or f"入库过账 ({inbound_type})",
+        )
+        inv.updated_at = now
+
         await db.commit()
         await db.refresh(inv)
-        
+
         return {
             "success": True,
             "type": "inbound",
+            "material_id": material_id,
             "material_code": material_code,
             "quantity": quantity,
             "before_qty": before_qty,
-            "after_qty": before_qty + quantity,
+            "after_qty": txn.after_qty,
             "warehouse_id": warehouse_id,
             "batch_code": batch_code,
             "purchase_order_id": purchase_order_id,
@@ -174,6 +172,7 @@ class InboundExecutor(BaseWmsExecutor):
             "operator": operator,
             "time": now.isoformat(),
             "inbound_order_id": inbound_order.id,
+            "transaction_id": txn.id,
         }
     
     def can_handle(self, operation: str) -> bool:
