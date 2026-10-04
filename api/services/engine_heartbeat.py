@@ -33,6 +33,8 @@ LOOP_INTERVAL_SECONDS: Dict[str, int] = {
     "skill-seed": 300,
     "followup-scanner": 120,
     "commander-watch": 300,
+    # 路线回填循环自己逐轮报心跳（含看了几个产品、回填几张工单）
+    "routing-backfill": 900,
 }
 
 

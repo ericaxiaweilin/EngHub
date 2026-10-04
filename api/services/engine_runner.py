@@ -28,13 +28,15 @@ _tasks: "set[asyncio.Task]" = set()
 def _loop_makers() -> List[Tuple[str, Callable[[], Coroutine[Any, Any, Any]], bool]]:
     """(循环名, 协程工厂, 是否自己报每轮心跳)。
 
-    只有 periodic-scheduler 会逐轮写心跳（它就是引擎的心脏，30 秒一轮）；
-    其余四个内部各自 sleep，这里只记录启动与崩溃，不谎报"还在跳"。
+    periodic-scheduler 是引擎的心脏（30 秒一轮、真实耗时叠加）；model-warmup /
+    followup-scanner / commander-watch / routing-backfill 也都逐轮报心跳，
+    报的是这一轮真实干了多少活，不再只证明"起了没崩"。
     """
     import main as enghub_main
     from api.routes.chat_routes import model_warmup_loop
     from api.services.factory_commander import commander_watch_loop
     from api.services.followup_task_service import followup_scanner_loop
+    from api.services.routing_backfill import routing_backfill_loop
     from scripts.seed_skills_startup import run_skill_seed
 
     return [
@@ -43,6 +45,7 @@ def _loop_makers() -> List[Tuple[str, Callable[[], Coroutine[Any, Any, Any]], bo
         ("skill-seed", run_skill_seed, False),
         ("followup-scanner", followup_scanner_loop, False),
         ("commander-watch", commander_watch_loop, False),
+        ("routing-backfill", routing_backfill_loop, True),
     ]
 
 

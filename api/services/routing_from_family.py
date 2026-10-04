@@ -53,7 +53,11 @@ def _matches(operation_name: str, corpus: str) -> bool:
 
 
 async def _model_corpus(db: AsyncSession, factory_id: str, product_model: str) -> str:
-    """型号自己 BOM 行上的文本（品名 + L3 上下文），作为工序佐证的材料。"""
+    """型号 BOM 行上的文本（品名 + L3 上下文），作为工序佐证的材料。
+
+    和 `bom_source.latest_bom_lines` 同一份口径：engflow 镜像优先，镜像没有这个型号
+    才用本地 `bom_items` —— 否则本地建过 BOM 的产品会被误判成"无法佐证"。
+    """
     rows = (await db.execute(text("""
         SELECT description, l3_context
         FROM enghub_bom_items
@@ -61,7 +65,16 @@ async def _model_corpus(db: AsyncSession, factory_id: str, product_model: str) -
           AND (description IS NOT NULL OR l3_context IS NOT NULL)
         LIMIT 6000
     """), {"fid": factory_id, "pid": product_model})).mappings().all()
-    return " ".join(f"{r['description'] or ''} {r['l3_context'] or ''}" for r in rows)
+    corpus = " ".join(f"{r['description'] or ''} {r['l3_context'] or ''}" for r in rows)
+    if corpus.strip():
+        return corpus
+    local = (await db.execute(text("""
+        SELECT material_name
+        FROM bom_items
+        WHERE factory_id = :fid AND product_id = :pid AND material_name IS NOT NULL
+        LIMIT 4000
+    """), {"fid": factory_id, "pid": product_model})).scalars().all()
+    return " ".join(str(name or "") for name in local)
 
 
 async def _reference_routings(db: AsyncSession, factory_id: str) -> List[Routing]:
