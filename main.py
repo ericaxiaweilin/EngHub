@@ -348,12 +348,14 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 交期智能体任务异常: {e}")
 
-        # 虚拟工厂脉搏 —— 每 60 分钟按真实节奏接单/拆单/报工/预警
+        # 虚拟工厂脉搏 —— 每 120 分钟按真实节奏接单/拆单/报工/预警
+        # 原为 60 分钟：测试/开发阶段每次 pulse 都会真实落库（报工/工单/订单/通知），
+        # 放慢一倍直接把写入量减半，压掉 WAL 与表膨胀。节奏参数在 PulseConfig 里。
         try:
             import time as _t_vf
             if not hasattr(_periodic_scheduler, "_last_virtual_factory"):
                 _periodic_scheduler._last_virtual_factory = 0
-            if _t_vf.time() - _periodic_scheduler._last_virtual_factory > 3600:  # 60min
+            if _t_vf.time() - _periodic_scheduler._last_virtual_factory > 7200:  # 120min
                 _periodic_scheduler._last_virtual_factory = _t_vf.time()
                 from api.services.virtual_factory_service import PulseConfig, VirtualFactoryService
                 async with db_config.session_factory() as db:

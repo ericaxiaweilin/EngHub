@@ -15,9 +15,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, text
+from sqlalchemy import bindparam, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.services.virtual_factory_clock import get_clock
 from database.models import (
     Notification,
     ProcessAnalysis,
@@ -33,6 +34,11 @@ DEFAULT_MONTHLY_CONTAINERS = 300
 DEFAULT_ORDER_DAYS = 90
 DEFAULT_FACTORY_ID = "FAC_ELEC_DEMO_2026"
 VIRTUAL_MARKER = "[virtual_factory]"
+# 种子数据（IE 基线）建过一次后，多久内不再重复检查（秒）
+SEED_CLAIM_TTL_SECONDS = 24 * 3600
+# 同一工单的节奏预警多久内只落一条通知（秒）。
+# 原实现每轮都插 Notification，是最典型的写入放大。
+ALERT_CLAIM_TTL_SECONDS = 6 * 3600
 
 
 @dataclass
@@ -43,6 +49,10 @@ class PulseConfig:
     target_active_orders: int = 6
     max_new_orders_per_pulse: int = 1
     operator: str = "virtual_factory"
+    # 仿真时钟：每次 pulse 推进多少仿真小时。时钟与事件都在内存，不下盘。
+    sim_step_hours: float = 2.0
+    # 事件队列上界，超出丢最旧的 —— 队列本身不能变成新的写入放大源。
+    event_queue_max: int = 200
 
     @property
     def daily_capacity(self) -> int:
@@ -57,9 +67,13 @@ class VirtualFactoryService:
 
     async def pulse(self, config: Optional[PulseConfig] = None) -> Dict[str, Any]:
         cfg = config or PulseConfig()
+        clock = get_clock()
+
         product = await self._ensure_virtual_product(cfg.factory_id, cfg.operator)
         stations = await self._ensure_virtual_stations(cfg.factory_id, cfg.operator)
-        await self._ensure_ie_baseline(cfg.factory_id, product.product_code, stations, cfg.operator)
+        # 种子只需建一次：用内存标记挡住每轮的重复查询与潜在插入
+        if await clock.claim(cfg.factory_id, "seed:ie", SEED_CLAIM_TTL_SECONDS):
+            await self._ensure_ie_baseline(cfg.factory_id, product.product_code, stations, cfg.operator)
 
         active_orders = await self._active_virtual_masters(cfg.factory_id)
         created_orders: List[Dict[str, Any]] = []
@@ -72,11 +86,36 @@ class VirtualFactoryService:
         alerts = await self._guard_and_notify(cfg)
         await self.db.commit()
 
+        # 仿真时钟与事件队列：内存推进，不落库
+        sim_now = await clock.advance(cfg.factory_id, cfg.sim_step_hours)
+        events: List[Dict[str, Any]] = []
+        for order in created_orders:
+            events.append({
+                "type": "order_created",
+                "at": sim_now.isoformat(),
+                "work_order_code": order.get("work_order_code"),
+                "sales_order_code": order.get("sales_order_code"),
+            })
+        if advanced.get("reports_created"):
+            events.append({
+                "type": "progress_reported",
+                "at": sim_now.isoformat(),
+                "reports_created": advanced["reports_created"],
+                "containers_reported": advanced["containers_reported"],
+            })
+        for alert in alerts:
+            events.append({"type": "rhythm_lag", "at": sim_now.isoformat(), **alert})
+        await clock.push_events(cfg.factory_id, events, max_len=cfg.event_queue_max)
+
         status = await self.status(cfg.factory_id)
         return {
             "success": True,
             "factory_id": cfg.factory_id,
             "pulse_at": datetime.utcnow().isoformat(),
+            "sim_now": sim_now.isoformat(),
+            "sim_step_hours": cfg.sim_step_hours,
+            "clock_backend": clock.backend,
+            "events_emitted": len(events),
             "rhythm": {
                 "monthly_capacity_containers": cfg.monthly_capacity_containers,
                 "daily_capacity_containers": cfg.daily_capacity,
@@ -128,12 +167,17 @@ class VirtualFactoryService:
             ProductionReport.factory_id == factory_id,
             ProductionReport.created_by == "virtual_factory",
         ))
+        clock = get_clock()
         return {
             "factory_id": factory_id,
             "active_virtual_orders": len(active),
             "virtual_sales_orders": int(order_count.scalar() or 0),
             "virtual_report_count": len(report_count.scalars().all()),
             "open_work_orders": open_rows,
+            # 仿真时钟与事件队列都在内存（Redis），不落库、不新增表
+            "sim_now": (await clock.now(factory_id)).isoformat(),
+            "clock_backend": clock.backend,
+            "recent_events": await clock.recent_events(factory_id, limit=20),
         }
 
     async def _ensure_virtual_product(self, factory_id: str, operator: str) -> Product:
@@ -170,11 +214,13 @@ class VirtualFactoryService:
         ]
         stations: List[Station] = []
         station_columns = await self._table_columns("stations")
+        # 一次查全部（原来是每个工位一条 SELECT）
+        existing = {s.station_code: s for s in (await self.db.execute(select(Station).where(
+            Station.factory_id == factory_id,
+            Station.station_code.in_([spec[0] for spec in specs]),
+        ))).scalars().all()}
         for code, name, stype, cap in specs:
-            station = (await self.db.execute(select(Station).where(
-                Station.factory_id == factory_id,
-                Station.station_code == code,
-            ))).scalar_one_or_none()
+            station = existing.get(code)
             if not station:
                 row = {
                     "id": str(uuid.uuid4()),
@@ -430,6 +476,9 @@ class VirtualFactoryService:
         containers_reported = 0
         per_order_daily = max(1, cfg.daily_capacity // max(1, len(masters)))
         station_by_code = {s.station_code: s for s in stations}
+        # 订单状态先攒起来，循环结束后按状态各合成一条 UPDATE
+        done_order_ids: List[str] = []
+        wip_order_ids: List[str] = []
 
         for master in masters:
             if master.planned_start and master.planned_start > today_end:
@@ -478,20 +527,25 @@ class VirtualFactoryService:
             master.next_station = "终检/OQC" if (master.completed_qty or 0) > (master.planned_qty or 1) * 0.8 else "主线生产"
             if master.status == "completed":
                 master.actual_complete = datetime.utcnow()
-                await self.db.execute(text("""
-                    UPDATE sales_orders
-                    SET status = 'completed', updated_at = :now
-                    WHERE id = :id
-                """), {"now": datetime.utcnow(), "id": master.sales_order_id})
+                done_order_ids.append(master.sales_order_id)
             else:
-                await self.db.execute(text("""
-                    UPDATE sales_orders
-                    SET status = 'in_progress', updated_at = :now
-                    WHERE id = :id
-                """), {"now": datetime.utcnow(), "id": master.sales_order_id})
+                wip_order_ids.append(master.sales_order_id)
 
             reports_created += 1
             containers_reported += qty
+
+        # 原来是每个工单一句 UPDATE，这里按状态各合成一句
+        batch_stmt = text("""
+            UPDATE sales_orders
+            SET status = :status, updated_at = :now
+            WHERE id IN :ids
+        """).bindparams(bindparam("ids", expanding=True))
+        for status_value, ids in (("completed", done_order_ids), ("in_progress", wip_order_ids)):
+            ids = [i for i in ids if i]
+            if ids:
+                await self.db.execute(
+                    batch_stmt, {"status": status_value, "now": datetime.utcnow(), "ids": ids}
+                )
 
         return {
             "reports_created": reports_created,
@@ -516,6 +570,12 @@ class VirtualFactoryService:
                     "summary": f"虚拟工厂节奏落后：计划应达 {expected_progress:.1f}%，当前 {progress:.1f}%",
                 }
                 alerts.append(alert)
+                # 同一工单在 TTL 内只落一条通知（原实现每轮都插）
+                if not await get_clock().claim(
+                    cfg.factory_id, f"alert:rhythm:{wo.id}", ALERT_CLAIM_TTL_SECONDS
+                ):
+                    alert["notification"] = "suppressed(recent)"
+                    continue
                 self.db.add(Notification(
                     id=str(uuid.uuid4()),
                     factory_id=cfg.factory_id,
