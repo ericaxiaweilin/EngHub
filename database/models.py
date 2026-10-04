@@ -2000,6 +2000,13 @@ class EngHubBomItem(Base):
     # ORM 路径写进去的镜像 factory_id 恒为 NULL
     factory_id = Column(String(50), index=True)
     is_production = Column(Boolean)
+    # 层级 BOM 的父子结构只体现在行序里（engflow 不写 parent_sap）：
+    # 按 (source_file, original_row_number) 排序后层深每次最多加 1，
+    # 丢掉行序就等于丢掉产品结构，多层 MRP 展开做不了。
+    source_file = Column(String(500))
+    original_row_number = Column(BigInteger, index=True)
+    l2_parent_group = Column(String(200))
+    l3_context = Column(String(200))
 
     __table_args__ = (
         Index("idx_enghub_bom_model_part", "product_model", "part_number"),

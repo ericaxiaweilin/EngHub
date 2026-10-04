@@ -98,3 +98,75 @@ async def test_material_issue_uses_the_same_entry(monkeypatch):
     lines, source = await svc._latest_bom_lines("FAC_MECH_001", "A-50-04-F")
     assert (lines, source) == ([], "none")
     assert seen["product"] == "A-50-04-F"
+
+
+def _row(level, part, qty, order):
+    return {"level": level, "material_code": part, "qty_per_unit": qty,
+            "material_name": part, "unit": "PCS", "original_row_number": order,
+            "vendor_code": None}
+
+
+def test_tree_parent_comes_from_indent_order():
+    """前序缩进行：父级 = 前面最近的一条浅一层行。这是层级 BOM 的本来的读法。"""
+    rows = [_row(1, "ASSY-A", 1, 0), _row(2, "SUB-B", 2, 1), _row(3, "RAW-C", 3, 2),
+            _row(2, "RAW-D", 5, 3)]
+    nodes, problems = bom_source.build_tree(rows)
+    assert problems == []
+    assert [(n["material_code"], n["parent_code"], n["per_unit_qty"]) for n in nodes] == [
+        ("ASSY-A", None, 1.0),
+        ("SUB-B", "ASSY-A", 2.0),
+        ("RAW-C", "SUB-B", 6.0),
+        ("RAW-D", "ASSY-A", 5.0),
+    ]
+
+
+def test_broken_indent_is_reported_not_repaired():
+    """层深一次跳 +2 说明中间缺了父级：如实报问题，不猜一个爹挂上去。"""
+    rows = [_row(1, "ASSY-A", 1, 0), _row(3, "RAW-X", 2, 1)]
+    nodes, problems = bom_source.build_tree(rows)
+    assert [n["material_code"] for n in nodes] == ["ASSY-A"]
+    assert problems and "找不到上一层父级" in problems[0]
+
+
+def test_orphan_before_any_root_is_reported():
+    rows = [_row(2, "SUB-ORPHAN", 1, 0)]
+    nodes, problems = bom_source.build_tree(rows)
+    assert nodes == [] and problems
+
+
+@pytest.mark.asyncio
+async def test_no_parent_column_does_not_block_explosion():
+    """parent_sap 全空也能展开：结构在行序里，不在那一列。"""
+    rows = [_row(1, "ASSY-A", 2, 0), _row(2, "RAW-B", 3, 1)]
+    for r in rows:
+        r["parent_part"] = None  # 镜像里 parent 列就是空的
+
+    async def fake(*a, **k):
+        return rows
+
+    class _R:
+        def mappings(self): return self
+        def all(self): return []
+
+    db = MagicMock()
+    calls = []
+
+    async def execute(statement, params=None):
+        calls.append(str(statement))
+        r = MagicMock()
+        if "enghub_bom_items" in str(statement) and "level" in str(statement) and "SUM" not in str(statement):
+            r.mappings.return_value.all.return_value = rows
+        else:
+            r.mappings.return_value.all.return_value = []
+        r.scalars.return_value.all.return_value = []
+        return r
+
+    db.execute = execute
+    out = await bom_source.explode_requirement(db, "FAC_MECH_001", "A-50-04-F", 10)
+    assert out["problems"] == []
+    assert out["nodes"] == 2 and out["max_level"] == 2
+    # ASSY-A 毛需求 20、无库存 -> 净 20；RAW-B 挂在 ASSY-A 下：20×3=60
+    by_code = {l["material_code"]: l for l in out["lines"]}
+    assert by_code["ASSY-A"]["required_qty"] == 20
+    assert by_code["RAW-B"]["required_qty"] == 60
+    assert by_code["RAW-B"]["parent_code"] == "ASSY-A"

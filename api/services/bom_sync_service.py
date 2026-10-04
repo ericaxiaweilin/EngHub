@@ -37,9 +37,8 @@ logger = logging.getLogger(__name__)
 SOURCE_TABLE = os.getenv("ENGFLOW_BOM_SOURCE_TABLE", "bom_items")
 PART_MASTER_TABLE = os.getenv("ENGFLOW_BOM_PART_MASTER_TABLE", "part_master")
 BATCH_SIZE = max(100, int(os.getenv("BOM_SYNC_BATCH", "5000")))
-# asyncpg 单条语句最多 32,767 个绑定参数：19 列 × 5,000 行会直接爆，
-# 所以 executemany 的块大小按列数反推，而不是跟拉取块一样大。
-UPSERT_CHUNK_ROWS = max(50, 30000 // 19)
+# asyncpg 单条语句最多 32,767 个绑定参数：二十几列 × 5,000 行会直接爆，
+# 所以 executemany 的块大小按"实际写多少列"反推，而不是跟拉取块一样大。
 MIRROR_FACTORY_ID = os.getenv("ENGFLOW_BOM_FACTORY_ID", "FAC_MECH_001")
 EPOCH = datetime(2000, 1, 1)
 
@@ -63,7 +62,12 @@ _MUTABLE = (
     "unit_price", "total_cost", "vendor_code", "vendor_name", "parent_part",
     "category_l1", "category_l2", "material_family", "component_type",
     "synced_at", "source_updated_at",
+    "source_file", "original_row_number", "l2_parent_group", "l3_context",
 )
+
+# executemany 的块大小按"实际写多少列"反推：asyncpg 单条语句上限 32,767 个绑定参数
+UPSERT_KEY_COLUMNS = ("source_row_id", "factory_id") + _MUTABLE
+UPSERT_CHUNK_ROWS = max(50, 30000 // len(UPSERT_KEY_COLUMNS))
 
 
 class BomSyncService:
@@ -106,6 +110,7 @@ class BomSyncService:
                 bi.row_id, bi.model_name, bi.part_number, bi.description, bi.level,
                 bi.quantity, bi.unit, bi.unit_price, bi.total_cost, bi.vendor_code,
                 bi.vendor_name, bi.parent_sap, bi.category_l1, bi.category_l2,
+                bi.source_file, bi.original_row_number, bi.l2_parent_group, bi.l3_context,
                 pm.material_family, pm.component_type, bi.updated_at
             FROM {bom} bi
             LEFT JOIN {pm} pm
@@ -151,6 +156,10 @@ class BomSyncService:
             "vendor_code": r["vendor_code"],
             "vendor_name": r["vendor_name"],
             "parent_part": r["parent_sap"],
+            "source_file": r.get("source_file"),
+            "original_row_number": r.get("original_row_number"),
+            "l2_parent_group": r.get("l2_parent_group"),
+            "l3_context": r.get("l3_context"),
             "category_l1": r["category_l1"],
             "category_l2": r["category_l2"],
             "material_family": r["material_family"],

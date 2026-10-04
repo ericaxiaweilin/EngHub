@@ -17,7 +17,13 @@ from database.db_config import get_db
 from core.auth.security import get_current_user, require_permission
 from database.models import User, Plan, Product, Inventory, Station, WorkOrder, WorkOrderMaterial
 from core.pp.plan import MPSService
-from api.services.bom_source import latest_bom_lines, label as bom_source_label
+from api.services.bom_source import (
+    explode_requirement,
+    latest_bom_lines,
+    label as bom_source_label,
+    rollup_status,
+    subassembly_suspects,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["pp"])
 
@@ -836,8 +842,22 @@ async def calculate_mrp(
         )
     
     # 库存可用量：按 material_code 汇总（跨仓库），按厂区过滤。
-    mat_codes = [str(b.get("material_code") or "") for b in bom_items]
+    # 多层展开优先：engflow 的层级 BOM 能按行序重建出父子链，需求要落到真正的采购件上，
+    # 不能停在装配件那一层 —— 那等于让供应商替我们造总成。
+    explosion = None
+    if bom_source == "engflow_mirror":
+        explosion = await explode_requirement(
+            db, p.factory_id, product_code, p.quantity, p.required_date
+        )
+    bom_expansion_problems = list((explosion or {}).get("problems") or [])
+    # 链断在几行上就退回单层口径，不拿半截树去算采购量
+    use_multi = bool(explosion and explosion.get("lines") and not bom_expansion_problems)
+    demand_rows = explosion["lines"] if use_multi else bom_items
+
+    mat_codes = [str(b.get("material_code") or "") for b in demand_rows]
     mat_codes = [code for code in mat_codes if code]
+    # 一层件里像装配件的那些要标出来：按一层净需求直接下采购单，可能买到的是自制总成
+    suspect_parts = await subassembly_suspects(db, p.factory_id, product_code, mat_codes)
     inv_res = await db.execute(
         select(Inventory.material_code, func.sum(Inventory.available_qty))
         .where(Inventory.material_code.in_(mat_codes))
@@ -901,13 +921,22 @@ async def calculate_mrp(
     shortage_count = 0
     total_shortage = 0
     
-    for b in bom_items:
+    for b in demand_rows:
         material_code = str(b.get("material_code") or "")
         qty_per_unit = float(b.get("qty_per_unit") or 1)
-        required = math.ceil(p.quantity * qty_per_unit)
-        on_hand = on_hand_map.get(material_code, 0)
-        on_order = on_order_map.get(material_code, 0)
-        net = max(0, required - on_hand - on_order)
+        if use_multi:
+            # 逐层净需求（低层码：父层库存够就不炸子层）在 explode_requirement 里算完
+            required = int(b.get("required_qty") or 0)
+            on_hand = int(b.get("on_hand_qty") or 0)
+            on_order = int(b.get("on_order_qty") or 0)
+            net = int(b.get("net_qty") or 0)
+            allocated = int(b.get("allocated_qty") or 0)
+        else:
+            required = math.ceil(p.quantity * qty_per_unit)
+            on_hand = on_hand_map.get(material_code, 0)
+            on_order = on_order_map.get(material_code, 0)
+            net = max(0, required - on_hand - on_order)
+            allocated = required - net
         
         # 采购建议：按供应商 MOQ 向上取整；没有供应商主数据时明确使用
         # 兼容默认 MOQ=100，不能悄悄把默认值当成真实供应商承诺。
@@ -924,9 +953,14 @@ async def calculate_mrp(
             "material_name": b.get("material_name") or material_code,
             "unit": b.get("unit") or "pcs",
             "qty_per_unit": qty_per_unit,
+            "level": b.get("level"),
+            "parent_code": b.get("parent_code"),
+            "subassembly_suspect": material_code in suspect_parts,
             "required_qty": required,
             "on_hand_qty": on_hand,
             "on_order_qty": on_order,
+            # 冲抵掉的供应量：同一料号出现在多处时只能算一次，报出来才好复核
+            "allocated_qty": allocated,
             "net_qty": net,
             "suggested_order_qty": suggested,
             "moq": moq,
@@ -993,7 +1027,15 @@ async def calculate_mrp(
         "bom_source_label": bom_source_label(bom_source),
         "bom_product_code": product_code,
         # 只展开 level=1 直接组件，多层 rolled-up 还没做，别被读成"全部物料"
-        "bom_expansion": "level-1",
+        "bom_expansion": (
+            f"multi-level-low-level-coding(x{explosion['max_level']}层"
+            f"/{explosion['nodes']}节点/{explosion['parts']}料号)"
+            if use_multi else "level-1"
+        ),
+        "bom_expansion_problems": bom_expansion_problems,
+        # 多层 rolled-up 做不了不是漏实现：上传的 BOM 没有父子链，这里把原因和层级分布摊开
+        "bom_rollup": await rollup_status(db, p.factory_id, product_code),
+        "subassembly_suspect_count": len(suspect_parts),
         "items": items,
         "summary": {
             "total_materials": len(items),
