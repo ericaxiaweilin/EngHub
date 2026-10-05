@@ -368,8 +368,7 @@ async def _derive_from_corpus(
     if not accepted:
         receipt.update({
             "status": "not_derived",
-            "reason": (f"最相近的路线是 {best['route'].id}，" + reject_reason
-                       if not component_subset else reject_reason),
+            "reason": reject_reason,
             "coverage": round(best["coverage"], 3),
             "reference_steps_unplaceable": len(best["dropped"]),
         })

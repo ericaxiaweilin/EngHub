@@ -333,3 +333,53 @@ async def test_subtree_evidence_falls_back_then_says_none():
     empty = _session([])
     none = await bom_source.subtree_evidence(empty, "FAC_MECH_001", "NOPE", ["X"])
     assert none["source"] == "none" and none["codes_with_text"] == 0
+
+@pytest.mark.asyncio
+async def test_finished_good_row_is_not_a_material_of_itself():
+    """上传文件第 1 行是成品自己的料号（`MF;A-50-04-F;EP298;US;110V;M`）。
+
+    行序重建会把整台机器挂到它名下，于是"这台机器的物料里有这台机器"，
+    还会给它开一张下级工单。齐套表要把它认出来并剔掉，同时报出来让人核对。
+    """
+    rows = [
+        {**_row(1, "MEP1791-P0", 1, 0), "attribute_text": "MF;A-50-04-F;EP298;US;110V;M"},
+        {**_row(2, "車架組", 1, 1), "attribute_text": "車架組;半成品;;;;"},
+        {**_row(3, "五通管", 2, 2), "attribute_text": "五通管;車架;;;45#;"},
+    ]
+
+    async def execute(statement, params=None):
+        r = MagicMock()
+        if "enghub_bom_items" in str(statement) and "SUM" not in str(statement):
+            r.mappings.return_value.all.return_value = rows
+        else:
+            r.mappings.return_value.all.return_value = []
+        r.scalars.return_value.all.return_value = []
+        return r
+
+    db = MagicMock()
+    db.execute = execute
+    out = await bom_source.explode_requirement(db, "FAC_MECH_001", "A-50-04-F", 10)
+    codes = [line["material_code"] for line in out["lines"]]
+    assert out["self_rows_excluded"] == ["MEP1791-P0"]
+    assert "MEP1791-P0" not in codes
+    assert codes == ["車架組", "五通管"], "剔掉成品自己的行，不能连累它下层的真实用量"
+    assert next(l for l in out["lines"] if l["material_code"] == "五通管")["required_qty"] == 20
+
+
+@pytest.mark.asyncio
+async def test_finished_good_row_gets_no_subtree_evidence():
+    """同一个判据也管住佐证语料：成品的"子树"就是整台机器，拿它佐证等于想套什么都有证据。"""
+    rows = [
+        {**_row(1, "MEP1791-P0", 1, 0), "attribute_text": "MF;A-50-04-F;EP298;US;110V;M",
+         "l3_context": None, "source_file": "f.xlsx", "unit": "PCS", "material_name": "MF",
+         "vendor_code": None, "qty_per_unit": 1, "level": 1, "original_row_number": 0},
+        {**_row(2, "車架組", 1, 1), "attribute_text": "車架組;;;烤漆;;EP298",
+         "l3_context": None, "source_file": "f.xlsx", "unit": "PCS", "material_name": "車架組",
+         "vendor_code": None, "qty_per_unit": 1, "level": 2, "original_row_number": 1},
+    ]
+    db = _session(rows)
+    out = await bom_source.subtree_evidence(
+        db, "FAC_MECH_001", "A-50-04-F", ["MEP1791-P0", "車架組"])
+    assert out["finished_good_rows"] == ["MEP1791-P0"]
+    assert "MEP1791-P0" not in out["evidence"]
+    assert "烤漆" in out["evidence"]["車架組"]

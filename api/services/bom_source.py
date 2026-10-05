@@ -31,7 +31,7 @@ import math
 from typing import Tuple
 from sqlalchemy import text
 
-from api.services.bom_attributes import clean_name
+from api.services.bom_attributes import clean_name, is_finished_good_row
 
 MIRROR_SQL = text("""
     SELECT part_number AS material_code, description AS material_name,
@@ -203,6 +203,7 @@ def build_tree(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[s
             "attribute_text": " ".join(filter(None, (
                 row.get("attribute_text"), row.get("l3_context"),
             ))),
+            "raw_description": row.get("attribute_text") or "",
         }
         nodes.append(node)
         del stack[level:]
@@ -382,8 +383,15 @@ async def explode_requirement(
     # 混在一个缺口总数里，PMC 就没法把活直接派给对的人。
     parent_codes = {n["parent_code"] for n in nodes if n["parent_code"]}
     merged: Dict[str, Dict[str, Any]] = {}
+    self_rows: List[str] = []
     for node in nodes:
         key = node["material_code"]
+        if is_finished_good_row(node.get("raw_description"), product_code, node["level"]):
+            # 整机自己的料号不是这台整机的物料；挂在下层是行序重建的必然结果，
+            # 但把它当自制件会开出"机器的下级是这台机器"的工单
+            if key not in self_rows:
+                self_rows.append(key)
+            continue
         row = merged.get(key)
         if row is None:
             merged[key] = {
@@ -421,6 +429,7 @@ async def explode_requirement(
         "make_parts": sum(1 for r in merged.values() if r["item_type"] == "make"),
         "buy_parts": sum(1 for r in merged.values() if r["item_type"] == "buy"),
         "problems": problems,
+        "self_rows_excluded": self_rows,
     }
 
 
@@ -454,10 +463,16 @@ async def subtree_evidence(
         })
         by_code: Dict[str, List[Dict[str, Any]]] = {}
         kids: Dict[str, List[Dict[str, Any]]] = {}
+        self_rows = set()
         for node in nodes:
             by_code.setdefault(str(node["material_code"]), []).append(node)
             kids.setdefault(str(node["parent_code"] or ""), []).append(node)
+            if is_finished_good_row(node.get("raw_description"), product_model, node["level"]):
+                self_rows.add(str(node["material_code"]))
+        receipt["finished_good_rows"] = sorted(self_rows)[:10]
         for code in wanted:
+            if code in self_rows:
+                continue
             chunks: List[str] = []
             for placement in by_code.get(code, []):
                 # 每一处出现单独走一遍：同一料号在两处出现时按料号去重，

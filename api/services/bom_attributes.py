@@ -31,6 +31,22 @@ ELECTRONIC_RE = re.compile(
 # 图纸/文档行：名称以"圖/图"结尾（爆炸圖、組立圖、走線圖、裝櫃示意圖…）
 DOCUMENT_RE = re.compile(r"(圖|图)$")
 
+def is_finished_good_row(raw: Optional[str], product_model: str, level: Optional[int]) -> bool:
+    """第 1 层里"位置"字段写着型号自己的那一行，是**成品的行**，不是子件。
+
+    上传文件的第一行通常是 `HF;A-50-04-F;EP298;US;110V;M` —— 成品 SAP 料号 + 型号 +
+    圖號 + 电压。前序重建父子链时，整台机器的下层都会挂到它名下（142 个型号都是这个形状），
+    于是它会被当成一个"有下级的自制半成品"：齐套表里出现"这台机器是这台机器的物料"，
+    还会给它开一张下级工单。这条判据把它认出来，让读数的人不用猜。
+    """
+    if int(level or 0) != 1:
+        return False
+    parts = [x.strip() for x in (raw or "").split(";")]
+    if len(parts) < 2 or not product_model:
+        return False
+    return parts[1] == str(product_model).strip()
+
+
 # 表面处理/工艺关键字 -> 这些词本身就是"这道件要过哪些车间"的证据。
 # 全系统只有这一份工序词表：路线佐证、工位匹配、缺口归集都从这里取，
 # 另开一份词表等于让同一个件在不同路径被判成不同工艺（10-05 就是这么散的）。
