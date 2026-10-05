@@ -8,7 +8,7 @@ x-backend-env: &backend-env
     - BOM_SYNC_BATCH=${BOM_SYNC_BATCH:-5000}
     # 开发/测试阶段的规模闸门（用户 10-05 定的口径：不跑全量、从小到大）。
     # 全量重建 48 万行默认关闭；要跑先在 docker/.env 里设 BOM_SYNC_ALLOW_FULL=1。
-    - BOM_SYNC_MODEL_ALLOWLIST=${BOM_SYNC_MODEL_ALLOWLIST:-}
+    - BOM_SYNC_MODEL_ALLOWLIST=${BOM_SYNC_MODEL_ALLOWLIST:-A-50-04-F,HTM1481-00,HTM1390-00,HTM1374-00,HTM1495-00}
     - BOM_SYNC_ALLOW_FULL=${BOM_SYNC_ALLOW_FULL:-0}
     # 路线回填循环：一轮几个产品、总共能推导几条路线（用完停手并在心跳里说明）
     - ROUTING_BACKFILL_BATCH=${ROUTING_BACKFILL_BATCH:-5}
