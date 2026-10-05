@@ -32,6 +32,7 @@ from api.services.bom_source import subtree_evidence
 from api.services.engine_heartbeat import record
 from api.services.component_orders import expand_ready_components
 from api.services.component_release import release_kitted_child_orders
+from api.services.chain_convergence import report as convergence_report
 from api.services.aps_draft_prune import (
     APPLY_ENABLED as DRAFT_PRUNE_APPLY,
     KEEP_VERSIONS as DRAFT_KEEP_VERSIONS,
@@ -384,6 +385,10 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     # 只动没确认过的 draft，压着锁定工序的那几份跳过（默认预演，开关在 compose）。
     receipt["draft_prune"] = await prune_superseded_drafts(
         db, apply=DRAFT_PRUNE_APPLY, keep=DRAFT_KEEP_VERSIONS)
+    # 最后一格是自我核对：这一轮工厂到底有没有往前走。
+    # 上一轮的读数就从这条心跳自己那一行里读，所以这是"逐轮对撞"而不是每次从零开始看。
+    receipt["convergence"] = await convergence_report(
+        db, QUALITY_FACTORY_ID, gate=receipt.get("plan_commit"))
     receipt["dry_run"] = not apply
     return receipt
 

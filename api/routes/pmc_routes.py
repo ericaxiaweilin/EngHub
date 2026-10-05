@@ -17,6 +17,7 @@ from api.services.plan_commit_gate import (
     evaluate_commit_gate,
 )
 from api.services.aps_draft_prune import plan_prune
+from api.services.chain_convergence import report as convergence_report
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
 
@@ -324,7 +325,9 @@ async def get_pmc_capabilities(
             {"key": "plan_commit_gate", "name": "计划逐单下达就绪门（哪些单真能开工、差哪条门）",
              "path": "/api/v1/pmc/plan-commit-gate", "mode": "read_only"},
             {"key": "aps_draft_prune", "name": "旧排产草案回收预演（keep-last-N，只读）",
-             "path": "/api/v1/pmc/aps-draft-prune", "mode": "read_only"},
+             "path": "/api/v1/pmc/aps-draft_prune", "mode": "read_only"},
+            {"key": "chain_convergence", "name": "链条收敛自检（有没有真的往前走）",
+             "path": "/api/v1/pmc/chain-convergence", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
@@ -380,6 +383,22 @@ async def get_aps_draft_prune(
     """
     del current_user
     return await plan_prune(db, factory_id=factory_id, keep=keep)
+
+
+@router.get("/chain-convergence", summary="无人链条收敛自检（只读）")
+async def get_chain_convergence(
+    factory_id: str = Query(..., description="厂区"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """这一轮工厂有没有往前走：完工、放行、缺口三个数与上一轮心跳对撞。
+
+    无人跑的系统最怕"心跳一直 tick、工厂一步不动"。这里把判定规则连同来源一起报出来：
+    `advancing / diverging / stalled`，以及"本厂 24 小时内有没有真实报工输入"——
+    没有报工时缺料单不可能自己清零，这条必须写在原因里，不能被读成"算法没干活"。
+    """
+    del current_user
+    return await convergence_report(db, factory_id)
 
 
 __all__ = ["router"]
