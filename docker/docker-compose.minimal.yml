@@ -16,8 +16,15 @@ x-backend-env: &backend-env
     # 每轮最多收窄几条"子件拿整条产线"的旧草案；0 关掉这条自我纠正
     - ROUTING_BACKFILL_REPAIR_BATCH=${ROUTING_BACKFILL_REPAIR_BATCH:-20}
     # 半成品拆子工单的尺度：一轮几张、全厂累计最多几张（开发阶段先小跑）
+    # 400 顶格时心跳是 budget_exhausted，实测因此压住 187 张主/子工单
+    # （627 行自制缺口、26,313 件），而其中 92 个自制件已经有推导路线可以直接建单，
+    # 所以抬到 600：约 +92 张子工单，仍然远小于全厂 473 个 BOM 型号的规模。
     - COMPONENT_ORDER_BATCH=${COMPONENT_ORDER_BATCH:-10}
-    - COMPONENT_ORDER_MAX_TOTAL=${COMPONENT_ORDER_MAX_TOTAL:-400}
+    - COMPONENT_ORDER_MAX_TOTAL=${COMPONENT_ORDER_MAX_TOTAL:-600}
+    # 计划逐单下达就绪门：过了"排齐+齐套+工位可映射"的门才把工单置为 released。
+    # 每轮最多 5 张（从小到大），一张都不合格时不动方案状态。
+    - PLAN_COMMIT_APPLY=${PLAN_COMMIT_APPLY:-true}
+    - PLAN_COMMIT_MAX_ORDERS=${PLAN_COMMIT_MAX_ORDERS:-5}
     - SECRET_KEY=your-secret-key-here
     # 测试模式：启用角色快捷切换（生产环境务必改为 false）
     - TEST_MODE=true
