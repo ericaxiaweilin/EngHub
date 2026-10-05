@@ -157,12 +157,27 @@ async def _periodic_scheduler():
     from api.services.report_generator_service import ReportGeneratorService
 
     await asyncio.sleep(30)  # 启动后 30s 再开始，等 DB 就绪
+    # 心脏每轮报 `{}`：看上去在跳，却分不清"这轮真干了活"和"什么都没人做"。
+    # 逐轮把做过的事和各个节流档距上次多久报出去，无人运行的事实才可核对。
+    _GATES = {
+        "patrol": "_last_patrol",
+        "report": "_last_report",
+        "aps_generate": "_last_aps",
+        "equipment_pm": "_last_pm",
+        "auto_dispatch": "_last_dispatch",
+        "exception_escalation": "_last_escalation",
+        "agent_stalled_check": "_last_agent_check",
+        "warehouse_replenish": "_last_warehouse_check",
+    }
     while True:
+        did = {}
         try:
             async with db_config.session_factory() as db:
                 svc = AndonService(db)
                 escalations = await svc.process_timeout_escalations()
                 reminders = await svc.process_timed_reminders()
+                did["andon_escalated"] = len(escalations or [])
+                did["andon_reminded"] = len(reminders or [])
                 if escalations:
                     _logger.info(f"[scheduler] 安灯自动升级 {len(escalations)} 条")
                 if reminders:
@@ -429,7 +444,15 @@ async def _periodic_scheduler():
             _logger.warning(f"[scheduler] 排产智能体任务异常: {e}")
 
         from api.services.engine_heartbeat import record as _heartbeat
-        await _heartbeat("periodic-scheduler", "tick")
+        import time as _gt
+        did["aps_auto_generate_enabled"] = (
+            os.getenv("APS_AUTO_GENERATE_ENABLED", "false").lower() == "true")
+        did["gates_seconds_since_last"] = {
+            name: (None if not hasattr(_periodic_scheduler, attr)
+                   else round(_gt.time() - float(getattr(_periodic_scheduler, attr) or 0)))
+            for name, attr in _GATES.items()
+        }
+        await _heartbeat("periodic-scheduler", "tick", detail=did)
         await asyncio.sleep(_SCHEDULER_INTERVAL)
 
 
