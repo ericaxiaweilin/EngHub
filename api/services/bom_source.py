@@ -34,6 +34,7 @@ from sqlalchemy import text
 from api.services.bom_attributes import (clean_name, families_in, is_finished_good_row,
                                     tokens_in)
 from api.services.sourcing_policy import decide as sourcing_policy_decide
+from api.services.sourcing_policy import declared_buy
 
 MIRROR_SQL = text("""
     SELECT part_number AS material_code, description AS material_name,
@@ -148,7 +149,8 @@ LEVEL_ROWS_SQL = text("""
            source_file, vendor_code, vendor_name,
            -- 属性原文（名稱;位置;規格;材料;表面處理;尺寸;圖號）留给工序佐证用；
            -- material_name 是清洗后的品名，够写主档，但"烤漆/鹽浴滲氮/45#"这些信息都在被砍掉的那几段里
-           description AS attribute_text, l3_context
+           description AS attribute_text, l3_context,
+           component_type, material_family
     FROM enghub_bom_items
     WHERE factory_id = :fid AND product_model = :pid
       AND original_row_number IS NOT NULL AND quantity IS NOT NULL
@@ -206,6 +208,8 @@ def build_tree(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[s
                 row.get("attribute_text"), row.get("l3_context"),
             ))),
             "raw_description": row.get("attribute_text") or "",
+            "component_type": row.get("component_type"),
+            "material_family": row.get("material_family"),
         }
         nodes.append(node)
         del stack[level:]
@@ -394,9 +398,22 @@ async def explode_requirement(
     def sourcing_of(code: str) -> str:
         return sourcing_basis_of(code)[0]
 
+    declared: Dict[str, str] = {}
+    for node in nodes:
+        ctype = str(node.get("component_type") or "")
+        key = str(node["material_code"])
+        if ctype and key not in declared:
+            declared[key] = ctype
+
     def sourcing_basis_of(code: str) -> tuple:
         if code not in evidence_cache:
             has_children = code in parent_codes
+            buying = declared_buy(factory_id, declared.get(code))
+            if buying:
+                # 源已经写明它是原料/五金/包装/标贴（或本厂不做的电子件）——
+                # 带下层也不是本厂要做的东西，不用再让结构推导去判
+                evidence_cache[code] = ("buy", buying)
+                return evidence_cache[code]
             if not has_children:
                 verdict = ("buy", "leaf")
             else:

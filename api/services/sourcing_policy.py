@@ -33,6 +33,30 @@ PLANT_FOREIGN_FAMILIES: Dict[str, set] = {
 ELECTRONIC_FAMILY = "电控"
 
 
+
+# 源声明的物料分类（engflow part_master → 镜像 enghub_bom_items.component_type）。
+# 这是你说的那类"字幕标记"的真身：10-05 实测快照 719 个料号里 680 个有值。
+# 权力仍然只有一条 —— 只用来把该买的摘出去，**不用来把东西判成自制**：
+# structural_part / assembly 只说明"它是结构件/总成"，不代表本厂一定自己做（买成品支架很常见），
+# 所以那两类继续要求有工序字样证据，政策不替工厂造自制。
+ALWAYS_BUY_DECLARED = ("raw_material", "hardware", "packaging", "label")
+PLANT_BUY_DECLARED = {
+    MECH_PLANT: ("electronic_component", "control_board"),   # 机械厂不做贴片：电子件按源声明买
+    ELEC_PLANT: ("packaging", "label"),                      # 电子厂包装标贴本来就买
+}
+
+
+def declared_buy(factory_id: str, component_type: Optional[str]) -> Optional[str]:
+    """源声明判外购时返回依据文字；不判返回 None。"""
+    ctype = str(component_type or "").strip().lower()
+    if not ctype or ctype == "unknown":
+        return None
+    if ctype in ALWAYS_BUY_DECLARED:
+        return f"source_declared:{ctype}"
+    if ctype in PLANT_BUY_DECLARED.get(str(factory_id), ()):
+        return f"source_declared:{ctype}@{factory_id}"
+    return None
+
 def decide(factory_id: str, families: Tuple[str, ...], *, has_children: bool,
            evidence: Tuple[str, ...] = ()
            ) -> Optional[Tuple[str, str]]:

@@ -423,3 +423,31 @@ async def test_subassembly_without_any_process_wording_is_purchased_not_selfmade
     assert out["purchased_assemblies"] == ["軸承組"]
     # 需求量不变，只是归到对的人手里
     assert by_code["軸承組"]["required_qty"] == 10
+
+
+@pytest.mark.asyncio
+async def test_source_declared_raw_material_is_bought_even_with_children():
+    """part_master 写明 raw_material/hardware/packaging 的料号：带下层也买，不占自制口径。"""
+    rows = [
+        {**_row(1, "ROOT", 1, 0), "attribute_text": "整機;;;", "component_type": "assembly"},
+        {**_row(2, "鋼板", 1, 1), "attribute_text": "鋼板;;;SPHC;;;", "component_type": "raw_material"},
+        {**_row(3, "補強片", 1, 2), "attribute_text": "補強片;鋼板;焊接;;;", "component_type": "hardware"},
+    ]
+
+    async def execute(statement, params=None):
+        r = MagicMock()
+        if "enghub_bom_items" in str(statement) and "SUM" not in str(statement):
+            r.mappings.return_value.all.return_value = rows
+        else:
+            r.mappings.return_value.all.return_value = []
+        r.scalars.return_value.all.return_value = []
+        return r
+
+    db = MagicMock()
+    db.execute = execute
+    out = await bom_source.explode_requirement(db, "FAC_MECH_001", "ROOT", 10)
+    by_code = {l["material_code"]: l for l in out["lines"]}
+    assert by_code["鋼板"]["item_type"] == "buy"
+    assert by_code["鋼板"]["sourcing_basis"] == "source_declared:raw_material"
+    # 下层有"焊接"字样的硬件仍按源声明买（源说它是 hardware）
+    assert by_code["補強片"]["item_type"] == "buy"
