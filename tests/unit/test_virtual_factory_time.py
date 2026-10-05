@@ -39,3 +39,32 @@ def test_short_material_never_stocks_in_and_falsely_clears_the_parent_kit():
     """这是上一版最脏的一条：欠料也照样做完入库，母单缺口就此假清零。"""
     assert units_makeable(100, 0, 1000, 1000) == 0
     assert progress_qty(10, 24, 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_readings_state_the_sim_clock_and_its_offset(monkeypatch):
+    """仿真推进后，读数必须自己讲清"这是仿真时间"，并给出与真实时间的差。"""
+    from datetime import datetime, timedelta, timezone
+    from api.services import chain_convergence as cc_mod
+
+    class FakeClock:
+        async def now(self, fid):
+            return datetime.now(timezone.utc) + timedelta(hours=36)
+
+    monkeypatch.setattr("api.services.virtual_factory_clock.get_clock", lambda: FakeClock())
+    out = await cc_mod.sim_clock_reading("FAC_MECH_001")
+    assert out["clock_available"] is True
+    assert 35.0 <= out["sim_offset_hours"] <= 37.0
+    assert "T" in out["sim_now"]
+
+
+@pytest.mark.asyncio
+async def test_sim_clock_unavailable_is_reported_not_invented(monkeypatch):
+    from api.services import chain_convergence as cc_mod
+
+    def boom():
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr("api.services.virtual_factory_clock.get_clock", boom)
+    out = await cc_mod.sim_clock_reading("FAC_MECH_001")
+    assert out == {"sim_now": None, "sim_offset_hours": None, "clock_available": False}

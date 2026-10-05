@@ -1,5 +1,9 @@
 """链条收敛自检：无人跑的系统必须能自己回答"这一轮它到底有没有把工厂往前推"。
 
+时间口径先说清楚：本引擎的进度是仿真时间推出来的（一拍 = 24 仿真小时），所以读数里
+必须同时给出 `sim_now` 与它和真实时间的偏移 —— 否则"单上完工时间 10-20、今天才 10-05"
+会被当成脏数据，或者更糟：被当成真实交付。
+
 背景是实测到的一个危险状态：10-05 把扩张上限抬到 600、就绪门打开之后，
 可下点数从 185 掉到 79、被压住数从 263 涨到 305 —— **链条在发散**，
 而引擎心跳每一轮都是 `tick / 0 failures`：从心跳看不出它在一个劲儿地空转。
@@ -54,6 +58,24 @@ PREVIOUS_SQL = text("""
 
 STALLED_ALERT_AFTER = 3
 SHORTAGE_EPSILON = 0.5  # 缺口是数值列，小于半件的变化当没动
+
+
+async def sim_clock_reading(factory_id: str) -> Dict[str, Any]:
+    """仿真时钟现在几点、与真实时间差多少小时。读不到就说读不到，不猜一个时间。"""
+    from datetime import datetime, timezone
+
+    try:
+        from api.services.virtual_factory_clock import get_clock
+        raw = await get_clock().now(factory_id)
+    except Exception:  # noqa: BLE001 - 时钟不可用不能把整份自检带崩
+        return {"sim_now": None, "sim_offset_hours": None, "clock_available": False}
+    naive = raw.replace(tzinfo=None) if raw.tzinfo else raw
+    real_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return {
+        "sim_now": naive.isoformat(),
+        "sim_offset_hours": round((naive - real_now).total_seconds() / 3600.0, 1),
+        "clock_available": True,
+    }
 
 
 async def measure(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
@@ -159,6 +181,7 @@ async def report(db: AsyncSession, factory_id: str, *, loop_name: str = "routing
                  gate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """一份逐轮可对账的收敛读数：链条数字 + 与上一轮的对撞 + 判定。"""
     current = await measure(db, factory_id)
+    current.update(await sim_clock_reading(factory_id))
     previous = await read_previous(db, loop_name)
     verdict = judge(current, previous)
     out = {
