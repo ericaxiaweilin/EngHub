@@ -238,6 +238,9 @@ _TOOL_SELECTION_ACTION_HINTS: Dict[str, tuple[str, ...]] = {
     "query_pmc_control_tower": ("pmc", "控制塔", "交期风险", "交付风险", "准时交付", "otd"),
     "query_wms_inventory_health": ("库存健康", "周转", "呆滞", "呆滞料", "该补什么", "补货建议", "过量", "满载", "库存结构", "效期"),
     "query_bom_data_quality": ("BOM 质量", "BOM 有什么问题", "bom 问题", "命名不规范", "数据质量", "ECR", "工程变更", "图纸行", "断链", "缺分类", "推不出路线"),
+    "query_chain_convergence": ("在推进", "停滞", "空转", "发散", "积压", "有没有往前走",
+                              "推进还是", "链条", "收敛", "趋势", "缺口在涨", "完工进展",
+                              "diverging", "stalled", "advancing"),
     "query_plan_commit_gate": ("能开工几张", "可以开工", "下达了", "已下达", "计划生效",
                               "为什么没下达", "卡在", "就绪门", "逐单", "还有多少单", "开工"),
     # 计划清单：措辞与提示词【计划清单·必须】里的"多步任务"口径对齐

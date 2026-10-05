@@ -861,6 +861,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_chain_convergence",
+            "description": "无人链条收敛自检（只读）：工厂这一轮到底有没有往前走。给出开放工单池、子工单数、真的完工了几张、由就绪门放行几张、缺口件数、近 24 小时有没有真实报工，并与上一轮引擎心跳的读数对撞后给出 advancing / diverging / stalled 判定与支撑它的增减量。用于'工厂在推进还是停滞''积压在涨还是消''有没有空转''完工进展''链条卡在哪'类问题。判定规则随结果一起返回，别人可以用同一串数字复算。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_plan_commit_gate",
             "description": "计划逐单下达就绪门（只读）：这一版排程里哪些工单真的能开工、哪些被哪条门压住（没排进本版本/工序没排齐/物料没齐套/首道工位映射不到），以及已经下达过的张数。用于'这版计划能开工几张''还有哪些单卡着''为什么没下达''计划生效了没'类问题。只报判定，不改工单状态、不下达。",
             "parameters": {"type": "object", "properties": {}},
@@ -2523,6 +2531,40 @@ async def _tool_query_bom_data_quality(
     }
 
 
+async def _tool_query_chain_convergence(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """链条收敛自检（只读）：判据只在 chain_convergence 一处定义，这里负责取厂区并转述。
+
+    无人跑的系统最怕"心跳一直 tick、工厂一步不动"，所以这个工具的存在意义就是
+    让机器人能回答"到底有没有在推进"，并且敢说 diverging / stalled。
+    """
+    from api.services.chain_convergence import report
+
+    fid = factory_id or "FAC_MECH_001"
+    out = await report(db, fid)
+    return {
+        "status": "ok",
+        "factory_id": fid,
+        "verdict": out.get("verdict"),
+        "reason": out.get("reason"),
+        "metrics": out.get("metrics"),
+        "previous_metrics": out.get("previous_metrics"),
+        "deltas": out.get("deltas"),
+        "stalled_ticks": out.get("stalled_ticks"),
+        "alert": out.get("alert"),
+        "verdict_rules": out.get("verdict_rules"),
+        "commit_gate": out.get("commit_gate") or {},
+        "counts_note": (
+            "metrics.released_by_gate 是累计由就绪门下达的工单数；"
+            "metrics.completed_orders 是全厂真的完工过的工单数（含历史）；"
+            "deltas 才是与上一轮心跳的差值，判断趋势请看 deltas，不要把累计数当本轮数。"
+        ),
+        "data_note": "只读：不改工单状态、不改计划；数字来自 work_orders / work_order_materials / "
+                     "production_reports / aps_schedules 与引擎心跳本身。",
+    }
+
+
 async def _tool_query_plan_commit_gate(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3058,6 +3100,7 @@ _TOOL_EXECUTORS = {
     "query_maintenance_due": _tool_query_maintenance_due,
     "query_wms_inventory_health": _tool_query_wms_inventory_health,
     "query_bom_data_quality": _tool_query_bom_data_quality,
+    "query_chain_convergence": _tool_query_chain_convergence,
     "query_plan_commit_gate": _tool_query_plan_commit_gate,
     "query_shortage_alerts": _tool_query_shortage_alerts,
     "query_stagnant": _tool_query_stagnant,
@@ -3449,6 +3492,7 @@ TOOL_LABELS = {
     "query_wms_inventory_health": "库存健康度",
     "query_bom_data_quality": "BOM 数据质量自检",
     "query_plan_commit_gate": "计划逐单下达就绪门",
+    "query_chain_convergence": "链条收敛自检",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",
