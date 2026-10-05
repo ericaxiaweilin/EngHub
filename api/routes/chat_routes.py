@@ -482,7 +482,10 @@ async def chat_health():
                 f"route={route['task_id']}"
             )
         except Exception as exc:  # noqa: BLE001
-            detail = f"unreachable: {type(exc).__name__}"
+            detail = "unreachable: %s %s" % (
+                type(exc).__name__,
+                re.sub(r"https?://\S+", "<内部地址>", " ".join(str(exc).split()))[:200],
+            )
     return {
         "configured": configured,
         "reachable": reachable,
@@ -551,7 +554,17 @@ async def _request_model_route_once(
     providers = route.get("providers") if isinstance(route, dict) else None
     provider = str(providers[0] if providers else "").strip()
     if not provider:
-        raise RuntimeError(f"model-stack returned no deployed route for {task_id}")
+        # 控制面自己说得出为什么是空的（例如 selected option 没部署）。这句话必须一路带到界面，
+        # 否则用户只看到"AI 服务暂不可用"，不知道该去把哪个选项改回来。
+        warnings = route.get("availability_warnings") if isinstance(route, dict) else None
+        detail = "; ".join(
+            str(w.get("message") or w.get("code"))
+            for w in (warnings or []) if isinstance(w, dict)
+        )
+        raise RuntimeError(
+            f"model-stack returned no deployed route for {task_id}"
+            + (f"（控制面原因：{detail}）" if detail else "")
+        )
 
     manifest = manifest_resp.json()
     provider_rows = manifest.get("providers") if isinstance(manifest, dict) else None
@@ -2435,8 +2448,11 @@ async def _handle_kernel_chat(
             "[chat] kernel context setup failed request=%s error=%s",
             turn_id, type(exc).__name__,
         )
+        # 真实原因（截断 + 去掉内部地址）要跟着回复出去，但异常对象本身不外泄。
+        reason = " ".join(str(exc).split())[:240] or type(exc).__name__
+        reason = re.sub(r"https?://\S+", "<内部地址>", reason)
         result = KernelResponse(
-            reply=_degraded_message("模型路由暂时不可用，请稍候重试"),
+            reply=_degraded_message(f"模型路由暂时不可用：{reason}"),
             model=MODEL_STACK_CHAT_TASK_ID,
             degraded=True,
             request_id=turn_id,
