@@ -32,6 +32,19 @@ from database.models import (
 )
 
 
+def progress_qty(daily_pieces: float, step_hours: float, remaining: int,
+                 fallback_daily: int = 1) -> int:
+    """这一拍该出多少件：映射到的日产能 × 仿真过了的时间。
+
+    时间在这里是参数，不是"等真实工厂过完一天"：一拍仿真 24 小时就出一天的量，
+    仿真 2 小时就出 1/12 天的量。日产能允许是小数（实测 ST-QC-02 配 0.6 件/日），
+    但一道工序至少推进 1 件，否则永远出不来；没到剩余量的上限就按上限截断。
+    """
+    rate = float(daily_pieces) if float(daily_pieces or 0) > 0 else float(max(1, fallback_daily))
+    produced = int(round(rate * float(step_hours) / 24.0))
+    return max(1, min(int(remaining), produced))
+
+
 DEFAULT_MONTHLY_CONTAINERS = 300
 DEFAULT_ORDER_DAYS = 90
 DEFAULT_FACTORY_ID = "FAC_ELEC_DEMO_2026"
@@ -52,7 +65,10 @@ class PulseConfig:
     max_new_orders_per_pulse: int = 1
     operator: str = "virtual_factory"
     # 仿真时钟：每次 pulse 推进多少仿真小时。时钟与事件都在内存，不下盘。
-    sim_step_hours: float = 2.0
+    # 这是虚拟工厂的核心参数之一：生产进度按"仿真过了多久 × 映射到的产能"算，
+    # 不是陪真实工厂等日历（原来默认 2 小时 + "今天已报过就不再报"，等于一小时只动一点点、
+    # 一天只动一次，600 张子工单要跑几周 —— 那是把仿真当真实时间在熬）。
+    sim_step_hours: float = max(0.5, float(os.getenv("VF_PULSE_SIM_STEP_HOURS", "24")))
     # 事件队列上界，超出丢最旧的 —— 队列本身不能变成新的写入放大源。
     event_queue_max: int = 200
     # 执行范围。原实现只推进 created_by='virtual_factory' 自己那几张单，
@@ -92,12 +108,12 @@ class VirtualFactoryService:
                 created = await self._create_order_chain(cfg, product, stations)
                 created_orders.append(created)
 
-        advanced = await self._advance_open_work(cfg, stations)
+        # 一拍先推进仿真时钟，再用这个时刻去推生产：报工时间、完工时间都用仿真时钟，
+        # 事件与读数因此能互相核对（同一 sim_now）。
+        sim_now = await clock.advance(cfg.factory_id, cfg.sim_step_hours)
+        advanced = await self._advance_open_work(cfg, stations, sim_now)
         alerts = await self._guard_and_notify(cfg)
         await self.db.commit()
-
-        # 仿真时钟与事件队列：内存推进，不落库
-        sim_now = await clock.advance(cfg.factory_id, cfg.sim_step_hours)
         events: List[Dict[str, Any]] = []
         for order in created_orders:
             events.append({
@@ -551,8 +567,38 @@ class VirtualFactoryService:
             "planned_due": due.date().isoformat(),
         }
 
-    async def _advance_open_work(self, cfg: PulseConfig, stations: List[Station]) -> Dict[str, Any]:
-        today_end = datetime.combine(date.today(), time.max)
+    async def _daily_pieces_by_order(self, factory_id: str, order_ids: List[str]) -> Dict[str, float]:
+        """每张单一天能出几件：从它在本厂生效方案里的首道工序工位，取 station_capacity。
+
+        这一列的口径是"一天可完成几件产品"（用户 10-03 确认），所以直接当日产率用；
+        映射不到工位的单不猜数字，回落到脉搏的总产能参数并在回执里说明有几张是回落的。
+        """
+        if not order_ids:
+            return {}
+        rows = (await self.db.execute(text("""
+            SELECT w.id AS work_order_id,
+                   COALESCE(sc.available_hours_per_day, 0) AS daily_pieces,
+                   f.station_id AS station_code
+            FROM work_orders w
+            LEFT JOIN (
+                SELECT DISTINCT ON (t.work_order_id) t.work_order_id, t.station_id
+                FROM aps_schedule_tasks t
+                JOIN aps_schedules s ON s.id = t.schedule_id
+                WHERE s.factory_id = :fid AND s.is_current = TRUE
+                  AND COALESCE(t.status, '') NOT IN ('completed', 'cancelled')
+                ORDER BY t.work_order_id, t.operation_seq, t.planned_start
+            ) f ON f.work_order_id = w.id
+            LEFT JOIN station_capacity sc
+              ON sc.station_id = f.station_id AND sc.factory_id = :fid AND sc.is_active = TRUE
+            WHERE w.id = ANY(CAST(:ids AS text[]))
+        """), {"fid": factory_id, "ids": order_ids})).mappings().all()
+        return {str(r["work_order_id"]): float(r["daily_pieces"] or 0) for r in rows}
+
+    async def _advance_open_work(self, cfg: PulseConfig, stations: List[Station],
+                                 sim_now: datetime) -> Dict[str, Any]:
+        # 仿真时钟给的是带时区的 UTC，而 MES 各表的时间列都是 naive UTC；
+        # 直接写会撞 asyncpg 的 DataError（带时区减不带时区），进门就先归一。
+        sim_now = sim_now.replace(tzinfo=None)
         masters = await self._open_work_orders(cfg)
         if not masters:
             return {"reports_created": 0, "containers_reported": 0, "work_orders_touched": 0}
@@ -560,7 +606,8 @@ class VirtualFactoryService:
         reports_created = 0
         containers_reported = 0
         budget = cfg.max_work_orders_per_pulse
-        skipped_today = 0
+        rates = await self._daily_pieces_by_order(cfg.factory_id, [str(m.id) for m in masters])
+        fallback_count = sum(1 for m in masters if rates.get(str(m.id), 0) <= 0)
         per_order_daily = max(1, cfg.daily_capacity // max(1, min(budget, len(masters))))
         station_by_code = {s.station_code: s for s in stations}
         # 订单状态先攒起来，循环结束后按状态各合成一条 UPDATE
@@ -572,25 +619,21 @@ class VirtualFactoryService:
         bom_sources: Dict[str, int] = {}
         material_shortages: List[Dict[str, Any]] = []
 
+        sim_start = sim_now - timedelta(hours=max(0.5, cfg.sim_step_hours))
+        predicted: List[Dict[str, Any]] = []
         for master in masters:
-            if master.planned_start and master.planned_start > today_end:
-                continue
-            last_report_at = (await self.db.execute(select(ProductionReport.created_at).where(
-                ProductionReport.work_order_id == master.id,
-                ProductionReport.created_by == cfg.operator,
-            ).order_by(ProductionReport.created_at.desc()).limit(1))).scalar_one_or_none()
-            if last_report_at and last_report_at.date() >= date.today():
-                skipped_today += 1   # 不占本轮额度：这张单今天已经推进过一次
-                continue
             if reports_created >= budget:
                 break
             remaining = max(0, (master.planned_qty or 0) - (master.completed_qty or 0))
             if remaining <= 0:
                 master.status = "completed"
-                master.actual_complete = master.actual_complete or datetime.utcnow()
+                master.actual_complete = master.actual_complete or sim_now
                 continue
-            due_days = max(1, ((master.planned_due or today_end) - datetime.utcnow()).days + 1)
-            qty = max(1, min(remaining, per_order_daily, round(remaining / due_days) + 1))
+            # 这一拍该出多少：映射到的日产能 × 仿真过了多少时间（一天=24 仿真小时）。
+            # 映射不到产能的单才回落到脉搏总产能均分，回执里把回落有几张报出来。
+            daily = float(rates.get(str(master.id)) or 0)
+            rate = daily if daily > 0 else float(per_order_daily)
+            qty = progress_qty(daily, cfg.sim_step_hours, remaining, per_order_daily)
             defect_qty = 1 if qty >= 20 and uuid.uuid4().int % 11 == 0 else 0
             good_qty = max(0, qty - defect_qty)
 
@@ -606,10 +649,12 @@ class VirtualFactoryService:
                 report_type="virtual_pulse",
                 shift="day",
                 operator_id=cfg.operator,
-                operation_name="虚拟工厂日节奏报工",
-                start_time=datetime.combine(date.today(), time(hour=8)),
-                end_time=datetime.combine(date.today(), time(hour=17)),
-                remark=f"{VIRTUAL_MARKER} daily_capacity={cfg.daily_capacity}",
+                operation_name="虚拟工厂节奏报工（按仿真时钟推进）",
+                start_time=sim_start,
+                end_time=sim_now,
+                remark=(f"{VIRTUAL_MARKER} sim_step_hours={cfg.sim_step_hours} "
+                        f"daily_pieces={daily if daily > 0 else 'fallback'} "
+                        f"rate={rate:.2f}/日 sim_now={sim_now.isoformat()}"),
                 created_by=cfg.operator,
             )
             self.db.add(report)
@@ -621,7 +666,16 @@ class VirtualFactoryService:
             master.current_stage = "生产中：按日节奏推进"
             master.next_station = "终检/OQC" if (master.completed_qty or 0) > (master.planned_qty or 1) * 0.8 else "主线生产"
             if master.status == "completed":
-                master.actual_complete = datetime.utcnow()
+                master.actual_complete = sim_now
+            else:
+                left = max(0, (master.planned_qty or 0) - (master.completed_qty or 0))
+                predicted.append({
+                    "work_order_code": master.work_order_code,
+                    "remaining": left,
+                    "daily_pieces": round(rate, 2),
+                    "predicted_completion": (sim_now + timedelta(
+                        days=left / rate if rate > 0 else 0)).isoformat(),
+                })
             # 销售订单状态只跟着虚拟工厂自己创建的单据走：BOM/ERP 映射进来的需求单是参考数据，
             # 执行结果落在工单上（工单才是担任务的对象），不回写需求侧的原始记录。
             if str(master.created_by or "") == "virtual_factory":
@@ -684,7 +738,13 @@ class VirtualFactoryService:
             "work_scope": cfg.work_scope,
             "candidates": len(masters),
             "per_pulse_budget": budget,
-            "skipped_already_reported_today": skipped_today,
+            "sim_step_hours": cfg.sim_step_hours,
+            "sim_now": sim_now.isoformat(),
+            # 日产能是从 station_capacity（口径=一天可完成几件）映射来的；
+            # 映射不到的单回落到脉搏总产能均分，这里报数量不报假来源。
+            "rate_mapped_orders": len(masters) - fallback_count,
+            "rate_fallback_orders": fallback_count,
+            "predicted_completion_samples": predicted[:5],
             "daily_capacity_containers": cfg.daily_capacity,
             # 本轮领料：按 BOM 真扣了多少、哪里欠、哪些产品没 BOM 可扣
             "materials_issued_lines": issued_lines,

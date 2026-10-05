@@ -34,6 +34,9 @@ x-backend-env: &backend-env
     # 每轮最多推进 25 张；同一张单每天最多报一次工，所以上限只决定"今天轮到谁"。
     - VF_PULSE_WORK_SCOPE=${VF_PULSE_WORK_SCOPE:-all_open}
     - VF_PULSE_MAX_WORK_ORDERS=${VF_PULSE_MAX_WORK_ORDERS:-25}
+    # 时间参数：一拍推进多少仿真小时。虚拟工厂不等真实日历——产出=映射到的日产能×仿真过的小时数，
+    # 完工时间与预计完工都算在仿真时钟上（默认一拍=仿真一天）。
+    - VF_PULSE_SIM_STEP_HOURS=${VF_PULSE_SIM_STEP_HOURS:-24}
     - SECRET_KEY=your-secret-key-here
     # 测试模式：启用角色快捷切换（生产环境务必改为 false）
     - TEST_MODE=true
