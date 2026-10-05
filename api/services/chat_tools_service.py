@@ -2563,6 +2563,14 @@ async def _tool_query_plan_commit_gate(
             for v in (gate.get("held") or [])[:6]
         ],
         "gate_rules": (gate.get("gate_rules") or {}).get("requires"),
+        # 三桶互斥且相加等于评估数 —— 这个口径必须写在数据里，
+        # 不然回答里会出现"399 张被压住，其中 203 张已下达"这种把并列说成包含的说法。
+        "counts_note": (
+            f"三桶互斥：可开工 {gate.get('ready_count')} + 被压住 {gate.get('held_count')} "
+            f"+ 已下达过 {gate.get('already_released_count')} "
+            f"= 评估工单 {gate.get('evaluated_orders')}；"
+            "\"已下达过\"是状态而不是被压住，别写成\"其中\""
+        ),
         "data_note": (
             "只读判定：系统不在这条路径上改工单状态。要机器自己放行得显式打开 "
             "PLAN_COMMIT_APPLY，并且每轮受 PLAN_COMMIT_MAX_ORDERS 限量。"
