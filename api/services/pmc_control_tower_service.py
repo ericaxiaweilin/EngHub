@@ -348,7 +348,14 @@ class PmcControlTowerService:
                 "data_note": "没有工单物料齐套来源，不能给出Shortage数量。",
                 "affected_work_order_count": 0, "shortage_material_count": 0, "total_shortage_qty": 0, "items": [],
             }
-        where = "wo.factory_id = :fid AND wo.status NOT IN ('completed', 'cancelled') AND COALESCE(wom.shortage_qty, 0) > 0"
+        # 需求只在主工单齐套快照上数一次：那张表本来就含所有层级（MRP→APS 的接口表）。
+        # 子装配件工单是同一份需求的**执行**，再计入总数就是把同一批料数两遍
+        # （实测 master 31,531 + component 2,790，加起来的 34,321 没有业务含义）。
+        where = (
+            "wo.factory_id = :fid AND wo.wo_type = 'master' "
+            "AND wo.status NOT IN ('completed', 'cancelled') "
+            "AND COALESCE(wom.shortage_qty, 0) > 0"
+        )
         params: Dict[str, Any] = {"fid": factory_id}
         if work_order_code:
             where += " AND wo.work_order_code = :work_order_code"
@@ -356,7 +363,12 @@ class PmcControlTowerService:
         rows = await self._rows(f"""
             SELECT wom.work_order_id, wo.work_order_code, wo.status, wom.material_code,
                    wom.material_name, wom.required_qty, wom.available_qty, wom.received_qty,
-                   wom.shortage_qty, wom.item_type, wom.level
+                   wom.shortage_qty, wom.item_type, wom.level,
+                   (SELECT child.work_order_code FROM work_orders child
+                     WHERE child.parent_work_order_id = wom.work_order_id
+                       AND child.product_id = wom.material_code
+                       AND child.status <> 'cancelled'
+                     LIMIT 1) AS child_order_code
             FROM work_order_materials wom
             JOIN work_orders wo ON wo.id = wom.work_order_id
             WHERE {where}
@@ -365,6 +377,7 @@ class PmcControlTowerService:
         grouped: Dict[str, Dict[str, Any]] = {}
         affected: Set[str] = set()
         by_type: Dict[str, float] = {}
+        tasked: Dict[str, float] = {"parts": 0, "shortage_qty": 0}
         for row in rows:
             code = str(row.get("material_code") or "unknown")
             item = grouped.setdefault(code, {
@@ -382,6 +395,11 @@ class PmcControlTowerService:
             item["available_qty"] += _number(row.get("available_qty"))
             key = str(row.get("item_type") or "unknown")
             by_type[key] = by_type.get(key, 0) + _number(row.get("shortage_qty"))
+            if row.get("child_order_code"):
+                # 这一行已经有一张下级工单在做了：缺口还在，但不再是"没人管"的数字
+                item["child_order_code"] = row.get("child_order_code")
+                tasked["parts"] += 1
+                tasked["shortage_qty"] += _number(row.get("shortage_qty"))
             if row.get("work_order_code") not in item["affected_work_orders"]:
                 item["affected_work_orders"].append(row.get("work_order_code"))
             if row.get("work_order_code"):
@@ -391,6 +409,7 @@ class PmcControlTowerService:
                 item[key] = round(item[key], 2)
         for key in list(by_type):
             by_type[key] = round(by_type[key], 2)
+        tasked["shortage_qty"] = round(tasked["shortage_qty"], 2)
 
         # 自制缺口只有开出工单才是可执行任务：主档 + 工艺路线 + 工步，缺一样就卡在哪一样
         make_codes = [c for c, i in grouped.items() if i.get("item_type") == "make"]
@@ -415,8 +434,11 @@ class PmcControlTowerService:
                 "shortage_by_item_type 里 buy=可下采购单的采购件、"
                 "make=要先排产自制的装配件、unknown=来源 BOM 只有一层判不出自制还是采购。"
                 "selfmade_readiness 按主档/工艺路线/工步判自制件能不能真开出工单。"
+                "缺口只数主工单齐套快照（含全部层级），下级工单是同一需求的执行、不重复计入；"
+                "dispatched_to_child_orders 表示这些缺口已经派了子装配件工单在做。"
             ),
             "shortage_by_item_type": by_type,
+            "dispatched_to_child_orders": tasked,
             "selfmade_readiness": readiness_roll,
             "affected_work_order_count": len(affected),
             "shortage_material_count": len(grouped),

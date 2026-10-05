@@ -1044,6 +1044,13 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
                 )
                 + "。只有 buy 能直接下 PO，make 要先排出上层的装配件工单。"
             )
+        dispatched = shortage.get("dispatched_to_child_orders") or {}
+        if dispatched.get("parts"):
+            lines.append(
+                f"- 已派下级装配件工单：{int(dispatched['parts'])} 种在制（缺口 "
+                f"{n(dispatched.get('shortage_qty'))}）。这部分缺口仍计入总数，"
+                "但不再是没人管的数字；下级工单本身不重复计入缺口。"
+            )
         readiness = shortage.get("selfmade_readiness") or {}
         if readiness:
             label_map = {

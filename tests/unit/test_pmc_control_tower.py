@@ -89,3 +89,14 @@ def test_selfmade_blocker_names_the_missing_master_data_object():
     assert blocker and "缺工艺路线 123 种" in blocker[0]
     assert "ready" not in blocker[0], "已就绪的件不该混进阻塞清单"
     assert "工艺路线与工步只能由工艺给" in blocker[0], "要说清系统不会替工厂编路线"
+
+
+def test_shortage_only_counts_master_snapshot_once():
+    """缺口只在主工单齐套快照上数一次；下级工单是同一需求的执行，不能重复计入。"""
+    from api.services.pmc_control_tower_service import PmcControlTowerService
+
+    src = PmcControlTowerService._shortage.__code__.co_consts
+    assert any("wo.wo_type = 'master'" in str(c) for c in src), \
+        "取缺口的 SQL 必须限定主工单快照，否则 component 工单会把同一批料数两遍"
+    note = " ".join(str(c) for c in src)
+    assert "不重复计入" in note, "口径要写在读数说明里，不然别人还会再加一遍"
