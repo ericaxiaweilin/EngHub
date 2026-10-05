@@ -14,9 +14,10 @@ from api.services.production_part_master import register_make_part_masters
 
 
 class _Master:
-    def __init__(self, code, factory_id):
+    def __init__(self, code, factory_id, product_name=""):
         self.product_code = code
         self.factory_id = factory_id
+        self.product_name = product_name
 
 
 def _db(existing=()):
@@ -103,3 +104,48 @@ async def test_dry_run_reports_without_writing():
     assert receipt["dry_run"] is True
     assert receipt["created"] == 2, "预演要说清会建几条"
     assert db.added == [], "预演不能落库"
+
+
+def test_clean_name_takes_only_the_first_attribute_token():
+    """description 是分号结构串（名稱;別名;規格;材料;表面處理…），品名只取第一段。"""
+    from api.services.bom_attributes import clean_name, is_document, is_electronic
+    raw = "齒輪;;;POM(塑膠鋼)+10%纖維+二硫化鉬;;H58/S22;JM03;"
+    assert clean_name(raw) == "齒輪"
+    assert is_document("零件爆炸圖;半成品;;;;;EP727;")
+    assert not is_document(clean_name(raw))
+    assert is_electronic("控制板PCB;主電控;V4.0")
+    assert not is_electronic("車架組;;;烤漆;DM334;;EP298;")
+
+
+@pytest.mark.asyncio
+async def test_drawing_rows_and_pcb_parts_are_not_registered_as_selfmade():
+    """用户口径：图纸行不是物料，PCB 上电子元器件是外购 —— 都不能变成半成品主档。"""
+    db = _db()
+    items = [
+        {"material_code": "DWG-1", "material_name": "零件爆炸圖;半成品;;;;;EP727;",
+         "unit": "PCS", "level": 3, "item_type": "make"},
+        {"material_code": "PCB-1", "material_name": "主控板PCB;電阻;電容;贴片",
+         "unit": "PCS", "level": 4, "item_type": "make"},
+        {"material_code": "REAL-1", "material_name": "車架組;;;烤漆;DM334;;EP298;",
+         "unit": "SET", "level": 3, "item_type": "make"},
+    ]
+    receipt = await register_make_part_masters(db, "FAC_MECH_001", "A-50-04-F", items)
+    assert [p.product_code for p in db.added] == ["REAL-1"]
+    assert db.added[0].product_name == "車架組", "存进主档的必须是干净品名"
+    assert "源行属性原文" in db.added[0].description
+    assert receipt["blocked"]["drawing_row"] == ["DWG-1"]
+    assert receipt["blocked"]["electronic_purchased"] == ["PCB-1"]
+
+
+@pytest.mark.asyncio
+async def test_repair_fixes_only_polluted_names_and_is_idempotent():
+    from api.services.production_part_master import repair_selfmade_master_names
+
+    dirty = _Master("001681-A", "FAC_MECH_001", "固定柱;;;ABS/PA757S;;回台物料;TM81;")
+    clean = _Master("029306-00", "FAC_MECH_001", "齒輪")
+    db = _db([dirty, clean])
+    fixed = await repair_selfmade_master_names(db)
+    assert fixed == 1
+    assert dirty.product_name == "固定柱"
+    assert clean.product_name == "齒輪", "已经干净的行不该被动过"
+    assert await repair_selfmade_master_names(db) == 0, "第二次跑应该是 0（幂等）"

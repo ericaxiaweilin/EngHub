@@ -1059,7 +1059,8 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
                     f"{label_map.get(k, k)} {int(v.get('parts') or 0)} 种（缺口 {n(v.get('shortage_qty'))}）"
                     for k, v in readiness.items()
                 )
-                + "。只有就绪度为 ready 的自制件能开成工单，其余要先补主数据。"
+                + "。ready 的能直接开工单；缺主档的那部分计划下达时会按 BOM 自动登记，"
+                  "缺工艺路线的只能由工艺给（系统不替工厂编路线）。"
             )
         for item in (shortage.get("items") or [])[:10]:
             lines.append(f"- {item.get('material_code')}: 缺 {n(item.get('shortage_qty'))}，影响工单 {','.join(map(str, item.get('affected_work_orders') or [])) or '暂无'}")

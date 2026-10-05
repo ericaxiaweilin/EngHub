@@ -228,23 +228,28 @@ async def test_readiness_names_the_missing_master_data_piece():
     """自制件开不出工单时，要说清缺的是主档、路线还是工步 —— 三种缺法补法不一样。"""
     masters = [
         {"material_code": "HAS-MASTER-OTHER-FACTORY", "master_factory_id": "FAC_ELEC_DEMO_2026",
-         "routing_id": "rt-1", "routing_steps": 3},
+         "routing_id": "rt-1", "step_rows": 3, "step_json": 0},
         {"material_code": "NO-ROUTING", "master_factory_id": "FAC_MECH_001",
-         "routing_id": None, "routing_steps": 0},
+         "routing_id": None, "step_rows": 0, "step_json": 0},
         {"material_code": "EMPTY-ROUTING", "master_factory_id": "FAC_MECH_001",
-         "routing_id": "rt-2", "routing_steps": 0},
+         "routing_id": "rt-2", "step_rows": 0, "step_json": 0},
+        # 推导/种子路线把工步写在 routings.steps JSON 里，routing_steps 表是空的
+        {"material_code": "JSON-STEPS-ROUTE", "master_factory_id": "FAC_MECH_001",
+         "routing_id": "rt-bom-x", "step_rows": 0, "step_json": 2},
         {"material_code": "READY", "master_factory_id": "FAC_MECH_001",
-         "routing_id": "rt-3", "routing_steps": 6},
+         "routing_id": "rt-3", "step_rows": 6, "step_json": 0},
     ]
     db = _session(masters)
     out = await bom_source.production_readiness(
         db, "FAC_MECH_001",
-        ["NO-MASTER", "HAS-MASTER-OTHER-FACTORY", "NO-ROUTING", "EMPTY-ROUTING", "READY"],
+        ["NO-MASTER", "HAS-MASTER-OTHER-FACTORY", "NO-ROUTING", "EMPTY-ROUTING",
+         "JSON-STEPS-ROUTE", "READY"],
     )
     assert out["NO-MASTER"] == "missing_master"
     assert out["HAS-MASTER-OTHER-FACTORY"] == "master_other_factory"
     assert out["NO-ROUTING"] == "no_routing"
     assert out["EMPTY-ROUTING"] == "empty_routing"
+    assert out["JSON-STEPS-ROUTE"] == "ready", "工步写在 JSON 里也算有路线，APS 读的就是它"
     assert out["READY"] == "ready"
 
 

@@ -6,6 +6,13 @@ x-backend-env: &backend-env
     - ENGFLOW_DATABASE_URL=${ENGFLOW_DATABASE_URL:-}
     - ENGFLOW_BOM_FACTORY_ID=${ENGFLOW_BOM_FACTORY_ID:-FAC_MECH_001}
     - BOM_SYNC_BATCH=${BOM_SYNC_BATCH:-5000}
+    # 开发/测试阶段的规模闸门（用户 10-05 定的口径：不跑全量、从小到大）。
+    # 全量重建 48 万行默认关闭；要跑先在 docker/.env 里设 BOM_SYNC_ALLOW_FULL=1。
+    - BOM_SYNC_MODEL_ALLOWLIST=${BOM_SYNC_MODEL_ALLOWLIST:-}
+    - BOM_SYNC_ALLOW_FULL=${BOM_SYNC_ALLOW_FULL:-0}
+    # 路线回填循环：一轮几个产品、总共能推导几条路线（用完停手并在心跳里说明）
+    - ROUTING_BACKFILL_BATCH=${ROUTING_BACKFILL_BATCH:-5}
+    - ROUTING_BACKFILL_MAX_ROUTES=${ROUTING_BACKFILL_MAX_ROUTES:-80}
     - SECRET_KEY=your-secret-key-here
     # 测试模式：启用角色快捷切换（生产环境务必改为 false）
     - TEST_MODE=true

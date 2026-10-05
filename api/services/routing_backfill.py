@@ -22,12 +22,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from api.services.engine_heartbeat import record
-from api.services.routing_from_family import derive_routing_for_product
+from api.services.routing_from_family import (
+    derive_routing_for_component,
+    derive_routing_for_product,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,108 @@ BIND_WO_SQL = text("""
       AND routing_id IS NULL
       AND factory_id = :fid AND product_id = :pid
 """)
+
+# 半成品级：只看已经有整机型路线、且齐套快照带层级的主工单
+COMPONENT_WO_SQL = text("""
+    SELECT wo.id, wo.factory_id, wo.product_id
+    FROM work_orders wo
+    WHERE wo.wo_type = 'master'
+      AND wo.status NOT IN ('completed', 'cancelled')
+      AND wo.routing_id IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM work_order_materials m
+          WHERE m.work_order_id = wo.id AND m.item_type = 'make' AND m.parent_code IS NOT NULL
+      )
+    ORDER BY wo.created_at DESC
+    LIMIT :limit
+""")
+
+COMPONENT_ROWS_SQL = text("""
+    SELECT material_code, material_name, item_type, level, parent_code
+    FROM work_order_materials
+    WHERE work_order_id = :wo_id
+""")
+
+ROUTED_CODES_SQL = text("""
+    SELECT p.product_code
+    FROM products p
+    JOIN routings r ON r.id = p.current_routing_id
+    WHERE p.product_code = ANY(:codes)
+      AND r.steps IS NOT NULL AND COALESCE(jsonb_array_length(r.steps::jsonb), 0) > 0
+""")
+
+COMPONENT_BATCH = max(1, int(os.getenv("ROUTING_BACKFILL_WOS_PER_TICK", "2")))
+
+
+async def _subtree_corpus(rows: List[Any], root_code: str) -> str:
+    """从齐套快照的 parent_code 链取某个半成品的整棵子树文本。
+
+    半成品自己的下层就在同一份 BOM 里（用户 10-05 的口径：L3 即半成品），
+    所以子件不用再传一次 BOM —— 子件行写的"烤漆/鹽浴滲氮/45#"就是工序佐证材料。
+    """
+    children: Dict[str, List[Any]] = {}
+    for row in rows:
+        parent = str(row["parent_code"] or "")
+        children.setdefault(parent, []).append(row)
+
+    texts: List[str] = []
+    stack = list(children.get(root_code, []))
+    seen = set()
+    while stack:
+        node = stack.pop()
+        code = str(node["material_code"] or "")
+        if code and code not in seen:
+            seen.add(code)
+            texts.append(str(node["material_name"] or ""))
+            stack.extend(children.get(code, []))
+    return " ".join(t for t in texts if t)
+
+
+async def backfill_component_routes(
+    db, *, limit: int = COMPONENT_BATCH, budget_left: int, apply: bool = True
+) -> Dict[str, Any]:
+    """给已下达到、有层级快照的自制半成品补工艺路线（同一道佐证门）。"""
+    receipt: Dict[str, Any] = {
+        "examined": 0, "derived": 0, "existing": 0, "not_derived": 0,
+        "no_master": 0, "no_bom_text": 0, "rejected": [],
+    }
+    if budget_left <= 0:
+        receipt["status"] = "budget_exhausted"
+        return receipt
+
+    wos = (await db.execute(COMPONENT_WO_SQL, {"limit": limit})).mappings().all()
+    for wo in wos:
+        fid = str(wo["factory_id"])
+        rows = (await db.execute(COMPONENT_ROWS_SQL, {"wo_id": wo["id"]})).mappings().all()
+        made = [r for r in rows if str(r["item_type"] or "") == "make"]
+        receipt["examined"] += len(made)
+        routed = {str(c) for c in (await db.execute(ROUTED_CODES_SQL, {
+            "codes": [str(r["material_code"]) for r in made] or ["__none__"]
+        })).scalars().all()}
+        for row in made:
+            if receipt["derived"] >= budget_left:
+                receipt["status"] = "budget_reached"
+                return receipt
+            code = str(row["material_code"])
+            if code in routed:
+                receipt["existing"] += 1
+                continue
+            corpus = await _subtree_corpus(rows, code)
+            result = await derive_routing_for_component(
+                db, fid, code, corpus, level=row["level"]
+            )
+            status = str(result.get("status"))
+            receipt[status] = receipt.get(status, 0) + 1
+            if status in ("not_derived", "no_bom_text") and len(receipt["rejected"]) < 5:
+                receipt["rejected"].append({
+                    "material_code": code, "status": status,
+                    "reason": result.get("reason"), "coverage": result.get("coverage"),
+                })
+        if apply:
+            await db.commit()
+        receipt["status"] = receipt.get("status", "ok")
+    receipt.setdefault("status", "ok")
+    return receipt
 
 
 async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]:
@@ -117,6 +222,14 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
         await db.commit()
     else:
         await db.rollback()
+
+    # 型号级之后再看半成品级：同一份预算里继续往下推，仍受佐证率那道门管
+    budget_left = max(0, MAX_DERIVED_ROUTES - already_derived - receipt["derived"])
+    components = await backfill_component_routes(
+            db, budget_left=budget_left, apply=apply)
+    receipt["components"] = components
+    if apply:
+        await db.commit()
     receipt["dry_run"] = not apply
     return receipt
 

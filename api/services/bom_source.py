@@ -31,6 +31,8 @@ import math
 from typing import Tuple
 from sqlalchemy import text
 
+from api.services.bom_attributes import clean_name
+
 MIRROR_SQL = text("""
     SELECT part_number AS material_code, description AS material_name,
            quantity AS qty_per_unit, unit, vendor_code, vendor_name
@@ -186,7 +188,8 @@ def build_tree(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[s
             "_index": len(nodes),
             "_parent_index": parent["_index"] if parent else None,
             "material_code": str(row["material_code"] or ""),
-            "material_name": row.get("material_name"),
+            # 品名只取分号串第一段（圖號/材料/表面處理这些原文留给主档的 description）
+            "material_name": clean_name(row.get("material_name")),
             "unit": row.get("unit"),
             "level": level,
             "qty_per_parent": float(row["qty_per_unit"] or 0),
@@ -213,8 +216,14 @@ def build_tree(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[s
 READINESS_SQL = text("""
     SELECT p.product_code AS material_code, p.factory_id AS master_factory_id,
            p.current_routing_id AS routing_id,
-           (SELECT count(*) FROM routing_steps rs WHERE rs.routing_id = p.current_routing_id) AS routing_steps
+           (SELECT count(*) FROM routing_steps rs
+             WHERE rs.routing_id = p.current_routing_id) AS step_rows,
+           -- 工步有两种存法：老数据在 routing_steps 表，种子/推导路线写在 routings.steps
+           -- JSON 数组里（APS 读的就是后者）。只查表会把刚推出来的路线判成空壳。
+           (CASE WHEN jsonb_typeof(r.steps) = 'array'
+                 THEN jsonb_array_length(r.steps) ELSE 0 END) AS step_json
     FROM products p
+    LEFT JOIN routings r ON r.id = p.current_routing_id
     WHERE p.product_code = ANY(:codes)
 """)
 
@@ -245,7 +254,7 @@ async def production_readiness(
             out[code] = "master_other_factory"
         elif not row["routing_id"]:
             out[code] = "no_routing"
-        elif int(row["routing_steps"] or 0) <= 0:
+        elif int(row["step_rows"] or 0) + int(row["step_json"] or 0) <= 0:
             out[code] = "empty_routing"
         else:
             out[code] = "ready"

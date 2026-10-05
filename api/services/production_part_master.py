@@ -22,12 +22,33 @@ from typing import Any, Dict, List
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.services.bom_attributes import clean_name, is_document, is_electronic
 from database.models import Product
 
 # 半成品用单独的分类，不和"BOM 型号"（category=真实机种）混在一类里：
 # 前者是整机种、后者是结构里的组件，采购/工程看的口径完全不同。
 SEMIFINISHED_CATEGORY = "半成品-BOM自制件"
 CREATED_BY = "bom-mirror"
+
+
+async def repair_selfmade_master_names(db: AsyncSession) -> int:
+    """修历史脏数据：早期版本把整串分号属性文本当品名写进了 product_name。
+
+    幂等：只动 `created_by=bom-mirror` 且名字里还带分号的行，改完就再也匹配不上。
+    """
+    rows = (await db.execute(select(Product).where(
+        Product.created_by == CREATED_BY,
+        Product.product_name.like("%;%"),
+    ))).scalars().all()
+    fixed = 0
+    for row in rows:
+        cleaned = clean_name(row.product_name)
+        if cleaned and cleaned != row.product_name:
+            row.product_name = cleaned[:100]
+            fixed += 1
+    if fixed:
+        await db.flush()
+    return fixed
 
 
 async def register_make_part_masters(
@@ -60,6 +81,8 @@ async def register_make_part_masters(
             "工艺路线不建 —— 路线是工艺事实，BOM 里没有，系统不替工厂编。"
         ),
     }
+    # 顺手把历史脏名字修回来（幂等：只有名字里还带分号的行会被改）
+    receipt["repaired_names"] = await repair_selfmade_master_names(db)
     if not make_items:
         return receipt
 
@@ -79,8 +102,18 @@ async def register_make_part_masters(
                 receipt["blocked"].setdefault("master_other_factory", []).append(code)
             continue
 
+        raw_name = str(item.get("material_name") or "")
+        # 用户给的工厂口径：图纸行不是物料；PCB 上的电子元器件是外购（贴片在 PCB 厂做）。
+        # 这两类都不登记半成品主档，否则下一步会给图纸开工艺路线。
+        if is_document(raw_name):
+            receipt["blocked"].setdefault("drawing_row", []).append(code)
+            continue
+        if is_electronic(raw_name):
+            receipt["blocked"].setdefault("electronic_purchased", []).append(code)
+            continue
+
         unit = str(item.get("unit") or "").strip()
-        name = str(item.get("material_name") or "").strip()
+        name = clean_name(raw_name)
         if not unit or not name:
             receipt["blocked"].setdefault("missing_source_fields", []).append(code)
             continue
@@ -95,8 +128,8 @@ async def register_make_part_masters(
                 category=SEMIFINISHED_CATEGORY,
                 unit=unit[:20],
                 description=(
-                    f"BOM 自制件登记：{product_model} 的 "
-                    f"level {item.get('level')} 组件（结构里有下级）"
+                    f"BOM 自制件登记：{product_model} 的 level {item.get('level')} 组件"
+                    f"（结构里有下级）；源行属性原文：{raw_name[:300]}"
                 )[:500],
                 status="active",
                 created_by=CREATED_BY,

@@ -43,6 +43,8 @@ STEP_KEYWORDS: Dict[str, tuple] = {
 }
 # 至少要印证到一半工序才套用；低于这个数说明这个型号和这条路线不是一族
 MIN_COVERAGE = 0.5
+# 半成品只取被它自己子树佐证的工序；少于 2 道就不算一条路线（一道工序的"路线"没意义）
+MIN_COMPONENT_STEPS = 2
 
 
 def _matches(operation_name: str, corpus: str) -> bool:
@@ -113,12 +115,75 @@ async def derive_routing_for_product(
             })
             return receipt
 
+
     corpus = await _model_corpus(db, factory_id, product_code)
     if not corpus.strip():
         receipt.update({"status": "no_bom_text",
                         "reason": "镜像里没有这个型号的 BOM 行，无法佐证工序"})
         return receipt
+    result = await _derive_from_corpus(db, factory_id, product_code, corpus,
+                                       source="整机型 BOM")
+    if result.get("status") in ("derived", "existing") and product is not None:
+        product.current_routing_id = result.get("routing_id") or product.current_routing_id
+        await db.flush()
+    return result
 
+
+async def derive_routing_for_component(
+    db: AsyncSession, factory_id: str, code: str, corpus: str, *, level: Optional[int] = None
+) -> Dict[str, Any]:
+    """给一个自制半成品推路线。
+
+    用户 10-05 给的工厂口径：BOM 里 **L3 就是半成品**，而且半成品的下层就在同一个
+    上传文件里 —— 所以子件不用另外传 BOM，拿它自己子树的属性文本就能佐证工序
+    （車架組的子件写著"烤漆" → 表面涂装这道工序有出处；導桿写"鹽浴滲氮/45#" → 机加）。
+    `corpus` 由调用方（齐套快照的子树）传入；门槛与型号级路径完全一样。
+    """
+    receipt: Dict[str, Any] = {"product_code": code, "status": "unknown"}
+    product = (await db.execute(select(Product).where(
+        Product.product_code == code
+    ))).scalar_one_or_none()
+    if product is None:
+        receipt.update({"status": "no_master",
+                        "reason": "半成品还没有主档，先按计划下达登记"})
+        return receipt
+    if product.current_routing_id:
+        existing = await db.get(Routing, str(product.current_routing_id))
+        if existing is not None and isinstance(existing.steps, list) and existing.steps:
+            receipt.update({
+                "status": "existing",
+                "routing_id": existing.id,
+                "steps": len(existing.steps),
+                "derived": str(existing.created_by or "") == CREATED_BY,
+            })
+            return receipt
+    if not (corpus or "").strip():
+        receipt.update({"status": "no_bom_text",
+                        "reason": "这个半成品在齐套快照里没有下层行，拿不到佐证材料"})
+        return receipt
+    result = await _derive_from_corpus(
+        db, factory_id, code, corpus,
+        source=f"L{level} 半成品子树" if level else "半成品子树",
+        component_subset=True,
+    )
+    if result.get("status") == "derived":
+        product.current_routing_id = result.get("routing_id")
+        await db.flush()
+    return result
+
+
+async def _derive_from_corpus(
+    db: AsyncSession, factory_id: str, code: str, corpus: str, *, source: str,
+    component_subset: bool = False,
+) -> Dict[str, Any]:
+    """共用的那道门：同厂参考路线 + BOM 文本佐证才套。
+
+    型号级：要覆盖参考路线至少 `MIN_COVERAGE` 的工序（整机要走完产线）。
+    半成品级（`component_subset`）：**只保留它自己子树能佐证的工序**，并且至少 2 道。
+        —— 車架組 只需焊接+涂装，不該被塞進"電控装配/總裝/包裝"；
+    套整条产线反而会给子件排出根本不存在的工作，所以这里按子集建路线。
+    """
+    receipt: Dict[str, Any] = {"product_code": code, "status": "unknown"}
     candidates = await _reference_routings(db, factory_id)
     if not candidates:
         receipt.update({"status": "no_reference_route",
@@ -127,33 +192,50 @@ async def derive_routing_for_product(
 
     best: Optional[Dict[str, Any]] = None
     for route in candidates:
-        if str(route.product_id) == str(product_code):
+        if str(route.product_id) == str(code):
             continue
         steps = route.steps or []
-        matched = sum(1 for s in steps if _matches(str(
+        hits = [s for s in steps if _matches(str(
             (s or {}).get("name") or (s or {}).get("operation_name") or ""
-        ), corpus))
-        coverage = matched / len(steps)
-        if best is None or coverage > best["coverage"]:
-            best = {"route": route, "matched": matched, "coverage": coverage,
-                    "steps": len(steps)}
+        ), corpus)]
+        coverage = len(hits) / len(steps)
+        score = len(hits) if component_subset else coverage
+        if best is None or score > best["score"]:
+            best = {"route": route, "hits": hits, "matched": len(hits),
+                    "coverage": coverage, "steps": len(steps), "score": score}
 
-    if best is None or best["coverage"] < MIN_COVERAGE:
+    if best is None:
+        receipt.update({"status": "not_derived", "reason": "没有可用的参考路线"})
+        return receipt
+
+    if component_subset:
+        accepted = len(best["hits"]) >= MIN_COMPONENT_STEPS
+        reject_reason = (
+            f"子树只能佐证 {best['matched']}/{best['steps']} 道工序"
+            f"（不足 {MIN_COMPONENT_STEPS} 道）：再多就是替工厂编工艺"
+        )
+    else:
+        accepted = best["coverage"] >= MIN_COVERAGE
+        reject_reason = (
+            f"最相近的路线是 {best['route'].id}"
+            f"（工序佐证 {best['matched']}/{best['steps']}，覆盖率 {best['coverage']:.0%}"
+            f" < {MIN_COVERAGE:.0%}）：{source}的文本认不出那条路线的工序，硬套等于替工厂编工艺"
+        )
+    if not accepted:
         receipt.update({
             "status": "not_derived",
             "reason": (
-                f"最相近的路线是 {best['route'].id if best else '无'}"
-                f"（工序佐证 {best['matched'] if best else 0}/{best['steps'] if best else 0}"
-                f"，覆盖率 {(best['coverage'] if best else 0):.0%} < {MIN_COVERAGE:.0%}）："
-                "这个型号的 BOM 文本认不出那条路线的工序，硬套等于替工厂编工艺"
+                f"最相近的路线是 {best['route'].id}，" + reject_reason
+                if not component_subset else reject_reason
             ),
-            "coverage": round(best["coverage"], 3) if best else 0.0,
+            "coverage": round(best["coverage"], 3),
         })
         return receipt
 
     ref = best["route"]
+    source_steps = best["hits"] if component_subset else (ref.steps or [])
     normalized = []
-    for idx, step in enumerate(ref.steps or []):
+    for idx, step in enumerate(source_steps):
         step = step or {}
         normalized.append({
             "step_no": int(step.get("step_no") or step.get("seq") or (idx + 1) * 10),
@@ -161,25 +243,26 @@ async def derive_routing_for_product(
             "station": step.get("station") or step.get("work_center"),
             # 不写 standard_time：参考路线本来就没有确认工时，推导也不补一个数
         })
-    routing_id = f"rt-bom-{product_code}"[:64]
+    routing_id = f"rt-bom-{code}"[:64]
     audit_note = (
         f"按产品族从 {ref.id}（{ref.product_id}）推导：工序与工位原样沿用同族标准路线；"
-        f"型号 BOM 文本印证 {best['matched']}/{len(normalized)} 道工序"
+        f"佐证材料={source}，印证 {best['matched']}/{len(normalized)} 道工序"
         f"（{best['coverage']:.0%}）。标准工时未经 IE 确认，排程只能当草案。"
     )
-    db.add(Routing(
-        id=routing_id,
-        factory_id=factory_id,
-        product_id=product_code,
-        routing_code=f"RT-BOM-{product_code}"[:50],
-        version="CURRENT",
-        status="active",
-        is_active=True,
-        steps=normalized,
-        created_by=CREATED_BY,
-        remark=audit_note,
-    ))
-    product.current_routing_id = routing_id
+    already = await db.get(Routing, routing_id)
+    if already is None:
+        db.add(Routing(
+            id=routing_id,
+            factory_id=factory_id,
+            product_id=code,
+            routing_code=f"RT-BOM-{code}"[:50],
+            version="CURRENT",
+            status="active",
+            is_active=True,
+            steps=normalized,
+            created_by=CREATED_BY,
+            remark=audit_note,
+        ))
     await db.flush()
     receipt.update({
         "status": "derived",
@@ -188,6 +271,7 @@ async def derive_routing_for_product(
         "coverage": round(best["coverage"], 3),
         "matched_steps": best["matched"],
         "steps": len(normalized),
-        "note": "工时未经 IE 确认；要改成正式基线需工艺部复核 remark 里的出处",
+        "corroborated_by": source,
+        "note": "工时未经 IE 确认；要转成正式基线需工艺部复核 remark 里的出处",
     })
     return receipt
