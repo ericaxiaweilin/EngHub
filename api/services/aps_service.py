@@ -4,6 +4,8 @@ APS 排程服务 - 桥接 DB 数据与 HybridScheduler 核心算法
 
 """
 
+import hashlib
+
 import uuid
 
 import logging
@@ -34,6 +36,140 @@ from core.mes.hybrid_scheduler import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── 输入指纹（写量刹车）───────────────────────────────────────────────
+# 排程算法是确定性的：同样的输入必给同样的输出。线上每次"再跑一遍"都要新写
+# 21~459 行 aps_schedule_tasks，而 304 份草案里 95% 从未被确认——写的全是重复。
+# 所以先把"这一版计划由哪些事实决定"哈希成一个指纹：指纹没变就复用那份未确认
+# 草案（回 reused=true，一行都不写），指纹变了才重排。
+# 这里只哈希排程真正读到的东西，且每段都回报它实际覆盖了多少行，
+# 免得"没比对"被当成"比对通过"。
+OPEN_WO_SCOPE = """
+    wo.factory_id = :fid
+      AND wo.wo_type IN ('master', 'component')
+      AND wo.status IN ('released', 'in_progress', 'pending')
+"""
+
+FINGERPRINT_SQL: Dict[str, str] = {
+    # 工单池：哪些单要排、各排多少、什么时候要、绑的是哪条路线
+    "orders": f"""
+        SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
+            SELECT concat(wo.id, '|', wo.status, '|', wo.wo_type, '|', wo.product_id, '|',
+                           wo.planned_qty, '|', wo.good_qty, '|', wo.priority, '|',
+                           to_char(wo.planned_start, 'IYYYIWIDTHH24MISS'), '|',
+                           to_char(wo.planned_due, 'IYYYIWIDTHH24MISS'), '|',
+                           wo.routing_template_id, '|', wo.routing_id) AS r
+            FROM work_orders wo WHERE {OPEN_WO_SCOPE}
+        ) s
+    """,
+    # 工艺路线：模板工步（顺序/工时/允许工位）与旧版 routings.steps JSON
+    "routes": f"""
+        SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
+            SELECT concat('T|', s.template_id, '|', s.seq, '|', s.operation_name, '|',
+                           s.work_center, '|', s.standard_hours) AS r
+            FROM routing_template_steps s
+            WHERE s.template_id IN (
+                SELECT DISTINCT wo.routing_template_id FROM work_orders wo
+                WHERE {OPEN_WO_SCOPE} AND wo.routing_template_id IS NOT NULL
+            )
+            UNION ALL
+            SELECT concat('R|', rt.id, '|', md5(rt.steps::text)) AS r
+            FROM routings rt
+            WHERE rt.id IN (
+                SELECT DISTINCT wo.routing_id FROM work_orders wo
+                WHERE {OPEN_WO_SCOPE} AND wo.routing_id IS NOT NULL
+            )
+        ) x
+    """,
+    # 工位产能：并发、OEE、换型、日可完成件数
+    "capacity": """
+        SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
+            SELECT concat(sc.station_id, '|', sc.available_hours_per_day, '|', sc.efficiency_rate, '|',
+                           sc.setup_time_minutes, '|', sc.max_concurrent_orders, '|', sc.required_skills) AS r
+            FROM station_capacity sc WHERE sc.factory_id = :fid AND sc.is_active = TRUE
+        ) c
+    """,
+    # 设备：按工位聚合"还剩几台可用"（与 is_broken 的判据同一口径）
+    "equipment": """
+        SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
+            SELECT concat(g.home, '|', g.total, '|', g.usable) AS r FROM (
+                SELECT COALESCE(eq.station_id, eq.equipment_code) AS home, count(*) AS total,
+                       count(*) FILTER (WHERE eq.status NOT IN ('broken', 'maintenance')) AS usable
+                FROM equipment eq WHERE eq.factory_id = :fid GROUP BY 1
+            ) g
+        ) e
+    """,
+    # 班次日历（本厂 + 平台 default 回落）与计划期内的假期/补班
+    "calendar": """
+        SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
+            SELECT concat('S|', cal.factory_id, '|', cal.resource_id, '|', cal.day_of_week, '|',
+                           cal.start_time, '|', cal.end_time, '|', cal.is_active) AS r
+            FROM aps_work_calendars cal
+            WHERE cal.factory_id IN (:fid, 'default') AND cal.is_active = TRUE
+            UNION ALL
+            SELECT concat('H|', h.holiday_date, '|', h.is_working_day) AS r
+            FROM aps_holidays h
+            WHERE h.factory_id IN (:fid, 'default') AND COALESCE(h.is_active, TRUE) = TRUE
+              AND h.holiday_date BETWEEN :hs_date AND :he_date
+        ) k
+    """,
+    # 齐套就绪：排程只用到"这张单有没有缺口"这一个布尔（不是每行物料）
+    "material_readiness": f"""
+        SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
+            SELECT concat(wo.id, '|', CASE WHEN COALESCE(m.shortage_rows, 0) > 0 THEN 1 ELSE 0 END) AS r
+            FROM work_orders wo
+            LEFT JOIN (
+                SELECT work_order_id,
+                       SUM(CASE WHEN COALESCE(shortage_qty, 0) > 0 THEN 1 ELSE 0 END) AS shortage_rows
+                FROM work_order_materials GROUP BY work_order_id
+            ) m ON m.work_order_id = wo.id
+            WHERE {OPEN_WO_SCOPE}
+        ) mm
+    """,
+    # 计划员钉住的工序：跨版本取每道工序最新一行（与 load_pinned_tasks 同口径）
+    "pinned_steps": """
+        SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
+            WITH latest_per_op AS (
+                SELECT DISTINCT ON (t.work_order_id, t.operation_seq)
+                       t.work_order_id, t.operation_seq, t.station_id,
+                       t.planned_start, t.planned_end, t.is_locked
+                FROM aps_schedule_tasks t
+                JOIN aps_schedules s ON s.id = t.schedule_id
+                WHERE s.factory_id = :fid AND COALESCE(t.status, '') NOT IN ('completed', 'cancelled')
+                ORDER BY t.work_order_id, t.operation_seq, s.version_number DESC, t.created_at DESC
+            )
+            SELECT concat(p.work_order_id, '|', p.operation_seq, '|', p.station_id, '|',
+                           to_char(p.planned_start, 'IYYYIWIDTHH24MISS'), '|',
+                           to_char(p.planned_end, 'IYYYIWIDTHH24MISS')) AS r
+            FROM latest_per_op p
+            WHERE p.is_locked = TRUE AND p.planned_end >= :now
+        ) l
+    """,
+}
+
+REUSE_SQL = text("""
+    SELECT id, schedule_code, version_number, created_at, created_by, total_tasks,
+           unscheduled_count, on_time_rate, avg_utilization, avg_cycle_hours,
+           total_setup_minutes
+    FROM aps_schedules
+    WHERE factory_id = :fid AND mode = :mode AND optimize_for = :optimize_for
+      AND status = 'draft' AND COALESCE(is_current, FALSE) = FALSE
+      AND horizon_start = :hs AND horizon_end = :he
+      AND input_fingerprint = :fp
+    ORDER BY created_at DESC
+    LIMIT 1
+""")
+
+SNAPSHOT_SQL = text("""
+    SELECT payload FROM aps_plan_events
+    WHERE schedule_id = :sid AND event_type = 'schedule_generated'
+    ORDER BY created_at DESC LIMIT 1
+""")
+
+# 诊断明细留在事件里：一份草案的未排清单可能有上百条，留前 N 条足够复核，
+# 超出部分记 truncated 与总数，不假装完整。
+SNAPSHOT_LIMIT = 60
+
 
 # 优先级映射
 
@@ -152,6 +288,129 @@ class ApsService:
             "calendar_source": model.calendar_source,
         }
 
+    async def _input_fingerprint(
+        self,
+        factory_id: str,
+        *,
+        mode: str,
+        optimize_for: str,
+        horizon_days: int,
+        horizon_start: datetime,
+        horizon_end: datetime,
+        excluded: set,
+    ) -> tuple:
+        """把这一版计划的全部输入压成一个指纹，并回报每段覆盖了多少行。
+
+        空字符串的段（比如本厂没有钉住工序）照样参与拼接，但会标 rows=0，
+        这样"比对了、确实没有"和"没比对"在回执里是分得开的。
+        """
+        params = {
+            "fid": factory_id, "hs": horizon_start, "he": horizon_end,
+            "hs_date": horizon_start.date(), "he_date": horizon_end.date(),
+            "now": datetime.utcnow(),
+        }
+        parts: Dict[str, Dict[str, Any]] = {}
+        for name, sql in FINGERPRINT_SQL.items():
+            row = (await self.db.execute(text(sql), params)).mappings().first()
+            parts[name] = {
+                "fingerprint": str((row["fp"] if row else "") or ""),
+                "rows": int(row["rows_in"] if row else 0),
+            }
+        request = "|".join([
+            str(mode), str(optimize_for), str(int(horizon_days)),
+            horizon_start.isoformat(), ",".join(sorted(excluded)),
+        ])
+        parts["request"] = {"fingerprint": hashlib.md5(request.encode("utf-8")).hexdigest(),
+                            "rows": 1}
+        digest = hashlib.md5("#".join(
+            f"{key}:{parts[key]['fingerprint']}" for key in sorted(parts)
+        ).encode("utf-8")).hexdigest()
+        return digest, parts
+
+    async def _reused_draft(
+        self,
+        draft: Any,
+        *,
+        fingerprint: str,
+        parts: Dict[str, Dict[str, Any]],
+        horizon_days: int,
+        horizon_start: datetime,
+        horizon_end: datetime,
+        created_by: str,
+        change_reason: str,
+    ) -> Dict[str, Any]:
+        """输入没变就交回已有草案：一行都不写，但把当初的结论原样带回来。
+
+        未排清单与约束原因不重算，而是读那份草案生成时写进 aps_plan_events 的快照；
+        快照是这次改动之前写的（没有诊断明细）就如实说"明细未留存"，不补一份新的冒充。
+        """
+        schedule_id = str(draft["id"])
+        task_rows = int((await self.db.execute(text(
+            "SELECT count(*) FROM aps_schedule_tasks WHERE schedule_id = :sid"
+        ), {"sid": schedule_id})).scalar() or 0)
+        locked_rows = int((await self.db.execute(text(
+            "SELECT count(*) FROM aps_schedule_tasks WHERE schedule_id = :sid AND COALESCE(is_locked, FALSE)"
+        ), {"sid": schedule_id})).scalar() or 0)
+        event = (await self.db.execute(SNAPSHOT_SQL, {"sid": schedule_id})).mappings().first()
+        snapshot = event["payload"] if event and isinstance(event["payload"], dict) else {}
+        unscheduled = snapshot.get("unscheduled_orders")
+        diagnostics = snapshot.get("diagnostics") or {}
+        age_seconds = (datetime.utcnow() - (draft["created_at"] or datetime.utcnow())).total_seconds()
+        message = (
+            f"输入未变，复用草案 {draft['schedule_code']}（v{draft['version_number']}，"
+            f"{age_seconds / 60:.0f} 分钟前生成，{task_rows} 行任务）：本次不新增写入。"
+        )
+        if not snapshot:
+            message += " 注意：该草案没有留存的诊断快照，未排原因只能到界面重新触发一次才能看到。"
+        logger.info(
+            "[aps] 复用草案 %s（指纹 %s，输入未变）：跳过 %s 行任务写入",
+            schedule_id, fingerprint[:8], task_rows,
+        )
+        return {
+            "success": bool(snapshot.get("success", True)),
+            "reused": True,
+            "schedule_id": schedule_id,
+            "schedule_code": draft["schedule_code"],
+            "version_number": draft["version_number"],
+            "created_by": draft["created_by"],
+            "generated_at": draft["created_at"].isoformat() if draft["created_at"] else None,
+            "total_tasks": task_rows,
+            "pinned_tasks": locked_rows,
+            "unscheduled_orders": unscheduled if unscheduled is not None else [],
+            "unscheduled_count": int(draft["unscheduled_count"] or 0),
+            "constraint_violation_count": int(snapshot.get("constraint_violation_count") or 0),
+            "horizon_days": horizon_days,
+            "horizon": f"{horizon_days}天",
+            "horizon_start": horizon_start.isoformat(),
+            "horizon_end": horizon_end.isoformat(),
+            "input_summary": {
+                "input_fingerprint": fingerprint,
+                "fingerprint_parts": parts,
+                "reused_schedule_id": schedule_id,
+                "requested_by": created_by,
+                "change_reason": change_reason,
+                "new_rows_written": {"aps_schedules": 0, "aps_schedule_tasks": 0},
+            },
+            "diagnostics": {
+                "unscheduled": diagnostics.get("unscheduled") or [],
+                "unscheduled_total": int(diagnostics.get("unscheduled_total") or 0),
+                "constraint_violations": diagnostics.get("constraint_violations") or [],
+                "violations_total": int(diagnostics.get("violations_total") or 0),
+                "data_integrity": diagnostics.get("data_integrity") or [],
+                "snapshot_available": bool(snapshot),
+                "snapshot_capped_at": int(diagnostics.get("snapshot_limit") or SNAPSHOT_LIMIT),
+            },
+            "station_loads": snapshot.get("station_loads") or [],
+            "rule_explanation": snapshot.get("rule_explanation") or "",
+            "metrics": {
+                "on_time_delivery_rate": draft["on_time_rate"],
+                "avg_resource_utilization": draft["avg_utilization"],
+                "avg_manufacturing_cycle": draft["avg_cycle_hours"],
+                "total_setup_time": draft["total_setup_minutes"],
+            },
+            "message": message,
+        }
+
     async def generate_schedule(
 
         self,
@@ -170,6 +429,8 @@ class ApsService:
 
         exclude_resources: Optional[List[str]] = None,
 
+        force: bool = False,
+
     ) -> Dict[str, Any]:
 
         """生成排程方案
@@ -177,6 +438,9 @@ class ApsService:
         exclude_resources 用于"某工位今天停用/设备故障"这类约束：这些工位不进本轮资源，
         受影响工序只会被排到工艺路线允许的其他工位上，排不进就带着原因报出来，
         而不是被随手塞到任意空闲工位。
+
+        force=True 才绕过输入指纹强制重排。默认走指纹门：算法是确定性的，输入没变
+        再跑一遍只会多写几百行任务明细，那些行和上一版一模一样。
         """
 
         excluded = {str(x).strip() for x in (exclude_resources or []) if str(x).strip()}
@@ -186,6 +450,22 @@ class ApsService:
         horizon_start = now.replace(hour=8, minute=0, second=0, microsecond=0)
 
         horizon_end = horizon_start + timedelta(days=horizon_days)
+
+        fingerprint, fp_parts = await self._input_fingerprint(
+            factory_id, mode=mode, optimize_for=optimize_for, horizon_days=horizon_days,
+            horizon_start=horizon_start, horizon_end=horizon_end, excluded=excluded,
+        )
+        if not force:
+            draft = (await self.db.execute(REUSE_SQL, {
+                "fid": factory_id, "mode": mode, "optimize_for": optimize_for,
+                "hs": horizon_start, "he": horizon_end, "fp": fingerprint,
+            })).mappings().first()
+            if draft is not None:
+                return await self._reused_draft(
+                    draft, fingerprint=fingerprint, parts=fp_parts,
+                    horizon_days=horizon_days, horizon_start=horizon_start,
+                    horizon_end=horizon_end, created_by=created_by, change_reason=change_reason,
+                )
 
         # 1. 加载待排工单（已下达/执行中的主工单）
 
@@ -680,6 +960,10 @@ class ApsService:
             "data_integrity_checked_stations": used_station_codes,
             # 只排进了部分工序（其余工序被产能挡住，但钉住的行按计划员意愿保留）
             "partial_orders": len(scheduled_order_ids & {str(o) for o in result.unscheduled_orders}),
+            # 这版计划由哪些输入决定；下次同样输入会被指纹门复用
+            "input_fingerprint": fingerprint,
+            "fingerprint_parts": fp_parts,
+            "new_rows_written": {"aps_schedules": 1, "aps_schedule_tasks": len(result.schedule)},
         }
 
         # 6. 持久化排程方案
@@ -760,6 +1044,7 @@ class ApsService:
             is_current=False,
             supersedes_schedule_id=current_schedule.id if current_schedule else None,
             change_reason=change_reason,
+            input_fingerprint=fingerprint,
 
         )
 
@@ -826,6 +1111,23 @@ class ApsService:
                 "version_number": next_version,
                 "total_tasks": len(result.schedule),
                 "unscheduled_orders": result.unscheduled_orders,
+                "input_fingerprint": fingerprint,
+                "fingerprint_parts": fp_parts,
+                # 诊断明细留一份快照：复用草案时靠它把"哪几单没排、为什么"原样带回，
+                # 不重算也不编。超出 SNAPSHOT_LIMIT 就明说截断了多少条。
+                "success": bool(result.success),
+                "message": result.message,
+                "constraint_violation_count": len(result.constraint_violations),
+                "diagnostics": {
+                    "unscheduled": unscheduled_details[:SNAPSHOT_LIMIT],
+                    "unscheduled_total": len(unscheduled_details),
+                    "constraint_violations": violation_details[:SNAPSHOT_LIMIT],
+                    "violations_total": len(violation_details),
+                    "data_integrity": data_integrity_warnings,
+                    "snapshot_limit": SNAPSHOT_LIMIT,
+                },
+                "station_loads": station_loads,
+                "rule_explanation": rule_explanations.get(optimize_for, rule_explanations["delivery"]),
             },
         )
         await self.db.commit()
@@ -843,6 +1145,10 @@ class ApsService:
         return {
 
             "success": result.success,
+
+            "reused": False,
+
+            "version_number": next_version,
 
             "schedule_id": schedule_id,
 

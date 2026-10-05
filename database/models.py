@@ -1820,6 +1820,8 @@ class ApsSchedule(Base):
     is_current = Column(Boolean, default=False, nullable=False, index=True)
     supersedes_schedule_id = Column(String(36), nullable=True, index=True)
     change_reason = Column(Text, nullable=True)
+    # 这一版计划的输入指纹：同指纹的未确认草案直接复用，不再重复写任务明细
+    input_fingerprint = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
