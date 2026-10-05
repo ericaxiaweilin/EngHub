@@ -983,10 +983,16 @@ async def calculate_mrp(
                 # 本地 bom_items 只有一层，判不出自制/采购，如实留空
                 item_type = None
         
-        # 采购建议：按供应商 MOQ 向上取整；没有供应商主数据时明确使用
-        # 兼容默认 MOQ=100，不能悄悄把默认值当成真实供应商承诺。
-        moq = moq_map.get(material_code, 100)
-        suggested = math.ceil(net / moq) * moq if net > 0 else 0
+        # 采购建议：只有厂里真有供应商 MOQ 时才向上取整。
+        # 原来没有 MOQ 也套用默认 100 —— 实测 56 个外购缺口里 55 个没有供应商主数据，
+        # 等于系统凭空给 55 条建议各加了最多 99 件的采购量。缺依据就按缺口原量建议。
+        moq = moq_map.get(material_code) or 0
+        if moq > 0:
+            suggested = math.ceil(net / moq) * moq if net > 0 else 0
+            moq_basis = "supplier_moq"
+        else:
+            suggested = net
+            moq_basis = "no_supplier_moq·按缺口原量建议"
         
         if net > 0:
             shortage_count += 1
@@ -1004,6 +1010,10 @@ async def calculate_mrp(
             "parent_code": b.get("parent_code"),
             # make=有下级的自制装配件，buy=没有下级的采购件，None=来源结构判不出
             "item_type": item_type,
+            # 判定理由要能逐行核对：厂区政策 / 结构+工序字样 / 反推外购 / 单层判不出
+            "sourcing_basis": b.get("sourcing_basis"),
+            "moq": moq or None,
+            "moq_basis": moq_basis,
             "subassembly_suspect": material_code in suspect_parts,
             "required_qty": required,
             "on_hand_qty": on_hand,
