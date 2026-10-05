@@ -1044,6 +1044,18 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
                 )
                 + "。只有 buy 能直接下 PO，make 要先排出上层的装配件工单。"
             )
+        procure = shortage.get("procurement_demands") or {}
+        if procure.get("materials"):
+            lines.append(
+                "- 外购待办："
+                f"{int(procure['materials'])} 种（缺口 {n(procure.get('shortage_qty'))}）；"
+                f"有供应商依据 {int(procure.get('supplier_known') or 0)} 种、"
+                f"没依据 {int(procure.get('supplier_missing') or 0)} 种；"
+                f"已在途 {n(procure.get('on_order_qty'))}。"
+                "清单已汇到料号级，但系统没有自动开采购单 —— "
+                "purchase_requests/purchase_orders 目前没有接口或页面在读，"
+                "落单要先有读者。"
+            )
         dispatched = shortage.get("dispatched_to_child_orders") or {}
         if dispatched.get("parts"):
             lines.append(

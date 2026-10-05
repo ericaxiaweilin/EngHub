@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.services.bom_source import production_readiness
+from api.services.procurement_demand import kit_shortage_demands
 
 
 READINESS_ACTION_LABELS = {
@@ -424,6 +425,10 @@ class PmcControlTowerService:
         for bucket in readiness_roll.values():
             bucket["shortage_qty"] = round(bucket["shortage_qty"], 2)
 
+        # 外购那一档要变成动作，先得有一张能看的清单：缺多少、谁在等、有没有供应商依据
+        buy_items = [i for i in grouped.values() if str(i.get("item_type") or "") == "buy"]
+        procurement = await kit_shortage_demands(self.db, factory_id, buy_items)
+
         return {
             "data_status": "ready",
             "source": "work_order_materials.shortage_qty + work_orders + products + routing_steps",
@@ -436,9 +441,11 @@ class PmcControlTowerService:
                 "selfmade_readiness 按主档/工艺路线/工步判自制件能不能真开出工单。"
                 "缺口只数主工单齐套快照（含全部层级），下级工单是同一需求的执行、不重复计入；"
                 "dispatched_to_child_orders 表示这些缺口已经派了子装配件工单在做。"
+                "buy 那一档带 procurement_demands：汇到料号级的采购待办（含供应商依据与在途量）。"
             ),
             "shortage_by_item_type": by_type,
             "dispatched_to_child_orders": tasked,
+            "procurement_demands": procurement,
             "selfmade_readiness": readiness_roll,
             "affected_work_order_count": len(affected),
             "shortage_material_count": len(grouped),
