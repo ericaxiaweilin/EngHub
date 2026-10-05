@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 
@@ -59,6 +59,30 @@ PO_HISTORY_SQL = text("""
 """)
 
 
+# 建议供应商的匹配类目：只用 `suppliers` 里**已经存在**的供应商，按它的名字/类目能承接的
+# 物料特征去配。这是"建议"，不是事实声明 —— 采购确认前不进任何自动下单判断。
+# 配不上就不建议：宁可空着，也不拿一个不相干的名字填位（那才是"乱了后面麻烦"）。
+SUGGESTION_RULES = (
+    ("紧固件", ("螺栓", "螺絲", "螺丝", "螺母", "帽", "铆钉", "鉚釘", "垫圈", "彈簧", "弹簧", "销", "銷")),
+    ("钢材/金属", ("鋼", "钢", "鐵", "铁", "管材", "管", "板", "鋁", "铝", "銅", "铜", "SPHC", "Q195", "Q235", "45#", "STK")),
+    ("塑料/橡胶", ("ABS", "POM", "PA6", "尼龍", "尼龙", "塑膠", "塑料", "橡膠", "橡胶", "泡棉", "silicon", "PR")),
+    ("线材/电子", ("線", "线", "電阻", "电阻", "電容", "电容", "二極", "二三極", "IC", "LED", "PCB", "FPC", "馬達", "马达", "電控", "电控", "儀表", "仪表")),
+    ("涂饰/表面", ("漆", "烤漆", "噴", "涂", "塗", "電鍍", "电镀", "鋅", "锌", "氧化")),
+    ("包装", ("紙", "纸", "箱", "盒", "棧板", "膠帶", "胶带", "泡珠", "EPS")),
+)
+SUPPLIER_QUERY_SQL = text("SELECT supplier_name FROM suppliers WHERE factory_id = :fid")
+
+
+def _suggest_supplier(item_name: str, suppliers_by_key: Dict[str, List[str]]) -> Optional[str]:
+    """按类目给一个建议供应商，名字一定来自 suppliers 表。"""
+    for key, tokens in SUGGESTION_RULES:
+        pool = suppliers_by_key.get(key) or []
+        if not pool or not any(token in (item_name or "") for token in tokens):
+            continue
+        return pool[0]
+    return None
+
+
 def _f(value: Any) -> float:
     try:
         return float(value or 0)
@@ -80,6 +104,7 @@ async def kit_shortage_demands(db: Any, factory_id: str, buy_items: List[Dict[st
         "shortage_qty": round(sum(_f(i.get("shortage_qty")) for i in items), 2),
         "supplier_known": 0,
         "supplier_missing": 0,
+        "suggested": 0,
         "on_order_qty": 0.0,
         "po_status_not_counted": {},
         "top": [],
@@ -117,7 +142,21 @@ async def kit_shortage_demands(db: Any, factory_id: str, buy_items: List[Dict[st
         result["po_status_not_counted"][str(row["status"])] = {
             "orders": int(row["orders"] or 0), "qty": round(_f(row["qty"]), 2)}
 
+    suppliers_by_key: Dict[str, List[str]] = {}
+    all_names = [str(r["supplier_name"]) for r in (await db.execute(
+        SUPPLIER_QUERY_SQL, {"fid": factory_id})).mappings().all() if r["supplier_name"]]
+    for key, tokens in SUGGESTION_RULES:
+        picked = [n for n in all_names if any(t in n for t in (
+            ("钢", "金属", "铜", "铝", "重工") if key == "钢材/金属" else
+            ("塑", "新材料", "橡胶", "矽", "silicon") if key == "塑料/橡胶" else
+            ("线材", "电子", "chip", "resistor", "capacitor", "tech") if key in ("线材/电子",) else
+            ("涂料", "电镀", "表面") if key == "涂饰/表面" else
+            ("包装", "纸箱") if key == "包装" else
+            ("紧固件", "五金", "标准件") if key == "紧固件" else
+            ("轴承", "铜业", "精铸", "铸造")))]
+        suppliers_by_key[key] = picked or all_names[:0]
     known = 0
+    suggested = 0
     for item in items:
         code = str(item.get("material_code"))
         supply = suppliers.get(code)
@@ -126,13 +165,20 @@ async def kit_shortage_demands(db: Any, factory_id: str, buy_items: List[Dict[st
             item["supplier_name"] = supply["supplier_name"]
             item["supplier_lead_days"] = supply.get("lead_time_days")
         item["on_order_qty"] = on_order.get(code, 0.0)
+        if not supply:
+            guess = _suggest_supplier(str(item.get("material_name") or ""), suppliers_by_key)
+            if guess:
+                item["suggested_supplier"] = guess
+                item["supplier_basis"] = "建议·未经采购确认"
+                suggested += 1
     result["supplier_known"] = known
+    result["suggested"] = suggested
     result["supplier_missing"] = len(items) - known
     result["on_order_qty"] = round(sum(on_order.values()), 2)
+    keys = ("material_code", "material_name", "shortage_qty", "supplier_name",
+            "suggested_supplier", "supplier_basis", "on_order_qty", "affected_work_orders")
     result["top"] = sorted(
-        ({k: item.get(k) for k in (
-            "material_code", "material_name", "shortage_qty", "supplier_name",
-            "on_order_qty", "affected_work_orders")} for item in items),
+        ({k: item[k] for k in keys if item.get(k) is not None} for item in items),
         key=lambda i: -_f(i["shortage_qty"]))[:10]
     result["note"] = (
         "缺口已按当前台账刷新（在途只认 confirmed/shipped 且预计到货在期内的 PO）；"

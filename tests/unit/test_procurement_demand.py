@@ -20,7 +20,8 @@ class _Rows:
         return self._rows
 
 
-def _db(suppliers=(), po_history=(), on_order=(), other_status=(), material_suppliers=()):
+def _db(suppliers=(), po_history=(), on_order=(), other_status=(), material_suppliers=(),
+        master_suppliers=()):
     db = MagicMock()
     writes = []
 
@@ -32,6 +33,8 @@ def _db(suppliers=(), po_history=(), on_order=(), other_status=(), material_supp
             return _Rows(po_history)
         if "NOT IN ('confirmed', 'shipped', 'received')" in sql:
             return _Rows(other_status)
+        if "FROM suppliers" in sql:
+            return _Rows(master_suppliers)
         if "FROM materials" in sql:
             return _Rows(material_suppliers)
         if "FROM purchase_orders" in sql:
@@ -106,3 +109,32 @@ async def test_material_master_default_supplier_counts_as_evidence():
          "item_type": "buy", "affected_work_orders": ["WO-1"]}])
     assert out["supplier_known"] == 1 and out["supplier_missing"] == 0
     assert out["top"][0]["supplier_name"] == "宝钢金属(佛山)"
+
+
+@pytest.mark.asyncio
+async def test_suggestion_only_uses_real_registered_suppliers():
+    """没依据的料号给一个**建议**供应商：名字必须来自 suppliers 档案，且标明未经确认。"""
+    db = _db(master_suppliers=[{"supplier_name": "永年紧固件(邯郸)"},
+                               {"supplier_name": "裕同包装(东莞)"}])
+    out = await kit_shortage_demands(db, "FAC_MECH_001", [
+        {"material_code": "RM-BOLT-9", "material_name": "M8螺栓", "shortage_qty": 90,
+         "item_type": "buy", "affected_work_orders": ["WO-1"]},
+        {"material_code": "RM-BOX-9", "material_name": "出口纸箱", "shortage_qty": 40,
+         "item_type": "buy", "affected_work_orders": ["WO-1"]},
+    ])
+    assert out["supplier_known"] == 0 and out["suggested"] == 2
+    by_code = {i["material_code"]: i for i in out["top"]}
+    assert by_code["RM-BOLT-9"]["suggested_supplier"] == "永年紧固件(邯郸)"
+    assert by_code["RM-BOX-9"]["suggested_supplier"] == "裕同包装(东莞)"
+    assert all(i["supplier_basis"] == "建议·未经采购确认" for i in by_code.values())
+
+
+@pytest.mark.asyncio
+async def test_no_suggestion_when_master_has_no_fitting_supplier():
+    """档案里一家都对不上就不建议 —— 空着比拿个不相干的名字填位好。"""
+    db = _db(master_suppliers=[])
+    out = await kit_shortage_demands(db, "FAC_MECH_001", [
+        {"material_code": "X", "material_name": "M8螺栓", "shortage_qty": 5,
+         "item_type": "buy", "affected_work_orders": []}])
+    assert out["suggested"] == 0
+    assert "suggested_supplier" not in out["top"][0]
