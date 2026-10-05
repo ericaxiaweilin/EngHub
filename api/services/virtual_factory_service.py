@@ -32,17 +32,37 @@ from database.models import (
 )
 
 
-def progress_qty(daily_pieces: float, step_hours: float, remaining: int,
-                 fallback_daily: int = 1) -> int:
+def progress_qty(daily_pieces: float, step_hours: float, remaining: int) -> int:
+    """映射不到产能（daily_pieces<=0）就返回 0 —— 由调用方跳过这张单。
+
+    原来这里允许回落到"脉搏总产能均分"，等于给一台查不到节拍的机器编一个产量，
+    做完还能入库，母单缺口就此假清零。虚拟工厂要有决策价值，第一件事就是不编。"""
     """这一拍该出多少件：映射到的日产能 × 仿真过了的时间。
 
     时间在这里是参数，不是"等真实工厂过完一天"：一拍仿真 24 小时就出一天的量，
     仿真 2 小时就出 1/12 天的量。日产能允许是小数（实测 ST-QC-02 配 0.6 件/日），
     但一道工序至少推进 1 件，否则永远出不来；没到剩余量的上限就按上限截断。
     """
-    rate = float(daily_pieces) if float(daily_pieces or 0) > 0 else float(max(1, fallback_daily))
+    rate = float(daily_pieces or 0)
+    if rate <= 0 or int(remaining) <= 0:
+        return 0
     produced = int(round(rate * float(step_hours) / 24.0))
     return max(1, min(int(remaining), produced))
+
+
+def units_makeable(planned_qty: int, completed_qty: int, required_qty: float,
+                   short_qty: float) -> int:
+    """材料还够做几件：齐套快照的 required/shortage 换成件数，再减掉已经做完的。
+
+    没有物料行（required<=0）一律算 0：宁可这张单不动，也不凭空造产出。
+    """
+    planned = int(planned_qty or 0)
+    required = float(required_qty or 0)
+    if planned <= 0 or required <= 0:
+        return 0
+    available_ratio = max(0.0, (required - float(short_qty or 0)) / required)
+    supported = int(planned * available_ratio)
+    return max(0, supported - int(completed_qty or 0))
 
 
 DEFAULT_MONTHLY_CONTAINERS = 300
@@ -567,32 +587,79 @@ class VirtualFactoryService:
             "planned_due": due.date().isoformat(),
         }
 
-    async def _daily_pieces_by_order(self, factory_id: str, order_ids: List[str]) -> Dict[str, float]:
-        """每张单一天能出几件：从它在本厂生效方案里的首道工序工位，取 station_capacity。
+    async def _capacity_by_route(self, factory_id: str, order_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """每张单的推进速率来自它自己的工艺路线，而不是"某版方案里恰好有它的行"。
 
-        这一列的口径是"一天可完成几件产品"（用户 10-03 确认），所以直接当日产率用；
-        映射不到工位的单不猜数字，回落到脉搏的总产能参数并在回执里说明有几张是回落的。
+        - `primary_daily`：首道工序所在工位的日产能（口径=一天可完成几件，用户 10-03 确认），
+          用它推产量 —— 这是"这台工位一天出几件"的直接映射；
+        - `bottleneck_daily`：整条路线上最慢的工位，只作为**约束读数**报出来。
+          不拿它当节拍：本厂 station_capacity 里 ST-QC-02 配 0.6 件/日这类值与现场明显脱节
+          （他 10-03 就指出这列需要重定），用它当速率会让所有单都龟速并替主数据错误背书；
+        - 一个工位都映射不到的单：跳过，不编速率。
         """
         if not order_ids:
             return {}
         rows = (await self.db.execute(text("""
-            SELECT w.id AS work_order_id,
-                   COALESCE(sc.available_hours_per_day, 0) AS daily_pieces,
-                   f.station_id AS station_code
-            FROM work_orders w
-            LEFT JOIN (
-                SELECT DISTINCT ON (t.work_order_id) t.work_order_id, t.station_id
-                FROM aps_schedule_tasks t
-                JOIN aps_schedules s ON s.id = t.schedule_id
-                WHERE s.factory_id = :fid AND s.is_current = TRUE
-                  AND COALESCE(t.status, '') NOT IN ('completed', 'cancelled')
-                ORDER BY t.work_order_id, t.operation_seq, t.planned_start
-            ) f ON f.work_order_id = w.id
+            WITH route_station AS (
+                SELECT w.id AS work_order_id, st.work_center AS station_code, st.seq::int AS step_seq
+                FROM work_orders w
+                JOIN routing_template_steps st
+                  ON st.template_id::text = w.routing_template_id::text
+                WHERE w.id = ANY(CAST(:ids AS text[])) AND w.routing_template_id IS NOT NULL
+                  AND COALESCE(st.work_center, '') <> ''
+                UNION ALL
+                SELECT w.id, COALESCE(s->>'station', s->>'work_center'),
+                       COALESCE((s->>'sequence')::int, (s->>'seq')::int, 0)
+                FROM work_orders w
+                JOIN routings r ON r.id = w.routing_id, jsonb_array_elements(r.steps::jsonb) AS s
+                WHERE w.id = ANY(CAST(:ids AS text[])) AND w.routing_id IS NOT NULL
+                  AND COALESCE(s->>'station', s->>'work_center', '') <> ''
+            )
+            SELECT rs.work_order_id,
+                   (array_agg(sc.available_hours_per_day ORDER BY rs.step_seq)
+                      FILTER (WHERE sc.station_id IS NOT NULL))[1] AS primary_daily,
+                   min(sc.available_hours_per_day)
+                      FILTER (WHERE sc.station_id IS NOT NULL) AS bottleneck_daily,
+                   (array_agg(rs.station_code ORDER BY rs.step_seq)
+                      FILTER (WHERE sc.station_id IS NOT NULL))[1] AS primary_station,
+                   count(*) AS route_stations,
+                   count(sc.id) AS mapped_stations
+            FROM route_station rs
             LEFT JOIN station_capacity sc
-              ON sc.station_id = f.station_id AND sc.factory_id = :fid AND sc.is_active = TRUE
-            WHERE w.id = ANY(CAST(:ids AS text[]))
-        """), {"fid": factory_id, "ids": order_ids})).mappings().all()
-        return {str(r["work_order_id"]): float(r["daily_pieces"] or 0) for r in rows}
+              ON sc.station_id = rs.station_code AND sc.factory_id = :fid AND sc.is_active = TRUE
+            GROUP BY rs.work_order_id
+        """), {"ids": order_ids, "fid": factory_id})).mappings().all()
+        return {
+            str(r["work_order_id"]): {
+                "primary_daily": float(r["primary_daily"] or 0),
+                "bottleneck_daily": float(r["bottleneck_daily"] or 0),
+                "primary_station": r["primary_station"],
+                "route_stations": int(r["route_stations"] or 0),
+                "mapped_stations": int(r["mapped_stations"] or 0),
+            } for r in rows
+        }
+
+    async def _material_coverage(self, order_ids: List[str]) -> Dict[str, Dict[str, float]]:
+        """每张单还做得动几件：齐套快照里 required/shortage 直接换算，不另设阈值。
+
+        shortage 的含义就是"这一行现在缺多少"，所以整单可支撑件数 =
+        planned_qty × (required - shortage) / required；已经做完的部分照实扣掉。
+        没有物料行的单（orders_without_bom 那一类）不猜，返回 None 由调用方跳过。
+        """
+        if not order_ids:
+            return {}
+        rows = (await self.db.execute(text("""
+            SELECT m.work_order_id,
+                   sum(COALESCE(m.required_qty, 0)) AS required_qty,
+                   sum(greatest(COALESCE(m.shortage_qty, 0), 0)) AS shortage_qty
+            FROM work_order_materials m
+            WHERE m.work_order_id = ANY(CAST(:ids AS text[]))
+            GROUP BY m.work_order_id
+        """), {"ids": order_ids})).mappings().all()
+        return {str(r["work_order_id"]): {
+            "required": float(r["required_qty"] or 0),
+            "shortage": float(r["shortage_qty"] or 0),
+        } for r in rows}
 
     async def _advance_open_work(self, cfg: PulseConfig, stations: List[Station],
                                  sim_now: datetime) -> Dict[str, Any]:
@@ -606,9 +673,15 @@ class VirtualFactoryService:
         reports_created = 0
         containers_reported = 0
         budget = cfg.max_work_orders_per_pulse
-        rates = await self._daily_pieces_by_order(cfg.factory_id, [str(m.id) for m in masters])
-        fallback_count = sum(1 for m in masters if rates.get(str(m.id), 0) <= 0)
-        per_order_daily = max(1, cfg.daily_capacity // max(1, min(budget, len(masters))))
+        ids = [str(m.id) for m in masters]
+        caps = await self._capacity_by_route(cfg.factory_id, ids)
+        coverage = await self._material_coverage(ids)
+        skipped_unmapped = 0
+        partially_mapped = 0
+        constraints: List[Dict[str, Any]] = []
+        skipped_no_bom_lines = 0
+        skipped_short_material = 0
+        blocked_examples: List[Dict[str, Any]] = []
         station_by_code = {s.station_code: s for s in stations}
         # 订单状态先攒起来，循环结束后按状态各合成一条 UPDATE
         done_order_ids: List[str] = []
@@ -629,11 +702,42 @@ class VirtualFactoryService:
                 master.status = "completed"
                 master.actual_complete = master.actual_complete or sim_now
                 continue
-            # 这一拍该出多少：映射到的日产能 × 仿真过了多少时间（一天=24 仿真小时）。
-            # 映射不到产能的单才回落到脉搏总产能均分，回执里把回落有几张报出来。
-            daily = float(rates.get(str(master.id)) or 0)
-            rate = daily if daily > 0 else float(per_order_daily)
-            qty = progress_qty(daily, cfg.sim_step_hours, remaining, per_order_daily)
+            # 产能门：这张单在本厂生效方案里的首道工序工位，映射得到日产能才谈推进
+            cap = caps.get(str(master.id)) or {}
+            daily = float(cap.get("primary_daily") or 0)
+            if daily <= 0:
+                skipped_unmapped += 1
+                continue
+            if int(cap.get("mapped_stations") or 0) < int(cap.get("route_stations") or 0):
+                partially_mapped += 1
+            if len(constraints) < 5 and float(cap.get("bottleneck_daily") or 0) > 0:
+                constraints.append({
+                    "work_order_code": master.work_order_code,
+                    "primary_station": cap.get("primary_station"),
+                    "primary_daily": round(daily, 2),
+                    "bottleneck_daily": round(float(cap["bottleneck_daily"]), 2),
+                })
+            # 材料门：欠料就做不出那么多件，宁可这张单停在这儿并报出去，
+            # 也不做出来入库去假充母单齐套
+            cover = coverage.get(str(master.id)) or {"required": 0.0, "shortage": 0.0}
+            makeable = units_makeable(master.planned_qty or 0, master.completed_qty or 0,
+                                      cover["required"], cover["shortage"])
+            if cover["required"] <= 0:
+                skipped_no_bom_lines += 1   # 齐套快照里没有它的物料行＝没有依据，不编产量
+                continue
+            if makeable <= 0:
+                skipped_short_material += 1
+                if len(blocked_examples) < 5:
+                    blocked_examples.append({
+                        "work_order_code": master.work_order_code,
+                        "planned_qty": master.planned_qty,
+                        "completed_qty": master.completed_qty,
+                        "required_material": round(cover["required"], 3),
+                        "short_material": round(cover["shortage"], 3),
+                    })
+                continue
+            qty = min(progress_qty(daily, cfg.sim_step_hours, remaining), makeable)
+            rate = daily
             defect_qty = 1 if qty >= 20 and uuid.uuid4().int % 11 == 0 else 0
             good_qty = max(0, qty - defect_qty)
 
@@ -742,8 +846,14 @@ class VirtualFactoryService:
             "sim_now": sim_now.isoformat(),
             # 日产能是从 station_capacity（口径=一天可完成几件）映射来的；
             # 映射不到的单回落到脉搏总产能均分，这里报数量不报假来源。
-            "rate_mapped_orders": len(masters) - fallback_count,
-            "rate_fallback_orders": fallback_count,
+            # 两道的门都只放行有依据的单；被挡住的按原因分类报出来，不藏进"完成率低"里
+            "skipped_no_capacity_mapping": skipped_unmapped,
+            "skipped_no_bom_lines": skipped_no_bom_lines,
+            "partially_mapped_route_orders": partially_mapped,
+            # 瓶颈只报约束不当节拍：station_capacity 里 0.6 件/日这类值与现场脱节（用户 10-03 已指出）
+            "route_constraints_sample": constraints,
+            "skipped_material_shortage": skipped_short_material,
+            "blocked_examples": blocked_examples,
             "predicted_completion_samples": predicted[:5],
             "daily_capacity_containers": cfg.daily_capacity,
             # 本轮领料：按 BOM 真扣了多少、哪里欠、哪些产品没 BOM 可扣
