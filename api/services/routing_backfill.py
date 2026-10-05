@@ -28,6 +28,7 @@ from sqlalchemy import bindparam, text
 
 from api.services.engine_heartbeat import record
 from api.services.component_orders import expand_ready_components
+from api.services.component_release import release_kitted_child_orders
 from api.services.snapshot_supply import refresh_snapshot_supply
 from api.services.routing_from_family import (
     derive_routing_for_component,
@@ -239,6 +240,10 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
         await db.commit()
     # 最后把主快照的缺口按当前台账刷一遍：下级完工入库后，父层齐套门才会自己放行
     receipt["supply_refresh"] = await refresh_snapshot_supply(db, apply=apply)
+    # 刷完缺口再判能否开工：下级装配件的料齐了就 released，没齐就报卡在哪
+    receipt["child_releases"] = await release_kitted_child_orders(
+        db, factory_id=None, apply=apply
+    )
     receipt["dry_run"] = not apply
     return receipt
 
