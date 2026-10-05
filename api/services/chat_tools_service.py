@@ -851,6 +851,16 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_bom_data_quality",
+            "description": "BOM 数据质量自检（只读）：名称就是料号、品名过于笼统、缺物料分类、缺单位、单价形状异常、图纸行当物料、层级断链、同料号多父级。每条带 affected_shortage_qty 并按影响缺口排序。用于 BOM 有什么问题 / 哪些命名不规范 / 该提哪条 ECR / 为什么这版 BOM 推不出自制路线 这类问题。只报问题，不修改任何 BOM 原始行。",
+            "parameters": {"type": "object", "properties": {
+                "product_model": {"type": "string", "description": "机种型号（= BOM 的 model_name）；不给就用当前厂区行数最多的机种"}
+            }},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_wms_inventory_health",
             "description": "WMS 库存健康度汇总：SKU 数、有单价的库存金额覆盖、周转（按真实消耗口径 production_out/outbound）、呆滞、效期、低库存、过量、补货建议，并同批返回覆盖率与不可计算项（库位容量、满载率、入库流水缺失、效期无值等）。用于'库存健康''周转''呆滞''该补什么''是否过量''库位满载'类问题；不要用 query_inventory 的行级明细替代这个汇总。",
             "parameters": {
@@ -2466,6 +2476,45 @@ async def _tool_query_maintenance_due(db: AsyncSession, args: Dict[str, Any], fa
     }
 
 
+async def _tool_query_bom_data_quality(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """BOM 质量自检（只读）：判据只在 bom_data_quality 一处定义，这里负责取厂区与兜型号。
+
+    目的是让机器人能回答"这版 BOM 哪里脏、该先改哪条"，而不是每次靠人肉查库对撞。
+    """
+    from api.services.bom_data_quality import scan
+
+    fid = factory_id or "FAC_MECH_001"
+    model = str(args.get("product_model") or "").strip()
+    if not model:
+        row = (await db.execute(text("""
+            SELECT product_model, count(*) AS lines FROM enghub_bom_items
+            WHERE factory_id = :fid GROUP BY 1 ORDER BY lines DESC LIMIT 1
+        """), {"fid": fid})).mappings().first()
+        model = str(row["product_model"]) if row else ""
+    if not model:
+        return {"status": "no_data", "factory_id": fid,
+                "message": "该厂区镜像里没有 BOM 行，没有质量数据可判：先确认 BOM 是否上传/同步。"}
+    data = await scan(db, fid, model)
+    findings = data.get("findings") or []
+    return {
+        "status": "ok" if findings else "clean",
+        "factory_id": fid,
+        "product_model": model,
+        "rows": data.get("rows"),
+        "codes": data.get("codes"),
+        "rule_count": len(findings),
+        "findings": [
+            {k: f.get(k) for k in ("rule", "name", "severity", "codes",
+                                   "affected_shortage_qty", "sample_codes", "action")}
+            for f in findings[:8]
+        ],
+        "data_note": ("只读自检：系统不改 BOM 原始行。按影响缺口从大到小提 ECR，"
+                      "优先做最挡生产的那条。"),
+    }
+
+
 async def _tool_query_wms_inventory_health(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -2945,6 +2994,7 @@ _TOOL_EXECUTORS = {
     "query_downtime": _tool_query_downtime,
     "query_maintenance_due": _tool_query_maintenance_due,
     "query_wms_inventory_health": _tool_query_wms_inventory_health,
+    "query_bom_data_quality": _tool_query_bom_data_quality,
     "query_shortage_alerts": _tool_query_shortage_alerts,
     "query_stagnant": _tool_query_stagnant,
     "query_spc_anomalies": _tool_query_spc_anomalies,
@@ -3333,6 +3383,7 @@ TOOL_LABELS = {
     "query_downtime": "停机记录",
     "query_maintenance_due": "保养到期",
     "query_wms_inventory_health": "库存健康度",
+    "query_bom_data_quality": "BOM 数据质量自检",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",
