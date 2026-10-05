@@ -174,11 +174,17 @@ async def test_no_parent_column_does_not_block_explosion():
 
 @pytest.mark.asyncio
 async def test_item_type_splits_selfmade_from_purchased():
-    """有下级的料号是自制装配件，没下级的才是采购件。
+    """自制/采购分流：有下级 **且子树写得出工序字样**才算自制。
 
-    混成一个缺口总数就派不了活：装配件的缺口要排产自装，不是下 PO。
+    旧口径只看结构（有下级=自制）。10-05 用户补了工厂事实：軸承組、電源線这类
+    买进来就带结构的组件，子树里没有任何工序字样，把它们判成自制只会卡在
+    "缺工艺路线"里；现在归采购口径，缺口才能落到对的人手上。
     """
-    rows = [_row(1, "ASSY-A", 2, 0), _row(2, "SUB-B", 3, 1), _row(3, "RAW-C", 1, 2)]
+    rows = [
+        {**_row(1, "ASSY-A", 2, 0), "attribute_text": "ASSY-A;;;"},
+        {**_row(2, "SUB-B", 3, 1), "attribute_text": "SUB-B;;烤漆;;;"},
+        {**_row(3, "RAW-C", 1, 2), "attribute_text": "RAW-C;;;"},
+    ]
 
     async def execute(statement, params=None):
         r = MagicMock()
@@ -383,3 +389,37 @@ async def test_finished_good_row_gets_no_subtree_evidence():
     assert out["finished_good_rows"] == ["MEP1791-P0"]
     assert "MEP1791-P0" not in out["evidence"]
     assert "烤漆" in out["evidence"]["車架組"]
+
+@pytest.mark.asyncio
+async def test_subassembly_without_any_process_wording_is_purchased_not_selfmade():
+    """有下级 ≠ 自制。用户的工厂口径（10-05）：子树里写不出工序字样就是买进来的组件。
+
+    軸承組（`HRB/輝遠` 轴承）这种带下层的东西，判成自制会去追一条"缺工艺路线"，
+    而它真正该走的是采购下 PO。
+    """
+    rows = [
+        {**_row(1, "ROOT", 1, 0), "attribute_text": "整機;;;"},
+        {**_row(2, "軸承組", 1, 1), "attribute_text": "軸承組;半成品;;;;EP591;"},
+        {**_row(3, "軸承", 2, 2), "attribute_text": "軸承;自動調心;2201-2RS;;;HRB/輝遠"},
+        {**_row(2, "車架組", 1, 3), "attribute_text": "車架組;半成品;;;;EP298;"},
+        {**_row(3, "五通管", 2, 4), "attribute_text": "五通管;車架;口50x100;;;焊接;EP298;"},
+    ]
+
+    async def execute(statement, params=None):
+        r = MagicMock()
+        if "enghub_bom_items" in str(statement) and "SUM" not in str(statement):
+            r.mappings.return_value.all.return_value = rows
+        else:
+            r.mappings.return_value.all.return_value = []
+        r.scalars.return_value.all.return_value = []
+        return r
+
+    db = MagicMock()
+    db.execute = execute
+    out = await bom_source.explode_requirement(db, "FAC_MECH_001", "ROOT", 10)
+    by_code = {line["material_code"]: line for line in out["lines"]}
+    assert by_code["軸承組"]["item_type"] == "buy", "没工序证据的带下层件是外购组件"
+    assert by_code["車架組"]["item_type"] == "make", "下层写着焊接，车架组才是厂内要做的"
+    assert out["purchased_assemblies"] == ["軸承組"]
+    # 需求量不变，只是归到对的人手里
+    assert by_code["軸承組"]["required_qty"] == 10

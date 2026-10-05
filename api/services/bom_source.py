@@ -31,7 +31,8 @@ import math
 from typing import Tuple
 from sqlalchemy import text
 
-from api.services.bom_attributes import clean_name, is_finished_good_row
+from api.services.bom_attributes import (clean_name, families_in,
+                                    is_finished_good_row)
 
 MIRROR_SQL = text("""
     SELECT part_number AS material_code, description AS material_name,
@@ -382,6 +383,28 @@ async def explode_requirement(
     # 有下级的是自制装配件（缺口要排产自装），没下级的是采购件（缺口下 PO）。
     # 混在一个缺口总数里，PMC 就没法把活直接派给对的人。
     parent_codes = {n["parent_code"] for n in nodes if n["parent_code"]}
+    # 用户的工厂口径（10-05）：光"有下级"不足以判自制 —— 軸承組/電源線/傳動軸 这类
+    # 买来就是带结构的组件，只有**子树里写得出工序字样**（焊接/烤漆/電鍍/POM/ABS…）
+    # 才是厂内要做的东西。反推过去：一句工序证据都没有的有下级件 = 外购组件，
+    # 它该进采购口径下 PO，而不是卡在"缺工艺路线"里让工艺部凭空给一道。
+    by_code, kids = _tree_indexes(nodes)
+    evidence_cache: Dict[str, tuple] = {}
+
+    def sourcing_of(code: str) -> str:
+        return sourcing_basis_of(code)[0]
+
+    def sourcing_basis_of(code: str) -> tuple:
+        if code not in evidence_cache:
+            has_children = code in parent_codes
+            if not has_children:
+                verdict = ("buy", "leaf")
+            else:
+                families = families_in(subtree_text(by_code, kids, code))
+                verdict = ("make", "children+process_evidence") if families \
+                    else ("buy", "purchased_assembly")
+            evidence_cache[code] = verdict
+        return evidence_cache[code]
+
     merged: Dict[str, Dict[str, Any]] = {}
     self_rows: List[str] = []
     for node in nodes:
@@ -402,7 +425,8 @@ async def explode_requirement(
                 "qty_per_unit": node["qty_per_parent"],
                 "level": node["level"],
                 "parent_code": node["parent_code"],
-                "item_type": "make" if key in parent_codes else "buy",
+                "item_type": sourcing_of(key),
+                "sourcing_basis": sourcing_basis_of(key)[1],
                 "required_qty": math.ceil(node["gross_qty"]),
                 "on_hand_qty": int(node["on_hand_qty"]),
                 "on_order_qty": int(node["on_order_qty"]),
@@ -430,7 +454,42 @@ async def explode_requirement(
         "buy_parts": sum(1 for r in merged.values() if r["item_type"] == "buy"),
         "problems": problems,
         "self_rows_excluded": self_rows,
+        # 有下级、但子树里一句工序字样都没有的：按工厂口径是买进来的组件，
+        # 报出来才能让采购看见它们，而不是留在"缺工艺路线"里没人管。
+        "purchased_assemblies": sorted(
+            code for code, row in merged.items()
+            if row.get("sourcing_basis") == "purchased_assembly"),
     }
+
+
+def _tree_indexes(nodes: List[Dict[str, Any]]) -> Tuple[Dict[str, List], Dict[str, List]]:
+    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    kids: Dict[str, List[Dict[str, Any]]] = {}
+    for node in nodes:
+        by_code.setdefault(str(node["material_code"]), []).append(node)
+        kids.setdefault(str(node["parent_code"] or ""), []).append(node)
+    return by_code, kids
+
+
+def subtree_text(by_code: Dict[str, List], kids: Dict[str, List], code: str) -> str:
+    """某个料号在自己**每一处出现**下的整棵子树原文（含它自己那一行）。
+
+    同一料号出现在多处时每一处都单独走：按料号去重只会读到第一处的下层，
+    另一处的证据就丢了（齐套表合并多父级行时正是这样丢的）。
+    """
+    chunks: List[str] = []
+    for placement in by_code.get(str(code), []):
+        seen: set = set()
+        stack = [placement]
+        while stack:
+            node = stack.pop()
+            key = str(node["material_code"])
+            if key in seen:
+                continue
+            seen.add(key)
+            chunks.append(str(node.get("attribute_text") or ""))
+            stack.extend(kids.get(key, []))
+    return " ".join(c for c in chunks if c).strip()
 
 
 async def subtree_evidence(
@@ -461,33 +520,16 @@ async def subtree_evidence(
             "source": "engflow_mirror_tree", "rows": len(nodes),
             "problems": problems[:5],
         })
-        by_code: Dict[str, List[Dict[str, Any]]] = {}
-        kids: Dict[str, List[Dict[str, Any]]] = {}
+        by_code, kids = _tree_indexes(nodes)
         self_rows = set()
         for node in nodes:
-            by_code.setdefault(str(node["material_code"]), []).append(node)
-            kids.setdefault(str(node["parent_code"] or ""), []).append(node)
             if is_finished_good_row(node.get("raw_description"), product_model, node["level"]):
                 self_rows.add(str(node["material_code"]))
         receipt["finished_good_rows"] = sorted(self_rows)[:10]
         for code in wanted:
             if code in self_rows:
                 continue
-            chunks: List[str] = []
-            for placement in by_code.get(code, []):
-                # 每一处出现单独走一遍：同一料号在两处出现时按料号去重，
-                # 只会读到第一处的下层，另一处的证据就又丢了。
-                seen: set = set()
-                stack = [placement]
-                while stack:
-                    node = stack.pop()
-                    key = str(node["material_code"])
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    chunks.append(str(node.get("attribute_text") or ""))
-                    stack.extend(kids.get(key, []))
-            blob = " ".join(c for c in chunks if c).strip()
+            blob = subtree_text(by_code, kids, code)
             if blob:
                 texts[code] = blob
     else:
