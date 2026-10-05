@@ -13,7 +13,7 @@ from api.services import chain_convergence as cc
 BASE = {
     "open_pool": 461, "child_orders": 474, "completed_orders": 5,
     "released_by_gate": 30, "shortage_qty": 34550.0, "reports_24h": 14,
-    "live_plans": 7, "plan_task_rows": 5138,
+    "live_plans": 7, "plan_task_rows": 5138, "reports_24h_virtual": 14,
 }
 
 
@@ -68,12 +68,13 @@ def test_three_stalled_ticks_in_a_row_raises_the_alert():
     assert out["alert"] is True
 
 
-def test_missing_execution_input_is_blamed_on_the_input_not_on_the_algorithm():
-    prev = _prev(reports_24h=0)
-    current = dict(BASE, reports_24h=0)
+def test_report_provenance_is_stated_instead_of_calling_virtual_work_not_real():
+    """执行侧口径：报工由虚拟工厂脉搏承担，不能再写成"没有真实报工输入"。"""
+    prev = _prev(reports_24h=0, reports_24h_virtual=0)
+    current = dict(BASE, reports_24h=6, reports_24h_virtual=6)
     out = cc.judge(current, prev)
-    assert "24 小时内没有真实报工" in out["reason"]
-    assert "不是算法没干活" in out["reason"]
+    assert "近 24h 报工 6 条（虚拟工厂脉搏 6 条 / 外部接入 0 条）" in out["reason"]
+    assert "没有真实报工" not in out["reason"]
 
 
 def test_rules_travel_with_the_verdict_so_a_reviewer_can_recompute():
@@ -122,7 +123,7 @@ async def test_measure_is_read_only():
         r.mappings.return_value.first.return_value = {
             "open_pool": 461, "child_orders": 474, "completed_orders": 5,
             "released_by_gate": 30, "shortage_qty": 34550, "reports_24h": 14,
-            "live_plans": 7, "plan_task_rows": 5138,
+            "live_plans": 7, "plan_task_rows": 5138, "reports_24h_virtual": 14,
         }
         return r
 

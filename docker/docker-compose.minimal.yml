@@ -29,6 +29,11 @@ x-backend-env: &backend-env
     # 实测 10-05 预演=306 份/19,144 行可回收、3 份被锁守住；确认后/下达过/归档的一律不碰。
     - APS_DRAFT_PRUNE_ENABLED=${APS_DRAFT_PRUNE_ENABLED:-true}
     - APS_DRAFT_KEEP_VERSIONS=${APS_DRAFT_KEEP_VERSIONS:-3}
+    # 虚拟工厂的执行范围：任务由虚拟工厂承担（真实工厂的数据是映射输入，不是执行方），
+    # 所以脉搏推进全厂在制单：母单 + BOM 派生的子工单，由深到浅。
+    # 每轮最多推进 25 张；同一张单每天最多报一次工，所以上限只决定"今天轮到谁"。
+    - VF_PULSE_WORK_SCOPE=${VF_PULSE_WORK_SCOPE:-all_open}
+    - VF_PULSE_MAX_WORK_ORDERS=${VF_PULSE_MAX_WORK_ORDERS:-25}
     - SECRET_KEY=your-secret-key-here
     # 测试模式：启用角色快捷切换（生产环境务必改为 false）
     - TEST_MODE=true

@@ -39,6 +39,9 @@ METRICS_SQL = text("""
           WHERE wo.factory_id = :fid AND wo.status IN ('released', 'in_progress', 'pending')) AS shortage_qty,
         (SELECT count(*) FROM production_reports pr
           WHERE pr.factory_id = :fid AND pr.created_at > now() - interval '24 hours') AS reports_24h,
+        (SELECT count(*) FROM production_reports pr
+          WHERE pr.factory_id = :fid AND pr.created_at > now() - interval '24 hours'
+            AND (pr.created_by = 'virtual_factory' OR pr.report_type = 'virtual_pulse')) AS reports_24h_virtual,
         (SELECT count(*) FROM aps_schedules s
           WHERE s.factory_id = :fid AND s.status <> 'archived') AS live_plans,
         (SELECT count(*) FROM aps_schedule_tasks t JOIN aps_schedules s ON s.id = t.schedule_id
@@ -62,6 +65,7 @@ async def measure(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         "released_by_gate": int(row["released_by_gate"] or 0),
         "shortage_qty": float(row["shortage_qty"] or 0),
         "reports_24h": int(row["reports_24h"] or 0),
+        "reports_24h_virtual": int(row["reports_24h_virtual"] or 0),
         "live_plans": int(row["live_plans"] or 0),
         "plan_task_rows": int(row["plan_task_rows"] or 0),
     }
@@ -126,8 +130,14 @@ def judge(current: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Dict[s
         verdict = "stalled"
         reason = "完工、放行、缺口三个数本轮都没动"
 
-    if current["reports_24h"] == 0:
-        reason += "；注意：本厂 24 小时内没有真实报工输入，缺料单不会自己清零（不是算法没干活）"
+    # 执行侧的口径要说清来源，不能再把虚拟工厂的报工说成"没有真实输入"：
+    # 任务本来就由虚拟工厂承担，外部接入是另一路（真实工厂目前只做映射输入）。
+    external = int(current["reports_24h"]) - int(current.get("reports_24h_virtual") or 0)
+    reason += (
+        f"；近 24h 报工 {current['reports_24h']} 条（虚拟工厂脉搏 "
+        f"{current.get('reports_24h_virtual')} 条 / 外部接入 {external} 条）—— "
+        "执行由虚拟工厂承担，缺口要靠领料扣得动与下层完工入库来消"
+    )
 
     return {
         "verdict": verdict,

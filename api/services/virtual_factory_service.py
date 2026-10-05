@@ -10,6 +10,7 @@ order immediately.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -54,6 +55,14 @@ class PulseConfig:
     sim_step_hours: float = 2.0
     # 事件队列上界，超出丢最旧的 —— 队列本身不能变成新的写入放大源。
     event_queue_max: int = 200
+    # 执行范围。原实现只推进 created_by='virtual_factory' 自己那几张单，
+    # 于是 BOM 派生的母单与 500 多张子工单没有任何执行侧输入：完工数从 8-25 起就停在 5，
+    # 缺口只增不减 —— 链条发散的真因在这里，不在排产算法。
+    # 虚拟工厂是担任务的那一方，真实工厂的数据是映射输入，所以默认担全厂在制单。
+    work_scope: str = os.getenv("VF_PULSE_WORK_SCOPE", "all_open")
+    # 每次脉搏最多推进几张单（开发尺度：一轮 25 张；同一张单每天最多报一次工，
+    # 所以上限只决定"今天轮到谁"，不会把写入撑开）。
+    max_work_orders_per_pulse: int = max(1, int(os.getenv("VF_PULSE_MAX_WORK_ORDERS", "25")))
 
     @property
     def daily_capacity(self) -> int:
@@ -378,6 +387,25 @@ class VirtualFactoryService:
         ).order_by(WorkOrder.planned_due.asc(), WorkOrder.created_at.asc()))).scalars().all()
         return list(rows)
 
+    async def _open_work_orders(self, cfg: PulseConfig) -> List[WorkOrder]:
+        """这一轮要执行哪些单：全厂在制的母单与子工单，由深到浅。
+
+        子工单先做，母单才可能拿到下层供货 —— 顺序反了就会一直"欠料却没人完工"。
+        多取几倍候选是因为"今天已报过工的单"要跳过，不能让它们占住本轮额度。
+        """
+        if cfg.work_scope == "virtual_only":
+            return await self._active_virtual_masters(cfg.factory_id)
+        rows = (await self.db.execute(select(WorkOrder).where(
+            WorkOrder.factory_id == cfg.factory_id,
+            WorkOrder.wo_type.in_(["master", "component"]),
+            WorkOrder.status.in_(["pending", "released", "in_progress", "on_hold"]),
+        ).order_by(
+            text("CASE WHEN wo_type = 'component' THEN 0 ELSE 1 END"),
+            WorkOrder.planned_due.asc().nullslast(),
+            WorkOrder.created_at.asc(),
+        ).limit(max(20, cfg.max_work_orders_per_pulse * 4)))).scalars().all()
+        return list(rows)
+
     async def _create_order_chain(
         self,
         cfg: PulseConfig,
@@ -525,13 +553,15 @@ class VirtualFactoryService:
 
     async def _advance_open_work(self, cfg: PulseConfig, stations: List[Station]) -> Dict[str, Any]:
         today_end = datetime.combine(date.today(), time.max)
-        masters = await self._active_virtual_masters(cfg.factory_id)
+        masters = await self._open_work_orders(cfg)
         if not masters:
             return {"reports_created": 0, "containers_reported": 0, "work_orders_touched": 0}
 
         reports_created = 0
         containers_reported = 0
-        per_order_daily = max(1, cfg.daily_capacity // max(1, len(masters)))
+        budget = cfg.max_work_orders_per_pulse
+        skipped_today = 0
+        per_order_daily = max(1, cfg.daily_capacity // max(1, min(budget, len(masters))))
         station_by_code = {s.station_code: s for s in stations}
         # 订单状态先攒起来，循环结束后按状态各合成一条 UPDATE
         done_order_ids: List[str] = []
@@ -550,7 +580,10 @@ class VirtualFactoryService:
                 ProductionReport.created_by == cfg.operator,
             ).order_by(ProductionReport.created_at.desc()).limit(1))).scalar_one_or_none()
             if last_report_at and last_report_at.date() >= date.today():
+                skipped_today += 1   # 不占本轮额度：这张单今天已经推进过一次
                 continue
+            if reports_created >= budget:
+                break
             remaining = max(0, (master.planned_qty or 0) - (master.completed_qty or 0))
             if remaining <= 0:
                 master.status = "completed"
@@ -589,9 +622,11 @@ class VirtualFactoryService:
             master.next_station = "终检/OQC" if (master.completed_qty or 0) > (master.planned_qty or 1) * 0.8 else "主线生产"
             if master.status == "completed":
                 master.actual_complete = datetime.utcnow()
-                done_order_ids.append(master.sales_order_id)
-            else:
-                wip_order_ids.append(master.sales_order_id)
+            # 销售订单状态只跟着虚拟工厂自己创建的单据走：BOM/ERP 映射进来的需求单是参考数据，
+            # 执行结果落在工单上（工单才是担任务的对象），不回写需求侧的原始记录。
+            if str(master.created_by or "") == "virtual_factory":
+                (done_order_ids if master.status == "completed" else wip_order_ids).append(
+                    master.sales_order_id)
 
             reports_created += 1
             containers_reported += qty
@@ -646,6 +681,10 @@ class VirtualFactoryService:
             "reports_created": reports_created,
             "containers_reported": containers_reported,
             "work_orders_touched": reports_created,
+            "work_scope": cfg.work_scope,
+            "candidates": len(masters),
+            "per_pulse_budget": budget,
+            "skipped_already_reported_today": skipped_today,
             "daily_capacity_containers": cfg.daily_capacity,
             # 本轮领料：按 BOM 真扣了多少、哪里欠、哪些产品没 BOM 可扣
             "materials_issued_lines": issued_lines,
