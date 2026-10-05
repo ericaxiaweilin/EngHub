@@ -31,8 +31,8 @@ import math
 from typing import Tuple
 from sqlalchemy import text
 
-from api.services.bom_attributes import (clean_name, families_in,
-                                    is_finished_good_row)
+from api.services.bom_attributes import (clean_name, families_in, is_finished_good_row,
+                                    tokens_in)
 from api.services.sourcing_policy import decide as sourcing_policy_decide
 
 MIRROR_SQL = text("""
@@ -406,7 +406,9 @@ async def explode_requirement(
                 # 厂区政策优先：机械厂里的纯电控组件、电子厂里的纯机加件，
                 # 结构上"有下级+有工序字样"也不该判成自制
                 if families:
-                    policy = sourcing_policy_decide(factory_id, families, has_children=True)
+                    policy = sourcing_policy_decide(
+                        factory_id, families, has_children=True,
+                        evidence=tokens_in(subtree_text(by_code, kids, code), families))
                     if policy:
                         verdict = policy
             evidence_cache[code] = verdict

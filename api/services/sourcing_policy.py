@@ -33,9 +33,14 @@ PLANT_FOREIGN_FAMILIES: Dict[str, set] = {
 ELECTRONIC_FAMILY = "电控"
 
 
-def decide(factory_id: str, families: Tuple[str, ...], *, has_children: bool
+def decide(factory_id: str, families: Tuple[str, ...], *, has_children: bool,
+           evidence: Tuple[str, ...] = ()
            ) -> Optional[Tuple[str, str]]:
-    """返回 (item_type, basis)；判不了返回 None，由调用方退回结构推导。"""
+    """返回 (item_type, basis)；判不了返回 None，由调用方退回结构推导。
+
+    `evidence` 是子树里真正命中的关键字。理由必须把它们写出来 —— 只写"本厂无电控工序"
+    会让人以为这个料号是电子件，而实际上可能是它的子树里挂了一根儀表線（10-05 就是这么误读过）。
+    """
     own = PLANT_OWN_FAMILIES.get(str(factory_id))
     if own is None:
         return None            # 不认识的厂区不判，别拿默认政策套到所有厂
@@ -47,7 +52,9 @@ def decide(factory_id: str, families: Tuple[str, ...], *, has_children: bool
     hits_foreign = present & foreign
     # 只沾外厂的活、本厂一样不沾 —— 判买
     if hits_foreign and not hits_own:
-        return ("buy", f"factory_policy:{factory_id}-本厂无{'/'.join(sorted(hits_foreign))}工序")
+        words = "/".join(str(w) for w in (evidence or hits_foreign))
+        return ("buy", f"factory_policy:{factory_id}-子树证据只有{'/'.join(sorted(hits_foreign))}"
+                       f"（命中字样 {words}），本厂没有做这类活的车间")
     # 既沾本厂又沾外厂（带线束的焊件、带塑胶件的机加件）—— 不判，交推导
     if hits_foreign and hits_own:
         return None

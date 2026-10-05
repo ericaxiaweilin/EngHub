@@ -97,6 +97,17 @@ def parse(raw: Optional[str]) -> Dict[str, str]:
     return fields
 
 
+def tokens_in(text: Optional[str], families) -> tuple:
+    """文本里为这些工序族实际命中的关键字（给判定理由当证据，不复述族名）。"""
+    body = text or ""
+    out = []
+    for family in families:
+        for token in PROCESS_TOKENS.get(family, ()):
+            if token in body and token not in out:
+                out.append(token)
+    return tuple(out)
+
+
 def clean_name(raw: Optional[str]) -> str:
     """品名只取第一段；没有分号的正常品名原样返回。"""
     text = (raw or "").strip()

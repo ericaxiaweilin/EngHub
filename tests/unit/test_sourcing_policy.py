@@ -9,9 +9,9 @@ from api.services.sourcing_policy import ELEC_PLANT, MECH_PLANT, decide
 
 def test_mech_plant_buys_pure_electrical_assembly():
     """机械厂只有电子件的活（電控/馬達）→ 买，即便它有下级也轮不到本厂做。"""
-    verdict = decide(MECH_PLANT, ("电控",), has_children=True)
+    verdict = decide(MECH_PLANT, ("电控",), has_children=True, evidence=("儀表", "線材"))
     assert verdict and verdict[0] == "buy"
-    assert "本厂无电控工序" in verdict[1]
+    assert "命中字样 儀表/線材" in verdict[1], "理由要带真正命中的字样，不能只写族名"
 
 
 def test_mech_plant_keeps_mechanical_assembly_as_make():
@@ -28,7 +28,7 @@ def test_mixed_work_is_left_to_derivation_not_guessed():
 def test_electronics_plant_buys_pure_mechanical_parts():
     verdict = decide(ELEC_PLANT, ("机加", "注塑"), has_children=True)
     assert verdict and verdict[0] == "buy"
-    assert "本厂无" in verdict[1]
+    assert "本厂没有做这类活的车间" in verdict[1]
 
 
 def test_unknown_plant_and_no_evidence_are_no_ops():
