@@ -10,6 +10,7 @@ from core.auth.security import get_current_user
 from database.db_config import get_db
 from database.models import User
 from api.services.pmc_control_tower_service import PmcControlTowerService
+from api.services.bom_data_quality import scan as scan_bom_quality
 from api.services.pmc_work_matrix_service import PmcWorkMatrixService
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
@@ -313,10 +314,28 @@ async def get_pmc_capabilities(
             {"key": "delivery_alerts", "name": "交期与供应异常", "path": "/api/v1/pmc/delivery/alerts", "mode": "read_only"},
             {"key": "delivery_risk", "name": "交期风险（按实际速度推算，与智能体同源）", "path": "/api/v1/pmc/delivery/risk", "mode": "read_only"},
             {"key": "data_readiness", "name": "PMC 数据完整性与补数清单", "path": "/api/v1/pmc/data-readiness", "mode": "read_only"},
+            {"key": "bom_quality", "name": "BOM 数据质量自检（命名/分类/断链，带影响缺口）",
+             "path": "/api/v1/pmc/bom-quality", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。",
     }
+
+
+@router.get("/bom-quality", summary="BOM 数据质量自检（只读，按影响缺口排序）")
+async def get_bom_quality(
+    product_model: str = Query(..., description="要扫的机种（= BOM 的 model_name）"),
+    factory_id: str = Query(..., description="厂区；不给默认值，免得拿一个厂的结果回答另一个厂的问题"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """无人工厂自己报 BOM 脏数据：命名不规范、缺分类、缺单位、单价形状异常、图纸行当物料、
+    层级断链、同料号多父级 —— 每条带**影响多少缺口**，先改最挡生产的那条。
+
+    只读：不修 BOM、不改原始行；改数据是工程/PMC 走 ECR 的事。
+    """
+    del current_user
+    return await scan_bom_quality(db, factory_id, product_model)
 
 
 __all__ = ["router"]
