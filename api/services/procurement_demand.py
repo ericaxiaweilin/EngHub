@@ -41,6 +41,16 @@ SUPPLIER_SQL = text("""
     WHERE sm.material_code = ANY(:codes) AND COALESCE(sm.is_active, true)
     ORDER BY sm.material_code, COALESCE(sm.is_primary, false) DESC
 """)
+# 物料主档上维护的默认供应商：这才是"哪个料号向谁买"的正式落点
+# （10-05 我先只查了 supplier_materials 与历史 PO，漏了这一列，56 个缺口料号里 7 个其实有依据）
+MATERIAL_SUPPLIER_SQL = text("""
+    SELECT material_code, default_supplier
+    FROM materials
+    WHERE material_code = ANY(:codes)
+      AND NULLIF(btrim(COALESCE(default_supplier, '')), '') IS NOT NULL
+""")
+# 电子元器件的厂商与现货商链接在 **engflow 的 `component_library`**（814 个料号、两列都满值），
+# 镜像侧目前没有这两列 —— 要用得先把 component_library 纳入同步，不在这里假造一张表。
 PO_HISTORY_SQL = text("""
     SELECT DISTINCT material_code, supplier_name
     FROM purchase_orders
@@ -85,6 +95,12 @@ async def kit_shortage_demands(db: Any, factory_id: str, buy_items: List[Dict[st
             "lead_time_days": row["lead_time_days"],
             "min_order_qty": _f(row["min_order_qty"]),
         })
+    for row in (await db.execute(MATERIAL_SUPPLIER_SQL, {"codes": codes})).mappings().all():
+        suppliers.setdefault(str(row["material_code"]), {
+            "supplier_name": row["default_supplier"], "lead_time_days": None,
+            "min_order_qty": 0.0, "basis": "物料主档默认供应商",
+        })
+
     # 没有维护供应商目录、但厂里真下过单：那家供应商同样是事实依据，不是编出来的
     for row in (await db.execute(PO_HISTORY_SQL, {"fid": factory_id, "codes": codes})).mappings().all():
         suppliers.setdefault(str(row["material_code"]), {

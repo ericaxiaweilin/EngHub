@@ -20,7 +20,7 @@ class _Rows:
         return self._rows
 
 
-def _db(suppliers=(), po_history=(), on_order=(), other_status=()):
+def _db(suppliers=(), po_history=(), on_order=(), other_status=(), material_suppliers=()):
     db = MagicMock()
     writes = []
 
@@ -32,6 +32,8 @@ def _db(suppliers=(), po_history=(), on_order=(), other_status=()):
             return _Rows(po_history)
         if "NOT IN ('confirmed', 'shipped', 'received')" in sql:
             return _Rows(other_status)
+        if "FROM materials" in sql:
+            return _Rows(material_suppliers)
         if "FROM purchase_orders" in sql:
             return _Rows(on_order)
         writes.append(sql)
@@ -92,3 +94,15 @@ async def test_zero_shortage_returns_an_empty_list_not_a_fake_number():
     out = await kit_shortage_demands(_db(), "FAC_MECH_001", [])
     assert out["materials"] == 0 and out["shortage_qty"] == 0
     assert out["top"] == []
+
+
+@pytest.mark.asyncio
+async def test_material_master_default_supplier_counts_as_evidence():
+    """物料主档的 `default_supplier` 是"向谁买"的正式落点，不能只查 supplier_materials。"""
+    db = _db(material_suppliers=[{"material_code": "RM-STEEL-009",
+                                  "default_supplier": "宝钢金属(佛山)"}])
+    out = await kit_shortage_demands(db, "FAC_MECH_001", [
+        {"material_code": "RM-STEEL-009", "material_name": "鋼板", "shortage_qty": 505,
+         "item_type": "buy", "affected_work_orders": ["WO-1"]}])
+    assert out["supplier_known"] == 1 and out["supplier_missing"] == 0
+    assert out["top"][0]["supplier_name"] == "宝钢金属(佛山)"
