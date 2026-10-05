@@ -16,6 +16,7 @@ from api.services.plan_commit_gate import (
     MAX_ORDERS as PLAN_COMMIT_MAX_ORDERS,
     evaluate_commit_gate,
 )
+from api.services.aps_draft_prune import plan_prune
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
 
@@ -322,6 +323,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/bom-quality", "mode": "read_only"},
             {"key": "plan_commit_gate", "name": "计划逐单下达就绪门（哪些单真能开工、差哪条门）",
              "path": "/api/v1/pmc/plan-commit-gate", "mode": "read_only"},
+            {"key": "aps_draft_prune", "name": "旧排产草案回收预演（keep-last-N，只读）",
+             "path": "/api/v1/pmc/aps-draft-prune", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
@@ -361,6 +364,22 @@ async def get_plan_commit_gate(
     gate = await evaluate_commit_gate(db, factory_id)
     gate["next_batch_limit"] = min(int(gate.get("ready_count") or 0), PLAN_COMMIT_MAX_ORDERS)
     return gate
+
+
+@router.get("/aps-draft-prune", summary="旧排产草案回收预演（只读）")
+async def get_aps_draft_prune(
+    factory_id: str = Query("", description="留空=全部厂区"),
+    keep: int = Query(3, ge=1, le=20, description="每厂区保留最近几版草案"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """回收窗口外还有哪些旧草案、各带多少行、哪几份因为压着锁定工序必须留下。
+
+    只读预演：这里不删任何东西。真正删除只在引擎循环里发生，且需要显式打开
+    `APS_DRAFT_PRUNE_ENABLED`。确认过/下达过/归档的方案一律不在候选集合里。
+    """
+    del current_user
+    return await plan_prune(db, factory_id=factory_id, keep=keep)
 
 
 __all__ = ["router"]

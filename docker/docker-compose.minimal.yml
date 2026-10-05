@@ -25,6 +25,10 @@ x-backend-env: &backend-env
     # 每轮最多 5 张（从小到大），一张都不合格时不动方案状态。
     - PLAN_COMMIT_APPLY=${PLAN_COMMIT_APPLY:-true}
     - PLAN_COMMIT_MAX_ORDERS=${PLAN_COMMIT_MAX_ORDERS:-5}
+    # 旧草案回收：每厂区保留最近 3 版，只动没确认过的 draft，压着仍算数的锁定工序的跳过。
+    # 实测 10-05 预演=306 份/19,144 行可回收、3 份被锁守住；确认后/下达过/归档的一律不碰。
+    - APS_DRAFT_PRUNE_ENABLED=${APS_DRAFT_PRUNE_ENABLED:-true}
+    - APS_DRAFT_KEEP_VERSIONS=${APS_DRAFT_KEEP_VERSIONS:-3}
     - SECRET_KEY=your-secret-key-here
     # 测试模式：启用角色快捷切换（生产环境务必改为 false）
     - TEST_MODE=true

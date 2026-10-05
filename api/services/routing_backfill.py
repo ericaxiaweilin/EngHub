@@ -32,6 +32,11 @@ from api.services.bom_source import subtree_evidence
 from api.services.engine_heartbeat import record
 from api.services.component_orders import expand_ready_components
 from api.services.component_release import release_kitted_child_orders
+from api.services.aps_draft_prune import (
+    APPLY_ENABLED as DRAFT_PRUNE_APPLY,
+    KEEP_VERSIONS as DRAFT_KEEP_VERSIONS,
+    prune_superseded_drafts,
+)
 from api.services.plan_commit_gate import (
     APPLY_ENABLED as PLAN_COMMIT_APPLY,
     MAX_ORDERS as PLAN_COMMIT_MAX_ORDERS,
@@ -375,6 +380,10 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     # 默认只预演（PLAN_COMMIT_APPLY），开发尺度每轮最多 PLAN_COMMIT_MAX_ORDERS 张。
     receipt["plan_commit"] = await commit_plan_ready(db, apply_enabled=PLAN_COMMIT_APPLY,
                                                      max_orders=PLAN_COMMIT_MAX_ORDERS)
+    # 扩张期每轮都会新写一份方案，旧草案不会自己变少：这里按 keep-last-N 回收，
+    # 只动没确认过的 draft，压着锁定工序的那几份跳过（默认预演，开关在 compose）。
+    receipt["draft_prune"] = await prune_superseded_drafts(
+        db, apply=DRAFT_PRUNE_APPLY, keep=DRAFT_KEEP_VERSIONS)
     receipt["dry_run"] = not apply
     return receipt
 
