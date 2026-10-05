@@ -33,6 +33,7 @@ from sqlalchemy import text
 
 from api.services.bom_attributes import (clean_name, families_in,
                                     is_finished_good_row)
+from api.services.sourcing_policy import decide as sourcing_policy_decide
 
 MIRROR_SQL = text("""
     SELECT part_number AS material_code, description AS material_name,
@@ -402,6 +403,12 @@ async def explode_requirement(
                 families = families_in(subtree_text(by_code, kids, code))
                 verdict = ("make", "children+process_evidence") if families \
                     else ("buy", "purchased_assembly")
+                # 厂区政策优先：机械厂里的纯电控组件、电子厂里的纯机加件，
+                # 结构上"有下级+有工序字样"也不该判成自制
+                if families:
+                    policy = sourcing_policy_decide(factory_id, families, has_children=True)
+                    if policy:
+                        verdict = policy
             evidence_cache[code] = verdict
         return evidence_cache[code]
 
