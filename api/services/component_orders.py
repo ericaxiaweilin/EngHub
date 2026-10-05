@@ -137,11 +137,25 @@ async def expand_ready_components(
             receipt["examined_components"] += 1
 
             wo_code = component_order_code(str(master["work_order_code"]), code)
-            already = (await db.execute(select(WorkOrder).where(
-                WorkOrder.work_order_code == wo_code
-            ))).scalar_one_or_none()
+            # 幂等键是 (父工单, 料号) 而不是工单编码：编码格式换过一次（旧的是
+            # `主工单号-料号`，会被 varchar(50) 截断），只按编码查就会把旧格式已建的单
+            # 当成新单再建一遍 —— 实测这样重复了 10 张。
+            existing_stmt = select(WorkOrder).where(
+                WorkOrder.parent_work_order_id == str(master["id"]),
+                WorkOrder.product_id == code,
+                WorkOrder.wo_type == COMPONENT_WO_TYPE,
+                WorkOrder.status != "cancelled",
+            )
+            already = (await db.execute(existing_stmt)).scalar_one_or_none()
             if already is not None:
                 receipt["existing"] += 1
+                continue
+
+            code_stmt = select(WorkOrder).where(WorkOrder.work_order_code == wo_code)
+            if (await db.execute(code_stmt)).scalar_one_or_none() is not None:
+                # 同编码已被别的单占用（散列撞车或历史遗留）：跳过而不是覆盖
+                receipt["skipped_not_ready"]["code_taken"] = \
+                    receipt["skipped_not_ready"].get("code_taken", 0) + 1
                 continue
 
             qty = int(row.get("required_qty") or 0)

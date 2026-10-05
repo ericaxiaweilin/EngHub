@@ -65,10 +65,14 @@ def _db(existing_codes=(), ready=("ARM-A",), total_components=0):
                  "step_rows": 0, "step_json": 2 if c in ready else 0}
                 for c in ("ARM-A", "NO-ROUTE", "ZERO-QTY")
             ]
-        elif "work_order_code" in sql and "SELECT" in sql.upper():
-            res.scalar_one_or_none.return_value = (
-                SimpleNamespace(work_order_code=existing_codes[0]) if existing_codes else None
-            )
+        elif "SELECT" in sql.upper() and "work_orders" in sql:
+            # 幂等键查询：按 (父工单, 料号) 命中已有单；编码占用查询单独分支
+            if "parent_work_order_id" in sql:
+                res.scalar_one_or_none.return_value = (
+                    SimpleNamespace(work_order_code=existing_codes[0]) if existing_codes else None
+                )
+            else:
+                res.scalar_one_or_none.return_value = None
         else:
             res.mappings.return_value.all.return_value = []
             res.scalar_one_or_none.return_value = None
