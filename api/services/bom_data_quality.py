@@ -160,3 +160,63 @@ async def scan(db: Any, factory_id: str, product_model: str) -> Dict[str, Any]:
             [f["affected_shortage_qty"] for f in findings] or [0]), 2),
         "note": "只读自检：不改 BOM 原始数据；每条问题都带影响缺口，按缺口从大到小排，先改最挡生产的。",
     }
+
+# 自检该看哪几颗机种：按"当前在制计划里挡了多少缺口"排，不是按 BOM 行数。
+# 行数最多的那颗可能一张工单都没有，扫它等于给自己看一个 0 缺口的清单。
+TOP_MODELS_SQL = text("""
+    SELECT w.product_id AS product_model, COALESCE(SUM(m.shortage_qty), 0) AS gap
+    FROM work_orders w
+    JOIN work_order_materials m ON m.work_order_id = w.id
+    WHERE w.wo_type = 'master' AND w.factory_id = :fid
+      AND w.status NOT IN ('completed', 'cancelled')
+      AND w.product_id IS NOT NULL
+    GROUP BY 1 ORDER BY gap DESC
+    LIMIT :limit
+""")
+# 厂里还没有任何在制工单时（新厂区、刚上线），退回按镜像行数选，至少能报结构问题
+FALLBACK_MODELS_SQL = text("""
+    SELECT product_model, count(*) AS lines
+    FROM enghub_bom_items
+    WHERE factory_id = :fid
+    GROUP BY 1 ORDER BY lines DESC
+    LIMIT :limit
+""")
+
+
+async def scan_plant(db: Any, factory_id: str, *, limit: int = 3) -> Dict[str, Any]:
+    """例行自检：扫该厂区行数最多的几颗机种，只回摘要（明细走 /pmc/bom-quality）。
+
+    心跳里塞得下的东西必须是能一眼看出"该先改哪条"的：按影响缺口最大的那条排第一。
+    这里仍然一行都不写 —— 发现问题和改数据是两回事，后者归工程/PMC 的 ECR。
+    """
+    picked = (await db.execute(
+        TOP_MODELS_SQL, {"fid": factory_id, "limit": max(1, int(limit))})).mappings().all()
+    basis = "open_plan_shortage"
+    if not picked:
+        picked = (await db.execute(
+            FALLBACK_MODELS_SQL, {"fid": factory_id, "limit": max(1, int(limit))})).mappings().all()
+        basis = "mirror_rows"
+    models = [str(r["product_model"]) for r in picked]
+    per_model, worst = [], None
+    for model in models:
+        report = await scan(db, factory_id, model)
+        findings = report.get("findings") or []
+        per_model.append({
+            "product_model": model,
+            "codes": report.get("codes"),
+            "rule_count": len(findings),
+            "top_rule": (findings[0]["rule"] if findings else None),
+            "top_gap": (findings[0]["affected_shortage_qty"] if findings else 0),
+        })
+        if findings and (worst is None or findings[0]["affected_shortage_qty"] > worst["affected_shortage_qty"]):
+            worst = {"product_model": model, **{k: findings[0].get(k) for k in (
+                "rule", "name", "codes", "affected_shortage_qty", "severity", "action")}}
+    return {
+        "factory_id": factory_id,
+        "model_selection": basis,
+        "models_scanned": len(models),
+        "models_with_findings": sum(1 for m in per_model if m["rule_count"]),
+        "worst_finding": worst,
+        "per_model": per_model,
+        "note": "例行只读自检；明细见 GET /api/v1/pmc/bom-quality?product_model=...&factory_id=...",
+    }

@@ -27,6 +27,7 @@ from typing import Any, Dict, List
 
 from sqlalchemy import bindparam, text
 
+from api.services.bom_data_quality import scan_plant
 from api.services.bom_source import subtree_evidence
 from api.services.engine_heartbeat import record
 from api.services.component_orders import expand_ready_components
@@ -105,6 +106,9 @@ ROUTED_CODES_SQL = text("""
 """)
 
 COMPONENT_BATCH = max(1, int(os.getenv("ROUTING_BACKFILL_WOS_PER_TICK", "2")))
+# 例行 BOM 自检的范围（只读，扫几颗机种；心跳一行，不写业务表）
+QUALITY_MODELS_PER_TICK = max(1, int(os.getenv("BOM_QUALITY_MODELS_PER_TICK", "2")))
+QUALITY_FACTORY_ID = os.getenv("BOM_QUALITY_FACTORY_ID", "FAC_MECH_001")
 # 旧逻辑把整条产线套到子件上过（10-05 实测 14 条：6 道/4 道工序的子件路线）。
 # 收窄一轮就能收敛：只动自己推导出来的草案路线，且只往少了改。
 REPAIR_BATCH = max(0, int(os.getenv("ROUTING_BACKFILL_REPAIR_BATCH", "20")))
@@ -359,6 +363,9 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     receipt["child_releases"] = await release_kitted_child_orders(
         db, factory_id=None, apply=apply
     )
+    # 数据脏不脏也要每天自己看一次：这步只读，产出写在心跳里（不改 BOM 原始行）
+    receipt["bom_quality"] = await scan_plant(
+        db, QUALITY_FACTORY_ID, limit=QUALITY_MODELS_PER_TICK)
     receipt["dry_run"] = not apply
     return receipt
 
