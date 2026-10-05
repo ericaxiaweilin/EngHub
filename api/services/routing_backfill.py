@@ -32,6 +32,11 @@ from api.services.bom_source import subtree_evidence
 from api.services.engine_heartbeat import record
 from api.services.component_orders import expand_ready_components
 from api.services.component_release import release_kitted_child_orders
+from api.services.plan_commit_gate import (
+    APPLY_ENABLED as PLAN_COMMIT_APPLY,
+    MAX_ORDERS as PLAN_COMMIT_MAX_ORDERS,
+    commit_ready_orders,
+)
 from api.services.snapshot_supply import refresh_snapshot_supply
 from api.services.routing_from_family import (
     CREATED_BY,
@@ -366,8 +371,33 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     # 数据脏不脏也要每天自己看一次：这步只读，产出写在心跳里（不改 BOM 原始行）
     receipt["bom_quality"] = await scan_plant(
         db, QUALITY_FACTORY_ID, limit=QUALITY_MODELS_PER_TICK)
+    # 最后一格：这版计划到底有没有单能开工。逐单就绪门按"排齐+齐套+工位可映射"放行，
+    # 默认只预演（PLAN_COMMIT_APPLY），开发尺度每轮最多 PLAN_COMMIT_MAX_ORDERS 张。
+    receipt["plan_commit"] = await commit_plan_ready(db, apply_enabled=PLAN_COMMIT_APPLY,
+                                                     max_orders=PLAN_COMMIT_MAX_ORDERS)
     receipt["dry_run"] = not apply
     return receipt
+
+
+async def commit_plan_ready(db, *, factory_id: str = QUALITY_FACTORY_ID,
+                            apply_enabled: bool, max_orders: int) -> Dict[str, Any]:
+    """引擎替计划走完最后一格：先保证有一版"当前输入"的方案，再按门逐单下达。
+
+    排程这一步放在门前面是有讲究的：同输入被写量刹车复用（0 行写入），输入变了才出新方案，
+    于是"要不要重排"由数据决定，而不是由定时器决定。下达本身仍是限量 + 显式开关。
+    """
+    from api.services.aps_service import ApsService
+
+    plan = await ApsService(db).generate_schedule(
+        factory_id, created_by="routing-backfill", change_reason="engine_tick"
+    )
+    gate = await commit_ready_orders(
+        db, factory_id, apply=apply_enabled, actor="plan-commit-gate", max_orders=max_orders
+    )
+    gate["plan_reused"] = bool(plan.get("reused"))
+    gate["plan_schedule_code"] = plan.get("schedule_code")
+    gate["plan_tasks"] = plan.get("total_tasks")
+    return gate
 
 
 async def routing_backfill_loop() -> None:

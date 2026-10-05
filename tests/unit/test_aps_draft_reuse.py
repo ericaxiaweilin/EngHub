@@ -22,6 +22,7 @@ DRAFT = {
     "version_number": 295,
     "created_at": datetime(2026, 10, 5, 6, 29, 28),
     "created_by": "eric",
+    "status": "draft",
     "total_tasks": 961,
     "unscheduled_count": 71,
     "on_time_rate": 85.4,
@@ -169,3 +170,15 @@ async def test_force_skips_the_reuse_gate():
         pass
     assert not any("input_fingerprint = :fp" in c for c in db.calls), "force 不该走复用查询"
     assert any("AS fp, count(*) AS rows_in" in c for c in db.calls), "指纹仍然要算，供这版方案落库"
+
+@pytest.mark.asyncio
+async def test_a_released_plan_of_the_same_inputs_is_reused_too():
+    """逐单门会把方案置成 released；这时同输入不能再逼出一版新草案（自激环）。"""
+    released = dict(DRAFT, status="released", is_current=True)
+    db = _db(draft=released)
+    result = await ApsService(db).generate_schedule("FAC_MECH_001")
+    assert result["reused"] is True
+    assert result["schedule_status"] == "released"
+    assert "released计划" in result["message"]
+    assert db.add.call_count == 0
+

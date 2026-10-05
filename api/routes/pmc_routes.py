@@ -12,6 +12,10 @@ from database.models import User
 from api.services.pmc_control_tower_service import PmcControlTowerService
 from api.services.bom_data_quality import scan as scan_bom_quality
 from api.services.pmc_work_matrix_service import PmcWorkMatrixService
+from api.services.plan_commit_gate import (
+    MAX_ORDERS as PLAN_COMMIT_MAX_ORDERS,
+    evaluate_commit_gate,
+)
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
 
@@ -316,9 +320,12 @@ async def get_pmc_capabilities(
             {"key": "data_readiness", "name": "PMC 数据完整性与补数清单", "path": "/api/v1/pmc/data-readiness", "mode": "read_only"},
             {"key": "bom_quality", "name": "BOM 数据质量自检（命名/分类/断链，带影响缺口）",
              "path": "/api/v1/pmc/bom-quality", "mode": "read_only"},
+            {"key": "plan_commit_gate", "name": "计划逐单下达就绪门（哪些单真能开工、差哪条门）",
+             "path": "/api/v1/pmc/plan-commit-gate", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
-        "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。",
+        "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
+                "APS 逐单就绪门同样默认只预演，要机器自己放行得显式打开 PLAN_COMMIT_APPLY。",
     }
 
 
@@ -336,6 +343,24 @@ async def get_bom_quality(
     """
     del current_user
     return await scan_bom_quality(db, factory_id, product_model)
+
+
+@router.get("/plan-commit-gate", summary="计划逐单下达就绪门（只读预演）")
+async def get_plan_commit_gate(
+    factory_id: str = Query(..., description="厂区；不给默认值，免得拿一个厂的计划回答另一个厂"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """这一版排程里哪些工单真的可以开工，差在哪一条门上。
+
+    判据只有四条，全部来自库里的事实：排进本版本、工序排齐（任务行数=路线工序数）、
+    任务行齐套、首道工序的工位编码能在本厂 stations 映射到。这里**只读**：不改工单状态、
+    不下达；要机器自己放行得打开 PLAN_COMMIT_APPLY，每轮上限 PLAN_COMMIT_MAX_ORDERS 张。
+    """
+    del current_user
+    gate = await evaluate_commit_gate(db, factory_id)
+    gate["next_batch_limit"] = min(int(gate.get("ready_count") or 0), PLAN_COMMIT_MAX_ORDERS)
+    return gate
 
 
 __all__ = ["router"]

@@ -40,8 +40,10 @@ logger = logging.getLogger(__name__)
 # ── 输入指纹（写量刹车）───────────────────────────────────────────────
 # 排程算法是确定性的：同样的输入必给同样的输出。线上每次"再跑一遍"都要新写
 # 21~459 行 aps_schedule_tasks，而 304 份草案里 95% 从未被确认——写的全是重复。
-# 所以先把"这一版计划由哪些事实决定"哈希成一个指纹：指纹没变就复用那份未确认
-# 草案（回 reused=true，一行都不写），指纹变了才重排。
+# 所以先把"这一版计划由哪些事实决定"哈希成一个指纹：指纹没变就把那份还没归档的方案
+# 交回去（回 reused=true，一行都不写），指纹变了才重排。
+# 复用不要求它还是 draft：确认/下达过的方案同样代表这一组输入，再逼出一版新草案
+# 只会让"逐单门把方案置为 released"变成自激环（每轮多写 ~961 行）。
 # 这里只哈希排程真正读到的东西，且每段都回报它实际覆盖了多少行，
 # 免得"没比对"被当成"比对通过"。
 OPEN_WO_SCOPE = """
@@ -51,10 +53,13 @@ OPEN_WO_SCOPE = """
 """
 
 FINGERPRINT_SQL: Dict[str, str] = {
-    # 工单池：哪些单要排、各排多少、什么时候要、绑的是哪条路线
+    # 工单池：哪些单要排、各排多少、什么时候要、绑的是哪条路线。
+    # 状态取"在不在池子里"这个桶而不是原值：released/in_progress/pending 三态对排程等价
+    # （订单约束那段完全不读状态），拿原值的话逐单门每放行一张都会把指纹打散、逼出一版新草案。
     "orders": f"""
         SELECT COALESCE(md5(string_agg(r, '#' ORDER BY r)), '') AS fp, count(*) AS rows_in FROM (
-            SELECT concat(wo.id, '|', wo.status, '|', wo.wo_type, '|', wo.product_id, '|',
+            SELECT concat(wo.id, '|', CASE WHEN wo.status IN ('released', 'in_progress', 'pending')
+                                           THEN 'open' ELSE wo.status END, '|', wo.wo_type, '|', wo.product_id, '|',
                            wo.planned_qty, '|', wo.good_qty, '|', wo.priority, '|',
                            to_char(wo.planned_start, 'IYYYIWIDTHH24MISS'), '|',
                            to_char(wo.planned_due, 'IYYYIWIDTHH24MISS'), '|',
@@ -148,12 +153,12 @@ FINGERPRINT_SQL: Dict[str, str] = {
 }
 
 REUSE_SQL = text("""
-    SELECT id, schedule_code, version_number, created_at, created_by, total_tasks,
+    SELECT id, schedule_code, version_number, created_at, created_by, status, total_tasks,
            unscheduled_count, on_time_rate, avg_utilization, avg_cycle_hours,
            total_setup_minutes
     FROM aps_schedules
     WHERE factory_id = :fid AND mode = :mode AND optimize_for = :optimize_for
-      AND status = 'draft' AND COALESCE(is_current, FALSE) = FALSE
+      AND status <> 'archived'
       AND horizon_start = :hs AND horizon_end = :he
       AND input_fingerprint = :fp
     ORDER BY created_at DESC
@@ -345,6 +350,7 @@ class ApsService:
         快照是这次改动之前写的（没有诊断明细）就如实说"明细未留存"，不补一份新的冒充。
         """
         schedule_id = str(draft["id"])
+        plan_status = str(draft["status"] or "draft")
         task_rows = int((await self.db.execute(text(
             "SELECT count(*) FROM aps_schedule_tasks WHERE schedule_id = :sid"
         ), {"sid": schedule_id})).scalar() or 0)
@@ -356,8 +362,9 @@ class ApsService:
         unscheduled = snapshot.get("unscheduled_orders")
         diagnostics = snapshot.get("diagnostics") or {}
         age_seconds = (datetime.utcnow() - (draft["created_at"] or datetime.utcnow())).total_seconds()
+        state = "草案" if plan_status == "draft" else f"{plan_status}计划"
         message = (
-            f"输入未变，复用草案 {draft['schedule_code']}（v{draft['version_number']}，"
+            f"输入未变，复用{state} {draft['schedule_code']}（v{draft['version_number']}，"
             f"{age_seconds / 60:.0f} 分钟前生成，{task_rows} 行任务）：本次不新增写入。"
         )
         if not snapshot:
@@ -371,6 +378,7 @@ class ApsService:
             "reused": True,
             "schedule_id": schedule_id,
             "schedule_code": draft["schedule_code"],
+            "schedule_status": plan_status,
             "version_number": draft["version_number"],
             "created_by": draft["created_by"],
             "generated_at": draft["created_at"].isoformat() if draft["created_at"] else None,
