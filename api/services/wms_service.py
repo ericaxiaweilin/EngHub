@@ -4,7 +4,7 @@ WMS 仓储增强服务 - 盘点/追溯/FIFO/预警/库存流水
 import uuid
 import logging
 from datetime import datetime, date
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -968,6 +968,12 @@ class InventoryService:
                     "bom_source": "none"}
         lines, bom_source = await self._latest_bom_lines(factory_id, product_code)
         if not lines:
+            # 下级装配件工单的结构不在 BOM 表里（镜像只有整机型），
+            # 但它自己的齐套快照就是这张单的需求：按单领料，不按系数编需求。
+            lines, bom_source = await self._work_order_snapshot_lines(
+                factory_id, work_order_id
+            )
+        if not lines:
             return {"issued_lines": 0, "issued_qty": 0, "shortages": [],
                     "reason": "no_bom", "bom_product": product_code, "bom_source": "none"}
         
@@ -1016,6 +1022,95 @@ class InventoryService:
             "shortages": shortages,
         }
     
+    async def _work_order_snapshot_lines(
+        self, factory_id: str, work_order_id: str
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """按工单齐套快照折算每台用量（下级装配件唯一的 BOM 来源）。
+
+        只取要买的行：`item_type='make'` 的那些由各自的子工单生产入库，
+        再从库存领走 —— 两处都扣一次就是把同一份料数两遍。
+        折算口径 = 本单需求数量 ÷ 本单计划产量，两个数都来自已落库的 MRP 结果。
+        """
+        planned = int((await self.db.execute(text("""
+            SELECT planned_qty FROM work_orders
+            WHERE id = :wo_id AND factory_id = :fid
+        """), {"wo_id": work_order_id, "fid": factory_id})).scalar() or 0)
+        if planned <= 0:
+            return [], "none"
+        rows = (await self.db.execute(text("""
+            SELECT material_code, material_name, unit,
+                   required_qty::double precision / :planned AS qty_per_unit
+            FROM work_order_materials
+            WHERE work_order_id = :wo_id
+              AND COALESCE(required_qty, 0) > 0
+              AND COALESCE(item_type, 'buy') <> 'make'
+            ORDER BY level NULLS LAST, material_code
+        """), {"wo_id": work_order_id, "planned": planned})).mappings().all()
+        return [dict(r) for r in rows], "work_order_snapshot"
+
+    async def record_production_output(
+        self,
+        *,
+        factory_id: str,
+        work_order_id: str,
+        product_code: str,
+        qty: int,
+        created_by: str = "virtual_factory",
+    ) -> Dict[str, Any]:
+        """合格产出入库并记 `production_in` 流水（挂工单锚点）。
+
+        这一步以前根本不存在：枚举里有 PRODUCTION_IN，全系统没有任何代码写过它，
+        所以工单完工后库存不增，父层齐套门永远等不到"下级做完了"。
+        库存行统一走 `_resolve_inbound_inventory_row`（数量的唯一变更入口仍是
+        apply_movement），落哪个仓：工单预留仓 → 该厂第一个仓；都没有就不入库并说明原因。
+        """
+        if qty <= 0:
+            return {"posted": 0, "reason": "no_output"}
+        order = (await self.db.execute(text("""
+            SELECT id, work_order_code, reserved_warehouse FROM work_orders
+            WHERE id = :wo_id AND factory_id = :fid
+        """), {"wo_id": work_order_id, "fid": factory_id})).mappings().first()
+        if order is None:
+            return {"posted": 0, "reason": "work_order_not_found"}
+
+        warehouse_id = order["reserved_warehouse"] or (await self.db.execute(text("""
+            SELECT id FROM warehouses
+            WHERE factory_id = :fid AND COALESCE(status, 'active') <> 'inactive'
+            ORDER BY created_at NULLS LAST, id LIMIT 1
+        """), {"fid": factory_id})).scalar()
+        if not warehouse_id:
+            return {"posted": 0,
+                    "reason": f"厂区 {factory_id} 没有可用仓库，产出不入库（不凭空建仓位）"}
+
+        material_id = (await self.db.execute(text("""
+            SELECT material_id FROM inventory
+            WHERE factory_id = :fid AND material_code = :code
+            GROUP BY material_id LIMIT 1
+        """), {"fid": factory_id, "code": product_code})).scalar() or product_code
+
+        inventory = await self._resolve_inbound_inventory_row(
+            factory_id=factory_id,
+            warehouse_id=str(warehouse_id),
+            material_id=str(material_id),
+            material_code=product_code,
+        )
+        await apply_movement(
+            self.db,
+            inventory=inventory,
+            transaction_type="production_in",
+            quantity=qty,
+            reference_type="work_order",
+            reference_id=str(order["id"]),
+            reference_doc_no=str(order["work_order_code"]),
+            work_order_id=str(order["id"]),
+            operator=created_by,
+            remark=f"完工入库 {product_code} × {qty}（工单 {order['work_order_code']}）",
+        )
+        await self.db.commit()
+        return {"posted": qty, "material_code": product_code,
+                "inventory_id": inventory.id, "warehouse_id": str(warehouse_id),
+                "reason": "posted"}
+
     async def reserve_inventory(
         self,
         factory_id: str,

@@ -96,6 +96,8 @@ class ProductionReportService:
         
         # 【新增】BOM物料反冲扣减 - 解决第4号缺陷（完工不扣BOM库存）
         # 根据良品数量反向扣减 BOM 材料用量
+        # 完工入库要在扣料之前：同一批物料不能在这张单里既算产出又算消耗
+        await self._record_output(self.db, work_order_id, good_qty, created_by)
         await self._backflush_materials(self.db, work_order_id, good_qty, created_by)
         
         # #11 PS事件解耦（增强版）- 将APS重算请求写入数据库队列，由消费者服务异步处理
@@ -162,95 +164,61 @@ class ProductionReportService:
         return result.scalar_one_or_none()
     
     async def _backflush_materials(self, db: AsyncSession, work_order_id: str, good_qty: int, created_by: Optional[str] = None) -> bool:
+        """报工扣料走唯一入口：`InventoryService.issue_materials_for_production`。
+
+        原来这段自己 `inventory.total_qty -= deduct_qty`、把记流水那句留在注释里
+        （`# await self.record_inventory_transaction(...)`），
+        结果是库存变了但 `inventory_transactions` 一条不写 —— 台账无痕，
+        与"单据必须过账"的基线相反；而且它自己查 `bom_items`，
+        和 MRP/领料用的 `bom_source` 不是同一份来源，同一产品会扣出两套需求。
+
+        现在：来源统一（engflow 镜像 → 本地 bom_items → 本单齐套快照），
+        扣减统一（`apply_movement` 写库存 + 写流水 + 校验工单锚点），
+        欠料只上报不打回报工（应领 50、实扣 40、欠 10 要照实进账）。
         """
-        BOM物料反冲扣减 - 生产报工后自动扣减原材料库存
-        
-        工作流程：
-        1. 获取工单产品信息（product_id, bom_version）
-        2. 查询该产品的BOM清单所有子项材料
-        3. 计算每种材料应扣减数量 = Σ(qty_per_unit × good_qty)
-        4. 检查库存是否充足（可选：可配置为不足时警告但不阻断）
-        5. 执行库存扣减并记录流水
-        
-        返回: True 成功，False 无BOM或无需扣减
-        """
-        from database.models import WorkOrder, Product, BomItem, Inventory
-        from sqlalchemy import select, join
-        
-        # 1. 获取工单信息
-        wo_stmt = select(WorkOrder).where(WorkOrder.id == work_order_id)
-        wo_result = await db.execute(wo_stmt)
-        work_order = wo_result.scalar_one_or_none()
-        
-        if not work_order or not work_order.product_id or not work_order.bom_version:
-            return False  # 无产品或无BOM版本，无需反冲
-        
-        factory_id = work_order.factory_id
-        
-        # 2. 查询该产品的BOM清单
-        bom_stmt = select(BomItem).where(
-            BomItem.product_id == work_order.product_id,
-            BomItem.bom_version == work_order.bom_version,
-            BomItem.factory_id == factory_id
-        )
-        bom_result = await db.execute(bom_stmt)
-        bom_items = bom_result.scalars().all()
-        
-        if not bom_items:
-            return False  # 无BOM明细，无法反冲
-        
-        # 3. 计算每种材料的总用量（基于良品数量）
-        # 注意：在制造业中，BOM反冲通常基于合格品数量（good_qty），因为不良品的材料消耗计入废品损失
-        material_updates = []  # [(inventory_id, deduct_qty, material_code, description)]
-        
-        for bom in bom_items:
-            # 计算本材料的需要扣减量 = 单位用量 × 良品数量
-            deduct_qty = int(bom.qty_per_unit * good_qty)
-            if deduct_qty > 0:
-                material_updates.append((bom, deduct_qty))
-        
-        if not material_updates:
-            return False  # 无需扣减
-        
-        # 4-5. 执行库存扣减（这里使用直接操作Inventory模型的方式）
-        # 实际生产环境建议调用 WMS service 以保持一致性
-        try:
-            for bom, deduct_qty in material_updates:
-                # 查找对应物料的库存记录（先按 material_code 查询，再匹配 warehouse/location）
-                # 简化实现：假设从通用原材料仓扣减
-                inv_stmt = select(Inventory).where(
-                    Inventory.factory_id == factory_id,
-                    Inventory.material_id == bom.material_code,  # 注意：实际应为material_id外键
-                    Inventory.warehouse_id != ""  # 任意可用仓
-                )
-                inv_result = await db.execute(inv_stmt)
-                inventory = inv_result.scalar_one_or_none()
-                
-                if inventory:
-                    # 检查库存充足性（可选严格模式）
-                    if inventory.available_qty < deduct_qty:
-                        # 库存不足但继续扣减（可配置为阻断或仅警告）
-                        # 实际系统中应在此处发出告警
-                        pass
-                    
-                    # 扣减库存
-                    inventory.total_qty -= deduct_qty
-                    inventory.available_qty -= deduct_qty
-                    inventory.updated_at = datetime.utcnow()
-                    
-                    # 记录库存流水（如果有事务跟踪服务）
-                    # await self.record_inventory_transaction(...)
-                else:
-                    # 物料不存在于库存中，记录日志或创建预留记录
-                    pass
-            
-            await db.commit()
-            return True
-        except Exception as e:
-            await db.rollback()
-            # 记录错误日志
+        from api.services.wms_service import InventoryService
+        from database.models import WorkOrder
+
+        if good_qty is None or int(good_qty) <= 0:
             return False
-    
+        work_order = await db.get(WorkOrder, work_order_id)
+        if work_order is None or not work_order.product_id:
+            return False
+
+        result = await InventoryService(db).issue_materials_for_production(
+            factory_id=work_order.factory_id,
+            work_order_id=work_order_id,
+            product_code=str(work_order.product_id),
+            output_qty=int(good_qty),
+            created_by=created_by or "mes_backflush",
+        )
+        await db.commit()
+        return int(result.get("issued_lines") or 0) > 0
+
+    async def _record_output(self, db: AsyncSession, work_order_id: str, good_qty: int,
+                             created_by: Optional[str] = None) -> None:
+        """合格产出入库并写 `production_in` 流水。
+
+        以前全系统没有任何地方写过这个类型（只在枚举里存在），
+        所以工单完工后库存不增、父层齐套门永远等不到下级做完 —— 闭环断在最后一步。
+        """
+        from api.services.wms_service import InventoryService
+        from database.models import WorkOrder
+
+        if good_qty is None or int(good_qty) <= 0:
+            return
+        work_order = await db.get(WorkOrder, work_order_id)
+        if work_order is None or not work_order.product_id:
+            return
+        await InventoryService(db).record_production_output(
+            factory_id=work_order.factory_id,
+            work_order_id=work_order_id,
+            product_code=str(work_order.product_id),
+            qty=int(good_qty),
+            created_by=created_by or "mes_backflush",
+        )
+        await db.commit()
+
     async def _enqueue_aps_replan(self, work_order_id: str, factory_id: str, report_id: str, 
                                   source_type: str, created_by: str) -> None:
         """#11 PS事件解耦（增强版）- 将APS重算请求写入数据库队列，由消费者服务异步处理

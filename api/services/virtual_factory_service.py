@@ -596,6 +596,16 @@ class VirtualFactoryService:
             reports_created += 1
             containers_reported += qty
 
+            # 完工入库：合格产出要真的进库存，否则父层齐套门永远等不到下级做完
+            # （production_in 以前只存在于枚举里，没有任何代码写过它）
+            await InventoryService(self.db).record_production_output(
+                factory_id=cfg.factory_id,
+                work_order_id=master.id,
+                product_code=master.product_id,
+                qty=good_qty,
+                created_by=cfg.operator,
+            )
+
             # 报工即领料：按他上传的 BOM 扣物料并逐条记流水；欠料只上报，不打回生产
             issue = await InventoryService(self.db).issue_materials_for_production(
                 factory_id=cfg.factory_id,

@@ -352,8 +352,13 @@ async def test_partial_stock_issues_what_exists_and_reports_the_shortage():
 
 @pytest.mark.asyncio
 async def test_product_without_uploaded_bom_issues_nothing():
-    """两份 BOM 都没有就一条都不扣：宁可报 no_bom，也不按系数编需求量。"""
-    session = _QueueSession([_result(rows=[]), _result(rows=[])])
+    """BOM 两级来源和工单快照都没有就一条都不扣：宁可报 no_bom，也不按系数编需求量。
+
+    队列里后两条是"按本单齐套快照折算用量"的兜底查询（计划产量、快照行），
+    它们必须也是空的，这条用例测的才是"三处都没来源"。
+    """
+    session = _QueueSession([_result(rows=[]), _result(rows=[]),
+                             _result(scalar=0), _result(rows=[])])
     svc = InventoryService(session)
 
     out = await svc.issue_materials_for_production(
