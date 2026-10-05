@@ -33,8 +33,11 @@ from database.models import Product, Routing
 CREATED_BY = "bom-family-derived"
 # 至少要印证到一半工序才套用；低于这个数说明这个型号和这条路线不是一族
 MIN_COVERAGE = 0.5
-# 半成品只取被它自己子树佐证的工序；少于 2 道就不算一条路线（一道工序的"路线"没意义）
-MIN_COMPONENT_STEPS = 2
+# 半成品只取被它自己子树佐证的工序。地板是"至少有一句字面工序证据"，不是"至少 2 道"：
+# 10-05 实测 142 个推不出路线的自制件里，101 个只有 1 道被佐证的工序（烤漆/ABS/儀表这些
+# 字样真写在子件行上），把它们判成"做不了"是我设的门槛，不是工厂的事实。
+# 反过来，0 句工序字样的 41 个仍然如实挡着 —— 门槛管的是证据，不是数量。
+MIN_COMPONENT_STEPS = 1
 
 
 def _step_name(step: Any) -> str:
@@ -355,6 +358,8 @@ async def _derive_from_corpus(
     if component_subset:
         accepted = len(best["hits"]) >= MIN_COMPONENT_STEPS
         reject_reason = (
+            f"子树文本里没有任何工序字样（0/{best['steps']}）：没有出处就不建路线"
+            if not best["matched"] else
             f"子树只能佐证 {best['matched']}/{best['steps']} 道工序"
             f"（不足 {MIN_COMPONENT_STEPS} 道）：再多就是替工厂编工艺"
         )

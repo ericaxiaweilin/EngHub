@@ -141,15 +141,31 @@ async def test_component_route_keeps_only_corroborated_steps():
 
 
 @pytest.mark.asyncio
-async def test_component_needs_two_corroborated_operations_to_get_a_route():
-    """只佐证到 1 道工序就不建路线：一道工序的"路线"是编出来的。"""
+async def test_component_needs_at_least_one_literal_operation():
+    """门槛管的是**证据**：子树里一句工序字样都没有，就不建路线。
+
+    原来这条要求"至少 2 道"，把 101 个只写了"烤漆"或"ABS"的件判成做不了 ——
+    那是我设的数量门槛，不是工厂的事实，10-05 已改成 1 道。
+    """
     db = _db([_Route("rt-tread-004-2026", "FG-TREAD-004", TREAD)], master=_Master("端蓋"))
     receipt = await rf.derive_routing_for_component(
-        db, "FAC_MECH_001", "端蓋", "端蓋;車架;左前;ABS PA757S;黑色", level=4
+        db, "FAC_MECH_001", "端蓋", "端蓋;車架;左前;鋁合金;白色", level=4
     )
     assert receipt["status"] == "not_derived", receipt
     assert db.added == []
-    assert "不足 2 道" in receipt["reason"]
+    assert "没有任何工序字样" in receipt["reason"]
+
+
+@pytest.mark.asyncio
+async def test_one_corroborated_operation_is_enough_for_a_component_route():
+    """只写了"烤漆"的子件就该拿到一道表面涂装工序，而不是被判成没人能做的东西。"""
+    db = _db([_Route("rt-tread-004-2026", "FG-TREAD-004", TREAD)], master=_Master("固定片"))
+    receipt = await rf.derive_routing_for_component(
+        db, "FAC_MECH_001", "固定片", "固定片;電磁鐵;;SPHC;鐵板;;;烤漆;DM334", level=4)
+    assert receipt["status"] == "derived", receipt
+    created = db.added[0]
+    assert [s["name"] for s in created.steps] == ["表面涂装"]
+    assert created.steps[0]["station"] == "ST-TZ-01"
 
 
 @pytest.mark.asyncio
@@ -245,7 +261,7 @@ async def test_no_station_master_is_an_honest_blocker():
 def test_component_gate_is_documented_separately_from_model_gate():
     """型号级要覆盖整条产线的一半；半成品级按子集，两个门槛不能混成一个数。"""
     assert rf.MIN_COVERAGE == 0.5
-    assert rf.MIN_COMPONENT_STEPS == 2
+    assert rf.MIN_COMPONENT_STEPS == 1, "地板是有没有工序证据，不是数量"
 
 @pytest.mark.asyncio
 async def test_model_route_keeps_the_line_but_drops_unplaceable_operations():
