@@ -193,7 +193,9 @@ class ApsService:
 
             WorkOrder.factory_id == factory_id,
 
-            WorkOrder.wo_type == "master",
+            # 子装配件工单和主工单一起排：它们有各自的路线与工位，
+            # 只排 master 的话半成品工单永远没有任务，车间还是开不了工
+            WorkOrder.wo_type.in_(["master", "component"]),
 
             WorkOrder.status.in_(["released", "in_progress", "pending"]),
 
@@ -711,7 +713,7 @@ class ApsService:
                     WHERE work_order_id IN (
                         SELECT id FROM work_orders
                         WHERE factory_id = :factory_id
-                          AND wo_type = 'master'
+                          AND wo_type IN ('master', 'component')
                           AND status IN ('released', 'in_progress', 'pending')
                     )
                     GROUP BY work_order_id

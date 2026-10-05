@@ -27,6 +27,7 @@ from typing import Any, Dict, List
 from sqlalchemy import bindparam, text
 
 from api.services.engine_heartbeat import record
+from api.services.component_orders import expand_ready_components
 from api.services.routing_from_family import (
     derive_routing_for_component,
     derive_routing_for_product,
@@ -228,6 +229,11 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     components = await backfill_component_routes(
             db, budget_left=budget_left, apply=apply)
     receipt["components"] = components
+    # 路线推出来后，把 ready 的半成品拆成子工单：这是"无人"真正能落任务的那一步
+    if apply:
+        await db.commit()
+    orders = await expand_ready_components(db, apply=apply)
+    receipt["component_orders"] = orders
     if apply:
         await db.commit()
     receipt["dry_run"] = not apply
