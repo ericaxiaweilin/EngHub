@@ -861,6 +861,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_plan_commit_gate",
+            "description": "计划逐单下达就绪门（只读）：这一版排程里哪些工单真的能开工、哪些被哪条门压住（没排进本版本/工序没排齐/物料没齐套/首道工位映射不到），以及已经下达过的张数。用于'这版计划能开工几张''还有哪些单卡着''为什么没下达''计划生效了没'类问题。只报判定，不改工单状态、不下达。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_wms_inventory_health",
             "description": "WMS 库存健康度汇总：SKU 数、有单价的库存金额覆盖、周转（按真实消耗口径 production_out/outbound）、呆滞、效期、低库存、过量、补货建议，并同批返回覆盖率与不可计算项（库位容量、满载率、入库流水缺失、效期无值等）。用于'库存健康''周转''呆滞''该补什么''是否过量''库位满载'类问题；不要用 query_inventory 的行级明细替代这个汇总。",
             "parameters": {
@@ -2515,6 +2523,53 @@ async def _tool_query_bom_data_quality(
     }
 
 
+async def _tool_query_plan_commit_gate(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """逐单下达就绪门（只读）：判据只在 plan_commit_gate 一处定义，这里负责取厂区、压成能念的数。
+
+    机器人要能回答"这版计划到底有几张单真能开工"，而不是只会报"排了 961 个任务"。
+    """
+    from api.services.plan_commit_gate import evaluate_commit_gate
+
+    fid = factory_id or "FAC_MECH_001"
+    gate = await evaluate_commit_gate(db, fid)
+    plan = gate.get("plan") or {}
+    if gate.get("status") == "no_current_draft":
+        return {"status": "no_data", "factory_id": fid, "message": gate.get("reason")}
+    rules = (gate.get("gate_rules") or {}).get("hold_reason_definitions") or {}
+    return {
+        "status": "ok",
+        "factory_id": fid,
+        "schedule_code": plan.get("schedule_code"),
+        "plan_version": plan.get("version_number"),
+        "plan_status": plan.get("plan_status"),
+        "is_current_plan": plan.get("is_current"),
+        "plan_generated_at": plan.get("generated_at"),
+        "evaluated_orders": gate.get("evaluated_orders"),
+        "ready_count": gate.get("ready_count"),
+        "held_count": gate.get("held_count"),
+        "already_released_count": gate.get("already_released_count"),
+        "hold_reason_counts": gate.get("hold_reason_counts"),
+        "hold_reason_meanings": {k: rules.get(k) for k in (gate.get("hold_reason_counts") or {})},
+        "ready_samples": [
+            {k: v.get(k) for k in ("work_order_code", "wo_type", "product_id", "planned_qty",
+                                   "plan_rows", "route_steps", "first_station_code")}
+            for v in (gate.get("ready") or [])[:6]
+        ],
+        "held_samples": [
+            {k: v.get(k) for k in ("work_order_code", "wo_type", "hold_reasons",
+                                   "plan_rows", "route_steps", "short_rows")}
+            for v in (gate.get("held") or [])[:6]
+        ],
+        "gate_rules": (gate.get("gate_rules") or {}).get("requires"),
+        "data_note": (
+            "只读判定：系统不在这条路径上改工单状态。要机器自己放行得显式打开 "
+            "PLAN_COMMIT_APPLY，并且每轮受 PLAN_COMMIT_MAX_ORDERS 限量。"
+        ),
+    }
+
+
 async def _tool_query_wms_inventory_health(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -2995,6 +3050,7 @@ _TOOL_EXECUTORS = {
     "query_maintenance_due": _tool_query_maintenance_due,
     "query_wms_inventory_health": _tool_query_wms_inventory_health,
     "query_bom_data_quality": _tool_query_bom_data_quality,
+    "query_plan_commit_gate": _tool_query_plan_commit_gate,
     "query_shortage_alerts": _tool_query_shortage_alerts,
     "query_stagnant": _tool_query_stagnant,
     "query_spc_anomalies": _tool_query_spc_anomalies,
@@ -3384,6 +3440,7 @@ TOOL_LABELS = {
     "query_maintenance_due": "保养到期",
     "query_wms_inventory_health": "库存健康度",
     "query_bom_data_quality": "BOM 数据质量自检",
+    "query_plan_commit_gate": "计划逐单下达就绪门",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",
