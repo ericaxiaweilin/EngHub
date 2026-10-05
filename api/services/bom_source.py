@@ -143,7 +143,10 @@ async def subassembly_suspects(
 LEVEL_ROWS_SQL = text("""
     SELECT part_number AS material_code, description AS material_name,
            quantity AS qty_per_unit, unit, level, original_row_number,
-           source_file, vendor_code, vendor_name
+           source_file, vendor_code, vendor_name,
+           -- 属性原文（名稱;位置;規格;材料;表面處理;尺寸;圖號）留给工序佐证用；
+           -- material_name 是清洗后的品名，够写主档，但"烤漆/鹽浴滲氮/45#"这些信息都在被砍掉的那几段里
+           description AS attribute_text, l3_context
     FROM enghub_bom_items
     WHERE factory_id = :fid AND product_model = :pid
       AND original_row_number IS NOT NULL AND quantity IS NOT NULL
@@ -197,6 +200,9 @@ def build_tree(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[s
             "parent_code": parent["material_code"] if parent else None,
             "row_number": row.get("original_row_number"),
             "vendor_code": row.get("vendor_code"),
+            "attribute_text": " ".join(filter(None, (
+                row.get("attribute_text"), row.get("l3_context"),
+            ))),
         }
         nodes.append(node)
         del stack[level:]
@@ -416,6 +422,75 @@ async def explode_requirement(
         "buy_parts": sum(1 for r in merged.values() if r["item_type"] == "buy"),
         "problems": problems,
     }
+
+
+async def subtree_evidence(
+    db: Any, factory_id: str, product_model: str, codes: List[str]
+) -> Dict[str, Any]:
+    """每个料号在这份 BOM 里**自己那棵子树**的属性原文（材料/表面處理都留着）。
+
+    用户 10-05 给的工厂口径：L3 就是半成品，而半成品的下层就在同一个上传文件里，
+    所以子件不需要另外传 BOM —— 它子树里写的"烤漆/鹽浴滲氮/45#/ABS PA757S"就是工序出处。
+    同一料号出现在多处时把各处的子树并起来（齐套快照把多父级的行合并且只留一个 parent_code，
+    拿它当语料会漏掉另一半结构，这里按镜像的行序重建，不漏）。
+
+    镜像里没有这个型号的结构时退回本地 `bom_items`（只有一层，语料=它自己那一行），
+    并在回执里写清来源；两份都没有就返回空文本，由调用方如实说"没有佐证材料"。
+    """
+    wanted = [str(c) for c in codes if c]
+    rows = (await db.execute(
+        LEVEL_ROWS_SQL, {"fid": factory_id, "pid": product_model}
+    )).mappings().all()
+    receipt: Dict[str, Any] = {
+        "codes_requested": len(wanted), "codes_with_text": 0,
+        "source": "none", "rows": 0, "problems": [],
+    }
+    texts: Dict[str, str] = {}
+    if rows:
+        nodes, problems = build_tree([dict(r) for r in rows])
+        receipt.update({
+            "source": "engflow_mirror_tree", "rows": len(nodes),
+            "problems": problems[:5],
+        })
+        by_code: Dict[str, List[Dict[str, Any]]] = {}
+        kids: Dict[str, List[Dict[str, Any]]] = {}
+        for node in nodes:
+            by_code.setdefault(str(node["material_code"]), []).append(node)
+            kids.setdefault(str(node["parent_code"] or ""), []).append(node)
+        for code in wanted:
+            chunks: List[str] = []
+            for placement in by_code.get(code, []):
+                # 每一处出现单独走一遍：同一料号在两处出现时按料号去重，
+                # 只会读到第一处的下层，另一处的证据就又丢了。
+                seen: set = set()
+                stack = [placement]
+                while stack:
+                    node = stack.pop()
+                    key = str(node["material_code"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    chunks.append(str(node.get("attribute_text") or ""))
+                    stack.extend(kids.get(key, []))
+            blob = " ".join(c for c in chunks if c).strip()
+            if blob:
+                texts[code] = blob
+    else:
+        local = (await db.execute(text("""
+            SELECT material_code, material_name
+            FROM bom_items
+            WHERE factory_id = :fid AND product_id = :pid
+        """), {"fid": factory_id, "pid": product_model})).mappings().all()
+        if local:
+            receipt["source"] = "local_bom_flat"
+            receipt["rows"] = len(local)
+            for row in local:
+                code = str(row["material_code"] or "")
+                if code in wanted and row["material_name"]:
+                    texts[code] = str(row["material_name"])
+    receipt["codes_with_text"] = len(texts)
+    receipt["evidence"] = texts
+    return receipt
 
 
 async def latest_bom_lines(

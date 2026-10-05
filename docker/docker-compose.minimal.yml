@@ -13,6 +13,8 @@ x-backend-env: &backend-env
     # 路线回填循环：一轮几个产品、总共能推导几条路线（用完停手并在心跳里说明）
     - ROUTING_BACKFILL_BATCH=${ROUTING_BACKFILL_BATCH:-5}
     - ROUTING_BACKFILL_MAX_ROUTES=${ROUTING_BACKFILL_MAX_ROUTES:-200}
+    # 每轮最多收窄几条"子件拿整条产线"的旧草案；0 关掉这条自我纠正
+    - ROUTING_BACKFILL_REPAIR_BATCH=${ROUTING_BACKFILL_REPAIR_BATCH:-20}
     # 半成品拆子工单的尺度：一轮几张、全厂累计最多几张（开发阶段先小跑）
     - COMPONENT_ORDER_BATCH=${COMPONENT_ORDER_BATCH:-10}
     - COMPONENT_ORDER_MAX_TOTAL=${COMPONENT_ORDER_MAX_TOTAL:-200}

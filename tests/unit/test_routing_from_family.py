@@ -21,11 +21,17 @@ TREAD_STEPS = [
 ]
 
 
-def test_matches_requires_the_model_to_recognize_the_operation():
-    corpus = "車架組 烤漆 電控板 組立 包裝"
-    assert rf._matches("车架焊接", corpus)
-    assert rf._matches("表面涂装", corpus)
-    assert not rf._matches("注塑成型", corpus)
+def test_matches_requires_the_text_to_name_the_operation_literally():
+    """佐证要 BOM 文本里真写了工序字样。
+
+    10-05 起去掉了"車架/管材 => 焊接"这类代用字：看到车架就推断要焊接，
+    等于替工厂编工艺。工序词表统一在 bom_attributes.PROCESS_TOKENS 一份。
+    """
+    corpus = "車架組;;;烤漆;DM334;;EP298; 端蓋;車架;左前;ABS PA757S;黑色/Black C;;EP589;"
+    assert rf._matches("表面涂装", corpus)          # 烤漆写在文本里
+    assert rf._matches("注塑成型", corpus)          # ABS 是注塑证据
+    assert not rf._matches("车架焊接", corpus)      # 文本里没"焊接"，不算
+    assert rf._matches("车架焊接", corpus + " 車架組;;;焊接;;EP298")
 
 
 def test_normalize_keeps_steps_without_inventing_times():

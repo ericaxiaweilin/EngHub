@@ -264,3 +264,72 @@ def test_readiness_rollup_only_counts_selfmade_and_drops_empty_buckets():
     assert roll["missing_master"] == {"parts": 2, "shortage_qty": 200}
     assert "ready" not in roll, "没有缺口的自制件不算待办，种数要和缺口对齐"
     assert "no_routing" not in roll, "没有自制件的桶不该出现在读数里"
+
+
+@pytest.mark.asyncio
+async def test_subtree_evidence_keeps_material_and_surface_finish():
+    """半成品的佐证材料要含**属性原文**（材料/表面處理），不能只有清洗后的品名。
+
+    用户给的工厂口径：L3 就是半成品，下层就在同一个上传文件里；
+    "烤漆/鹽浴滲氮/45#" 这些工序出处全在被 clean_name 砍掉的那几段里。
+    """
+    rows = [
+        {"material_code": "A-50-04-F", "material_name": "跑步機", "qty_per_unit": 1,
+         "unit": "PCS", "level": 1, "original_row_number": 1, "source_file": "f.xlsx",
+         "vendor_code": None, "vendor_name": None,
+         "attribute_text": "跑步機;;;;", "l3_context": None},
+        {"material_code": "1000461221", "material_name": "車架組", "qty_per_unit": 1,
+         "unit": "PCS", "level": 2, "original_row_number": 2, "source_file": "f.xlsx",
+         "vendor_code": None, "vendor_name": None,
+         "attribute_text": "車架組;;;烤漆;DM334;;EP298;", "l3_context": None},
+        {"material_code": "1000461222", "material_name": "車架組", "qty_per_unit": 2,
+         "unit": "PCS", "level": 3, "original_row_number": 3, "source_file": "f.xlsx",
+         "vendor_code": None, "vendor_name": None,
+         "attribute_text": "車架組;;;焊接;;EP298", "l3_context": "車架組;;;烤漆;DM334;;EP298;"},
+        {"material_code": "1000341659", "material_name": "五通管", "qty_per_unit": 2,
+         "unit": "PCS", "level": 4, "original_row_number": 4, "source_file": "f.xlsx",
+         "vendor_code": None, "vendor_name": None,
+         "attribute_text": "五通管;車架;口50x100;;;45#;EP589", "l3_context": "車架組;;;烤漆;"},
+    ]
+    db = _session(rows)
+    out = await bom_source.subtree_evidence(db, "FAC_MECH_001", "A-50-04-F", ["1000461221"])
+    text = out["evidence"]["1000461221"]
+    assert out["source"] == "engflow_mirror_tree"
+    assert "焊接" in text and "烤漆" in text and "45#" in text
+    assert out["codes_with_text"] == 1
+
+
+@pytest.mark.asyncio
+async def test_subtree_evidence_unions_every_placement():
+    """同一料号出现在多处时，两处子树都要算进来。
+
+    齐套快照把多父级的行合并且只留一个 parent_code，拿它当语料会漏掉另一半结构。
+    """
+    rows = [
+        {"material_code": "ROOT", "material_name": "整機", "qty_per_unit": 1, "unit": "PCS",
+         "level": 1, "original_row_number": 1, "source_file": "f.xlsx",
+         "vendor_code": None, "vendor_name": None, "attribute_text": "整機;;;", "l3_context": None},
+        {"material_code": "共用件", "material_name": "側板", "qty_per_unit": 1, "unit": "PCS",
+         "level": 2, "original_row_number": 2, "source_file": "f.xlsx",
+         "vendor_code": None, "vendor_name": None, "attribute_text": "側板;;;電鍍;;;", "l3_context": None},
+        {"material_code": "共用件", "material_name": "側板", "qty_per_unit": 1, "unit": "PCS",
+         "level": 2, "original_row_number": 3, "source_file": "f.xlsx",
+         "vendor_code": None, "vendor_name": None, "attribute_text": "側板;;;鹽浴滲氮;;;", "l3_context": None},
+    ]
+    db = _session(rows)
+    out = await bom_source.subtree_evidence(db, "FAC_MECH_001", "ROOT", ["共用件"])
+    text = out["evidence"]["共用件"]
+    assert "電鍍" in text and "鹽浴滲氮" in text
+
+
+@pytest.mark.asyncio
+async def test_subtree_evidence_falls_back_then_says_none():
+    """镜像没有这个型号的结构时退回本地 BOM（只有一层）；两份都没有就报没有。"""
+    db = _session([], [{"material_code": "RM-1", "material_name": "鋼板 45#"}])
+    out = await bom_source.subtree_evidence(db, "FAC_MECH_001", "VF-CMECH001-40HQ", ["RM-1"])
+    assert out["source"] == "local_bom_flat"
+    assert out["evidence"]["RM-1"] == "鋼板 45#"
+
+    empty = _session([])
+    none = await bom_source.subtree_evidence(empty, "FAC_MECH_001", "NOPE", ["X"])
+    assert none["source"] == "none" and none["codes_with_text"] == 0

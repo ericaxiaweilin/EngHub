@@ -20,17 +20,22 @@ APS 每次都把它们列进 unrouted 清单，永远排不动（实测厂区 65
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any, Dict, List
 
 from sqlalchemy import bindparam, text
 
+from api.services.bom_source import subtree_evidence
 from api.services.engine_heartbeat import record
 from api.services.component_orders import expand_ready_components
 from api.services.component_release import release_kitted_child_orders
 from api.services.snapshot_supply import refresh_snapshot_supply
 from api.services.routing_from_family import (
+    CREATED_BY,
+    MIN_COMPONENT_STEPS,
+    corroborated_component_subset,
     derive_routing_for_component,
     derive_routing_for_product,
 )
@@ -100,6 +105,34 @@ ROUTED_CODES_SQL = text("""
 """)
 
 COMPONENT_BATCH = max(1, int(os.getenv("ROUTING_BACKFILL_WOS_PER_TICK", "2")))
+# 旧逻辑把整条产线套到子件上过（10-05 实测 14 条：6 道/4 道工序的子件路线）。
+# 收窄一轮就能收敛：只动自己推导出来的草案路线，且只往少了改。
+REPAIR_BATCH = max(0, int(os.getenv("ROUTING_BACKFILL_REPAIR_BATCH", "20")))
+
+# 子件却拿着整条产线的路线：那些料号在齐套快照里是别人的下层，不是机种
+OVERCLAIMED_SQL = text("""
+    SELECT DISTINCT ON (r.id)
+           r.id AS routing_id, r.product_id AS material_code,
+           COALESCE(jsonb_array_length(r.steps::jsonb), 0) AS nsteps,
+           wo.factory_id, wo.product_id AS model_code
+    FROM routings r
+    JOIN work_order_materials m ON m.material_code = r.product_id AND m.item_type = 'make'
+    JOIN work_orders wo ON wo.id = m.work_order_id AND wo.wo_type = 'master'
+    WHERE r.created_by = :created_by
+      AND COALESCE(jsonb_array_length(r.steps::jsonb), 0) > :min_steps
+      AND NOT EXISTS (
+          SELECT 1 FROM work_orders w2
+          WHERE w2.wo_type = 'master' AND w2.product_id = r.product_id
+      )
+    ORDER BY r.id, wo.created_at DESC
+    LIMIT :limit
+""")
+
+NARROW_SQL = text("""
+    UPDATE routings
+    SET steps = CAST(:steps AS jsonb), remark = :remark, updated_at = NOW()
+    WHERE id = :routing_id AND created_by = :created_by
+""")
 
 
 async def _subtree_corpus(rows: List[Any], root_code: str) -> str:
@@ -133,6 +166,9 @@ async def backfill_component_routes(
     receipt: Dict[str, Any] = {
         "examined": 0, "derived": 0, "existing": 0, "not_derived": 0,
         "no_master": 0, "no_bom_text": 0, "rejected": [],
+        # 佐证语料的来源分布：BOM 镜像子树（含材料/表面處理原文）才是全量结构，
+        # 齐套快照只剩清洗后的品名，用它当语料会把"烤漆/鹽浴滲氮"这些证据丢掉。
+        "corpus_by_source": {},
     }
     if budget_left <= 0:
         receipt["status"] = "budget_exhausted"
@@ -147,6 +183,10 @@ async def backfill_component_routes(
         routed = {str(c) for c in (await db.execute(ROUTED_CODES_SQL, {
             "codes": [str(r["material_code"]) for r in made] or ["__none__"]
         })).scalars().all()}
+        model = str(wo["product_id"] or "")
+        codes = [str(r["material_code"]) for r in made]
+        evidence = await subtree_evidence(db, fid, model, codes)
+
         for row in made:
             if receipt["derived"] >= budget_left:
                 receipt["status"] = "budget_reached"
@@ -155,7 +195,14 @@ async def backfill_component_routes(
             if code in routed:
                 receipt["existing"] += 1
                 continue
-            corpus = await _subtree_corpus(rows, code)
+            corpus = str((evidence["evidence"] or {}).get(code) or "")
+            corpus_source = "bom_mirror_subtree" if corpus.strip() else ""
+            if not corpus.strip():
+                # 镜像里没有这个型号的结构（本地 BOM 建的型号才会这样）才退回快照品名
+                corpus = await _subtree_corpus(rows, code)
+                corpus_source = "wo_snapshot_subtree" if corpus.strip() else "none"
+            receipt["corpus_by_source"][corpus_source] = \
+                receipt["corpus_by_source"].get(corpus_source, 0) + 1
             result = await derive_routing_for_component(
                 db, fid, code, corpus, level=row["level"]
             )
@@ -165,10 +212,76 @@ async def backfill_component_routes(
                 receipt["rejected"].append({
                     "material_code": code, "status": status,
                     "reason": result.get("reason"), "coverage": result.get("coverage"),
+                    "corpus_source": corpus_source,
+                    "corpus_chars": len(corpus),
                 })
         if apply:
             await db.commit()
         receipt["status"] = receipt.get("status", "ok")
+    receipt.setdefault("status", "ok")
+    return receipt
+
+
+
+async def rederive_overclaimed_routes(db, *, limit: int = REPAIR_BATCH, apply: bool = True
+                                      ) -> Dict[str, Any]:
+    """把"整条产线套在子件上"的路线收窄到它自己子树佐证的工序。
+
+    只动 `created_by='bom-family-derived'` 的草案，且只在**工序变少**时改写；
+    收窄后不足 2 道工序的不改（那说明这个件该怎么工艺本来就没证据，列出来交工艺部，
+    不是让引擎再套一条更假的路线）。路线 id 不动，所以工单与 APS 的引用不会断。
+    """
+    receipt: Dict[str, Any] = {
+        "examined": 0, "narrowed": 0, "unchanged": 0,
+        "needs_process_engineering": [], "samples": [],
+    }
+    if limit <= 0:
+        receipt["status"] = "disabled"
+        return receipt
+
+    rows = (await db.execute(OVERCLAIMED_SQL, {
+        "created_by": CREATED_BY, "min_steps": MIN_COMPONENT_STEPS, "limit": limit,
+    })).mappings().all()
+    receipt["examined"] = len(rows)
+    for row in rows:
+        fid = str(row["factory_id"])
+        code = str(row["material_code"])
+        model = str(row["model_code"])
+        evidence = await subtree_evidence(db, fid, model, [code])
+        corpus = str((evidence["evidence"] or {}).get(code) or "")
+        if not corpus.strip():
+            receipt["unchanged"] += 1
+            continue
+        subset = await corroborated_component_subset(db, fid, corpus)
+        steps = subset.get("steps") or []
+        if len(steps) < MIN_COMPONENT_STEPS or len(steps) >= int(row["nsteps"]):
+            # 佐不到 2 道 = 没人知道这个件怎么做；比原路线更宽 = 不动，宁缺勿造
+            if len(steps) < MIN_COMPONENT_STEPS:
+                receipt["needs_process_engineering"].append({
+                    "material_code": code, "steps_on_route": int(row["nsteps"]),
+                    "corroborated": len(steps), "reason": subset.get("reason")
+                    or "子树只佐证到不足 2 道工序",
+                })
+            receipt["unchanged"] += 1
+            continue
+        remark = (
+            f"收窄自 {int(row['nsteps'])} 道工序：按它在 {model} 的 BOM 子树里只佐证到 "
+            f"{subset.get('matched_steps')}/{len(steps)} 道；参考路线 {subset.get('derived_from')}；"
+            + "、".join(subset.get("station_sources") or []) +
+            "。标准工时未经 IE 确认，排程只能当草案。"
+        )
+        if apply:
+            await db.execute(NARROW_SQL, {
+                "routing_id": row["routing_id"], "created_by": CREATED_BY,
+                "steps": json.dumps(steps, ensure_ascii=False), "remark": remark,
+            })
+        receipt["narrowed"] += 1
+        if len(receipt["samples"]) < 5:
+            receipt["samples"].append({
+                "material_code": code, "before": int(row["nsteps"]),
+                "after": len(steps),
+                "kept": [str(st.get("name")) for st in steps],
+            })
     receipt.setdefault("status", "ok")
     return receipt
 
@@ -231,6 +344,8 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     components = await backfill_component_routes(
             db, budget_left=budget_left, apply=apply)
     receipt["components"] = components
+    # 旧草案里"子件拿整条产线"的那些，按现在的证据收窄；id 不变，工单引用不受影响
+    receipt["route_repairs"] = await rederive_overclaimed_routes(db, apply=apply)
     # 路线推出来后，把 ready 的半成品拆成子工单：这是"无人"真正能落任务的那一步
     if apply:
         await db.commit()
