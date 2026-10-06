@@ -27,6 +27,45 @@ from core.mes.route_resolution import route_ops_for_product
 from sqlalchemy.ext.asyncio import AsyncSession
 
 DEFAULT_LABOR_COST_PER_PERSON_DAY = float(os.getenv("SIM_LABOR_COST_PER_PERSON_DAY", "30"))
+# 加急对价：每件每天提前一天要多付的钱（库里没有运费/加急费率，这是内置标定，结果里标明 basis）
+SIM_EXPEDITE_COST_PER_UNIT_DAY = float(os.getenv("SIM_EXPEDITE_COST_PER_UNIT_DAY", "0.15"))
+# 开第二条线的代价：多一套班组、多一份管理幅度。库里没有这条费率，按"整线班组×班时"标定。
+SIM_LINE_ACTIVATION_COST_PER_DAY = float(os.getenv("SIM_LINE_ACTIVATION_COST_PER_DAY", "4500"))
+
+
+LOAD_HEALTHY_BAND = (0.60, 0.90)
+
+
+def peak_load_ratio(bottleneck_lead: int, due: date, today: date, units: float,
+                    units_per_day: float, parallel_lines: int,
+                    attendance_curve: Dict[int, float]) -> float:
+    """要赶上交期，每天必须做多少台 ÷ 这段时间实际能做多少台。
+
+    料要在第 N 天才齐，能用的天数就被压短；短到每天要做的台数超过线的实际产能，
+    这个比值就 >1（得加班或开第二条线）。比"1/出勤率"有信息量得多，也不会让"多开线"白拿分。
+    """
+    if units_per_day <= 0 or units <= 0:
+        return 0.0
+    total_days = max(1, (due - today).days)
+    usable_days = max(1, total_days - max(0, int(bottleneck_lead)))
+    attend = sum(attendance_curve.get(d, 1.0) for d in range(total_days)) / max(1, total_days)
+    available = units_per_day * max(1, int(parallel_lines)) * attend * usable_days
+    return round(units / available, 4) if available > 0 else 99.0
+
+
+def load_band_gap(ratio: float) -> float:
+    """离健康区间有多远：区间内 = 0，越偏离越大。这样"多开线把人闲下来"要付分。"""
+    lo, hi = LOAD_HEALTHY_BAND
+    if ratio < lo:
+        return round(lo - ratio, 4)
+    if ratio > hi:
+        return round((ratio - hi) / (1 - hi) * lo, 4)     # 超载侧按剩余缓冲折算
+    return 0.0
+
+
+def kit_lead_of(kit: Dict[str, Any]) -> int:
+    part = kit.get("bottleneck_part") or {}
+    return int(part.get("lead_time_days") or 0)
 MAX_MAKE_DEPTH = int(os.getenv("SIM_MAX_MAKE_DEPTH", "2"))
 IDLE_COST_WEIGHT = float(os.getenv("SIM_IDLE_COST_WEIGHT", "1.0"))
 
@@ -238,17 +277,24 @@ async def load_family_route(db: AsyncSession, factory_id: str, model: str) -> Li
 async def run_target(db: AsyncSession, factory_id: str, model: str, units: float,
                      due: date, today: date, attendance_curve: Dict[int, float],
                      lines: List[Dict[str, Any]], shift_days: set,
-                     expedite_lead_days: Optional[int] = None) -> Dict[str, Any]:
+                     expedite_lead_days: Optional[int] = None, allow_partial: bool = True,
+                     parallel_lines: int = 1, crew_bonus: float = 0.0,
+                     cached: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把一个目标跑成一条演变时间线。"""
-    bom = [dict(r) for r in (await db.execute(
-        BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
-    codes = [str(r["material_code"]) for r in bom]
-    stock_rows = (await db.execute(STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all() if codes else []
-    stock = {str(r["material_code"]): float(r["available"] or 0) for r in stock_rows}
-
-    route_own = await route_ops_for_product(db, factory_id, model)
-    family_rows = [] if route_own else await load_family_route(db, factory_id, model)
-    route, route_basis = resolve_route([dict(o) for o in route_own], family_rows)
+    cache = (cached or {}).get(model)
+    if not cache:
+        bom = [dict(r) for r in (await db.execute(
+            BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
+        codes = [str(r["material_code"]) for r in bom]
+        stock_rows = (await db.execute(STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all() if codes else []
+        stock = {str(r["material_code"]): float(r["available"] or 0) for r in stock_rows}
+        route_own = await route_ops_for_product(db, factory_id, model)
+        family_rows = [] if route_own else await load_family_route(db, factory_id, model)
+        cache = {"bom": bom, "stock": stock,
+                 "route_own": [dict(o) for o in route_own], "family_rows": family_rows}
+    bom, stock = cache["bom"], cache["stock"]
+    route_own, family_rows = cache["route_own"], cache["family_rows"]
+    route, route_basis = resolve_route(list(route_own), family_rows)
     line, line_basis = pick_line(model, lines)
     hours_per_unit, hours_basis = hours_per_unit_from(route, line)
 
@@ -278,8 +324,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                 "due": str(due)}
 
     hours_per_day = float((line or {}).get("hours_per_day") or 11)
-    crew = float((line or {}).get("crew_size") or 0)
-    cap = float((line or {}).get("units_per_day") or 0)
+    crew = round(float((line or {}).get("crew_size") or 0) * (1.0 + crew_bonus), 1)
+    cap = float((line or {}).get("units_per_day") or 0) * max(1, int(parallel_lines))
 
     # 引擎的决策（不是计算器会做的事）：现料能做几台就先开几台，剩下的排在到货日之后
     coverable = []
@@ -287,7 +333,7 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         per = float(l["need"] / units) if units else 0.0
         coverable.append(int(l["have"] / per) if per > 0 else int(units))
     stock_units = min(coverable, default=0)
-    batch_a = min(int(units), max(0, stock_units))
+    batch_a = min(int(units), max(0, stock_units)) if allow_partial else 0
     batch_b = int(units) - batch_a
     decision = (
         f"现料够先做 {batch_a} 台（第 0 天开工），剩余 {batch_b} 台等料"
@@ -330,6 +376,21 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "standby_cost_if_line_held_usd": round(run["idle_person_days_before_start"]
                                                * DEFAULT_LABOR_COST_PER_PERSON_DAY * IDLE_COST_WEIGHT, 2),
         "bottleneck_part": kit["bottleneck_part"],
+        # 峰值负载 = 需要的相对人力。健康是 0.70~0.95：太低是养闲，太高没有缓冲。
+        # 不能写成"越低越好"，否则引擎会永远多开线（那条线的代价没人付）。
+        "load_band_gap": load_band_gap(peak_load_ratio(kit_lead_of(kit), due, today, units,
+                                                        float((line or {}).get("units_per_day") or 0),
+                                                        parallel_lines, attendance_curve)),
+        "line_activation_cost_usd": (max(1, int(parallel_lines)) - 1) * SIM_LINE_ACTIVATION_COST_PER_DAY
+                                    * max(1, int(run.get("work_days") or 1)),
+        "expedite_cost_usd": (round(float(units) * max(0, (kit_lead_of(kit) - expedite_lead_days))
+                                    * SIM_EXPEDITE_COST_PER_UNIT_DAY, 2)
+                              if expedite_lead_days is not None and kit.get("bottleneck_part") else 0.0),
+        "evidence": {route_basis: len(route) or 1,
+                    hours_basis: len(route) or 1,
+                    line_basis: 1},
+        "policy": {"allow_partial": allow_partial, "parallel_lines": parallel_lines,
+                   "crew_bonus": crew_bonus, "expedite_lead_days": expedite_lead_days},
         "standby_note": ("等料那几天这条线是空的；只有把整班人守着这条线才算损失。"
                          "厂里还有几百张单没排，空档可以承接 —— 所以这笔是上限，不是必然发生的钱。"),
         "material_cost_usd": kit["material_cost"],
@@ -393,4 +454,168 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
         },
     }
 
+async def default_models(db: AsyncSession, factory_id: str, n: int = 2) -> List[str]:
+    """默认取 BOM 最完整的 n 个机种，不从代码里写死机种名。"""
+    rows = (await db.execute(text("""
+        SELECT product_id FROM bom_items WHERE factory_id = :fid
+        GROUP BY product_id HAVING count(*) >= 8 ORDER BY count(*) DESC LIMIT :n
+    """), {"fid": factory_id, "n": n})).scalars().all()
+    return [str(r) for r in rows]
+
+
+async def derive_targets(db: AsyncSession, factory_id: str, models: List[str],
+                         *, days_of_output: float = 6.0, lead_margin: float = 1.15
+                         ) -> List[Dict[str, Any]]:
+    """场景自己标定，不拍脑袋。
+
+    批量 = 该线若干天的产量（少到 1 天就能做完的话，产能/人力/线这些维度全都没区分度）；
+    交期 = 瓶颈件提前期 × 系数（比提前期还宽的话，所有政策都准点，准点这维也是废的）。
+    这是上一轮自己发现的偏差：300 台配 30 天交期，12 个政策全部"准点 1.00"，比较不出任何东西。
+    """
+    lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
+    targets: List[Dict[str, Any]] = []
+    for model in models:
+        line, line_basis = pick_line(model, lines)
+        per_day = float((line or {}).get("units_per_day") or 0)
+        bom = [dict(r) for r in (await db.execute(
+            BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
+        codes = [str(r["material_code"]) for r in bom]
+        lead_rows = (await db.execute(text("""
+            SELECT MAX(COALESCE(m.lead_time_days, 0)) AS max_lead
+            FROM materials m WHERE m.factory_id = :fid AND m.material_code = ANY(CAST(:codes AS text[]))
+        """), {"fid": factory_id, "codes": codes})).mappings().first() if codes else None
+        max_lead = int((lead_rows or {}).get("max_lead") or 0)
+        units = int(per_day * days_of_output) if per_day > 0 else 300
+        due_in_days = int(max(1, round(max(1, max_lead) * lead_margin)))
+        targets.append({"model_code": model, "units": units, "due_in_days": due_in_days,
+                        "calibration": f"批量={days_of_output:g} 天线产量（线 {per_day:g} 台/天）；"
+                                       f"交期={max_lead} 天瓶颈提前期 × {lead_margin:g}"})
+    return targets
+
+
+# 可控政策（引擎能决定的事）与环境场景（只能接受的事）分开：
+# 把天气当成"可选政策"放进同一个前沿比后悔是错的 —— 厂里没人能选天气。
+POLICIES: List[Dict[str, Any]] = [
+    {"name": "现况（分批开工·正常出勤）", "allow_partial": True},
+    {"name": "等齐套才开工（不分批）", "allow_partial": False},
+    {"name": "瓶颈件加急到 10 天", "expedite_lead_days": 10},
+    {"name": "瓶颈件加急到 5 天", "expedite_lead_days": 5},
+    {"name": "开并联第二条线", "parallel_lines": 2},
+    {"name": "加班加人 15%", "crew_bonus": 0.15},
+    {"name": "加急 10 天 + 开并联线", "expedite_lead_days": 10, "parallel_lines": 2},
+    {"name": "开并联线 + 加班 15%", "parallel_lines": 2, "crew_bonus": 0.15},
+]
+
+WEATHER_SCENARIOS: List[Dict[str, Any]] = [
+    {"name": "好天（到岗 0.97）", "attendance": 0.97},
+    {"name": "雨季（到岗 0.92）", "attendance": 0.92},
+    {"name": "暴雨（到岗 0.70）", "attendance": 0.70},
+]
+
+
+def _objectives(run: Dict[str, Any], demand_units: float, due_day: int) -> Dict[str, Any]:
+    finish = run.get("finish_day")
+    late = max(0, int(finish) - int(due_day)) if finish is not None else max(0, due_day)
+    made = float(run.get("units") or 0) if finish is not None else 0.0
+    on_time = 1.0 if finish is not None and finish <= due_day else 0.0
+    conf = {
+        "route_standard_hours": 1.0, "own_route": 1.0,
+        "line_declared_can_make": 1.0, "line_declared_home": 1.0, "line_declared_default_model": 1.0,
+        "borrowed_route_from_family": 0.4, "takt_from_line_capacity": 0.35,
+        "line_inferred_by_family_name": 0.5, "assumed_ie_hours": 0.3, "no_route": 0.0,
+        "no_time_basis": 0.0, "no_line": 0.0,
+    }
+
+    def _c(v: Optional[str]) -> float:
+        return conf.get(str(v), 0.6)
+    weights = [_c(run.get("route_basis")), _c(run.get("hours_basis")), _c(run.get("line_basis"))]
+    return {
+        "on_time_rate": on_time,
+        "throughput_units": made,
+        "labor_cost_usd": float(run.get("labor_cost_usd") or 0),
+        "expedite_cost_usd": float(run.get("expedite_cost_usd") or 0),
+        "standby_person_days": float(run.get("standby_person_days_if_line_held") or 0),
+        "data_confidence": round(sum(weights) / len(weights), 4),
+        "load_band_gap": float(run.get("load_band_gap") or 0),
+        "days_late": late,
+        "finish_date": run.get("finish_date"),
+    }
+
+
+async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
+                        *, today: Optional[date] = None,
+                        policies: Optional[List[Dict[str, Any]]] = None,
+                        scenarios: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """让引擎自己扫政策组合：同一批目标在多种产能/出勤/采购/分批政策下的多目标结果。
+
+    这里刻意不给"唯一总分"。每个政策产出一个目标向量，交给 pareto_eval 判前沿与平衡解 ——
+    工厂是取舍，不是考试。
+    """
+    today = today or date.today()
+    lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
+    shift_days = {int(r["weekday"]) + 1 for r in
+                  (await db.execute(CALENDAR_SQL, {"fid": factory_id})).mappings().all()} or {1, 2, 3, 4, 5, 6}
+    policies = policies or POLICIES
+    scenarios = scenarios or WEATHER_SCENARIOS
+    demand_units = sum(float(t.get("units") or 0) for t in targets)
+
+    cache: Dict[str, Any] = {}
+    grouped: Dict[str, Any] = {}
+    for scen in scenarios:
+      curve = {d: float(scen.get("attendance", 0.97)) for d in range(0, 400)}
+      solutions: List[Dict[str, Any]] = []
+      for pol in policies:
+        per_run: List[Dict[str, Any]] = []
+        for t in targets:
+            due_day = int(t.get("due_in_days") or 30)
+            run = await run_target(db, factory_id, str(t["model_code"]), float(t.get("units") or 0),
+                                   today + timedelta(days=due_day), today, curve, lines, shift_days,
+                                   expedite_lead_days=pol.get("expedite_lead_days"),
+                                   allow_partial=bool(pol.get("allow_partial", True)),
+                                   parallel_lines=int(pol.get("parallel_lines", 1)),
+                                   crew_bonus=float(pol.get("crew_bonus", 0.0)),
+                                   cached=cache)
+            per_run.append({"run": run, "due_day": due_day, "units": float(t.get("units") or 0)})
+        worst_late = max(_objectives(x["run"], x["units"], x["due_day"])["days_late"] for x in per_run)
+        on_time_n = sum(1 for x in per_run
+                        if _objectives(x["run"], x["units"], x["due_day"])["on_time_rate"] >= 1.0)
+        made = sum(_objectives(x["run"], x["units"], x["due_day"])["throughput_units"] for x in per_run)
+        objs = {
+            "on_time_rate": round(on_time_n / max(1, len(per_run)), 4),
+            "throughput_units": round(made, 2),
+            "labor_cost_usd": round(sum(float(x["run"].get("labor_cost_usd") or 0) for x in per_run), 2),
+            "expedite_cost_usd": round(sum(float(x["run"].get("expedite_cost_usd") or 0)
+                                           for x in per_run), 2),
+            "standby_person_days": round(sum(float(x["run"].get("standby_person_days_if_line_held") or 0)
+                                             for x in per_run), 1),
+            "data_confidence": round(sum(_objectives(x["run"], x["units"], x["due_day"])["data_confidence"]
+                                         for x in per_run) / max(1, len(per_run)), 4),
+            "load_band_gap": round(sum(_objectives(x["run"], x["units"], x["due_day"])["load_band_gap"]
+                                       for x in per_run) / max(1, len(per_run)), 4),  # 区间外才扣分
+            "line_activation_cost_usd": round(sum(float(x["run"].get("line_activation_cost_usd") or 0)
+                                                  for x in per_run), 2),
+            "days_late_worst": worst_late,
+        }
+        solutions.append({
+            "id": f"{scen['name']}-pol{len(solutions)}", "name": pol["name"],
+            "scenario": scen["name"], "attendance": float(scen.get("attendance", 0.97)),
+            "policy": pol,
+            "objectives": objs,
+            "evidence": {str(x["run"].get("route_basis")): 1 for x in per_run}
+                        | {str(x["run"].get("hours_basis")): 1 for x in per_run}
+                        | {str(x["run"].get("line_basis")): 1 for x in per_run},
+            "detail": [{"model_code": x["run"].get("model_code"),
+                        "finish_date": x["run"].get("finish_date"),
+                        "status": x["run"].get("status"),
+                        "batch_decision": x["run"].get("batch_decision"),
+                        "bottleneck_part": x["run"].get("bottleneck_part")} for x in per_run],
+        })
+      grouped[scen["name"]] = {"attendance": float(scen.get("attendance", 0.97)),
+                               "solutions": solutions}
+    total = sum(len(v["solutions"]) for v in grouped.values())
+    return {"factory_id": factory_id, "today": str(today), "demand_units": demand_units,
+            "policies_tried": total, "scenarios": list(grouped),
+            "by_scenario": grouped,
+            "note": ("前沿在每个天气场景内部各算一次：天气不是可选政策。"
+                     "跨场景的推荐按'各场景推荐解里后悔向量最稳的那个'给。")}
 

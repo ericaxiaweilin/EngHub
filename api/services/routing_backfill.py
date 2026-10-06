@@ -42,6 +42,7 @@ from api.services.time_basis import time_basis_review
 from api.services.data_authority import data_authority_report
 from api.services.partial_kit import report_partial_kit_splits
 from api.services.portfolio_flywheel import run_once as run_portfolio_cycle
+from api.services.portfolio_flywheel import record_tradeoffs as record_sim_tradeoffs
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
 from api.services.aps_draft_prune import (
@@ -428,6 +429,9 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     receipt["data_authority"] = await data_authority_report(db, QUALITY_FACTORY_ID)
     # 飞轮那一圈：组合推演打分 → 记分卡落库 → 瓶颈换了就开一条待办（同瓶颈不重复催）。
     receipt["portfolio_scorecard"] = await run_portfolio_cycle(
+        db, QUALITY_FACTORY_ID, apply=PORTFOLIO_FLYWHEEL_APPLY)
+    # 政策×天气的权衡矩阵：前沿与稳健推荐变了才写卡（工厂是取舍，不是把某个分数刷到最高）
+    receipt["sim_tradeoffs"] = await record_sim_tradeoffs(
         db, QUALITY_FACTORY_ID, apply=PORTFOLIO_FLYWHEEL_APPLY)
     if isinstance(receipt.get("plan_commit"), dict):
         # 就绪门的读数旁边挂上同一份口径：压着的单里有多少其实能先开一批。

@@ -465,6 +465,25 @@ async def get_fake_output_revert(
     return report
 
 
+@router.get("/sim-tradeoffs", summary="政策×天气的权衡矩阵：帕累托前沿与跨场景稳健推荐（默认只算不写）")
+async def get_sim_tradeoffs(
+    factory_id: str = Query(..., description="厂区"),
+    apply: bool = Query(False, description="true 才把权衡结果写进记分卡"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """引擎自己扫政策、自己评估质量：不给唯一最高分，给前沿和代价。
+
+    天气是外生的，所以按场景分开算（好天/雨季/暴雨各一套前沿），跨场景用 minimax regret 选
+    "最坏天气下后悔最小"的政策 —— 不赌天气，也不靠牺牲某一维刷分。产量不达标的解直接淘汰，
+    否则"干脆不做"永远成本最优。加急和开并联线都带真实代价进目标向量。
+    """
+    del current_user
+    from api.services.portfolio_flywheel import record_tradeoffs
+
+    return await record_tradeoffs(db, factory_id, apply=apply)
+
+
 @router.post("/virtual-run", summary="沙箱执行推演：引擎自己拆单/借路线/开采购/按天推进")
 async def post_virtual_run(
     body: Dict[str, Any] = Body(..., description="factory_id, targets:[{model_code,units,due_in_days}], "

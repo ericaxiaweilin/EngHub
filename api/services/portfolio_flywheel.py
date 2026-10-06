@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from datetime import date, datetime
+from typing import List
 from typing import Any, Dict, Optional
 
 from sqlalchemy import text
@@ -41,6 +42,12 @@ LAST_SQL = text("""
     FROM simulation_scorecards WHERE factory_id = :fid
     ORDER BY created_at DESC LIMIT 1
 """)
+
+TRADEOFF_NOTE = (
+    "工厂是取舍不是考试：记分卡存的是目标向量、帕累托前沿与跨天气的稳健推荐，"
+    "不存'唯一最高分'。推荐规则是 minimax regret（最坏场景后悔最小），"
+    "产量不达标的解直接淘汰（否则'干脆不做'永远最优）。")
+
 
 OPEN_TASK_SQL = text("""
     SELECT id, status, payload->>'constraint' AS slot_constraint
@@ -163,9 +170,111 @@ async def record_cycle(db: AsyncSession, sim: Dict[str, Any], *, factory_id: str
     return receipt
 
 
+async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = True,
+                            models: Optional[List[str]] = None) -> Dict[str, Any]:
+    """扫一遍政策×天气，把权衡矩阵与稳健推荐写进记分卡；推荐变了才动待办。"""
+    from api.services.pareto_eval import evaluate_by_scenario
+    from api.services.virtual_run import derive_targets, scan_policies
+
+    from api.services.virtual_run import default_models
+    targets = await derive_targets(db, factory_id,
+                                   models or await default_models(db, factory_id, n=2))
+    scan = await scan_policies(db, factory_id, targets)
+    verdict = evaluate_by_scenario(scan["by_scenario"], scan["demand_units"])
+    robust = verdict.get("robust_recommendation") or {}
+    per_scenario = {name: {"recommended": (res.get("recommended") or {}).get("name"),
+                           "frontier_size": len(res.get("frontier") or []),
+                           "eliminated": len(res.get("eliminated") or [])}
+                    for name, res in (verdict.get("by_scenario") or {}).items()}
+    signature = f"{robust.get('policy')}|{json.dumps(per_scenario, ensure_ascii=False, sort_keys=True)}"
+
+    last = (await db.execute(LAST_SQL, {"fid": factory_id})).mappings().first()
+    changed = (not last) or str((last or {}).get("top_constraint") or "") != signature
+    receipt = {"factory_id": factory_id, "apply": apply, "changed": changed,
+               "robust_recommendation": robust, "by_scenario": per_scenario,
+               "calibration": [(t["model_code"], t["units"], t["due_in_days"], t.get("calibration"))
+                               for t in targets],
+               "selection_rule": verdict.get("selection_rule"), "note": TRADEOFF_NOTE,
+               "card_written": False}
+    if not changed:
+        receipt["skipped_reason"] = "稳健推荐与各场景前沿都没变，不重复写卡"
+        return receipt
+    if not apply:
+        receipt["skipped_reason"] = "apply=false，只算不写"
+        return receipt
+
+    # 先给推荐解本身算一遍代价：钱和天数值不值得，写在建议里，不让人再去问模型
+    best = None
+    for name, res in (verdict.get("by_scenario") or {}).items():
+        rec = res.get("recommended")
+        if rec:
+            best = rec
+            break
+    objectives = (best or {}).get("objectives") or {}
+    await db.execute(INSERT_SQL, {
+        "id": _gen_id(), "fid": factory_id, "eday": date.today(),
+        "models": len(per_scenario), "score": float(objectives.get("on_time_rate") or 0) * 100.0,
+        "weights": json.dumps({"rule": "minimax regret over weather scenarios",
+                               "objectives": list((best or {}).get("objectives") or {})},
+                              ensure_ascii=False),
+        "top": signature[:200],
+        "levers": json.dumps(robust, ensure_ascii=False),
+        "detail": json.dumps({"by_scenario": per_scenario, "calibration": receipt["calibration"],
+                              "self_check": {n: (r or {}).get("self_check")
+                                             for n, r in (verdict.get("by_scenario") or {}).items()},
+                              "note": TRADEOFF_NOTE}, ensure_ascii=False),
+        "source": "virtual_run_tradeoff",
+    })
+    await db.commit()
+    receipt["card_written"] = True
+
+    # 推荐变了 = 一条建议待办；旧的那条要收掉（同一个问题不留两条互相矛盾的建议）
+    from api.services.followup_task_service import create_task
+    superseded = (await db.execute(text("""
+        UPDATE followup_tasks SET status = 'cancelled', updated_at = NOW(),
+               block_reason = COALESCE(block_reason, '') || ' ｜ 已被更新的推演推荐取代'
+        WHERE factory_id = :fid AND status NOT IN ('done', 'cancelled')
+          AND payload->>'category' = 'simulation_recommendation'
+    """), {"fid": factory_id})).rowcount
+    rec = robust.get("policy")
+    if rec:
+        per = {n: ((r or {}).get("recommended") or {}).get("name")
+               for n, r in (verdict.get("by_scenario") or {}).items()}
+        objs = (best or {}).get("objectives") or {}
+        created = await create_task(
+            db, factory_id, "virtual_factory",
+            f"推演推荐｜{rec}（好天~暴雨都不误期，代价 ${float(objs.get('expedite_cost_usd') or 0) + float(objs.get('line_activation_cost_usd') or 0):,.0f}）"[:200],
+            description=(
+                f"政策×天气扫描（{len(per)} 个天气场景 × {scan['policies_tried']} 个政策）的稳健推荐：{rec}。\n"
+                f"各场景推荐：" + "；".join(f"{k}→{v}" for k, v in per.items()) + "\n"
+                f"代价：加急 ${float(objs.get('expedite_cost_usd') or 0):,.0f}"
+                f" + 开并联线 ${float(objs.get('line_activation_cost_usd') or 0):,.0f}"
+                f" + 人工 ${float(objs.get('labor_cost_usd') or 0):,.0f}；"
+                f"等料空档 {float(objs.get('standby_person_days') or 0):,.0f} 人日。\n"
+                f"选择规则：{verdict.get('selection_rule')}\n"
+                f"（不是'分最高'：交期与产量是硬约束，其余维度取最小最大后悔，避免为刷一个维度牺牲另一维。）\n"
+                f"场景标定：" + "；".join(f"{c[0]} {c[1]}台/{c[2]}天" for c in receipt["calibration"])),
+            agent_key="pmc_agent", item_type="followup", source="virtual_factory",
+            block_reason="推演建议，采纳与否看厂里的取舍；不自动改排产与采购",
+            conversation_hint="采纳的话：把这个瓶颈件的到货目标日压到推荐值，并确认并联线/班组是否可用。",
+            payload=json.dumps({"category": "simulation_recommendation", "policy": rec,
+                                "per_scenario": per, "objectives": objs,
+                                "robust_why": robust.get("why")}, ensure_ascii=False),
+            follow_interval_minutes=24 * 60)
+        if created.get("task_id"):
+            await db.execute(text("""
+                UPDATE followup_tasks SET next_follow_at = NOW() + INTERVAL '10 minutes'
+                WHERE id = :id"""), {"id": str(created["task_id"])})
+            await db.commit()
+        receipt["recommendation_task"] = {"task_id": created.get("task_id"),
+                                          "superseded": int(superseded or 0)}
+    return receipt
+
+
 async def run_once(db: AsyncSession, factory_id: str, *, apply: bool = True,
-                   models: Optional[list] = None, attendance_factor: Optional[float] = None) -> Dict[str, Any]:
-    """跑一轮推演（含四个杠杆对比）并记账。"""
+                   models: Optional[list] = None, attendance_factor: Optional[float] = None,
+                   with_tradeoff: bool = True) -> Dict[str, Any]:
+    """跑一轮推演（政策×天气的权衡扫描 + 记分卡落库）。"""
     from api.services.attendance_model import attendance_factor as attend_of
     from api.services.portfolio_sim import simulate
 
