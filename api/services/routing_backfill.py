@@ -41,6 +41,7 @@ from api.services.line_strategy_advisor import advise_line_strategy
 from api.services.time_basis import time_basis_review
 from api.services.data_authority import data_authority_report
 from api.services.partial_kit import report_partial_kit_splits
+from api.services.portfolio_flywheel import run_once as run_portfolio_cycle
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
 from api.services.aps_draft_prune import (
@@ -131,6 +132,9 @@ COMPONENT_BATCH = max(1, int(os.getenv("ROUTING_BACKFILL_WOS_PER_TICK", "2")))
 # 例行 BOM 自检的范围（只读，扫几颗机种；心跳一行，不写业务表）
 QUALITY_MODELS_PER_TICK = max(1, int(os.getenv("BOM_QUALITY_MODELS_PER_TICK", "2")))
 QUALITY_FACTORY_ID = os.getenv("BOM_QUALITY_FACTORY_ID", "FAC_MECH_001")
+
+# 记分卡要不要落库、瓶颈待办要不要发（默认开：只写我们自己那张推演读数表）
+PORTFOLIO_FLYWHEEL_APPLY = os.getenv("PORTFOLIO_FLYWHEEL_APPLY", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 # 无人排产按哪个目标占产能。词汇与 cost_model.OBJECTIVES 一致：
 # labor_first / delivery_first / total_cost / balanced。目标是一个参数，不是引擎的偏好，
@@ -422,6 +426,9 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     # 数据源台账：仿真每一维今天到底有没有真值（IE 工时 / 考勤 / 设备 / 排产 / 齐套），
     # 以及哪些数是我们自己灌的、不能当现场证据。只读，不改任何表。
     receipt["data_authority"] = await data_authority_report(db, QUALITY_FACTORY_ID)
+    # 飞轮那一圈：组合推演打分 → 记分卡落库 → 瓶颈换了就开一条待办（同瓶颈不重复催）。
+    receipt["portfolio_scorecard"] = await run_portfolio_cycle(
+        db, QUALITY_FACTORY_ID, apply=PORTFOLIO_FLYWHEEL_APPLY)
     if isinstance(receipt.get("plan_commit"), dict):
         # 就绪门的读数旁边挂上同一份口径：压着的单里有多少其实能先开一批。
         receipt["plan_commit"]["partial_option"] = {

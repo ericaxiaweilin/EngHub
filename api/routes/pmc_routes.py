@@ -465,6 +465,24 @@ async def get_fake_output_revert(
     return report
 
 
+@router.get("/portfolio-flywheel", summary="跑一轮组合推演并记记分卡（默认只算不写）")
+async def get_portfolio_flywheel(
+    factory_id: str = Query(..., description="厂区"),
+    apply: bool = Query(False, description="false=只算不写卡不发待办"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """引擎每 15 分钟自己会跑这一圈；这个端点用于当下看一轮的结果与它会写什么。
+
+    写的是 `simulation_scorecards`（我方推演读数）和一条瓶颈待办，不动任何事实表。
+    去重规则：同一天同瓶颈且分数没实质变化就不写第二张卡；同一瓶颈只留一条未关闭待办。
+    """
+    del current_user
+    from api.services.portfolio_flywheel import run_once
+
+    return await run_once(db, factory_id, apply=apply)
+
+
 @router.post("/portfolio-sim", summary="机种组合推演（只读）：货期 · 人力利用 · 评分 · 杠杆")
 async def post_portfolio_sim(
     body: Dict[str, Any] = Body(..., description="factory_id, models?, n?, units?, due_in_days?, levers?"),
