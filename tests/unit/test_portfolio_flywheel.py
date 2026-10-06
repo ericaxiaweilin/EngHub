@@ -123,13 +123,22 @@ async def test_same_bottleneck_already_open_does_not_spam_tasks():
 
 
 @pytest.mark.asyncio
-async def test_unchanged_bottleneck_writes_no_task_even_when_score_moves():
+async def test_bottleneck_is_reopened_after_someone_closes_the_task():
+    """待办被关掉不等于瓶颈解决了：没有未关闭待办时，同一个瓶颈要能再次发出来。"""
+    import api.services.followup_task_service as fts
     db = _FakeDB(last={"portfolio_score": 26.2, "top_constraint": "算不出货期",
                        "engine_date": (datetime.utcnow() - timedelta(days=1)).date(),
-                       "created_at": None})
+                       "created_at": None}, open_tasks=[])
+    monkeypatch = pytest.MonkeyPatch()
+
+    async def fake_create_task(db_, factory_id, created_by, title, **kw):
+        return {"task_id": "t-reopen"}
+
+    monkeypatch.setattr(fts, "create_task", fake_create_task)
     out = await pf.record_cycle(db, _sim(score=62.2), factory_id="FAC_MECH_001", trials={}, apply=True)
-    assert out["card_written"] is True                    # 分数大涨要留痕
-    assert out["task"]["action"] == "bottleneck_unchanged"  # 但瓶颈没换就不发新待办
+    assert out["card_written"] is True
+    assert out["task"]["action"] == "opened"
+    monkeypatch.undo()
 
 
 @pytest.mark.asyncio

@@ -114,7 +114,8 @@ async def record_cycle(db: AsyncSession, sim: Dict[str, Any], *, factory_id: str
     else:
         receipt["skipped_reason"] = "apply=false，只算不写"
 
-    # 瓶颈没换就不开新待办：同一件事每 15 分钟催一次，接收的人会直接忽略它
+    # 判据是"这个瓶颈当前有没有未关闭的待办"，不是"瓶颈有没有换"：
+    # 只看变化会留一个洞 —— 待办被人关掉之后，同一个瓶颈再出现就再也发不出来了。
     open_tasks = [dict(r) for r in (await db.execute(
         OPEN_TASK_SQL, {"fid": factory_id, "cat": CATEGORY})).mappings().all()]
     same_open = next((t for t in open_tasks if str(t.get("slot_constraint") or "") == constraint), None)
@@ -122,10 +123,6 @@ async def record_cycle(db: AsyncSession, sim: Dict[str, Any], *, factory_id: str
     if same_open:
         receipt["task"] = {"action": "same_bottleneck_already_open", "task_id": same_open["id"]}
         return receipt
-    if last is not None and str(last.get("top_constraint") or "") == constraint:
-        receipt["task"] = {"action": "bottleneck_unchanged", "skip": True}
-        return receipt
-
     orders = sim.get("orders") or []
     stuck = [o for o in orders if str(o.get("binding_constraint") or "") == constraint]
     levers = _lever_deltas(trials or {})
@@ -155,6 +152,13 @@ async def record_cycle(db: AsyncSession, sim: Dict[str, Any], *, factory_id: str
                             "lever_deltas": levers}, ensure_ascii=False),
         follow_interval_minutes=24 * 60,
     )
+    # 收件箱按"下次跟进"排序且只渲染前 10 行：按 24 小时挂会沉到看不见的位置（升级单踩过同一个坑）
+    if created.get("task_id"):
+        await db.execute(text("""
+            UPDATE followup_tasks SET next_follow_at = NOW() + INTERVAL '10 minutes'
+            WHERE id = :id
+        """), {"id": str(created["task_id"])})
+        await db.commit()
     receipt["task"] = {"action": "opened", "task_id": created.get("task_id"), "title": title}
     return receipt
 
