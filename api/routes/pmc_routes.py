@@ -21,6 +21,7 @@ from api.services.chain_convergence import report as convergence_report
 from api.services.idle_capacity import idle_capacity_report
 from api.services.option_simulator import compare_options
 from api.services.time_basis import time_basis_audit
+from api.services.partial_kit import partial_kit_opportunities
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
 
@@ -337,11 +338,33 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/production-options", "mode": "read_only"},
             {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
              "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
+            {"key": "partial_kit", "name": "部分齐投产机会（还能先开几台，只读）",
+             "path": "/api/v1/pmc/partial-kit", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
                 "APS 逐单就绪门同样默认只预演，要机器自己放行得显式打开 PLAN_COMMIT_APPLY。",
     }
+
+
+@router.get("/partial-kit", summary="部分齐投产机会（只读：还能先开几台）")
+async def get_partial_kit(
+    factory_id: str = Query(..., description="厂区"),
+    min_units: int = Query(1, description="至少能先开几台才报，默认 1"),
+    limit: int = Query(20, description="最多报几张单"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """一张单被一种料压住时，别的料可能已经够先开一批 —— 这里按台账算出台数。
+
+    口径：能开几台 = 各领料行 (可用量 ÷ 单件用量) 取最小，封顶在"这张单还欠几台"。
+    单件用量取 领料行毛需求 ÷ 计划台数；主档 qty_per_unit 只有 49/4110 行有值，
+    不做主依据，但对不上的行数和单数会一起报出来（per_unit_conflicts）。
+
+    只读：引擎不改 planned_qty、不自动拆单 —— 拆多少要看车间临时腾不腾得出人力和工位。
+    """
+    del current_user
+    return await partial_kit_opportunities(db, factory_id, min_units=min_units, limit=limit)
 
 
 @router.get("/bom-quality", summary="BOM 数据质量自检（只读，按影响缺口排序）")

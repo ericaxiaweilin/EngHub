@@ -39,6 +39,7 @@ from api.services.component_release import release_kitted_child_orders
 from api.services.purchase_receipts import receive_due_purchase_orders
 from api.services.line_strategy_advisor import advise_line_strategy
 from api.services.time_basis import time_basis_review
+from api.services.partial_kit import report_partial_kit_splits
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
 from api.services.aps_draft_prune import (
@@ -414,6 +415,17 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
         db, QUALITY_FACTORY_ID, limit=MATERIAL_CHASE_LIMIT, apply=True)
     # 停在哪条线更贵、能不能挪过去：把线组比较发成 PMC 待办（有差额才发，一组一条）
     receipt["line_strategy"] = await advise_line_strategy(db, QUALITY_FACTORY_ID)
+    # 料没齐不等于停工：算出"这张单现在还能先开几台"，发成分批待办（不自动拆单）。
+    partial = await report_partial_kit_splits(db, QUALITY_FACTORY_ID)
+    receipt["partial_kit"] = partial
+    if isinstance(receipt.get("plan_commit"), dict):
+        # 就绪门的读数旁边挂上同一份口径：压着的单里有多少其实能先开一批。
+        receipt["plan_commit"]["partial_option"] = {
+            "orders": partial.get("orders_with_partial_option"),
+            "units_startable_now": partial.get("units_startable_now"),
+            "units_still_waiting": partial.get("units_still_waiting"),
+            "tasks_created": partial.get("tasks_created"),
+        }
     # 最后一格是自我核对：这一轮工厂到底有没有往前走。
     # 上一轮的读数就从这条心跳自己那一行里读，所以这是"逐轮对撞"而不是每次从零开始看。
     receipt["convergence"] = await convergence_report(
