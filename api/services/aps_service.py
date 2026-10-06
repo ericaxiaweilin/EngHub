@@ -527,6 +527,8 @@ class ApsService:
 
         product_routings: Dict[str, List[Dict]] = {}
         unrouted_orders: List[str] = []
+        # 有路线但一道工序工时都没有的单：不进排程，理由要和"没路线"分开点名
+        no_hours_orders: List[str] = []
         # 单件工时必须有名有姓：工步自己声明 > 厂里声明的线产能 > 工位主档产能，
         # 三条都给不出就记 no_time_basis，绝不回落到"5 分钟换型"那种编的数。
         time_basis = await load_time_basis(self.db, factory_id)
@@ -608,13 +610,30 @@ class ApsService:
                         step_basis[f"{wo.product_id}|{sequence}"] = used
                     product_routings[wo.product_id] = json_ops
 
-            # 如果产品有工艺路线，加载到排程器
-
+            # 如果产品有工艺路线，加载到排程器。
+            # 但"有路线"不等于"有工时"：一条路线里如果每道工序都没有 IE 给的单件工时，
+            # 就不许进排程 —— 以前它们会落到"0 秒/件 + 300 秒换型"的兜底，
+            # 账面排满、交期看着宽裕，车间实际拿到的是假时间。
             if wo.product_id in product_routings:
-
-                scheduler.load_process_constraints(wo.product_id, product_routings[wo.product_id])
+                ops = product_routings[wo.product_id]
+                has_ie_hours = any(
+                    step_basis.get(f"{wo.product_id}|{op.get('sequence')}") not in (None, BASIS_NONE)
+                    for op in ops
+                )
+                if has_ie_hours:
+                    scheduler.load_process_constraints(wo.product_id, ops)
+                else:
+                    no_hours_orders.append(str(wo.id))
             else:
                 unrouted_orders.append(str(wo.id))
+
+        products_with_ie_hours = {
+            key.split("|", 1)[0] for key, used in step_basis.items() if used != BASIS_NONE
+        }
+        no_hours_products = sorted({
+            str(wo.product_id) for wo in work_orders
+            if wo.product_id in product_routings and str(wo.product_id) not in products_with_ie_hours
+        })
 
         # 3. 加载资源约束（设备/工位、真实产能、班次和假期）
 
@@ -950,13 +969,24 @@ class ApsService:
                 )
 
         if unrouted_orders:
-            result.unscheduled_orders = list(dict.fromkeys(result.unscheduled_orders + unrouted_orders))
+            result.unscheduled_orders = list(dict.fromkeys(
+                result.unscheduled_orders + unrouted_orders + no_hours_orders
+            ))
             result.constraint_violations.extend(
                 {"order_id": wo_id, "reason": "工单没有可用工艺路线"}
                 for wo_id in unrouted_orders
             )
+            result.constraint_violations.extend(
+                {"order_id": wo_id, "reason": "路线里没有任何 IE 给的单件工时（也没落到声明过产能的线上）："
+                                             "不给它编预计时间，等 IE 量过再排"}
+                for wo_id in no_hours_orders
+            )
             result.success = False
-            result.message = f"有 {len(unrouted_orders)} 个工单缺少可用工艺路线"
+            result.message = (
+                f"有 {len(unrouted_orders)} 个工单缺少可用工艺路线"
+                + (f"；{len(no_hours_orders)} 个工单有路线但没有 IE 工时、暂不排时"
+                   if no_hours_orders else "")
+            )
 
         # 生成可解释结果：把“算法跑完”拆成输入、排入、未排和约束原因，供前端审阅。
         work_order_map = {str(wo.id): wo for wo in work_orders}
@@ -1037,6 +1067,8 @@ class ApsService:
             "total_orders": len(work_orders),
             "routable_orders": len(work_orders) - len(unrouted_orders),
             "skipped_orders": len(unrouted_orders),
+            "orders_without_ie_hours": len(no_hours_orders),
+            "products_without_ie_hours": len(no_hours_products),
             "scheduled_orders": len(scheduled_order_ids),
             "unscheduled_orders": len(result.unscheduled_orders),
             "scheduled_tasks": len(result.schedule),

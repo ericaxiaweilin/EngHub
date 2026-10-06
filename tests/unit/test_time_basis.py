@@ -66,16 +66,19 @@ def test_precedence_route_then_line_then_station():
     takt = 11 * 3600 / 300
     assert (used, round(seconds, 3)) == (BASIS_LINE, round(takt, 3))
 
-    # 机种没有归属线、工步没声明工时 → 才轮到工位主档
+    # 机种没有归属线、工步也没 IE 工时 → 工位那列**不再补位**（单位未定义，10-06 定）
     seconds, used = basis.seconds_per_piece(model="A-99-XX", station="ST-HJ-01", step={})
-    assert (used, seconds) == (BASIS_STATION, 900.0)
+    assert (used, seconds) == (BASIS_NONE, None)
+    # 但工位值仍然是对撞报告的证据
+    assert basis.bottleneck_rate(["ST-HJ-01", "ST-ZL-01"]) == 4.0
 
 
-def test_no_evidence_anywhere_yields_no_time_basis():
+def test_ie_hours_and_line_params_are_the_only_two_sources():
+    """两个来源都不成立就是 no_time_basis —— 工位那列未定义单位的数不许补位。"""
     basis = _basis()
-    seconds, used = basis.seconds_per_piece(model="A-99-XX", station="ST-UNKNOWN", step={})
-    assert seconds is None
-    assert used == BASIS_NONE
+    assert basis.seconds_per_piece(model="A-99-XX", station="ST-HJ-01", step={})[1] == BASIS_NONE
+    # 归属线仍然给时长（参考级：用户口述）
+    assert basis.seconds_per_piece(model="A-50-04-F", station="ST-HJ-01", step={})[1] == BASIS_LINE
 
 
 def test_home_line_wins_over_a_faster_line_that_could_also_make_it():

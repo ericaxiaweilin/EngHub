@@ -23,7 +23,7 @@ from sqlalchemy import text
 
 BASIS_ROUTE = "route_declared_hours"
 BASIS_LINE = "declared_line_capacity"
-BASIS_STATION = "station_declared_rate"
+BASIS_STATION = "station_declared_rate"  # 已不作工时来源；仅保留给产能对撞报告标注
 BASIS_NONE = "no_time_basis"
 
 # 线产能与工位瓶颈对撞到这个倍数以外就点名报冲突：同一厂区里
@@ -145,15 +145,19 @@ class TimeBasis:
     def seconds_per_piece(
         self, *, model: Optional[str], station: Optional[str], step: Optional[Dict[str, Any]] = None
     ) -> Tuple[Optional[float], str]:
+        """这一道工序每件几秒 —— 只认 IE 给的工时和厂里声明的线产能。
+
+        `stations.capacity_per_hour` 现在**不再当工时来源**（用户 10-06 定口径：IE/HR 为准）：
+        那一列单位没人定义过，28 个工位、15 个不同取值，同一行焊接能读成
+        22 / 44 / 924 / 2,400 台/天，跨 100 倍。它只留下做产能对撞的证据（bottleneck_rate），
+        谁拿它算过时长，读数里就该看不见它。
+        """
         declared = declared_step_seconds(step) if step else None
         if declared:
             return declared, BASIS_ROUTE
         line = self.line_by_model.get(str(model)) if model else None
         if line:
             return float(line["seconds_per_piece"]), BASIS_LINE
-        seconds = seconds_from_hourly_rate(self.station_rates.get(str(station))) if station else None
-        if seconds:
-            return seconds, BASIS_STATION
         return None, BASIS_NONE
 
     def bottleneck_rate(self, stations: List[str]) -> Optional[float]:

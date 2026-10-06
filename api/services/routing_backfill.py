@@ -39,6 +39,7 @@ from api.services.component_release import release_kitted_child_orders
 from api.services.purchase_receipts import receive_due_purchase_orders
 from api.services.line_strategy_advisor import advise_line_strategy
 from api.services.time_basis import time_basis_review
+from api.services.data_authority import data_authority_report
 from api.services.partial_kit import report_partial_kit_splits
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
@@ -418,6 +419,9 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     # 料没齐不等于停工：算出"这张单现在还能先开几台"，发成分批待办（不自动拆单）。
     partial = await report_partial_kit_splits(db, QUALITY_FACTORY_ID)
     receipt["partial_kit"] = partial
+    # 数据源台账：仿真每一维今天到底有没有真值（IE 工时 / 考勤 / 设备 / 排产 / 齐套），
+    # 以及哪些数是我们自己灌的、不能当现场证据。只读，不改任何表。
+    receipt["data_authority"] = await data_authority_report(db, QUALITY_FACTORY_ID)
     if isinstance(receipt.get("plan_commit"), dict):
         # 就绪门的读数旁边挂上同一份口径：压着的单里有多少其实能先开一批。
         receipt["plan_commit"]["partial_option"] = {

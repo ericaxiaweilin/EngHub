@@ -21,6 +21,7 @@ from api.services.chain_convergence import report as convergence_report
 from api.services.idle_capacity import idle_capacity_report
 from api.services.option_simulator import compare_options
 from api.services.time_basis import time_basis_audit
+from api.services.data_authority import data_authority_report
 from api.services.partial_kit import partial_kit_opportunities
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
@@ -340,11 +341,32 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
             {"key": "partial_kit", "name": "部分齐投产机会（还能先开几台，只读）",
              "path": "/api/v1/pmc/partial-kit", "mode": "read_only"},
+            {"key": "data_authority", "name": "仿真输入数据源台账（IE/HR/考勤/设备/排产/齐套）",
+             "path": "/api/v1/pmc/data-authority", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
                 "APS 逐单就绪门同样默认只预演，要机器自己放行得显式打开 PLAN_COMMIT_APPLY。",
     }
+
+
+@router.get("/data-authority", summary="仿真输入的数据源台账（只读）")
+async def get_data_authority(
+    factory_id: str = Query(..., description="厂区"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """每一维仿真输入只认一个权威出处：IE 工时、HR 人力、考勤、设备状况、生效排产、物料齐套。
+
+    用户 10-06 定的口径：**IE 数据 + HR 人力数据为准**，口述的线产能降为参考；
+    仿真由"今天多少人出勤 · 设备状况 · 排产计划 · 物料齐套"共同维持。
+    所以这里逐维报：表里有多少行、今天有没有值、是不是我们自己灌的种子数据。
+
+    三条"不能当证据"的读数也是这接口给的：工位每小时产能（单位没人定义过）、
+    物料批量提前期（3 万行只有 11 个不同值）、虚拟工厂自写报工（1,005/1,017 行）。
+    """
+    del current_user
+    return await data_authority_report(db, factory_id)
 
 
 @router.get("/partial-kit", summary="部分齐投产机会（只读：还能先开几台）")
