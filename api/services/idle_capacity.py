@@ -177,7 +177,8 @@ def _station_people(name: str, code: str, rows: List[Any],
         return out
     for r in rows:
         if str(r["station"] or "") in wanted:
-            out[str(r["position"] or "(未写岗位)")] =                 out.get(str(r["position"] or "(未写岗位)"), 0) + int(r["people"] or 0)
+            role = str(r["position"] or "(未写岗位)")
+            out[role] = out.get(role, 0) + int(r["people"] or 0)
     return out
 
 
