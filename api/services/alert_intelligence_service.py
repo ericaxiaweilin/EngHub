@@ -449,7 +449,9 @@ async def patrol(
     # 6. 环境异常（公共气象 API 检测高温/高湿/大风）
     try:
         import httpx
-        lat, lon = 10.8231, 106.6297  # 默认胡志明市工业区
+        # 坐标与"预计出勤"共用一条基线（默认北宁省）。原来这里写死胡志明市，
+        # 跟厂址差着上千公里 —— 同一个厂不可能一边下雨一边晴。
+        from api.services.attendance_model import FACTORY_LAT as lat, FACTORY_LON as lon
         url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"

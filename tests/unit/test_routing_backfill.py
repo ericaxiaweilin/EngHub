@@ -68,14 +68,14 @@ def _stub_tail(monkeypatch):
     """把链条后半段"要读真库"的步骤换成明说被跳过的桩。
 
     本文件守的是路线回填的两条边界（只补排不动的工单、套不上要说清原因）。
-    后半段（BOM 体检、工时口径、排程、草案回收、催料、线组比较、自我核对）读的是
+    后半段（BOM 体检、工时口径、数据源台账、排程、草案回收、催料、线组比较、自我核对）读的是
     工单/路线/产能/草案这些真表行，桩喂不出可信结果 —— 让它们进测试只会红在
     和被测行为无关的地方。桩返回值写 skipped_in_test，心跳里一眼看得出是没跑。
     """
     async def _skip(db, *args, **kwargs):
         return {"status": "skipped_in_test", "reason": "这一步要读真实库，本测试不覆盖"}
 
-    for name in ("scan_plant", "time_basis_review", "commit_plan_ready",
+    for name in ("scan_plant", "time_basis_review", "data_authority_report", "commit_plan_ready",
                  "prune_superseded_drafts", "chase_material_shortages",
                  "advise_line_strategy", "convergence_report"):
         monkeypatch.setattr(rb, name, _skip)
