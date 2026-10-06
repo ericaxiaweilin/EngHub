@@ -306,3 +306,64 @@ def test_batch_actions_survive_for_every_model():
     assert {a["model_code"] for a in first} == {"M-1", "M-2"}
     gaps = [a for a in acts if a["type"] == "master_data_gap"]      # 同一个缺口跨台单要合并
     assert len(gaps) == 1 and sorted(gaps[0]["models"]) == ["M-1", "M-2"]
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
+class _FakeDB:
+    def __init__(self, rows):
+        self.rows = rows
+        self.params = []
+
+    async def execute(self, sql, params=None):
+        self.params.append(params or {})
+        return _FakeResult(self.rows)
+
+
+@pytest.mark.asyncio
+async def test_followthrough_uses_ledger_evidence_not_hope():
+    """建议有没有落地只看两处台账：主档提前期压没压、这阵子有没有对该料号开过采购单。"""
+    rows = [{"material_code": "RM-A", "lead_now": 10, "default_supplier": "VN-1", "pos_since": 0},
+            {"material_code": "RM-B", "lead_now": 20, "default_supplier": "VN-2", "pos_since": 0},
+            {"material_code": "RM-C", "lead_now": 20, "default_supplier": "VN-3", "pos_since": 2}]
+    db = _FakeDB(rows)
+    acts = [{"type": "expedite_purchase", "material_code": c, "target_lead_days": 10}
+            for c in ("RM-A", "RM-B", "RM-C")]
+    out = await vr.recommendation_followthrough(db, "FAC_MECH_001", acts)
+    assert out["checked"] == 3
+    assert {a["material_code"] for a in out["adopted"]} == {"RM-A", "RM-C"}
+    assert {n["material_code"] for n in out["not_acted"]} == {"RM-B"}
+    assert "部分落地" in out["verdict"]
+    assert "materials.lead_time_days" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_supplier_gap_is_rechecked_against_the_master_row():
+    rows = [{"material_code": "RM-D", "lead_now": None, "default_supplier": None, "pos_since": 0},
+            {"material_code": "RM-E", "lead_now": None, "default_supplier": "VN-9", "pos_since": 0}]
+    db = _FakeDB(rows)
+    out = await vr.recommendation_followthrough(
+        db, "FAC_MECH_001",
+        [{"type": "supplier_master_missing", "material_code": "RM-D"},
+         {"type": "supplier_master_missing", "material_code": "RM-E"},
+         {"type": "supplier_master_missing", "material_code": "RM-GONE"}])
+    assert {a["material_code"] for a in out["adopted"]} == {"RM-E"}
+    assert {n["material_code"] for n in out["not_acted"]} == {"RM-D"}
+    assert out["no_master_row"] == ["RM-GONE"]      # 主档里没有这行就说没有，不算"已补齐"
+
+
+@pytest.mark.asyncio
+async def test_followthrough_without_named_part_says_so():
+    db = _FakeDB([])
+    out = await vr.recommendation_followthrough(
+        db, "FAC_MECH_001", [{"type": "start_first_batch", "model_code": "M-1"}])
+    assert out["checked"] == 0 and out["adopted"] == [] and out["not_acted"] == []

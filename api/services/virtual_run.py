@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
@@ -532,6 +532,67 @@ def _tune_one(cal: Dict[str, float], disc: Dict[str, Any]) -> Optional[str]:
             return (f"可行解只有 {disc['feasible']} 个/目标维度全平 → "
                     f"批量降到 {cal['days_of_output']:g} 天线产量，找中间地带")
     return None
+
+
+FOLLOWTHROUGH_SQL = text("""
+    SELECT m.material_code, m.lead_time_days AS lead_now, m.default_supplier,
+           (SELECT COUNT(*) FROM purchase_orders po
+             WHERE po.factory_id = :fid AND po.material_code = m.material_code
+               AND po.created_at >= CAST(:since AS timestamp)) AS pos_since
+    FROM materials m
+    WHERE m.factory_id = :fid AND m.material_code = ANY(CAST(:codes AS text[]))
+""")
+
+
+async def recommendation_followthrough(db: AsyncSession, factory_id: str,
+                                       actions: List[Dict[str, Any]],
+                                       *, since: Optional[datetime] = None) -> Dict[str, Any]:
+    """上一轮建议的动作到底做没做 —— 引擎得能发现自己是不是一直在对空气提建议。
+
+    只看台账里已有的证据：物料主档的提前期压到建议值没有、这段时间对这个料号开过采购单没有、
+    缺供应商的料号补齐没有。查不到证据就说查不到，不猜"可能口头催过了"。
+    """
+    wanted = [a for a in (actions or []) if a.get("material_code")]
+    codes = sorted({str(a["material_code"]) for a in wanted})
+    if not codes:
+        return {"checked": 0, "adopted": [], "not_acted": [],
+                "note": "本轮建议没点名到料号，无复查对象"}
+    until = since or (datetime.utcnow() - timedelta(days=7))
+    if getattr(until, "tzinfo", None) is not None:
+        until = until.replace(tzinfo=None)
+    rows = (await db.execute(FOLLOWTHROUGH_SQL,
+                             {"fid": factory_id, "codes": codes, "since": until})).mappings().all()
+    by_code = {str(r["material_code"]): dict(r) for r in rows}
+    adopted: List[Dict[str, Any]] = []
+    not_acted: List[Dict[str, Any]] = []
+    no_master: List[str] = []
+    for a in wanted:
+        code = str(a["material_code"])
+        row = by_code.get(code)
+        if row is None:
+            no_master.append(code)
+            continue
+        lead_now = row.get("lead_now")
+        target = int(a.get("target_lead_days") or 0)
+        pos = int(row.get("pos_since") or 0)
+        if str(a.get("type")) == "supplier_master_missing":
+            item = {"material_code": code, "check": "补供应商",
+                    "default_supplier": row.get("default_supplier")}
+            (adopted if row.get("default_supplier") else not_acted).append(item)
+            continue
+        pressed = lead_now is not None and target and int(lead_now) <= target
+        (adopted if (pressed or pos > 0) else not_acted).append(
+            {"material_code": code,
+             "check": f"提前期压到 {target} 天或已开采购单",
+             "lead_now": lead_now, "lead_target": target, "purchase_orders_since": pos})
+    verdict = ("建议有下落：提前期已压缩或已开采购单" if adopted and not not_acted else
+               ("建议还没落地：主档提前期没变，也没查到新采购单" if not_acted and not adopted else
+                "部分落地：见明细，未落地的部分继续挂在建议里"))
+    return {"checked": len(wanted), "adopted": adopted, "not_acted": not_acted,
+            "no_master_row": sorted(set(no_master)), "since": str(until),
+            "verdict": verdict,
+            "note": ("复查只看台账证据（materials.lead_time_days、purchase_orders.created_at），"
+                     "没有证据就报没证据，不猜有没有人口头催过")}
 
 
 # 动作排序：先"今天就能下单/开工"的，再"要人去确认"的，最后是主数据缺口。

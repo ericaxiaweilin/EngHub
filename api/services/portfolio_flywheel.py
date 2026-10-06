@@ -48,7 +48,8 @@ CAL_SQL = text("""
 
 LAST_SQL = text("""
     SELECT portfolio_score, top_constraint, engine_date, created_at,
-           (detail->'calibration_by_scenario')::text AS calibration
+           (detail->'calibration_by_scenario')::text AS calibration,
+           (detail->'actions')::text AS actions
     FROM simulation_scorecards WHERE factory_id = :fid
     ORDER BY created_at DESC LIMIT 1
 """)
@@ -73,7 +74,7 @@ def _gen_id() -> str:
 
 
 def tradeoff_signature(policy: Optional[str], sig_view: Dict[str, Any],
-                       action_sig: List[str]) -> Tuple[str, str]:
+                       action_sig: List[str], follow_state: str = "ft:none") -> Tuple[str, str]:
     """记分卡的"变没变"指纹：短到能进列，又不能把有意义的变化截掉。
 
     之前直接 [:200] 截断，而场景计数那段本身就超 200 字 —— 后面的动作清单被切没了，
@@ -81,7 +82,7 @@ def tradeoff_signature(policy: Optional[str], sig_view: Dict[str, Any],
     返回 (入库用的短指纹, 可复核的完整指纹)。
     """
     full = (f"{policy}|{json.dumps(sig_view, ensure_ascii=False, sort_keys=True)}"
-            f"|{','.join(action_sig)}")
+            f"|{','.join(action_sig)}|{follow_state}")
     short = f"{(policy or '')[:60]}|{hashlib.sha1(full.encode('utf-8')).hexdigest()[:12]}"
     return short[:200], full
 
@@ -254,7 +255,21 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     action_sig = sorted({f"{a.get('type')}:"
                          f"{a.get('material_code') or a.get('detail') or a.get('model_code') or ','.join(a.get('models') or [])}"
                          for a in actions})
-    full_signature = tradeoff_signature(robust.get("policy"), sig_view, action_sig)
+    # 上一轮建议的动作做没做 —— 引擎要能发现自己一直对空气提建议
+    from api.services.virtual_run import recommendation_followthrough
+    prev_actions: List[Dict[str, Any]] = []
+    try:
+        prev_actions = json.loads((prev or {}).get("actions") or "[]")
+    except (TypeError, ValueError):
+        prev_actions = []
+    followthrough = (await recommendation_followthrough(
+        db, factory_id, prev_actions, since=(prev or {}).get("created_at"))
+        if prev_actions else None)
+    # 落地状态分三档进签名（没落地/部分/全落地）：有人把提前期压下来就该重算交期换建议；
+    # 不逐条进签名，否则每 15 分钟都被判成"变了"而重写卡与待办
+    ft_state = (f"ft:{len(followthrough.get('adopted') or [])}-of-{followthrough.get('checked')}"
+                if followthrough else "ft:no-named-part")
+    full_signature = tradeoff_signature(robust.get("policy"), sig_view, action_sig, ft_state)
     receipt_signature = full_signature[0]
     signature = receipt_signature
     last = prev      # 同一张上一轮记分卡，热启动标定与变更比较都读它，不查第二遍
@@ -262,6 +277,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     receipt = {"factory_id": factory_id, "apply": apply, "changed": changed,
                "robust_recommendation": robust, "by_scenario": per_scenario,
                "actions": actions, "action_count": len(actions),
+               "followthrough": followthrough or {"checked": 0,
+                                                  "note": "上一张卡没有点名到料号的动作，无复查对象"},
                "scenario_divergence": verdict.get("scenario_divergence"),
                "calibration": [(t.get("model_code"), t.get("units"), t.get("due_in_days"),
                                 t.get("calibration")) for t in (tuned.get("targets") or [])],
@@ -316,6 +333,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                               "calibration": receipt["calibration"],
                               "calibration_by_scenario": tuned.get("calibration_by_scenario") or {},
                               "full_signature": full_signature[1],
+                              "followthrough": followthrough,
                               "tuning": receipt["tuning_trajectory"],
                               "self_check": tuned["final"].get("notes") or [],
                               "note": TRADEOFF_NOTE}, ensure_ascii=False),
@@ -341,6 +359,10 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         per = {n: _rec((r or {}).get("recommended"))
                for n, r in (verdict.get("by_scenario") or {}).items()}
         objs = objectives
+        ft = followthrough or {}
+        ft_line = (f"上一轮建议复查：{ft.get('checked', 0)} 条里 {len(ft.get('adopted') or [])} 条已落地、"
+                   f"{len(ft.get('not_acted') or [])} 条无变化（{ft.get('verdict')}）"
+                   if ft.get("checked") else "")
         act_lines = []
         for a in actions[:8]:
             t = a.get("type")
@@ -376,7 +398,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                 f" + 开并联线 ${float(objs.get('line_activation_cost_usd') or 0):,.0f}"
                 f" + 人工 ${float(objs.get('labor_cost_usd') or 0):,.0f}；"
                 f"等料空档 {float(objs.get('standby_person_days') or 0):,.0f} 人日。\n"
-                f"选择规则：{verdict.get('selection_rule')}\n"
+                + (f"\n{ft_line}\n" if ft_line else "")
+                + f"选择规则：{verdict.get('selection_rule')}\n"
                 f"（不是'分最高'：交期与产量是硬约束，其余维度取最小最大后悔，避免为刷一个维度牺牲另一维。）\n"
                 f"场景标定：" + "；".join(f"{c[0]} {c[1]}台/{c[2]}天" for c in receipt["calibration"])
                 + ("\n动作（都在沙箱里，不写 MES/WMS，也不自动开采购单）：\n"

@@ -163,3 +163,5 @@ def test_signature_detects_a_change_beyond_the_first_200_characters():
     assert len(a[0]) <= 200 and len(b[0]) <= 200
     assert a[0] != b[0]
     assert pf.tradeoff_signature("加急到 10 天", view, ["expedite_purchase:RM-A"])[0] == a[0]
+    # 上一轮建议的落地状态也是"变没变"的一部分：有人压了提前期就得重算交期、换一条建议
+    assert pf.tradeoff_signature("加急到 10 天", view, ["expedite_purchase:RM-A"], "ft:2-of-2")[0] != a[0]
