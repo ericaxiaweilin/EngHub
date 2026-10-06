@@ -232,3 +232,22 @@ async def test_unparsable_detail_does_not_become_a_fake_empty_recommendation():
             "weights": "不是 json", "levers": None, "detail": "{坏数据"}
     out = await pf.latest_tradeoff_state(_ReadDB(card), "FAC_MECH_001")
     assert out["status"] == "ok" and out["actions"] == [] and out["robust_recommendation"] == {}
+
+
+def test_task_key_ignores_the_floats_that_move_every_tick():
+    """待办的"变没变"只看推荐政策、有没有准点、点名到哪些料号。
+
+    前沿宽度与后悔差随台账动，把它们放进待办判据就会每 15 分钟新挂一条又取消上一条 ——
+    人会直接把这个agent的待办全关掉。
+    """
+    acts_a = [{"type": "expedite_purchase", "material_code": "RM-1"},
+              {"type": "start_first_batch", "model_code": "M-1", "units": 18}]
+    acts_b = [{"type": "expedite_purchase", "material_code": "RM-1"},
+              {"type": "start_first_batch", "model_code": "M-1", "units": 999}]
+    assert pf.tradeoff_task_key("加急到 10 天", 3, 3, acts_a) == \
+        pf.tradeoff_task_key("加急到 10 天", 3, 3, acts_b)
+    assert pf.tradeoff_task_key("加急到 10 天", 0, 3, acts_a) != \
+        pf.tradeoff_task_key("加急到 10 天", 3, 3, acts_a)
+    assert pf.tradeoff_task_key("加急到 10 天", 3, 3, [{"type": "expedite_purchase",
+                                                       "material_code": "RM-2"}]) != \
+        pf.tradeoff_task_key("加急到 10 天", 3, 3, acts_a)

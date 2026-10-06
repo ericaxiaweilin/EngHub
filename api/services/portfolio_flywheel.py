@@ -119,6 +119,14 @@ TRADEOFF_NOTE = (
     "产量不达标的解直接淘汰（否则'干脆不做'永远最优）。")
 
 
+OPEN_REC_SIG_SQL = text("""
+    SELECT id, payload->>'sig_key' AS sig
+    FROM followup_tasks
+    WHERE factory_id = :fid AND payload->>'category' = 'simulation_recommendation'
+      AND status NOT IN ('done', 'cancelled')
+    ORDER BY created_at DESC LIMIT 1
+""")
+
 OPEN_TASK_SQL = text("""
     SELECT id, status, payload->>'constraint' AS slot_constraint
     FROM followup_tasks
@@ -130,6 +138,19 @@ OPEN_TASK_SQL = text("""
 def _gen_id() -> str:
     import uuid
     return str(uuid.uuid4())
+
+
+def tradeoff_task_key(policy: Optional[str], on_time_count: int, scenario_count: int,
+                      actions: List[Dict[str, Any]]) -> str:
+    """待办的"变没变"只看人会据此做决定的三件事：推荐是哪条、有没有准点、点名到哪些料号。
+
+    记分卡的签名比这个细（带前沿宽度、后悔差这些浮点读数，它们随台账动，作历史留痕没问题）；
+    但那几项每天都动，拿来判待办就会每 15 分钟给人新挂一条、把上一条取消掉。
+    """
+    named = sorted({str(a.get("material_code") or a.get("detail") or "")
+                    for a in actions if a.get("material_code") or a.get("detail")})
+    claim = f"ontime:{on_time_count}-of-{scenario_count}" if scenario_count else "ontime:none"
+    return f"{policy or ''}|{claim}|{','.join(x for x in named if x)}"[:200]
 
 
 def tradeoff_signature(policy: Optional[str], sig_view: Dict[str, Any],
@@ -420,8 +441,18 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     await db.commit()
     receipt["card_written"] = True
 
-    # 推荐变了 = 一条建议待办；旧的那条要收掉（同一个问题不留两条互相矛盾的建议）
+    # 推荐变了 = 一条建议待办；旧的那条要收掉（同一个问题不留两条互相矛盾的建议）。
+    # 判"变了"用人看得懂的三件事，不看浮点读数，否则每 15 分钟新挂一条又取消上一条。
     from api.services.followup_task_service import create_task
+    n_on_time_pre = sum(1 for r in (verdict.get("by_scenario") or {}).values()
+                        if not (r or {}).get("no_feasible"))
+    n_scen_pre = max(1, len(per_scenario))
+    task_key = tradeoff_task_key(robust.get("policy"), n_on_time_pre, n_scen_pre, actions)
+    held = (await db.execute(OPEN_REC_SIG_SQL, {"fid": factory_id})).mappings().first()
+    if held and str((held or {}).get("sig") or "") == task_key:
+        receipt["recommendation_task"] = {"action": "unchanged", "task_id": (held or {}).get("id"),
+                                          "task_key": task_key}
+        return receipt
     superseded = (await db.execute(text("""
         UPDATE followup_tasks SET status = 'cancelled', updated_at = NOW(),
                block_reason = COALESCE(block_reason, '') || ' ｜ 已被更新的推演推荐取代'
@@ -439,10 +470,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         objs = objectives
         # 标题里那句"准不准点"必须按数据说：降级比较时一个准点解都没有，
         # 还写着"好天~暴雨都不误期"就是引擎在替人编承诺
-        n_scen = max(1, len(per))
-        n_on_time = sum(1 for r in (verdict.get("by_scenario") or {}).values()
-                        if not (r or {}).get("no_feasible"))
-        claim = (f"{n_on_time}/{n_scen} 个天气场景有准点解" if n_on_time
+        claim = (f"{n_on_time_pre}/{n_scen_pre} 个天气场景有准点解" if n_on_time_pre
                  else "承诺交期下没有准点解，按延误最小排")
         ft = followthrough or {}
         promise_line = (("口径提醒：" + str(verdict.get("conclusion")) + "\n")
@@ -501,7 +529,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                                 "robust_why": robust.get("why"),
                                 "robust_tied_with": robust.get("tied_with") or [],
                                 "scenario_divergence": verdict.get("scenario_divergence"),
-                                "actions": actions[:20]}, ensure_ascii=False),
+                                "actions": actions[:20],
+                                "sig_key": task_key}, ensure_ascii=False),
             follow_interval_minutes=24 * 60)
         if created.get("task_id"):
             await db.execute(text("""
