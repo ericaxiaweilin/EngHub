@@ -251,3 +251,13 @@ def test_task_key_ignores_the_floats_that_move_every_tick():
     assert pf.tradeoff_task_key("加急到 10 天", 3, 3, [{"type": "expedite_purchase",
                                                        "material_code": "RM-2"}]) != \
         pf.tradeoff_task_key("加急到 10 天", 3, 3, acts_a)
+
+
+def test_as_dict_treats_json_null_as_empty_not_as_a_crash():
+    """jsonb->text 可能是字面量 'null'，解析成 None 后不能一路当 dict 用。"""
+    assert pf._as_dict(None) == {}
+    assert pf._as_dict("null") == {}
+    assert pf._as_dict("[1,2]") == {}
+    assert pf._as_dict('{"a": 1}') == {"a": 1}
+    assert pf._as_dict({"a": 1}) == {"a": 1}
+    assert pf._as_dict("坏 json") == {}

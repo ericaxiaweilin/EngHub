@@ -282,11 +282,9 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     # 不再用固定标定：先自调（太松/太紧会自己改批量与交期系数），调稳了才比较。
     # 标定从上一张记分卡热启动：15 分钟一轮，每轮从零重摸一遍既白算也收不敛。
     prev = (await db.execute(LAST_SQL, {"fid": factory_id})).mappings().first()
-    seed: Dict[str, Any] = {}
-    try:
-        seed = json.loads((prev or {}).get("calibration") or "{}")
-    except (TypeError, ValueError):
-        seed = {}
+    # 卡里没存过这项时 jsonb->text 是 "null"，json.loads 会给出 None：
+    # 静默当"没有热启动"就会让每轮都从零重摸标定（我踩过一次，症状是 warm_started 恒 false）
+    seed = _as_dict((prev or {}).get("calibration"))
     tuned = await auto_tune(db, factory_id, models or await default_models(db, factory_id, n=5),
                             rounds=4, calibration=seed)
     verdict = {"by_scenario": {k: v for k, v in (tuned["final"]["per_scenario"] or {}).items()},
