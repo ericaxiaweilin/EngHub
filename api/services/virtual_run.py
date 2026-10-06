@@ -160,6 +160,10 @@ def family_prefix(model: str) -> str:
     return "-".join(parts[:2]) + "-%" if len(parts) >= 3 else f"{model}%"
 
 
+# 系统里唯一的换型数字来自 APS 默认值（300 秒/次）；厂里没有换型台账，所以这是下限而不是实测。
+SIM_CHANGEOVER_HOURS = float(os.getenv("SIM_CHANGEOVER_HOURS", "0.0833"))
+
+
 def pick_line(model: str, lines: List[Dict[str, Any]]) -> tuple:
     """先按声明（can_make_models），再按 default_model，最后按同族前缀归线。返回 (线, 依据)。"""
     for l in lines:
@@ -326,7 +330,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                      cached: Optional[Dict[str, Any]] = None,
                      line_busy_days: float = 0.0, equip_rate: float = 1.0,
                      hours_multiplier: float = 1.0, lead_multiplier: float = 1.0,
-                     stock_multiplier: float = 1.0) -> Dict[str, Any]:
+                     stock_multiplier: float = 1.0, batches: int = 1,
+                     changeover_hours: float = 0.0) -> Dict[str, Any]:
     """把一个目标跑成一条演变时间线。"""
     cache = (cached or {}).get(model)
     if not cache:
@@ -408,9 +413,28 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     finish_date = today + timedelta(days=finish_day) if finish_day is not None else None
     late = (finish_day - (due - today).days) if finish_day is not None else None
 
-    labor_cost = round(run["person_days"] * DEFAULT_LABOR_COST_PER_PERSON_DAY, 2)
+    # 同一张单拆成 k 批投放：总量不变，每多一批就多一次换型（系统里唯一的换型数字是 APS 默认 300 秒）。
+    # 这个模型只算换型工时，不含搬运/清线/再齐套 —— 所以它只能证伪"拆批免费"，不能证明"拆批免费"。
+    extra_releases = max(0, int(batches) - 1)
+    changeover_days = round(extra_releases * (float(changeover_hours) / hours_per_day), 3) \
+        if (changeover_hours and hours_per_day) else 0.0
+    finish_day_out = (round(finish_day + changeover_days) if finish_day is not None else None)
+    finish_date_out = (today + timedelta(days=finish_day_out)) if finish_day_out is not None else None
+    person_days_out = round(run["person_days"] + changeover_days * crew, 1)
+    labor_cost = round(person_days_out * DEFAULT_LABOR_COST_PER_PERSON_DAY, 2)
+    binding_terms = []
+    if arrival >= max(int(line_busy_days), child_days) and arrival > 0:
+        binding_terms.append("material_arrival")
+    if int(line_busy_days) > arrival:
+        binding_terms.append("group_queue")
+    if capacity_binding == "ie_hours":
+        binding_terms.append("work_content_hours")
+    if not binding_terms:
+        binding_terms.append("work_duration")
+
     return {
         "model_code": model, "units": units, "status": "simulated",
+        "binding_terms": binding_terms,
         "route_steps": len(route), "route_basis": route_basis,
         "line": (line or {}).get("line_code"), "line_basis": line_basis,
         "hours_per_unit": hours_per_unit, "hours_basis": hours_basis,
@@ -422,10 +446,14 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "wait_days_for_material": (run_a or {"wait_days": 0})["wait_days"] + run["wait_days"],
         "work_days": run["work_days"],
         "started_on_day": run["started_on_day"],
-        "finish_day": finish_day, "finish_date": str(finish_date) if finish_date else None,
-        "due_date": str(due), "days_late": late,
+        "finish_day": finish_day_out, "finish_date": str(finish_date_out) if finish_date_out is not None else None,
+        "raw_finish_day": finish_day, "raw_finish_date": str(finish_date) if finish_date else None,
+        "batches_released": int(batches), "changeover_days_added": changeover_days,
+        "changeover_hours_per_release": float(changeover_hours),
+        "due_date": str(due),
+        "days_late": ((finish_day_out - (due - today).days) if finish_day_out is not None else None),
         "people_present_avg": round(run["person_days"] / run["work_days"], 1) if run["work_days"] else None,
-        "person_days": run["person_days"],
+        "person_days": person_days_out,
         "idle_person_days_before_start": run["idle_person_days_before_start"],
         "labor_cost_usd": labor_cost,
         "standby_person_days_if_line_held": run["idle_person_days_before_start"],
@@ -1230,8 +1258,14 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                                     or equip.get("rate") or 1.0),
                                    hours_multiplier=float((perturb or {}).get("hours_multiplier", 1.0)),
                                    lead_multiplier=float((perturb or {}).get("lead_multiplier", 1.0)),
-                                   stock_multiplier=float((perturb or {}).get("stock_multiplier", 1.0)))
-            allocated[grp] = busy + float(run.get("work_days") or 0)
+                                   stock_multiplier=float((perturb or {}).get("stock_multiplier", 1.0)),
+                                   batches=int((perturb or {}).get("batches", 1)),
+                                   changeover_hours=float((perturb or {}).get("changeover_hours",
+                                                                              SIM_CHANGEOVER_HOURS)))
+            # 排队要推进到这一台真正做完的那天。只累加 work_days 会让"到货日 > 排队"的那些台
+            # 永远看不到队列 —— 实测 4 台 TREAD 都从第 20 天并行开工 = 同一条线被占用 4 次。
+            allocated[grp] = max(busy, float(run.get("finish_day") or busy),
+                                 busy + float(run.get("work_days") or 0))
             per_run.append({"run": run, "due_day": due_day, "units": float(t.get("units") or 0)})
         # 没有工时依据/没有可归属线的机种不算"厂里做不到"，是模型还代表不了它 —— 缺的是数据。
         # 把它们留在需求量里，每个政策都会卡产量底线，整轮扫描退化成"全都不可行"（实测踩过）。
@@ -1288,9 +1322,18 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         "due_date": x["run"].get("due_date"), "days_late": x["run"].get("days_late"),
                         "status": x["run"].get("status"), "line": x["run"].get("line"),
                         "why": x["run"].get("why"),
+                        "binding_terms": x["run"].get("binding_terms"),
+                        "batches_released": x["run"].get("batches_released"),
+                        "changeover_days_added": x["run"].get("changeover_days_added"),
                         "queue_days_before_this_order": x["run"].get("line_busy_days_before_order"),
                         "capacity_basis": x["run"].get("capacity_basis"),
                         "capacity_binding": x["run"].get("capacity_binding"),
+                        "work_days": x["run"].get("work_days"),
+                        "started_on_day": x["run"].get("started_on_day"),
+                        "earliest_start_day": x["run"].get("earliest_start_day"),
+                        "hours_per_unit": x["run"].get("hours_per_unit"),
+                        "hours_basis": x["run"].get("hours_basis"),
+                        "wait_days_for_material": x["run"].get("wait_days_for_material"),
                         "capacity_line_declared": x["run"].get("capacity_line_declared"),
                         "capacity_hours_implied": x["run"].get("capacity_hours_implied"),
                         "material_arrival_day": x["run"].get("material_arrival_day"),

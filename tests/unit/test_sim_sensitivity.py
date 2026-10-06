@@ -28,6 +28,28 @@ def test_slope_is_local_not_a_global_average():
     assert out["days_per_step"] == 2.0             # 提前期每 +10% → 晚 2 天（下档差值换算成 +方向）
     assert out["on_time_models_per_step"] == -2.0  # 每 +10% → 少 2 台准点
     assert out["money_per_day_saved"] == 500.0
+    # 这条测试曲线是线性的：局部与拟合应当一致，不能虚报"台阶型"
+    assert out["nonlinear"] is False and out["days_per_step_fit"] == 2.0
+
+
+def test_stepwise_curve_is_flagged_so_nobody_extrapolates_it():
+    """提前期那类曲线是台阶：压到跨过到货门槛那一档才跳几天，平均值会低报。"""
+    rows = [{"level": 1.0, "finish_date": "2026-11-19", "days_vs_base": 0, "labor_delta_usd": 0.0,
+             "on_time_models": 0, "is_base": True},
+            {"level": 0.9, "finish_date": "2026-11-19", "days_vs_base": 0, "labor_delta_usd": 0.0,
+             "on_time_models": 0},
+            {"level": 0.75, "finish_date": "2026-11-03", "days_vs_base": -16, "labor_delta_usd": 0.0,
+             "on_time_models": 4}]
+    lever = {"label": "外购提前期", "step": 0.1, "base": 1.0}
+    out = ss.slope_per_step(rows, lever, 1.0)
+    assert out["days_per_step"] == 0.0                      # 近处那一档一动不动
+    assert out["steepest_days_per_step"] == 6.4             # 跨过门槛那档才跳
+    assert out["days_per_step_fit"] == 5.517                 # 平均数会低报跨门槛的收益
+    assert out["nonlinear"] is True and out["steepest_at_level"] == 0.75
+    assert "台阶" in out["shape_note"]
+    meta = {"label": "外购提前期", "step": 0.1}
+    txt = ss._reads_as(meta, out)
+    assert "台阶" in txt and "跨不过" not in txt and "0.75" in txt
 
 
 def test_slope_refuses_when_base_missing():

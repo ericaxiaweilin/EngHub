@@ -46,9 +46,14 @@ LEVERS: List[Dict[str, Any]] = [
     {"key": "equip_rate", "label": "设备可用率", "kind": "absolute", "step": 0.05,
      "levels": [0.60, 0.78, 0.90, 1.00], "base": None,
      "reads_as": "停机台数折进日产能后，交期与用工怎么变"},
-    {"key": "days_of_output", "label": "批量（几天产量）", "kind": "batch", "step": 1.0,
-     "levels": [2.0, 4.0, 6.0, 9.0], "base": 6.0,
-     "reads_as": "一批下几天产量时，组合交期与线组排队怎么变"},
+    {"key": "days_of_output", "label": "订单大小（每台单下几天产量·会改总需求量）", "kind": "batch",
+     "step": 1.0, "levels": [2.0, 4.0, 6.0, 9.0], "base": 6.0,
+     "not_a_scheduling_lever": True,
+     "reads_as": "这一格改的是「要多少台」，不是「怎么排」：少下单当然又快又省，不能当优化杠杆引用"},
+    {"key": "batches", "label": "同一张单拆几批投放（总量不变）", "kind": "perturb_int", "step": 1.0,
+     "levels": [1.0, 2.0, 4.0, 8.0], "base": 1.0,
+     "reads_as": "拆批只计换型工时（系统里唯一数字=APS 默认 300 秒/次）；搬运/清线/再齐套没建模，"
+                 "所以这一档只能证伪「拆批免费」，不能证明拆批免费"},
     {"key": "parallel_lines", "label": "并联开线（条）", "kind": "policy", "step": 1.0,
      "levels": [1.0, 2.0], "base": 1.0,
      "reads_as": "同组再开一条线（按组内声明的合并产能，不是单线×条数）换几天"},
@@ -71,7 +76,7 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
     if not sols:
         return {"dated_models": 0, "finish_date": None, "blocked_models": [],
                 "labor_cost_usd": 0.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
-                "first_batch_units": 0.0, "queued_units": 0.0}
+                "first_batch_units": 0.0, "waiting_for_material_units": 0.0}
     sol = sols[0]
     objs = sol.get("objectives") or {}
     detail = sol.get("detail") or []
@@ -79,7 +84,9 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
     blocked = [{"model_code": b.get("model_code"), "status": b.get("status"),
                 "why": b.get("why")} for b in (sol.get("blocked_models") or [])]
     binding = sorted({str(d.get("capacity_binding")) for d in detail if d.get("capacity_binding")})
-    return {"binding": "+".join(binding) or None,
+    terms = sorted({str(t) for d in detail for t in (d.get("binding_terms") or [])})
+    return {"binding": "+".join(binding) or None, "binding_terms": terms,
+            "binding_per_model": {str(d.get("model_code")): d.get("binding_terms") for d in detail},
             "dated_models": len(dates), "models_total": len(detail),
             "finish_date": dates[-1] if dates else None,
             "days_late_worst": objs.get("days_late_worst"),
@@ -91,7 +98,9 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
             "on_time_models": sum(1 for d in detail
                                   if d.get("finish_date") and not d.get("days_late")),
             "first_batch_units": round(sum(float(d.get("batch_a_units") or 0) for d in detail), 2),
-            "queued_units": round(sum(float(d.get("batch_b_units") or 0) for d in detail), 2),
+            "waiting_for_material_units": round(sum(float(d.get("batch_b_units") or 0) for d in detail), 2),
+            "capacity_line_declared_max": max([float(d.get("capacity_line_declared") or 0) for d in detail] or [0.0]),
+            "capacity_basis": sorted({str(d.get("capacity_basis")) for d in detail if d.get("capacity_basis")}),
             "blocked_models": blocked}
 
 
@@ -147,10 +156,41 @@ def slope_per_step(rows: List[Dict[str, Any]], lever: Dict[str, Any],
     per_step_labor = round((pick["labor_delta_usd"] or 0) * (step / span) * sign, 2)
     on_time_delta = (float(pick.get("on_time_models") or 0)
                      - float(bn.get("on_time_models") or 0)) * (step / span) * sign
+    # 局部值与整条曲线的最小二乘拟合一起给：拟合是"平均效应"，局部是"跨门槛那一档的效应"。
+    # 提前期/库存这类曲线只在跨过到货门槛那一档跳，线性外推会低报（实测两者差 20 倍）。
+    xs = [float(r["level"]) - base for r in usable]
+    ys = [float(r.get("days_vs_base") or 0) for r in usable]
+    denom = sum(x * x for x in xs)
+    fit_days = round((sum(x * y for x, y in zip(xs, ys)) / denom) * step, 3) if denom > 1e-12 else None
+    ys2 = [float(r.get("on_time_models") or 0) - float(bn.get("on_time_models") or 0) for r in usable]
+    fit_on_time = round((sum(x * y for x, y in zip(xs, ys2)) / denom) * step, 3) if denom > 1e-12 else None
+    # 台阶形状有两种表现：近处有跳变而平均低报，或近处一动不动、远处才跳。都算非线性。
+    per_step_all = []
+    for r in usable:
+        d = float(r["level"]) - base
+        if abs(d) > 1e-12:
+            per_step_all.append((abs(float(r.get("days_vs_base") or 0) / d * step),
+                                 float(r["level"])))
+    steepest = max(per_step_all, key=lambda x: x[0]) if per_step_all else (0.0, None)
+    steepest_days = round(steepest[0], 3)
+    local_abs = abs(per_step_days)
+    # 判"台阶"看每档换算成同一档距后的效果差多少：有一档为 0 而另一档不为 0，
+    # 或最大档效应超过最小档两倍 —— 都说明线性引用会骗人。
+    magnitudes = sorted(x[0] for x in per_step_all)
+    lo_mag = next((m for m in magnitudes if m > 1e-9), 0.0)
+    hi_mag = magnitudes[-1] if magnitudes else 0.0
+    nonlinear = bool(len(magnitudes) >= 2 and (any(m <= 1e-9 for m in magnitudes)
+                                               or (lo_mag > 0 and hi_mag > 2.0 * lo_mag)))
     return {"computable": True, "base_level": round(base, 4),
             "unit": f"每 {lever['label']} ±{format(step, 'g')}",
             "days_per_step": per_step_days, "labor_usd_per_step": per_step_labor,
             "on_time_models_per_step": round(on_time_delta, 3),
+            "days_per_step_fit": fit_days, "on_time_models_per_step_fit": fit_on_time,
+            "steepest_days_per_step": steepest_days, "steepest_at_level": steepest[1],
+            "nonlinear": bool(nonlinear),
+            "shape_note": ("这条曲线是台阶型的：按档距线性引用会低报（近处 0 天、跨门槛那档才跳），"
+                           "引用时要用 steepest 那一档并说明门槛在哪"
+                           if nonlinear else "局部与拟合一致，可按线性引用"),
             "measured_between": [base, float(pick["level"])],
             "direction": "把该输入加大一档",
             "money_per_day_saved": (round(abs(per_step_labor) / abs(per_step_days), 2)
@@ -174,7 +214,7 @@ async def sensitivity(db: AsyncSession, factory_id: str, models: List[str], *,
     out: List[Dict[str, Any]] = []
     for lever in LEVERS:
         rows: List[Dict[str, Any]] = []
-        if lever["kind"] in ("ratio", "batch", "margin"):
+        if lever["kind"] in ("ratio", "batch", "margin", "perturb_int"):
             base_level = float(lever.get("base") or days_of_output)
             levels = list(lever["levels"])
         elif lever["kind"] == "policy":
@@ -196,6 +236,9 @@ async def sensitivity(db: AsyncSession, factory_id: str, models: List[str], *,
             elif lever["kind"] == "margin":
                 tgts = await vr.derive_targets(db, factory_id, models,
                                                days_of_output=days_of_output, lead_margin=float(level))
+            elif lever["kind"] == "perturb_int":
+                perturb[lever["key"]] = float(level)
+                perturb["changeover_hours"] = float(vr.SIM_CHANGEOVER_HOURS)
             elif lever["kind"] == "policy":
                 lvl_policy = dict(pol)
                 lvl_policy[lever["key"]] = (bool(level) if lever["key"] == "allow_partial"
@@ -213,11 +256,14 @@ async def sensitivity(db: AsyncSession, factory_id: str, models: List[str], *,
                 "labor_delta_usd": round(m["labor_cost_usd"] - base["labor_cost_usd"], 2),
                 "expedite_delta_usd": round(m["expedite_cost_usd"] - base["expedite_cost_usd"], 2),
                 "activation_delta_usd": round(m["line_activation_cost_usd"] - base["line_activation_cost_usd"], 2),
-                "first_batch_units": m["first_batch_units"], "queued_units": m["queued_units"],
+                "first_batch_units": m["first_batch_units"], "waiting_for_material_units": m["waiting_for_material_units"],
                 "dated_models": m["dated_models"], "on_time_models": m.get("on_time_models"),
+                "capacity_line_declared_max": m.get("capacity_line_declared_max"),
+                "capacity_basis": m.get("capacity_basis"),
                 "days_late_worst": m.get("days_late_worst"), "on_time_rate": m.get("on_time_rate"),
                 "binding": m.get("binding")})
         out.append({"label": lever["label"], "key": lever["key"], "kind": lever["kind"],
+                    "not_a_scheduling_lever": bool(lever.get("not_a_scheduling_lever")),
                     "reads_as": lever["reads_as"], "curve": rows,
                     "base_level": round(base_level, 4),
                     "slope": slope_per_step(rows, lever, base_level)})
@@ -348,7 +394,8 @@ def propagate_uncertainty(sens: Dict[str, Any], acc: Dict[str, Any],
                        "不做平方和开根 —— 那些误差不是独立测量，相加是保守口径")}
 
 
-def _reads_as(meta: Dict[str, Any], sl: Dict[str, Any]) -> str:
+def _reads_as(meta: Dict[str, Any], sl: Dict[str, Any],
+              rows_meta: Optional[List[Dict[str, Any]]] = None) -> str:
     label = meta.get("label") or "?"
     if not sl.get("computable"):
         return f"{label}：{sl.get('why', '算不出局部斜率')}"
@@ -359,8 +406,18 @@ def _reads_as(meta: Dict[str, Any], sl: Dict[str, Any]) -> str:
         bits.append(f"准点 {sl['on_time_models_per_step']:+g} 台")
     if sl.get("labor_usd_per_step"):
         bits.append(f"人工 {sl['labor_usd_per_step']:+,.0f} USD")
+    caps = [float(r.get("capacity_line_declared_max") or 0) for r in (rows_meta or [])]
+    if meta.get("key") == "parallel_lines" and len(set(caps)) <= 1 and caps:
+        bits.append(f"这条线上产能声明没变（{caps[0]:g} 台/天）：该线组只登记了一条线，"
+                    f"「开第二条」在现在的主数据里是 0 产能，不是 0 效果")
+    if sl.get("nonlinear") and float(sl.get("steepest_days_per_step") or 0) > 0:
+        # 近处那档 0 天不代表这项不重要 —— 门槛在远处，漏说就会被人当成"不动"
+        bits.append(f"台阶型：近处档位看不出效果，跨过门槛那一档才跳 "
+                    f"{sl.get('steepest_days_per_step')} 天/档（在 {sl.get('steepest_at_level')} 那档）")
     if not bits:
         return f"{label}：动一档交期与准点都不变（这项当前不进约束，别为它花钱）"
+    if sl.get("nonlinear"):
+        bits.append(f"（台阶型：平均只有 {sl.get('days_per_step_fit')} 天/档，按档距引用会低报）")
     return f"{label}：" + "，".join(bits)
 
 
@@ -379,15 +436,25 @@ async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -
     for lever in sens.get("levers") or []:
         sl = lever.get("slope") or {}
         power = abs(float(sl.get("days_per_step") or 0)) + abs(float(sl.get("on_time_models_per_step") or 0))
+        if sl.get("nonlinear"):
+            power = max(power, abs(float(sl.get("days_per_step_fit") or 0)) +
+                        abs(float(sl.get("on_time_models_per_step_fit") or 0)))
         ranked.append({"lever": lever["label"], "base_level": lever.get("base_level"),
                        "days_per_step": sl.get("days_per_step"),
                        "on_time_models_per_step": sl.get("on_time_models_per_step"),
                        "labor_usd_per_step": sl.get("labor_usd_per_step"),
                        "money_per_day_saved": sl.get("money_per_day_saved"),
                        "power": round(power, 3),
-                       "reads_as": _reads_as(meta.get(lever["key"]) or {"label": lever["label"]}, sl)})
+                       "not_a_scheduling_lever": bool(lever.get("not_a_scheduling_lever")),
+                       "reads_as": _reads_as(meta.get(lever["key"]) or {"label": lever["label"]},
+                                             sl, lever.get("curve")),
+                       "binding_terms": lever.get("binding_terms")})
     ranked.sort(key=lambda r: -float(r["power"]))
-    return {"ranked": ranked, "overall_accuracy": acc.get("overall_accuracy"),
+    # 「订单大小」那格改的是需求量而不是排法，不能和真杠杆混在同一份"最值钱"清单里
+    actionable = [r for r in ranked if not r.get("not_a_scheduling_lever")]
+    return {"ranked": actionable, "ranked_all": ranked,
+            "not_scheduling_levers": [r["lever"] for r in ranked if r.get("not_a_scheduling_lever")],
+            "overall_accuracy": acc.get("overall_accuracy"),
             "base": sens.get("base"), "models": models,
             "note": ("斜率是局部值（基准两侧最近两档），只在小步长内成立；"
                      "power=|天/档|+|准点台/档|，只用于排序不改判")}
@@ -397,7 +464,19 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], **kw: Any
     acc = await mapping_accuracy(db, factory_id, models)
     sens = await sensitivity(db, factory_id, models, **kw)
     unc = propagate_uncertainty(sens, acc)
-    return {"factory_id": factory_id, "models": models,
+    priced = sum(1 for m in acc.get("models") or []
+                 if float((m.get("components") or {}).get("price", {}).get("score") or 0) > 0)
+    economy = {
+        "cost_side": "人工（率 $30/人日·标定）、加急、开线、换型 —— 都在台账里算出来",
+        "revenue_side": ("缺：延误罚则/客户违约成本/单价覆盖率 0 —— 没有收益侧的数，"
+                         "所以「划不划算」「无收益」这类判断在这份数据上算不出来"),
+        "usable_for": ("只能用于「同一批单内谁更省时省工」的排序；"
+                       "不能作为投资决策，也不能对外说某个杠杆「无收益」"),
+        "priced_models": priced, "models": len(models),
+        "claim_guard": ("任何写成「省 $X / 值 $Y」的结论都必须同时写"
+                        "「收益侧未建模，这只是成本差值」"),
+    }
+    return {"factory_id": factory_id, "models": models, "economic_readiness": economy,
             "accuracy": acc, "sensitivity": sens, "uncertainty": unc,
             "how_to_read": ("要交期就给交期：base.finish_date 是这批的组合完工日，"
                             "curves 给每个输入动一档之后的完工日/人工/加急差值，"
