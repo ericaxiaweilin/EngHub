@@ -18,6 +18,7 @@ from api.services.plan_commit_gate import (
 )
 from api.services.aps_draft_prune import plan_prune
 from api.services.chain_convergence import report as convergence_report
+from api.services.idle_capacity import idle_capacity_report
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
 
@@ -328,6 +329,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/aps-draft_prune", "mode": "read_only"},
             {"key": "chain_convergence", "name": "链条收敛自检（有没有真的往前走）",
              "path": "/api/v1/pmc/chain-convergence", "mode": "read_only"},
+            {"key": "idle_capacity", "name": "闲置产能台账（人·小时，成本判断的底）",
+             "path": "/api/v1/pmc/idle-capacity", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
@@ -383,6 +386,24 @@ async def get_aps_draft_prune(
     """
     del current_user
     return await plan_prune(db, factory_id=factory_id, keep=keep)
+
+
+@router.get("/idle-capacity", summary="闲置产能台账（只读，按工位报人·小时）")
+async def get_idle_capacity(
+    factory_id: str = Query(..., description="厂区"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """这一版方案覆盖的几天里：每个工位排了多少工时、其中多少属于开不了工的缺料单、
+    真闲置多少、以及"有没有齐套却没排的单能就地填满"。
+
+    成本判断的形状：人力在岗即付（缺料 3 天且没别的单可做就是确定损失），
+    设备全款则停着只是折旧 —— 所以"要不要调线"看的是人，不是机器。
+    这里只算到**人·小时**：库里没有薪资、没有设备原值/购置方式（实测 hr_employees 1,747 人 0 个
+    薪资列、equipment 无原值），把倍数编出来就是假账，等参数有人给再乘。
+    """
+    del current_user
+    return await idle_capacity_report(db, factory_id)
 
 
 @router.get("/chain-convergence", summary="无人链条收敛自检（只读）")
