@@ -333,6 +333,9 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     # 在"要不要写卡"之前就算好：apply=false 也要看得见引擎准备发什么动作。
     from api.services.virtual_run import recommendation_actions
     actions = recommendation_actions(tuned.get("final_scan") or {}, tuned.get("final_verdict") or {})
+    # 杠杆经济账：每个输入动一档值几天/多少钱，随推荐一起出去（<1 秒，同一条推演路径）
+    from api.services.sim_sensitivity import lever_headline
+    levers = await lever_headline(db, factory_id, [t["model_code"] for t in (tuned.get("targets") or [])])
     # 动作清单里"催哪个料"变了才算推荐变了（不带日期与数量：那些每天都动）
     # 身份取"料号/缺口描述"，没有料号的（分批、开线）用机种当身份 ——
     # 否则两台单的分批建议在签名里是同一个元素，动作清单少了一半也看不出来
@@ -368,6 +371,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     receipt = {"factory_id": factory_id, "apply": apply, "changed": changed,
                "robust_recommendation": robust, "by_scenario": per_scenario,
                "actions": actions, "action_count": len(actions),
+               "lever_economics": levers.get("ranked") or [],
+               "mapping_accuracy": levers.get("overall_accuracy"),
                "followthrough": followthrough or {"checked": 0,
                                                   "note": "上一张卡没有点名到料号的动作，无复查对象"},
                "promise_conclusion": verdict.get("conclusion"),
@@ -423,7 +428,10 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                               ensure_ascii=False),
         "top": signature,
         "levers": json.dumps(robust, ensure_ascii=False),
-        "detail": json.dumps({"actions": actions[:20], "by_scenario": per_scenario,
+        "detail": json.dumps({"actions": actions[:20],
+                              "lever_economics": (levers.get("ranked") or [])[:8],
+                              "mapping_accuracy": levers.get("overall_accuracy"),
+                              "by_scenario": per_scenario,
                               "calibration": receipt["calibration"],
                               "calibration_by_scenario": tuned.get("calibration_by_scenario") or {},
                               "full_signature": full_signature[1],
@@ -476,6 +484,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         ft_line = (f"上一轮建议复查：{ft.get('checked', 0)} 条里 {len(ft.get('adopted') or [])} 条已落地、"
                    f"{len(ft.get('not_acted') or [])} 条无变化（{ft.get('verdict')}）"
                    if ft.get("checked") else "")
+        lever_lines = [f"· {r['lever']}：{r['reads_as']}" for r in (levers.get("ranked") or [])[:4]]
         act_lines = []
         for a in actions[:8]:
             t = a.get("type")
@@ -518,7 +527,9 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                 f"（不是'分最高'：交期与产量是硬约束，其余维度取最小最大后悔，避免为刷一个维度牺牲另一维。）\n"
                 f"场景标定：" + "；".join(f"{c[0]} {c[1]}台/{c[2]}天" for c in receipt["calibration"])
                 + ("\n动作（都在沙箱里，不写 MES/WMS，也不自动开采购单）：\n"
-                   + "\n".join(act_lines) if act_lines else "")),
+                   + "\n".join(act_lines) if act_lines else "")
+                + ("\n杠杆经济账（每动一档实测值多少）：\n" + "\n".join(lever_lines)
+                   if lever_lines else "")),
             agent_key="pmc_agent", item_type="followup", source="virtual_factory",
             block_reason="推演建议，采纳与否看厂里的取舍；不自动改排产与采购",
             conversation_hint="采纳的话：把这个瓶颈件的到货目标日压到推荐值，并确认并联线/班组是否可用。",

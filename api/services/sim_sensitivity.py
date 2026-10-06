@@ -130,22 +130,29 @@ def slope_per_step(rows: List[Dict[str, Any]], lever: Dict[str, Any],
     bn = next((r for r in usable if abs(float(r["level"]) - float(base)) < 1e-6), None)
     if not bn or not (lo or hi):
         return {"computable": False, "why": "基准档或对比档缺失，算不出局部斜率"}
-    pick = max(lo, key=lambda r: float(r["level"])) if lo else min(hi, key=lambda r: float(r["level"]))
+    # 一律读成"把这个输入加大一档会怎样"：有上档就用上档，只有下档就把差值取反。
+    # 混着来会读成反话 —— 到岗率那档曾报成"每 ±0.05 → 交期 +0.8 天"，其实是人少了才晚。
+    near_hi = min(hi, key=lambda r: float(r["level"])) if hi else None
+    near_lo = max(lo, key=lambda r: float(r["level"])) if lo else None
+    # 取离基准更近的那一档（更接近局部斜率），符号统一换算成"加大一档"的后果
+    if near_hi is not None and (near_lo is None
+                                or abs(float(near_hi["level"]) - base) <= abs(float(near_lo["level"]) - base)):
+        pick, sign = near_hi, 1.0
+    else:
+        pick, sign = near_lo, -1.0
     span = abs(float(pick["level"]) - float(base))
     if span <= 0:
         return {"computable": False, "why": "档位间距为 0"}
-    days = (pick["days_vs_base"] or 0)
-    per_step_days = round(days * (step / span), 3)
-    labor = (pick["labor_delta_usd"] or 0)
-    per_step_labor = round(labor * (step / span), 2)
-    pair = [bn, pick]
-    on_time_delta = (float(pair[1].get("on_time_models") or 0)
-                       - float(pair[0].get("on_time_models") or 0)) * (step / span)
+    per_step_days = round((pick["days_vs_base"] or 0) * (step / span) * sign, 3)
+    per_step_labor = round((pick["labor_delta_usd"] or 0) * (step / span) * sign, 2)
+    on_time_delta = (float(pick.get("on_time_models") or 0)
+                     - float(bn.get("on_time_models") or 0)) * (step / span) * sign
     return {"computable": True, "base_level": round(base, 4),
             "unit": f"每 {lever['label']} ±{format(step, 'g')}",
             "days_per_step": per_step_days, "labor_usd_per_step": per_step_labor,
             "on_time_models_per_step": round(on_time_delta, 3),
             "measured_between": [base, float(pick["level"])],
+            "direction": "把该输入加大一档",
             "money_per_day_saved": (round(abs(per_step_labor) / abs(per_step_days), 2)
                                     if per_step_days else None)}
 
@@ -339,6 +346,51 @@ def propagate_uncertainty(sens: Dict[str, Any], acc: Dict[str, Any],
                                 for r in ranked if r["uncertainty_days_sum"] > 0],
             "method": ("不确定天数 = |局部斜率| × (允许误差 ÷ 档位步长)；多项数据的不确定按线性相加报，"
                        "不做平方和开根 —— 那些误差不是独立测量，相加是保守口径")}
+
+
+def _reads_as(meta: Dict[str, Any], sl: Dict[str, Any]) -> str:
+    label = meta.get("label") or "?"
+    if not sl.get("computable"):
+        return f"{label}：{sl.get('why', '算不出局部斜率')}"
+    bits = []
+    if sl.get("days_per_step"):
+        bits.append(f"每 ±{format(float(meta.get('step') or 0.1), 'g')} → 交期 {sl['days_per_step']:+g} 天")
+    if sl.get("on_time_models_per_step"):
+        bits.append(f"准点 {sl['on_time_models_per_step']:+g} 台")
+    if sl.get("labor_usd_per_step"):
+        bits.append(f"人工 {sl['labor_usd_per_step']:+,.0f} USD")
+    if not bits:
+        return f"{label}：动一档交期与准点都不变（这项当前不进约束，别为它花钱）"
+    return f"{label}：" + "，".join(bits)
+
+
+async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -> Dict[str, Any]:
+    """给记分卡与待办用的短账：按"每档效果"排序，最有用的杠杆在前。
+
+    只报实测数与'动一档'的后果，不下"该不该做"的判断 —— 判断要人结合钱的口径与现场，
+    引擎负责把差值算准并摆在同一条推演路径上。
+    """
+    if not models:
+        return {"ranked": [], "overall_accuracy": None}
+    acc = await mapping_accuracy(db, factory_id, models)
+    sens = await sensitivity(db, factory_id, models)
+    ranked: List[Dict[str, Any]] = []
+    meta = {l["key"]: l for l in LEVERS}
+    for lever in sens.get("levers") or []:
+        sl = lever.get("slope") or {}
+        power = abs(float(sl.get("days_per_step") or 0)) + abs(float(sl.get("on_time_models_per_step") or 0))
+        ranked.append({"lever": lever["label"], "base_level": lever.get("base_level"),
+                       "days_per_step": sl.get("days_per_step"),
+                       "on_time_models_per_step": sl.get("on_time_models_per_step"),
+                       "labor_usd_per_step": sl.get("labor_usd_per_step"),
+                       "money_per_day_saved": sl.get("money_per_day_saved"),
+                       "power": round(power, 3),
+                       "reads_as": _reads_as(meta.get(lever["key"]) or {"label": lever["label"]}, sl)})
+    ranked.sort(key=lambda r: -float(r["power"]))
+    return {"ranked": ranked, "overall_accuracy": acc.get("overall_accuracy"),
+            "base": sens.get("base"), "models": models,
+            "note": ("斜率是局部值（基准两侧最近两档），只在小步长内成立；"
+                     "power=|天/档|+|准点台/档|，只用于排序不改判")}
 
 
 async def report(db: AsyncSession, factory_id: str, models: List[str], **kw: Any) -> Dict[str, Any]:

@@ -23,9 +23,10 @@ def test_slope_is_local_not_a_global_average():
     """全局回归会把阶跃曲线抹成一个假平均数：只取基准两侧最近那一档。"""
     lever = {"label": "外购提前期", "step": 0.1, "base": 1.0}
     out = ss.slope_per_step(_curve(), lever, 1.0)
-    assert out["computable"] and out["measured_between"] == [1.0, 0.9]
-    assert out["days_per_step"] == -2.0            # 每 −10% 提前期 → 早 2 天
-    assert out["on_time_models_per_step"] == 2.0   # 每 −10% → 多 2 台准点
+    # 一律读成"加大一档会怎样"：有上档就用上档，符号不再随两边档位翻来覆去
+    assert out["computable"] and out["measured_between"] == [1.0, 0.9]   # 取离基准最近那档
+    assert out["days_per_step"] == 2.0             # 提前期每 +10% → 晚 2 天（下档差值换算成 +方向）
+    assert out["on_time_models_per_step"] == -2.0  # 每 +10% → 少 2 台准点
     assert out["money_per_day_saved"] == 500.0
 
 
