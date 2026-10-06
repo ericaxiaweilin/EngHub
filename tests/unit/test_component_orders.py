@@ -67,15 +67,24 @@ def _db(existing_codes=(), ready=("ARM-A",), total_components=0):
             ]
         elif "SELECT" in sql.upper() and "work_orders" in sql:
             # 幂等键查询：按 (父工单, 料号) 命中已有单；编码占用查询单独分支
+            hit = (SimpleNamespace(work_order_code=existing_codes[0], status="released",
+                                   id="wo-existing-1") if existing_codes else None)
             if "parent_work_order_id" in sql:
-                res.scalar_one_or_none.return_value = (
-                    SimpleNamespace(work_order_code=existing_codes[0]) if existing_codes else None
-                )
+                # 幂等查的是 ORM select(...).scalar()：三个取值口都要给，MagicMock 默认值不是 None
+                res.scalar_one_or_none.return_value = hit
+                res.scalar.return_value = hit
+                res.mappings.return_value.first.return_value = (
+                    {"work_order_code": existing_codes[0], "status": "released", "id": "wo-existing-1"}
+                    if existing_codes else None)
             else:
                 res.scalar_one_or_none.return_value = None
+                res.scalar.return_value = None
+                res.mappings.return_value.first.return_value = None
         else:
             res.mappings.return_value.all.return_value = []
+            res.mappings.return_value.first.return_value = None
             res.scalar_one_or_none.return_value = None
+            res.scalar.return_value = None
         return res
 
     async def flush():
