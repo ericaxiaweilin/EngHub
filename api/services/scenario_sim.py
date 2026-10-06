@@ -297,7 +297,8 @@ async def run_scenarios(db: AsyncSession, factory_id: str, scenarios: Dict[str, 
 
 LINES_SQL = text("""
     SELECT line_code, line_name, hours_per_day, units_per_day, crew_size,
-           parallel_lines, can_make_models, cannot_make_models, default_model, source, note
+           parallel_lines, can_make_models, cannot_make_models, default_model, source, note,
+           line_group, group_units_per_day
     FROM line_profiles
     WHERE factory_id = :fid AND COALESCE(is_active, TRUE)
     ORDER BY line_code
@@ -332,62 +333,86 @@ def simulate_lines(lines: List[Dict[str, Any]], jobs: List[Dict[str, Any]], *,
       挪不过去的那部分照样闲在那条线上；给了数就是上限口径。两个都跑，差别就是
       "这 200 人到底能不能救回来"的答案区间。
     """
+    by_code: Dict[str, Any] = {str(l["line_code"]): l for l in lines}
+    # 线组：同一组内的线共用一个**合流**产能（用户给的 bike 是 400+400 但合并只有 700）。
+    # 按相加算会把 bike 线高估 14%，而"缺料能不能靠另一条线追回来"的判断正好卡在这 14% 上。
+    groups: Dict[str, Dict[str, Any]] = {}
+    for l in lines:
+        code = str(l["line_code"])
+        gname = str(l.get("line_group") or code)
+        gcap = float(l.get("group_units_per_day") or 0) or _line_capacity(
+            l, units_are_per_line=units_are_per_line)
+        grp = groups.setdefault(gname, {"lines": [], "cap": gcap})
+        grp["lines"].append(code)
+        if float(l.get("group_units_per_day") or 0) > 0:
+            grp["cap"] = float(l["group_units_per_day"])
+        by_code[code] = l
+        by_code[code]["_group"] = gname
     cap = {str(l["line_code"]): _line_capacity(l, units_are_per_line=units_are_per_line)
            for l in lines}
-    by_code = {str(l["line_code"]): l for l in lines}
-    queue = []
-    for i, j in enumerate(jobs):
-        queue.append({"id": j.get("id") or f"J{i+1:02d}", "product_id": str(j["product_id"]),
-                      "qty": float(j.get("qty") or 0), "due": j.get("due"),
-                      "remaining": float(j.get("qty") or 0), "home_line": j.get("line"),
-                      "ran_on": None, "finish_day": None})
+    queue = [{"id": j.get("id") or f"J{i+1:02d}", "product_id": str(j["product_id"]),
+              "qty": float(j.get("qty") or 0), "due": j.get("due"),
+              "remaining": float(j.get("qty") or 0), "home_line": j.get("line"),
+              "ran_on": None, "finish_day": None} for i, j in enumerate(jobs)]
     line_units: Dict[str, float] = {c: 0.0 for c in cap}
     made_by_job: Dict[str, float] = {}
     moved_units = 0.0
 
     for day in range(days):
-        for code in cap:
-            left = cap[code]
+        for gname, grp in groups.items():
+            left = float(grp["cap"])
+            glines = set(grp["lines"])
             eligible = [j for j in queue if j["remaining"] > 1e-9
                         and int(available_from.get(j["product_id"], 0) or 0) <= day
-                        and _can_run(by_code[code], j["product_id"])]
-            # 家线优先，其次才是挪到能兼容它的线上（bike 线可接跑步机；反向不行）
-            eligible.sort(key=lambda j: (j["home_line"] != code, j["due"] or date.max, j["id"]))
+                        and any(_can_run(by_code[c], j["product_id"]) for c in glines)]
             if not allow_line_move:
-                eligible = [j for j in eligible if j["home_line"] == code]
+                eligible = [j for j in eligible
+                            if j["home_line"] in glines
+                            and _can_run(by_code.get(j["home_line"] or "", {}), j["product_id"])]
+            # 本组的单先做，外面的（挪进来的）后做
+            eligible.sort(key=lambda j: (j["home_line"] not in glines,
+                                         j["due"] or date.max, j["id"]))
             for j in eligible:
                 if left <= 1e-9:
                     break
                 units = min(j["remaining"], left)
                 j["remaining"] -= units
                 left -= units
-                line_units[code] += units
+                home = j["home_line"] if j["home_line"] in glines else next(
+                    (c for c in grp["lines"] if _can_run(by_code[c], j["product_id"])),
+                    grp["lines"][0])
+                line_units[home] += units
                 made_by_job[j["id"]] = made_by_job.get(j["id"], 0.0) + units
-                if j["home_line"] and code != j["home_line"]:
+                if j["home_line"] and j["home_line"] not in glines:
                     moved_units += units
                 if j["remaining"] <= 1e-9:
                     j["finish_day"] = day
-                    j["ran_on"] = code
+                    j["ran_on"] = home
 
+    # 闲置要按**线组**记：一个组里的两条线共用合流产能，把活分到哪条线上是排班细节，
+    # 不是两种不同的人力占用 —— 按线记会出现"一条忙一条闲"的分配假象（第一版就是这样，
+    # 同一份需求凭空多算出 3,150 人日闲置）。
     rows = []
-    for l in lines:
-        code = str(l["line_code"])
-        rate = cap[code]
-        crew = int(l["crew_size"] or 0)
-        # 人力跟着活走：这条线的班组提供的"人·天/台"是它的劳动含量，
-        # 活被别家的机器做掉时，人还是这边的人 —— 否则"调人去能做的线"就算不出收益。
-        labor_per_unit = (crew / rate) if rate else 0.0
-        own_work = sum(made_by_job.get(j["id"], 0.0) for j in queue if j["home_line"] == code)
-        busy_days = round(own_work / rate, 3) if rate else 0.0
+    for gname, grp in groups.items():
+        glines = grp["lines"]
+        rate = float(grp["cap"] or 0)
+        crew_total = sum(int(by_code[c]["crew_size"] or 0) for c in glines)
+        own_units = sum(made_by_job.get(j["id"], 0.0) for j in queue
+                        if j["home_line"] in glines)
+        busy_days = round(own_units / rate, 3) if rate else 0.0
         idle_days = round(max(0.0, days - busy_days), 3)
-        rows.append({"line_code": code, "line_name": l.get("line_name"),
-                     "capacity_units_per_day": rate, "crew_size": crew,
-                     "labor_days_per_unit": round(labor_per_unit, 4),
-                     "machine_days_used_this_line": round(line_units[code] / rate, 3) if rate else 0.0,
-                     "own_orders_units": round(own_work, 1),
-                     "busy_person_days": round(busy_days * crew, 1),
-                     "idle_person_days": round(idle_days * crew, 1),
-                     "idle_labor_cost": round(idle_days * crew * labor_rate, 2)})
+        rows.append({"line_group": gname,
+                     "lines": glines,
+                     "line_names": [by_code[c].get("line_name") for c in glines],
+                     "group_units_per_day": rate,
+                     "crew_size_total": crew_total,
+                     "hours_per_day": float(by_code[glines[0]]["hours_per_day"] or 0),
+                     "own_orders_units": round(own_units, 1),
+                     "machines_used_by_this_group": round(sum(line_units[c] for c in glines), 1),
+                     "busy_days": busy_days, "idle_days": idle_days,
+                     "idle_person_days": round(idle_days * crew_total, 1),
+                     "idle_labor_cost": round(idle_days * crew_total * labor_rate, 2)})
+
     unfinished = sum(j["remaining"] for j in queue)
     return {"days": days, "lines": rows,
             "total_idle_person_days": round(sum(r["idle_person_days"] for r in rows), 1),
