@@ -19,6 +19,7 @@ from api.services.plan_commit_gate import (
 from api.services.aps_draft_prune import plan_prune
 from api.services.chain_convergence import report as convergence_report
 from api.services.idle_capacity import idle_capacity_report
+from api.services.option_simulator import compare_options
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
 
@@ -331,6 +332,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/chain-convergence", "mode": "read_only"},
             {"key": "idle_capacity", "name": "闲置产能台账（人·小时，成本判断的底）",
              "path": "/api/v1/pmc/idle-capacity", "mode": "read_only"},
+            {"key": "production_options", "name": "缺料时的生产选择推演（多策略比较）",
+             "path": "/api/v1/pmc/production-options", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
@@ -386,6 +389,24 @@ async def get_aps_draft_prune(
     """
     del current_user
     return await plan_prune(db, factory_id=factory_id, keep=keep)
+
+
+@router.get("/production-options", summary="缺料时的生产选择推演（只读，多策略比较）")
+async def get_production_options(
+    factory_id: str = Query(..., description="厂区"),
+    objective: str = Query("labor_first", description="目标：labor_first/delivery_first/total_cost/balanced"),
+    days: int = Query(30, ge=3, le=180, description="推演天数（按仿真日历）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """同一份现状跑四条路：等料 / 能干就先干（部分投产）/ 按交期重排 / 调人补线。
+
+    为什么不是"欠料就卡住不排产"：现实里工厂的目标是能赚钱、能省钱、能维持人力利用，
+    这几条经常互相冲突，所以要给的是**每条路的后果比较**，不是一个"能不能开工"的是非题。
+    假设与模型边界随结果一起报出（assumptions / transfer_note），只读，不改任何工单或库存。
+    """
+    del current_user
+    return await compare_options(db, factory_id, objective=objective, days=days)
 
 
 @router.get("/idle-capacity", summary="闲置产能台账（只读，按工位报人·小时）")
