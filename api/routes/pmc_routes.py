@@ -349,6 +349,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/expected-attendance", "mode": "read_only"},
             {"key": "followup_lifecycle", "name": "缺料催办证据判定：齐套自动关闭 / 催不动升级（默认预演）",
              "path": "/api/v1/pmc/followup-lifecycle", "mode": "read_only"},
+            {"key": "fake_output", "name": "虚假产出冲回：零领料却入库的半成品（默认只预演）",
+             "path": "/api/v1/pmc/fake-output-revert", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
@@ -428,6 +430,39 @@ async def get_followup_lifecycle(
         "rule": ("关闭与升级都按齐套台账的缺口数判定；快照没有行的单不判齐套（空集合不等于通过）。"
                  "升级承接人从 HR 岗位台账找，找不到就把缺口写在单上等人认领，不编名字。"),
     }
+
+
+@router.get("/fake-output-revert", summary="虚假产出冲回（默认只预演，动库存要显式 apply）")
+async def get_fake_output_revert(
+    factory_id: str = Query(..., description="厂区"),
+    apply: bool = Query(False, description="false=只出清单；true 才反向过账并退单"),
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把"零投入却做出了成品"的产出冲回：反向过账、报工作废、工单退回待开工。
+
+    判据要两条同时成立 —— ①齐套表里没有带需求量的物料行 ②这张单没有任何领料流水。
+    只有①而没有②的单子是快照缺数据（镜像里没有组件级子 BOM，见 #46），
+    那不是造假，不能拿冲库存去"修"一个数据缺口。
+
+    冲回按原入库批次逐笔反向，上限是该批次当前可用量：已经被下游领走的部分**冲不回来**，
+    如实写进 unrecoverable_qty，而不是记一笔负库存冒充平账。报工只标作废不删行，
+    执行流水是仿真历史。apply=true 之前先把受影响行导出 CSV，写不出备份就不动库。
+    """
+    del current_user
+    from api.services.fake_output_revert import revert, scan
+
+    if apply:
+        return await revert(db, factory_id, apply=True, limit=limit)
+    report = await scan(db, factory_id, limit=limit)
+    report["apply"] = False
+    report["message"] = (f"候选 {report['candidates']} 张：可冲回 "
+                         f"{report['counts']['revert_stock']} 张 / "
+                         f"{report['totals']['revertible_qty']:g} 件；"
+                         f"{report['counts']['protected_has_issues']} 张因有领料流水被保护；"
+                         f"确认清单后带 apply=true 再执行。")
+    return report
 
 
 @router.get("/data-authority", summary="仿真输入的数据源台账（只读）")
