@@ -68,6 +68,8 @@ ORDERS_SQL = text("""
       AND wo.wo_type IN ('master', 'component')
       AND wo.status IN ('pending', 'released', 'in_progress')
       AND GREATEST(wo.planned_qty - COALESCE(wo.completed_qty, 0), 0) > 0
+      -- 可以只推演指定的几张单（他说"给虚拟引擎 5 个工单"那种口径）：不筛就是全在制池
+      AND (CAST(:codes AS varchar[]) IS NULL OR wo.work_order_code = ANY(CAST(:codes AS varchar[])))
     ORDER BY wo.planned_due NULLS LAST, wo.work_order_code
 """)
 
@@ -96,65 +98,92 @@ def _station_for(order: Dict[str, Any], routes: Dict[str, str]) -> str:
 def _simulate(strategy: str, orders: List[Dict[str, Any]], stations: Dict[str, Dict[str, Any]],
               routes: Dict[str, str], arrivals: List[Dict[str, Any]], *, start: date,
               days: int, labor_rate: float) -> Dict[str, Any]:
-    """闲置成本按**人**算，不按台·天算：一个工位闲着 = 它那一班人都在闲着。"""
-    """按天推演一条策略；返回可比较的结果，不返回"正确答案"。"""
-    # 到货累加池：某一天之后有多少某料可用（近似：不跨单做争抢分配，见 assumptions）
-    arrival_by_day: Dict[int, Dict[str, float]] = {}
-    for a in arrivals:
-        offset = (a["expected_date"] - start).days
-        if offset < 0:
-            offset = 0
-        arrival_by_day.setdefault(offset, {})[str(a["material_code"])] = \
-            arrival_by_day.get(offset, {}).get(str(a["material_code"]), 0.0) + float(a["qty"] or 0)
+    """按天推演一条策略。闲置成本按**人·天**算（工位闲着 = 那一班人在闲着）。
 
-    work = [dict(o, remaining=float(o["remaining_qty"] or 0)) for o in orders]
-    station_load: Dict[str, float] = {code: 0.0 for code in stations}
-    produced = 0.0
-    delivered_orders = 0
-    late_delivered = 0
+    四条路的真正区别在"卡住的那道单怎么处理"：
+    - `wait_for_material` 是**队头阻塞**（现在厂里/系统的实际后果）：工位按交期取第一张待做的单，
+      它不齐套就整台工位停在那儿，后面的齐套单也不许插队 —— 这才叫"因为一个料缺就停产"；
+    - `resequence_by_due` 把不齐套的单跳过、让后面的齐套单先做（缺料单不占产能位）；
+    - `run_what_you_can` 在能跳的基础上，还允许按已覆盖物料比例部分投产；
+    - `transfer_idle_labor` 同 3，并显式声明本版模型里人力不是产能约束。
+    换线成本也计入：同一工位换了不同机种就扣一次换线时间（`setup_time_minutes`）。
+    """
+    work: Dict[str, Dict[str, Any]] = {}
+    for o in orders:
+        work[str(o["id"])] = dict(o, remaining=float(o["remaining_qty"] or 0),
+                                  finish_day=None)
+    # 调人这一路同样允许部分投产（差别只在人力是否算产能约束，见 transfer_note）
+    allow_partial = strategy in ("run_what_you_can", "transfer_idle_labor")
+    skip_blocked = strategy in ("resequence_by_due", "run_what_you_can", "transfer_idle_labor")
+
     idle_days_by_station: Dict[str, float] = {}
     worked_station_days = 0.0
+    produced = 0.0
+    changeovers = 0
+    last_product: Dict[str, str] = {}
+    setup_loss_days = 0.0
 
     for day in range(days):
         for code, st in stations.items():
             capacity_units = float(st["capacity_per_hour"] or 0) * float(st["line_hours_per_day"] or 0)
             if capacity_units <= 0:
                 continue
-            # 这条策略允许哪些单在这台工位上跑
-            here = [w for w in work if w["remaining"] > 0 and _station_for(w, routes) == code]
-            if strategy == "wait_for_material":
-                here = [w for w in here if _coverage(w) >= 1.0]
-            elif strategy == "resequence_by_due":
-                here = [w for w in here if _coverage(w) >= 1.0]
-                here.sort(key=lambda w: (w["planned_due"] or date.max, w["work_order_code"]))
-            elif strategy in ("run_what_you_can", "transfer_idle_labor"):
-                here.sort(key=lambda w: (-_coverage(w), w["planned_due"] or date.max))
-                here = [w for w in here if _coverage(w) >= PARTIAL_COVERAGE_MIN]
-            if strategy == "transfer_idle_labor" and not here:
+            here = [w for w in work.values() if w["remaining"] > 0 and _station_for(w, routes) == code]
+            if not here:
                 idle_days_by_station[code] = idle_days_by_station.get(code, 0.0) + 1.0
                 continue
+            here.sort(key=lambda w: (w["planned_due"] or date.max, w["work_order_code"]))
+            if allow_partial:
+                here.sort(key=lambda w: (-_coverage(w), w["planned_due"] or date.max))
+
             used = 0.0
             for w in here:
                 if used >= capacity_units:
                     break
-                share = _coverage(w) if strategy in ("run_what_you_can", "transfer_idle_labor") else 1.0
-                can_make = min(w["remaining"], capacity_units - used)
-                can_make = min(can_make, can_make * share if share < 1 else can_make)
+                coverage = _coverage(w)
+                if coverage >= 1.0:
+                    share = 1.0
+                elif allow_partial and coverage >= PARTIAL_COVERAGE_MIN:
+                    share = coverage
+                elif skip_blocked:
+                    continue                     # 跳过去做后面的齐套单
+                else:
+                    # 队头阻塞：这台工位今天到此为止，别的单不许插队
+                    break
+                if last_product.get(code) and last_product[code] != str(w["product_id"]):
+                    setup_days = float(st["setup_time_minutes"] or 0) / (
+                        float(st["line_hours_per_day"] or HOURS_PER_DAY_FALLBACK) * 60.0)
+                    used += capacity_units * min(1.0, setup_days)
+                    setup_loss_days += min(1.0, setup_days)
+                    changeovers += 1
+                    if used >= capacity_units:
+                        break
+                last_product[code] = str(w["product_id"])
+                can_make = min(w["remaining"], capacity_units - used) * share
                 if can_make <= 0:
                     continue
                 w["remaining"] -= can_make
                 used += can_make
                 produced += can_make
-                if w["remaining"] <= 0:
-                    delivered_orders += 1
-                    if w["planned_due"] and start + timedelta(days=day) > w["planned_due"]:
-                        late_delivered += 1
+                if w["remaining"] <= 1e-6:
+                    w["remaining"] = 0.0
+                    w["finish_day"] = day
             if used > 0:
-                station_load[code] = station_load.get(code, 0.0) + used
                 worked_station_days += min(1.0, used / capacity_units)
             else:
                 idle_days_by_station[code] = idle_days_by_station.get(code, 0.0) + 1.0
 
+    done = [w for w in work.values() if w["remaining"] <= 1e-6 and w["finish_day"] is not None]
+    late = [w for w in done if w.get("planned_due")
+            and start + timedelta(days=int(w["finish_day"])) > w["planned_due"]]
+    delays = [((start + timedelta(days=int(w["finish_day"])) - w["planned_due"]).days)
+              for w in late]
+    total_station_days = len([x for x in stations.values()
+                              if float(x["capacity_per_hour"] or 0) > 0]) * days
+    util = round(worked_station_days / total_station_days, 4) if total_station_days else 0.0
+    idle_station_days = round(sum(idle_days_by_station.values()), 1)
+    idle_person_days = round(sum(idle * int(stations[c].get("headcount_hr") or 0)
+                                 for c, idle in idle_days_by_station.items()), 1)
     if strategy == "transfer_idle_labor":
         transfer_note = ("这一版模型里产能按『线 × 小时 × capacity_per_hour』计，人力**不是**产能约束"
                          "（缺「一条线几人 / 几班倒」这个输入），所以调人策略与『能干就先干』产出相同 —— "
@@ -162,27 +191,35 @@ def _simulate(strategy: str, orders: List[Dict[str, Any]], stations: Dict[str, D
     else:
         transfer_note = None
 
-    total_station_days = len([s for s in stations.values()
-                              if float(s["capacity_per_hour"] or 0) > 0]) * days
-    util = round(worked_station_days / total_station_days, 4) if total_station_days else 0.0
-    idle_station_days = round(sum(idle_days_by_station.values()), 1)
-    idle_person_days = round(sum(idle * int(stations[code].get("headcount_hr") or 0)
-                                 for code, idle in idle_days_by_station.items()), 1)
     return {
         "strategy": strategy,
         "produced_units": round(produced, 1),
-        "delivered_orders": delivered_orders,
-        "late_delivered_orders": late_delivered,
+        "orders_completed": len(done),
+        "orders_open_at_horizon": len([w for w in work.values() if w["remaining"] > 0]),
+        "delivered_on_time": len(done) - len(late),
+        "delivered_late": len(late),
+        "avg_delay_days": round(sum(delays) / len(delays), 1) if delays else 0.0,
+        "changeovers": changeovers,
         "capacity_utilization": util,
-        "idle_station_days": round(idle_station_days, 1),
+        "idle_station_days": idle_station_days,
         "idle_person_days": idle_person_days,
         "labor_idle_cost": round(idle_person_days * labor_rate, 2),
+        "setup_capacity_lost_days": round(setup_loss_days, 2),
         "transfer_note": transfer_note,
+        "completions_sample": sorted(
+            [{"work_order_code": w["work_order_code"], "product_id": w["product_id"],
+              "qty": float(w["remaining_qty"] or 0),
+              "planned_due": str(w["planned_due"]) if w.get("planned_due") else None,
+              "finish_day": w["finish_day"],
+              "on_time": bool(w["planned_due"]) and (start + timedelta(days=int(w["finish_day"]))) <= w["planned_due"]
+              if w["finish_day"] is not None else False}
+             for w in done],
+            key=lambda x: (x["finish_day"] if x["finish_day"] is not None else 9999))[:12],
     }
 
 
 STRATEGY_LABELS = {
-    "wait_for_material": "等料：只做全部齐套的单（现在系统的行为，作基线）",
+    "wait_for_material": "等料（队头阻塞）：工位只认交期最早那张单，它不齐套就整台停在那儿——现在系统的实际后果",
     "run_what_you_can": "能干什么先干什么：部分齐套按已到料的比例投产",
     "resequence_by_due": "重排：仍只做齐套单，但按交期排、缺料单不占产能位",
     "transfer_idle_labor": "调人：闲置班组挪去有活等着的工位（扣换线时间）",
@@ -191,7 +228,8 @@ STRATEGY_LABELS = {
 
 async def compare_options(
     db: AsyncSession, factory_id: str, *, objective: str = "labor_first",
-    days: int | None = None, as_of: date | None = None
+    days: int | None = None, as_of: date | None = None,
+    order_codes: List[str] | None = None,
 ) -> Dict[str, Any]:
     """同一份现状，四条路各跑一遍，给出比较表 + 按目标的排序 + 假设清单。"""
     from api.services.cost_model import resolve_rates
@@ -215,7 +253,8 @@ async def compare_options(
         st["headcount_hr"] = sum(_station_people(str(st.get("station_name") or ""), code,
                                                  hr_rows, hr_index).values())
     orders = [dict(r) for r in (await db.execute(
-        ORDERS_SQL, {"fid": factory_id})).mappings().all()]
+        ORDERS_SQL, {"fid": factory_id, "codes": list(order_codes) if order_codes else None}
+    )).mappings().all()]
     arrivals = [dict(r) for r in (await db.execute(
         ARRIVALS_SQL, {"fid": factory_id})).mappings().all()]
 
@@ -247,6 +286,17 @@ async def compare_options(
         if row and row["station_code"]:
             routes[ref] = str(row["station_code"])
 
+    scoped_note = None
+    if order_codes:
+        # 只看这几张单时，闲置也必须只算它们涉及的工位：否则"5 张单的产出"配"全厂 30 天的闲置"
+        # 是两个不同分母的数，成本比较就是错的。
+        in_scope = {_station_for(o, routes) for o in orders}
+        kept = {c: st for c, st in stations.items() if c in in_scope}
+        dropped = len(stations) - len(kept)
+        stations = kept
+        scoped_note = (f"只推演指定的 {len(orders)} 张单：工位范围收窄到它们首道工序涉及的 "
+                       f"{len(stations)} 个（其余 {dropped} 个不计入闲置，避免分母不一致）")
+
     rates = resolve_rates([], objective=objective)
     labor_rate = float(rates["rates"]["labor_person_day"]["amount"])
     horizon = days or SIM_HORIZON_DAYS
@@ -260,12 +310,18 @@ async def compare_options(
         r["objective_score"] = round(w["delivery"] * r["produced_units"] / 100.0
                                     + w["labor"] * (-r["labor_idle_cost"] / 100.0)
                                     + w["equipment"] * r["capacity_utilization"] * 10.0, 3)
-    ranked = sorted(results, key=lambda r: -r["objective_score"])
+    # 分数相同（比如这份现状下四条路都没活可干）时，用"按期交付→产出→闲置"决定名次，
+    # 不能让排序取决于字典顺序 —— 否则同一份数据两次给出不同的"最优"。
+    ranked = sorted(results, key=lambda r: (-r["objective_score"], -r["delivered_on_time"],
+                                            -r["produced_units"], r["idle_person_days"],
+                                            r["strategy"]))
     return {
         "factory_id": factory_id,
         "as_of": str(as_of),
         "clock_basis": basis,
         "horizon_days": horizon,
+        "scope_order_codes": list(order_codes) if order_codes else "全部在制单",
+        "scope_note": scoped_note,
         "objective": rates["objective"],
         "objective_label": rates["objective_label"],
         "orders_in_scope": len(orders),

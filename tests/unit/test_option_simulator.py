@@ -19,9 +19,10 @@ def _stations(code="ST-A", cap=10.0, hours=8.0, people=20):
                    "line_hours_per_day": hours, "setup_time_minutes": 30, "headcount_hr": people}}
 
 
-def _order(code, qty=100, required=100, covered=100, due=date(2026, 12, 31)):
+def _order(code, qty=100, required=100, covered=100, due=date(2026, 12, 31), product="P-A"):
     return {"id": code, "work_order_code": code, "remaining_qty": qty, "planned_due": due,
-            "required": required, "covered": covered, "route_ref": "rt-ST-A", "unit": "PCS"}
+            "required": required, "covered": covered, "route_ref": "rt-ST-A", "unit": "PCS",
+            "product_id": product}
 
 
 ROUTES = {"rt-ST-A": "ST-A"}
@@ -68,3 +69,27 @@ def test_transfer_strategy_declares_its_own_boundary():
     """人力在这版模型里不是产能约束：调人必须自带说明，不能被读成"厂里不该调人"。"""
     out = _run("transfer_idle_labor", [_order("WO-5", covered=80)])
     assert out["transfer_note"] and "人力" in out["transfer_note"]
+
+
+def test_head_of_line_blocking_is_worse_than_resequencing_same_data():
+    """他指出的关键：队头阻塞与按交期重排**理论上就不该同分**。
+    交期早的那张缺料、后面那张齐套 —— 阻塞时整台工位停着；重排时后面的活能插队做完。"""
+    blocked_first = _order("WO-EARLY", qty=100, covered=0, required=100, due=date(2026, 11, 5))
+    kitted_later = _order("WO-LATER", qty=100, covered=100, required=100, due=date(2026, 11, 20))
+    orders = [blocked_first, kitted_later]
+    blocked = _run("wait_for_material", [dict(o) for o in orders])
+    reseql = _run("resequence_by_due", [dict(o) for o in orders])
+    assert blocked["produced_units"] == 0            # 卡在第一张上，整天不动
+    assert blocked["idle_station_days"] == 10.0
+    assert reseql["produced_units"] > 0              # 跳过缺料的，把齐套的做完
+    assert reseql["orders_completed"] == 1
+    assert reseql["idle_station_days"] < blocked["idle_station_days"]
+
+
+def test_changeover_between_products_costs_capacity():
+    """换不同机种要扣换线时间（setup_time_minutes 是实测字段）：否则模型永远鼓励乱切。"""
+    a = _order("WO-A", qty=60, product="P-A")
+    b = _order("WO-B", qty=60, product="P-B", due=date(2026, 11, 3))
+    out = _run("resequence_by_due", [dict(o) for o in [a, b]])
+    assert out["changeovers"] >= 1
+    assert out["setup_capacity_lost_days"] > 0

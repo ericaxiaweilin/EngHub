@@ -396,6 +396,7 @@ async def get_production_options(
     factory_id: str = Query(..., description="厂区"),
     objective: str = Query("labor_first", description="目标：labor_first/delivery_first/total_cost/balanced"),
     days: int = Query(30, ge=3, le=180, description="推演天数（按仿真日历）"),
+    order_codes: str = Query("", description="只推演这几张工单，逗号分隔；留空=全部在制单"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -406,7 +407,8 @@ async def get_production_options(
     假设与模型边界随结果一起报出（assumptions / transfer_note），只读，不改任何工单或库存。
     """
     del current_user
-    return await compare_options(db, factory_id, objective=objective, days=days)
+    codes = [c.strip() for c in order_codes.split(",") if c.strip()] or None
+    return await compare_options(db, factory_id, objective=objective, days=days, order_codes=codes)
 
 
 @router.get("/idle-capacity", summary="闲置产能台账（只读，按工位报人·小时）")
