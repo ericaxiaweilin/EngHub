@@ -95,6 +95,40 @@ def test_robust_pick_requires_covering_every_weather_scenario():
             assert row.get("regret_by_objective"), f"{name}/{row['name']} 没有后悔向量"
 
 
+def test_hard_constraint_dims_are_named_not_silently_compared():
+    """交期是硬约束后，准点率/延误天数在存活解里必然全同 —— 要明说它们退出了比较。"""
+    keep = [dict(_sol("k1"), objectives={"on_time_rate": 1.0, "throughput_units": 600,
+                                         "labor_cost_usd": 100, "expedite_cost_usd": 0,
+                                         "standby_person_days": 0, "data_confidence": 0.9,
+                                         "load_band_gap": 0.0, "line_activation_cost_usd": 0,
+                                         "days_late_worst": 0}),
+            dict(_sol("k2"), objectives={"on_time_rate": 1.0, "throughput_units": 600,
+                                         "labor_cost_usd": 200, "expedite_cost_usd": 5,
+                                         "standby_person_days": 3, "data_confidence": 0.9,
+                                         "load_band_gap": 0.2, "line_activation_cost_usd": 10,
+                                         "days_late_worst": 0})]
+    out = pe.evaluate(keep, demand_units=600, keys=list(pe.DIRECTIONS))
+    assert set(out["absorbed_by_constraint"]) == {"on_time_rate", "days_late_worst"}
+    assert out["recommended"]["id"] == "k1"          # 剩下按成本/加急/空档/负载/开线费比
+
+
+def test_self_check_stays_silent_when_there_is_nothing_to_choose_between():
+    """可行解只有 1~2 个时不许报"每个维度都可被刷"—— 那是样本不足，不是可刷分。"""
+    one = [dict(_sol("only"), objectives={"on_time_rate": 1.0, "throughput_units": 600,
+                                         "labor_cost_usd": 100, "expedite_cost_usd": 0,
+                                         "standby_person_days": 0, "data_confidence": 0.9,
+                                         "load_band_gap": 0.0, "line_activation_cost_usd": 0,
+                                         "days_late_worst": 0}),
+           dict(_sol("late"), objectives={"on_time_rate": 0.0, "throughput_units": 600,
+                                         "labor_cost_usd": 50, "expedite_cost_usd": 0,
+                                         "standby_person_days": 0, "data_confidence": 0.9,
+                                         "load_band_gap": 0.0, "line_activation_cost_usd": 0,
+                                         "days_late_worst": 9})]
+    out = pe.evaluate(one, demand_units=600, keys=list(pe.DIRECTIONS))
+    assert out["self_check"] == []
+    assert any("可行解只剩" in n for n in out["notes"])
+
+
 def test_unknown_objective_direction_is_rejected_not_defaulted():
     """目标名写错时必须报错。默认按 max 处理会把"越小越好"的维度反过来选。"""
     sols = [_s("好天", "a", 1.0, 1000), _s("好天", "b", 0.0, 2000)]

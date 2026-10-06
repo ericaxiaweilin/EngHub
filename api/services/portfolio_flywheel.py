@@ -173,18 +173,27 @@ async def record_cycle(db: AsyncSession, sim: Dict[str, Any], *, factory_id: str
 async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = True,
                             models: Optional[List[str]] = None) -> Dict[str, Any]:
     """扫一遍政策×天气，把权衡矩阵与稳健推荐写进记分卡；推荐变了才动待办。"""
-    from api.services.pareto_eval import evaluate_by_scenario
-    from api.services.virtual_run import derive_targets, scan_policies
-
-    from api.services.virtual_run import default_models
-    targets = await derive_targets(db, factory_id,
-                                   models or await default_models(db, factory_id, n=2))
-    scan = await scan_policies(db, factory_id, targets)
-    verdict = evaluate_by_scenario(scan["by_scenario"], scan["demand_units"])
+    from api.services.virtual_run import auto_tune, default_models
+    # 不再用固定标定：先自调（太松/太紧会自己改批量与交期系数），调稳了才比较
+    tuned = await auto_tune(db, factory_id, models or await default_models(db, factory_id, n=2),
+                            rounds=4)
+    verdict = {"by_scenario": {k: v for k, v in (tuned["final"]["per_scenario"] or {}).items()},
+               "robust_recommendation": {"policy": tuned["final"]["robust"]},
+               "selection_rule": tuned["rule"]}
+    scan = {"policies_tried": int(tuned["final"].get("policies_tried") or 0)}
     robust = verdict.get("robust_recommendation") or {}
-    per_scenario = {name: {"recommended": (res.get("recommended") or {}).get("name"),
-                           "frontier_size": len(res.get("frontier") or []),
-                           "eliminated": len(res.get("eliminated") or [])}
+    def _rec_name(v):
+        if isinstance(v, str):
+            return v
+        return (v or {}).get("name") if isinstance(v, dict) else None
+    def _count(v):
+        # auto_tune 给的是计数，evaluate_by_scenario 给的是列表 —— 两种都要能吃
+        return len(v) if isinstance(v, (list, tuple)) else int(v or 0)
+    per_scenario = {name: {"recommended": _rec_name(res.get("recommended")),
+                           "frontier_size": _count(res.get("frontier") if "frontier" in res
+                                                    else res.get("feasible")),
+                           "eliminated": _count(res.get("eliminated")),
+                           "no_feasible": bool(res.get("no_feasible"))}
                     for name, res in (verdict.get("by_scenario") or {}).items()}
     signature = f"{robust.get('policy')}|{json.dumps(per_scenario, ensure_ascii=False, sort_keys=True)}"
 
@@ -192,9 +201,12 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     changed = (not last) or str((last or {}).get("top_constraint") or "") != signature
     receipt = {"factory_id": factory_id, "apply": apply, "changed": changed,
                "robust_recommendation": robust, "by_scenario": per_scenario,
-               "calibration": [(t["model_code"], t["units"], t["due_in_days"], t.get("calibration"))
-                               for t in targets],
+               "calibration": [(t.get("model_code"), t.get("units"), t.get("due_in_days"),
+                                t.get("calibration")) for t in (tuned.get("targets") or [])],
                "selection_rule": verdict.get("selection_rule"), "note": TRADEOFF_NOTE,
+               "tuning_trajectory": [{"round": t["round"], "calibration": t["calibration"],
+                                      "diagnosis": t["diagnosis"], "next_tweak": t["next_tweak"],
+                                      "robust": t["robust"]} for t in tuned["trajectory"]],
                "card_written": False}
     if not changed:
         receipt["skipped_reason"] = "稳健推荐与各场景前沿都没变，不重复写卡"
@@ -204,24 +216,22 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         return receipt
 
     # 先给推荐解本身算一遍代价：钱和天数值不值得，写在建议里，不让人再去问模型
-    best = None
-    for name, res in (verdict.get("by_scenario") or {}).items():
-        rec = res.get("recommended")
-        if rec:
-            best = rec
+    objectives: Dict[str, Any] = {}
+    for res in (verdict.get("by_scenario") or {}).values():
+        if isinstance(res, dict) and res.get("objectives"):
+            objectives = res["objectives"]
             break
-    objectives = (best or {}).get("objectives") or {}
     await db.execute(INSERT_SQL, {
         "id": _gen_id(), "fid": factory_id, "eday": date.today(),
         "models": len(per_scenario), "score": float(objectives.get("on_time_rate") or 0) * 100.0,
         "weights": json.dumps({"rule": "minimax regret over weather scenarios",
-                               "objectives": list((best or {}).get("objectives") or {})},
+                               "objectives": objectives},
                               ensure_ascii=False),
         "top": signature[:200],
         "levers": json.dumps(robust, ensure_ascii=False),
         "detail": json.dumps({"by_scenario": per_scenario, "calibration": receipt["calibration"],
-                              "self_check": {n: (r or {}).get("self_check")
-                                             for n, r in (verdict.get("by_scenario") or {}).items()},
+                              "tuning": receipt["tuning_trajectory"],
+                              "self_check": tuned["final"].get("notes") or [],
                               "note": TRADEOFF_NOTE}, ensure_ascii=False),
         "source": "virtual_run_tradeoff",
     })
@@ -238,9 +248,13 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     """), {"fid": factory_id})).rowcount
     rec = robust.get("policy")
     if rec:
-        per = {n: ((r or {}).get("recommended") or {}).get("name")
+        def _rec(v):
+            if isinstance(v, str):
+                return v
+            return (v or {}).get("name") if isinstance(v, dict) else None
+        per = {n: _rec((r or {}).get("recommended"))
                for n, r in (verdict.get("by_scenario") or {}).items()}
-        objs = (best or {}).get("objectives") or {}
+        objs = objectives
         created = await create_task(
             db, factory_id, "virtual_factory",
             f"推演推荐｜{rec}（好天~暴雨都不误期，代价 ${float(objs.get('expedite_cost_usd') or 0) + float(objs.get('line_activation_cost_usd') or 0):,.0f}）"[:200],

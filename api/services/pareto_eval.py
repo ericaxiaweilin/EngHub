@@ -28,6 +28,7 @@ DIRECTIONS = {
     "data_confidence": "max",         # 依据里有多少是声明的、多少是借/假设的
     "load_band_gap": "min",           # 离人力健康负载区间的偏离（养闲和超载都要付）
     "line_activation_cost_usd": "min",  # 开第二条线的代价 —— 没有它，"多开线"就是免费的
+    "days_late_worst": "min",         # 连续延误天数：0/1 准点率会饱和，延 1 天和延 20 天不该同重
 }
 
 # 反 Goodhart 硬门槛：达不到就不参与推荐（不是扣分，是淘汰）
@@ -74,6 +75,8 @@ def feasible(sol: Dict[str, Any], demand_units: float) -> Tuple[bool, Optional[s
     if demand_units > 0 and made < demand_units * MIN_THROUGHPUT_RATIO:
         return False, (f"只做出来 {made:g}/{demand_units:g} 台（<{MIN_THROUGHPUT_RATIO:.0%}）—— "
                        f"省下的成本是不干活省的，不参与比较")
+    # 交期一旦作为硬约束，"准点率/延误天数"就不能再当比较维度：存活解在这两维必然全同，
+    # 留着只会让 regret 算出 0 分并把有效维度稀释掉。它们仍作为事实报出，只是不参与择优。
     if _value(sol, "on_time_rate") < ON_TIME_REQUIRED:
         return False, ("误期：交期是合同约束，不能用低成本/低闲置换回来"
                        f"（准点率 {_value(sol, 'on_time_rate'):.2f} < {ON_TIME_REQUIRED:.2f}）")
@@ -125,6 +128,19 @@ def assumption_share(sol: Dict[str, Any]) -> float:
                ("borrowed_route_from_family", "takt_from_line_capacity",
                 "line_inferred_by_family_name", "assumed_ie_hours"))
     return round(weak / total, 4)
+
+
+def objective_spread(solutions: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
+    """哪一维全场同值 = 这一维白算，通常是场景标得不合理（上一轮 12 个政策全部准点 1.00 就是这个）。"""
+    out = []
+    for k in keys:
+        vals = [_value(s, k) for s in solutions]
+        if not vals:
+            continue
+        out.append({"objective": k, "min": round(min(vals), 4), "max": round(max(vals), 4),
+                    "distinct": len(set(round(v, 6) for v in vals)),
+                    "useless": (max(vals) - min(vals)) < 1e-9})
+    return out
 
 
 def anti_goodhart_check(solutions: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
@@ -196,6 +212,7 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
     """产出前沿、被淘汰的解、推荐解，以及每步判定的理由（可复核，不给单一总分）。"""
     keys = keys or list(DIRECTIONS)
     scored: List[Dict[str, Any]] = []
+    notes: List[str] = []
     eliminated: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
     for sol in solutions:
@@ -218,6 +235,20 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         eliminated = rejected
         rejected = []
 
+    # 全场同值的维度没有区分度：留在向量里会让 regret/self_check 说胡话（n=1 时会把每个维度
+    # 都报成"可被刷"）。挑出来并从比较用的 keys 里摘掉，但在结果里明说摘了哪些。
+    spread = objective_spread(scored, keys)
+    dead = [s["objective"] for s in spread if s["useless"]]
+    # 硬约束吸收掉的维度：全场都刚好满足约束时，这两维没有信息量，明确点名而不是默默比
+    absorbed = [k for k in ("on_time_rate", "days_late_worst")
+                if k in keys and k in dead]
+    if dead:
+        notes.append(f"{len(dead)} 个维度全场同值，不参与后悔比较：{'、'.join(dead)}"
+                     f"（通常说明场景标定太松/太紧，或政策网格没有覆盖到能动这一维的手段）")
+        keys = [k for k in keys if k not in dead] or keys
+    if len(scored) <= 2:
+        notes.append(f"可行解只剩 {len(scored)} 个：前沿/后悔在这里没有意义，"
+                     f"结论只是「这套组合可行、别的都不行」，不要当成择优结果")
     front = pareto_front(scored, keys)
     # 后悔要在**全部可行解**上算，不是只在前沿内算：只算前沿会让被支配解拿到空后悔向量，
     # 空向量在字典序里"最小"，稳健推荐就会挑一个最差解（实测踩过）。
@@ -266,7 +297,11 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
                            "（先最小化最坏后悔，并列再比次坏，不靠顺序瞎选）。"
                            "不用加权总分：加权和会被'牺牲一维换另一维'刷高，"
                            "而工厂要的是不被任何单一目标绑死的平衡解。"),
-        "self_check": anti_goodhart_check(scored, keys),
+        "self_check": anti_goodhart_check(scored, keys) if len(scored) >= 4 else [],
+        "objective_spread": spread,
+        "non_discriminating_objectives": dead,
+        "absorbed_by_constraint": absorbed,
+        "notes": notes,
         "anti_goodhart": {
             "throughput_floor_ratio": MIN_THROUGHPUT_RATIO,
             "why": "产量不到需求 95% 的解直接淘汰 —— 否则'干脆不做'永远是最优解。",

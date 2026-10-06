@@ -103,6 +103,48 @@ CALENDAR_SQL = text("""
     WHERE (factory_id = :fid OR factory_id = 'default') AND is_active = true
 """)
 
+# 这条线已经排了多少活：能做的机种的开放工单计划量之和（按声明日产能折算占用天数）
+LINE_COMMITMENT_SQL = text("""
+    SELECT COALESCE(SUM(w.planned_qty), 0) AS committed_units
+    FROM work_orders w
+    WHERE w.factory_id = :fid AND w.wo_type = 'master'
+      AND w.status IN ('pending', 'released', 'in_progress')
+      AND w.product_id = ANY(CAST(:models AS text[]))
+""")
+
+EQUIP_RATE_SQL = text("""
+    SELECT COUNT(*) FILTER (WHERE status = 'running') AS running,
+           COUNT(*) AS total
+    FROM equipment WHERE factory_id = :fid
+""")
+
+
+def declared_models(line: Dict[str, Any]) -> List[str]:
+    raw = str(line.get("can_models") or "")
+    return [m.strip().strip("'").strip("\\") for m in raw.strip("{}").split(",") if m.strip()]
+
+
+async def line_committed_days(db: AsyncSession, factory_id: str, line: Dict[str, Any]) -> Dict[str, Any]:
+    """该线已承诺工单占掉多少天产线 —— 没有这一步，沙箱就是在一条"凭空空出来"的线上排新单。"""
+    models = declared_models(line)
+    if not models:
+        return {"committed_units": 0.0, "busy_days": 0.0}
+    row = (await db.execute(LINE_COMMITMENT_SQL,
+                            {"fid": factory_id, "models": models})).mappings().first()
+    units = float((row or {}).get("committed_units") or 0)
+    per_day = float(line.get("units_per_day") or 0) or 1.0
+    return {"committed_units": units, "busy_days": round(units / per_day, 2)}
+
+
+async def equipment_rate(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """设备可用率：停着 9 台保养、1 台故障，产线就不可能按满配跑。"""
+    row = (await db.execute(EQUIP_RATE_SQL, {"fid": factory_id})).mappings().first()
+    total = int((row or {}).get("total") or 0)
+    running = int((row or {}).get("running") or 0)
+    return {"running": running, "total": total,
+            "rate": round(running / total, 4) if total else 1.0}
+
+
 PART_BOM_SQL = text("""
     SELECT b.material_code, COALESCE(b.qty_per_unit, b.quantity, 0) AS qty_per_unit,
            m.make_or_buy, m.lead_time_days
@@ -279,7 +321,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                      lines: List[Dict[str, Any]], shift_days: set,
                      expedite_lead_days: Optional[int] = None, allow_partial: bool = True,
                      parallel_lines: int = 1, crew_bonus: float = 0.0,
-                     cached: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                     cached: Optional[Dict[str, Any]] = None,
+                     line_busy_days: float = 0.0, equip_rate: float = 1.0) -> Dict[str, Any]:
     """把一个目标跑成一条演变时间线。"""
     cache = (cached or {}).get(model)
     if not cache:
@@ -314,7 +357,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                  if str(r["lead_time_days"] or "").isdigit()]
         child_days = max(child_days, (max(leads) + 1) if leads else 0)
 
-    earliest_start = max(arrival, child_days)
+    # 开工要排在三件事之后：料齐、子件做完、这条线手上已承诺的活干完
+    earliest_start = max(arrival, child_days, int(line_busy_days))
     if hours_basis == "no_time_basis":
         return {"model_code": model, "units": units, "status": "no_time_basis",
                 "why": "既没有路线工时，也没有可归属的线节拍（线都没声明能做它）",
@@ -325,7 +369,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
 
     hours_per_day = float((line or {}).get("hours_per_day") or 11)
     crew = round(float((line or {}).get("crew_size") or 0) * (1.0 + crew_bonus), 1)
-    cap = float((line or {}).get("units_per_day") or 0) * max(1, int(parallel_lines))
+    cap = round(float((line or {}).get("units_per_day") or 0) * max(1, int(parallel_lines))
+                * max(0.1, min(1.0, equip_rate)), 2)     # 设备可用率折进实际日产能
 
     # 引擎的决策（不是计算器会做的事）：现料能做几台就先开几台，剩下的排在到货日之后
     coverable = []
@@ -391,6 +436,9 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                     line_basis: 1},
         "policy": {"allow_partial": allow_partial, "parallel_lines": parallel_lines,
                    "crew_bonus": crew_bonus, "expedite_lead_days": expedite_lead_days},
+        "line_busy_days_before_order": line_busy_days,
+        "equipment_rate_applied": round(equip_rate, 4),
+        "capacity_after_equipment": cap,
         "standby_note": ("等料那几天这条线是空的；只有把整班人守着这条线才算损失。"
                          "厂里还有几百张单没排，空档可以承接 —— 所以这笔是上限，不是必然发生的钱。"),
         "material_cost_usd": kit["material_cost"],
@@ -401,6 +449,73 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "actions": [a for a in run["timeline"]][:40],
         "po_lines": [l for l in kit["lines"] if l["short"] > 0 and l["make_or_buy"] == "外购"][:12],
     }
+
+
+async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rounds: int = 3,
+                     days_of_output: float = 6.0, lead_margin: float = 1.15) -> Dict[str, Any]:
+    """自己标定 → 自己扫 → 看失败原因 → 改标定/改网格 → 再扫。
+
+    三条调参规则都是从"上一轮哪里白算了"推出来的，不是拍脑袋：
+    ① 所有政策都准点 ⇒ 场景太松：收紧交期系数或加大批量，让准点这维真的有区分度；
+    ② 没有任何政策准点 ⇒ 场景不可能：把最狠的加急/并联档加进网格，或如实报告
+       "以现有提前期这个交期做不到"（这本身就是结论，不是失败）；
+    ③ 可行解 ≤2 个 ⇒ 比较没有意义：放宽一档标定或补政策档位，并标注本轮只做可行性筛选。
+    """
+    trajectory: List[Dict[str, Any]] = []
+    grid_extra: List[Dict[str, Any]] = []
+    for rnd in range(max(1, rounds)):
+        targets = await derive_targets(db, factory_id, models, days_of_output=days_of_output,
+                                       lead_margin=lead_margin)
+        grid = await build_policy_grid(db, factory_id, targets)
+        for extra in grid_extra:
+            if extra["name"] not in {g["name"] for g in grid}:
+                grid.append(extra)
+        scan = await scan_policies(db, factory_id, targets, policies=grid)
+        from api.services.pareto_eval import evaluate_by_scenario
+        verdict = evaluate_by_scenario(scan["by_scenario"], scan["demand_units"])
+        per = {k: {"recommended": (v.get("recommended") or {}).get("name"),
+                  "feasible": len(v.get("frontier") or []) + len(v.get("dominated") or []),
+                  "eliminated": len(v.get("eliminated") or []),
+                  "no_feasible": bool(v.get("no_feasible_solution")),
+                  "dead_dims": v.get("non_discriminating_objectives") or []}
+               for k, v in (verdict.get("by_scenario") or {}).items()}
+        feasible_counts = [p2["feasible"] for p2 in per.values()]
+        all_on_time = all(p2["eliminated"] == 0 for p2 in per.values())
+        none_on_time = any(p2["no_feasible"] for p2 in per.values())
+        action = {
+            "round": rnd,
+            "calibration": {"days_of_output": days_of_output, "lead_margin": lead_margin},
+            "per_scenario": per,
+            "robust": (verdict.get("robust_recommendation") or {}).get("policy"),
+            "policies_tried": len(grid),
+            "diagnosis": None, "next_tweak": None,
+        }
+        if none_on_time:
+            action["diagnosis"] = "有天气场景下没有任何政策能准点交付"
+            if lead_margin < 1.6:
+                lead_margin = round(lead_margin + 0.15, 2)
+                action["next_tweak"] = f"放宽交期系数到 {lead_margin}（先分清是政策不行还是交期本身不可能）"
+            else:
+                grid_extra.append({"name": "极限加急（提前期压到 2 天）+ 并联开满",
+                                   "expedite_lead_days": 2, "parallel_lines": 2})
+                action["next_tweak"] = "交期已放宽到 1.6 倍仍无解 → 补一档极限加急政策试试；" \
+                                       "再不行就是现有供应链提前期下这个交期做不到（这是结论）"
+        elif all_on_time:
+            action["diagnosis"] = "所有政策都准点：准点这维没有区分度，场景标得太松"
+            lead_margin = round(max(0.8, lead_margin - 0.1), 2)
+            action["next_tweak"] = f"收紧交期系数到 {lead_margin}"
+        elif feasible_counts and min(feasible_counts) <= 2:
+            action["diagnosis"] = "可行解太少（≤2），本轮只做可行性筛选，不宣称择优"
+            days_of_output = max(2.0, days_of_output - 1.0)
+            action["next_tweak"] = f"批量降到 {days_of_output:g} 天线产量，看中间地带"
+        else:
+            action["diagnosis"] = "各场景都有 ≥3 个可行解：本轮前沿与后悔比较可用"
+        trajectory.append(action)
+        if action["diagnosis"].startswith("各场景都有"):
+            break
+    return {"factory_id": factory_id, "rounds": len(trajectory),
+            "targets": targets, "final": trajectory[-1], "trajectory": trajectory,
+            "rule": "标定期望落在中间地带：既有政策能准点、也有政策会延期；两边都饱和时比较没有信息。"}
 
 
 async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
@@ -453,6 +568,40 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
             "lead_time_source": "materials.lead_time_days（外购全部有值）",
         },
     }
+
+async def build_policy_grid(db: AsyncSession, factory_id: str,
+                            targets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """政策档位从库里长出来，不写死：加急到几天、能并联几条线、能加多少人，都由现有数据决定。"""
+    lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
+    grid: List[Dict[str, Any]] = [{"name": "现况（分批开工）", "allow_partial": True},
+                                  {"name": "等齐套才开工（不分批）", "allow_partial": False}]
+    leads = set()
+    for t in targets:
+        bom = [dict(r) for r in (await db.execute(
+            BOM_SQL, {"fid": factory_id, "model": str(t["model_code"])})).mappings().all()]
+        for r in bom:
+            lead = str(r.get("lead_time_days") or "")
+            if lead.isdigit() and int(lead) > 2:
+                leads.add(int(lead))
+    for lead in sorted(leads, reverse=True)[:3]:
+        for factor, label in ((2, "减半"), (4, "压到 1/4")):
+            value = max(1, lead // factor)
+            grid.append({"name": f"瓶颈件提前期 {lead} 天 → {value} 天（{label}）",
+                         "expedite_lead_days": value})
+    groups: Dict[str, int] = {}
+    for l in lines:
+        groups[str(l.get("line_group") or l["line_code"])] = groups.get(
+            str(l.get("line_group") or l["line_code"]), 0) + 1
+    for grp, n in groups.items():
+        if n >= 2:
+            grid.append({"name": f"同组并联开满（{grp}={n} 条线）", "parallel_lines": n})
+    grid.append({"name": "加班加人 15%", "crew_bonus": 0.15})
+    grid.append({"name": "加班加人 30%", "crew_bonus": 0.30})
+    grid.append({"name": "无视已排 backlog 插单", "ignore_backlog": True})
+    grid.append({"name": "加急 1/4 + 并联开满", "expedite_lead_days": (
+        max(1, sorted(leads, reverse=True)[0] // 4) if leads else 5), "parallel_lines": 2})
+    return grid
+
 
 async def default_models(db: AsyncSession, factory_id: str, n: int = 2) -> List[str]:
     """默认取 BOM 最完整的 n 个机种，不从代码里写死机种名。"""
@@ -555,10 +704,14 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
     lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
     shift_days = {int(r["weekday"]) + 1 for r in
                   (await db.execute(CALENDAR_SQL, {"fid": factory_id})).mappings().all()} or {1, 2, 3, 4, 5, 6}
-    policies = policies or POLICIES
+    policies = policies or await build_policy_grid(db, factory_id, targets)
     scenarios = scenarios or WEATHER_SCENARIOS
     demand_units = sum(float(t.get("units") or 0) for t in targets)
 
+    equip = await equipment_rate(db, factory_id)
+    busy_by_line: Dict[str, Dict[str, Any]] = {}
+    for l in lines:
+        busy_by_line[l["line_code"]] = await line_committed_days(db, factory_id, l)
     cache: Dict[str, Any] = {}
     grouped: Dict[str, Any] = {}
     for scen in scenarios:
@@ -568,13 +721,16 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
         per_run: List[Dict[str, Any]] = []
         for t in targets:
             due_day = int(t.get("due_in_days") or 30)
+            busy = float((busy_by_line.get(str((pick_line(str(t["model_code"]), lines)[0] or {}).get("line_code") or ""),
+                                       {"busy_days": 0.0})).get("busy_days") or 0.0)
             run = await run_target(db, factory_id, str(t["model_code"]), float(t.get("units") or 0),
                                    today + timedelta(days=due_day), today, curve, lines, shift_days,
                                    expedite_lead_days=pol.get("expedite_lead_days"),
                                    allow_partial=bool(pol.get("allow_partial", True)),
                                    parallel_lines=int(pol.get("parallel_lines", 1)),
                                    crew_bonus=float(pol.get("crew_bonus", 0.0)),
-                                   cached=cache)
+                                   cached=cache, line_busy_days=(0.0 if pol.get("ignore_backlog") else busy),
+                                   equip_rate=float(equip.get("rate") or 1.0))
             per_run.append({"run": run, "due_day": due_day, "units": float(t.get("units") or 0)})
         worst_late = max(_objectives(x["run"], x["units"], x["due_day"])["days_late"] for x in per_run)
         on_time_n = sum(1 for x in per_run
@@ -592,6 +748,9 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                          for x in per_run) / max(1, len(per_run)), 4),
             "load_band_gap": round(sum(_objectives(x["run"], x["units"], x["due_day"])["load_band_gap"]
                                        for x in per_run) / max(1, len(per_run)), 4),  # 区间外才扣分
+            # 连续延误天数：0/1 准点率会让"延 1 天"和"延 20 天"在后悔值上一样重
+            "days_late_worst": max(_objectives(x["run"], x["units"], x["due_day"])["days_late"]
+                                   for x in per_run),
             "line_activation_cost_usd": round(sum(float(x["run"].get("line_activation_cost_usd") or 0)
                                                   for x in per_run), 2),
             "days_late_worst": worst_late,
