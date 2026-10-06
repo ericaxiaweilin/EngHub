@@ -1215,6 +1215,13 @@ def _numeric_claims(reply: str) -> List[str]:
     return numeric_claims(reply)
 
 
+def _annotate_reply_numbers(reply: str, actions: Any) -> str:
+    """答复出口的统一标注：本轮调过工具就不标（数字有出处），没调过就写明未经核实。"""
+    if actions:
+        return reply or ""
+    return _annotate_unverified_numbers(reply)
+
+
 def _annotate_unverified_numbers(reply: str) -> str:
     """没调工具却报了两个以上数字 → 显式标明未经核实。
 
@@ -2448,6 +2455,7 @@ async def _handle_kernel_chat(
         persist_hook=persist_after,
         permission_gate=permission_gate,
         model_reviewer=model_reviewer,
+        annotate_reply=_annotate_reply_numbers,
         deterministic_handler=deterministic_handler,
         event_persist=persist_event,
         event_commit=db.commit,
@@ -5377,6 +5385,7 @@ async def chat_eval_run(
         legacy_execute_tool=bound_execute,
         permission_gate=PermissionGate(),
         model_reviewer=ModelReviewer(call_llm=_call_llm, clean_reply=_clean_model_reply),
+        annotate_reply=_annotate_reply_numbers,
         **_checkpoint_options(),
     )
     ctx = await kernel.build_context(

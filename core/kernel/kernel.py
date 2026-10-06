@@ -95,6 +95,7 @@ class HarnessKernel:
         persist_hook: Optional[Callable[[KernelContext, "KernelResponse"], Awaitable[None]]] = None,
         permission_gate: Any = None,
         model_reviewer: Any = None,
+        annotate_reply: Optional[Callable[[str, List[Any]], str]] = None,
         checkpoint_manager: Optional[CheckpointManager] = None,
         checkpoint_session_factory: Optional[Callable[[], Any]] = None,
         checkpoint_persistence_enabled: bool = False,
@@ -125,6 +126,9 @@ class HarnessKernel:
         self._write_tools = write_tools or frozenset()
         self._permission_gate = permission_gate
         self._model_reviewer = model_reviewer
+        # 出口处的纯文本标注钩子：不调模型、不改语义，只把"这句话有没有查过库"写清楚。
+        # 与 verify_reply 不同，它在 reviewer 接管审校时**照样执行** —— 否则标注会被绕过。
+        self._annotate_reply = annotate_reply
         self._resolve_model_route = resolve_model_route
         self._tool_definitions = tool_definitions or []
         self._system_prompt = system_prompt
@@ -271,6 +275,12 @@ class HarnessKernel:
                     )
                     reply = review_result.revised_reply
                     ctx.metadata["model_review"] = review_result.to_dict()
+
+                if self._annotate_reply is not None and reply:
+                    try:
+                        reply = self._annotate_reply(reply, loop_result.actions)
+                    except Exception:  # noqa: BLE001
+                        _logger.exception("[kernel] annotate_reply failed for %s", request_id)
 
                 response = KernelResponse(
                     reply=reply,
