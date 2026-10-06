@@ -391,6 +391,8 @@ async def get_aps_draft_prune(
 @router.get("/idle-capacity", summary="闲置产能台账（只读，按工位报人·小时）")
 async def get_idle_capacity(
     factory_id: str = Query(..., description="厂区"),
+    objective: str = Query("labor_first",
+                           description="目标：labor_first / delivery_first / total_cost / balanced"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -399,11 +401,13 @@ async def get_idle_capacity(
 
     成本判断的形状：人力在岗即付（缺料 3 天且没别的单可做就是确定损失），
     设备全款则停着只是折旧 —— 所以"要不要调线"看的是人，不是机器。
-    这里只算到**人·小时**：库里没有薪资、没有设备原值/购置方式（实测 hr_employees 1,747 人 0 个
-    薪资列、equipment 无原值），把倍数编出来就是假账，等参数有人给再乘。
+
+    单价库里确实没有（hr_employees 1,747 人 0 个薪资列、equipment 无原值），
+    所以钱是按**内置默认标定**乘出来的，每项在 cost_basis 里标 default_calibration / override+来源；
+    换一个 objective（人力优先 / 交期优先 / 总成本）就换一套权重和排序，答案本身随目标变。
     """
     del current_user
-    return await idle_capacity_report(db, factory_id)
+    return await idle_capacity_report(db, factory_id, objective=objective)
 
 
 @router.get("/chain-convergence", summary="无人链条收敛自检（只读）")

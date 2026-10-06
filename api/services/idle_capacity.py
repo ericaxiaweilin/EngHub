@@ -182,7 +182,8 @@ def _station_people(name: str, code: str, rows: List[Any],
 
 
 async def idle_capacity_report(
-    db: AsyncSession, factory_id: str, *, as_of: date | None = None
+    db: AsyncSession, factory_id: str, *, as_of: date | None = None,
+    objective: str | None = None,
 ) -> Dict[str, Any]:
     """按仿真日历算一遍当天：各工位排了多少、其中多少开不了工、真闲置多少、能不能就地填满。"""
     if as_of is None:
@@ -270,7 +271,7 @@ async def idle_capacity_report(
     tot_person_idle = round(sum(l["idle_person_hours_estimated"] for l in lines), 1)
     tot_labor_available = round(sum(l["labor_hours_available_estimated"] for l in lines), 1)
     fillable_total = sum(l["fillable_kitted_orders"] for l in lines)
-    return {
+    out = {
         "factory_id": factory_id,
         "as_of": str(as_of),
         "clock_basis": clock_basis,
@@ -284,9 +285,42 @@ async def idle_capacity_report(
                               "「一条线几人 / 几班倒」的换算比（HR 只有 shift 字样：常日班/白班/"
                               "夜班/两班倒），所以这不是财务数，是给成本模型用的量。"),
         "kitted_unscheduled_orders_fillable": fillable_total,
-        "cost_note": ("钱没算：库里没有薪资与设备原值/购置方式（实测 hr_employees 1,747 人 0 个薪资列、"
-                      "equipment 无原值）。人·小时先算出来，等单价有人填再乘。"),
+        "cost_note": ("单价库里没有（hr_employees 1,747 人 0 个薪资列、equipment 无原值），"
+                      "下面这些钱是**内置默认标定**乘出来的，每项的 basis/来源在 cost_basis 里，"
+                      "填了 cost_parameters 就换掉对应项。"),
         "capacity_missing_stations": sum(1 for l in lines
                                          if l["capacity_basis"] != "station_capacity"),
         "top_idle": sorted(lines, key=lambda l: -l["idle_person_hours_estimated"])[:10],
     }
+
+    # 钱的部分：默认标定 × 上面这些量。换目标（人力优先/交期优先/总成本）就换排序，
+    # 参数被 cost_parameters 覆盖过就在 basis 里显示 override + 来源。
+    from api.services.cost_model import (RATE_OVERRIDES_SQL, cost_lines, reallocation_options,
+                                         resolve_rates)
+
+    overrides = [dict(x) for x in (await db.execute(
+        RATE_OVERRIDES_SQL, {"fid": factory_id})).mappings().all()]
+    rates = resolve_rates(overrides, objective=objective)
+    costed = cost_lines(lines, rates)
+    days = max(1, window_days)
+    out = {
+        **out,
+        "currency": rates["currency"],
+        "objective": rates["objective"],
+        "objective_label": rates["objective_label"],
+        "cost_basis": {code: {k: v for k, v in spec.items() if k in ("amount", "unit", "hard", "basis", "source")}
+                       for code, spec in rates["rates"].items()},
+        "cost_totals": {
+            "labor_idle_cost_window": round(sum(c["labor_idle_cost"] for c in costed), 2),
+            "labor_idle_cost_per_day": round(sum(c["labor_idle_cost"] for c in costed) / days, 2),
+            "equipment_idle_depreciation_window": round(
+                sum(c["equipment_idle_depreciation"] for c in costed), 2),
+            "equipment_idle_hard_window": round(sum(c["equipment_idle_hard"] for c in costed), 2),
+            "hard_cash_cost_window": round(sum(c["hard_cost_total"] for c in costed), 2),
+            "energy_avoided_by_idle_window": round(
+                sum(c["energy_avoided_by_idle"] for c in costed), 2),
+        },
+        "cost_by_station": sorted(costed, key=lambda c: -c["labor_idle_cost"])[:10],
+        "reallocation_options": reallocation_options(costed, lines, rates),
+    }
+    return out

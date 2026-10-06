@@ -89,4 +89,6 @@ async def test_report_sums_idle_person_hours_across_stations():
     assert line["idle_person_hours_estimated"] <= line["labor_hours_available_estimated"]
     assert line["fillable_kitted_orders"] == 1
     assert line["fillable_need_hours"] == 5.0     # 0.5 工时/件 × 10 件
-    assert out["cost_note"].startswith("钱没算")
+    # 闲置量一旦算出来，钱就跟着出来（用内置标定，来源标 default_calibration）
+    assert out["cost_totals"]["labor_idle_cost_window"] > 0
+    assert out["cost_basis"]["labor_person_day"]["basis"] == "default_calibration"
