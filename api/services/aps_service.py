@@ -29,6 +29,7 @@ from database.models import (
 
 from core.mes.capacity_math import load_station_models, summarize_load  # 工位日历与负荷的唯一口径
 
+from api.services.attendance_model import attendance_factor
 from api.services.idle_capacity import crew_by_station as crew_by_station_map
 from api.services.schedule_objective import normalize_objective, order_rank
 from api.services.time_basis import declared_step_seconds, load_time_basis, BASIS_NONE
@@ -857,7 +858,17 @@ class ApsService:
         # 4. 排产目标函数：谁先占产能由 objective 算出来，不再由排程器内部写死的分支决定。
         #    人力项要站得到人：路线工步的工位 → stations 主档名称 → HR 在岗人数，
         #    对不上就是 0 人·时（宁可这项不成立，也不给每台机器假设站 3 个人）。
-        crew_by_station = await crew_by_station_map(self.db, factory_id)
+        crew_in_roster = await crew_by_station_map(self.db, factory_id)
+        # 天气折算的出勤系数乘进人力维：暴雨天少来的人不该被算成"还能干活的产能"。
+        # 与闲置台账用同一个 attendance_factor，一处算两处用，免得两边折出不一致的数。
+        try:
+            attend = await attendance_factor(self.db, factory_id, on=horizon_start.date())
+        except Exception as exc:  # 外部气象接口取不到就按人到齐，但要在回执里标出来
+            attend = {"factor": 1.0, "unproven": True,
+                    "note": f"出勤系数取不到，按人到齐算：{type(exc).__name__}"}
+        crew_factor = float(attend.get("factor") or 1.0)
+        crew_by_station = {code: people * crew_factor
+                           for code, people in crew_in_roster.items()}
 
         order_features: List[Dict[str, Any]] = []
         for wo in work_orders:
@@ -1079,6 +1090,12 @@ class ApsService:
             "objective": ranking["objective"],
             "objective_label": ranking["objective_label"],
             "objective_weights": ranking["weights"],
+            # 人力项是"预计到岗的人"乘出来的，不是在册人数：暴雨天算出来的排序才是能落地的
+            "attendance_factor": crew_factor,
+            "attendance_unproven": bool(attend.get("unproven")),
+            # 在册 vs 预计到岗两栏都报出来：只看系数 0.97 感知不到少了多少人
+            "crew_in_roster": round(sum(crew_in_roster.values()), 1),
+            "crew_expected_present": round(sum(crew_by_station.values()), 1),
             "orders_ranked": len(ranking["rank"]),
             "orders_blocked_last": ranking["blocked_last"],
             "orders_with_person_hours": ranking["orders_with_person_hours"],

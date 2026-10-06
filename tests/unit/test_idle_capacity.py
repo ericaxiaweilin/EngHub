@@ -1,4 +1,5 @@
-"""闲置产能台账的口径：闲置按方案跨度算、人数按 HR 原始行加一次、匹配不到就说匹配不到。
+"""闲置产能台账的口径：闲置按方案跨度算、人数按 HR 原始行加一次、匹配不到就说匹配不到、
+缺勤按天气出勤系数扣掉后单列。
 
 第一版这里错得很难看：窗口取了"今天"，而方案排在另外 31 天里，于是每个工位都算成
 `available=8、scheduled=0、全天空转` —— 那是把口径 bug 报成经营结论。所以现在断言打在窗口上。
@@ -41,28 +42,25 @@ def test_window_comes_from_the_plan_not_from_today():
     assert "CAST(:as_of AS date) AS d0" not in sql
 
 
-@pytest.mark.asyncio
-async def test_report_sums_idle_person_hours_across_stations():
-    """只读：一张 UPDATE/INSERT 都不许发，且闲置按"工时 × 该工位人数"落到人·小时。"""
-    station_rows = [
-        {"station_id": "s1", "station_code": "ST-HJ-01", "station_name": "焊接车间",
-         "workshop_id": None, "window_days": 3, "available_hours": 24.0,
-         "efficiency_rate": 1, "setup_time_minutes": 0,
-         "capacity_known": True, "capacity_hours_per_day": 8.0, "required_skills": None,
-         "scheduled_hours": 4.0, "blocked_hours": 2.0, "scheduled_orders": 5},
-    ]
-    fill_rows = [{"id": "o1", "work_order_code": "WO-1", "planned_qty": 10,
-                  "routing_id": "rt-1", "routing_template_id": None}]
+_STATION_ROW = {"station_id": "s1", "station_code": "ST-HJ-01", "station_name": "焊接车间",
+                "workshop_id": None, "window_days": 3, "available_hours": 24.0,
+                "efficiency_rate": 1, "setup_time_minutes": 0,
+                "capacity_known": True, "capacity_hours_per_day": 8.0, "required_skills": None,
+                "scheduled_hours": 4.0, "blocked_hours": 2.0, "scheduled_orders": 5}
+_FILL_ROW = {"id": "o1", "work_order_code": "WO-1", "planned_qty": 10,
+             "routing_id": "rt-1", "routing_template_id": None}
 
+
+def _stub_db(hr_rows):
     async def execute(statement, params=None):
         r = MagicMock()
         sql = str(statement)
         if "FROM aps_schedule_tasks t" in sql and "win AS" in sql:
-            r.mappings.return_value.all.return_value = station_rows
+            r.mappings.return_value.all.return_value = [_STATION_ROW]
         elif "FROM work_orders wo" in sql:
-            r.mappings.return_value.all.return_value = fill_rows
+            r.mappings.return_value.all.return_value = [_FILL_ROW]
         elif "hr_employees" in sql:
-            r.mappings.return_value.all.return_value = [_hr("焊接", "操作员", 10)]
+            r.mappings.return_value.all.return_value = hr_rows
         elif "step_seq" in sql:
             r.mappings.return_value.first.return_value = {
                 "step_seq": 1, "station_code": "ST-HJ-01", "standard_hours": 0.5,
@@ -76,7 +74,26 @@ async def test_report_sums_idle_person_hours_across_stations():
 
     db = MagicMock()
     db.execute = execute
-    out = await ic.idle_capacity_report(db, "FAC_MECH_001", as_of=date(2026, 11, 2))
+    return db
+
+
+def _pin_attendance(monkeypatch, factor, condition="dry"):
+    """出勤系数必须钉住：单测去打真实气象接口，同一份代码在不同日子会给出不同的数。"""
+    from api.services import attendance_model
+
+    async def fake(db, factory_id, *, on=None):
+        return {"factor": factor, "condition": condition, "source": "pinned_for_test",
+                "region": "bacninh", "unproven": False, "note": "测试钉住"}
+
+    monkeypatch.setattr(attendance_model, "attendance_factor", fake)
+
+
+@pytest.mark.asyncio
+async def test_report_sums_idle_person_hours_across_stations(monkeypatch):
+    """只读：一张 UPDATE/INSERT 都不许发，且闲置按"工时 × 该工位人数"落到人·小时。"""
+    _pin_attendance(monkeypatch, 1.0)
+    out = await ic.idle_capacity_report(_stub_db([_hr("焊接", "操作员", 10)]),
+                                        "FAC_MECH_001", as_of=date(2026, 11, 2))
 
     line = out["top_idle"][0]
     assert out["plan_window_days"] == 3
@@ -92,3 +109,28 @@ async def test_report_sums_idle_person_hours_across_stations():
     # 闲置量一旦算出来，钱就跟着出来（用内置标定，来源标 default_calibration）
     assert out["cost_totals"]["labor_idle_cost_window"] > 0
     assert out["cost_basis"]["labor_person_day"]["basis"] == "default_calibration"
+
+
+@pytest.mark.asyncio
+async def test_absent_people_are_not_reported_as_idle_capacity(monkeypatch):
+    """暴雨天 30% 的人没来：那部分要单列成缺勤，不能混进"闲置产能"里让人去填单。
+
+    混了会发生什么：台账显示该工位 240 人·时可用、闲置 80%，计划员照着一版排到 200 人·时
+    的量 —— 而那 72 人·时根本没有人。
+    """
+    _pin_attendance(monkeypatch, 0.70, "storm")
+    out = await ic.idle_capacity_report(_stub_db([_hr("焊接", "操作员", 10)]),
+                                        "FAC_MECH_001", as_of=date(2026, 11, 2))
+
+    line = out["top_idle"][0]
+    assert line["headcount_hr"] == 10
+    assert line["headcount_expected_present"] == 7.0
+    assert line["labor_hours_available_estimated"] == 168.0    # 7 人 × 8h × 3 天
+    assert line["absent_person_hours"] == 72.0                 # 3 人 × 8h × 3 天
+    assert out["absent_person_hours_total"] == 72.0
+    assert out["attendance"]["factor"] == 0.70
+    assert out["attendance"]["condition"] == "storm"
+    assert out["attendance"]["unproven"] is False
+    # 缺勤不参与闲置折算：闲置人时只能吃预计到岗那 168 人·时
+    assert line["idle_person_hours_estimated"] <= line["labor_hours_available_estimated"]
+    assert out["labor_hours_available_estimated"] == 168.0

@@ -269,6 +269,40 @@ async def fetch_live_weather(on: ddate, region: str = DEFAULT_REGION) -> Dict[st
     return out
 
 
+async def attendance_factor(db, factory_id: str, *, on: Optional[ddate] = None) -> Dict[str, Any]:
+    """排产与闲置账要乘的那个系数：只给"今天几个人能干活"这一件事，一处算，两处用。
+
+    为什么单独拆一个函数：闲置台账按 HR 在岗人数算人·时，排产目标函数也按人数算人·时；
+    两处各自折算迟早会算出两个数（闲置那边说人没来、排产那边说人都在）。
+    拿不到天气依据时 factor=1.0 并明确标 `unproven`，
+    即"不知道天气就按人到齐算"，但读数里必须看得见这条假设。
+    """
+    today = (on or ddate.today())
+    region, region_source = await resolve_region(db, factory_id)
+    live = await fetch_live_weather(today, region)
+    month_shares = None
+    if live.get("ok"):
+        condition = weather_condition(live.get("precip_mm"), live.get("weather_code"))
+        source = "当日实况天气"
+    else:
+        climate = await fetch_climatology(region)
+        month_shares = (climate.get("months") or {}).get(str(today.month))
+        condition = draw_band(month_shares, f"{region},{today.isoformat()}") if month_shares else "unknown"
+        source = f"{region_meta(region)['label']}近 {HISTORY_YEARS} 年按月分布定档"
+    rate = attendance_rate(condition)
+    return {
+        "date": today.isoformat(),
+        "region": region,
+        "region_source": region_source,
+        "condition": condition,
+        "source": source,
+        "factor": rate if rate is not None else 1.0,
+        "unproven": rate is None,
+        "note": (None if rate is not None else
+                 "天气没有依据 → 按人到齐算（factor=1.0），这一维是假设不是实测"),
+    }
+
+
 async def expected_attendance(db, factory_id: str, *, on: Optional[ddate] = None) -> Dict[str, Any]:
     """某一天预计多少人到岗：在册 × 天气折算率，并说清天气是哪来的。"""
     on = on or ddate.today()

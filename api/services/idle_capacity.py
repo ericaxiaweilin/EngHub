@@ -228,6 +228,16 @@ async def idle_capacity_report(
     hr = [dict(r) for r in (await db.execute(
         HEADCOUNT_SQL, {"fid": factory_id})).mappings().all()]
     hr_index = _headcount_index(hr)
+    # 出勤系数：天气折算的"今天几个人能干活"。拿不到依据时按 1.0 算并标 unproven，
+    # 但读数里必须看得见这条假设 —— 不然暴雨天会把"人没来"报成"产能闲置"。
+    try:
+        from api.services.attendance_model import attendance_factor
+        attend = await attendance_factor(db, factory_id, on=as_of)
+    except Exception as exc:  # 外部气象接口不许把整张台账拖死
+        attend = {"factor": 1.0, "unproven": True, "condition": "unknown",
+                "source": None, "region": None,
+                "note": f"出勤系数取不到，按人到齐算：{type(exc).__name__}"}
+    attend_factor = float(attend.get("factor") or 1.0)
     fillable = (await db.execute(FILLABLE_SQL, {"fid": factory_id})).mappings().all()
 
     # 齐套未排的单按"首道工序工位"归堆：闲置要能被填掉才算得了数
@@ -262,12 +272,17 @@ async def idle_capacity_report(
         people = _station_people(str(s["station_name"] or ""), str(s["station_code"] or ""), hr, hr_index)
         headcount = sum(people.values())
         fill = fill_by_station.get(str(s["station_code"]), None)
-        labor_available = round(headcount * 8.0 * window_days, 1)
+        # 在册人数 × 出勤系数 = 预计到岗；人·时按到岗人数算
+        present = round(headcount * attend_factor, 1)
+        absent_person_hours = round(headcount * (1.0 - attend_factor) * 8.0 * window_days, 1)
+        labor_available = round(present * 8.0 * window_days, 1)
         idle_ratio = round(idle / available, 4) if available > 0 else 0.0
         lines.append({
             "station_code": s["station_code"],
             "station_name": s["station_name"],
             "headcount_hr": headcount,
+            "headcount_expected_present": present,
+            "absent_person_hours": absent_person_hours,
             "positions_by_role": people,
             "available_hours": available,
             "scheduled_hours": scheduled,
@@ -301,6 +316,16 @@ async def idle_capacity_report(
         "factory_id": factory_id,
         "as_of": str(as_of),
         "clock_basis": clock_basis,
+        "attendance": {
+            "factor": attend_factor,
+            "condition": attend.get("condition"),
+            "source": attend.get("source"),
+            "region": attend.get("region"),
+            "unproven": bool(attend.get("unproven")),
+            "note": attend.get("note"),
+            "rule": "人·时按预计到岗人数算；缺勤那部分单列 absent_person_hours，不混进闲置（人没来不是有空闲产能）",
+        },
+        "absent_person_hours_total": round(sum(l["absent_person_hours"] for l in lines), 1),
         "plan_window_days": window_days,
         "stations": len(lines),
         "idle_hours": tot_idle,
