@@ -85,7 +85,7 @@ STOCK_SQL = text("""
 """)
 
 LINES_SQL = text("""
-    SELECT line_code, line_group, hours_per_day, units_per_day, crew_size,
+    SELECT line_code, line_group, hours_per_day, units_per_day, group_units_per_day, crew_size,
            can_make_models::text AS can_models, default_model
     FROM line_profiles WHERE factory_id = :fid AND is_active = true ORDER BY line_code
 """)
@@ -368,9 +368,9 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                 "due": str(due)}
 
     hours_per_day = float((line or {}).get("hours_per_day") or 11)
-    crew = round(float((line or {}).get("crew_size") or 0) * (1.0 + crew_bonus), 1)
-    cap = round(float((line or {}).get("units_per_day") or 0) * max(1, int(parallel_lines))
-                * max(0.1, min(1.0, equip_rate)), 2)     # 设备可用率折进实际日产能
+    group_cap = group_capacity(lines, line or {}, parallel_lines)
+    crew = round(group_cap["crew"] * (1.0 + crew_bonus), 1)
+    cap = round(group_cap["units_per_day"] * max(0.1, min(1.0, equip_rate)), 2)  # 设备可用率折进日产能
 
     # 引擎的决策（不是计算器会做的事）：现料能做几台就先开几台，剩下的排在到货日之后
     coverable = []
@@ -439,6 +439,7 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "line_busy_days_before_order": line_busy_days,
         "equipment_rate_applied": round(equip_rate, 4),
         "capacity_after_equipment": cap,
+        "capacity_basis": group_cap["capacity_basis"],
         "standby_note": ("等料那几天这条线是空的；只有把整班人守着这条线才算损失。"
                          "厂里还有几百张单没排，空档可以承接 —— 所以这笔是上限，不是必然发生的钱。"),
         "material_cost_usd": kit["material_cost"],
@@ -603,6 +604,30 @@ async def build_policy_grid(db: AsyncSession, factory_id: str,
     return grid
 
 
+def group_capacity(lines: List[Dict[str, Any]], line: Dict[str, Any],
+                   parallel_lines: int) -> Dict[str, Any]:
+    """并联产能只能按线组声明的合并产能算 —— 跑步机线 11h/300 台、bike 单线 400 台但
+    **两线合并 700 不是 800**（用户 10-06 第三次口述定稿）。按 n×单线乘出来的产能会凭空多出 14% 富余，
+    而这 14% 正好会改变"缺料能不能靠另一条线追回"的结论。"""
+    single = float(line.get("units_per_day") or 0)
+    group = str(line.get("line_group") or "")
+    n = max(1, int(parallel_lines))
+    if n <= 1 or not group:
+        return {"units_per_day": single, "capacity_basis": "single_line",
+                "crew": float(line.get("crew_size") or 0)}
+    members = [l for l in lines if str(l.get("line_group") or "") == group]
+    group_total = float((members[0] if members else {}).get("group_units_per_day") or 0)
+    crew_total = sum(float(l.get("crew_size") or 0) for l in members[:n]) if members else float(
+        line.get("crew_size") or 0) * n
+    if group_total > 0:
+        # 合并产能是厂里声明的上限，最多用到它，不许按线数乘出来
+        return {"units_per_day": round(min(single * n, group_total), 2),
+                "capacity_basis": f"group_declared({group}={group_total:g}/天)",
+                "crew": round(crew_total, 1)}
+    return {"units_per_day": single * n, "capacity_basis": f"multiplied({n} lines, 组内未声明合并产能)",
+            "crew": round(crew_total, 1)}
+
+
 async def default_models(db: AsyncSession, factory_id: str, n: int = 2) -> List[str]:
     """默认取 BOM 最完整的 n 个机种，不从代码里写死机种名。"""
     rows = (await db.execute(text("""
@@ -712,6 +737,12 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
     busy_by_line: Dict[str, Dict[str, Any]] = {}
     for l in lines:
         busy_by_line[l["line_code"]] = await line_committed_days(db, factory_id, l)
+    # 同组线共享已承诺量：一条线排着的活，并联时也占同一批人力/同一组产能
+    group_busy: Dict[str, float] = {}
+    for l in lines:
+        grp = str(l.get("line_group") or l["line_code"])
+        group_busy[grp] = max(group_busy.get(grp, 0.0),
+                              float(busy_by_line[l["line_code"]]["busy_days"]))
     cache: Dict[str, Any] = {}
     grouped: Dict[str, Any] = {}
     for scen in scenarios:
