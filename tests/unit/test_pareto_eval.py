@@ -27,9 +27,18 @@ def test_dominance_is_over_all_objectives():
              expedite_cost_usd=0, standby_person_days=0, data_confidence=0.9, peak_load_ratio=1.0)
     assert pe.dominates(a, b, ALL) and not pe.dominates(b, a, ALL)
     # 各赢一维 → 互不支配，都该留在前沿上
+    # 各赢一个**目标**维才叫互不支配（准点率/产量现在是约束，不再算目标）
     c = _sol("c", on_time_rate=1.0, throughput_units=300, labor_cost_usd=300,
-             expedite_cost_usd=0, standby_person_days=0, data_confidence=1.0, peak_load_ratio=1.0)
-    assert not pe.dominates(a, c, ALL) and not pe.dominates(c, a, ALL)
+             expedite_cost_usd=0, standby_person_days=0, data_confidence=1.0,
+             load_band_gap=0.0, line_activation_cost_usd=0)
+    assert pe.dominates(a, c, ALL)          # a 更便宜且别处不差 → a 支配 c
+    d = _sol("d", on_time_rate=1.0, throughput_units=300, labor_cost_usd=300,
+             expedite_cost_usd=0, standby_person_days=0, data_confidence=1.0,
+             load_band_gap=0.0, line_activation_cost_usd=0)
+    e = _sol("e", on_time_rate=1.0, throughput_units=300, labor_cost_usd=50,
+             expedite_cost_usd=99, standby_person_days=0, data_confidence=1.0,
+             load_band_gap=0.0, line_activation_cost_usd=0)
+    assert not pe.dominates(d, e, ALL) and not pe.dominates(e, d, ALL)
 
 
 def test_doing_nothing_is_eliminated_not_optimal():
@@ -108,7 +117,7 @@ def test_hard_constraint_dims_are_named_not_silently_compared():
                                          "load_band_gap": 0.2, "line_activation_cost_usd": 10,
                                          "days_late_worst": 0})]
     out = pe.evaluate(keep, demand_units=600, keys=list(pe.DIRECTIONS))
-    assert set(out["absorbed_by_constraint"]) == {"on_time_rate", "days_late_worst"}
+    assert {"on_time_rate", "throughput_units"} <= set(out["absorbed_by_constraint"])
     assert out["recommended"]["id"] == "k1"          # 剩下按成本/加急/空档/负载/开线费比
 
 
@@ -160,10 +169,13 @@ def test_regret_is_normalized_per_objective():
         _sol("b", on_time_rate=0.0, throughput_units=300, labor_cost_usd=200,
              expedite_cost_usd=0, standby_person_days=0, data_confidence=1.0, peak_load_ratio=1.0),
     ]
-    r = pe.regret_matrix(sols, ALL)
-    assert r["a"]["on_time_rate"] == 0.0 and r["b"]["on_time_rate"] == 1.0
+    keys = ["labor_cost_usd", "expedite_cost_usd", "standby_person_days"]
+    r = pe.regret_matrix(sols, keys)
     assert r["a"]["labor_cost_usd"] == 0.0 and r["b"]["labor_cost_usd"] == 1.0
     assert r["a"]["expedite_cost_usd"] == 0.0          # 同值目标后悔为 0
+    # 准点率/产量已经不是目标维（它们是硬约束），写进 keys 会直接报错而不是被当成可优化的分
+    with pytest.raises(KeyError):
+        pe.regret_matrix(sols, ["on_time_rate"])
 
 
 def _scenario(name, sols):

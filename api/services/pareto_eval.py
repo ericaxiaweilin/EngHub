@@ -19,13 +19,12 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 # 方向：max 越大越好，min 越小越好
+# 只有这五项是"政策能改变"的目标：交期达成与产量都是硬约束（达标就恒定，比不出东西），
+# 依据可信度是模型属性（换政策不会变）—— 它们进约束/标注，不进目标向量。
 DIRECTIONS = {
-    "on_time_rate": "max",            # 准点交付比例
-    "throughput_units": "max",        # 真做出来的台数（不许用"不开工"来省钱）
     "labor_cost_usd": "min",
     "expedite_cost_usd": "min",       # 加急/插单的对价
     "standby_person_days": "min",     # 等料空档（养线的代价）
-    "data_confidence": "max",         # 依据里有多少是声明的、多少是借/假设的
     "load_band_gap": "min",           # 离人力健康负载区间的偏离（养闲和超载都要付）
     "line_activation_cost_usd": "min",  # 开第二条线的代价 —— 没有它，"多开线"就是免费的
     "days_late_worst": "min",         # 连续延误天数：0/1 准点率会饱和，延 1 天和延 20 天不该同重
@@ -70,14 +69,15 @@ def dominates(a: Dict[str, Any], b: Dict[str, Any], keys: List[str]) -> bool:
     return better_or_equal and strictly_better
 
 
-def feasible(sol: Dict[str, Any], demand_units: float) -> Tuple[bool, Optional[str]]:
+def feasible(sol: Dict[str, Any], demand_units: float,
+             ignore_deadline: bool = False) -> Tuple[bool, Optional[str]]:
     made = _value(sol, "throughput_units")
     if demand_units > 0 and made < demand_units * MIN_THROUGHPUT_RATIO:
         return False, (f"只做出来 {made:g}/{demand_units:g} 台（<{MIN_THROUGHPUT_RATIO:.0%}）—— "
                        f"省下的成本是不干活省的，不参与比较")
     # 交期一旦作为硬约束，"准点率/延误天数"就不能再当比较维度：存活解在这两维必然全同，
     # 留着只会让 regret 算出 0 分并把有效维度稀释掉。它们仍作为事实报出，只是不参与择优。
-    if _value(sol, "on_time_rate") < ON_TIME_REQUIRED:
+    if not ignore_deadline and _value(sol, "on_time_rate") < ON_TIME_REQUIRED:
         return False, ("误期：交期是合同约束，不能用低成本/低闲置换回来"
                        f"（准点率 {_value(sol, 'on_time_rate'):.2f} < {ON_TIME_REQUIRED:.2f}）")
     return True, None
@@ -210,7 +210,7 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any], demand_units: float,
 def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
              keys: Optional[List[str]] = None) -> Dict[str, Any]:
     """产出前沿、被淘汰的解、推荐解，以及每步判定的理由（可复核，不给单一总分）。"""
-    keys = keys or list(DIRECTIONS)
+    base_keys = keys or list(DIRECTIONS)
     scored: List[Dict[str, Any]] = []
     notes: List[str] = []
     eliminated: List[Dict[str, Any]] = []
@@ -226,8 +226,16 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         scored.append(sol)
     no_feasible = False
     if not scored and solutions:
-        # 一个场景里没有任何准点解：不能空手而归，退回比较全部并明确标注"这是矮子里拔将军"
+        # 一个场景里没有任何准点解：退回比较全部（矮子里拔将军），此时延误天数才重新变成目标
         no_feasible = True
+        keys = base_keys + ["days_late_worst"]
+        notes.append("本场景没有准点解：改按延误天数择优，并明确标注这是降级比较")
+        for sol in solutions:
+            ok, _ = feasible(sol, demand_units, ignore_deadline=True)
+            sol = dict(sol)
+            sol["assumption_share"] = assumption_share(sol)
+            if ok:
+                scored.append(sol)
         for sol in solutions:
             sol = dict(sol)
             sol["assumption_share"] = assumption_share(sol)
@@ -235,13 +243,13 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         eliminated = rejected
         rejected = []
 
+    keys = locals().get("keys") or base_keys
     # 全场同值的维度没有区分度：留在向量里会让 regret/self_check 说胡话（n=1 时会把每个维度
     # 都报成"可被刷"）。挑出来并从比较用的 keys 里摘掉，但在结果里明说摘了哪些。
-    spread = objective_spread(scored, keys)
+    spread = objective_spread(scored, keys + ["on_time_rate", "throughput_units"])
     dead = [s["objective"] for s in spread if s["useless"]]
-    # 硬约束吸收掉的维度：全场都刚好满足约束时，这两维没有信息量，明确点名而不是默默比
-    absorbed = [k for k in ("on_time_rate", "days_late_worst")
-                if k in keys and k in dead]
+    # 硬约束吸收掉的维度：准点与产量达标后必然恒定，明确点名而不是默默比
+    absorbed = [k for k in ("on_time_rate", "throughput_units", "days_late_worst") if k in dead]
     if dead:
         notes.append(f"{len(dead)} 个维度全场同值，不参与后悔比较：{'、'.join(dead)}"
                      f"（通常说明场景标定太松/太紧，或政策网格没有覆盖到能动这一维的手段）")
@@ -259,9 +267,17 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         sol["regret_by_objective"] = r
         sol["on_pareto_front"] = any(s["id"] == sol["id"] for s in front)
 
-    # 推荐：前沿里"最大后悔最小"的那个；假设占比过高的不能当推荐
-    eligible = [s for s in front if s.get("assumption_share", 0) <= ASSUMPTION_SHARE_LIMIT]
-    pool = eligible or front or scored
+    # 推荐：先看前沿里依据够扎实的；若前沿解全靠借用/假设数据撑起来，
+    # 宁可退回"可靠依据的解里较好的那个"并明说它不在前沿上 —— 借来的路线不算赢。
+    solid = [s for s in scored if s.get("assumption_share", 0) <= ASSUMPTION_SHARE_LIMIT]
+    eligible = [s for s in front if s in solid]
+    out_of_frontier = False
+    pool = eligible
+    if not pool and solid:
+        pool, out_of_frontier = solid, True
+        notes.append("帕累托前沿上的解全靠借用路线/反推工时撑着，不配当结论："
+                     "已退到依据可靠的解里选（推荐解不在前沿上，这点会写进结果）")
+    pool = pool or front or scored
     recommended = None
     if pool:
         # 最大后悔并列时不能靠顺序瞎选：把每个解的后悔从最坏到最好排成向量比字典序，
@@ -292,6 +308,7 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         "eliminated": rejected,
         "no_feasible_solution": no_feasible,
         "recommended": recommended,
+        "recommended_off_frontier": out_of_frontier,
         "recommended_note": recommended_note,
         "selection_rule": ("可行解 → 帕累托前沿 → 前沿里选后悔向量字典序最小的解"
                            "（先最小化最坏后悔，并列再比次坏，不靠顺序瞎选）。"
