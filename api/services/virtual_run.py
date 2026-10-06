@@ -598,7 +598,7 @@ async def recommendation_followthrough(db: AsyncSession, factory_id: str,
 # 动作排序：先"今天就能下单/开工"的，再"要人去确认"的，最后是主数据缺口。
 _ACTION_PRIORITY = {"expedite_purchase": 0, "supplier_master_missing": 1, "start_first_batch": 2,
                     "schedule_second_batch_after_arrival": 3, "activate_parallel_line": 4,
-                    "authorize_overtime": 5, "master_data_gap": 6}
+                    "authorize_overtime": 5, "model_data_gap": 6, "master_data_gap": 7}
 
 
 def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
@@ -639,6 +639,12 @@ def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
         due = d.get("due_date")
         base = {"model_code": m, "scenario": scen, "due_date": due,
                 "planned_finish_date": d.get("finish_date"), "sandbox_only": True}
+        if d.get("status") and str(d.get("status")) != "simulated":
+            # 这台机种从比较里摘掉了：不是厂里做不到，是模型没有能算工时的依据 —— 要补的是数据
+            out.append({**base, "type": "model_data_gap", "units_excluded": d.get("units"),
+                        "detail": f"{m}：{d.get('status')} — {d.get('why')}",
+                        "note": "它不进产量底线也不进这轮推荐；补上工时依据（IE 标准工时或线声明节拍）才能推演"})
+            continue
         if int(pol.get("parallel_lines") or 1) > 1:
             out.append({**base, "type": "activate_parallel_line", "line": d.get("line"),
                         "capacity_basis": d.get("capacity_basis"), "crew_verified": False,
@@ -811,8 +817,12 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
                     disc["verdict"] = "本场景没有准点解：已降级按延误天数比较，这是结论不是失败"
                 else:
                     disc["verdict"] = "落在有信息量的区间：可行比例在带内，推荐解与次优解有后悔差"
+            blocked = {(b.get("model_code"), str(b.get("status")))
+                       for s in ((scan["by_scenario"].get(name) or {}).get("solutions") or [])
+                       for b in (s.get("blocked_models") or [])}
             per[name] = {"calibration": dict(cal),
                          "demand_units": scan["demand_by_scenario"].get(name),
+                         "blocked_models": [{"model_code": mc, "status": st} for mc, st in sorted(blocked)],
                          "recommended_objectives": (res.get("recommended") or {}).get("objectives"),
                          "recommended_off_frontier": res.get("recommended_off_frontier"),
                          **disc}
@@ -1083,8 +1093,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
       curve = {d: float(scen.get("attendance", 0.97)) for d in range(0, 400)}
       # 每个天气场景可以用自己标定的目标（批量/交期系数），全局值兜底
       scen_targets = (targets_by_scenario or {}).get(scen["name"]) or targets
-      demand_by_scenario[scen["name"]] = round(sum(float(t.get("units") or 0)
-                                                    for t in scen_targets), 2)
+      demand_by_scenario[scen["name"]] = 0.0   # 逐政策算，只算"能推演的那部分需求"
       solutions: List[Dict[str, Any]] = []
       for pol in policies:
         per_run: List[Dict[str, Any]] = []
@@ -1101,24 +1110,39 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                    cached=cache, line_busy_days=(0.0 if pol.get("ignore_backlog") else busy),
                                    equip_rate=float(equip.get("rate") or 1.0))
             per_run.append({"run": run, "due_day": due_day, "units": float(t.get("units") or 0)})
-        worst_late = max(_objectives(x["run"], x["units"], x["due_day"])["days_late"] for x in per_run)
-        on_time_n = sum(1 for x in per_run
+        # 没有工时依据/没有可归属线的机种不算"厂里做不到"，是模型还代表不了它 —— 缺的是数据。
+        # 把它们留在需求量里，每个政策都会卡产量底线，整轮扫描退化成"全都不可行"（实测踩过）。
+        work = [x for x in per_run if x["run"].get("status") == "simulated"]
+        blocked = [{"model_code": x["run"].get("model_code"), "units": x["units"],
+                    "status": x["run"].get("status"), "why": x["run"].get("why")}
+                   for x in per_run if x["run"].get("status") != "simulated"]
+        if not work:
+            solutions.append({"id": f"{scen['name']}-pol{len(solutions)}", "name": pol["name"],
+                              "scenario": scen["name"],
+                              "attendance": float(scen.get("attendance", 0.97)),
+                              "policy": pol, "objectives": {}, "evidence": {},
+                              "blocked_models": blocked, "detail": [],
+                              "note": "这些机种都没有可推演的依据（缺工时/缺可归属线），本轮不产出解"})
+            continue
+        demand_by_scenario[scen["name"]] = round(sum(float(x["units"] or 0) for x in work), 2)
+        worst_late = max(_objectives(x["run"], x["units"], x["due_day"])["days_late"] for x in work)
+        on_time_n = sum(1 for x in work
                         if _objectives(x["run"], x["units"], x["due_day"])["on_time_rate"] >= 1.0)
-        made = sum(_objectives(x["run"], x["units"], x["due_day"])["throughput_units"] for x in per_run)
+        made = sum(_objectives(x["run"], x["units"], x["due_day"])["throughput_units"] for x in work)
         objs = {
-            "on_time_rate": round(on_time_n / max(1, len(per_run)), 4),
+            "on_time_rate": round(on_time_n / max(1, len(work)), 4),
             "throughput_units": round(made, 2),
-            "labor_cost_usd": round(sum(float(x["run"].get("labor_cost_usd") or 0) for x in per_run), 2),
+            "labor_cost_usd": round(sum(float(x["run"].get("labor_cost_usd") or 0) for x in work), 2),
             "expedite_cost_usd": round(sum(float(x["run"].get("expedite_cost_usd") or 0)
-                                           for x in per_run), 2),
+                                           for x in work), 2),
             "standby_person_days": round(sum(float(x["run"].get("standby_person_days_if_line_held") or 0)
-                                             for x in per_run), 1),
+                                             for x in work), 1),
             "data_confidence": round(sum(_objectives(x["run"], x["units"], x["due_day"])["data_confidence"]
-                                         for x in per_run) / max(1, len(per_run)), 4),
+                                         for x in work) / max(1, len(work)), 4),
             "load_band_gap": round(sum(_objectives(x["run"], x["units"], x["due_day"])["load_band_gap"]
-                                       for x in per_run) / max(1, len(per_run)), 4),  # 区间外才扣分
+                                       for x in work) / max(1, len(work)), 4),  # 区间外才扣分
             "line_activation_cost_usd": round(sum(float(x["run"].get("line_activation_cost_usd") or 0)
-                                                  for x in per_run), 2),
+                                                  for x in work), 2),
             # 连续延误天数：0/1 准点率会让"延 1 天"和"延 20 天"在后悔值上一样重
             "days_late_worst": worst_late,
         }
@@ -1127,13 +1151,15 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
             "scenario": scen["name"], "attendance": float(scen.get("attendance", 0.97)),
             "policy": pol,
             "objectives": objs,
-            "evidence": {str(x["run"].get("route_basis")): 1 for x in per_run}
-                        | {str(x["run"].get("hours_basis")): 1 for x in per_run}
-                        | {str(x["run"].get("line_basis")): 1 for x in per_run},
+            "blocked_models": blocked,
+            "evidence": {str(x["run"].get("route_basis")): 1 for x in work}
+                        | {str(x["run"].get("hours_basis")): 1 for x in work}
+                        | {str(x["run"].get("line_basis")): 1 for x in work},
             "detail": [{"model_code": x["run"].get("model_code"),
                         "units": x["run"].get("units"), "finish_date": x["run"].get("finish_date"),
                         "due_date": x["run"].get("due_date"), "days_late": x["run"].get("days_late"),
                         "status": x["run"].get("status"), "line": x["run"].get("line"),
+                        "why": x["run"].get("why"),
                         "capacity_basis": x["run"].get("capacity_basis"),
                         "material_arrival_day": x["run"].get("material_arrival_day"),
                         "batch_a_units": x["run"].get("batch_a_units"),

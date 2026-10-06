@@ -230,7 +230,8 @@ def _scan_with(policy_name, scen_details, *, expedite_lead_days=None, parallel=1
 def test_recommendation_names_the_part_the_supplier_and_the_date():
     """政策要变成动作：哪个料号、向谁催、几号前下单、几号前要到。"""
     scan, verdict = _scan_with("加急到 10 天", {
-        "暴雨": [{"model_code": "FG-TREAD-003", "units": 1800, "days_late": 0,
+        "暴雨": [{"model_code": "FG-TREAD-003", "units": 1800, "status": "simulated",
+                 "days_late": 0,
                  "material_arrival_day": 20, "due_date": "2026-11-06",
                  "finish_date": "2026-11-04", "line": "LINE-TREAD-01",
                  "batch_a_units": 600, "batch_b_units": 1200,
@@ -258,7 +259,8 @@ def test_recommendation_names_the_part_the_supplier_and_the_date():
 def test_missing_supplier_becomes_a_data_action_not_an_invented_vendor():
     """没有供应商主数据就不许编一个厂商出来 —— 这类缺口卡的是数据，不是产能。"""
     scan, verdict = _scan_with("加急到 10 天", {
-        "好天": [{"model_code": "X", "days_late": 0, "material_arrival_day": 15,
+        "好天": [{"model_code": "X", "status": "simulated", "days_late": 0,
+                 "material_arrival_day": 15,
                  "bottleneck_part": {"material_code": "M-2", "short": 40,
                                      "lead_time_days": 15, "supplier": None},
                  "blockers": ["M-2 无提前期"]}]}, expedite_lead_days=5)
@@ -273,7 +275,8 @@ def test_missing_supplier_becomes_a_data_action_not_an_invented_vendor():
 
 def test_actions_use_the_tightest_weather_scenario_not_the_pretty_one():
     """按好天的到货日下单，暴雨天就直接失约 —— 动作依据必须取最紧那个场景。"""
-    easy = {"model_code": "X", "days_late": 0, "material_arrival_day": 10,
+    easy = {"model_code": "X", "status": "simulated", "days_late": 0,
+            "material_arrival_day": 10,
             "finish_date": "2026-10-20", "due_date": "2026-10-25",
             "bottleneck_part": {"material_code": "M-1", "short": 10,
                                 "lead_time_days": 20, "supplier": "VN-1"},
@@ -297,7 +300,8 @@ def test_no_robust_policy_no_actions():
 def test_batch_actions_survive_for_every_model():
     """分批/开线这类动作没有"料号"身份，不能因为身份为空就被当成重复项吃掉。"""
     def detail(m, a_units, b_units):
-        return {"model_code": m, "days_late": 0, "material_arrival_day": 12,
+        return {"model_code": m, "status": "simulated", "days_late": 0,
+                "material_arrival_day": 12,
                 "batch_a_units": a_units, "batch_b_units": b_units,
                 "bottleneck_part": None, "blockers": ["RM-X 未标自制/外购"]}
     scan, verdict = _scan_with("现况", {"好天": [detail("M-1", 10, 90), detail("M-2", 20, 80)]})
@@ -367,3 +371,16 @@ async def test_followthrough_without_named_part_says_so():
     out = await vr.recommendation_followthrough(
         db, "FAC_MECH_001", [{"type": "start_first_batch", "model_code": "M-1"}])
     assert out["checked"] == 0 and out["adopted"] == [] and out["not_acted"] == []
+
+
+def test_unsimulatable_model_becomes_a_data_gap_not_a_failed_plan():
+    """没有工时依据的机种要说成"补数据"，不能算成"厂里做不到这批货"。"""
+    scan, verdict = _scan_with("现况", {"好天": [
+        {"model_code": "X-NO-ROUTE", "units": 500, "status": "no_time_basis",
+         "why": "既没有路线工时，也没有可归属的线节拍（线都没声明能做它）",
+         "days_late": 0, "material_arrival_day": 0, "blockers": []}]})
+    acts = vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))
+    gaps = [a for a in acts if a["type"] == "model_data_gap"]
+    assert len(gaps) == 1 and "no_time_basis" in gaps[0]["detail"]
+    assert gaps[0]["units_excluded"] == 500
+    assert not [a for a in acts if a["type"] in ("expedite_purchase", "start_first_batch")]

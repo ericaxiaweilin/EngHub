@@ -207,7 +207,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         seed = json.loads((prev or {}).get("calibration") or "{}")
     except (TypeError, ValueError):
         seed = {}
-    tuned = await auto_tune(db, factory_id, models or await default_models(db, factory_id, n=2),
+    tuned = await auto_tune(db, factory_id, models or await default_models(db, factory_id, n=5),
                             rounds=4, calibration=seed)
     verdict = {"by_scenario": {k: v for k, v in (tuned["final"]["per_scenario"] or {}).items()},
                "robust_recommendation": {"policy": tuned["final"].get("robust"),
@@ -322,7 +322,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     robustness_pct = round(100.0 * on_time_scen / max(1, len(per_scenario)), 1)
     await db.execute(INSERT_SQL, {
         "id": _gen_id(), "fid": factory_id, "eday": date.today(),
-        "models": len(per_scenario), "score": robustness_pct,
+        # models 列存的是"这轮推演了几台机种"，不是天气场景数（原先误填 len(per_scenario)=3）
+        "models": len(tuned.get("targets") or []), "score": robustness_pct,
         "weights": json.dumps({"rule": "minimax regret over weather scenarios",
                                "score_meaning": "稳健度：推荐政策在多少个天气场景下真正准点（不是加权总分）",
                                "objectives": objectives},
