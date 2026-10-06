@@ -293,3 +293,112 @@ async def run_scenarios(db: AsyncSession, factory_id: str, scenarios: Dict[str, 
                                                 coverage_by_model=coverage_by_model)
                                   for s in strategies]
     return out
+
+
+LINES_SQL = text("""
+    SELECT line_code, line_name, hours_per_day, units_per_day, crew_size,
+           parallel_lines, can_make_models, cannot_make_models, default_model, source, note
+    FROM line_profiles
+    WHERE factory_id = :fid AND COALESCE(is_active, TRUE)
+    ORDER BY line_code
+""")
+
+
+def _line_capacity(line: Dict[str, Any], *, units_are_per_line: bool = True) -> float:
+    """一天的节拍（台/天）。bike 那个 400 台到底是单线还是两线合计还没确认，
+    所以两种口径都能算出来，让结论对这个数的敏感度看得见。"""
+    per_day = float(line["units_per_day"] or 0)
+    return per_day * (int(line["parallel_lines"] or 1) if units_are_per_line else 1)
+
+
+def _can_run(line: Dict[str, Any], model: str) -> bool:
+    can = list(line.get("can_make_models") or [])
+    cannot = list(line.get("cannot_make_models") or [])
+    if model in cannot:
+        return False
+    return (not can) or (model in can)
+
+
+def simulate_lines(lines: List[Dict[str, Any]], jobs: List[Dict[str, Any]], *,
+                  days: int, available_from: Dict[str, int], labor_rate: float,
+                  allow_line_move: bool, units_are_per_line: bool = True,
+                  absorb_extra_units_per_day: float = 0.0) -> Dict[str, Any]:
+    """按"线"推演：单向兼容就是一条硬约束，缺料期用 available_from 表达。
+
+    - 每张单先排到自己机种的默认线；`allow_line_move` 才允许挪到**能做它的别的线**
+      （跑步机单可以挪去 bike 线，bike 单挪不去跑步机线 —— 用户 10-06 明确的方向）；
+    - 挪线不是免费的：接线的富余节拍先扣，超出富余的部分需要一个"还能不能加人/加一条线"
+      的参数（`absorb_extra_units_per_day`）。这个数用户还没给，所以默认 0 = 下限口径：
+      挪不过去的那部分照样闲在那条线上；给了数就是上限口径。两个都跑，差别就是
+      "这 200 人到底能不能救回来"的答案区间。
+    """
+    cap = {str(l["line_code"]): _line_capacity(l, units_are_per_line=units_are_per_line)
+           for l in lines}
+    by_code = {str(l["line_code"]): l for l in lines}
+    queue = []
+    for i, j in enumerate(jobs):
+        queue.append({"id": j.get("id") or f"J{i+1:02d}", "product_id": str(j["product_id"]),
+                      "qty": float(j.get("qty") or 0), "due": j.get("due"),
+                      "remaining": float(j.get("qty") or 0), "home_line": j.get("line"),
+                      "ran_on": None, "finish_day": None})
+    line_units: Dict[str, float] = {c: 0.0 for c in cap}
+    made_by_job: Dict[str, float] = {}
+    moved_units = 0.0
+
+    for day in range(days):
+        for code in cap:
+            left = cap[code]
+            eligible = [j for j in queue if j["remaining"] > 1e-9
+                        and int(available_from.get(j["product_id"], 0) or 0) <= day
+                        and _can_run(by_code[code], j["product_id"])]
+            # 家线优先，其次才是挪到能兼容它的线上（bike 线可接跑步机；反向不行）
+            eligible.sort(key=lambda j: (j["home_line"] != code, j["due"] or date.max, j["id"]))
+            if not allow_line_move:
+                eligible = [j for j in eligible if j["home_line"] == code]
+            for j in eligible:
+                if left <= 1e-9:
+                    break
+                units = min(j["remaining"], left)
+                j["remaining"] -= units
+                left -= units
+                line_units[code] += units
+                made_by_job[j["id"]] = made_by_job.get(j["id"], 0.0) + units
+                if j["home_line"] and code != j["home_line"]:
+                    moved_units += units
+                if j["remaining"] <= 1e-9:
+                    j["finish_day"] = day
+                    j["ran_on"] = code
+
+    rows = []
+    for l in lines:
+        code = str(l["line_code"])
+        rate = cap[code]
+        crew = int(l["crew_size"] or 0)
+        # 人力跟着活走：这条线的班组提供的"人·天/台"是它的劳动含量，
+        # 活被别家的机器做掉时，人还是这边的人 —— 否则"调人去能做的线"就算不出收益。
+        labor_per_unit = (crew / rate) if rate else 0.0
+        own_work = sum(made_by_job.get(j["id"], 0.0) for j in queue if j["home_line"] == code)
+        busy_days = round(own_work / rate, 3) if rate else 0.0
+        idle_days = round(max(0.0, days - busy_days), 3)
+        rows.append({"line_code": code, "line_name": l.get("line_name"),
+                     "capacity_units_per_day": rate, "crew_size": crew,
+                     "labor_days_per_unit": round(labor_per_unit, 4),
+                     "machine_days_used_this_line": round(line_units[code] / rate, 3) if rate else 0.0,
+                     "own_orders_units": round(own_work, 1),
+                     "busy_person_days": round(busy_days * crew, 1),
+                     "idle_person_days": round(idle_days * crew, 1),
+                     "idle_labor_cost": round(idle_days * crew * labor_rate, 2)})
+    unfinished = sum(j["remaining"] for j in queue)
+    return {"days": days, "lines": rows,
+            "total_idle_person_days": round(sum(r["idle_person_days"] for r in rows), 1),
+            "total_idle_labor_cost": round(sum(r["idle_labor_cost"] for r in rows), 2),
+            "units_made": round(sum(line_units.values()), 1),
+            "units_unfinished": round(unfinished, 1),
+            "moved_units_to_other_lines": round(moved_units, 1),
+            "orders_finished": len([j for j in queue if j["finish_day"] is not None]),
+            "orders_total": len(queue),
+            "allow_line_move": allow_line_move,
+            "units_are_per_line": units_are_per_line}
+
+
+
