@@ -165,3 +165,70 @@ def test_signature_detects_a_change_beyond_the_first_200_characters():
     assert pf.tradeoff_signature("加急到 10 天", view, ["expedite_purchase:RM-A"])[0] == a[0]
     # 上一轮建议的落地状态也是"变没变"的一部分：有人压了提前期就得重算交期、换一条建议
     assert pf.tradeoff_signature("加急到 10 天", view, ["expedite_purchase:RM-A"], "ft:2-of-2")[0] != a[0]
+
+
+class _Row(dict):
+    """mappings().first() 返回的就是类 dict 行，直接继承 dict 即可。"""
+
+
+class _OneResult:
+    def __init__(self, row):
+        self._row = row
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self._row
+
+
+class _ReadDB:
+    def __init__(self, row):
+        self.row = row
+
+    async def execute(self, sql, params=None):
+        return _OneResult(self._materialize(self.row))
+
+    @staticmethod
+    def _materialize(row):
+        if row is None:
+            return None
+        return _Row(row)
+
+
+@pytest.mark.asyncio
+async def test_no_card_says_so_instead_of_returning_empty_readings():
+    out = await pf.latest_tradeoff_state(_ReadDB(None), "FAC_MECH_001")
+    assert out["status"] == "no_card" and "15 分钟" in out["message"]
+
+
+@pytest.mark.asyncio
+async def test_jsonb_columns_are_read_whether_the_driver_gives_str_or_dict():
+    """asyncpg 有的路径给 str、有的给 dict：两种都要能读出来。
+
+    踩过一次：按 str 解析失败被 except 吞掉，工具于是回"没有推荐、没有动作"，
+    而卡里明明有 17 条动作 —— 空读数比报错更坏。
+    """
+    card = {"portfolio_score": 100.0, "engine_date": "2026-10-06", "created_at": "x",
+            "models_simulated": 5,
+            "weights": json.dumps({"rule": "minimax", "score_meaning": "稳健度",
+                                   "objectives": {"days_late_worst": 0}}),
+            "levers": {"policy": "加急到 10 天"},      # dict 形态
+            "detail": json.dumps({"actions": [{"type": "expedite_purchase", "material_code": "M-1"}],
+                                  "by_scenario": {"好天": {"recommended": "加急到 10 天",
+                                                          "informative": True}},
+                                  "followthrough": {"verdict": "建议还没落地"}})}
+    out = await pf.latest_tradeoff_state(_ReadDB(card), "FAC_MECH_001")
+    assert out["status"] == "ok" and out["models_simulated"] == 5
+    assert out["robust_recommendation"]["policy"] == "加急到 10 天"
+    assert out["actions"][0]["material_code"] == "M-1"
+    assert out["by_scenario"]["好天"]["informative"] is True
+    assert out["followthrough"]["verdict"] == "建议还没落地"
+
+
+@pytest.mark.asyncio
+async def test_unparsable_detail_does_not_become_a_fake_empty_recommendation():
+    card = {"portfolio_score": 0.0, "created_at": "x", "models_simulated": 0,
+            "weights": "不是 json", "levers": None, "detail": "{坏数据"}
+    out = await pf.latest_tradeoff_state(_ReadDB(card), "FAC_MECH_001")
+    assert out["status"] == "ok" and out["actions"] == [] and out["robust_recommendation"] == {}

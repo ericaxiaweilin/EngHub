@@ -869,6 +869,21 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_simulation_recommendation",
+            "description": (
+                "政策×天气推演的最新结论与落地复查（只读）：稳健推荐是哪条政策、它要花多少钱"
+                "（加急/开线/人工），引擎准备发出的动作清单（催哪个料号、向哪家供应商、几号前下单、"
+                "几号前要到、哪台单先开几台、第二批排在哪天），上一轮建议到底有没有落地"
+                "（主档提前期压下来没有、有没有开过采购单、缺供应商的料号补齐没有），"
+                "以及三个天气场景各自有没有区分度。用于'引擎在建议什么''要不要加急''该催哪个料'"
+                "'上次的建议做了没''推演有没有效果''开第二条线划不划算''哪些机种还推演不了'类问题。"
+                "只念记分卡里那张卡，不重跑扫描；不下单、不改排产、不写真实系统。"),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_plan_commit_gate",
             "description": "计划逐单下达就绪门（只读）：这一版排程里哪些工单真的能开工、哪些被哪条门压住（没排进本版本/工序没排齐/物料没齐套/首道工位映射不到），以及已经下达过的张数。用于'这版计划能开工几张''还有哪些单卡着''为什么没下达''计划生效了没'类问题。只报判定，不改工单状态、不下达。",
             "parameters": {"type": "object", "properties": {}},
@@ -2531,6 +2546,38 @@ async def _tool_query_bom_data_quality(
     }
 
 
+async def _tool_query_simulation_recommendation(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """推演建议与落地复查（只读）：判据在 virtual_run/pareto_eval/portfolio_flywheel 一处定义，
+    这里只负责取最近那张卡并转述，不重跑扫描 —— 重跑会给出和记分卡不同的数。"""
+    from api.services.portfolio_flywheel import latest_tradeoff_state
+
+    fid = factory_id or "FAC_MECH_001"
+    out = await latest_tradeoff_state(db, fid)
+    if out.get("status") == "no_card":
+        return {"status": "ok", "factory_id": fid, "has_card": False, **out}
+    ft = out.get("followthrough") or {}
+    return {
+        "status": "ok", "factory_id": fid, "has_card": True,
+        "as_of": out.get("as_of"), "engine_date": out.get("engine_date"),
+        "models_simulated": out.get("models_simulated"),
+        "robust_recommendation": out.get("robust_recommendation"),
+        "robustness_pct": out.get("robustness_pct"),
+        "score_meaning": out.get("score_meaning"),
+        "actions": out.get("actions"), "action_total": out.get("action_total"),
+        "followthrough": ft,
+        "followthrough_verdict": ft.get("verdict") or ft.get("note"),
+        "by_scenario": out.get("by_scenario"),
+        "scenario_divergence": out.get("scenario_divergence"),
+        "calibration_note": ("每个天气场景的批量与交期系数是引擎自己标定的测试口径，"
+                             "不是对客户的承诺；标定只决定这一轮有没有区分度。"),
+        "note": out.get("note") or (
+            "推荐不是打分第一名：交期与产量是硬约束，其余维度取最小最大后悔；"
+            "并列时会说明没说哪个最好。动作都在沙箱里，不写 MES/WMS。"),
+    }
+
+
 async def _tool_query_chain_convergence(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3100,6 +3147,7 @@ _TOOL_EXECUTORS = {
     "query_maintenance_due": _tool_query_maintenance_due,
     "query_wms_inventory_health": _tool_query_wms_inventory_health,
     "query_bom_data_quality": _tool_query_bom_data_quality,
+    "query_simulation_recommendation": _tool_query_simulation_recommendation,
     "query_chain_convergence": _tool_query_chain_convergence,
     "query_plan_commit_gate": _tool_query_plan_commit_gate,
     "query_shortage_alerts": _tool_query_shortage_alerts,
@@ -3493,6 +3541,7 @@ TOOL_LABELS = {
     "query_bom_data_quality": "BOM 数据质量自检",
     "query_plan_commit_gate": "计划逐单下达就绪门",
     "query_chain_convergence": "链条收敛自检",
+    "query_simulation_recommendation": "推演建议与落地复查",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",

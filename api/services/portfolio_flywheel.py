@@ -54,6 +54,63 @@ LAST_SQL = text("""
     ORDER BY created_at DESC LIMIT 1
 """)
 
+LATEST_SQL = text("""
+    SELECT portfolio_score, top_constraint, engine_date, created_at, models_simulated,
+           weights, lever_deltas AS levers, detail
+    FROM simulation_scorecards WHERE factory_id = :fid
+    ORDER BY created_at DESC LIMIT 1
+""")
+
+
+def _as_dict(val: Any) -> Dict[str, Any]:
+    """jsonb 列在 asyncpg 下可能是 str 也可能是 dict：两种都接，别让解析失败静默变成空读数。"""
+    if isinstance(val, dict):
+        return val
+    try:
+        loaded = json.loads(val or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+async def latest_tradeoff_state(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """把最近一轮推演的结论、准备发的动作与落地复查原样转述出来（只读，不重跑扫描）。
+
+    聊天侧要的是"引擎在建议什么、上次的建议做没做"，重新扫一遍既慢又会给出
+    和记分卡不同的数 —— 这里只念台账里那张卡。
+    """
+    row = (await db.execute(LATEST_SQL, {"fid": factory_id})).mappings().first()
+    if not row:
+        return {"status": "no_card",
+                "message": ("还没跑过政策×天气推演。引擎每 15 分钟自己跑一轮；"
+                            "现在想看就 GET /api/v1/pmc/sim-tradeoffs（apply=false 只算不写）。")}
+    detail = _as_dict((row or {}).get("detail"))
+    levers = _as_dict((row or {}).get("levers"))
+    weights = _as_dict((row or {}).get("weights"))
+    per = {k: {kk: v.get(kk) for kk in ("recommended", "feasible_ratio", "frontier_size",
+                                        "eliminated", "runner_up_regret_gap", "informative",
+                                        "tied_with_recommended", "scenario_verdict", "calibration")}
+           for k, v in (detail.get("by_scenario") or {}).items() if isinstance(v, dict)}
+    return {
+        "status": "ok", "as_of": str((row or {}).get("created_at")),
+        "engine_date": str((row or {}).get("engine_date")),
+        "models_simulated": (row or {}).get("models_simulated"),
+        "robust_recommendation": levers,
+        "robustness_pct": float((row or {}).get("portfolio_score") or 0),
+        "score_meaning": weights.get("score_meaning"),
+        "objectives_of_recommended": weights.get("objectives"),
+        "actions": (detail.get("actions") or [])[:12],
+        "action_total": len(detail.get("actions") or []),
+        "followthrough": detail.get("followthrough"),
+        "by_scenario": per,
+        "calibration_by_scenario": detail.get("calibration_by_scenario"),
+        "selection_rule": weights.get("rule"),
+        "scenario_divergence": detail.get("scenario_divergence"),
+        "rule": TRADEOFF_NOTE,
+        "note": TRADEOFF_NOTE,
+    }
+
+
 TRADEOFF_NOTE = (
     "工厂是取舍不是考试：记分卡存的是目标向量、帕累托前沿与跨天气的稳健推荐，"
     "不存'唯一最高分'。推荐规则是 minimax regret（最坏场景后悔最小），"
@@ -335,6 +392,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                               "calibration_by_scenario": tuned.get("calibration_by_scenario") or {},
                               "full_signature": full_signature[1],
                               "followthrough": followthrough,
+                              "scenario_divergence": verdict.get("scenario_divergence"),
                               "tuning": receipt["tuning_trajectory"],
                               "self_check": tuned["final"].get("notes") or [],
                               "note": TRADEOFF_NOTE}, ensure_ascii=False),
