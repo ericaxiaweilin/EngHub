@@ -343,6 +343,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/sim-sensitivity", "mode": "read_only"},
             {"key": "engine_layers", "name": "仿真引擎分层验收（五层判据+过线闸门，下层不过线上层不引用）",
              "path": "/api/v1/pmc/engine-layers", "mode": "read_only"},
+            {"key": "engine_contract", "name": "引擎对外契约（三接口签名+业务词表，与模型内部无关；自检见 /engine-contract-check）",
+             "path": "/api/v1/pmc/engine-contract", "mode": "read_only"},
             {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
              "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
             {"key": "partial_kit", "name": "部分齐投产机会（还能先开几台，只读）",
@@ -532,6 +534,79 @@ async def get_sim_sensitivity(
     if not models:
         raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
     return await report(db, factory_id, models)
+
+
+
+async def _engine_contract_call(iface: str, db: AsyncSession, factory_id: str,
+                                body: Dict[str, Any]) -> Dict[str, Any]:
+    """契约调用的唯一入口：词表外的东西一律 422 并回 allowed，不静默忽略、不 500。"""
+    from api.services.engine_contract import ContractError, attribution, sensitivity, simulate
+
+    if not factory_id:
+        raise HTTPException(status_code=422, detail="需要 factory_id")
+    fn = {"simulate": simulate, "sensitivity": sensitivity, "attribution": attribution}[iface]
+    try:
+        return await fn(db, factory_id, body)
+    except ContractError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_dict())
+
+
+@router.get("/engine-contract", summary="引擎对外契约：三个接口的签名与业务词表（与模型内部无关）")
+async def get_engine_contract(current_user: User = Depends(get_current_user)):
+    """agent 与前端只该看这一份：能问什么、每个业务输入的单位与范围、信封的不变量。
+
+    设计约束是「接口稳定、实现隐藏」：模型内部的参数名、节点/工位标识不出现在这一层，
+    引擎内部换算法、加层、重排都不用动调用方；反过来调用方也不许拿内部名当参数传。
+    """
+    del current_user
+    from api.services.engine_contract import spec
+
+    return spec()
+
+
+@router.post("/engine-simulate", summary="契约 simulate：这些条件下几号能交、延几天、卡在哪一项")
+async def post_engine_simulate(
+    body: Dict[str, Any] = Body(..., description="factory_id, models?, n_models?, scope?, conditions?, inputs?"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+    return await _engine_contract_call("simulate", db, str(body.get("factory_id") or ""), body)
+
+
+@router.post("/engine-sensitivity", summary="契约 sensitivity：哪个业务输入最能动结果、值几天，答案可信到几成")
+async def post_engine_sensitivity(
+    body: Dict[str, Any] = Body(..., description="factory_id + 可选 models/scope/conditions"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+    return await _engine_contract_call("sensitivity", db, str(body.get("factory_id") or ""), body)
+
+
+@router.post("/engine-attribution", summary="契约 attribution：为什么是这个答案；给了 compare 就归因变更")
+async def post_engine_attribution(
+    body: Dict[str, Any] = Body(..., description="factory_id + inputs? + compare{baseline,alternative}?"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+    return await _engine_contract_call("attribution", db, str(body.get("factory_id") or ""), body)
+
+
+@router.get("/engine-contract-check", summary="契约自检：泄漏内部标识数 / 信封违规数 / 内部名被拒率")
+async def get_engine_contract_check(
+    factory_id: str = Query(..., description="厂区"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """接口是不是真的与模型无关，看三个数：内部名当键出现的次数、信封缺单位/依据的次数、
+    把内部 kwarg 名当参数传进来被结构化拒绝的比例。这三条破了就说明接口和实现黏住了。
+    """
+    del current_user
+    from api.services.engine_contract import self_check
+
+    return await self_check(db, factory_id)
 
 
 @router.post("/virtual-run", summary="沙箱执行推演：引擎自己拆单/借路线/开采购/按天推进")

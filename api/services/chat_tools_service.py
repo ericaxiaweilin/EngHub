@@ -899,6 +899,27 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_engine_attribution",
+            "description": (
+                "引擎的因果归因（只读，走对外契约接口 attribution）：现在这个完工日被哪一项卡住"
+                "（等料 / 排队 / 做不完 / 日历），逐台点名；松掉每一项业务输入一档实测值几天"
+                "（斜率是逐档真跑出来的，不是权重打分）；当前交期可信到几成、不确定天数分摊在"
+                "哪几项数据上；带 compare（两组业务输入，如提前期 100%→50%、到岗 0.70→1.00）时"
+                "给出总差值、各项单项效果与交互残差 —— 残差不为 0 就说明各项互相挡着，"
+                "不许按单项比例分摊。用于'为什么交期是这天''这台单卡在哪儿''为什么改条件差这么多'"
+                "'该先松哪个约束'类问题。只说业务概念，不暴露模型内部；不写任何系统。"),
+            "parameters": {"type": "object", "properties": {
+                "models": {"type": "array", "items": {"type": "string"},
+                           "description": "机种编码；不填则取 BOM 最完整的 3 台"},
+                "weather": {"type": "string", "enum": ["fair", "rain", "storm"]},
+                "compare": {"type": "object",
+                            "description": "可选 {baseline: {业务输入名: 值}, alternative: {同}}"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_engine_capability_layers",
             "description": (
                 "仿真引擎的分层验收（只读）：L1 内核（单轮耗时/可复现率/崩溃率）、"
@@ -2618,6 +2639,34 @@ async def _tool_query_simulation_sensitivity(
     }
 
 
+async def _tool_query_engine_attribution(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """归因（只读）：走 engine_contract 的对外接口，词表与判据都在契约那一处，这里只转述。"""
+    from api.services.engine_contract import ContractError, attribution
+    from api.services.virtual_run import default_models
+
+    fid = factory_id or "FAC_MECH_001"
+    models = [str(m) for m in (args.get("models") or [])] or await default_models(db, fid, n=3)
+    req = {"models": models, "conditions": {"weather": str(args.get("weather") or "storm")}}
+    if isinstance(args.get("compare"), dict):
+        req["compare"] = args["compare"]
+    try:
+        out = await attribution(db, fid, req)
+    except ContractError as exc:
+        return {"status": "rejected", "has_data": False, **exc.as_dict()}
+    ans = out.get("answers") or {}
+    return {"status": "ok", "factory_id": fid, "has_data": True, "models": models,
+            "contract_version": out.get("contract_version"), "answer": ans.get("answer"),
+            "constraint_attribution": ans.get("constraint_attribution"),
+            "relief_attribution": (ans.get("relief_attribution") or [])[:6],
+            "uncertainty_attribution": ans.get("uncertainty_attribution"),
+            "change_attribution": ans.get("change_attribution"),
+            "unavailable": out.get("unavailable"), "caveats": out.get("caveats"),
+            "note": ("归因用的是实测反事实（真跑了推演），不是权重打分；"
+                     "算不出的项在 unavailable 里点名缺什么，不折算成 0")}
+
+
 async def _tool_query_engine_capability_layers(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3247,7 +3296,7 @@ _TOOL_EXECUTORS = {
     "query_bom_data_quality": _tool_query_bom_data_quality,
     "query_engine_capability_layers": _tool_query_engine_capability_layers,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
-    "query_simulation_sensitivity": _tool_query_simulation_sensitivity,
+    "query_simulation_sensitivity": _tool_query_simulation_sensitivity,    "query_engine_attribution": _tool_query_engine_attribution,
     "query_chain_convergence": _tool_query_chain_convergence,
     "query_plan_commit_gate": _tool_query_plan_commit_gate,
     "query_shortage_alerts": _tool_query_shortage_alerts,
@@ -3643,7 +3692,7 @@ TOOL_LABELS = {
     "query_chain_convergence": "链条收敛自检",
     "query_simulation_recommendation": "推演建议与落地复查",
     "query_engine_capability_layers": "引擎分层验收",
-    "query_simulation_sensitivity": "建模精度与敏感度",
+    "query_simulation_sensitivity": "建模精度与敏感度",    "query_engine_attribution": "交期为什么是这个数（归因）",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",

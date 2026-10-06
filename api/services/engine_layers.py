@@ -33,7 +33,9 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
     "L3": {"retest_improvement_days": 0.5,  # 推荐相对基线至少要值半天，否则别推荐
            "adoption_rate": 0.30,           # 人真采纳过；全被引擎自己取代 = 没人看
            "flip_rate": 0.20},              # 推荐反复翻转说明结论不稳
-    "L4": {"routing_accuracy": 0.85, "tool_backing_rate": 0.80, "number_backing_rate": 0.90},
+    "L4": {"routing_accuracy": 0.85, "tool_backing_rate": 0.80,
+           "number_backing_rate": 0.90, "contract_leaks": 0, "envelope_violations": 0,
+           "internal_names_rejected": 1.0},
 }
 LAYER_ORDER = ["L1", "L2A", "L2B", "L3", "L4"]
 LAYER_NAMES = {"L1": "仿真内核", "L2A": "能力·敏感度", "L2B": "能力·准确度",
@@ -51,7 +53,10 @@ ROUTING_GOLDEN: List[Tuple[str, str]] = [
     ("上次让它催的料催了没有", "query_simulation_recommendation"),
     ("补 IE 工时值几天", "query_simulation_sensitivity"),
     ("加班和开第二条线划不划算", "query_simulation_sensitivity"),
-    ("这个交期有多可信", "query_simulation_sensitivity"),
+    ("这个交期有多可信", "query_simulation_sensitivity"),    ("为什么交期是这天", "query_engine_attribution"),
+    ("这台单卡在哪儿", "query_engine_attribution"),
+    ("把提前期砍半为什么能早这么多", "query_engine_attribution"),
+    ("该先松哪个约束", "query_engine_attribution"),
     ("工厂现在是在推进还是停滞", "query_chain_convergence"),
     ("积压在涨还是在消", "query_chain_convergence"),
     ("这版计划能开工几张", "query_plan_commit_gate"),
@@ -454,7 +459,30 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         elif len(unbacked_samples) < 3:
             unbacked_samples.append({"numbers": nums[:6], "backed": round(rate, 2)})
     number_rate = round(backed / checked, 3) if checked else None
+    contract, contract_error = {}, None
+    try:
+        from api.services.engine_contract import self_check as contract_self_check
+
+        contract = await contract_self_check(db, factory_id)
+    except Exception as exc:
+        contract_error = f"{type(exc).__name__}: {exc}"
+    tried = contract.get("internal_names_tried") or []
     return {"metrics": [
+        _metric("契约泄漏内部标识数", contract.get("internal_token_leaks"),
+                THRESHOLDS["L4"]["contract_leaks"], "lte", "处",
+                "响应里把内部 kwarg 名/节点/工位当接口名用的键数。破了就意味着 agent 会照内部名传参，"
+                "引擎内部一改它就崩"
+                + (f"（自检失败：{contract_error}）" if contract_error else ""),
+                missing=("契约自检没跑成：" + contract_error if contract_error else None)),
+        _metric("契约信封违规数", contract.get("envelope_violations"),
+                THRESHOLDS["L4"]["envelope_violations"], "lte", "处",
+                "数没带单位/依据，或说算不出却没点名缺什么"),
+        _metric("内部参数名被拒率",
+                (round(contract.get("internal_names_rejected", 0) / max(1, len(tried)), 3)
+                 if contract else None),
+                THRESHOLDS["L4"]["internal_names_rejected"], "gte", "",
+                f"拿 {len(tried)} 个内部 kwarg 名当参数传进来，被结构化拒绝的比例 —— "
+                "接口必须是封闭词表，静默忽略等于把内部结构当公共接口"),
         _metric("问题→查询准确率", round(hits / len(ROUTING_GOLDEN), 3),
                 THRESHOLDS["L4"]["routing_accuracy"], "gte", "",
                 f"{hits}/{len(ROUTING_GOLDEN)} 条自然问法命中应选工具（回归集在 ROUTING_GOLDEN）"),
