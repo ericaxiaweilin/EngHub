@@ -501,8 +501,14 @@ class HybridScheduler:
         self,
         mode: SchedulingMode = SchedulingMode.HYBRID,
         optimize_for: str = "delivery",  # delivery, efficiency, cost
+        order_rank: Optional[Dict[str, float]] = None,
     ) -> SchedulingResult:
-        """执行混合排程"""
+        """执行混合排程。
+
+        order_rank 由上层的目标函数算好传进来（值越小越先占产能）。传了就以它为准，
+        不再走下面那串写死的分支 —— 目标（人力/交期/总成本）在业务层定义，
+        排程器只照排序放置，避免同一件事有两套排序口径。
+        """
         logger.info("启动混合排程引擎 (模式：%s, 优化目标：%s)", mode.value, optimize_for)
         
         self.schedule = []
@@ -529,7 +535,13 @@ class HybridScheduler:
             remaining = max(0.0, (order.due_date - order.release_date).total_seconds())
             return remaining / max(estimated_work_seconds(order), 1.0)
 
-        if mode == SchedulingMode.BACKWARD:
+        if order_rank:
+            sorted_orders = sorted(
+                self.orders.values(),
+                key=lambda x: (order_rank.get(str(x.order_id), float('inf')),
+                               -x.priority.value, x.due_date, str(x.order_id)),
+            )
+        elif mode == SchedulingMode.BACKWARD:
             sorted_orders = sorted(
                 self.orders.values(),
                 key=lambda x: (-x.priority.value, -x.due_date.timestamp()),

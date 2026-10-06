@@ -182,6 +182,31 @@ def _station_people(name: str, code: str, rows: List[Any],
     return out
 
 
+STATION_ROSTER_SQL = text("""
+    SELECT station_code, station_name FROM stations WHERE factory_id = :fid
+""")
+
+
+async def crew_by_station(db, factory_id: str) -> Dict[str, int]:
+    """工位编码 -> HR 台账上在岗人数。
+
+    HR 写"焊接"、主档写"焊接车间"是叫法差异，归一化走 `_station_aliases` 同一套；
+    匹配不到就是 0 人 —— 不许为了"先跑起来"假设每个工位都站着人，
+    那会把排产目标和闲置账一起带偏。
+    """
+    roster = (await db.execute(STATION_ROSTER_SQL, {"fid": factory_id})).mappings().all()
+    rows = (await db.execute(HEADCOUNT_SQL, {"fid": factory_id})).mappings().all()
+    index = _headcount_index(rows)
+    out: Dict[str, int] = {}
+    for r in roster:
+        code = str(r["station_code"] or "")
+        if not code:
+            continue
+        people = _station_people(str(r["station_name"] or ""), code, rows, index)
+        out[code] = sum(int(v or 0) for v in people.values())
+    return out
+
+
 async def idle_capacity_report(
     db: AsyncSession, factory_id: str, *, as_of: date | None = None,
     objective: str | None = None,

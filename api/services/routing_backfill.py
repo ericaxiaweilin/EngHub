@@ -38,6 +38,7 @@ from api.services.component_orders import (
 from api.services.component_release import release_kitted_child_orders
 from api.services.purchase_receipts import receive_due_purchase_orders
 from api.services.line_strategy_advisor import advise_line_strategy
+from api.services.time_basis import time_basis_review
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
 from api.services.aps_draft_prune import (
@@ -128,6 +129,11 @@ COMPONENT_BATCH = max(1, int(os.getenv("ROUTING_BACKFILL_WOS_PER_TICK", "2")))
 # 例行 BOM 自检的范围（只读，扫几颗机种；心跳一行，不写业务表）
 QUALITY_MODELS_PER_TICK = max(1, int(os.getenv("BOM_QUALITY_MODELS_PER_TICK", "2")))
 QUALITY_FACTORY_ID = os.getenv("BOM_QUALITY_FACTORY_ID", "FAC_MECH_001")
+
+# 无人排产按哪个目标占产能。词汇与 cost_model.OBJECTIVES 一致：
+# labor_first / delivery_first / total_cost / balanced。目标是一个参数，不是引擎的偏好，
+# 所以它必须能从部署配置上看见、能改，而不是写死在代码里。
+SCHEDULE_OBJECTIVE = os.getenv("ENGINE_SCHEDULE_OBJECTIVE", "labor_first")
 # 旧逻辑把整条产线套到子件上过（10-05 实测 14 条：6 道/4 道工序的子件路线）。
 # 收窄一轮就能收敛：只动自己推导出来的草案路线，且只往少了改。
 REPAIR_BATCH = max(0, int(os.getenv("ROUTING_BACKFILL_REPAIR_BATCH", "20")))
@@ -392,6 +398,9 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     # 数据脏不脏也要每天自己看一次：这步只读，产出写在心跳里（不改 BOM 原始行）
     receipt["bom_quality"] = await scan_plant(
         db, QUALITY_FACTORY_ID, limit=QUALITY_MODELS_PER_TICK)
+    # 预计时间的出处是否唯一、线报的日产量和工位主档的时产能是不是互相打架。
+    # 这一格只报不判：谁对谁错要 IE 核定，引擎不取平均，也不许用默认工时蒙过去。
+    receipt["time_basis"] = await time_basis_review(db, QUALITY_FACTORY_ID)
     # 最后一格：这版计划到底有没有单能开工。逐单就绪门按"排齐+齐套+工位可映射"放行，
     # 默认只预演（PLAN_COMMIT_APPLY），开发尺度每轮最多 PLAN_COMMIT_MAX_ORDERS 张。
     receipt["plan_commit"] = await commit_plan_ready(db, apply_enabled=PLAN_COMMIT_APPLY,
@@ -423,7 +432,8 @@ async def commit_plan_ready(db, *, factory_id: str = QUALITY_FACTORY_ID,
     from api.services.aps_service import ApsService
 
     plan = await ApsService(db).generate_schedule(
-        factory_id, created_by="routing-backfill", change_reason="engine_tick"
+        factory_id, optimize_for=SCHEDULE_OBJECTIVE,
+        created_by="routing-backfill", change_reason="engine_tick"
     )
     # 先把机制自己放错行的放行收回来（没有领料依据的"齐套"），再判这一轮能放哪些单：
     # 顺序是有意的 —— 收回之后门就不会在同一轮里把同一批单又放一遍。

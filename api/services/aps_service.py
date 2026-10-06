@@ -29,6 +29,10 @@ from database.models import (
 
 from core.mes.capacity_math import load_station_models, summarize_load  # 工位日历与负荷的唯一口径
 
+from api.services.idle_capacity import crew_by_station as crew_by_station_map
+from api.services.schedule_objective import normalize_objective, order_rank
+from api.services.time_basis import declared_step_seconds, load_time_basis, BASIS_NONE
+
 from core.mes.hybrid_scheduler import (
 
     HybridScheduler, SchedulingMode, SchedulingPriority,
@@ -252,13 +256,8 @@ class ApsService:
 
     @staticmethod
     def _routing_step_seconds(step: Dict[str, Any]) -> float:
-        """统一旧 Routing JSON 与模板路线的工时单位。"""
-        if step.get("standard_hours") is not None:
-            return float(step.get("standard_hours") or 0) * 3600
-        if step.get("time_min") is not None:
-            return float(step.get("time_min") or 0) * 60
-        # routings.steps 的 standard_time 历史口径为秒。
-        return float(step.get("standard_time") or 0)
+        """统一旧 Routing JSON 与模板路线的工时单位；没有声明就是 0，不补默认值。"""
+        return declared_step_seconds(step) or 0.0
 
     async def _load_calendar_constraints(
         self,
@@ -457,7 +456,6 @@ class ApsService:
     ) -> Dict[str, Any]:
 
         """生成排程方案
-
         exclude_resources 用于"某工位今天停用/设备故障"这类约束：这些工位不进本轮资源，
         受影响工序只会被排到工艺路线允许的其他工位上，排不进就带着原因报出来，
         而不是被随手塞到任意空闲工位。
@@ -465,6 +463,10 @@ class ApsService:
         force=True 才绕过输入指纹强制重排。默认走指纹门：算法是确定性的，输入没变
         再跑一遍只会多写几百行任务明细，那些行和上一版一模一样。
         """
+
+        # 目标词汇只留一套：API 历史上的 delivery/cost 等别名先进 cost_model 的目标名，
+        # 否则同一个目标会因为写法不同被存成两版、被指纹当成两回事。
+        optimize_for = normalize_objective(optimize_for)
 
         excluded = {str(x).strip() for x in (exclude_resources or []) if str(x).strip()}
 
@@ -512,27 +514,9 @@ class ApsService:
 
             return {"success": False, "message": "无待排程工单", "schedule_id": None}
 
-        # 排产顺序要认物料：缺料的单排到后面，别让它占着工位时隙。
-        # 原来只按 优先级→交期 排，于是每一版方案都是"交期最早的先占位"，
-        # 而它十有八九正缺料 —— 结果是账面排满、车间开不了工，能开工的单反而没位置。
-        # （就绪门仍然会拦住缺料单下达，这里改的是"谁先占产能"，不是"谁可以开工"。）
+        # 排产顺序由目标函数决定（见下面第 4 格 order_rank），不在这里再排一遍：
+        # 两处各排一次，会出现"排产以为它能干、门说不能干"那种对不上的账。
         shortage_ids = await self._shortage_order_ids(factory_id)
-
-        def _queue_key(wo):
-
-            return (
-
-                1 if str(wo.id) in shortage_ids else 0,
-
-                0 if str(wo.priority or "normal") == "urgent" else 1,
-
-                wo.planned_due or ddate(9999, 12, 31),
-
-                str(wo.work_order_code or ""),
-
-            )
-
-        work_orders.sort(key=_queue_key)
 
         # 2. 加载工艺路线约束
 
@@ -543,6 +527,10 @@ class ApsService:
 
         product_routings: Dict[str, List[Dict]] = {}
         unrouted_orders: List[str] = []
+        # 单件工时必须有名有姓：工步自己声明 > 厂里声明的线产能 > 工位主档产能，
+        # 三条都给不出就记 no_time_basis，绝不回落到"5 分钟换型"那种编的数。
+        time_basis = await load_time_basis(self.db, factory_id)
+        step_basis: Dict[str, str] = {}
 
         for wo in work_orders:
 
@@ -563,44 +551,62 @@ class ApsService:
 
                     if steps:
 
-                        product_routings[wo.product_id] = [
+                        template_ops = []
 
-                            {
+                        for s in steps:
+
+                            seconds, used = time_basis.seconds_per_piece(
+
+                                model=str(wo.product_id),
+
+                                station=str(s.work_center or ""),
+
+                                step={"standard_hours": float(s.standard_hours or 0) or None},
+
+                            )
+
+                            template_ops.append({
 
                                 "sequence": s.seq * 10,
 
                                 "name": s.operation_name,
 
-                                "standard_time": float(s.standard_hours or 0) * 3600,  # 转秒
+                                "standard_time": seconds or 0.0,
 
-                                "setup_time": 300.0,  # 默认换型5分钟
+                                "setup_time": 0.0,  # 模板路线没有换型声明，不补 5 分钟
 
                                 "allowed_stations": [s.work_center] if s.work_center else [],
 
                                 "required_skills": [],
 
-                            }
+                            })
 
-                            for s in steps
+                            step_basis[f"{wo.product_id}|{s.seq * 10}"] = used
 
-                        ]
+                        product_routings[wo.product_id] = template_ops
 
             elif wo.routing_id:
                 # 兼容旧版 routings.steps JSON；新工单优先使用模板路线，
                 # 但历史工单没有模板绑定时也必须进入同一套 APS 引擎。
                 routing = await self.db.get(Routing, str(wo.routing_id))
                 if routing and isinstance(routing.steps, list) and routing.steps:
-                    product_routings[wo.product_id] = [
-                        {
-                            "sequence": int(step.get("sequence", step.get("seq", (idx + 1) * 10))),
+                    json_ops = []
+                    for idx, step in enumerate(routing.steps):
+                        sequence = int(step.get("sequence", step.get("seq", (idx + 1) * 10)))
+                        station = str(step.get("station") or step.get("work_center") or "")
+                        seconds, used = time_basis.seconds_per_piece(
+                            model=str(wo.product_id), station=station, step=step
+                        )
+                        json_ops.append({
+                            "sequence": sequence,
                             "name": step.get("name", step.get("operation_name", f"工序{idx + 1}")),
-                            "standard_time": self._routing_step_seconds(step),
-                            "setup_time": float(step.get("setup_time", 300) or 300),
-                            "allowed_stations": [step.get("station") or step.get("work_center")] if (step.get("station") or step.get("work_center")) else [],
+                            "standard_time": seconds or 0.0,
+                            "setup_time": float(step.get("setup_time") or 0),
+                            "allowed_stations": [station] if station else [],
                             "required_skills": step.get("required_skills", []),
-                        }
-                        for idx, step in enumerate(routing.steps)
-                    ]
+                        })
+                        step_basis[f"{wo.product_id}|{sequence}"] = used
+                    product_routings[wo.product_id] = json_ops
 
             # 如果产品有工艺路线，加载到排程器
 
@@ -829,7 +835,34 @@ class ApsService:
 
             return {"success": False, "message": "无可用资源（设备/工位）", "schedule_id": None}
 
-        # 4. 加载订单约束
+        # 4. 排产目标函数：谁先占产能由 objective 算出来，不再由排程器内部写死的分支决定。
+        #    人力项要站得到人：路线工步的工位 → stations 主档名称 → HR 在岗人数，
+        #    对不上就是 0 人·时（宁可这项不成立，也不给每台机器假设站 3 个人）。
+        crew_by_station = await crew_by_station_map(self.db, factory_id)
+
+        order_features: List[Dict[str, Any]] = []
+        for wo in work_orders:
+            ops = product_routings.get(wo.product_id) or []
+            qty = max(1, int(wo.planned_qty or 1))
+            work_hours = sum(float(o.get("standard_time") or 0) * qty for o in ops) / 3600.0
+            person_hours = sum(
+                float(o.get("standard_time") or 0) * qty / 3600.0
+                * crew_by_station.get(str((o.get("allowed_stations") or [""])[0] or ""), 0)
+                for o in ops
+            )
+            due = wo.planned_due or horizon_end
+            order_features.append({
+                "order_id": str(wo.id),
+                "blocked": str(wo.id) in shortage_ids,
+                "work_hours": work_hours,
+                "person_hours": person_hours,
+                "hours_to_due": max(0.0, (due - horizon_start).total_seconds() / 3600.0),
+            })
+        ranking = order_rank(
+            order_features, optimize_for, horizon_hours=float(horizon_days) * 24.0
+        )
+
+        # 5. 加载订单约束
 
         for wo in work_orders:
 
@@ -900,7 +933,7 @@ class ApsService:
 
         sched_mode = SchedulingMode(mode) if mode in ("forward", "backward", "hybrid") else SchedulingMode.HYBRID
 
-        result = scheduler.schedule_hybrid(sched_mode, optimize_for)
+        result = scheduler.schedule_hybrid(sched_mode, optimize_for, order_rank=ranking["rank"])
 
         for _d in getattr(scheduler, "pinned_dropped", None) or []:
             result.constraint_violations.append(
@@ -986,12 +1019,20 @@ class ApsService:
         station_loads.sort(key=lambda item: item["load_minutes"], reverse=True)
 
         rule_explanations = {
-            "delivery": "先按工单优先级，再按交期排序；同时遵守工艺路线、资源日历、设备可用性和工位不重叠约束。",
-            "efficiency": "先按预计加工工时从短到长，再按优先级和交期排序；同时遵守工艺路线、资源日历、设备可用性和工位不重叠约束。",
-            "critical_ratio": "先按关键比率（剩余交期时间 ÷ 预计加工工时）从低到高，再按优先级和交期排序。",
-            "priority": "先按工单优先级，再按交期和预计加工工时排序。",
-            "cost": "当前以优先级和交期为主排序，换型时间计入任务负荷；成本优化将在后续版本继续细化。",
+            ranking["objective"]: (
+                f"目标「{ranking['objective_label']}」："
+                f"权重 人力 {ranking['weights']['labor']} / 交期 {ranking['weights']['delivery']}；"
+                f"缺料单 {ranking['blocked_last']} 张一律靠后（料不齐开不了工，不该占工位时隙）；"
+                f"{ranking['orders_with_person_hours']} 张单能数出在岗人数，"
+                f"其余按 0 人·时参与（对不上工位就按 0 算，不假设每台机器都站着人）。"
+                f"{ranking['note']}"
+            ),
         }
+        basis_counts: Dict[str, int] = {}
+        for task in result.schedule:
+            key = step_basis.get(f"{task.product_code}|{task.operation_sequence}") or BASIS_NONE
+            basis_counts[key] = basis_counts.get(key, 0) + 1
+
         input_summary = {
             "total_orders": len(work_orders),
             "routable_orders": len(work_orders) - len(unrouted_orders),
@@ -999,6 +1040,16 @@ class ApsService:
             "scheduled_orders": len(scheduled_order_ids),
             "unscheduled_orders": len(result.unscheduled_orders),
             "scheduled_tasks": len(result.schedule),
+            # 每条任务行的时长来自哪一类出处，必须能在方案上看见；no_time_basis
+            # 不为零就是"这些工序的预计时间没有依据"，要报给 IE 补，而不是靠默认值蒙。
+            "duration_basis_counts": basis_counts,
+            "tasks_without_time_basis": basis_counts.get(BASIS_NONE, 0),
+            "objective": ranking["objective"],
+            "objective_label": ranking["objective_label"],
+            "objective_weights": ranking["weights"],
+            "orders_ranked": len(ranking["rank"]),
+            "orders_blocked_last": ranking["blocked_last"],
+            "orders_with_person_hours": ranking["orders_with_person_hours"],
             "pinned_tasks": pinned_count,
             "excluded_resources": sorted(excluded),
             "data_integrity_warning_count": len(data_integrity_warnings),
@@ -1133,6 +1184,12 @@ class ApsService:
 
                 run_seconds=task.run_time,
 
+                duration_basis=step_basis.get(
+
+                    f"{task.product_code}|{task.operation_sequence}"
+
+                ),
+
                 quantity=task.quantity,
 
                 status=(task.status.lower() if task.is_locked and task.status else "planned"),
@@ -1172,7 +1229,7 @@ class ApsService:
                     "snapshot_limit": SNAPSHOT_LIMIT,
                 },
                 "station_loads": station_loads,
-                "rule_explanation": rule_explanations.get(optimize_for, rule_explanations["delivery"]),
+                "rule_explanation": rule_explanations.get(ranking["objective"], ""),
             },
         )
         await self.db.commit()
@@ -1227,7 +1284,7 @@ class ApsService:
 
             "station_loads": station_loads,
 
-            "rule_explanation": rule_explanations.get(optimize_for, rule_explanations["delivery"]),
+            "rule_explanation": rule_explanations.get(ranking["objective"], ""),
 
             "metrics": result.performance_metrics,
 

@@ -1852,6 +1852,7 @@ class ApsScheduleTask(Base):
     operation_name = Column(String(100))
     setup_seconds = Column(Float, default=0)
     run_seconds = Column(Float, default=0)
+    duration_basis = Column(String(40), nullable=True)
     quantity = Column(Integer, default=0)
     is_locked = Column(Boolean, default=False)
     priority = Column(Integer, default=5)

@@ -20,6 +20,7 @@ from api.services.aps_draft_prune import plan_prune
 from api.services.chain_convergence import report as convergence_report
 from api.services.idle_capacity import idle_capacity_report
 from api.services.option_simulator import compare_options
+from api.services.time_basis import time_basis_audit
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
 
@@ -334,6 +335,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/idle-capacity", "mode": "read_only"},
             {"key": "production_options", "name": "缺料时的生产选择推演（多策略比较）",
              "path": "/api/v1/pmc/production-options", "mode": "read_only"},
+            {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
+             "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
@@ -431,6 +434,26 @@ async def get_idle_capacity(
     """
     del current_user
     return await idle_capacity_report(db, factory_id, objective=objective)
+
+
+@router.get("/time-basis", summary="预计工时的出处与产能对撞（只读）")
+async def get_time_basis(
+    factory_id: str = Query(..., description="厂区"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """每道工序的单件时长是从哪儿来的：工步声明 / 线产能 / 工位产能，还是根本没有依据。
+
+    为什么单独开这一格：路线 JSON 里 430 个工步 0 个带工时，排程就落到
+    "0 秒/件 + 300 秒换型"的兜底上，账面 1,180 台的单像 5 分钟做完。
+    现在只认厂里声明过的产能，并把自己打自己：同一机种"线报一天 300 台"和
+    "工位主档每小时 4 件"对不上时，两个数一起报给 IE 核定，引擎不取平均。
+
+    预计完工按流水线口径（数量 ÷ 线产能 + 首件节拍），不等于排程任务行求和 ——
+    排程器按一单一工位串行放置，那是批次假设。
+    """
+    del current_user
+    return await time_basis_audit(db, factory_id)
 
 
 @router.get("/chain-convergence", summary="无人链条收敛自检（只读）")

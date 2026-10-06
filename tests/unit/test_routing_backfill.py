@@ -27,6 +27,13 @@ class _Result:
     def scalar(self):
         return self._rows[0][0] if self._rows else None
 
+    def first(self):
+        # mappings().first() 要的是"一行记录"，本桩只喂得出列表行 —— 列表行不是记录，返回 None。
+        for row in self._rows:
+            if isinstance(row, dict):
+                return row
+        return None
+
 
 def _db(targets, derive_results, update_rowcount=3, existing_derived=0):
     """按 SQL 文本分派的假会话：查目标 / 回填工单，其余交给 derive 自己处理。"""
@@ -57,6 +64,23 @@ def _db(targets, derive_results, update_rowcount=3, existing_derived=0):
     return db, state
 
 
+def _stub_tail(monkeypatch):
+    """把链条后半段"要读真库"的步骤换成明说被跳过的桩。
+
+    本文件守的是路线回填的两条边界（只补排不动的工单、套不上要说清原因）。
+    后半段（BOM 体检、工时口径、排程、草案回收、催料、线组比较、自我核对）读的是
+    工单/路线/产能/草案这些真表行，桩喂不出可信结果 —— 让它们进测试只会红在
+    和被测行为无关的地方。桩返回值写 skipped_in_test，心跳里一眼看得出是没跑。
+    """
+    async def _skip(db, *args, **kwargs):
+        return {"status": "skipped_in_test", "reason": "这一步要读真实库，本测试不覆盖"}
+
+    for name in ("scan_plant", "time_basis_review", "commit_plan_ready",
+                 "prune_superseded_drafts", "chase_material_shortages",
+                 "advise_line_strategy", "convergence_report"):
+        monkeypatch.setattr(rb, name, _skip)
+
+
 @pytest.mark.asyncio
 async def test_backfill_binds_only_when_route_is_available(monkeypatch):
     targets = [{"factory_id": "FAC_MECH_001", "product_id": "A-50-04-F"},
@@ -68,6 +92,7 @@ async def test_backfill_binds_only_when_route_is_available(monkeypatch):
         return {"status": "not_derived", "reason": "工序佐证率 1/6", "coverage": 0.17}
 
     monkeypatch.setattr(rb, "derive_routing_for_product", fake_derive)
+    _stub_tail(monkeypatch)
     db, _ = _db(targets, [])
     receipt = await rb.backfill_missing_routings(db)
     assert receipt["status"] == "ok"
@@ -89,6 +114,7 @@ async def test_dry_run_does_not_write(monkeypatch):
         return {"status": "derived", "routing_id": "rt-bom-X"}
 
     monkeypatch.setattr(rb, "derive_routing_for_product", fake_derive)
+    _stub_tail(monkeypatch)
     db, _ = _db([{"factory_id": "FAC_MECH_001", "product_id": "X"}], [])
     receipt = await rb.backfill_missing_routings(db, apply=False)
 
