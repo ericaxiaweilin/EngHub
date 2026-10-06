@@ -339,6 +339,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/idle-capacity", "mode": "read_only"},
             {"key": "production_options", "name": "缺料时的生产选择推演（多策略比较）",
              "path": "/api/v1/pmc/production-options", "mode": "read_only"},
+            {"key": "sim_sensitivity", "name": "建模精度×敏感度（每个输入动一档，交期/准点/钱变多少；含补数据的量化价值）",
+             "path": "/api/v1/pmc/sim-sensitivity", "mode": "read_only"},
             {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
              "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
             {"key": "partial_kit", "name": "部分齐投产机会（还能先开几台，只读）",
@@ -482,6 +484,29 @@ async def get_sim_tradeoffs(
     from api.services.portfolio_flywheel import record_tradeoffs
 
     return await record_tradeoffs(db, factory_id, apply=apply)
+
+
+@router.get("/sim-sensitivity", summary="建模精度×敏感度：每个输入动一档，交期/准点/钱各变多少")
+async def get_sim_sensitivity(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """量化三段：①敏感度斜率（每档值几天、每天值多少钱）②映射精度（每项输入有多少真依据）
+    ③误差传导（现在交期可信到几成、补哪项数据能压掉几天）。
+
+    斜率只取基准两侧最近两档（局部线性）：提前期/库存那类曲线会阶跃，全局回归会把台阶抹平。
+    只读：不写业务表、不改排产，也不回写任何外部系统。
+    """
+    del current_user
+    from api.services.sim_sensitivity import report
+    from api.services.virtual_run import default_models
+
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await report(db, factory_id, models)
 
 
 @router.post("/virtual-run", summary="沙箱执行推演：引擎自己拆单/借路线/开采购/按天推进")

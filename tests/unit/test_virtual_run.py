@@ -403,3 +403,13 @@ def test_unsimulatable_model_becomes_a_data_gap_not_a_failed_plan():
     assert len(gaps) == 1 and "no_time_basis" in gaps[0]["detail"]
     assert gaps[0]["units_excluded"] == 500
     assert not [a for a in acts if a["type"] in ("expedite_purchase", "start_first_batch")]
+
+
+def test_capacity_takes_the_tighter_of_line_declaration_and_work_content():
+    """线组说 300 台/天，但班组按工时只做得完 100 台/天 → 用 100，并说明是谁约束的。"""
+    loose = vr.capacity_limits(crew=300, hours_per_day=11, hours_per_unit=1.16, line_declared=300)
+    assert loose["binding"] == "line_declared" and loose["units_per_day"] == 300
+    tight = vr.capacity_limits(crew=10, hours_per_day=11, hours_per_unit=1.1, line_declared=300)
+    assert tight["binding"] == "ie_hours" and tight["units_per_day"] == 100.0
+    none = vr.capacity_limits(crew=10, hours_per_day=11, hours_per_unit=0, line_declared=0)
+    assert none["binding"] == "no_capacity" and none["units_per_day"] == 0.0

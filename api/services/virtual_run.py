@@ -197,7 +197,8 @@ def hours_per_unit_from(route: List[Dict[str, Any]], line: Optional[Dict[str, An
 
 
 def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
-              start_day: int) -> Dict[str, Any]:
+              start_day: int, *, lead_multiplier: float = 1.0,
+              stock_multiplier: float = 1.0) -> Dict[str, Any]:
     """齐套与到货计划：外购按提前期到料，自制件先记 needing（由子件满足）。"""
     lines: List[Dict[str, Any]] = []
     buy_arrival_days: List[int] = []
@@ -211,7 +212,7 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
         need = float(row["qty_per_unit"] or 0) * float(units)
         if need <= 0:
             continue
-        have = float(stock.get(code, 0.0))
+        have = float(stock.get(code, 0.0)) * max(0.0, float(stock_multiplier))
         short = max(0.0, need - have)
         kind = str(row["make_or_buy"] or "unknown")
         lead = row["lead_time_days"]
@@ -228,7 +229,7 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
         else:
             cost_unknown += 1
         if short > 0 and str(lead or "").isdigit() and kind == "外购":
-            lead_days = int(lead)
+            lead_days = max(0, int(round(int(lead) * max(0.0, float(lead_multiplier)))))
             if lead_days >= (kit_lead_max[0] or -1):
                 kit_lead_max[0] = lead_days
                 kit_bottleneck[0] = {"material_code": code, "lead_time_days": lead_days,
@@ -238,8 +239,9 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
         if short > 0:
             if kind == "外购":
                 if str(lead or "").isdigit() and int(lead) >= 0:
-                    buy_arrival_days.append(start_day + int(lead))
-                    entry["action"] = f"开采购 {round(short, 3)}，{int(lead)} 天后到"
+                    scaled = max(0, int(round(int(lead) * max(0.0, float(lead_multiplier)))))
+                    buy_arrival_days.append(start_day + scaled)
+                    entry["action"] = f"开采购 {round(short, 3)}，{scaled} 天后到"
                 else:
                     entry["action"] = "外购缺料但没有提前期 → 无法排到货日"
                     blockers.append(f"{code} 无提前期")
@@ -262,7 +264,7 @@ def simulate_days(units: float, hours_per_unit: float, hours_per_day: float,
     # 人是这条线的瓶颈（跑步机线 300 人配 300 台/天 = 一台一份人力），
     # 所以到岗不足时产能必须一起降：暴雨只来 7 成人，一天就不可能还是 300 台。
     # 不绑人力的装配线可以以后按线打标放开，现在按声明的 人数:台数 比例算。
-    units_per_day = cap_per_day if cap_per_day > 0 else (
+    units_per_day = cap_per_day if cap_per_day > 0 else (   # cap_per_day 已经把工时上限取过 min
         max(1.0, hours_per_day / hours_per_unit) if hours_per_unit > 0 else 0.0)
     remaining = float(units)
     day = 0
@@ -322,7 +324,9 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                      expedite_lead_days: Optional[int] = None, allow_partial: bool = True,
                      parallel_lines: int = 1, crew_bonus: float = 0.0,
                      cached: Optional[Dict[str, Any]] = None,
-                     line_busy_days: float = 0.0, equip_rate: float = 1.0) -> Dict[str, Any]:
+                     line_busy_days: float = 0.0, equip_rate: float = 1.0,
+                     hours_multiplier: float = 1.0, lead_multiplier: float = 1.0,
+                     stock_multiplier: float = 1.0) -> Dict[str, Any]:
     """把一个目标跑成一条演变时间线。"""
     cache = (cached or {}).get(model)
     if not cache:
@@ -340,8 +344,11 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     route, route_basis = resolve_route(list(route_own), family_rows)
     line, line_basis = pick_line(model, lines)
     hours_per_unit, hours_basis = hours_per_unit_from(route, line)
+    if hours_per_unit:
+        hours_per_unit = round(hours_per_unit * max(0.05, float(hours_multiplier)), 6)
 
-    kit = build_kit(bom, units, stock, start_day=0)
+    kit = build_kit(bom, units, stock, start_day=0, lead_multiplier=lead_multiplier,
+                    stock_multiplier=stock_multiplier)
     if expedite_lead_days is not None and kit["bottleneck_part"]:
         kit["buy_arrival_days"] = [expedite_lead_days if d == kit["bottleneck_part"]["lead_time_days"] else d
                                    for d in kit["buy_arrival_days"]]
@@ -370,7 +377,11 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     hours_per_day = float((line or {}).get("hours_per_day") or 11)
     group_cap = group_capacity(lines, line or {}, parallel_lines)
     crew = round(group_cap["crew"] * (1.0 + crew_bonus), 1)
-    cap = round(group_cap["units_per_day"] * max(0.1, min(1.0, equip_rate)), 2)  # 设备可用率折进日产能
+    cap_line = round(group_cap["units_per_day"] * max(0.1, min(1.0, equip_rate)), 2)  # 设备可用率折进日产能
+    caps = capacity_limits(crew=crew, hours_per_day=hours_per_day, hours_per_unit=hours_per_unit,
+                           line_declared=cap_line)
+    cap, capacity_binding = caps["units_per_day"], caps["binding"]
+    cap_hours = caps["hours_implied"]
 
     # 引擎的决策（不是计算器会做的事）：现料能做几台就先开几台，剩下的排在到货日之后
     coverable = []
@@ -440,6 +451,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "equipment_rate_applied": round(equip_rate, 4),
         "capacity_after_equipment": cap,
         "capacity_basis": group_cap["capacity_basis"],
+        "capacity_binding": capacity_binding,
+        "capacity_line_declared": cap_line, "capacity_hours_implied": cap_hours,
         "standby_note": ("等料那几天这条线是空的；只有把整班人守着这条线才算损失。"
                          "厂里还有几百张单没排，空档可以承接 —— 所以这笔是上限，不是必然发生的钱。"),
         "material_cost_usd": kit["material_cost"],
@@ -1024,6 +1037,25 @@ async def build_policy_grid(db: AsyncSession, factory_id: str,
     return grid
 
 
+def capacity_limits(*, crew: float, hours_per_day: float, hours_per_unit: float,
+                    line_declared: float) -> Dict[str, Any]:
+    """日产能取两个上限的较小值：线组声明的台/天，和班组按单件工时做得完的台/天。
+
+    原来只要有声明产能就完全不看工时 —— 实测 IE 工时 ±40% 对交期 0 影响，
+    模型对着映射的数据不动，推演就退化成了日历器。两边都给不出 → 0（这台单没法排时）。
+    """
+    hours_implied = (round(crew * hours_per_day / hours_per_unit, 2)
+                     if hours_per_unit and hours_per_unit > 0 and crew > 0 else 0.0)
+    options = [x for x in (float(line_declared or 0), hours_implied) if x > 0]
+    if not options:
+        return {"units_per_day": 0.0, "binding": "no_capacity",
+                "line_declared": float(line_declared or 0), "hours_implied": 0.0}
+    binding = ("ie_hours" if hours_implied and hours_implied <= float(line_declared or 0)
+               else "line_declared")
+    return {"units_per_day": round(min(options), 2), "binding": binding,
+            "line_declared": float(line_declared or 0), "hours_implied": hours_implied}
+
+
 def group_capacity(lines: List[Dict[str, Any]], line: Dict[str, Any],
                    parallel_lines: int) -> Dict[str, Any]:
     """并联产能只能按线组声明的合并产能算 —— 跑步机线 11h/300 台、bike 单线 400 台但
@@ -1140,8 +1172,8 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         *, today: Optional[date] = None,
                         policies: Optional[List[Dict[str, Any]]] = None,
                         scenarios: Optional[List[Dict[str, Any]]] = None,
-                        targets_by_scenario: Optional[Dict[str, List[Dict[str, Any]]]] = None
-                        ) -> Dict[str, Any]:
+                        targets_by_scenario: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+                        perturb: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     """让引擎自己扫政策组合：同一批目标在多种产能/出勤/采购/分批政策下的多目标结果。
 
     这里刻意不给"唯一总分"。每个政策产出一个目标向量，交给 pareto_eval 判前沿与平衡解 ——
@@ -1194,7 +1226,11 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                    parallel_lines=int(pol.get("parallel_lines", 1)),
                                    crew_bonus=float(pol.get("crew_bonus", 0.0)),
                                    cached=cache, line_busy_days=(0.0 if pol.get("ignore_backlog") else busy),
-                                   equip_rate=float(equip.get("rate") or 1.0))
+                                   equip_rate=float((perturb or {}).get("equip_rate")
+                                                    or equip.get("rate") or 1.0),
+                                   hours_multiplier=float((perturb or {}).get("hours_multiplier", 1.0)),
+                                   lead_multiplier=float((perturb or {}).get("lead_multiplier", 1.0)),
+                                   stock_multiplier=float((perturb or {}).get("stock_multiplier", 1.0)))
             allocated[grp] = busy + float(run.get("work_days") or 0)
             per_run.append({"run": run, "due_day": due_day, "units": float(t.get("units") or 0)})
         # 没有工时依据/没有可归属线的机种不算"厂里做不到"，是模型还代表不了它 —— 缺的是数据。
@@ -1254,6 +1290,9 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         "why": x["run"].get("why"),
                         "queue_days_before_this_order": x["run"].get("line_busy_days_before_order"),
                         "capacity_basis": x["run"].get("capacity_basis"),
+                        "capacity_binding": x["run"].get("capacity_binding"),
+                        "capacity_line_declared": x["run"].get("capacity_line_declared"),
+                        "capacity_hours_implied": x["run"].get("capacity_hours_implied"),
                         "material_arrival_day": x["run"].get("material_arrival_day"),
                         "batch_a_units": x["run"].get("batch_a_units"),
                         "batch_b_units": x["run"].get("batch_b_units"),

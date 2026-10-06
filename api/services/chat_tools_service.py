@@ -884,6 +884,21 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_simulation_sensitivity",
+            "description": (
+                "仿真引擎的量化读数（只读）：组合完工日、延几天、人工/加急/开线各多少钱；"
+                "每个输入动一档的局部斜率（单件工时±10%、外购提前期×0.5、可用库存×1.5、"
+                "到岗率±0.05、设备可用率±0.05、批量±1天产量、并联开线、加班加人、承诺交期系数），"
+                "换算成'值几天、每天值多少钱、救回几台准点'；映射精度（每项输入有多少真依据、"
+                "允许误差多大）；以及误差传导 —— 现在这个交期可信到几成、把哪项数据补到可信能压掉几天。"
+                "用于'补 IE 工时值多少''加急值几天''该不该开第二条线''加班划不划算'"
+                "'这个交期有多可信''哪个杠杆最值钱''数据补齐能改善多少'类问题。不写任何系统。"),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_plan_commit_gate",
             "description": "计划逐单下达就绪门（只读）：这一版排程里哪些工单真的能开工、哪些被哪条门压住（没排进本版本/工序没排齐/物料没齐套/首道工位映射不到），以及已经下达过的张数。用于'这版计划能开工几张''还有哪些单卡着''为什么没下达''计划生效了没'类问题。只报判定，不改工单状态、不下达。",
             "parameters": {"type": "object", "properties": {}},
@@ -2546,6 +2561,48 @@ async def _tool_query_bom_data_quality(
     }
 
 
+async def _tool_query_simulation_sensitivity(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """敏感度与映射精度（只读）：斜率、精度、误差传导都在 sim_sensitivity 一处算。"""
+    from api.services.sim_sensitivity import report
+    from api.services.virtual_run import default_models
+
+    fid = factory_id or "FAC_MECH_001"
+    models = await default_models(db, fid, n=5)
+    if not models:
+        return {"status": "ok", "factory_id": fid, "has_data": False,
+                "message": "厂区里没有可推演的机种（BOM 镜像为空？）"}
+    out = await report(db, fid, models)
+    sens = out.get("sensitivity") or {}
+    base = sens.get("base") or {}
+    levers = [{"lever": l["label"], "base_level": l.get("base_level"),
+               "slope": l.get("slope"),
+               "curve": [{k: c.get(k) for k in ("level", "finish_date", "days_vs_base",
+                                                "on_time_models", "labor_delta_usd",
+                                                "expedite_delta_usd", "activation_delta_usd")}
+                         for c in (l.get("curve") or [])]}
+              for l in sens.get("levers") or []]
+    acc = out.get("accuracy") or {}
+    return {
+        "status": "ok", "factory_id": fid, "has_data": True, "models": models,
+        "base": {k: base.get(k) for k in ("finish_date", "days_late_worst", "on_time_rate",
+                                          "labor_cost_usd", "expedite_cost_usd",
+                                          "line_activation_cost_usd", "first_batch_units",
+                                          "queued_units", "binding")},
+        "targets": sens.get("targets"),
+        "levers": levers,
+        "accuracy_overall": acc.get("overall_accuracy"),
+        "accuracy_per_model": [{"model_code": m["model_code"], "score": m["accuracy_score"],
+                                "drags": m["drags"]} for m in acc.get("models") or []],
+        "uncertainty": (out.get("uncertainty") or {}).get("per_model"),
+        "value_of_repair": (out.get("uncertainty") or {}).get("value_of_repair"),
+        "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
+                   "不确定天数 = |斜率| × (允许误差 ÷ 档位步长)，多项线性相加是保守口径；"
+                   "所有档位都走同一条 scan_policies 推演路径，不另建第二套算法。"),
+    }
+
+
 async def _tool_query_simulation_recommendation(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3152,6 +3209,7 @@ _TOOL_EXECUTORS = {
     "query_wms_inventory_health": _tool_query_wms_inventory_health,
     "query_bom_data_quality": _tool_query_bom_data_quality,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
+    "query_simulation_sensitivity": _tool_query_simulation_sensitivity,
     "query_chain_convergence": _tool_query_chain_convergence,
     "query_plan_commit_gate": _tool_query_plan_commit_gate,
     "query_shortage_alerts": _tool_query_shortage_alerts,
@@ -3546,6 +3604,7 @@ TOOL_LABELS = {
     "query_plan_commit_gate": "计划逐单下达就绪门",
     "query_chain_convergence": "链条收敛自检",
     "query_simulation_recommendation": "推演建议与落地复查",
+    "query_simulation_sensitivity": "建模精度与敏感度",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",
