@@ -36,6 +36,7 @@ from api.services.component_orders import (
     retire_covered_child_orders,
 )
 from api.services.component_release import release_kitted_child_orders
+from api.services.purchase_receipts import receive_due_purchase_orders
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
 from api.services.aps_draft_prune import (
@@ -374,8 +375,12 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     receipt["component_orders"] = orders
     if apply:
         await db.commit()
+    # 到货先记账，再刷缺口：PO 的预计到货日过了不等于货到了 —— 以前没人把在途收成库存，
+    # 于是 MRP 永远算缺料、门永远不放行（实测 31 张单飘了一个半月）。
+    receipt["purchase_receipts"] = await receive_due_purchase_orders(db)
     # 最后把主快照的缺口按当前台账刷一遍：下级完工入库后，父层齐套门才会自己放行
     receipt["supply_refresh"] = await refresh_snapshot_supply(db, apply=apply)
+    # 刷完缺口再判能否开工：下级装配件的料齐了就 released，没齐就报卡在哪
     # 刷完缺口再判能否开工：下级装配件的料齐了就 released，没齐就报卡在哪
     receipt["child_releases"] = await release_kitted_child_orders(
         db, factory_id=None, apply=apply

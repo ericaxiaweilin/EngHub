@@ -291,10 +291,16 @@ def readiness_rollup(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]
             for k, v in out.items() if v["parts"]}
 
 
+# 还没到货的采购单算哪些状态：这一份清单是"在途"的唯一口径，收货那一步也用它，
+# 两边各写一份就会漏 —— 实测原来这里只认 confirmed/shipped，14 张 in_transit 的 PO
+# 对 MRP 完全不存在，货等于在系统外飘着；而它们的 expected_date 早过了也没人收货（见 purchase_receipts）。
+OPEN_PO_STATUSES = ("confirmed", "approved", "ordered", "in_transit", "shipped")
+
+
 async def stock_and_supply(
     db: Any, factory_id: str, material_codes: List[str], target_date=None
 ) -> Dict[str, Dict[str, float]]:
-    """一次查完在库可用与在途（口径与 MRP 端点一致：只算 confirmed/shipped 且交期不晚于目标日）。"""
+    """一次查完在库可用与在途（在途 = 未收数量、且预计到货日不晚于目标日）。"""
     codes = [c for c in dict.fromkeys(material_codes) if c]
     if not codes:
         return {}
@@ -310,15 +316,17 @@ async def stock_and_supply(
         out.setdefault(str(r["material_code"]), {"on_hand": 0.0, "on_order": 0.0})["on_hand"] = float(r["avail"] or 0)
 
     po = (await db.execute(text("""
-        SELECT material_code, COALESCE(SUM(qty), 0) AS on_order
+        SELECT material_code,
+               COALESCE(SUM(GREATEST(qty - COALESCE(received_qty, 0), 0)), 0) AS on_order
         FROM purchase_orders
         WHERE factory_id = :fid
           AND material_code = ANY(:codes)
-          AND status IN ('confirmed', 'shipped')
+          AND status = ANY(:open_statuses)
           AND expected_date IS NOT NULL
           AND expected_date <= COALESCE(:target_date, CURRENT_DATE)
         GROUP BY material_code
-    """), {"fid": factory_id, "codes": codes, "target_date": target_date})).mappings().all()
+    """), {"fid": factory_id, "codes": codes, "target_date": target_date,
+           "open_statuses": list(OPEN_PO_STATUSES)})).mappings().all()
     for r in po:
         out.setdefault(str(r["material_code"]), {"on_hand": 0.0, "on_order": 0.0})["on_order"] = float(r["on_order"] or 0)
 

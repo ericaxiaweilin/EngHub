@@ -1111,6 +1111,84 @@ class InventoryService:
                 "inventory_id": inventory.id, "warehouse_id": str(warehouse_id),
                 "reason": "posted"}
 
+    async def record_purchase_receipt(
+        self,
+        *,
+        factory_id: str,
+        po_id: str,
+        po_code: str,
+        material_code: str,
+        qty: int,
+        supplier_id: Optional[str] = None,
+        warehouse_id: Optional[str] = None,
+        received_at: Optional[datetime] = None,
+        created_by: str = "purchase_receipt",
+        remark: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """采购到货入库：落一张 `goods_receipts` 收货单，并按 `purchase_in` 过账。
+
+        和 `record_production_output` 同一条路（仓库解析 + `apply_movement`），
+        因为"到货"以前在系统里根本不存在 —— PO 的 expected_date 过了之后没有任何代码
+        把它变成库存与流水，于是 MRP 永远算缺料、齐套门永远等不到补齐（实测 31 张单飘了一个半月）。
+        收货单必须落：只有库存动了、单据没影子，等于凭空造料。
+        `received_at` 用仿真时钟：到货日在虚拟工厂里是算出来的时间，不是这台机器今天的日期。
+        """
+        if qty <= 0:
+            return {"posted": 0, "reason": "no_quantity"}
+
+        warehouse_id = warehouse_id or (await self.db.execute(text("""
+            SELECT id FROM warehouses
+            WHERE factory_id = :fid AND COALESCE(status, 'active') <> 'inactive'
+            ORDER BY created_at NULLS LAST, id LIMIT 1
+        """), {"fid": factory_id})).scalar()
+        if not warehouse_id:
+            return {"posted": 0,
+                    "reason": f"厂区 {factory_id} 没有可用仓库，到货不入库（不凭空建仓位）"}
+
+        material_id = (await self.db.execute(text("""
+            SELECT material_id FROM inventory
+            WHERE factory_id = :fid AND material_code = :code
+            GROUP BY material_id LIMIT 1
+        """), {"fid": factory_id, "code": material_code})).scalar() or material_code
+
+        inventory = await self._resolve_inbound_inventory_row(
+            factory_id=factory_id,
+            warehouse_id=str(warehouse_id),
+            material_id=str(material_id),
+            material_code=material_code,
+        )
+        gr_code = f"GR-{date.today().strftime('%y%m%d')}-{str(uuid.uuid4())[:8]}"
+        gr_id = str(uuid.uuid4())
+        await self.db.execute(text("""
+            INSERT INTO goods_receipts
+                (id, gr_code, factory_id, po_id, material_code, supplier_id,
+                 quantity, qty_accepted, qty_rejected, iqc_status, warehouse,
+                 received_by, received_at, created_at)
+            VALUES
+                (:id, :gr_code, :fid, :po_id, :code, :supplier_id,
+                 :qty, :qty, 0, 'accepted', :warehouse, :who,
+                 COALESCE(CAST(:received_at AS timestamp), NOW()), NOW())
+        """), {
+            "id": gr_id, "gr_code": gr_code, "fid": factory_id, "po_id": po_id,
+            "code": material_code, "supplier_id": supplier_id, "qty": qty,
+            "warehouse": str(warehouse_id), "who": created_by,
+            "received_at": received_at,
+        })
+        await apply_movement(
+            self.db,
+            inventory=inventory,
+            transaction_type=document_movement_type("in", "purchase"),
+            quantity=qty,
+            reference_type="goods_receipt",
+            reference_id=gr_id,
+            reference_doc_no=gr_code,
+            operator=created_by,
+            remark=remark or f"采购到货入库 {material_code} × {qty}（{po_code}）",
+        )
+        return {"posted": qty, "gr_code": gr_code, "goods_receipt_id": gr_id,
+                "material_code": material_code, "warehouse_id": str(warehouse_id),
+                "reason": "posted"}
+
     async def reserve_inventory(
         self,
         factory_id: str,
