@@ -534,6 +534,125 @@ def _tune_one(cal: Dict[str, float], disc: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# 动作排序：先"今天就能下单/开工"的，再"要人去确认"的，最后是主数据缺口。
+_ACTION_PRIORITY = {"expedite_purchase": 0, "supplier_master_missing": 1, "start_first_batch": 2,
+                    "schedule_second_batch_after_arrival": 3, "activate_parallel_line": 4,
+                    "authorize_overtime": 5, "master_data_gap": 6}
+
+
+def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
+                           *, today: Optional[date] = None,
+                           max_actions: int = 30) -> List[Dict[str, Any]]:
+    """把"稳健推荐的政策"翻译成能执行的动作：催哪个料、哪天到货、先开哪一批、开哪条线。
+
+    政策名不是动作 —— 人要的是"找谁、买多少、几号到"。三条诚实规矩：
+    ① 缺口料号没有供应商主数据就不许编一个供应商，改成补数据动作（卡住交付的是数据不是产能）；
+    ② 开并联线要说清人手从哪来，技能矩阵还是 0 行就标 crew_verified=false，不假装人能调；
+    ③ 动作只落在沙箱建议里（sandbox_only），不写 MES/WMS，也不自动生成采购单。
+    依据取"该政策最紧的那个天气场景"：按好天的到货日下单，暴雨天就直接失约。
+    """
+    today = today or date.today()
+    robust = ((verdict or {}).get("robust_recommendation") or {}).get("policy")
+    if not robust:
+        return []
+    binding: Dict[str, Dict[str, Any]] = {}     # model -> 该模型最紧场景的 detail + 政策
+    for name, block in (scan.get("by_scenario") or {}).items():
+        for sol in (block.get("solutions") or []):
+            if str(sol.get("name")) != str(robust):
+                continue
+            for d in (sol.get("detail") or []):
+                m = str(d.get("model_code"))
+                score = (int(d.get("days_late") or 0), int(d.get("material_arrival_day") or 0))
+                cur = binding.get(m)
+                if cur is None or score > (int(cur.get("days_late") or 0),
+                                           int(cur.get("material_arrival_day") or 0)):
+                    entry = dict(d)
+                    entry["_scenario"] = name
+                    entry["_policy"] = sol.get("policy") or {}
+                    binding[m] = entry
+
+    out: List[Dict[str, Any]] = []
+    for m, d in sorted(binding.items()):
+        pol = d.get("_policy") or {}
+        scen = d.get("_scenario")
+        due = d.get("due_date")
+        base = {"model_code": m, "scenario": scen, "due_date": due,
+                "planned_finish_date": d.get("finish_date"), "sandbox_only": True}
+        if int(pol.get("parallel_lines") or 1) > 1:
+            out.append({**base, "type": "activate_parallel_line", "line": d.get("line"),
+                        "capacity_basis": d.get("capacity_basis"), "crew_verified": False,
+                        "note": ("开第二条线按组内声明的合并产能算（不是单线×线数）；"
+                                 "要的人手没有技能矩阵佐证，先按'能开'算钱、按'待确认'报人")})
+        if float(pol.get("crew_bonus") or 0) > 0:
+            out.append({**base, "type": "authorize_overtime",
+                        "extra_crew_share": round(float(pol["crew_bonus"]), 3),
+                        "note": f"加班加人 {float(pol['crew_bonus']):.0%}，成本已计入人工口径"})
+        bp = d.get("bottleneck_part") or {}
+        if pol.get("expedite_lead_days") is not None and bp and float(bp.get("short") or 0) > 0:
+            target = int(pol["expedite_lead_days"])
+            cur_lead = int(bp.get("lead_time_days") or 0)
+            arrival = int(d.get("material_arrival_day") or 0)
+            pull = max(0, cur_lead - target)
+            # arrival 已经是加急之后的到货日（run_target 里换过一遍），不能再减一次 pull：
+            # 那样催购要到的日期会比第二批开工的日期还早，两张动作自相矛盾。
+            act = {**base, "material_code": bp.get("material_code"),
+                   "qty_short": round(float(bp.get("short") or 0), 3),
+                   "current_lead_days": cur_lead, "target_lead_days": target,
+                   "order_by_date": str(today),
+                   "required_arrival_date": str(today + timedelta(days=arrival)),
+                   "pulled_in_days": pull,
+                   "arrival_note": f"按 {target} 天提前期推演的到货日；不催的话要到 {today + timedelta(days=arrival + pull)}"}
+            if bp.get("supplier"):
+                act.update({"type": "expedite_purchase", "supplier": bp["supplier"],
+                            "note": f"向 {bp['supplier']} 把 {cur_lead} 天提前期压到 {target} 天；"
+                                    f"下单每晚一天，出货日就晚一天"})
+            else:
+                act.update({"type": "supplier_master_missing",
+                            "note": ("这个缺口料号在物料主档里没有默认供应商 —— 催购没有对象。"
+                                     "卡住交付的是数据不是产能：先补料号供应商，再谈加急价")})
+            out.append(act)
+        a = float(d.get("batch_a_units") or 0)
+        b = float(d.get("batch_b_units") or 0)
+        if a > 0:
+            out.append({**base, "type": "start_first_batch", "units": round(a, 3),
+                        "start_date": str(today),
+                        "note": f"现料够先做 {a:g} 台，不等齐套；这批可以马上进排产预排"})
+        if b > 0:
+            out.append({**base, "type": "schedule_second_batch_after_arrival",
+                        "units": round(b, 3),
+                        "not_before": str(today + timedelta(days=int(d.get("material_arrival_day") or 0))),
+                        "note": "第二批卡在到货日，提前开工只会做出做不完的半成品"})
+        for gap in (d.get("blockers") or []):
+            out.append({**base, "type": "master_data_gap", "detail": str(gap),
+                        "note": "齐套算不下去的缺口在这里：不是产能，也不是人手"})
+
+    # 同一个主数据缺口会在多台单上重复出现：合成一条并列出受影响的机种，
+    # 否则动作清单被重复行占满，真正要催的那条反而看不见
+    merged: Dict[Tuple, Dict[str, Any]] = {}
+    order: List[Tuple] = []
+    for a in out:
+        ident = str(a.get("material_code") or a.get("detail") or "")
+        # 没有"料号/缺口"身份的动作（分批、开线）每台单都是独立的一条，
+        # 不能拿空身份当 key —— 那样第二台单的分批建议会被当成重复项吃掉
+        key = (a["type"], ident) if ident else (a["type"], str(a.get("model_code") or ""), len(order))
+        if key[1] and a["type"] in ("master_data_gap", "supplier_master_missing"):
+            if key not in merged:
+                merged[key] = dict(a, models=[])
+                order.append(key)
+            merged[key]["models"].append(a["model_code"])
+            merged[key].pop("model_code", None)
+            continue
+        if key not in merged:
+            merged[key] = a
+            order.append(key)
+    # 能花钱/能开工的动作排在前面，主数据缺口垫底：待办正文只放得下前几条，
+    # 让"今天该给谁下单"占位、"哪个料号没标自制外购"占位是两种完全不同的损失
+    ranked = sorted((merged[k] for k in order),
+                    key=lambda a: (_ACTION_PRIORITY.get(str(a.get("type")), 9),
+                                   str(a.get("model_code") or "")))
+    return ranked[:max(1, int(max_actions))]
+
+
 def _seed_calibration(seed: Optional[Dict[str, Any]], days_of_output: float,
                      lead_margin: float) -> Dict[str, Dict[str, float]]:
     """每 15 分钟一轮，标定不能每轮从 1.15 重新摸索一遍 —— 那等于每轮都把已知的
@@ -662,6 +781,7 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
             break
     return {"factory_id": factory_id, "rounds": len(trajectory), "warm_started": seeded,
             "targets": targets, "final": final, "trajectory": trajectory,
+            "final_scan": scan, "final_verdict": verdict,
             "calibration_by_scenario": {k: dict(v) for k, v in calib.items()},
             "rule": ("标定按天气场景各调各的，目标是每一轮都有区分度：可行比例落在 "
                      f"{FEASIBLE_BAND[0]:.0%}~{FEASIBLE_BAND[1]:.0%}，且推荐解与次优解的后悔不相等。"
@@ -950,9 +1070,16 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         | {str(x["run"].get("hours_basis")): 1 for x in per_run}
                         | {str(x["run"].get("line_basis")): 1 for x in per_run},
             "detail": [{"model_code": x["run"].get("model_code"),
-                        "finish_date": x["run"].get("finish_date"),
-                        "status": x["run"].get("status"),
+                        "units": x["run"].get("units"), "finish_date": x["run"].get("finish_date"),
+                        "due_date": x["run"].get("due_date"), "days_late": x["run"].get("days_late"),
+                        "status": x["run"].get("status"), "line": x["run"].get("line"),
+                        "capacity_basis": x["run"].get("capacity_basis"),
+                        "material_arrival_day": x["run"].get("material_arrival_day"),
+                        "batch_a_units": x["run"].get("batch_a_units"),
+                        "batch_b_units": x["run"].get("batch_b_units"),
                         "batch_decision": x["run"].get("batch_decision"),
+                        "blockers": x["run"].get("blockers"),
+                        "po_lines": x["run"].get("po_lines"),
                         "bottleneck_part": x["run"].get("bottleneck_part")} for x in per_run],
         })
       grouped[scen["name"]] = {"attendance": float(scen.get("attendance", 0.97)),

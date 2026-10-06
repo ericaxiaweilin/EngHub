@@ -214,3 +214,95 @@ def test_truly_tied_solutions_are_reported_not_ordered():
     assert disc["runner_up_regret_gap"] is None and disc["feasible"] == 3
     cal = {"days_of_output": 6.0, "lead_margin": 1.15}
     assert vr._tune_one(cal, disc) is not None      # 并列 + 全可行 → 该收紧这一格了
+
+
+def _scan_with(policy_name, scen_details, *, expedite_lead_days=None, parallel=1):
+    """造一轮扫描：一个稳健政策在若干场景下每台单的推演明细。"""
+    scen = {}
+    for name, details in scen_details.items():
+        scen[name] = {"attendance": 0.9, "solutions": [{
+            "id": f"{name}-0", "name": policy_name, "scenario": name,
+            "policy": {"expedite_lead_days": expedite_lead_days, "parallel_lines": parallel},
+            "detail": details}]}
+    return {"by_scenario": scen}, {"robust_recommendation": {"policy": policy_name}}
+
+
+def test_recommendation_names_the_part_the_supplier_and_the_date():
+    """政策要变成动作：哪个料号、向谁催、几号前下单、几号前要到。"""
+    scan, verdict = _scan_with("加急到 10 天", {
+        "暴雨": [{"model_code": "FG-TREAD-003", "units": 1800, "days_late": 0,
+                 "material_arrival_day": 20, "due_date": "2026-11-06",
+                 "finish_date": "2026-11-04", "line": "LINE-TREAD-01",
+                 "batch_a_units": 600, "batch_b_units": 1200,
+                 "bottleneck_part": {"material_code": "M-9001", "short": 1800,
+                                     "lead_time_days": 20, "supplier": "VN-77",
+                                     "unit_price": 3.5},
+                 "blockers": []}]}, expedite_lead_days=10)
+    acts = vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))
+    exp = [a for a in acts if a["type"] == "expedite_purchase"]
+    assert len(exp) == 1
+    a = exp[0]
+    assert a["material_code"] == "M-9001" and a["supplier"] == "VN-77"
+    assert a["current_lead_days"] == 20 and a["target_lead_days"] == 10
+    assert a["pulled_in_days"] == 10
+    assert a["order_by_date"] == "2026-10-06"
+    assert a["required_arrival_date"] == "2026-10-26"      # 到货日 = 推演里加急后的到货日
+    assert a["sandbox_only"] is True
+    assert [x["type"] for x in acts if x["model_code"] == "FG-TREAD-003"] == [
+        "expedite_purchase", "start_first_batch", "schedule_second_batch_after_arrival"]
+    second = [x for x in acts if x["type"] == "schedule_second_batch_after_arrival"][0]
+    assert second["units"] == 1200 and second["not_before"] == "2026-10-26"
+    assert second["not_before"] == a["required_arrival_date"]
+
+
+def test_missing_supplier_becomes_a_data_action_not_an_invented_vendor():
+    """没有供应商主数据就不许编一个厂商出来 —— 这类缺口卡的是数据，不是产能。"""
+    scan, verdict = _scan_with("加急到 10 天", {
+        "好天": [{"model_code": "X", "days_late": 0, "material_arrival_day": 15,
+                 "bottleneck_part": {"material_code": "M-2", "short": 40,
+                                     "lead_time_days": 15, "supplier": None},
+                 "blockers": ["M-2 无提前期"]}]}, expedite_lead_days=5)
+    acts = vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))
+    kinds = {a["type"] for a in acts}
+    assert "expedite_purchase" not in kinds and "supplier_master_missing" in kinds
+    assert "master_data_gap" in kinds
+    # 待办正文只放得下前几条：能办事的排前面，主数据缺口垫底
+    assert [a["type"] for a in vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))][-1] \
+        == "master_data_gap"
+
+
+def test_actions_use_the_tightest_weather_scenario_not_the_pretty_one():
+    """按好天的到货日下单，暴雨天就直接失约 —— 动作依据必须取最紧那个场景。"""
+    easy = {"model_code": "X", "days_late": 0, "material_arrival_day": 10,
+            "finish_date": "2026-10-20", "due_date": "2026-10-25",
+            "bottleneck_part": {"material_code": "M-1", "short": 10,
+                                "lead_time_days": 20, "supplier": "VN-1"},
+            "batch_a_units": 0, "batch_b_units": 0, "blockers": []}
+    hard = dict(easy, days_late=3, material_arrival_day=18, finish_date="2026-10-28")
+    scan, verdict = _scan_with("加急到 10 天", {"好天（到岗 0.97）": [easy], "暴雨（到岗 0.70）": [hard]},
+                               expedite_lead_days=10)
+    acts = vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))
+    a = [x for x in acts if x["type"] == "expedite_purchase"][0]
+    assert a["scenario"].startswith("暴雨")
+    assert a["required_arrival_date"] == "2026-10-24"       # 取的是最紧场景的到货日(第 18 天)
+    assert a["pulled_in_days"] == 10
+
+
+def test_no_robust_policy_no_actions():
+    scan, verdict = _scan_with("加急", {"好天": []})
+    verdict["robust_recommendation"] = None
+    assert vr.recommendation_actions(scan, verdict) == []
+
+
+def test_batch_actions_survive_for_every_model():
+    """分批/开线这类动作没有"料号"身份，不能因为身份为空就被当成重复项吃掉。"""
+    def detail(m, a_units, b_units):
+        return {"model_code": m, "days_late": 0, "material_arrival_day": 12,
+                "batch_a_units": a_units, "batch_b_units": b_units,
+                "bottleneck_part": None, "blockers": ["RM-X 未标自制/外购"]}
+    scan, verdict = _scan_with("现况", {"好天": [detail("M-1", 10, 90), detail("M-2", 20, 80)]})
+    acts = vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))
+    first = [a for a in acts if a["type"] == "start_first_batch"]
+    assert {a["model_code"] for a in first} == {"M-1", "M-2"}
+    gaps = [a for a in acts if a["type"] == "master_data_gap"]      # 同一个缺口跨台单要合并
+    assert len(gaps) == 1 and sorted(gaps[0]["models"]) == ["M-1", "M-2"]

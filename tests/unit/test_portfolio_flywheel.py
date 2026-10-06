@@ -147,3 +147,19 @@ async def test_preview_mode_computes_without_writing():
     out = await pf.record_cycle(db, _sim(), factory_id="FAC_MECH_001", trials={}, apply=False)
     assert db.inserts == [] and db.commits == 0
     assert out["task"]["action"] == "would_open"
+
+
+def test_signature_detects_a_change_beyond_the_first_200_characters():
+    """短指纹要能看见"催的料号换了"。
+
+    老写法把长串直接 [:200] 截断，而各场景计数那段本身就超过 200 字 ——
+    尾巴上的动作清单被切掉，卡与待办因此永远算"没变"。
+    """
+    view = {f"场景{i}": {"recommended": "政策" * 24, "frontier_size": 7, "eliminated": 6,
+                         "no_feasible": False, "feasible_ratio": 0.54,
+                         "runner_up_regret_gap": 0.375} for i in range(3)}
+    a = pf.tradeoff_signature("加急到 10 天", view, ["expedite_purchase:RM-A"])
+    b = pf.tradeoff_signature("加急到 10 天", view, ["expedite_purchase:RM-B"])
+    assert len(a[0]) <= 200 and len(b[0]) <= 200
+    assert a[0] != b[0]
+    assert pf.tradeoff_signature("加急到 10 天", view, ["expedite_purchase:RM-A"])[0] == a[0]

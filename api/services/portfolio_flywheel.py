@@ -12,11 +12,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 from datetime import date, datetime
-from typing import List
+from typing import List, Tuple
 from typing import Any, Dict, Optional
 
 from sqlalchemy import text
@@ -69,6 +70,20 @@ OPEN_TASK_SQL = text("""
 def _gen_id() -> str:
     import uuid
     return str(uuid.uuid4())
+
+
+def tradeoff_signature(policy: Optional[str], sig_view: Dict[str, Any],
+                       action_sig: List[str]) -> Tuple[str, str]:
+    """记分卡的"变没变"指纹：短到能进列，又不能把有意义的变化截掉。
+
+    之前直接 [:200] 截断，而场景计数那段本身就超 200 字 —— 后面的动作清单被切没了，
+    于是"催的料号换了"这种真变化在比较里看不见，卡与待办都不会更新。
+    返回 (入库用的短指纹, 可复核的完整指纹)。
+    """
+    full = (f"{policy}|{json.dumps(sig_view, ensure_ascii=False, sort_keys=True)}"
+            f"|{','.join(action_sig)}")
+    short = f"{(policy or '')[:60]}|{hashlib.sha1(full.encode('utf-8')).hexdigest()[:12]}"
+    return short[:200], full
 
 
 def should_write_card(last: Optional[Dict[str, Any]], score: float, constraint: str) -> bool:
@@ -229,12 +244,24 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                                              "no_feasible", "feasible_ratio",
                                              "runner_up_regret_gap")}
                 for name, r in per_scenario.items()}
-    signature = f"{robust.get('policy')}|{json.dumps(sig_view, ensure_ascii=False, sort_keys=True)}"[:200]
-
+    # 推荐不是一个政策名，是一串能执行的动作：催哪个料、哪天到、先开哪一批、开哪条线。
+    # 在"要不要写卡"之前就算好：apply=false 也要看得见引擎准备发什么动作。
+    from api.services.virtual_run import recommendation_actions
+    actions = recommendation_actions(tuned.get("final_scan") or {}, tuned.get("final_verdict") or {})
+    # 动作清单里"催哪个料"变了才算推荐变了（不带日期与数量：那些每天都动）
+    # 身份取"料号/缺口描述"，没有料号的（分批、开线）用机种当身份 ——
+    # 否则两台单的分批建议在签名里是同一个元素，动作清单少了一半也看不出来
+    action_sig = sorted({f"{a.get('type')}:"
+                         f"{a.get('material_code') or a.get('detail') or a.get('model_code') or ','.join(a.get('models') or [])}"
+                         for a in actions})
+    full_signature = tradeoff_signature(robust.get("policy"), sig_view, action_sig)
+    receipt_signature = full_signature[0]
+    signature = receipt_signature
     last = prev      # 同一张上一轮记分卡，热启动标定与变更比较都读它，不查第二遍
     changed = (not last) or str((last or {}).get("top_constraint") or "") != signature
     receipt = {"factory_id": factory_id, "apply": apply, "changed": changed,
                "robust_recommendation": robust, "by_scenario": per_scenario,
+               "actions": actions, "action_count": len(actions),
                "scenario_divergence": verdict.get("scenario_divergence"),
                "calibration": [(t.get("model_code"), t.get("units"), t.get("due_in_days"),
                                 t.get("calibration")) for t in (tuned.get("targets") or [])],
@@ -283,10 +310,12 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                                "score_meaning": "稳健度：推荐政策在多少个天气场景下真正准点（不是加权总分）",
                                "objectives": objectives},
                               ensure_ascii=False),
-        "top": signature[:200],
+        "top": signature,
         "levers": json.dumps(robust, ensure_ascii=False),
-        "detail": json.dumps({"by_scenario": per_scenario, "calibration": receipt["calibration"],
+        "detail": json.dumps({"actions": actions[:20], "by_scenario": per_scenario,
+                              "calibration": receipt["calibration"],
                               "calibration_by_scenario": tuned.get("calibration_by_scenario") or {},
+                              "full_signature": full_signature[1],
                               "tuning": receipt["tuning_trajectory"],
                               "self_check": tuned["final"].get("notes") or [],
                               "note": TRADEOFF_NOTE}, ensure_ascii=False),
@@ -312,6 +341,31 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         per = {n: _rec((r or {}).get("recommended"))
                for n, r in (verdict.get("by_scenario") or {}).items()}
         objs = objectives
+        act_lines = []
+        for a in actions[:8]:
+            t = a.get("type")
+            if t == "expedite_purchase":
+                act_lines.append(f"· 催购 {a['material_code']} {float(a['qty_short']):g} 件"
+                                 f"（{a.get('supplier')}）：提前期 {a['current_lead_days']}→"
+                                 f"{a['target_lead_days']} 天，{a['order_by_date']} 前下单、"
+                                 f"{a['required_arrival_date']} 前要到")
+            elif t == "supplier_master_missing":
+                act_lines.append(f"· 补主数据 {a['material_code']}：没有供应商，催购没有对象"
+                                 f"（卡的是数据，不是产能）")
+            elif t == "start_first_batch":
+                act_lines.append(f"· {a['model_code']} 先开 {float(a['units']):g} 台"
+                                 f"（{a['start_date']}），不等齐套")
+            elif t == "schedule_second_batch_after_arrival":
+                act_lines.append(f"· {a['model_code']} 第二批 {float(a['units']):g} 台"
+                                 f"排在 {a['not_before']} 到货之后")
+            elif t == "activate_parallel_line":
+                act_lines.append(f"· {a['model_code']} 开并联线 {a.get('line')}"
+                                 f"（{a.get('capacity_basis')}，人手无技能矩阵佐证）")
+            elif t == "authorize_overtime":
+                act_lines.append(f"· {a['model_code']} 加班加人 "
+                                 f"{float(a['extra_crew_share']):.0%}")
+            elif t == "master_data_gap":
+                act_lines.append(f"· 主数据缺口：{a.get('detail')}")
         created = await create_task(
             db, factory_id, "virtual_factory",
             f"推演推荐｜{rec}（好天~暴雨都不误期，代价 ${float(objs.get('expedite_cost_usd') or 0) + float(objs.get('line_activation_cost_usd') or 0):,.0f}）"[:200],
@@ -324,13 +378,18 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                 f"等料空档 {float(objs.get('standby_person_days') or 0):,.0f} 人日。\n"
                 f"选择规则：{verdict.get('selection_rule')}\n"
                 f"（不是'分最高'：交期与产量是硬约束，其余维度取最小最大后悔，避免为刷一个维度牺牲另一维。）\n"
-                f"场景标定：" + "；".join(f"{c[0]} {c[1]}台/{c[2]}天" for c in receipt["calibration"])),
+                f"场景标定：" + "；".join(f"{c[0]} {c[1]}台/{c[2]}天" for c in receipt["calibration"])
+                + ("\n动作（都在沙箱里，不写 MES/WMS，也不自动开采购单）：\n"
+                   + "\n".join(act_lines) if act_lines else "")),
             agent_key="pmc_agent", item_type="followup", source="virtual_factory",
             block_reason="推演建议，采纳与否看厂里的取舍；不自动改排产与采购",
             conversation_hint="采纳的话：把这个瓶颈件的到货目标日压到推荐值，并确认并联线/班组是否可用。",
             payload=json.dumps({"category": "simulation_recommendation", "policy": rec,
                                 "per_scenario": per, "objectives": objs,
-                                "robust_why": robust.get("why")}, ensure_ascii=False),
+                                "robust_why": robust.get("why"),
+                                "robust_tied_with": robust.get("tied_with") or [],
+                                "scenario_divergence": verdict.get("scenario_divergence"),
+                                "actions": actions[:20]}, ensure_ascii=False),
             follow_interval_minutes=24 * 60)
         if created.get("task_id"):
             await db.execute(text("""
