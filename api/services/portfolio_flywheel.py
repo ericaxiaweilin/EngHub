@@ -37,8 +37,17 @@ INSERT_SQL = text("""
             CAST(:levers AS jsonb), CAST(:detail AS jsonb), :source, NOW())
 """)
 
+CAL_SQL = text("""
+    UPDATE simulation_scorecards
+       SET detail = jsonb_set(COALESCE(detail, '{}'::jsonb), '{calibration_by_scenario}',
+                              CAST(:cal AS jsonb))
+     WHERE id = (SELECT id FROM simulation_scorecards WHERE factory_id = :fid
+                 ORDER BY created_at DESC LIMIT 1)
+""")
+
 LAST_SQL = text("""
-    SELECT portfolio_score, top_constraint, engine_date, created_at
+    SELECT portfolio_score, top_constraint, engine_date, created_at,
+           (detail->'calibration_by_scenario')::text AS calibration
     FROM simulation_scorecards WHERE factory_id = :fid
     ORDER BY created_at DESC LIMIT 1
 """)
@@ -174,11 +183,21 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                             models: Optional[List[str]] = None) -> Dict[str, Any]:
     """扫一遍政策×天气，把权衡矩阵与稳健推荐写进记分卡；推荐变了才动待办。"""
     from api.services.virtual_run import auto_tune, default_models
-    # 不再用固定标定：先自调（太松/太紧会自己改批量与交期系数），调稳了才比较
+    # 不再用固定标定：先自调（太松/太紧会自己改批量与交期系数），调稳了才比较。
+    # 标定从上一张记分卡热启动：15 分钟一轮，每轮从零重摸一遍既白算也收不敛。
+    prev = (await db.execute(LAST_SQL, {"fid": factory_id})).mappings().first()
+    seed: Dict[str, Any] = {}
+    try:
+        seed = json.loads((prev or {}).get("calibration") or "{}")
+    except (TypeError, ValueError):
+        seed = {}
     tuned = await auto_tune(db, factory_id, models or await default_models(db, factory_id, n=2),
-                            rounds=4)
+                            rounds=4, calibration=seed)
     verdict = {"by_scenario": {k: v for k, v in (tuned["final"]["per_scenario"] or {}).items()},
-               "robust_recommendation": {"policy": tuned["final"]["robust"]},
+               "robust_recommendation": {"policy": tuned["final"].get("robust"),
+                                         "why": tuned["final"].get("robust_why"),
+                                         "tied_with": tuned["final"].get("robust_tied_with") or []},
+               "scenario_divergence": tuned["final"].get("scenario_divergence") or {},
                "selection_rule": tuned["rule"]}
     scan = {"policies_tried": int(tuned["final"].get("policies_tried") or 0)}
     robust = verdict.get("robust_recommendation") or {}
@@ -193,22 +212,52 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                            "frontier_size": _count(res.get("frontier") if "frontier" in res
                                                     else res.get("feasible")),
                            "eliminated": _count(res.get("eliminated")),
-                           "no_feasible": bool(res.get("no_feasible"))}
+                           "no_feasible": bool(res.get("no_feasible")),
+                           # 区分度读数：标定按场景各调各的，这几列说明"这一轮比出了什么"
+                           "feasible_ratio": res.get("feasible_ratio"),
+                           "runner_up_regret_gap": res.get("runner_up_regret_gap"),
+                           "live_objectives": res.get("live_objectives"),
+                           "informative": res.get("informative"),
+                           "calibration": res.get("calibration"),
+                           "tied_with_recommended": res.get("tied_with_recommended"),
+                           "recommended_objectives": res.get("recommended_objectives"),
+                           "scenario_verdict": res.get("verdict")}
                     for name, res in (verdict.get("by_scenario") or {}).items()}
-    signature = f"{robust.get('policy')}|{json.dumps(per_scenario, ensure_ascii=False, sort_keys=True)}"
+    # 签名只取"推荐变了没、各场景比出了什么"，不带 finish_date/钱数这类每天都动的量：
+    # 否则每轮都算"变了"，写卡和写待办的量平白翻几倍。
+    sig_view = {name: {k: r.get(k) for k in ("recommended", "frontier_size", "eliminated",
+                                             "no_feasible", "feasible_ratio",
+                                             "runner_up_regret_gap")}
+                for name, r in per_scenario.items()}
+    signature = f"{robust.get('policy')}|{json.dumps(sig_view, ensure_ascii=False, sort_keys=True)}"[:200]
 
-    last = (await db.execute(LAST_SQL, {"fid": factory_id})).mappings().first()
+    last = prev      # 同一张上一轮记分卡，热启动标定与变更比较都读它，不查第二遍
     changed = (not last) or str((last or {}).get("top_constraint") or "") != signature
     receipt = {"factory_id": factory_id, "apply": apply, "changed": changed,
                "robust_recommendation": robust, "by_scenario": per_scenario,
+               "scenario_divergence": verdict.get("scenario_divergence"),
                "calibration": [(t.get("model_code"), t.get("units"), t.get("due_in_days"),
                                 t.get("calibration")) for t in (tuned.get("targets") or [])],
                "selection_rule": verdict.get("selection_rule"), "note": TRADEOFF_NOTE,
-               "tuning_trajectory": [{"round": t["round"], "calibration": t["calibration"],
-                                      "diagnosis": t["diagnosis"], "next_tweak": t["next_tweak"],
-                                      "robust": t["robust"]} for t in tuned["trajectory"]],
+               "warm_started": bool(tuned.get("warm_started")),
+               "seed_from_last_card": bool(seed),
+               "tuning_rounds_used": tuned.get("rounds"),
+               "tuning_trajectory": [{"round": t.get("round"), "calibration": t.get("calibration"),
+                                      "diagnosis": t.get("diagnosis"),
+                                      "next_tweak": t.get("next_tweak"),
+                                      "tweaks": t.get("tweaks") or [],
+                                      "robust": t.get("robust")} for t in tuned["trajectory"]],
+               "calibration_by_scenario": tuned.get("calibration_by_scenario") or {},
                "card_written": False}
     if not changed:
+        # 标定得被记住，否则每 15 分钟都从 1.15 重摸一遍暴雨该多紧。
+        # 不为此写整张卡：只在标定和上一张卡里存的不一样时补一个 jsonb 字段，收敛后这条写也没有。
+        if apply and seed != (tuned.get("calibration_by_scenario") or {}):
+            await db.execute(CAL_SQL, {"fid": factory_id,
+                                       "cal": json.dumps(tuned.get("calibration_by_scenario") or {},
+                                                         ensure_ascii=False)})
+            await db.commit()
+            receipt["calibration_persisted"] = True
         receipt["skipped_reason"] = "稳健推荐与各场景前沿都没变，不重复写卡"
         return receipt
     if not apply:
@@ -218,18 +267,26 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     # 先给推荐解本身算一遍代价：钱和天数值不值得，写在建议里，不让人再去问模型
     objectives: Dict[str, Any] = {}
     for res in (verdict.get("by_scenario") or {}).values():
-        if isinstance(res, dict) and res.get("objectives"):
-            objectives = res["objectives"]
+        if isinstance(res, dict) and res.get("recommended_objectives"):
+            objectives = res["recommended_objectives"]
             break
+    # 记分卡的"分数"不是总分排名，是稳健度：推荐政策在多少个天气场景下真的准点（0~100）。
+    # 以前这里取 on_time_rate，但 auto_tune 不再回传 objectives，于是张张卡都是 0 分。
+    on_time_scen = sum(1 for r in per_scenario.values()
+                       if int(((r.get("recommended_objectives") or {}).get("days_late_worst")) or 0) == 0
+                       and not r.get("no_feasible"))
+    robustness_pct = round(100.0 * on_time_scen / max(1, len(per_scenario)), 1)
     await db.execute(INSERT_SQL, {
         "id": _gen_id(), "fid": factory_id, "eday": date.today(),
-        "models": len(per_scenario), "score": float(objectives.get("on_time_rate") or 0) * 100.0,
+        "models": len(per_scenario), "score": robustness_pct,
         "weights": json.dumps({"rule": "minimax regret over weather scenarios",
+                               "score_meaning": "稳健度：推荐政策在多少个天气场景下真正准点（不是加权总分）",
                                "objectives": objectives},
                               ensure_ascii=False),
         "top": signature[:200],
         "levers": json.dumps(robust, ensure_ascii=False),
         "detail": json.dumps({"by_scenario": per_scenario, "calibration": receipt["calibration"],
+                              "calibration_by_scenario": tuned.get("calibration_by_scenario") or {},
                               "tuning": receipt["tuning_trajectory"],
                               "self_check": tuned["final"].get("notes") or [],
                               "note": TRADEOFF_NOTE}, ensure_ascii=False),

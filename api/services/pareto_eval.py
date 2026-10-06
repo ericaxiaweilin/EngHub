@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # 方向：max 越大越好，min 越小越好
 # 只有这五项是"政策能改变"的目标：交期达成与产量都是硬约束（达标就恒定，比不出东西），
@@ -171,7 +171,8 @@ def anti_goodhart_check(solutions: List[Dict[str, Any]], keys: List[str]) -> Lis
     return warnings
 
 
-def evaluate_by_scenario(by_scenario: Dict[str, Any], demand_units: float,
+def evaluate_by_scenario(by_scenario: Dict[str, Any],
+                         demand_units: Union[float, Dict[str, float]],
                          keys: Optional[List[str]] = None) -> Dict[str, Any]:
     """在每个天气场景内部各算一次前沿，再给一个跨场景稳健推荐。
 
@@ -180,7 +181,10 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any], demand_units: float,
     """
     per_scenario = {}
     for name, block in (by_scenario or {}).items():
-        per_scenario[name] = evaluate(block.get("solutions") or [], demand_units, keys)
+        # 每个场景可以带自己标定的批量（virtual_run.auto_tune 按场景调），需求量就按场景取；
+        # 没有该场景的值时用全局量，保持老的调用方式不变。
+        dm = (demand_units.get(name) if isinstance(demand_units, dict) else demand_units) or 0.0
+        per_scenario[name] = evaluate(block.get("solutions") or [], float(dm), keys)
     # 同一政策在各场景的最大后悔，取最差场景做稳健比较（minimax over scenarios）
     if not by_scenario:
         return {"by_scenario": {}, "robust_recommendation": None,
@@ -202,15 +206,41 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any], demand_units: float,
             continue
         if robust is None or worst < robust[1]:
             robust = (policy, worst, rows)
+    robust_tied = []
+    if robust:
+        robust_tied = [p for p, rows in by_policy.items()
+                       if p != robust[0] and len(rows) >= len(per_scenario)
+                       and max(r[1] for r in rows) == robust[1]]
+    # 天气场景有没有真的改变结论：同一政策在各场景的目标向量若一模一样，这一维就没带信息
+    sig_by_policy: Dict[str, List[Tuple]] = {}
+    for name, res in per_scenario.items():
+        for sol in (res.get("frontier") or []) + (res.get("dominated") or []):
+            objs = sol.get("objectives") or {}
+            sig_by_policy.setdefault(str(sol.get("name") or sol.get("id")), []).append(
+                tuple(round(float(objs.get(k) or 0.0), 4) for k in FIXED_ORDER))
+    moved = sum(1 for sigs in sig_by_policy.values() if len(set(sigs)) > 1)
+    divergence = {
+        "policies_compared": len(sig_by_policy), "policies_that_move": moved,
+        "note": (f"{moved}/{len(sig_by_policy)} 个政策在不同天气下的结果确实不一样 —— "
+                 "场景分开算有信息" if moved else
+                 "所有政策在不同天气下的目标向量一模一样：这批单卡的是到货日不是出勤，"
+                 "天气这一维目前不携带任何信息（要么模型里出勤还没接到这条路径，要么本来就该如此）"),
+    }
     return {
+        "scenario_divergence": divergence,
         "by_scenario": {k: {kk: vv for kk, vv in v.items() if kk != "selection_rule"}
                         for k, v in per_scenario.items()},
         "robust_recommendation": None if not robust else {
             "policy": robust[0], "worst_scenario_regret_profile": list(robust[1]),
+            "tied_with": robust_tied,
+            "tied_note": (f"稳健推荐与 {'、'.join(str(x) for x in robust_tied[:6])} 在最坏场景下的后悔向量完全并列，"
+                          f"这一轮分不出高下" if robust_tied else None),
             "why": "该政策在好天/雨季/暴雨三个场景里都有解进入比较，且最坏场景的后悔向量最好；"
                    "选它不是因为它分数最高，而是因为它不赌天气。"},
         "selection_rule": ("场景内：可行解 → 帕累托前沿 → 后悔向量字典序最小；"
-                           "跨场景：取最坏场景后悔最小的政策（minimax），不是平均最好。"),
+                           "跨场景：取最坏场景后悔最小的政策（minimax），不是平均最好。"
+                           "各场景的批量是各自标定的，跨场景比的是场景内归一化之后的后悔向量，"
+                           "不是原始美元/天数 —— 所以'标定'只决定这一轮有没有区分度，不改变谁更好。"),
     }
 
 
@@ -232,21 +262,27 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         sol["assumption_share"] = assumption_share(sol)
         scored.append(sol)
     no_feasible = False
+    report_only_comparison = False
     if not scored and solutions:
         # 一个场景里没有任何准点解：退回比较全部（矮子里拔将军），此时延误天数才重新变成目标
         no_feasible = True
-        keys = base_keys + ["days_late_worst"]
+        keys = list(dict.fromkeys(base_keys + ["days_late_worst"]))   # 重键会让同一维算两次后悔
         notes.append("本场景没有准点解：改按延误天数择优，并明确标注这是降级比较")
         for sol in solutions:
             ok, _ = feasible(sol, demand_units, ignore_deadline=True)
-            sol = dict(sol)
-            sol["assumption_share"] = assumption_share(sol)
-            if ok:
-                scored.append(sol)
-        for sol in solutions:
-            sol = dict(sol)
-            sol["assumption_share"] = assumption_share(sol)
-            scored.append(sol)
+            if not ok:
+                continue
+            s2 = dict(sol)
+            s2["assumption_share"] = assumption_share(s2)
+            scored.append(s2)
+        if not scored:
+            # 连"忽略交期"都过不了产量底线：这些解只摆出来对比，不进择优
+            for sol in solutions:
+                s2 = dict(sol)
+                s2["assumption_share"] = assumption_share(s2)
+                scored.append(s2)
+            report_only_comparison = True
+            notes.append("没有任何解达到产量底线：以下只是把政策摆出来，不宣称哪个更好")
         eliminated = rejected
         rejected = []
 
@@ -286,13 +322,23 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
                      "已退到依据可靠的解里选（推荐解不在前沿上，这点会写进结果）")
     pool = pool or front or scored
     recommended = None
-    if pool:
+    tied_with: List[Any] = []
+
+    def profile(s):
         # 最大后悔并列时不能靠顺序瞎选：把每个解的后悔从最坏到最好排成向量比字典序，
         # 等于"先保证最坏的那维别太糟，再看次坏的" —— 平衡解要一整串都好，不是只一项好。
-        def profile(s):
-            r = [(s.get("regret_by_objective") or {}).get(k) or 0.0 for k in FIXED_ORDER]
-            return (s.get("max_regret") is None, sorted(r, reverse=True))
+        r = [(s.get("regret_by_objective") or {}).get(k) or 0.0 for k in FIXED_ORDER]
+        return (s.get("max_regret") is None, sorted(r, reverse=True))
+    if pool:
         recommended = min(pool, key=profile)
+        # 排序后的后悔向量会丢"后悔长在哪一维"，所以两个各让一头的解可能完全并列。
+        # 并列不能靠列表顺序假装选出来了：如实报"这一轮分不出高下"，让人去定优先级。
+        tied_with = [s.get("name") for s in pool if s is not recommended and profile(s) == profile(recommended)]
+        if tied_with:
+            notes.append(f"推荐解与 {len(tied_with)} 个政策的后悔向量每一位都相同（"
+                         f"{'、'.join(str(x) for x in tied_with[:6])}）："
+                         f"这一轮只筛掉了明显更差的，没说哪个最好。要分高下得给目标定优先级，"
+                         f"或补一档真能改变成本的政策 —— 列出的先后不代表排序。")
     if recommended is not None and recommended.get("assumption_share", 0) > ASSUMPTION_SHARE_LIMIT:
         recommended_note = (f"前沿里后悔最小的解有 {recommended['assumption_share']:.0%} "
                             f"的时间来自借用/假设依据，作为参考而非结论")
@@ -314,6 +360,8 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
                       for s in scored if not s.get("on_pareto_front")],
         "eliminated": rejected,
         "no_feasible_solution": no_feasible,
+        "report_only_comparison": report_only_comparison,
+        "recommended_tied_with": tied_with,
         "recommended": recommended,
         "recommended_off_frontier": out_of_frontier,
         "recommended_note": recommended_note,

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
@@ -452,71 +452,221 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     }
 
 
-async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rounds: int = 3,
-                     days_of_output: float = 6.0, lead_margin: float = 1.15) -> Dict[str, Any]:
-    """自己标定 → 自己扫 → 看失败原因 → 改标定/改网格 → 再扫。
+# 场景标定要落在"有信息量"的区间：全可行或全不可行都白算一轮。
+FEASIBLE_BAND = (0.25, 0.90)
+MARGIN_BOUNDS = (0.8, 1.6)
+BATCH_BOUNDS = (2.0, 12.0)
 
-    三条调参规则都是从"上一轮哪里白算了"推出来的，不是拍脑袋：
-    ① 所有政策都准点 ⇒ 场景太松：收紧交期系数或加大批量，让准点这维真的有区分度；
-    ② 没有任何政策准点 ⇒ 场景不可能：把最狠的加急/并联档加进网格，或如实报告
-       "以现有提前期这个交期做不到"（这本身就是结论，不是失败）；
-    ③ 可行解 ≤2 个 ⇒ 比较没有意义：放宽一档标定或补政策档位，并标注本轮只做可行性筛选。
+
+def regret_profile(sol: Dict[str, Any]) -> Tuple[float, ...]:
+    """与 pareto_eval 的择优同口径：把该解的各目标后悔从最坏到最好排成一个向量。"""
+    reg = sol.get("regret_by_objective") or {}
+    from api.services.pareto_eval import FIXED_ORDER
+    return tuple(sorted((float(reg.get(k) or 0.0) for k in FIXED_ORDER), reverse=True))
+
+
+def scenario_discrimination(res: Dict[str, Any], n_policies: int) -> Dict[str, Any]:
+    """这一轮这个场景到底比出了什么 —— 判"有没有信息"，不判"分数好不好看"。
+
+    runner_up_regret_gap 用字典序口径而不是 max_regret 之差：实测前沿只有 2~4 个点时
+    每个点都在某一维全场最差，max_regret 清一色等于 1.0，做差恒为 0，
+    看着像"全并列"其实是量错了。真正要比的是择优那串字典序里**第一个不相等的分量**。
+    gap=0 才是真的并列（抛硬币），gap=None 是连两个可比解都没有。
     """
+    pool = (res.get("frontier") or []) + (res.get("dominated") or [])
+    profiles = sorted(regret_profile(s) for s in pool)
+    tied = len([x for x in profiles[1:] if x == profiles[0]]) if profiles else 0
+    # 并列的那些不算次优：gap 要比到第一个**真的不一样**的解，否则永远读出 0
+    runner = next((x for x in profiles[1:] if x != profiles[0]), None) if len(profiles) > 1 else None
+    if runner is not None:
+        gap = next((round(b - a, 4) for a, b in zip(profiles[0], runner)
+                    if abs(b - a) > 1e-9), 0.0)
+    else:
+        gap = None
+    dead = res.get("non_discriminating_objectives") or []
+    live = len([k for k in (res.get("objectives") or []) if k not in dead])
+    feasible_ratio = round(len(pool) / max(1, int(n_policies or 1)), 2)
+    in_band = FEASIBLE_BAND[0] <= feasible_ratio <= FEASIBLE_BAND[1]
+    report_only = bool(res.get("report_only_comparison"))
+    return {
+        "recommended": (res.get("recommended") or {}).get("name"),
+        "feasible": len(pool),
+        "eliminated": len(res.get("eliminated") or []),
+        "feasible_ratio": feasible_ratio,
+        "frontier_size": len(res.get("frontier") or []),
+        "live_objectives": live,
+        "dead_dims": dead,
+        "runner_up_regret_gap": gap,
+        "tied_with_recommended": len(res.get("recommended_tied_with") or []),
+        "no_feasible": bool(res.get("no_feasible_solution")),
+        "report_only_comparison": report_only,
+        "informative": bool(len(pool) >= 3 and in_band and gap and live >= 1 and not report_only),
+    }
+
+
+def _tune_one(cal: Dict[str, float], disc: Dict[str, Any]) -> Optional[str]:
+    """按场景调自己的标定；返回这一格做了什么调整（None = 这轮不用动）。"""
+    ratio = disc["feasible_ratio"]
+    if disc["no_feasible"] or ratio < FEASIBLE_BAND[0]:
+        # 触发原因要分清：没有任何准点解 ≠ 可行比例低（降级比较时可行比例可以是 100%）
+        reason = ("没有任何准点解" if disc["no_feasible"] else f"可行比例 {ratio:.0%} 太低")
+        if cal["lead_margin"] < MARGIN_BOUNDS[1]:
+            cal["lead_margin"] = round(min(MARGIN_BOUNDS[1], cal["lead_margin"] + 0.1), 2)
+            return f"{reason} → 交期系数放宽到 {cal['lead_margin']:g}"
+        if ratio < FEASIBLE_BAND[0] and cal["days_of_output"] > BATCH_BOUNDS[0]:
+            cal["days_of_output"] = round(max(BATCH_BOUNDS[0], cal["days_of_output"] - 1.0), 2)
+            return f"交期已到上限还几乎无解 → 批量降到 {cal['days_of_output']:g} 天线产量，分清是量太大还是真做不到"
+        return None     # 标定已到底：做不到就是结论，不再用调参把它调成"做得到"
+    if ratio > FEASIBLE_BAND[1]:
+        # 全（或几乎全）可行不一定是坏事：目标维度还能取舍就不许再收紧交期去制造"延不延期"的假区分度
+        if disc["informative"] or (disc["live_objectives"] >= 2 and disc["runner_up_regret_gap"]):
+            return None
+        if cal["lead_margin"] > MARGIN_BOUNDS[0]:
+            cal["lead_margin"] = round(max(MARGIN_BOUNDS[0], cal["lead_margin"] - 0.1), 2)
+            return (f"{ratio:.0%} 的政策都准点、且推荐解与次优解的后悔并列 "
+                    f"→ 交期系数收紧到 {cal['lead_margin']:g}")
+        return None
+    if disc["feasible"] <= 2 or disc["live_objectives"] == 0:
+        if cal["days_of_output"] > BATCH_BOUNDS[0]:
+            cal["days_of_output"] = round(max(BATCH_BOUNDS[0], cal["days_of_output"] - 1.0), 2)
+            return (f"可行解只有 {disc['feasible']} 个/目标维度全平 → "
+                    f"批量降到 {cal['days_of_output']:g} 天线产量，找中间地带")
+    return None
+
+
+def _seed_calibration(seed: Optional[Dict[str, Any]], days_of_output: float,
+                     lead_margin: float) -> Dict[str, Dict[str, float]]:
+    """每 15 分钟一轮，标定不能每轮从 1.15 重新摸索一遍 —— 那等于每轮都把已知的
+    "哪个天气场景该多紧"重新忘掉，既白算也永远收敛不到中间地带。"""
+    calib = {s["name"]: {"days_of_output": round(float(days_of_output), 2),
+                         "lead_margin": round(float(lead_margin), 2)} for s in WEATHER_SCENARIOS}
+    for name, val in (seed or {}).items():
+        if name not in calib or not isinstance(val, dict):
+            continue
+        try:
+            batch = float(val.get("days_of_output"))
+            margin = float(val.get("lead_margin"))
+        except (TypeError, ValueError):
+            continue
+        if batch > 0 and margin > 0:
+            calib[name] = {"days_of_output": min(BATCH_BOUNDS[1], max(BATCH_BOUNDS[0], batch)),
+                           "lead_margin": min(MARGIN_BOUNDS[1], max(MARGIN_BOUNDS[0], margin))}
+    return calib
+
+
+async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rounds: int = 3,
+                    days_of_output: float = 6.0, lead_margin: float = 1.15,
+                    calibration: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """自己**按每个天气场景**标定 → 扫 → 看哪里白算 → 改标定 → 再扫。
+
+    标定从全局改成按场景，是上一轮自审抓出来的洞：可行度按场景分布，标定却是全局的 ——
+    暴雨一收紧，好天场景就退化成"13 个政策全可行、0 个淘汰"，那一轮同样没有信息量；
+    反过来全局放宽，暴雨又全不可行，还是比不出东西。
+
+    每格调的是什么，判据是"这一轮有没有区分度"，不是分数好不好看：
+    ① 可行比例 < 0.25（几乎没人能准点）⇒ 先放宽该场景交期系数；到上限再降批量，
+       分清是"量定大了"还是"以现有提前期就是做不到"（后者是结论，不是失败）；
+    ② 可行比例 > 0.90 且推荐解与次优解的后悔并列 ⇒ 收紧该场景交期系数；
+       若目标维度还能取舍（人力/加急/开线/负载比不一样），就**不许**再收紧 ——
+       准点这维本来就是空的，硬造"延不延期"的区分度是自欺；
+    ③ 可行解 ≤2 或目标维度全平 ⇒ 该场景批量降一档，去看中间地带。
+    """
+    calib = _seed_calibration(calibration, days_of_output, lead_margin)
+    seeded = bool(calibration)
     trajectory: List[Dict[str, Any]] = []
     grid_extra: List[Dict[str, Any]] = []
-    for rnd in range(max(1, rounds)):
-        targets = await derive_targets(db, factory_id, models, days_of_output=days_of_output,
-                                       lead_margin=lead_margin)
+    extreme_added = False
+    final: Dict[str, Any] = {}
+    targets: List[Dict[str, Any]] = []
+    for rnd in range(max(1, int(rounds))):
+        targets_by_scenario: Dict[str, List[Dict[str, Any]]] = {}
+        for name, cal in calib.items():
+            targets_by_scenario[name] = await derive_targets(
+                db, factory_id, models, days_of_output=cal["days_of_output"],
+                lead_margin=cal["lead_margin"])
+        targets = targets_by_scenario[WEATHER_SCENARIOS[0]["name"]]
         grid = await build_policy_grid(db, factory_id, targets)
         for extra in grid_extra:
             if extra["name"] not in {g["name"] for g in grid}:
                 grid.append(extra)
-        scan = await scan_policies(db, factory_id, targets, policies=grid)
+        scan = await scan_policies(db, factory_id, targets, policies=grid,
+                                   targets_by_scenario=targets_by_scenario)
         from api.services.pareto_eval import evaluate_by_scenario
-        verdict = evaluate_by_scenario(scan["by_scenario"], scan["demand_units"])
-        per = {k: {"recommended": (v.get("recommended") or {}).get("name"),
-                  "feasible": len(v.get("frontier") or []) + len(v.get("dominated") or []),
-                  "eliminated": len(v.get("eliminated") or []),
-                  "no_feasible": bool(v.get("no_feasible_solution")),
-                  "dead_dims": v.get("non_discriminating_objectives") or []}
-               for k, v in (verdict.get("by_scenario") or {}).items()}
-        feasible_counts = [p2["feasible"] for p2 in per.values()]
-        all_on_time = all(p2["eliminated"] == 0 for p2 in per.values())
-        none_on_time = any(p2["no_feasible"] for p2 in per.values())
-        action = {
+        verdict = evaluate_by_scenario(scan["by_scenario"], scan["demand_by_scenario"])
+        per: Dict[str, Any] = {}
+        tweaks: List[str] = []
+        for scen in WEATHER_SCENARIOS:
+            name = scen["name"]
+            res = (verdict.get("by_scenario") or {}).get(name) or {}
+            disc = scenario_discrimination(res, len(grid))
+            cal = calib[name]
+            tweak = _tune_one(cal, disc)
+            if tweak:
+                tweaks.append(f"{name}：{tweak}")
+            at_bounds = (cal["lead_margin"] >= MARGIN_BOUNDS[1]
+                         and cal["days_of_output"] <= BATCH_BOUNDS[0])
+            if disc["feasible_ratio"] < FEASIBLE_BAND[0] and at_bounds:
+                if not extreme_added:
+                    grid_extra.append({"name": "极限加急（提前期压到 2 天）+ 并联开满",
+                                       "expedite_lead_days": 2, "parallel_lines": 2})
+                    extreme_added = True
+                    tweaks.append(f"{name}：标定已到边界仍无准点解 → 补一档极限加急政策试试")
+                else:
+                    disc["verdict"] = ("以现有供应商提前期，这个天气场景做不到准点交付 —— "
+                                       "这是结论。标定不再往里压，避免把'做不到'调成'做得到'")
+            elif tweak is None:
+                # 每格都要有自己的说法，不能留 None 让人去猜这一轮到底算不算数
+                if disc["report_only_comparison"]:
+                    disc["verdict"] = "没有解达到产量底线：这一轮只摆数据，不择优"
+                elif disc["feasible_ratio"] > FEASIBLE_BAND[1]:
+                    disc["verdict"] = (f"{disc['feasible_ratio']:.0%} 的政策都能准点：准点这维在本场景是空的，"
+                                       f"政策靠目标维度取舍（推荐解赢次优解的后悔差 "
+                                       f"{disc['runner_up_regret_gap']}）")
+                elif disc["tied_with_recommended"]:
+                    disc["verdict"] = (f"推荐解与 {disc['tied_with_recommended']} 个政策的后悔向量每一位都相同："
+                                       f"本轮只筛掉了明显更差的，没说哪个最好 —— 要分高下得给目标定优先级")
+                elif disc["runner_up_regret_gap"] in (0.0, None):
+                    disc["verdict"] = "没有一个可比解与推荐解的后悔不同：本轮等于抛硬币，不能当结论"
+                elif disc["no_feasible"]:
+                    disc["verdict"] = "本场景没有准点解：已降级按延误天数比较，这是结论不是失败"
+                else:
+                    disc["verdict"] = "落在有信息量的区间：可行比例在带内，推荐解与次优解有后悔差"
+            per[name] = {"calibration": dict(cal),
+                         "demand_units": scan["demand_by_scenario"].get(name),
+                         "recommended_objectives": (res.get("recommended") or {}).get("objectives"),
+                         "recommended_off_frontier": res.get("recommended_off_frontier"),
+                         **disc}
+        row = {
             "round": rnd,
-            "calibration": {"days_of_output": days_of_output, "lead_margin": lead_margin},
+            # 兼容老的记分卡字段（单场景标定字符串），同时给出按场景的完整标定
+            "calibration": "；".join(
+                f"{s['name']}：批量 {calib[s['name']]['days_of_output']:g} 天线产量、"
+                f"交期系数 {calib[s['name']]['lead_margin']:g}" for s in WEATHER_SCENARIOS),
+            "calibration_by_scenario": {k: dict(v) for k, v in calib.items()},
             "per_scenario": per,
             "robust": (verdict.get("robust_recommendation") or {}).get("policy"),
+            "robust_why": (verdict.get("robust_recommendation") or {}).get("why"),
+            "robust_tied_with": (verdict.get("robust_recommendation") or {}).get("tied_with") or [],
             "policies_tried": len(grid),
-            "diagnosis": None, "next_tweak": None,
+            "notes": [n for r in (verdict.get("by_scenario") or {}).values()
+                      for n in (r.get("notes") or [])],
+            "scenario_divergence": verdict.get("scenario_divergence") or {},
+            "diagnosis": ("；".join(tweaks) if tweaks
+                          else "各场景都落在有信息量的区间：本轮前沿与后悔比较可用"),
+            "next_tweak": tweaks[0] if tweaks else None,
+            "tweaks": tweaks,
         }
-        if none_on_time:
-            action["diagnosis"] = "有天气场景下没有任何政策能准点交付"
-            if lead_margin < 1.6:
-                lead_margin = round(lead_margin + 0.15, 2)
-                action["next_tweak"] = f"放宽交期系数到 {lead_margin}（先分清是政策不行还是交期本身不可能）"
-            else:
-                grid_extra.append({"name": "极限加急（提前期压到 2 天）+ 并联开满",
-                                   "expedite_lead_days": 2, "parallel_lines": 2})
-                action["next_tweak"] = "交期已放宽到 1.6 倍仍无解 → 补一档极限加急政策试试；" \
-                                       "再不行就是现有供应链提前期下这个交期做不到（这是结论）"
-        elif all_on_time:
-            action["diagnosis"] = "所有政策都准点：准点这维没有区分度，场景标得太松"
-            lead_margin = round(max(0.8, lead_margin - 0.1), 2)
-            action["next_tweak"] = f"收紧交期系数到 {lead_margin}"
-        elif feasible_counts and min(feasible_counts) <= 2:
-            action["diagnosis"] = "可行解太少（≤2），本轮只做可行性筛选，不宣称择优"
-            days_of_output = max(2.0, days_of_output - 1.0)
-            action["next_tweak"] = f"批量降到 {days_of_output:g} 天线产量，看中间地带"
-        else:
-            action["diagnosis"] = "各场景都有 ≥3 个可行解：本轮前沿与后悔比较可用"
-        trajectory.append(action)
-        if action["diagnosis"].startswith("各场景都有"):
+        trajectory.append(row)
+        final = row
+        if not tweaks:
             break
-    return {"factory_id": factory_id, "rounds": len(trajectory),
-            "targets": targets, "final": trajectory[-1], "trajectory": trajectory,
-            "rule": "标定期望落在中间地带：既有政策能准点、也有政策会延期；两边都饱和时比较没有信息。"}
+    return {"factory_id": factory_id, "rounds": len(trajectory), "warm_started": seeded,
+            "targets": targets, "final": final, "trajectory": trajectory,
+            "calibration_by_scenario": {k: dict(v) for k, v in calib.items()},
+            "rule": ("标定按天气场景各调各的，目标是每一轮都有区分度：可行比例落在 "
+                     f"{FEASIBLE_BAND[0]:.0%}~{FEASIBLE_BAND[1]:.0%}，且推荐解与次优解的后悔不相等。"
+                     "调参只为了让比较有意义，不为把分数调高 —— 调到底还做不到的场景如实报做不到。")}
+
 
 
 async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
@@ -719,7 +869,9 @@ def _objectives(run: Dict[str, Any], demand_units: float, due_day: int) -> Dict[
 async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                         *, today: Optional[date] = None,
                         policies: Optional[List[Dict[str, Any]]] = None,
-                        scenarios: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                        scenarios: Optional[List[Dict[str, Any]]] = None,
+                        targets_by_scenario: Optional[Dict[str, List[Dict[str, Any]]]] = None
+                        ) -> Dict[str, Any]:
     """让引擎自己扫政策组合：同一批目标在多种产能/出勤/采购/分批政策下的多目标结果。
 
     这里刻意不给"唯一总分"。每个政策产出一个目标向量，交给 pareto_eval 判前沿与平衡解 ——
@@ -732,6 +884,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
     policies = policies or await build_policy_grid(db, factory_id, targets)
     scenarios = scenarios or WEATHER_SCENARIOS
     demand_units = sum(float(t.get("units") or 0) for t in targets)
+    demand_by_scenario: Dict[str, float] = {}
 
     equip = await equipment_rate(db, factory_id)
     busy_by_line: Dict[str, Dict[str, Any]] = {}
@@ -747,10 +900,14 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
     grouped: Dict[str, Any] = {}
     for scen in scenarios:
       curve = {d: float(scen.get("attendance", 0.97)) for d in range(0, 400)}
+      # 每个天气场景可以用自己标定的目标（批量/交期系数），全局值兜底
+      scen_targets = (targets_by_scenario or {}).get(scen["name"]) or targets
+      demand_by_scenario[scen["name"]] = round(sum(float(t.get("units") or 0)
+                                                    for t in scen_targets), 2)
       solutions: List[Dict[str, Any]] = []
       for pol in policies:
         per_run: List[Dict[str, Any]] = []
-        for t in targets:
+        for t in scen_targets:
             due_day = int(t.get("due_in_days") or 30)
             busy = float((busy_by_line.get(str((pick_line(str(t["model_code"]), lines)[0] or {}).get("line_code") or ""),
                                        {"busy_days": 0.0})).get("busy_days") or 0.0)
@@ -779,11 +936,9 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                          for x in per_run) / max(1, len(per_run)), 4),
             "load_band_gap": round(sum(_objectives(x["run"], x["units"], x["due_day"])["load_band_gap"]
                                        for x in per_run) / max(1, len(per_run)), 4),  # 区间外才扣分
-            # 连续延误天数：0/1 准点率会让"延 1 天"和"延 20 天"在后悔值上一样重
-            "days_late_worst": max(_objectives(x["run"], x["units"], x["due_day"])["days_late"]
-                                   for x in per_run),
             "line_activation_cost_usd": round(sum(float(x["run"].get("line_activation_cost_usd") or 0)
                                                   for x in per_run), 2),
+            # 连续延误天数：0/1 准点率会让"延 1 天"和"延 20 天"在后悔值上一样重
             "days_late_worst": worst_late,
         }
         solutions.append({
@@ -804,6 +959,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                "solutions": solutions}
     total = sum(len(v["solutions"]) for v in grouped.values())
     return {"factory_id": factory_id, "today": str(today), "demand_units": demand_units,
+            "demand_by_scenario": demand_by_scenario,
             "policies_tried": total, "scenarios": list(grouped),
             "by_scenario": grouped,
             "note": ("前沿在每个天气场景内部各算一次：天气不是可选政策。"

@@ -95,3 +95,122 @@ def test_waiting_for_material_does_not_fake_output():
     assert run["wait_days"] >= 1
     assert run["idle_person_days_before_start"] > 0      # 等料期间人在岗是要认的成本
     assert run["work_days"] == 1
+
+
+BIKE_G = {**BIKE, "group_units_per_day": 700.0}
+BIKE_G2 = {**BIKE, "line_code": "LINE-BIKE-02", "group_units_per_day": 700.0}
+
+
+def test_parallel_lines_are_capped_by_the_declared_group_capacity():
+    """同组两条 bike 线合并是 700 台/天，不是 400×2=800（用户 10-06 口述定稿）。
+
+    凭空多出的那 100 台/天会改变"缺料时靠另一条线追不追得回来"的结论，
+    而政策网格里的"并联开满"档就是靠这个判断输赢的。
+    """
+    one = vr.group_capacity([BIKE_G, BIKE_G2], BIKE_G, 1)
+    two = vr.group_capacity([BIKE_G, BIKE_G2], BIKE_G, 2)
+    assert one["units_per_day"] == 400.0 and one["capacity_basis"] == "single_line"
+    assert two["units_per_day"] == 700.0 and "group_declared" in two["capacity_basis"]
+    assert two["crew"] == 300.0            # 并联要用两条线的人，不能只算一条
+    loose = vr.group_capacity([BIKE, {**BIKE, "line_code": "LINE-BIKE-02"}], BIKE, 2)
+    assert loose["units_per_day"] == 800.0
+    assert loose["capacity_basis"].startswith("multiplied")   # 没声明就只能乘，但要写明是乘的
+
+
+def _res(vecs, *, objectives=("labor_cost_usd", "expedite_cost_usd"), dead=(),
+         frontier=2, eliminated=0, no_feasible=False, report_only=False):
+    """vecs: 每个可行解的后悔向量（写成 {目标: 后悔} 或单独一个数）。"""
+    pool = []
+    for i, v in enumerate(vecs):
+        reg = {"labor_cost_usd": float(v)} if isinstance(v, (int, float)) else dict(v)
+        pool.append({"name": f"p{i}", "regret_by_objective": reg,
+                     "max_regret": max(reg.values()) if reg else None})
+    return {"frontier": pool[:frontier], "dominated": pool[frontier:],
+            "eliminated": [{"name": f"e{i}"} for i in range(eliminated)],
+            "objectives": [k for k in objectives if k not in dead],
+            "non_discriminating_objectives": list(dead),
+            "no_feasible_solution": no_feasible,
+            "report_only_comparison": report_only,
+            "recommended": {"name": "p0", "objectives": {"days_late_worst": 0}},
+            "recommended_tied_with": []}
+
+
+def test_scenario_is_left_alone_when_objectives_still_discriminate():
+    """全政策准点不该靠收紧交期去制造区分度：人力/加急/开线还能比出差别就是有效的一轮。"""
+    res = _res([0.1, 0.4, 0.7, 0.9, 1.2, 1.5, 1.8])
+    disc = vr.scenario_discrimination(res, 7)
+    cal = {"days_of_output": 6.0, "lead_margin": 1.15}
+    assert disc["feasible_ratio"] == 1.0 and disc["runner_up_regret_gap"] == 0.3
+    assert vr._tune_one(cal, disc) is None
+    assert cal == {"days_of_output": 6.0, "lead_margin": 1.15}
+
+
+def test_saturated_and_tied_scenario_gets_tightened():
+    """都准点 + 推荐解与次优解后悔并列 + 目标维度全平 = 这一轮白算，收紧该场景交期。"""
+    res = _res([0.5, 0.5, 0.5], dead=("labor_cost_usd", "expedite_cost_usd"))
+    disc = vr.scenario_discrimination(res, 3)
+    cal = {"days_of_output": 6.0, "lead_margin": 1.15}
+    assert vr._tune_one(cal, disc) is not None
+    assert cal["lead_margin"] == 1.05          # 只动这个场景，别动全局
+
+
+def test_hungry_scene_is_relaxed_before_the_batch_is_touched():
+    """几乎没政策能准点：先分清是交期定太紧，还是量定太大 —— 顺序不能反。"""
+    res = _res([], eliminated=10, no_feasible=True)
+    disc = vr.scenario_discrimination(res, 10)
+    cal = {"days_of_output": 6.0, "lead_margin": 1.15}
+    vr._tune_one(cal, disc)
+    assert cal["lead_margin"] == 1.25 and cal["days_of_output"] == 6.0
+    cal2 = {"days_of_output": 6.0, "lead_margin": 1.6}
+    vr._tune_one(cal2, disc)
+    assert cal2["lead_margin"] == 1.6 and cal2["days_of_output"] == 5.0
+
+
+def test_calibration_does_not_tune_an_infeasible_deadline_into_feasibility():
+    """交期系数与批量都到边界还是没人能准点 → 不再调参。
+
+    继续调下去就是把"以现有提前期做不到"调成"做得到"，这是自欺，不是优化。
+    """
+    res = _res([], eliminated=13, no_feasible=True)
+    disc = vr.scenario_discrimination(res, 13)
+    cal = {"days_of_output": 2.0, "lead_margin": 1.6}
+    assert vr._tune_one(cal, disc) is None
+    assert cal == {"days_of_output": 2.0, "lead_margin": 1.6}
+
+
+def test_warm_start_keeps_the_calibration_found_last_cycle():
+    """15 分钟一轮，标定不能每轮从 1.15 重摸一遍。"""
+    hot = vr.WEATHER_SCENARIOS[-1]["name"]
+    seed = {hot: {"days_of_output": 4.0, "lead_margin": 1.45},
+            "不存在的场景": {"days_of_output": 99.0, "lead_margin": 0.1},
+            "坏值": "不是字典"}
+    calib = vr._seed_calibration(seed, 6.0, 1.15)
+    assert calib[hot] == {"days_of_output": 4.0, "lead_margin": 1.45}
+    assert "不存在的场景" not in calib
+    assert all(c["lead_margin"] <= vr.MARGIN_BOUNDS[1] and c["days_of_output"] <= vr.BATCH_BOUNDS[1]
+               for c in calib.values())
+    assert vr._seed_calibration({}, 6.0, 1.15)[hot] == {"days_of_output": 6.0, "lead_margin": 1.15}
+
+
+def test_a_head_to_head_frontier_is_not_misread_as_a_tie():
+    """两个各让一头的解，max_regret 都是 1.0 —— 拿它做差会恒等于 0，看着像"全并列"。
+
+    真实数据集里就是这样：加急省钱的政策人力贵、开线的政策负载好，量错了就会
+    一路去收紧交期，去制造"延不延期"的假区分度。
+    """
+    res = _res([{"labor_cost_usd": 0.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                 "load_band_gap": 1.0},
+                {"labor_cost_usd": 1.0, "expedite_cost_usd": 1.0, "line_activation_cost_usd": 1.0,
+                 "load_band_gap": 0.0}], frontier=2)
+    disc = vr.scenario_discrimination(res, 2)
+    assert disc["runner_up_regret_gap"] == 1.0      # 排序后悔向量第一位就不同
+    assert disc["tied_with_recommended"] == 0
+
+def test_truly_tied_solutions_are_reported_not_ordered():
+    """后悔向量每一位都相同 = 并列，得说明"这轮没说哪个最好"，不许按列表顺序假装选出来。"""
+    same = {"labor_cost_usd": 1.0, "expedite_cost_usd": 0.0}
+    res = _res([same, dict(same), dict(same)], frontier=1)
+    disc = vr.scenario_discrimination(res, 3)
+    assert disc["runner_up_regret_gap"] is None and disc["feasible"] == 3
+    cal = {"days_of_output": 6.0, "lead_margin": 1.15}
+    assert vr._tune_one(cal, disc) is not None      # 并列 + 全可行 → 该收紧这一格了

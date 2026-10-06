@@ -248,3 +248,60 @@ def test_robust_pick_requires_covering_every_weather_scenario():
 def test_empty_input_does_not_invent_a_recommendation():
     out = pe.evaluate([], demand_units=300, keys=ALL)
     assert out["recommended"] is None and out["frontier"] == []
+
+
+def test_degraded_comparison_still_requires_the_throughput_floor():
+    """没有任何准点解时只放"过了产量底线"的解进降级比较。
+
+    老写法在降级分支里把全部解又无条件追加了一遍，"干脆不做这单"因此重新进场还能被推荐 ——
+    降级只是放松交期，不是放松产量。
+    """
+    a = _sol("a", on_time_rate=0.0, throughput_units=600, labor_cost_usd=100,
+             expedite_cost_usd=0, load_band_gap=0.0, line_activation_cost_usd=0,
+             days_late_worst=5)
+    b = _sol("b", on_time_rate=0.0, throughput_units=60, labor_cost_usd=1,
+             expedite_cost_usd=0, load_band_gap=0.0, line_activation_cost_usd=0,
+             days_late_worst=0)
+    out = pe.evaluate([a, b], demand_units=600, keys=ALL)
+    assert out["no_feasible_solution"] is True
+    names = {s["name"] for s in out["frontier"]} | {s["name"] for s in out["dominated"]}
+    assert "b" not in names
+    assert out["recommended"]["name"] == "a"
+    assert out["report_only_comparison"] is False
+
+
+def test_identical_regret_profiles_are_reported_as_a_tie():
+    """三个解各让一头、后悔向量每一位都相同时，不许按列表顺序假装选出一个"更好的"。"""
+    a = _sol("a", on_time_rate=1.0, throughput_units=600, labor_cost_usd=200,
+             expedite_cost_usd=10, load_band_gap=0.0, line_activation_cost_usd=0,
+             days_late_worst=0)
+    b = _sol("b", on_time_rate=1.0, throughput_units=600, labor_cost_usd=100,
+             expedite_cost_usd=200, load_band_gap=0.0, line_activation_cost_usd=0,
+             days_late_worst=0)
+    c = _sol("c", on_time_rate=1.0, throughput_units=600, labor_cost_usd=100,
+             expedite_cost_usd=10, load_band_gap=0.1, line_activation_cost_usd=0,
+             days_late_worst=0)
+    out = pe.evaluate([a, b, c], demand_units=600, keys=ALL)
+    assert sorted(out["recommended_tied_with"]) == ["b", "c"] or \
+        sorted(out["recommended_tied_with"]) == ["a", "c"] or \
+        sorted(out["recommended_tied_with"]) == ["a", "b"]
+    assert any("没说哪个最好" in n for n in out["notes"])
+
+
+def test_weather_scenarios_that_change_nothing_are_named():
+    """场景分开算是对的，但如果所有政策在好天和暴雨下结果一模一样，这一维就是装饰 —— 要报出来。"""
+    def block(scen):
+        return {"solutions": [
+            {"id": f"{scen}-a", "name": "加急", "objectives": dict(
+                on_time_rate=1.0, throughput_units=600, labor_cost_usd=100,
+                expedite_cost_usd=50, load_band_gap=0.0, line_activation_cost_usd=10,
+                days_late_worst=0), "evidence": {}},
+            {"id": f"{scen}-b", "name": "现况", "objectives": dict(
+                on_time_rate=1.0, throughput_units=600, labor_cost_usd=200,
+                expedite_cost_usd=0, load_band_gap=0.1, line_activation_cost_usd=0,
+                days_late_worst=0), "evidence": {}},
+        ]}
+    out = pe.evaluate_by_scenario({"好天": block("好天"), "暴雨": block("暴雨")}, 600, ALL)
+    div = out["scenario_divergence"]
+    assert div["policies_compared"] == 2 and div["policies_that_move"] == 0
+    assert "不携带任何信息" in div["note"]
