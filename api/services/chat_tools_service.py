@@ -2570,6 +2570,10 @@ async def _tool_query_simulation_recommendation(
         "followthrough_verdict": ft.get("verdict") or ft.get("note"),
         "by_scenario": out.get("by_scenario"),
         "scenario_divergence": out.get("scenario_divergence"),
+        "promise_conclusion": out.get("promise_conclusion"),
+        "robust_pool": out.get("robust_pool"),
+        "promise_note": ("推荐只在承诺口径（瓶颈提前期×1.15）之内参与跨场景比较；"
+                         "放宽之后的场景只作诊断，它的准点不算能兑现承诺"),
         "calibration_note": ("每个天气场景的批量与交期系数是引擎自己标定的测试口径，"
                              "不是对客户的承诺；标定只决定这一轮有没有区分度。"),
         "note": out.get("note") or (
