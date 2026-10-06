@@ -30,7 +30,11 @@ from sqlalchemy import bindparam, text
 from api.services.bom_data_quality import scan_plant
 from api.services.bom_source import subtree_evidence
 from api.services.engine_heartbeat import record
-from api.services.component_orders import expand_ready_components
+from api.services.component_orders import (
+    expand_ready_components,
+    rebuild_missing_component_kits,
+    retire_covered_child_orders,
+)
 from api.services.component_release import release_kitted_child_orders
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
@@ -42,6 +46,7 @@ from api.services.aps_draft_prune import (
 from api.services.plan_commit_gate import (
     APPLY_ENABLED as PLAN_COMMIT_APPLY,
     MAX_ORDERS as PLAN_COMMIT_MAX_ORDERS,
+    audit_false_releases,
     commit_ready_orders,
 )
 from api.services.snapshot_supply import refresh_snapshot_supply
@@ -375,6 +380,9 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     receipt["child_releases"] = await release_kitted_child_orders(
         db, factory_id=None, apply=apply
     )
+    # 组件单的对账（同一轮只做这三格，顺序固定：补依据 → 停掉没有依据的放行 → 收净缺口 0 的）
+    receipt["kit_rebuild"] = await rebuild_missing_component_kits(db)
+    receipt["covered_children"] = await retire_covered_child_orders(db)
     # 数据脏不脏也要每天自己看一次：这步只读，产出写在心跳里（不改 BOM 原始行）
     receipt["bom_quality"] = await scan_plant(
         db, QUALITY_FACTORY_ID, limit=QUALITY_MODELS_PER_TICK)
@@ -409,9 +417,14 @@ async def commit_plan_ready(db, *, factory_id: str = QUALITY_FACTORY_ID,
     plan = await ApsService(db).generate_schedule(
         factory_id, created_by="routing-backfill", change_reason="engine_tick"
     )
+    # 先把机制自己放错行的放行收回来（没有领料依据的"齐套"），再判这一轮能放哪些单：
+    # 顺序是有意的 —— 收回之后门就不会在同一轮里把同一批单又放一遍。
+    revoked = await audit_false_releases(db, factory_id)
     gate = await commit_ready_orders(
         db, factory_id, apply=apply_enabled, actor="plan-commit-gate", max_orders=max_orders
     )
+    gate["false_releases"] = {k: revoked.get(k) for k in
+                              ("false_releases_found", "revoked", "tasks_reset", "dry_run")}
     gate["plan_reused"] = bool(plan.get("reused"))
     gate["plan_schedule_code"] = plan.get("schedule_code")
     gate["plan_tasks"] = plan.get("total_tasks")

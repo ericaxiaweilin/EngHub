@@ -237,12 +237,14 @@ class WorkOrderMaterial(Base):
     material_id = Column(String(50), nullable=True)
     material_code = Column(String(50), nullable=True)
     material_name = Column(String(256), nullable=True)
-    qty_per_unit = Column(Integer, nullable=True)
-    required_qty = Column(Integer, nullable=False, default=0)
+    # 深层原料的每件用量是小数（0.255 kg/m 这类），用 Integer 会把需求截成 0，
+    # 子工单因此拿不到自己的物料行；齐套表统一放宽到 numeric(18,4)（见 migration 102）
+    qty_per_unit = Column(Numeric(18, 4), nullable=True)
+    required_qty = Column(Numeric(18, 4), nullable=False, default=0)
     unit = Column(String(20), nullable=True)
-    received_qty = Column(Integer, default=0)
-    available_qty = Column(Integer, default=0)
-    shortage_qty = Column(Integer, default=0)
+    received_qty = Column(Numeric(18, 4), default=0)
+    available_qty = Column(Numeric(18, 4), default=0)
+    shortage_qty = Column(Numeric(18, 4), default=0)
     # 层级结构随齐套快照一起落库：PMC 要能区分采购件与自制装配件
     level = Column(Integer, nullable=True)
     parent_code = Column(String(100), nullable=True)

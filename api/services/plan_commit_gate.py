@@ -78,18 +78,27 @@ GATE_SQL = text("""
         FROM aps_schedule_tasks t
         WHERE t.schedule_id = :sid
         ORDER BY t.work_order_id, t.operation_seq, t.planned_start
+    ),
+    kit AS (
+        SELECT m.work_order_id,
+               count(*) FILTER (WHERE COALESCE(m.required_qty, 0) > 0) AS kit_rows
+        FROM work_order_materials m
+        JOIN pool pp ON pp.id = m.work_order_id      -- 只数池子里这些单，不扫全表
+        GROUP BY m.work_order_id
     )
     SELECT p.id AS work_order_id, p.work_order_code, p.wo_type, p.status, p.product_id,
            p.planned_qty, p.planned_due, p.planned_start,
            COALESCE(e.route_steps, 0) AS route_steps,
            COALESCE(t.plan_rows, 0) AS plan_rows,
            COALESCE(t.short_rows, 0) AS short_rows,
+           COALESCE(k.kit_rows, 0) AS kit_rows,
            f.station_id AS first_station_code,
            f.planned_start AS first_start,
            CASE WHEN f.station_id IS NULL THEN TRUE ELSE (s.id IS NOT NULL) END AS station_mapped
     FROM pool p
     LEFT JOIN expected e ON e.work_order_id = p.id
     LEFT JOIN task t ON t.work_order_id = p.id
+    LEFT JOIN kit k ON k.work_order_id = p.id
     LEFT JOIN first_step f ON f.work_order_id = p.id
     LEFT JOIN stations s ON s.station_code = f.station_id AND s.factory_id = :fid
     ORDER BY p.planned_due NULLS LAST, p.work_order_code
@@ -99,6 +108,7 @@ HOLD_REASONS = {
     "not_scheduled": "这一版里没有它的任何工序行（仍在待排池）",
     "partial_steps": "只排进了一部分工序：车间不该拿到残缺工艺",
     "shortage": "有物料缺口未齐套（含下层自制件没完工）",
+    "no_kit_evidence": "齐套表里没有任何带需求量的物料行：不知道要发什么料就不算齐套，不许下达",
     "station_unmapped": "首道工序的工位编码在本厂 stations 查不到，无法回写派工工位",
 }
 
@@ -114,6 +124,7 @@ def _verdict(row: Any) -> Dict[str, Any]:
     steps = int(row["route_steps"] or 0)
     plan_rows = int(row["plan_rows"] or 0)
     short_rows = int(row["short_rows"] or 0)
+    kit_rows = int(row.get("kit_rows") or 0)
     reasons: List[str] = []
     if plan_rows == 0:
         reasons.append("not_scheduled")
@@ -122,6 +133,10 @@ def _verdict(row: Any) -> Dict[str, Any]:
             reasons.append("partial_steps")
         if short_rows > 0:
             reasons.append("shortage")
+    if kit_rows == 0:
+        # 没有一行领料需求 = 没有依据说这单能开工。缺料和"根本不知道缺什么"
+        # 是两种不齐套，后者更危险：它会被前一种判据当成"没缺口"直接放行。
+        reasons.append("no_kit_evidence")
     if not row["station_mapped"]:
         reasons.append("station_unmapped")
     already = str(row["status"] or "") in ALREADY_ACTED
@@ -179,7 +194,8 @@ async def evaluate_commit_gate(
             "status": "no_current_draft",
             "reason": "本厂没有带输入指纹的方案：先跑一次排程（/api/v1/aps/schedule）",
             "gate_rules": {"requires": ["排进本版本", "工序排齐（任务行数=路线工序数）",
-                                        "全部任务行齐套", "首道工序工位可在本厂映射到 stations.id"],
+                                        "全部任务行齐套", "齐套表里有带需求量的领料行",
+                                        "首道工序工位可在本厂映射到 stations.id"],
                            "hold_reason_definitions": HOLD_REASONS},
         }
     rows = (await db.execute(GATE_SQL, {"fid": factory_id, "sid": plan["schedule_id"]})).mappings().all()
@@ -205,6 +221,7 @@ async def evaluate_commit_gate(
         "ready_ids": [v["work_order_id"] for v in ready],
         "gate_rules": {
             "requires": ["排进本版本", "工序排齐（任务行数=路线工序数）", "全部任务行齐套",
+                         "齐套表里有带需求量的领料行",
                          "首道工序工位可在本厂映射到 stations.id"],
             "hold_reason_definitions": HOLD_REASONS,
             "route_step_source": "工单自己的绑定：模板看 routing_template_steps 行数，旧版看 routings.steps",
@@ -358,3 +375,95 @@ async def commit_ready_orders(
 
 APPLY_ENABLED = os.getenv("PLAN_COMMIT_APPLY", "false").strip().lower() in ("1", "true", "yes", "on")
 MAX_ORDERS = max(1, int(os.getenv("PLAN_COMMIT_MAX_ORDERS", "5")))
+
+# 撤销机制自己声明过的放行 = 承认之前放错了，是在改状态不是在删数据，
+# 但同样要显式开：默认只把"哪些单被放错了"报出来。
+RECONCILE_APPLY = os.getenv("ENGINE_RECONCILE_APPLY", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+FALSE_RELEASES_SQL = text("""
+    SELECT wo.id AS work_order_id, wo.work_order_code, wo.wo_type, wo.status,
+           wo.released_by, wo.product_id, wo.planned_qty,
+           count(m.id) FILTER (WHERE COALESCE(m.required_qty, 0) > 0) AS kit_rows
+    FROM work_orders wo
+    LEFT JOIN work_order_materials m ON m.work_order_id = wo.id
+    WHERE wo.factory_id = :fid
+      AND wo.wo_type <> 'operation'                    -- 仿真自己的工序单没有领料概念
+      AND wo.status IN ('released', 'in_progress')
+      AND wo.released_by IN ('plan-commit-gate', 'component_kit')
+      AND COALESCE(wo.completed_qty, 0) = 0            -- 有产出的不动，那是另一条账
+      AND NOT EXISTS (SELECT 1 FROM production_reports pr WHERE pr.work_order_id = wo.id)
+    GROUP BY wo.id, wo.work_order_code, wo.wo_type, wo.status,
+             wo.released_by, wo.product_id, wo.planned_qty
+    HAVING count(m.id) FILTER (WHERE COALESCE(m.required_qty, 0) > 0) = 0
+    ORDER BY wo.work_order_code
+""")
+
+
+async def audit_false_releases(
+    db: AsyncSession, factory_id: str, *,
+    apply: Optional[bool] = None, actor: str = "plan-commit-gate",
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """把"被机制放行、但齐套表里一行领料需求都没有"的单收回待开工。
+
+    只撤销机制自己声明的放行（`released_by` 是这两个机制名），人工下达的一律不碰；
+    有报工或有产出的不碰（那是既成事实，要按虚假产出那条账处理）。
+    收回时连带把这一版里它的工序行从 released 退回 planned —— 否则界面仍是"已下达"。
+    """
+    if apply is None:
+        apply = RECONCILE_APPLY
+    rows = (await db.execute(
+        FALSE_RELEASES_SQL, {"fid": factory_id}
+    )).mappings().all()
+    plan = await _latest_draft(db, factory_id)
+    schedule_id = plan["schedule_id"] if plan else None
+    receipt: Dict[str, Any] = {
+        "factory_id": factory_id, "apply": apply, "dry_run": not apply,
+        "false_releases_found": len(rows), "revoked": 0, "tasks_reset": 0,
+        "examples": [dict(r) for r in rows[:5]],
+    }
+    if not rows:
+        receipt["status"] = "nothing_to_revoke"
+        return receipt
+    if not apply:
+        receipt["status"] = "dry_run"
+        receipt["message"] = (f"预演：{len(rows)} 张单被机制放行但没有任何领料需求行，"
+                             "可收回待开工；开 ENGINE_RECONCILE_APPLY=true 才真收回")
+        return receipt
+
+    for row in list(rows)[:limit]:
+        wo_id = str(row["work_order_id"])
+        updated = await db.execute(text("""
+            UPDATE work_orders
+            SET status = 'pending', released_by = NULL,
+                remark = COALESCE(remark, '') || :note,
+                updated_at = NOW()
+            WHERE id = :wid AND status IN ('released', 'in_progress')
+              AND COALESCE(completed_qty, 0) = 0
+              AND released_by IN ('plan-commit-gate', 'component_kit')
+        """), {
+            "wid": wo_id,
+            "note": (f"；就绪门收回：放行时齐套表里没有任何领料需求行"
+                     f"（放行方 {row['released_by']}），不能算齐套"),
+        })
+        receipt["revoked"] += int(updated.rowcount or 0)
+        reset = await db.execute(text("""
+            UPDATE aps_schedule_tasks SET status = 'planned'
+            WHERE work_order_id = :wid AND schedule_id = :sid AND status = 'released'
+        """), {"wid": wo_id, "sid": schedule_id})
+        receipt["tasks_reset"] += int(reset.rowcount or 0)
+        if schedule_id:
+            db.add(_event(
+                factory_id=factory_id, event_type="order_release_revoked", actor=actor,
+                schedule_id=schedule_id, work_order_id=wo_id,
+                reason=f"就绪门收回误放行：{row['work_order_code']} 没有领料依据",
+                payload={"released_by": str(row["released_by"] or ""),
+                         "wo_type": str(row["wo_type"] or ""),
+                         "kit_rows": int(row["kit_rows"] or 0)},
+            ))
+    await db.commit()
+    receipt["status"] = "ok"
+    receipt["message"] = (f"收回 {receipt['revoked']} 张没有领料依据的放行，"
+                          f"退回 {receipt['tasks_reset']} 道工序行")
+    return receipt

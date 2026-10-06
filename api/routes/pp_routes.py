@@ -270,14 +270,15 @@ async def release_plan(
                 material_id=item["material_id"],
                 material_code=item["material_code"],
                 material_name=item["material_name"],
-                required_qty=int(item["required_qty"] or 0),
-                available_qty=int(item["available_qty"] or 0),
-                received_qty=int(item["available_qty"] or 0),
-                shortage_qty=int(item["shortage_qty"] or 0),
+                # 保留小数：MRP 侧本来就是 numeric，int() 会把 0.255 这类每件用量截成 0
+                required_qty=item["required_qty"] or 0,
+                available_qty=item["available_qty"] or 0,
+                received_qty=item["available_qty"] or 0,
+                shortage_qty=item["shortage_qty"] or 0,
                 unit=item["unit"],
                 level=item["level"],
                 parent_code=item["parent_code"],
-                allocated_qty=int(item["allocated_qty"] or 0),
+                allocated_qty=item["allocated_qty"] or 0,
                 item_type=item["item_type"],
             ))
 

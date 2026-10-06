@@ -11,7 +11,9 @@ APS 排的是任务顺序，车间能不能真开工看的是料。`release_plan
 3. 自制料（make 行）要"本单不靠库存"才算齐：该料有库存够用就冲抵库存，
    否则必须有**自己的子工单已经 completed**（下层先装好，自然形成由深到浅的开工顺序）；
    没有库存、也没有已完工的子工单 → 不放行，原因如实报；
-4. 没有路线的工单永不放行（排不出也干不了，别伪装成已就绪）。
+4. 没有路线的工单永不放行（排不出也干不了，别伪装成已就绪）；
+5. 齐套表里**一行带需求量的料都没有**也不放行 —— 那是"没有领料依据"，不是"料齐了"
+   （实测这样被放行的下级工单有 120 张，全是拆单时从父单快照抄来 0 需求行的那批）。
 
 只改 `status/released_by/released_at/current_stage`，不碰数量与台账。
 """
@@ -119,6 +121,18 @@ async def release_kitted_child_orders(
             text(LINES_SQL.text), {"wo_id": cand["id"], "fid": fid}
         )).mappings().all()
         blocker = None
+        # 一行带需求量的料都没有 = 没有任何领料依据。以前这算"没有缺口→齐套"，
+        # 于是拆单时抄了 0 需求的子单被成批放行（实测 120 张）：
+        # "没人缺货"和"知道要发什么料"是两件事，判不齐就宁可压住。
+        if not lines:
+            receipt["held"]["no_kit_evidence"] = \
+                receipt["held"].get("no_kit_evidence", 0) + 1
+            if len(receipt["held_examples"]) < 5:
+                receipt["held_examples"].append({
+                    "work_order_code": str(cand["work_order_code"]),
+                    "blocker": "no_kit_evidence",
+                })
+            continue
         # 先算到影子账上：本单被压住时不能已经把匹配到的行从公共池扣掉了，
         # 否则后面的单会以为料被占走，明明能齐却放不了行
         taken: Dict[tuple, float] = {}

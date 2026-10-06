@@ -30,12 +30,14 @@ PLAN_ROW = {
 
 
 def _row(code, *, steps, plan_rows, short=0, station="ST-JG-01", mapped=True,
-         status="pending", wo_type="master"):
+         status="pending", wo_type="master", kit=1):
     return {
         "work_order_id": code, "work_order_code": f"WO-{code}", "wo_type": wo_type,
         "status": status, "product_id": f"P-{code}", "planned_qty": 10,
         "planned_due": datetime(2026, 10, 20), "planned_start": None,
         "route_steps": steps, "plan_rows": plan_rows, "short_rows": short,
+        # kit_rows = 齐套表里带需求量的领料行数（0 表示根本没有依据，不是"不缺料"）
+        "kit_rows": kit,
         "first_station_code": station, "first_start": datetime(2026, 10, 6, 8, 0),
         "station_mapped": mapped,
     }
@@ -94,7 +96,7 @@ def _get(enabled):
     return getter
 
 
-def test_verdict_holds_orders_missing_any_one_of_the_four_rules():
+def test_verdict_holds_orders_missing_any_one_of_the_five_rules():
     assert gate_mod._verdict(_row("a", steps=7, plan_rows=7))["ready"] is True
     assert gate_mod._verdict(_row("b", steps=7, plan_rows=7, short=1))["hold_reasons"] == ["shortage"]
     # 只排进一半工序：不能下，车间拿到的是残缺工艺
@@ -104,6 +106,10 @@ def test_verdict_holds_orders_missing_any_one_of_the_four_rules():
     # 两个条件都不满足时要都点名，别只报第一个
     both = gate_mod._verdict(_row("f", steps=7, plan_rows=3, short=2))
     assert set(both["hold_reasons"]) == {"partial_steps", "shortage"}
+    # 齐套表里一行领料需求都没有：这不是"没缺口"，是"没有依据"，同样不许下达
+    no_kit = gate_mod._verdict(_row("g", steps=7, plan_rows=7, kit=0))
+    assert no_kit["hold_reasons"] == ["no_kit_evidence"]
+    assert no_kit["ready"] is False
 
 
 @pytest.mark.asyncio
