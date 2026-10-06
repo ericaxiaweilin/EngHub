@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Optional, Tuple
 DIRECTIONS = {
     "labor_cost_usd": "min",
     "expedite_cost_usd": "min",       # 加急/插单的对价
-    "standby_person_days": "min",     # 等料空档（养线的代价）
     "load_band_gap": "min",           # 离人力健康负载区间的偏离（养闲和超载都要付）
     "line_activation_cost_usd": "min",  # 开第二条线的代价 —— 没有它，"多开线"就是免费的
     "days_late_worst": "min",         # 连续延误天数：0/1 准点率会饱和，延 1 天和延 20 天不该同重
@@ -37,6 +36,13 @@ MIN_THROUGHPUT_RATIO = float(0.95)
 ON_TIME_REQUIRED = float(os.getenv("PARETO_ON_TIME_REQUIRED", "1.0"))
 # 借来/假设的依据占比超过这个值的解必须标出来（可以进前沿，但不能当推荐）
 ASSUMPTION_SHARE_LIMIT = 0.5
+# 只在"整班守着这条线"的前提下成立的量：当目标会让引擎花钱去买加急，代价是估出来的、
+# 收益也是估出来的。降级为报告项，不参与择优（要真算就得先有停工待料的实际工时制度）。
+REPORT_ONLY = ("standby_person_days",)
+
+
+# 后悔向量的固定顺序：跨场景比较必须同长同序，否则长度不同的元组字典序没有意义
+FIXED_ORDER = tuple(k for k in DIRECTIONS if k not in ("standby_person_days",))
 
 
 def _dir(key: str) -> str:
@@ -183,7 +189,8 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any], demand_units: float,
     for name, res in per_scenario.items():
         pool = {str(s.get("id")): s for s in (res.get("frontier") or []) + (res.get("dominated") or [])}
         for sol in pool.values():
-            prof = tuple(sorted((sol.get("regret_by_objective") or {}).values(), reverse=True))
+            reg = sol.get("regret_by_objective") or {}
+            prof = tuple(reg.get(k) or 0.0 for k in FIXED_ORDER)
             if not prof:
                 continue      # 没有后悔向量的解不参与稳健比较
             by_policy.setdefault(str(sol.get("name") or sol.get("id")), []).append((sol.get("max_regret"), prof))
@@ -210,7 +217,7 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any], demand_units: float,
 def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
              keys: Optional[List[str]] = None) -> Dict[str, Any]:
     """产出前沿、被淘汰的解、推荐解，以及每步判定的理由（可复核，不给单一总分）。"""
-    base_keys = keys or list(DIRECTIONS)
+    base_keys = [k for k in (keys or list(DIRECTIONS)) if k not in REPORT_ONLY]
     scored: List[Dict[str, Any]] = []
     notes: List[str] = []
     eliminated: List[Dict[str, Any]] = []
@@ -283,7 +290,7 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         # 最大后悔并列时不能靠顺序瞎选：把每个解的后悔从最坏到最好排成向量比字典序，
         # 等于"先保证最坏的那维别太糟，再看次坏的" —— 平衡解要一整串都好，不是只一项好。
         def profile(s):
-            r = (s.get("regret_by_objective") or {}).values()
+            r = [(s.get("regret_by_objective") or {}).get(k) or 0.0 for k in FIXED_ORDER]
             return (s.get("max_regret") is None, sorted(r, reverse=True))
         recommended = min(pool, key=profile)
     if recommended is not None and recommended.get("assumption_share", 0) > ASSUMPTION_SHARE_LIMIT:
@@ -310,6 +317,7 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         "recommended": recommended,
         "recommended_off_frontier": out_of_frontier,
         "recommended_note": recommended_note,
+        "report_only": list(REPORT_ONLY),
         "selection_rule": ("可行解 → 帕累托前沿 → 前沿里选后悔向量字典序最小的解"
                            "（先最小化最坏后悔，并列再比次坏，不靠顺序瞎选）。"
                            "不用加权总分：加权和会被'牺牲一维换另一维'刷高，"

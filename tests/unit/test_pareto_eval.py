@@ -138,6 +138,40 @@ def test_self_check_stays_silent_when_there_is_nothing_to_choose_between():
     assert any("可行解只剩" in n for n in out["notes"])
 
 
+def test_assumption_dependent_cost_does_not_drive_the_choice():
+    """等料空档只在"整班守线"时成立 —— 它是报告项，不许驱动引擎花钱买加急。"""
+    cheap_wait = _sol("wait", "并联开线", on_time_rate=1.0, throughput_units=600,
+                      labor_cost_usd=52380, expedite_cost_usd=0, standby_person_days=7420,
+                      data_confidence=1.0, load_band_gap=0.8, line_activation_cost_usd=36000,
+                      days_late_worst=0)
+    paid_fast = _sol("fast", "加急+并联", on_time_rate=1.0, throughput_units=600,
+                     labor_cost_usd=52380, expedite_cost_usd=9450, standby_person_days=5674,
+                     data_confidence=1.0, load_band_gap=0.8, line_activation_cost_usd=36000,
+                     days_late_worst=0)
+    out = pe.evaluate([cheap_wait, paid_fast], demand_units=600)
+    assert "standby_person_days" in out["report_only"]
+    assert out["recommended"]["id"] == "wait"       # 不加权买伪成本省下的空档
+
+
+def test_regret_vectors_line_up_across_scenarios():
+    """跨场景比向量必须同长同序：死维度要占位补 0，否则短元组会靠长度赢。"""
+    def mk(scen, name, on_time, cost, exp):
+        return {"id": f"{scen}-{name}", "name": name, "scenario": scen,
+                "objectives": {"on_time_rate": on_time, "throughput_units": 600,
+                               "labor_cost_usd": cost, "expedite_cost_usd": exp,
+                               "standby_person_days": 0, "data_confidence": 1.0,
+                               "load_band_gap": 0.0, "line_activation_cost_usd": 0,
+                               "days_late_worst": 0}, "evidence": {}}
+    by = {"好天": {"solutions": [mk("好天", "a", 1.0, 100, 0), mk("好天", "b", 1.0, 900, 50)]},
+          "暴雨": {"solutions": [mk("暴雨", "a", 0.0, 100, 0), mk("暴雨", "b", 1.0, 900, 50)]}}
+    from api.services.pareto_eval import FIXED_ORDER
+    out = evaluate_by_scenario_local = pe.evaluate_by_scenario(by, demand_units=600)
+    # 暴雨里 a 误期被硬约束淘汰 → 只有 b 覆盖全部场景，稳健推荐必须是 b
+    assert out["robust_recommendation"]["policy"] == "b"
+    # 跨场景比较用的向量必须同长同序（按 FIXED_ORDER 占位，死维度补 0）
+    assert len(out["robust_recommendation"]["worst_scenario_regret_profile"]) == len(FIXED_ORDER)
+
+
 def test_unknown_objective_direction_is_rejected_not_defaulted():
     """目标名写错时必须报错。默认按 max 处理会把"越小越好"的维度反过来选。"""
     sols = [_s("好天", "a", 1.0, 1000), _s("好天", "b", 0.0, 2000)]
@@ -169,7 +203,10 @@ def test_regret_is_normalized_per_objective():
         _sol("b", on_time_rate=0.0, throughput_units=300, labor_cost_usd=200,
              expedite_cost_usd=0, standby_person_days=0, data_confidence=1.0, peak_load_ratio=1.0),
     ]
-    keys = ["labor_cost_usd", "expedite_cost_usd", "standby_person_days"]
+    # standby 已降级为"只报告不参与择优"，拿它比后悔必须报错
+    with pytest.raises(KeyError):
+        pe.regret_matrix(sols, ["labor_cost_usd", "standby_person_days"])
+    keys = ["labor_cost_usd", "expedite_cost_usd", "load_band_gap"]
     r = pe.regret_matrix(sols, keys)
     assert r["a"]["labor_cost_usd"] == 0.0 and r["b"]["labor_cost_usd"] == 1.0
     assert r["a"]["expedite_cost_usd"] == 0.0          # 同值目标后悔为 0
