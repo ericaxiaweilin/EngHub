@@ -211,6 +211,9 @@ async def sensitivity(db: AsyncSession, factory_id: str, models: List[str], *,
         (await vr.equipment_rate(db, factory_id)).get("rate") or 1.0)
     base = await _run_one(db, factory_id, base_targets, pol, attendance=attendance,
                           perturb={"equip_rate": base_eq} if base_eq else None)
+    # 同一政策在暴雨那一档的结果一起给：只报好天的数就是挑好看的看
+    storm = await _run_one(db, factory_id, base_targets, pol, attendance=0.70,
+                           perturb={"equip_rate": base_eq} if base_eq else None)
     out: List[Dict[str, Any]] = []
     for lever in LEVERS:
         rows: List[Dict[str, Any]] = []
@@ -271,10 +274,13 @@ async def sensitivity(db: AsyncSession, factory_id: str, models: List[str], *,
             "targets": [{"model_code": t["model_code"], "units": t["units"],
                          "due_in_days": t["due_in_days"]} for t in base_targets],
             "base": {**base, "lead_margin": margin, "days_of_output": days_of_output,
-                     "attendance": attendance, "policy": pol["name"]},
+                     "attendance": attendance, "policy": pol["name"],
+                     "worst_weather": {k: storm.get(k) for k in ("finish_date", "days_late_worst",
+                                                                "labor_cost_usd", "binding_terms")}},
             "levers": out,
-            "note": ("斜率只取基准两侧的局部档，不做全局回归：提前期/库存这类曲线会阶跃，"
-                     "平均值会把台阶抹平。所有档位都用同一条推演路径跑（scan_policies），"
+            "note": ("基准档按好天（到岗 0.97）算，base.worst_weather 给暴雨（0.70）下同一政策的结果，"
+                     "两个数都要看，别只报好看的那个。斜率只取基准两侧的局部档，不做全局回归："
+                     "提前期/库存这类曲线会阶跃，平均值会把台阶抹平。所有档位都用同一条推演路径跑（scan_policies），"
                      "不另建第二套算法。")}
 
 
