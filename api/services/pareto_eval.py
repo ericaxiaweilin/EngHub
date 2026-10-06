@@ -36,6 +36,9 @@ MIN_THROUGHPUT_RATIO = float(0.95)
 ON_TIME_REQUIRED = float(os.getenv("PARETO_ON_TIME_REQUIRED", "1.0"))
 # 借来/假设的依据占比超过这个值的解必须标出来（可以进前沿，但不能当推荐）
 ASSUMPTION_SHARE_LIMIT = 0.5
+# "插单"准点不是产能，是把已经答应该做的活往后推 —— 默认不许靠它宣布方案可行。
+# 放开需要人工确认挪哪些单，所以是个显式开关，不是评分项。
+ALLOW_QUEUE_JUMPING = os.getenv("PARETO_ALLOW_QUEUE_JUMPING", "0") == "1"
 # 只在"整班守着这条线"的前提下成立的量：当目标会让引擎花钱去买加急，代价是估出来的、
 # 收益也是估出来的。降级为报告项，不参与择优（要真算就得先有停工待料的实际工时制度）。
 REPORT_ONLY = ("standby_person_days",)
@@ -77,6 +80,10 @@ def dominates(a: Dict[str, Any], b: Dict[str, Any], keys: List[str]) -> bool:
 
 def feasible(sol: Dict[str, Any], demand_units: float,
              ignore_deadline: bool = False) -> Tuple[bool, Optional[str]]:
+    if sol.get("displaces_committed_work") and not ALLOW_QUEUE_JUMPING:
+        return False, ("这条政策靠把已经在排的活往后挪来宣布准点：那不是产能，是抢产能。"
+                       "默认不进比较（要放开：PARETO_ALLOW_QUEUE_JUMPING=1，"
+                       "并由计划员确认可以挪哪些单）")
     made = _value(sol, "throughput_units")
     if demand_units > 0 and made < demand_units * MIN_THROUGHPUT_RATIO:
         return False, (f"只做出来 {made:g}/{demand_units:g} 台（<{MIN_THROUGHPUT_RATIO:.0%}）—— "
@@ -173,7 +180,8 @@ def anti_goodhart_check(solutions: List[Dict[str, Any]], keys: List[str]) -> Lis
 
 def evaluate_by_scenario(by_scenario: Dict[str, Any],
                          demand_units: Union[float, Dict[str, float]],
-                         keys: Optional[List[str]] = None) -> Dict[str, Any]:
+                         keys: Optional[List[str]] = None,
+                         robust_scenarios: Optional[List[str]] = None) -> Dict[str, Any]:
     """在每个天气场景内部各算一次前沿，再给一个跨场景稳健推荐。
 
     天气是外生的，把 0.97 和 0.70 的解混进同一个前沿比后悔是错的 ——
@@ -190,7 +198,11 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any],
         return {"by_scenario": {}, "robust_recommendation": None,
                 "selection_rule": "没有解，不编推荐"}
     by_policy: Dict[str, List[Tuple[float, Dict[str, Any]]]] = {}
-    for name, res in per_scenario.items():
+    # 只按"承诺范围内的场景"选稳健解：标定被放宽到不是厂里真会承诺的交期之后，
+    # 那种场景里准点不算本事，拿它当最坏场景会把推荐抬到一个现实中做不到的位置。
+    robust_pool = {k: v for k, v in per_scenario.items()
+                   if not robust_scenarios or k in robust_scenarios}
+    for name, res in robust_pool.items():
         pool = {str(s.get("id")): s for s in (res.get("frontier") or []) + (res.get("dominated") or [])}
         for sol in pool.values():
             reg = sol.get("regret_by_objective") or {}
@@ -201,7 +213,7 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any],
     robust = None
     for policy, rows in by_policy.items():
         worst = max(r[1] for r in rows)          # 该政策在最坏场景下的后悔向量
-        covered = len(rows) >= len(per_scenario)
+        covered = len(rows) >= len(robust_pool)
         if not covered:
             continue
         if robust is None or worst < robust[1]:
@@ -209,7 +221,7 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any],
     robust_tied = []
     if robust:
         robust_tied = [p for p, rows in by_policy.items()
-                       if p != robust[0] and len(rows) >= len(per_scenario)
+                       if p != robust[0] and len(rows) >= len(robust_pool)
                        and max(r[1] for r in rows) == robust[1]]
     # 天气场景有没有真的改变结论：同一政策在各场景的目标向量若一模一样，这一维就没带信息
     sig_by_policy: Dict[str, List[Tuple]] = {}
@@ -237,6 +249,8 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any],
                           f"这一轮分不出高下" if robust_tied else None),
             "why": "该政策在好天/雨季/暴雨三个场景里都有解进入比较，且最坏场景的后悔向量最好；"
                    "选它不是因为它分数最高，而是因为它不赌天气。"},
+        "robust_scenario_pool": sorted(robust_pool),
+        "diagnostic_only_scenarios": sorted(set(per_scenario) - set(robust_pool)),
         "selection_rule": ("场景内：可行解 → 帕累托前沿 → 后悔向量字典序最小；"
                            "跨场景：取最坏场景后悔最小的政策（minimax），不是平均最好。"
                            "各场景的批量是各自标定的，跨场景比的是场景内归一化之后的后悔向量，"
@@ -297,6 +311,12 @@ def evaluate(solutions: List[Dict[str, Any]], demand_units: float,
         notes.append(f"{len(dead)} 个维度全场同值，不参与后悔比较：{'、'.join(dead)}"
                      f"（通常说明场景标定太松/太紧，或政策网格没有覆盖到能动这一维的手段）")
         keys = [k for k in keys if k not in dead] or keys
+    jumped = [r for r in rejected if "抢产能" in str(r.get("eliminated_for") or "")
+              or "往后挪" in str(r.get("eliminated_for") or "")]
+    if jumped:
+        notes.append(f"{len(jumped)} 条政策只有靠插单（抢占已在排的活）才准点，已排除在比较外："
+                     f"{'、'.join(str(j.get('name')) for j in jumped[:4])}。"
+                     f"真要采纳得由人确认挪哪些单 —— 本轮推荐不含它。")
     if len(scored) <= 2:
         notes.append(f"可行解只剩 {len(scored)} 个：前沿/后悔在这里没有意义，"
                      f"结论只是「这套组合可行、别的都不行」，不要当成择优结果")

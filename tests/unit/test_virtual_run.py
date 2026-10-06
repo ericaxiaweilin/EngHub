@@ -154,16 +154,26 @@ def test_saturated_and_tied_scenario_gets_tightened():
     assert cal["lead_margin"] == 1.05          # 只动这个场景，别动全局
 
 
-def test_hungry_scene_is_relaxed_before_the_batch_is_touched():
-    """几乎没政策能准点：先分清是交期定太紧，还是量定太大 —— 顺序不能反。"""
+def test_hungry_scene_is_relaxed_only_up_to_the_promise_then_shrinks_the_batch():
+    """放宽只能到承诺口径为止；到顶之后改批量，不改交期 —— 不许把题目改简单再宣布可行。"""
     res = _res([], eliminated=10, no_feasible=True)
     disc = vr.scenario_discrimination(res, 10)
-    cal = {"days_of_output": 6.0, "lead_margin": 1.15}
+    assert vr.promise_ceiling() == vr.PROMISE_LEAD_MARGIN
+    cal = {"days_of_output": 6.0, "lead_margin": 1.05}
     vr._tune_one(cal, disc)
-    assert cal["lead_margin"] == 1.25 and cal["days_of_output"] == 6.0
-    cal2 = {"days_of_output": 6.0, "lead_margin": 1.6}
-    vr._tune_one(cal2, disc)
-    assert cal2["lead_margin"] == 1.6 and cal2["days_of_output"] == 5.0
+    assert cal["lead_margin"] == vr.promise_ceiling() and cal["days_of_output"] == 6.0
+    vr._tune_one(cal, disc)
+    assert cal["lead_margin"] == vr.promise_ceiling() and cal["days_of_output"] == 5.0
+
+
+def test_a_scene_loosened_beyond_the_promise_is_pulled_back_down():
+    """上一版留在 1.45 的场景这轮要往回收，不能赖在宽交期上刷可行解。"""
+    res = _res([0.1, 0.5, 0.9])
+    disc = vr.scenario_discrimination(res, 3)
+    cal = {"days_of_output": 6.0, "lead_margin": 1.45}
+    tweak = vr._tune_one(cal, disc)
+    assert tweak is not None and "收回" in tweak
+    assert cal["lead_margin"] == 1.35
 
 
 def test_calibration_does_not_tune_an_infeasible_deadline_into_feasibility():
@@ -185,7 +195,8 @@ def test_warm_start_keeps_the_calibration_found_last_cycle():
             "不存在的场景": {"days_of_output": 99.0, "lead_margin": 0.1},
             "坏值": "不是字典"}
     calib = vr._seed_calibration(seed, 6.0, 1.15)
-    assert calib[hot] == {"days_of_output": 4.0, "lead_margin": 1.45}
+    # 越出承诺口径的历史标定被收回到上限，批量这种"测试规模"旋钮保留
+    assert calib[hot] == {"days_of_output": 4.0, "lead_margin": vr.promise_ceiling()}
     assert "不存在的场景" not in calib
     assert all(c["lead_margin"] <= vr.MARGIN_BOUNDS[1] and c["days_of_output"] <= vr.BATCH_BOUNDS[1]
                for c in calib.values())

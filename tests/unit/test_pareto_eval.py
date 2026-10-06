@@ -305,3 +305,42 @@ def test_weather_scenarios_that_change_nothing_are_named():
     div = out["scenario_divergence"]
     assert div["policies_compared"] == 2 and div["policies_that_move"] == 0
     assert "不携带任何信息" in div["note"]
+
+
+def test_queue_jumping_is_not_counted_as_capacity(monkeypatch):
+    """"插单"能准点不是产能：默认排除在比较外，放开要显式开关。
+
+    不加这道门，引擎总能靠"把别人往后挪"宣布自己做到了 —— 那是把别人的交付
+    变成自己的分数，工厂里得由人点头。
+    """
+    good = _sol("good", on_time_rate=1.0, throughput_units=600, labor_cost_usd=100,
+                expedite_cost_usd=10, load_band_gap=0.1, line_activation_cost_usd=0,
+                days_late_worst=0)
+    jump = _sol("jump", on_time_rate=1.0, throughput_units=600, labor_cost_usd=1,
+                expedite_cost_usd=0, load_band_gap=0.0, line_activation_cost_usd=0,
+                days_late_worst=0)
+    jump["displaces_committed_work"] = True
+    out = pe.evaluate([good, jump], demand_units=600, keys=ALL)
+    assert [e["name"] for e in out["eliminated"]] == ["jump"]
+    assert out["recommended"]["name"] == "good"
+    assert any("插单" in n for n in out["notes"])
+    # 显式放开后才进比较
+    monkeypatch.setattr(pe, "ALLOW_QUEUE_JUMPING", True)
+    out2 = pe.evaluate([good, jump], demand_units=600, keys=ALL)
+    assert {s["name"] for s in out2["frontier"]} | {s["name"] for s in out2["dominated"]} == {"good", "jump"}
+
+
+def test_robust_pick_ignores_scenarios_loosened_beyond_the_promise():
+    """跨场景稳健推荐只认承诺口径内的场景：把题目改简单之后得到的"准点"不算兑现能力。"""
+    def block_for(vals):
+        return {"solutions": [{"id": f"{k}-a", "name": "加急", "objectives": dict(
+                    on_time_rate=v, throughput_units=600, labor_cost_usd=100,
+                    expedite_cost_usd=10, load_band_gap=0.1, line_activation_cost_usd=0,
+                    days_late_worst=0 if v >= 1 else 5), "evidence": {}}
+                for k, v in vals.items()]}
+    by = {"承诺内（好天）": block_for({"承诺内（好天）": 1.0}),
+          "放宽到1.6（诊断）": block_for({"放宽到1.6（诊断）": 0.0})}
+    out = pe.evaluate_by_scenario(by, 600, ALL, robust_scenarios=["承诺内（好天）"])
+    assert out["robust_scenario_pool"] == ["承诺内（好天）"]
+    assert out["diagnostic_only_scenarios"] == ["放宽到1.6（诊断）"]
+    assert (out["robust_recommendation"] or {}).get("policy") == "加急"

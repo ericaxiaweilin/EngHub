@@ -452,6 +452,9 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     }
 
 
+# 厂里真会对外承诺的交期口径：瓶颈件提前期 × 这个系数。标定可以放宽去找有信息量的区间，
+# 但比承诺还宽的场景只能当诊断，不能拿它的"准点"当结论 —— 那是把题目改简单了。
+PROMISE_LEAD_MARGIN = float(os.getenv("SIM_PROMISE_LEAD_MARGIN", "1.15"))
 # 场景标定要落在"有信息量"的区间：全可行或全不可行都白算一轮。
 FEASIBLE_BAND = (0.25, 0.90)
 MARGIN_BOUNDS = (0.8, 1.6)
@@ -504,19 +507,35 @@ def scenario_discrimination(res: Dict[str, Any], n_policies: int) -> Dict[str, A
     }
 
 
+def promise_ceiling() -> float:
+    """标定最多能放宽到哪儿 = 厂里真会承诺的交期口径。
+
+    越过承诺去调标定等于把题目改简单再宣布"能做到" —— 那正是用户警告过的过拟合。
+    放宽只到承诺口径为止；到顶还是没人能准点，就如实报"以现有提前期做不到"。
+    """
+    return round(min(MARGIN_BOUNDS[1], PROMISE_LEAD_MARGIN), 2)
+
+
 def _tune_one(cal: Dict[str, float], disc: Dict[str, Any]) -> Optional[str]:
     """按场景调自己的标定；返回这一格做了什么调整（None = 这轮不用动）。"""
+    ceiling = promise_ceiling()
     ratio = disc["feasible_ratio"]
     if disc["no_feasible"] or ratio < FEASIBLE_BAND[0]:
         # 触发原因要分清：没有任何准点解 ≠ 可行比例低（降级比较时可行比例可以是 100%）
         reason = ("没有任何准点解" if disc["no_feasible"] else f"可行比例 {ratio:.0%} 太低")
-        if cal["lead_margin"] < MARGIN_BOUNDS[1]:
-            cal["lead_margin"] = round(min(MARGIN_BOUNDS[1], cal["lead_margin"] + 0.1), 2)
-            return f"{reason} → 交期系数放宽到 {cal['lead_margin']:g}"
+        if cal["lead_margin"] < ceiling:
+            cal["lead_margin"] = round(min(ceiling, cal["lead_margin"] + 0.1), 2)
+            return f"{reason} → 交期系数放宽到 {cal['lead_margin']:g}（承诺口径上限 {ceiling:g}）"
         if ratio < FEASIBLE_BAND[0] and cal["days_of_output"] > BATCH_BOUNDS[0]:
             cal["days_of_output"] = round(max(BATCH_BOUNDS[0], cal["days_of_output"] - 1.0), 2)
-            return f"交期已到上限还几乎无解 → 批量降到 {cal['days_of_output']:g} 天线产量，分清是量太大还是真做不到"
+            return (f"交期已到承诺口径上限还几乎无解 → 批量降到 {cal['days_of_output']:g} 天线产量，"
+                    f"分清是批量定大了还是以现有提前期就是做不到")
         return None     # 标定已到底：做不到就是结论，不再用调参把它调成"做得到"
+    if cal["lead_margin"] > ceiling and disc["feasible"]:
+        # 上一轮为了诊断放宽过，这轮有准点解就收回来：不许赖在简单模式里刷可行解
+        cal["lead_margin"] = round(max(ceiling, cal["lead_margin"] - 0.1), 2)
+        return (f"这一格还停在比承诺口径（{ceiling:g}）更宽的交期上、且已经有准点解 → "
+                f"交期系数收回 {cal['lead_margin']:g}，不靠改题目拿可行解")
     if ratio > FEASIBLE_BAND[1]:
         # 全（或几乎全）可行不一定是坏事：目标维度还能取舍就不许再收紧交期去制造"延不延期"的假区分度
         if disc["informative"] or (disc["live_objectives"] >= 2 and disc["runner_up_regret_gap"]):
@@ -532,6 +551,7 @@ def _tune_one(cal: Dict[str, float], disc: Dict[str, Any]) -> Optional[str]:
             return (f"可行解只有 {disc['feasible']} 个/目标维度全平 → "
                     f"批量降到 {cal['days_of_output']:g} 天线产量，找中间地带")
     return None
+
 
 
 FOLLOWTHROUGH_SQL = text("""
@@ -735,8 +755,9 @@ def _seed_calibration(seed: Optional[Dict[str, Any]], days_of_output: float,
         except (TypeError, ValueError):
             continue
         if batch > 0 and margin > 0:
+            # 历史标定若越出承诺口径（上一版允许放宽到 1.6 时留下的），热启动就收回来
             calib[name] = {"days_of_output": min(BATCH_BOUNDS[1], max(BATCH_BOUNDS[0], batch)),
-                           "lead_margin": min(MARGIN_BOUNDS[1], max(MARGIN_BOUNDS[0], margin))}
+                           "lead_margin": min(promise_ceiling(), max(MARGIN_BOUNDS[0], margin))}
     return calib
 
 
@@ -778,7 +799,11 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
         scan = await scan_policies(db, factory_id, targets, policies=grid,
                                    targets_by_scenario=targets_by_scenario)
         from api.services.pareto_eval import evaluate_by_scenario
-        verdict = evaluate_by_scenario(scan["by_scenario"], scan["demand_by_scenario"])
+        # 标定已放宽到超过承诺系数的场景只作诊断，不参与跨场景稳健推荐
+        within_promise = [n for n, c in calib.items()
+                          if c["lead_margin"] <= PROMISE_LEAD_MARGIN + 1e-9]
+        verdict = evaluate_by_scenario(scan["by_scenario"], scan["demand_by_scenario"],
+                                       robust_scenarios=within_promise or None)
         per: Dict[str, Any] = {}
         tweaks: List[str] = []
         for scen in WEATHER_SCENARIOS:
@@ -789,9 +814,12 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
             tweak = _tune_one(cal, disc)
             if tweak:
                 tweaks.append(f"{name}：{tweak}")
-            at_bounds = (cal["lead_margin"] >= MARGIN_BOUNDS[1]
-                         and cal["days_of_output"] <= BATCH_BOUNDS[0])
-            if disc["feasible_ratio"] < FEASIBLE_BAND[0] and at_bounds:
+            # 交期这个旋钮已经拧到承诺口径上限，再没有"把题目改简单"的余地：
+            # 这时还没准点解就该去试极限杠杆，而不是先看批量降到多小
+            ceiling_reached = cal["lead_margin"] >= promise_ceiling()
+            # 触发条件不能只看可行比例：降级比较时可行比例可以高达 92%（全都算进来了），
+            # 而真相是本场景没有任何准点解 —— 那才是"补极限加急/报做不到"的信号
+            if (disc["no_feasible"] or disc["feasible_ratio"] < FEASIBLE_BAND[0]) and ceiling_reached:
                 if not extreme_added:
                     grid_extra.append({"name": "极限加急（提前期压到 2 天）+ 并联开满",
                                        "expedite_lead_days": 2, "parallel_lines": 2})
@@ -804,6 +832,9 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
                 # 每格都要有自己的说法，不能留 None 让人去猜这一轮到底算不算数
                 if disc["report_only_comparison"]:
                     disc["verdict"] = "没有解达到产量底线：这一轮只摆数据，不择优"
+                elif disc["no_feasible"]:
+                    disc["verdict"] = ("本场景没有任何准点解（含放宽后的口径）：已降级按延误天数比较，"
+                                       "这是结论不是失败")
                 elif disc["feasible_ratio"] > FEASIBLE_BAND[1]:
                     disc["verdict"] = (f"{disc['feasible_ratio']:.0%} 的政策都能准点：准点这维在本场景是空的，"
                                        f"政策靠目标维度取舍（推荐解赢次优解的后悔差 "
@@ -813,13 +844,17 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
                                        f"本轮只筛掉了明显更差的，没说哪个最好 —— 要分高下得给目标定优先级")
                 elif disc["runner_up_regret_gap"] in (0.0, None):
                     disc["verdict"] = "没有一个可比解与推荐解的后悔不同：本轮等于抛硬币，不能当结论"
-                elif disc["no_feasible"]:
-                    disc["verdict"] = "本场景没有准点解：已降级按延误天数比较，这是结论不是失败"
                 else:
                     disc["verdict"] = "落在有信息量的区间：可行比例在带内，推荐解与次优解有后悔差"
             blocked = {(b.get("model_code"), str(b.get("status")))
                        for s in ((scan["by_scenario"].get(name) or {}).get("solutions") or [])
                        for b in (s.get("blocked_models") or [])}
+            disc["beyond_promise"] = cal["lead_margin"] > PROMISE_LEAD_MARGIN + 1e-9
+            if disc["beyond_promise"]:
+                disc["diagnostic_only"] = (
+                    f"这一格把交期放宽到提前期 ×{cal['lead_margin']:g}（承诺口径是 ×"
+                    f"{PROMISE_LEAD_MARGIN:g}）：只用来判断'做不到是政策不够还是交期本身不可能'，"
+                    f"它的准点不算交付承诺，也不参与跨场景稳健推荐")
             per[name] = {"calibration": dict(cal),
                          "demand_units": scan["demand_by_scenario"].get(name),
                          "blocked_models": [{"model_code": mc, "status": st} for mc, st in sorted(blocked)],
@@ -835,14 +870,20 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
             "calibration_by_scenario": {k: dict(v) for k, v in calib.items()},
             "per_scenario": per,
             "robust": (verdict.get("robust_recommendation") or {}).get("policy"),
+            "robust_pool": verdict.get("robust_scenario_pool") or [],
+            "diagnostic_only_scenarios": verdict.get("diagnostic_only_scenarios") or [],
+            "promise_margin": PROMISE_LEAD_MARGIN,
             "robust_why": (verdict.get("robust_recommendation") or {}).get("why"),
             "robust_tied_with": (verdict.get("robust_recommendation") or {}).get("tied_with") or [],
             "policies_tried": len(grid),
             "notes": [n for r in (verdict.get("by_scenario") or {}).values()
                       for n in (r.get("notes") or [])],
             "scenario_divergence": verdict.get("scenario_divergence") or {},
-            "diagnosis": ("；".join(tweaks) if tweaks
-                          else "各场景都落在有信息量的区间：本轮前沿与后悔比较可用"),
+            "diagnosis": ("；".join(tweaks) if tweaks else (
+                "各场景都有区分度：可行比例在带内、推荐解与次优解有后悔差，本轮前沿与后悔比较可用"
+                if all(p.get("informative") for p in per.values()) else
+                "标定已到承诺口径上限（×%g），各场景仍在降级比较（没有准点解）："
+                "本轮只按延误天数排先后，不宣称谁能准点" % PROMISE_LEAD_MARGIN)),
             "next_tweak": tweaks[0] if tweaks else None,
             "tweaks": tweaks,
         }
@@ -850,7 +891,25 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
         final = row
         if not tweaks:
             break
+    all_beyond = all((c["lead_margin"] > PROMISE_LEAD_MARGIN + 1e-9) for c in calib.values())
+    final_per = (trajectory[-1].get("per_scenario") or {}) if trajectory else {}
+    conclusion = None
+    if final_per and all(p.get("no_feasible") for p in final_per.values()):
+        worst = max(int(((p.get("recommended_objectives") or {}).get("days_late_worst")) or 0)
+                    for p in final_per.values())
+        conclusion = (f"以承诺交期（瓶颈提前期 ×{PROMISE_LEAD_MARGIN:g}、批量 "
+                      f"{calib[WEATHER_SCENARIOS[0]['name']]['days_of_output']:g} 天线产量）"
+                      f"这 {len(models)} 台做不到准点：连后悔最小的政策也要延 {worst} 天。"
+                      f"要兑现得压提前期/加急或改承诺交期 —— 而不是把标定放宽，那只是把题目改简单。")
+    elif all_beyond:
+        conclusion = (f"以承诺交期（瓶颈提前期 ×{PROMISE_LEAD_MARGIN:g}）这 {len(models)} 台做不到准点；"
+                      f"要准点得压提前期/加急，或把交期改成 ×{min(c['lead_margin'] for c in calib.values()):g} 以上 —— "
+                      f"本轮放宽之后的推荐只说明'交期这么定就行'，不说明现有承诺能兑现")
     return {"factory_id": factory_id, "rounds": len(trajectory), "warm_started": seeded,
+            "all_scenarios_beyond_promise": all_beyond,
+            "nothing_on_time_at_promise": bool(final_per) and all(
+                p.get("no_feasible") for p in final_per.values()),
+            "conclusion": conclusion,
             "targets": targets, "final": final, "trajectory": trajectory,
             "final_scan": scan, "final_verdict": verdict,
             "calibration_by_scenario": {k: dict(v) for k, v in calib.items()},
@@ -939,7 +998,9 @@ async def build_policy_grid(db: AsyncSession, factory_id: str,
             grid.append({"name": f"同组并联开满（{grp}={n} 条线）", "parallel_lines": n})
     grid.append({"name": "加班加人 15%", "crew_bonus": 0.15})
     grid.append({"name": "加班加人 30%", "crew_bonus": 0.30})
-    grid.append({"name": "无视已排 backlog 插单", "ignore_backlog": True})
+    # 这不是产能，是把已经答应该做的活往后推：必须点名"插单"，并且默认不许靠它宣布准点
+    grid.append({"name": "插单（抢占已在排的活）", "ignore_backlog": True,
+                 "displaces_committed_work": True})
     grid.append({"name": "加急 1/4 + 并联开满", "expedite_lead_days": (
         max(1, sorted(leads, reverse=True)[0] // 4) if leads else 5), "parallel_lines": 2})
     return grid
@@ -1097,10 +1158,17 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
       solutions: List[Dict[str, Any]] = []
       for pol in policies:
         per_run: List[Dict[str, Any]] = []
-        for t in scen_targets:
+        # 本轮模拟出来的单也要排队：同一条线组的产能是它们一起占的。以前每台单只吃
+        # "真实已承诺量"，于是三台跑步机机种各占 GROUP-TREAD 十几天却互不遮挡，
+        # 交期普遍算得偏乐观 —— 而"谁先做"本来是引擎要做的决定，不是背景假设。
+        allocated: Dict[str, float] = {} if pol.get("ignore_backlog") else dict(group_busy)
+        ordered = sorted(scen_targets, key=lambda x: (int(x.get("due_in_days") or 999),
+                                                      str(x.get("model_code"))))
+        for t in ordered:
             due_day = int(t.get("due_in_days") or 30)
-            busy = float((busy_by_line.get(str((pick_line(str(t["model_code"]), lines)[0] or {}).get("line_code") or ""),
-                                       {"busy_days": 0.0})).get("busy_days") or 0.0)
+            line_of_t = pick_line(str(t["model_code"]), lines)[0] or {}
+            grp = str(line_of_t.get("line_group") or line_of_t.get("line_code") or "")
+            busy = float(allocated.get(grp, 0.0) or 0.0)
             run = await run_target(db, factory_id, str(t["model_code"]), float(t.get("units") or 0),
                                    today + timedelta(days=due_day), today, curve, lines, shift_days,
                                    expedite_lead_days=pol.get("expedite_lead_days"),
@@ -1109,6 +1177,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                    crew_bonus=float(pol.get("crew_bonus", 0.0)),
                                    cached=cache, line_busy_days=(0.0 if pol.get("ignore_backlog") else busy),
                                    equip_rate=float(equip.get("rate") or 1.0))
+            allocated[grp] = busy + float(run.get("work_days") or 0)
             per_run.append({"run": run, "due_day": due_day, "units": float(t.get("units") or 0)})
         # 没有工时依据/没有可归属线的机种不算"厂里做不到"，是模型还代表不了它 —— 缺的是数据。
         # 把它们留在需求量里，每个政策都会卡产量底线，整轮扫描退化成"全都不可行"（实测踩过）。
@@ -1122,6 +1191,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                               "attendance": float(scen.get("attendance", 0.97)),
                               "policy": pol, "objectives": {}, "evidence": {},
                               "blocked_models": blocked, "detail": [],
+                              "displaces_committed_work": bool(pol.get("ignore_backlog")),
                               "note": "这些机种都没有可推演的依据（缺工时/缺可归属线），本轮不产出解"})
             continue
         demand_by_scenario[scen["name"]] = round(sum(float(x["units"] or 0) for x in work), 2)
@@ -1152,6 +1222,10 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
             "policy": pol,
             "objectives": objs,
             "blocked_models": blocked,
+            "displaces_committed_work": bool(pol.get("ignore_backlog")),
+            "sequencing": ("同一线组按交期先后排队（EDD）：每台单占用它自己的工时天数，"
+                           "后面的单要等前面的做完才能上；"
+                           "'插单'政策放开的是真实已排的活，默认不参与择优（见 pareto_eval）"),
             "evidence": {str(x["run"].get("route_basis")): 1 for x in work}
                         | {str(x["run"].get("hours_basis")): 1 for x in work}
                         | {str(x["run"].get("line_basis")): 1 for x in work},
@@ -1160,6 +1234,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         "due_date": x["run"].get("due_date"), "days_late": x["run"].get("days_late"),
                         "status": x["run"].get("status"), "line": x["run"].get("line"),
                         "why": x["run"].get("why"),
+                        "queue_days_before_this_order": x["run"].get("line_busy_days_before_order"),
                         "capacity_basis": x["run"].get("capacity_basis"),
                         "material_arrival_day": x["run"].get("material_arrival_day"),
                         "batch_a_units": x["run"].get("batch_a_units"),

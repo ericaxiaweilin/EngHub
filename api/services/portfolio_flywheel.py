@@ -106,6 +106,8 @@ async def latest_tradeoff_state(db: AsyncSession, factory_id: str) -> Dict[str, 
         "calibration_by_scenario": detail.get("calibration_by_scenario"),
         "selection_rule": weights.get("rule"),
         "scenario_divergence": detail.get("scenario_divergence"),
+        "promise_conclusion": detail.get("promise_conclusion"),
+        "robust_pool": detail.get("robust_pool"),
         "rule": TRADEOFF_NOTE,
         "note": TRADEOFF_NOTE,
     }
@@ -271,6 +273,12 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                                          "why": tuned["final"].get("robust_why"),
                                          "tied_with": tuned["final"].get("robust_tied_with") or []},
                "scenario_divergence": tuned["final"].get("scenario_divergence") or {},
+               "conclusion": tuned.get("conclusion"),
+               "all_scenarios_beyond_promise": bool(tuned.get("all_scenarios_beyond_promise")),
+               "nothing_on_time_at_promise": bool(tuned.get("nothing_on_time_at_promise")),
+               "promise_margin": tuned["final"].get("promise_margin"),
+               "diagnostic_only_scenarios": tuned["final"].get("diagnostic_only_scenarios") or [],
+               "robust_pool": tuned["final"].get("robust_pool") or [],
                "selection_rule": tuned["rule"]}
     scan = {"policies_tried": int(tuned["final"].get("policies_tried") or 0)}
     robust = verdict.get("robust_recommendation") or {}
@@ -326,7 +334,14 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     # 不逐条进签名，否则每 15 分钟都被判成"变了"而重写卡与待办
     ft_state = (f"ft:{len(followthrough.get('adopted') or [])}-of-{followthrough.get('checked')}"
                 if followthrough else "ft:no-named-part")
-    full_signature = tradeoff_signature(robust.get("policy"), sig_view, action_sig, ft_state)
+    # 有没有越过承诺口径也进签名：从"做不到"翻成"放宽后才可行"是结论变了，不是小变化
+    promise_state = ("beyond-promise" if verdict.get("all_scenarios_beyond_promise") else "within-promise")
+    # "有没有准点解"必须进签名：从"都不误期"翻成"承诺交期下做不到"是结论变了，
+    # 待办标题里那句声明跟着变，否则界面上会一直挂着过期的承诺
+    on_time_state = ("ontime:{}-of-{}".format(
+        sum(1 for r in per_scenario.values() if not r.get("no_feasible")), len(per_scenario)))
+    full_signature = tradeoff_signature(robust.get("policy"), sig_view, action_sig,
+                                        f"{ft_state}|{promise_state}|{on_time_state}")
     receipt_signature = full_signature[0]
     signature = receipt_signature
     last = prev      # 同一张上一轮记分卡，热启动标定与变更比较都读它，不查第二遍
@@ -336,6 +351,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                "actions": actions, "action_count": len(actions),
                "followthrough": followthrough or {"checked": 0,
                                                   "note": "上一张卡没有点名到料号的动作，无复查对象"},
+               "promise_conclusion": verdict.get("conclusion"),
+               "all_scenarios_beyond_promise": verdict.get("all_scenarios_beyond_promise"),
                "scenario_divergence": verdict.get("scenario_divergence"),
                "calibration": [(t.get("model_code"), t.get("units"), t.get("due_in_days"),
                                 t.get("calibration")) for t in (tuned.get("targets") or [])],
@@ -393,6 +410,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                               "full_signature": full_signature[1],
                               "followthrough": followthrough,
                               "scenario_divergence": verdict.get("scenario_divergence"),
+                              "promise_conclusion": verdict.get("conclusion"),
+                              "robust_pool": verdict.get("robust_pool"),
                               "tuning": receipt["tuning_trajectory"],
                               "self_check": tuned["final"].get("notes") or [],
                               "note": TRADEOFF_NOTE}, ensure_ascii=False),
@@ -418,7 +437,16 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         per = {n: _rec((r or {}).get("recommended"))
                for n, r in (verdict.get("by_scenario") or {}).items()}
         objs = objectives
+        # 标题里那句"准不准点"必须按数据说：降级比较时一个准点解都没有，
+        # 还写着"好天~暴雨都不误期"就是引擎在替人编承诺
+        n_scen = max(1, len(per))
+        n_on_time = sum(1 for r in (verdict.get("by_scenario") or {}).values()
+                        if not (r or {}).get("no_feasible"))
+        claim = (f"{n_on_time}/{n_scen} 个天气场景有准点解" if n_on_time
+                 else "承诺交期下没有准点解，按延误最小排")
         ft = followthrough or {}
+        promise_line = (("口径提醒：" + str(verdict.get("conclusion")) + "\n")
+                        if verdict.get("conclusion") else "")
         ft_line = (f"上一轮建议复查：{ft.get('checked', 0)} 条里 {len(ft.get('adopted') or [])} 条已落地、"
                    f"{len(ft.get('not_acted') or [])} 条无变化（{ft.get('verdict')}）"
                    if ft.get("checked") else "")
@@ -445,11 +473,12 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
             elif t == "authorize_overtime":
                 act_lines.append(f"· {a['model_code']} 加班加人 "
                                  f"{float(a['extra_crew_share']):.0%}")
-            elif t == "master_data_gap":
-                act_lines.append(f"· 主数据缺口：{a.get('detail')}")
+            elif t in ("master_data_gap", "model_data_gap"):
+                act_lines.append(f"· {'机种推演不了' if t == 'model_data_gap' else '主数据缺口'}："
+                                 f"{a.get('detail')}")
         created = await create_task(
             db, factory_id, "virtual_factory",
-            f"推演推荐｜{rec}（好天~暴雨都不误期，代价 ${float(objs.get('expedite_cost_usd') or 0) + float(objs.get('line_activation_cost_usd') or 0):,.0f}）"[:200],
+            f"推演推荐｜{rec}（{claim}，代价 ${float(objs.get('expedite_cost_usd') or 0) + float(objs.get('line_activation_cost_usd') or 0):,.0f}）"[:200],
             description=(
                 f"政策×天气扫描（{len(per)} 个天气场景 × {scan['policies_tried']} 个政策）的稳健推荐：{rec}。\n"
                 f"各场景推荐：" + "；".join(f"{k}→{v}" for k, v in per.items()) + "\n"
@@ -457,6 +486,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                 f" + 开并联线 ${float(objs.get('line_activation_cost_usd') or 0):,.0f}"
                 f" + 人工 ${float(objs.get('labor_cost_usd') or 0):,.0f}；"
                 f"等料空档 {float(objs.get('standby_person_days') or 0):,.0f} 人日。\n"
+                + (promise_line or "")
                 + (f"\n{ft_line}\n" if ft_line else "")
                 + f"选择规则：{verdict.get('selection_rule')}\n"
                 f"（不是'分最高'：交期与产量是硬约束，其余维度取最小最大后悔，避免为刷一个维度牺牲另一维。）\n"
