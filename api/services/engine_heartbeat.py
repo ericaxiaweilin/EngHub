@@ -67,13 +67,15 @@ async def record(loop_name: str, status: str = "tick", detail: Optional[Dict[str
             await db.execute(text(f"""
                 INSERT INTO {TABLE}
                     (loop_name, host, pid, interval_seconds, started_at,
-                     last_tick_at, ticks, failures, last_status, last_error, last_detail, updated_at)
+                     last_tick_at, ticks, failures, last_status, last_error, last_detail,
+                     recent_errors, updated_at)
                 VALUES (:loop, :host, :pid, :interval, :now, :now, 1,
                         CASE WHEN :status = 'failed' THEN 1 ELSE 0 END,
-                        :status, :error, CAST(:detail AS jsonb), :now,
+                        :status, :error, CAST(:detail AS jsonb),
                         CASE WHEN :status = 'failed'
-                             THEN jsonb_build_array(jsonb_build_object('at', :now, 'error', :error))
-                             ELSE '[]'::jsonb END)
+                             THEN jsonb_build_array(jsonb_build_object('at', CAST(:now_text AS text), 'error', CAST(:error AS text)))
+                             ELSE '[]'::jsonb END,
+                        :now)
                 ON CONFLICT (loop_name) DO UPDATE SET
                     host = EXCLUDED.host,
                     pid = EXCLUDED.pid,
@@ -100,6 +102,7 @@ async def record(loop_name: str, status: str = "tick", detail: Optional[Dict[str
                 "pid": os.getpid(),
                 "interval": interval_seconds or expected_interval(loop_name),
                 "now": now,
+                "now_text": now.isoformat(timespec="seconds"),
                 "status": status,
                 "error": (error or "")[:500] or None,
                 "detail": json_dumps(detail),
