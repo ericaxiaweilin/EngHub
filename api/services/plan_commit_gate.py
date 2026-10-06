@@ -63,7 +63,27 @@ GATE_SQL = text("""
                  ELSE COALESCE((
                      SELECT jsonb_array_length(r.steps::jsonb) FROM routings r WHERE r.id = p.routing_id
                  ), 0)
-               END AS route_steps
+               END AS route_steps,
+               -- 有多少道工序带着 IE 给的单件工时（两种存法都要认）
+               CASE
+                 WHEN p.routing_template_id IS NOT NULL THEN (
+                     SELECT count(*) FROM routing_template_steps st
+                     WHERE st.template_id::text = p.routing_template_id::text
+                       AND COALESCE(st.standard_hours, 0) > 0
+                 )
+                 ELSE COALESCE((
+                     SELECT count(*) FROM routings r, jsonb_array_elements(r.steps::jsonb) e(s)
+                     WHERE r.id = p.routing_id AND COALESCE((e.s->>'standard_hours')::numeric, 0) > 0
+                 ), 0)
+               END AS steps_with_hours,
+               -- 这个机种有没有落到"厂里声明过日产量"的线上（参考级线产能）
+               EXISTS (
+                   SELECT 1 FROM line_profiles lp
+                   WHERE lp.factory_id = :fid AND lp.is_active
+                     AND lp.units_per_day > 0 AND lp.hours_per_day > 0
+                     AND (lp.default_model = p.product_id OR p.product_id = ANY(lp.can_make_models))
+                     AND NOT (p.product_id = ANY(lp.cannot_make_models))
+               ) AS has_line_capacity
         FROM pool p
     ),
     task AS (
@@ -90,6 +110,8 @@ GATE_SQL = text("""
     SELECT p.id AS work_order_id, p.work_order_code, p.wo_type, p.status, p.product_id,
            p.planned_qty, p.planned_due, p.planned_start,
            COALESCE(e.route_steps, 0) AS route_steps,
+           COALESCE(e.steps_with_hours, 0) AS steps_with_hours,
+           COALESCE(e.has_line_capacity, FALSE) AS has_line_capacity,
            COALESCE(t.plan_rows, 0) AS plan_rows,
            COALESCE(t.short_rows, 0) AS short_rows,
            COALESCE(k.kit_rows, 0) AS kit_rows,
@@ -110,6 +132,8 @@ HOLD_REASONS = {
     "partial_steps": "只排进了一部分工序：车间不该拿到残缺工艺",
     "shortage": "有物料缺口未齐套（含下层自制件没完工）",
     "no_kit_evidence": "齐套表里没有任何带需求量的物料行：不知道要发什么料就不算齐套，不许下达",
+    "no_time_basis": "路线里没有任何 IE 给的单件工时，机种也没落到声明过日产量的线上："
+                     "不给它排时，也不替它编预计完工 —— 等 IE 量过这道工序",
     "station_unmapped": "首道工序的工位编码在本厂 stations 查不到，无法回写派工工位",
 }
 
@@ -128,7 +152,11 @@ def _verdict(row: Any) -> Dict[str, Any]:
     kit_rows = int(row.get("kit_rows") or 0)
     reasons: List[str] = []
     if plan_rows == 0:
-        reasons.append("not_scheduled")
+        # "没排进本版"和"根本没资格被排时"是两件事，混在一起会把数据缺口报成产能不足
+        if int(row.get("steps_with_hours") or 0) == 0 and not row.get("has_line_capacity"):
+            reasons.append("no_time_basis")
+        else:
+            reasons.append("not_scheduled")
     else:
         if steps and plan_rows < steps:
             reasons.append("partial_steps")

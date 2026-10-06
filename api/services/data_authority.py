@@ -105,6 +105,17 @@ LEAD_TIME_SQL = text("""
     FROM materials
 """)
 
+TEMPLATE_HOURS_SQL = text("""
+    SELECT COUNT(*) AS step_rows,
+           COUNT(*) FILTER (WHERE COALESCE(st.standard_hours,0) > 0) AS with_hours,
+           COUNT(DISTINCT rt.id) AS templates,
+           MIN(st.created_at)::date AS first_import, MAX(st.created_at)::date AS last_import,
+           string_agg(DISTINCT COALESCE(NULLIF(rt.created_by, ''), '(空)'), ', ') AS 声明来源
+    FROM routing_template_steps st
+    JOIN routing_templates rt ON rt.id::text = st.template_id
+    WHERE rt.factory_id = :fid
+""")
+
 VIRTUAL_REPORTS_SQL = text("""
     SELECT COUNT(*) AS report_rows,
            COUNT(*) FILTER (WHERE created_by IN ('virtual_factory','virtual_factory_agent')) AS synthetic_rows,
@@ -169,6 +180,7 @@ async def data_authority_report(db: AsyncSession, factory_id: str, *, as_of=None
     rate = (await db.execute(STATION_RATE_SQL, {"fid": factory_id})).mappings().first()
     lead = (await db.execute(LEAD_TIME_SQL)).mappings().first()
     vrep = (await db.execute(VIRTUAL_REPORTS_SQL)).mappings().first()
+    tpl = (await db.execute(TEMPLATE_HOURS_SQL, {"fid": factory_id})).mappings().first()
 
     ie = classify(ie_rows)
     fresh = attendance_freshness(att["last_attended"] if att else None, today)
@@ -212,6 +224,18 @@ async def data_authority_report(db: AsyncSession, factory_id: str, *, as_of=None
             },
         },
         "not_usable_as_evidence": [
+            dirty_inventory_row(
+                "模板工序声明工时 routing_template_steps.standard_hours",
+                int(tpl["with_hours"] or 0) if tpl else 0,
+                "%d 个工步有值（%d 条路线），但 %s 行都是 %s~%s 一次性导入的，"
+                "created_by 写的是「%s」而代码里没有任何写这张表的路径 —— 是种子，不是 IE 量过的"
+                % (int(tpl["with_hours"] or 0) if tpl else 0,
+                   int(tpl["templates"] or 0) if tpl else 0,
+                   int(tpl["with_hours"] or 0) if tpl else 0,
+                   tpl["first_import"] if tpl else "-", tpl["last_import"] if tpl else "-",
+                   tpl["声明来源"] if tpl else "-"),
+                "暂时仍作 IE 列使用（它是 MES 里 IE 该维护的那一列），但在读数里标「未经 IE 复核」；"
+                "IE 复核后写 standard_operation_times 就能顶掉它"),
             dirty_inventory_row(
                 "工位每小时产能 stations.capacity_per_hour",
                 int(rate["stations_with_rate"] or 0) if rate else 0,

@@ -30,7 +30,7 @@ PLAN_ROW = {
 
 
 def _row(code, *, steps, plan_rows, short=0, station="ST-JG-01", mapped=True,
-         status="pending", wo_type="master", kit=1):
+         status="pending", wo_type="master", kit=1, hours=None, line=False):
     return {
         "work_order_id": code, "work_order_code": f"WO-{code}", "wo_type": wo_type,
         "status": status, "product_id": f"P-{code}", "planned_qty": 10,
@@ -38,6 +38,9 @@ def _row(code, *, steps, plan_rows, short=0, station="ST-JG-01", mapped=True,
         "route_steps": steps, "plan_rows": plan_rows, "short_rows": short,
         # kit_rows = 齐套表里带需求量的领料行数（0 表示根本没有依据，不是"不缺料"）
         "kit_rows": kit,
+        # 工时依据：路线里有几道工序带 IE 给的单件工时、机种有没有落到声明过日产量的线上
+        "steps_with_hours": steps if hours is None else hours,
+        "has_line_capacity": line,
         "first_station_code": station, "first_start": datetime(2026, 10, 6, 8, 0),
         "station_mapped": mapped,
     }
@@ -102,6 +105,11 @@ def test_verdict_holds_orders_missing_any_one_of_the_five_rules():
     # 只排进一半工序：不能下，车间拿到的是残缺工艺
     assert gate_mod._verdict(_row("c", steps=7, plan_rows=4))["hold_reasons"] == ["partial_steps"]
     assert gate_mod._verdict(_row("d", steps=7, plan_rows=0))["hold_reasons"] == ["not_scheduled"]
+    # 一道工序工时都没有、也没线产能可依的单，不许混进"没排进本版"（那是产能不足的说法）
+    assert gate_mod._verdict(_row("d2", steps=7, plan_rows=0, hours=0))["hold_reasons"] == ["no_time_basis"]
+    # 没有 IE 工时但机种落在声明过日产量的线上 → 有依据可排时，仍算没排进本版
+    assert gate_mod._verdict(_row("d3", steps=7, plan_rows=0, hours=0, line=True))[
+        "hold_reasons"] == ["not_scheduled"]
     assert gate_mod._verdict(_row("e", steps=7, plan_rows=7, mapped=False))["hold_reasons"] == ["station_unmapped"]
     # 两个条件都不满足时要都点名，别只报第一个
     both = gate_mod._verdict(_row("f", steps=7, plan_rows=3, short=2))

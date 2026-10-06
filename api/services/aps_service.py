@@ -1817,6 +1817,11 @@ class ApsService:
         wo_ids = set(t.work_order_id for t in tasks if t.work_order_id)
 
         released = 0
+
+
+        already_released = 0
+
+
         held_by_gate = 0
 
         released_order_ids: set = set()
