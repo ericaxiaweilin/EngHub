@@ -1757,28 +1757,51 @@ class ApsService:
                 "partial_releasable": True,
             }
 
-        previous_result = await self.db.execute(
-            select(ApsSchedule).where(
-                ApsSchedule.factory_id == schedule.factory_id,
-                ApsSchedule.is_current.is_(True),
-                ApsSchedule.id != schedule.id,
-            )
+        # 先把旧版退下来，再动这一版：一厂只许一版生效是**部分唯一索引**
+        # （factory_id WHERE is_current），走 ORM 两条 UPDATE 的先后顺序不保证，
+        # 实测新行先更新就撞"同一个厂两版同时生效"，整笔事务回滚、下达看上去失败。
+        demote = await self.db.execute(text("""
+            UPDATE aps_schedules
+            SET is_current = FALSE,
+                status = CASE WHEN status = 'released' THEN 'archived' ELSE status END,
+                updated_at = NOW()
+            WHERE factory_id = :fid AND is_current = TRUE AND id <> :sid
+        """), {"fid": schedule.factory_id, "sid": schedule.id})
+        demoted_versions = int(demote.rowcount or 0)
+        await self.db.flush()
+
+        # 版本下达 ≠ 逐单放行。哪些单能进"已下达"，只认就绪门那一套判据
+        # （排进本版 + 工序排齐 + 任务行齐套 + 齐套表有领料依据 + 首道工位可映射）。
+        # 原来这里是"版里出现过就 released"，等于在就绪门外又开了一条更弱的口子：
+        # 缺料的单会跟着整版一起变成已下达，而 audit_false_releases 只回收
+        # released_by 是门的那批，这条路放出去的自己看不见。
+        from api.services.plan_commit_gate import evaluate_commit_gate
+
+        gate = await evaluate_commit_gate(
+            self.db, schedule.factory_id, full=True, schedule_id=schedule.id
         )
-        for previous in previous_result.scalars().all():
-            previous.is_current = False
-            if previous.status == "released":
-                previous.status = "archived"
-            previous.updated_at = datetime.utcnow()
+        releasable = {str(oid) for oid in (gate.get("ready_ids") or [])}
 
         wo_ids = set(t.work_order_id for t in tasks if t.work_order_id)
 
         released = 0
+        held_by_gate = 0
+
+        released_order_ids: set = set()
 
         for wo_id in wo_ids:
 
             wo = await self.db.get(WorkOrder, wo_id)
 
-            if wo and wo.status in ("pending", "released"):
+            if wo is None:
+                continue
+
+            if wo.status == "pending" and str(wo_id) not in releasable:
+                # 没门依据的单保持待下达；已下达/在制的一律不动（收回是就绪门那条路的事）
+                held_by_gate += 1
+                continue
+
+            if wo.status == "pending":
 
                 wo.status = "released"
 
@@ -1786,9 +1809,21 @@ class ApsService:
 
                 released += 1
 
+            elif wo.status == "released":
+
+                # 本来就已下达的，这次只是继续留在生效版里 —— 不许报成"我下达了它"
+
+                already_released += 1
+
+            released_order_ids.add(str(wo_id))
+
         for t in tasks:
 
-            t.status = "released"
+            # 任务行状态跟着它自己那张单走：单没过门，工序行不许写"已下达"
+
+            if t.work_order_id is None or str(t.work_order_id) in released_order_ids:
+
+                t.status = "released"
 
         schedule.status = "released"
         schedule.is_current = True
@@ -1803,6 +1838,8 @@ class ApsService:
             reason=("APS 方案部分下达" if blockers else "APS 方案下达") + (f"：{note}" if note else ""),
             payload={
                 "released_orders": released,
+                "held_by_kit_gate": held_by_gate,
+                "previous_current_demoted": demoted_versions,
                 "allow_partial": allow_partial,
                 "blockers": blockers,
                 "unscheduled_count": schedule.unscheduled_count,
@@ -1814,11 +1851,13 @@ class ApsService:
 
         return {
             "success": True,
-            "message": f"已下达 {released} 个工单"
+            "message": f"方案已生效；按就绪门下达 {released} 个工单"
+                       + (f"，另有 {held_by_gate} 张没过逐单就绪门、保持待下达" if held_by_gate else "")
                        + (f"；未下达：{'、'.join(blockers)}" if blockers else ""),
             "schedule_id": schedule.id,
             "version_number": schedule.version_number,
             "released_orders": released,
+            "held_by_kit_gate": held_by_gate,
             "is_current": True,
             "blockers": blockers,
         }

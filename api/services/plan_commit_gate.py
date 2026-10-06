@@ -31,11 +31,12 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-LATEST_DRAFT_SQL = text("""
+PLAN_PICK_SQL = text("""
     SELECT id, schedule_code, version_number, input_fingerprint, unscheduled_count,
            status, is_current, created_at
     FROM aps_schedules
     WHERE factory_id = :fid AND status <> 'archived' AND input_fingerprint IS NOT NULL
+      AND (CAST(:sid AS text) IS NULL OR id = CAST(:sid AS text))
     ORDER BY is_current DESC NULLS LAST, created_at DESC
     LIMIT 1
 """)
@@ -160,8 +161,11 @@ def _verdict(row: Any) -> Dict[str, Any]:
     }
 
 
-async def _latest_draft(db: AsyncSession, factory_id: str) -> Optional[Dict[str, Any]]:
-    row = (await db.execute(LATEST_DRAFT_SQL, {"fid": factory_id})).mappings().first()
+async def _latest_draft(db: AsyncSession, factory_id: str,
+                        schedule_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """取"这版"或"最新版"。点名某版是给人用的：下达第 340 版就得按第 340 版判，
+    不能拿库里最新的那版替它决定谁能开工。"""
+    row = (await db.execute(PLAN_PICK_SQL, {"fid": factory_id, "sid": schedule_id})).mappings().first()
     if row is None:
         return None
     return {
@@ -176,14 +180,15 @@ async def _latest_draft(db: AsyncSession, factory_id: str) -> Optional[Dict[str,
 
 
 async def evaluate_commit_gate(
-    db: AsyncSession, factory_id: str, *, full: bool = False
+    db: AsyncSession, factory_id: str, *, full: bool = False,
+    schedule_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """只读预演：这一版草案里哪些单可以下达、哪些卡在哪一条门上。
 
     默认只回前 PREVIEW_LIMIT 条明细（心跳和界面用），`full=True` 才带回全部 id ——
     下达那一步需要完整清单，回执里则只放限量样本，否则心跳 JSON 会胀到没人看。
     """
-    plan = await _latest_draft(db, factory_id)
+    plan = await _latest_draft(db, factory_id, schedule_id)
     if plan is None:
         return {
             "factory_id": factory_id, "plan": None,

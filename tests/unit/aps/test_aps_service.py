@@ -21,6 +21,7 @@ def mock_aps_db():
     db.commit = AsyncMock()
     db.rollback = AsyncMock()
     db.refresh = AsyncMock()
+    db.flush = AsyncMock()
     return db
 
 
@@ -29,6 +30,8 @@ def _empty_scalars(db):
     res.scalars.return_value.all.return_value = []
     res.scalar_one_or_none.return_value = None
     res.mappings.return_value.all.return_value = []
+    res.mappings.return_value.first.return_value = None
+    res.rowcount = 0
     res.all.return_value = []
     db.execute = AsyncMock(return_value=res)
     return db
@@ -77,6 +80,68 @@ async def test_release_schedule_requires_confirmed_then_releases(mock_aps_db):
     assert sched.status == "released"
     assert sched.is_current is True
     assert ok["released_orders"] == 0
+
+
+@pytest.mark.asyncio
+async def test_release_plan_does_not_release_orders_the_kit_gate_held(mock_aps_db):
+    """整版下达不许越过逐单就绪门 —— 这条是补第二条弱口子用的。
+
+    原来 release_schedule 只看"这单在版里出现过"就把工单写成 released，
+    于是缺料单跟着整版一起变成"已下达"；而回收假放行的 audit_false_releases
+    只认 released_by 是门的那批，这条路放出去的它自己看不见。
+    """
+    sched = _schedule("confirmed")
+    tasks = [
+        SimpleNamespace(work_order_id="WO-READY", material_ready=True, status="planned"),
+        SimpleNamespace(work_order_id="WO-SHORT", material_ready=False, status="planned"),
+    ]
+    orders = {
+        "WO-READY": SimpleNamespace(id="WO-READY", factory_id="F001", status="pending"),
+        "WO-SHORT": SimpleNamespace(id="WO-SHORT", factory_id="F001", status="pending"),
+    }
+
+    async def fake_get(model, pk):
+        if model is ApsSchedule:
+            return sched
+        return orders.get(str(pk))
+
+    mock_aps_db.get = AsyncMock(side_effect=fake_get)
+    res = MagicMock()
+    res.scalars.return_value.all.return_value = tasks
+    res.rowcount = 0
+    mock_aps_db.execute = AsyncMock(return_value=res)
+
+    gate = AsyncMock(return_value={"ready_ids": ["WO-READY"], "hold_reason_counts": {}})
+    with patch("api.services.plan_commit_gate.evaluate_commit_gate", gate):
+        out = await ApsService(mock_aps_db).release_schedule(
+            "sched-001", released_by="planner", allow_partial=True
+        )
+
+    assert out["success"] is True
+    assert out["released_orders"] == 1, "只有就绪门点头的那张算新下达"
+    assert out["held_by_kit_gate"] == 1, "没过门的单要数出来，不能静静消失"
+    assert orders["WO-READY"].status == "released"
+    assert orders["WO-SHORT"].status == "pending", "缺料单不许跟着整版变成已下达"
+    assert tasks[1].status == "planned", "单没过门，它的工序行也不许写已下达"
+    assert tasks[0].status == "released"
+
+
+@pytest.mark.asyncio
+async def test_release_plan_demotes_previous_current_before_promoting(mock_aps_db):
+    """一厂只许一版生效是部分唯一索引；顺序错了整笔事务回滚，下达看上去就失败。"""
+    sched = _schedule("confirmed")
+    mock_aps_db.get = AsyncMock(return_value=sched)
+    _empty_scalars(mock_aps_db)
+    with patch("api.services.plan_commit_gate.evaluate_commit_gate",
+               AsyncMock(return_value={"ready_ids": []})):
+        out = await ApsService(mock_aps_db).release_schedule(
+            "sched-001", released_by="planner", allow_partial=True
+        )
+    assert out["success"] is True
+    sqls = [str(c.args[0]) for c in mock_aps_db.execute.await_args_list]
+    demote = [i for i, q in enumerate(sqls) if "UPDATE aps_schedules" in q and "is_current = FALSE" in q]
+    assert demote, "必须有一条显式把旧版退下来的 UPDATE"
+    assert sched.is_current is True
 
 
 @pytest.mark.asyncio
