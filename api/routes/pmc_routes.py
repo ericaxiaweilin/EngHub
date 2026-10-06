@@ -1,5 +1,6 @@
 """PMC 工作矩阵接口。"""
 
+from datetime import date
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
@@ -22,6 +23,7 @@ from api.services.idle_capacity import idle_capacity_report
 from api.services.option_simulator import compare_options
 from api.services.time_basis import time_basis_audit
 from api.services.data_authority import data_authority_report
+from api.services.attendance_model import expected_attendance
 from api.services.partial_kit import partial_kit_opportunities
 
 router = APIRouter(prefix="/api/v1/pmc", tags=["PMC - 工作矩阵"])
@@ -343,11 +345,30 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/partial-kit", "mode": "read_only"},
             {"key": "data_authority", "name": "仿真输入数据源台账（IE/HR/考勤/设备/排产/齐套）",
              "path": "/api/v1/pmc/data-authority", "mode": "read_only"},
+            {"key": "expected_attendance", "name": "按天气折算预计出勤（好天97%/雨92%/暴雨70%）",
+             "path": "/api/v1/pmc/expected-attendance", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
                 "APS 逐单就绪门同样默认只预演，要机器自己放行得显式打开 PLAN_COMMIT_APPLY。",
     }
+
+
+@router.get("/expected-attendance", summary="按天气折算的预计出勤（只读，不写考勤表）")
+async def get_expected_attendance(
+    factory_id: str = Query(..., description="厂区"),
+    on: Optional[date] = Query(None, description="哪一天，默认今天"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """在册人数 × 天气折算率 = 预计到岗：天气好 97%、雨 92%、暴雨 70%（用户 10-06 标定）。
+
+    为什么算出来不写进 `attendance`：那张表是现场打卡表，灌生成记录就和真打卡分不开 ——
+    我们刚清掉一批"自己造的自己读"的数据。这里只出读数，来源、雨量、折算率、
+    考勤断在哪天，全部随结果一起给。天气取不到时不折算（不给 97% 的默认值冒充人到齐）。
+    """
+    del current_user
+    return await expected_attendance(db, factory_id, on=on)
 
 
 @router.get("/data-authority", summary="仿真输入的数据源台账（只读）")

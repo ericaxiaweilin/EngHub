@@ -27,6 +27,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
+
+from api.services.attendance_model import expected_attendance
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # 冒充 IE / 现场实测的自造来源。删它们不是删数据，是把假证据从算式里拿掉。
@@ -200,6 +202,7 @@ async def data_authority_report(db: AsyncSession, factory_id: str, *, as_of=None
                 "people_present": int(att["people_present"] or 0) if att else 0,
                 **fresh,
             },
+            "expected_attendance": await expected_attendance(db, factory_id, on=today),
             "hr_roster": {
                 "roster": int(hr["roster"] or 0) if hr else 0,
                 "active": int(hr["active"] or 0) if hr else 0,
