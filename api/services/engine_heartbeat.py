@@ -38,6 +38,28 @@ LOOP_INTERVAL_SECONDS: Dict[str, int] = {
 }
 
 
+def window_hours() -> int:
+    """崩溃率的滚动窗口长度（小时）。默认 24：够攒上百跳，又短到当天就能暴露回归。
+
+    累计口径的问题不是数字假，是它把插桩之前查不到成因的失败永久压在分子上 ——
+    无法归因的数不能当判据，所以判线看窗口，累计只当诊断留档。"""
+    try:
+        return max(1, int(os.getenv("ENGINE_WINDOW_HOURS", "24")))
+    except ValueError:
+        return 24
+
+
+def crash_window_rate(window_ticks: Any, window_failures: Any) -> Optional[float]:
+    """窗口崩溃率；没有窗口数据返回 None（算不出，不是 0）。"""
+    try:
+        ticks = int(window_ticks or 0)
+    except (TypeError, ValueError):
+        return None
+    if ticks <= 0:
+        return None
+    return round(int(window_failures or 0) / ticks, 5)
+
+
 def expected_interval(loop_name: str) -> int:
     return LOOP_INTERVAL_SECONDS.get(loop_name, 300)
 
@@ -68,14 +90,16 @@ async def record(loop_name: str, status: str = "tick", detail: Optional[Dict[str
                 INSERT INTO {TABLE}
                     (loop_name, host, pid, interval_seconds, started_at,
                      last_tick_at, ticks, failures, last_status, last_error, last_detail,
-                     recent_errors, updated_at)
+                     recent_errors, updated_at,
+                     window_started_at, window_ticks, window_failures)
                 VALUES (:loop, :host, :pid, :interval, :now, :now, 1,
                         CASE WHEN :status = 'failed' THEN 1 ELSE 0 END,
                         :status, :error, CAST(:detail AS jsonb),
                         CASE WHEN :status = 'failed'
                              THEN jsonb_build_array(jsonb_build_object('at', CAST(:now_text AS text), 'error', CAST(:error AS text)))
                              ELSE '[]'::jsonb END,
-                        :now)
+                        :now, :now, 1,
+                        CASE WHEN :status = 'failed' THEN 1 ELSE 0 END)
                 ON CONFLICT (loop_name) DO UPDATE SET
                     host = EXCLUDED.host,
                     pid = EXCLUDED.pid,
@@ -95,7 +119,22 @@ async def record(loop_name: str, status: str = "tick", detail: Optional[Dict[str
                                   '$[0 to 4]'))
                         ELSE {TABLE}.recent_errors END,
                     last_detail = EXCLUDED.last_detail,
-                    updated_at = EXCLUDED.updated_at
+                    updated_at = EXCLUDED.updated_at,
+                    -- 滚动窗口：跨过 ENGINE_WINDOW_HOURS 就重新起算（累计值单独留着当诊断）
+                    window_started_at = CASE WHEN {TABLE}.window_started_at IS NULL
+                        OR EXCLUDED.last_tick_at - {TABLE}.window_started_at
+                           > make_interval(hours => CAST(:window_hours AS int))
+                        THEN EXCLUDED.last_tick_at ELSE {TABLE}.window_started_at END,
+                    window_ticks = CASE WHEN {TABLE}.window_started_at IS NULL
+                        OR EXCLUDED.last_tick_at - {TABLE}.window_started_at
+                           > make_interval(hours => CAST(:window_hours AS int))
+                        THEN 1 ELSE {TABLE}.window_ticks + 1 END,
+                    window_failures = CASE WHEN {TABLE}.window_started_at IS NULL
+                        OR EXCLUDED.last_tick_at - {TABLE}.window_started_at
+                           > make_interval(hours => CAST(:window_hours AS int))
+                        THEN CASE WHEN EXCLUDED.last_status = 'failed' THEN 1 ELSE 0 END
+                        ELSE {TABLE}.window_failures
+                             + CASE WHEN EXCLUDED.last_status = 'failed' THEN 1 ELSE 0 END END
             """), {
                 "loop": loop_name,
                 "host": socket.gethostname(),
@@ -106,6 +145,7 @@ async def record(loop_name: str, status: str = "tick", detail: Optional[Dict[str
                 "status": status,
                 "error": (error or "")[:500] or None,
                 "detail": json_dumps(detail),
+                "window_hours": window_hours(),
             })
             await db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -123,7 +163,8 @@ async def read_states() -> list:
     async with db_config.session_factory() as db:
         rows = (await db.execute(text(f"""
             SELECT loop_name, host, pid, interval_seconds, started_at, last_tick_at,
-                   ticks, failures, last_status, last_error
+                   ticks, failures, last_status, last_error,
+                   window_started_at, window_ticks, window_failures
             FROM {TABLE} ORDER BY loop_name
         """))).mappings().all()
 
@@ -157,5 +198,9 @@ async def read_states() -> list:
             "failures": row["failures"],
             "last_status": status,
             "last_error": row["last_error"],
+            "window_started_at": str(row["window_started_at"]) if row["window_started_at"] else None,
+            "window_ticks": int(row["window_ticks"] or 0),
+            "window_failures": int(row["window_failures"] or 0),
+            "window_crash_rate": crash_window_rate(row["window_ticks"], row["window_failures"]),
         })
     return out

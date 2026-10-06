@@ -24,7 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 THRESHOLDS: Dict[str, Dict[str, float]] = {
     "L1": {"reproducible_rate": 1.0,        # 同输入不同结果 = 上面所有数都不可引用
            "p50_seconds": 120.0,            # 链条一轮预算 900 秒，内核最多占 1/8
-           "crash_rate": 0.01},
+           # 崩溃率判窗口不判累计：插桩前查不到成因的历史失败不该永久压住上层
+           "crash_rate": 0.01, "crash_window_min_ticks": 12,
+           # 心跳必须新鲜：这次心跳台账断写了几小时，库里所有读数都还在"上一次成功"上
+           "heartbeat_alive_rate": 1.0},
     "L2A": {"elastic_coverage": 0.60,       # 六成以上参数能算出弹性，才谈"弹性表"
             "direction_hit_rate": 1.0,      # 符号错就是模型坏，不是精度问题
             "ci_width_steps": 1.5,           # 90% 置信区间宽过 1.5 个档距就等于没测出来
@@ -37,6 +40,9 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
            "number_backing_rate": 0.90, "contract_leaks": 0, "envelope_violations": 0,
            "internal_names_rejected": 1.0},
 }
+from api.services.engine_heartbeat import window_hours as _window_hours
+
+WINDOW_HOURS_LABEL = f"{_window_hours()}h"
 LAYER_ORDER = ["L1", "L2A", "L2B", "L3", "L4"]
 LAYER_NAMES = {"L1": "仿真内核", "L2A": "能力·敏感度", "L2B": "能力·准确度",
                "L3": "决策逻辑", "L4": "Agent 接口"}
@@ -53,7 +59,8 @@ ROUTING_GOLDEN: List[Tuple[str, str]] = [
     ("上次让它催的料催了没有", "query_simulation_recommendation"),
     ("补 IE 工时值几天", "query_simulation_sensitivity"),
     ("加班和开第二条线划不划算", "query_simulation_sensitivity"),
-    ("这个交期有多可信", "query_simulation_sensitivity"),    ("为什么交期是这天", "query_engine_attribution"),
+    ("这个交期有多可信", "query_simulation_sensitivity"),
+    ("为什么交期是这天", "query_engine_attribution"),
     ("这台单卡在哪儿", "query_engine_attribution"),
     ("把提前期砍半为什么能早这么多", "query_engine_attribution"),
     ("该先松哪个约束", "query_engine_attribution"),
@@ -192,9 +199,16 @@ async def _l1_kernel(db: AsyncSession, factory_id: str, models: List[str],
         times.append(round(time.perf_counter() - t0, 3))
     repro = round(sum(1 for d in digests[1:] if d == digests[0]) / max(1, len(digests) - 1), 3) if digests else None
     loop = (await db.execute(text("""
-        SELECT ticks, failures, recent_errors::text AS errs
+        SELECT ticks, failures, window_ticks, window_failures, window_started_at,
+               recent_errors::text AS errs
         FROM engine_loop_state WHERE loop_name='routing-backfill'
     """))).mappings().first()
+    from api.services.engine_heartbeat import window_hours
+    window_label = f"{window_hours()}h"
+    w_ticks = int((loop or {}).get("window_ticks") or 0)
+    w_fails = int((loop or {}).get("window_failures") or 0)
+    window_rate = round(w_fails / w_ticks, 5) if w_ticks else None
+    window_start = str((loop or {}).get("window_started_at") or "")[:19]
     try:
         recent_errs = json.loads((loop or {}).get("errs") or "[]")
     except (TypeError, ValueError):
@@ -203,14 +217,51 @@ async def _l1_kernel(db: AsyncSession, factory_id: str, models: List[str],
                        max(1, float((loop or {}).get("ticks") or 1)), 5)
     import resource
     rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
+    # 无人任务中心"在跑"这件事要能被算出来，不能靠日志。一次性任务（跑完就 exited）
+    # 不进分母 —— 说它活着是假话；但每个逐轮报心跳的循环都必须新鲜。
+    from api.services.engine_heartbeat import read_states
+
+    try:
+        states = await read_states()
+    except Exception as exc:
+        states = []
+        hb_error = f"{type(exc).__name__}: {exc}"
+    else:
+        hb_error = None
+    # 只判已经报过完整一轮的循环：刚 spawned 还没跳过手的，判它死是误报，说它活是假话，
+    # 所以不进分母、单独点名
+    ticking = [x for x in states if x.get("state") == "ticking"]
+    waiting = [x for x in states if x.get("state") == "spawned-unverified"]
+    stale = [x for x in ticking if not x.get("alive")]
+    hb_rate = round((len(ticking) - len(stale)) / len(ticking), 3) if ticking else None
+    crash_attr = [str(x.get("error"))[:120] for x in recent_errs][-3:]
     return {"metrics": [
         _metric("同输入可复现率", repro, THRESHOLDS["L1"]["reproducible_rate"], "gte", "",
                 "同一输入跑 3 轮，比较目标向量与完工日摘要（3 次里 2 次比对）"),
         _metric("单轮耗时 p50", (statistics.median(times) if times else None),
                 THRESHOLDS["L1"]["p50_seconds"], "lte", "秒", "5 台机种 × 1 政策单轮，含排队"),
         _metric("探针崩溃率", round(crashes / max(1, len(times)), 3), 0.0, "lte", "", "本次 3 轮里抛异常的次数"),
-        _metric("引擎循环累计崩溃率", loop_crash, THRESHOLDS["L1"]["crash_rate"], "lte", "",
-                "engine_loop_state 的 failures/ticks，真实长期值"),
+        _metric("引擎循环窗口崩溃率", window_rate, THRESHOLDS["L1"]["crash_rate"], "lte", "",
+                f"当前窗口（{window_start} 起，{window_label}）内 routing-backfill 失败 "
+                f"{w_fails}/{w_ticks} 跳。判据只看过得去的窗口：累计口径里那些没有错误小环、"
+                "查不到成因的历史失败，永远压着上层却没人能修",
+                n=w_ticks, min_n=int(THRESHOLDS["L1"]["crash_window_min_ticks"]),
+                missing=(None if w_ticks >= int(THRESHOLDS["L1"]["crash_window_min_ticks"])
+                         else f"窗口才 {w_ticks} 跳（判线要 ≥{THRESHOLDS['L1']['crash_window_min_ticks']} 跳）："
+                              "心跳 900 秒一跳，得等窗口攒够样本；0/2 不算通过"),),
+        _metric("逐轮心跳新鲜率", hb_rate, THRESHOLDS["L1"]["heartbeat_alive_rate"], "gte", "比例",
+                f"{len(ticking) - len(stale)}/{len(ticking)} 个已报过完整一轮的循环在 2 个间隔内跳过；"
+                f"另有 {len(waiting)} 个刚启动还没跳过手（不判生死：{[w['loop'] for w in waiting]}）；"
+                "心跳断写时台账里的每个数都停在最后一次成功上，比崩溃更隐蔽"
+                + (f"（自检读取失败：{hb_error}）" if hb_error else ""),
+                missing=(hb_error or (None if ticking else "没有任何循环在逐轮报心跳")),),
+        _metric("窗口内已归因失败数", len(crash_attr), None, "lte", "条",
+                f"recent_errors 小环里带时间戳的最近几条：崩溃必须能被归因才有意义；"
+                f"内容见 detail.recent_errors（{'; '.join(crash_attr)[:120] or '环是空的，说明窗口内没崩过'}）"),
+        _metric("引擎循环累计崩溃率", loop_crash, None, "lte", "",
+                "engine_loop_state 的 failures/ticks（自进程启动累计）：只报数不判线。"
+                "已知的 5 次失败成因从日志回查得到：cached plan 失效（加列迁移那次，一次性的）、"
+                "心跳 INSERT 列序错位（10-06 已修）、回填链里三处代码缺陷（现均已不在树上）"),
         _metric("峰值内存", rss_mb, None, "lte", "MB", "只报数不判线：这台机器上还跑别的容器"),
     ], "recent_errors": recent_errs}
 
