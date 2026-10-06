@@ -449,9 +449,11 @@ async def patrol(
     # 6. 环境异常（公共气象 API 检测高温/高湿/大风）
     try:
         import httpx
-        # 坐标与"预计出勤"共用一条基线（默认北宁省）。原来这里写死胡志明市，
-        # 跟厂址差着上千公里 —— 同一个厂不可能一边下雨一边晴。
-        from api.services.attendance_model import FACTORY_LAT as lat, FACTORY_LON as lon
+        # 天气坐标与"预计出勤"同一条基线，并且**按厂区解析区域**（北宁/胡志明市）：
+        # 原来这里写死一个城市，南北两个厂共用一份天气，等于一边下雨另一边也下雨。
+        from api.services.attendance_model import region_coords, resolve_region
+
+        lat, lon = region_coords((await resolve_region(db, factory_id))[0])
         url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"

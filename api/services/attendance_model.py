@@ -26,11 +26,55 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
-# 厂址默认**北宁省（Bắc Ninh）**：河内东侧工业区，机械厂/电子厂都按这里取天气。
-# 一条基线：车间环境预警也读这两个值，不再各写一套（原来那边写死胡志明市，差了 1,000 公里）。
-FACTORY_LAT = float(os.getenv("FACTORY_LATITUDE", "21.186"))
-FACTORY_LON = float(os.getenv("FACTORY_LONGITUDE", "106.046"))
+# 天气按**区域**取，不是一个全局坐标：越南南北气候差很多，北宁（河内东侧工业区）雨季 5-9 月，
+# 胡志明市是南部工业重地、雨季更长更热。一套数盖不住两个厂，所以两个区域都留着。
+# 厂区→区域走 `factories.config->>'weather_region'`；没配就用默认区域，并在读数里说明是默认 —— 不猜。
+REGIONS: Dict[str, Dict[str, Any]] = {
+    "bacninh": {"label": "北宁 Bắc Ninh", "lat": 21.186, "lon": 106.046},
+    "hochiminh": {"label": "胡志明市 TP.HCM", "lat": 10.8231, "lon": 106.6297},
+}
+DEFAULT_REGION = os.getenv("ATTENDANCE_REGION", "bacninh")
 FACTORY_TZ = os.getenv("FACTORY_TIMEZONE", "Asia/Ho_Chi_Minh")
+
+# 显式给了经纬度就当成自定义区域（新厂/外迁时不必改代码）
+_CUSTOM_LAT = os.getenv("FACTORY_LATITUDE")
+_CUSTOM_LON = os.getenv("FACTORY_LONGITUDE")
+if _CUSTOM_LAT and _CUSTOM_LON:
+    REGIONS["custom"] = {"label": "自定义坐标", "lat": float(_CUSTOM_LAT), "lon": float(_CUSTOM_LON)}
+    DEFAULT_REGION = "custom"
+
+
+def region_meta(key: str) -> Dict[str, Any]:
+    return REGIONS.get(key) or REGIONS[DEFAULT_REGION]
+
+
+def region_coords(key: str) -> Tuple[float, float]:
+    meta = region_meta(key)
+    return float(meta["lat"]), float(meta["lon"])
+
+
+async def resolve_region(db, factory_id: str) -> Tuple[str, str]:
+    """这个厂区按哪个区域的天气：配置里写了就用配置，没写用默认并把来源说清。"""
+    import json as _json
+
+    row = (await db.execute(text(
+        "SELECT config FROM factories WHERE id = :fid"
+    ), {"fid": factory_id})).mappings().first()
+    config = (row["config"] if row else None) or {}
+    if isinstance(config, str):
+        try:
+            config = _json.loads(config) or {}
+        except ValueError:
+            config = {}
+    want = str((config or {}).get("weather_region") or "").strip().lower()
+    if want in REGIONS:
+        return want, "厂区配置 factories.config.weather_region"
+    return DEFAULT_REGION, f"厂区没配 weather_region，按默认区域（{region_meta(DEFAULT_REGION)['label']}）"
+
+
+# 默认区域坐标（给了厂区没配区域时的兜底；按厂区取区域的调用请用 resolve_region）
+FACTORY_LAT, FACTORY_LON = region_coords(DEFAULT_REGION)
+
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
@@ -59,7 +103,7 @@ _STORM_CODES = {65, 82, 95, 96, 99}
 _RAIN_CODES = {51, 53, 55, 56, 57, 61, 63, 66, 71, 73, 75, 80, 81, 85}
 
 _LIVE_CACHE: Dict[str, Dict[str, Any]] = {}
-_CLIMATE_CACHE: Dict[str, Any] = {}
+_CLIMATE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def band_of_amount(precip_mm: Optional[float]) -> Optional[str]:
@@ -145,17 +189,19 @@ def draw_band(month_shares: Dict[str, Any], key: str) -> Optional[str]:
     return "storm"
 
 
-async def fetch_climatology(force: bool = False) -> Dict[str, Any]:
-    """北宁近 N 年日雨量 → 按月档位分布。取不到就如实报取不到。"""
-    if _CLIMATE_CACHE and not force:
-        return _CLIMATE_CACHE
+async def fetch_climatology(region: str = DEFAULT_REGION, force: bool = False) -> Dict[str, Any]:
+    """某个区域近 N 年日雨量 → 按月档位分布。取不到就如实报取不到。"""
+    lat, lon = region_coords(region)
+    cache_key = "%s,%s" % (lat, lon)
+    if _CLIMATE_CACHE.get(cache_key) and not force:
+        return _CLIMATE_CACHE[cache_key]
     out: Dict[str, Any] = {"ok": False, "months": {}, "reason": None}
     try:
         import httpx
 
         end = datetime.utcnow().date() - timedelta(days=3)
         start = end.replace(year=end.year - HISTORY_YEARS)
-        url = (f"{ARCHIVE_URL}?latitude={FACTORY_LAT}&longitude={FACTORY_LON}"
+        url = (f"{ARCHIVE_URL}?latitude={lat}&longitude={lon}"
                f"&start_date={start.isoformat()}&end_date={end.isoformat()}"
                f"&daily=precipitation_sum&timezone={FACTORY_TZ}")
         async with httpx.AsyncClient(timeout=25) as client:
@@ -173,24 +219,30 @@ async def fetch_climatology(force: bool = False) -> Dict[str, Any]:
             out.update({
                 "ok": True, **agg,
                 "window": f"{start.isoformat()}~{end.isoformat()}",
-                "location": f"{FACTORY_LAT},{FACTORY_LON}（北宁 Bac Ninh，{FACTORY_TZ}）",
+                "region": region,
+                "location": f"{lat},{lon}（{region_meta(region)['label']}，{FACTORY_TZ}）",
                 "thresholds": {"rain_ge_mm": RAIN_MM, "storm_ge_mm": STORM_MM},
                 "bands_source": f"近 {HISTORY_YEARS} 年逐日雨量实测（open-meteo 历史归档）",
             })
-            _CLIMATE_CACHE.clear()
-            _CLIMATE_CACHE.update(out)
+            _CLIMATE_CACHE[cache_key] = out
     except Exception as exc:  # 外部接口：超时/DNS/限流都算取不到
         out["reason"] = f"历史气象取不到：{type(exc).__name__}"
     return out
 
 
-async def fetch_live_weather(on: ddate) -> Dict[str, Any]:
+async def regional_climatology() -> Dict[str, Any]:
+    """所有区域的按月分布：南部与北部并排放，别拿一个区域盖住另一个厂。"""
+    return {key: await fetch_climatology(key) for key in REGIONS}
+
+
+async def fetch_live_weather(on: ddate, region: str = DEFAULT_REGION) -> Dict[str, Any]:
     """当日/近期实况；超出预报窗口的日期直接判不可用，交给气候档。"""
+    lat, lon = region_coords(region)
     today = datetime.utcnow().date()
     if on < today - timedelta(days=2) or on > today + timedelta(days=6):
         return {"ok": False, "precip_mm": None, "weather_code": None,
                 "reason": "该日期超出预报接口可取范围，改用历史雨量分布"}
-    key = f"{FACTORY_LAT},{FACTORY_LON},{on.isoformat()}"
+    key = f"{lat},{lon},{on.isoformat()}"
     if key in _LIVE_CACHE:
         return _LIVE_CACHE[key]
     out: Dict[str, Any] = {"ok": False, "precip_mm": None, "weather_code": None}
@@ -198,7 +250,7 @@ async def fetch_live_weather(on: ddate) -> Dict[str, Any]:
         import httpx
 
         day = on.isoformat()
-        url = (f"{FORECAST_URL}?latitude={FACTORY_LAT}&longitude={FACTORY_LON}"
+        url = (f"{FORECAST_URL}?latitude={lat}&longitude={lon}"
                f"&daily=precipitation_sum,weather_code&timezone={FACTORY_TZ}"
                f"&start_date={day}&end_date={day}")
         async with httpx.AsyncClient(timeout=10) as client:
@@ -224,16 +276,18 @@ async def expected_attendance(db, factory_id: str, *, on: Optional[ddate] = None
     gap = (await db.execute(ATTENDANCE_GAP_SQL, {"fid": factory_id})).mappings().first()
     roster = int(base["active_roster"] or 0) if base else 0
 
-    live = await fetch_live_weather(on)
-    climate = await fetch_climatology() if not live.get("ok") else {}
+    region, region_source = await resolve_region(db, factory_id)
+    live = await fetch_live_weather(on, region)
+    climate = await fetch_climatology(region) if not live.get("ok") else {}
     month_shares = (climate.get("months") or {}).get(str(on.month)) if climate else None
 
     if live.get("ok"):
         condition = weather_condition(live.get("precip_mm"), live.get("weather_code"))
         weather_basis = "当日实况天气"
     elif month_shares:
-        condition = draw_band(month_shares, f"{FACTORY_LAT},{FACTORY_LON},{on.isoformat()}")
-        weather_basis = (f"北宁近 {HISTORY_YEARS} 年逐日雨量按月分布定档"
+        lat, lon = region_coords(region)
+        condition = draw_band(month_shares, f"{lat},{lon},{on.isoformat()}")
+        weather_basis = (f"{region_meta(region)['label']}近 {HISTORY_YEARS} 年逐日雨量按月分布定档"
                          f"（同日期永远同结果，仿真可重算）")
     else:
         condition = "unknown"
@@ -254,7 +308,9 @@ async def expected_attendance(db, factory_id: str, *, on: Optional[ddate] = None
             "weather_code": live.get("weather_code") if live.get("ok") else None,
             "month_climatology": month_shares or None,
             "live_reason": None if live.get("ok") else live.get("reason"),
-            "location": f"{FACTORY_LAT},{FACTORY_LON}（北宁，与车间环境预警同一坐标）",
+            "region": region,
+            "region_source": region_source,
+            "location": "%s,%s（%s）" % (*region_coords(region), region_meta(region)["label"]),
             "window": climate.get("window"),
         },
         "rates_calibration": {"dry": RATE_DRY, "rain": RATE_RAIN, "storm": RATE_STORM,

@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 
-from api.services.attendance_model import expected_attendance
+from api.services.attendance_model import expected_attendance, region_meta, regional_climatology
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # 冒充 IE / 现场实测的自造来源。删它们不是删数据，是把假证据从算式里拿掉。
@@ -185,6 +185,7 @@ async def data_authority_report(db: AsyncSession, factory_id: str, *, as_of=None
     tpl = (await db.execute(TEMPLATE_HOURS_SQL, {"fid": factory_id})).mappings().first()
 
     ie = classify(ie_rows)
+    regions = await regional_climatology()
     fresh = attendance_freshness(att["last_attended"] if att else None, today)
 
     return {
@@ -203,6 +204,18 @@ async def data_authority_report(db: AsyncSession, factory_id: str, *, as_of=None
                 **fresh,
             },
             "expected_attendance": await expected_attendance(db, factory_id, on=today),
+            "weather_regions": {
+                key: {
+                    "label": region_meta(key)["label"],
+                    "ok": bool(val.get("ok")),
+                    "window": val.get("window"),
+                    "observed_days": val.get("observed_days"),
+                    "reason": val.get("reason"),
+                    "months": {m: {"dry": d["dry"], "rain": d["rain"], "storm": d["storm"],
+                                   "average_rate": d["average_rate"]}
+                               for m, d in sorted((val.get("months") or {}).items(), key=lambda x: int(x[0]))},
+                } for key, val in regions.items()
+            },
             "hr_roster": {
                 "roster": int(hr["roster"] or 0) if hr else 0,
                 "active": int(hr["active"] or 0) if hr else 0,

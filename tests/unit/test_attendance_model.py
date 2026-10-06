@@ -84,3 +84,18 @@ def test_draw_band_is_reproducible_and_follows_the_distribution():
     assert counts["dry"] > counts["rain"] > counts["storm"], "抽样得偏向好天，不能三档均匀"
     assert abs(counts["dry"] - 0.8) < 0.05
     assert draw_band({}, key) is None, "没有当月分布就别假装抽得出天气"
+
+
+def test_north_and_south_are_kept_as_separate_regions():
+    """南部是工业重地，不能拿北部的天气盖它。"""
+    from api.services.attendance_model import REGIONS, region_coords
+
+    assert {"bacninh", "hochiminh"} <= set(REGIONS)
+    north, south = region_coords("bacninh"), region_coords("hochiminh")
+    assert abs(north[0] - south[0]) > 5, "两个区域得真的隔着一段纬度，不然分它做什么"
+
+
+def test_unknown_region_falls_back_to_default_instead_of_crashing():
+    from api.services.attendance_model import DEFAULT_REGION, region_meta
+
+    assert region_meta("mars")["label"] == region_meta(DEFAULT_REGION)["label"]
