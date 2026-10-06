@@ -187,3 +187,19 @@ def test_relief_state_splits_measured_no_effect_and_suspicious():
     # 到岗率加大一档应该更早（lte）
     assert ec.relief_state("crew_attendance", -0.8)[0] == "measured"
     assert ec.relief_state("crew_attendance", 0.9)[0] == "suspicious_direction"
+
+
+def test_spec_lists_every_interface_with_the_same_request_shape():
+    """自述是给机器读的：三个接口的 request 必须是同一种形状，不能一个 dict 一个字符串。
+
+    之前 sensitivity 写的是"与 simulate 相同（…）"这种人话 —— 人看得懂，
+    agent 按 dict 解析就当场崩，等于接口没有自述。"""
+    sp = ec.spec()
+    by_name = {i["name"]: i for i in sp["interfaces"]}
+    assert set(by_name) == {"simulate", "sensitivity", "attribution"}
+    common = set(by_name["simulate"]["request"])
+    for name, item in by_name.items():
+        assert isinstance(item["request"], dict), name
+        assert common <= set(item["request"]), (name, sorted(common - set(item["request"])))
+        assert item.get("request_note"), name
+    assert "compare" in by_name["attribution"]["request"]

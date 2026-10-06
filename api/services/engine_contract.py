@@ -742,6 +742,20 @@ async def attribution(db: AsyncSession, factory_id: str,
                      unavailable=unavailable, caveats=caveats, started=started)
 
 
+# 三个接口共用同一套请求字段：spec() 里必须每个接口都完整列一遍（同一个 dict 形状），
+# 这样 agent 只读一份自述就能拼出任意一个请求，不用靠"与某接口相同"这种人话推断。
+REQUEST_FIELDS = {
+    "factory_id": "必填（厂区代码）",
+    "models": "机种编码列表；不填则引擎自选 BOM 最完整的 n_models 台",
+    "n_models": "1-8，默认 5",
+    "as_of": "YYYY-MM-DD，默认今天",
+    "scope": {"order_size_days_of_output": {"value": "数值", "unit": "days"},
+              "promise_margin": {"value": "数值", "unit": "multiple_of_bottleneck_lead"}},
+    "conditions": {"weather": "fair | rain | storm"},
+    "inputs": {"见 inputs 词表": {"value": "数值", "unit": "词表内单位"}},
+}
+
+
 def spec() -> Dict[str, Any]:
     """契约自述：agent 从这一个接口就能学全它能说什么，不需要读代码。"""
     return {
@@ -751,25 +765,21 @@ def spec() -> Dict[str, Any]:
                               "这一层，引擎内部怎么改都不动接口"),
         "interfaces": [
             {"name": "simulate", "question": QUESTIONS["simulate"],
-             "request": {"factory_id": "必填（厂区代码）",
-                         "models": "机种编码列表；不填则引擎自选 BOM 最完整的 n_models 台",
-                         "n_models": "1-8，默认 5",
-                         "as_of": "YYYY-MM-DD，默认今天",
-                         "scope": {"order_size_days_of_output": {"value": "数值", "unit": "days"},
-                                    "promise_margin": {"value": "数值",
-                                                       "unit": "multiple_of_bottleneck_lead"}},
-                         "conditions": {"weather": "fair | rain | storm"},
-                         "inputs": {"见 inputs 词表": {"value": "数值", "unit": "词表内单位"}}},
+             "request": REQUEST_FIELDS,
+             "request_note": "inputs 不填即按台账现值推演",
              "response": ["scope", "inputs_echo", "answers", "metrics[]", "unavailable[]",
                           "caveats[]", "provenance"]},
             {"name": "sensitivity", "question": QUESTIONS["sensitivity"],
-             "request": "与 simulate 相同（厂、机种、批量、天气、承诺口径），inputs 可以不填",
+             "request": REQUEST_FIELDS,
+             "request_note": "这一接口 inputs 通常不填：问的是每一项动一档值几天，不是问某个设定下的结果",
              "response": ["answers.inputs[]（每个业务输入的实测斜率）", "answers.ranking[]",
                           "answers.answer_confidence", "answers.data_confidence",
                           "metrics[]", "unavailable[]"]},
             {"name": "attribution", "question": QUESTIONS["attribution"],
-             "request": {"与 simulate 相同": "", "compare": {
-                 "baseline": "inputs 一组", "alternative": "inputs 另一组"}},
+             "request": dict(REQUEST_FIELDS, **{
+                 "compare": {"baseline": "一组业务输入（如 {\"purchase_lead_time\": 100}）",
+                             "alternative": "另一组业务输入（如 {\"purchase_lead_time\": 50}）"}}),
+             "request_note": "给了 compare 才算变更归因；不给只回答当前答案的成因",
              "response": ["answers.constraint_attribution（哪一项卡住每台单）",
                           "answers.relief_attribution（松掉哪一项值几天）",
                           "answers.uncertainty_attribution（现在的数可信到几成）",
