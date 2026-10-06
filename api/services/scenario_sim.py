@@ -323,7 +323,7 @@ def _can_run(line: Dict[str, Any], model: str) -> bool:
 def simulate_lines(lines: List[Dict[str, Any]], jobs: List[Dict[str, Any]], *,
                   days: int, available_from: Dict[str, int], labor_rate: float,
                   allow_line_move: bool, units_are_per_line: bool = True,
-                  absorb_extra_units_per_day: float = 0.0) -> Dict[str, Any]:
+                  coverage_by_model: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     """按"线"推演：单向兼容就是一条硬约束，缺料期用 available_from 表达。
 
     - 每张单先排到自己机种的默认线；`allow_line_move` 才允许挪到**能做它的别的线**
@@ -333,6 +333,9 @@ def simulate_lines(lines: List[Dict[str, Any]], jobs: List[Dict[str, Any]], *,
       挪不过去的那部分照样闲在那条线上；给了数就是上限口径。两个都跑，差别就是
       "这 200 人到底能不能救回来"的答案区间。
     """
+    # 覆盖率决定"现在能开多少台"：0.73 就是只能先开 73%，其余等料。
+    # 不给这个数就等于假设料一定齐 —— 那算出来的欠交全是零，是自欺。
+    coverage_by_model = coverage_by_model or {}
     by_code: Dict[str, Any] = {str(l["line_code"]): l for l in lines}
     # 线组：同一组内的线共用一个**合流**产能（用户给的 bike 是 400+400 但合并只有 700）。
     # 按相加算会把 bike 线高估 14%，而"缺料能不能靠另一条线追回来"的判断正好卡在这 14% 上。
@@ -350,10 +353,16 @@ def simulate_lines(lines: List[Dict[str, Any]], jobs: List[Dict[str, Any]], *,
         by_code[code]["_group"] = gname
     cap = {str(l["line_code"]): _line_capacity(l, units_are_per_line=units_are_per_line)
            for l in lines}
-    queue = [{"id": j.get("id") or f"J{i+1:02d}", "product_id": str(j["product_id"]),
-              "qty": float(j.get("qty") or 0), "due": j.get("due"),
-              "remaining": float(j.get("qty") or 0), "home_line": j.get("line"),
-              "ran_on": None, "finish_day": None} for i, j in enumerate(jobs)]
+    queue = []
+    for i, j in enumerate(jobs):
+        qty = float(j.get("qty") or 0)
+        cov = float(coverage_by_model.get(str(j["product_id"]), 1.0) or 0.0)
+        startable = round(qty * cov, 3) if cov < 1.0 else qty
+        queue.append({"id": j.get("id") or f"J{i+1:02d}", "product_id": str(j["product_id"]),
+                      "qty": qty, "startable": startable,
+                      "awaiting_material": round(qty - startable, 3), "due": j.get("due"),
+                      "remaining": startable, "home_line": j.get("line"),
+                      "ran_on": None, "finish_day": None})
     line_units: Dict[str, float] = {c: 0.0 for c in cap}
     made_by_job: Dict[str, float] = {}
     moved_units = 0.0
@@ -413,7 +422,7 @@ def simulate_lines(lines: List[Dict[str, Any]], jobs: List[Dict[str, Any]], *,
                      "idle_person_days": round(idle_days * crew_total, 1),
                      "idle_labor_cost": round(idle_days * crew_total * labor_rate, 2)})
 
-    unfinished = sum(j["remaining"] for j in queue)
+    unfinished = sum(j["remaining"] for j in queue) + sum(j.get("awaiting_material", 0.0) for j in queue)
     return {"days": days, "lines": rows,
             "total_idle_person_days": round(sum(r["idle_person_days"] for r in rows), 1),
             "total_idle_labor_cost": round(sum(r["idle_labor_cost"] for r in rows), 2),
@@ -423,6 +432,7 @@ def simulate_lines(lines: List[Dict[str, Any]], jobs: List[Dict[str, Any]], *,
             "orders_finished": len([j for j in queue if j["finish_day"] is not None]),
             "orders_total": len(queue),
             "allow_line_move": allow_line_move,
+            "units_awaiting_material": round(sum(j.get("awaiting_material", 0.0) for j in queue), 1),
             "units_are_per_line": units_are_per_line}
 
 

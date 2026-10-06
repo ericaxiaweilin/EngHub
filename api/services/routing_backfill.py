@@ -37,6 +37,7 @@ from api.services.component_orders import (
 )
 from api.services.component_release import release_kitted_child_orders
 from api.services.purchase_receipts import receive_due_purchase_orders
+from api.services.line_strategy_advisor import advise_line_strategy
 from api.services.material_followup import CHASE_LIMIT as MATERIAL_CHASE_LIMIT, chase_material_shortages
 from api.services.chain_convergence import report as convergence_report
 from api.services.aps_draft_prune import (
@@ -402,6 +403,8 @@ async def backfill_missing_routings(db, *, apply: bool = True) -> Dict[str, Any]
     # 缺料不能执行，就得有人去追：按 HR 岗位映射开催料待办（一张单最多一条未关闭）
     receipt["material_chase"] = await chase_material_shortages(
         db, QUALITY_FACTORY_ID, limit=MATERIAL_CHASE_LIMIT, apply=True)
+    # 停在哪条线更贵、能不能挪过去：把线组比较发成 PMC 待办（有差额才发，一组一条）
+    receipt["line_strategy"] = await advise_line_strategy(db, QUALITY_FACTORY_ID)
     # 最后一格是自我核对：这一轮工厂到底有没有往前走。
     # 上一轮的读数就从这条心跳自己那一行里读，所以这是"逐轮对撞"而不是每次从零开始看。
     receipt["convergence"] = await convergence_report(

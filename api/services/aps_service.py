@@ -419,6 +419,21 @@ class ApsService:
             "message": message,
         }
 
+    async def _shortage_order_ids(self, factory_id: str) -> set:
+        """有物料缺口的工单 id。排产顺序要认它：缺料的排后面，别占着工位时隙。
+
+        口径与就绪门一致（`work_order_materials.shortage_qty > 0`），不另立一套：
+        两处判断不一致时，会出现"排产以为它能干、门说不能干"的空转。
+        """
+        rows = (await self.db.execute(text("""
+            SELECT DISTINCT m.work_order_id
+            FROM work_order_materials m
+            JOIN work_orders w ON w.id = m.work_order_id
+            WHERE w.factory_id = :fid
+              AND COALESCE(m.shortage_qty, 0) > 0
+        """), {"fid": factory_id})).all()
+        return {str(r[0]) for r in rows}
+
     async def generate_schedule(
 
         self,
@@ -496,6 +511,28 @@ class ApsService:
         if not work_orders:
 
             return {"success": False, "message": "无待排程工单", "schedule_id": None}
+
+        # 排产顺序要认物料：缺料的单排到后面，别让它占着工位时隙。
+        # 原来只按 优先级→交期 排，于是每一版方案都是"交期最早的先占位"，
+        # 而它十有八九正缺料 —— 结果是账面排满、车间开不了工，能开工的单反而没位置。
+        # （就绪门仍然会拦住缺料单下达，这里改的是"谁先占产能"，不是"谁可以开工"。）
+        shortage_ids = await self._shortage_order_ids(factory_id)
+
+        def _queue_key(wo):
+
+            return (
+
+                1 if str(wo.id) in shortage_ids else 0,
+
+                0 if str(wo.priority or "normal") == "urgent" else 1,
+
+                wo.planned_due or ddate(9999, 12, 31),
+
+                str(wo.work_order_code or ""),
+
+            )
+
+        work_orders.sort(key=_queue_key)
 
         # 2. 加载工艺路线约束
 
