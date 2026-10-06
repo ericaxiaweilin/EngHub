@@ -3,7 +3,7 @@
 from datetime import date
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -463,6 +463,69 @@ async def get_fake_output_revert(
                          f"{report['counts']['protected_has_issues']} 张因有领料流水被保护；"
                          f"确认清单后带 apply=true 再执行。")
     return report
+
+
+@router.post("/portfolio-sim", summary="机种组合推演（只读）：货期 · 人力利用 · 评分 · 杠杆")
+async def post_portfolio_sim(
+    body: Dict[str, Any] = Body(..., description="factory_id, models?, n?, units?, due_in_days?, levers?"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """按现有线参数 / HR / 设备 / 库存 / 工艺路线，把 N 个机种排队上线，推出交货日期与人力利用，并打分。
+
+    评分口径（权重随结果一起返回）：准点交付 40%、人力利用 25%、齐套 20%、设备可用 10%、依据完整 5%。
+    算不出货期的单给 0 分而不是给个平均分 —— 没有依据的日期不是"乐观"，是没用。
+    `levers` 会给出"改掉哪类瓶颈能涨几分"，并可用 levers 参数（extra_line / crew_bonus）在同一次调用里
+    做前后对比，这就是要的飞轮：先量瓶颈，再逐条试改动，看得分怎么动。
+    """
+    del current_user
+    from api.services.attendance_model import attendance_factor
+    from api.services.portfolio_sim import simulate
+
+    factory_id = str(body.get("factory_id") or "")
+    if not factory_id:
+        raise HTTPException(status_code=422, detail="缺少 factory_id")
+    n = int(body.get("n") or 5)
+    units = int(body.get("units") or 300)
+    due_in_days = int(body.get("due_in_days") or 25)
+    models = body.get("models")
+    attend = (await attendance_factor(db, factory_id)).get("factor")
+
+    base = await simulate(db, factory_id, models=models, n=n, units_default=units,
+                          demand_date=date.today(), attendance_factor=attend)
+    out: Dict[str, Any] = {"base": base, "attendance_factor_used": attend}
+    want = body.get("levers") or {}
+    if want.get("extra_line"):
+        trial = await simulate(db, factory_id, models=models, n=n, units_default=units,
+                               demand_date=date.today(), attendance_factor=attend, extra_line=True)
+        out["lever_extra_line"] = {"portfolio_score": trial["portfolio_score"],
+                                   "delta": round(trial["portfolio_score"] - base["portfolio_score"], 1),
+                                   "orders": trial["orders"]}
+    if want.get("crew_bonus"):
+        trial = await simulate(db, factory_id, models=models, n=n, units_default=units,
+                               demand_date=date.today(), attendance_factor=attend,
+                               crew_bonus=float(want["crew_bonus"]))
+        out["lever_crew_bonus"] = {"portfolio_score": trial["portfolio_score"],
+                                   "delta": round(trial["portfolio_score"] - base["portfolio_score"], 1),
+                                   "orders": trial["orders"]}
+    if want.get("clear_storm"):
+        trial = await simulate(db, factory_id, models=models, n=n, units_default=units,
+                               demand_date=date.today(), attendance_factor=1.0)
+        out["lever_full_attendance"] = {"portfolio_score": trial["portfolio_score"],
+                                        "delta": round(trial["portfolio_score"] - base["portfolio_score"], 1)}
+    if want.get("ie_hours_per_unit"):
+        # 补上单件工时（按线节拍标定）会怎样：这是检验"卡住分数的是数据还是资源"的那一刀
+        trial = await simulate(db, factory_id, models=models, n=n, units_default=units,
+                               demand_date=date.today(), attendance_factor=attend,
+                               ie_hours_per_unit=float(want["ie_hours_per_unit"]))
+        out["lever_ie_hours"] = {"portfolio_score": trial["portfolio_score"],
+                                 "delta": round(trial["portfolio_score"] - base["portfolio_score"], 1),
+                                 "orders": [{"model_code": o["model_code"], "score": o["score"],
+                                             "finish": o["estimated_finish"],
+                                             "basis": o["time_basis"],
+                                             "production_days": o["production_days"]}
+                                            for o in trial["orders"]]}
+    return out
 
 
 @router.get("/data-authority", summary="仿真输入的数据源台账（只读）")
