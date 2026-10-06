@@ -347,6 +347,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/data-authority", "mode": "read_only"},
             {"key": "expected_attendance", "name": "按天气折算预计出勤（好天97%/雨92%/暴雨70%）",
              "path": "/api/v1/pmc/expected-attendance", "mode": "read_only"},
+            {"key": "followup_lifecycle", "name": "缺料催办证据判定：齐套自动关闭 / 催不动升级（默认预演）",
+             "path": "/api/v1/pmc/followup-lifecycle", "mode": "read_only"},
             {"key": "position_trainer", "name": "PMC 职位训练器", "path": "/api/v1/trainer/pack?position_code=pmc", "mode": "training"},
         ],
         "note": "所有评审、ATP 和沙盘结果均不直接修改订单/MPS；下达仍由 PP/MPS 授权流程执行。"
@@ -373,6 +375,59 @@ async def get_expected_attendance(
     """
     del current_user
     return await expected_attendance(db, factory_id, on=on)
+
+
+@router.get("/followup-lifecycle", summary="缺料催办的证据判定（默认只预演：该关的、该升级的）")
+async def get_followup_lifecycle(
+    factory_id: str = Query(..., description="厂区"),
+    apply: bool = Query(False, description="false=只出判定不动库；true 才真的关闭/挂升级单"),
+    limit: int = Query(50, ge=1, le=200),
+    closed_within_days: int = Query(7, ge=0, le=90,
+                                    description="顺带复核最近几天内「已完成」的催办；0=不复核"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """催办闭环的两件事：齐套了就自己关（别继续追人），催不动就升级（别一直挂着当已处理）。
+
+    判定一律按 `work_order_materials` 的当前缺口算，不看模型上一轮写了什么：
+    缺口归零且快照有行 → 关闭；快照 0 行 → 判不了齐套，继续催并写明"没有依据"；
+    缺口连续几轮一点没变小 → 升级成一条待人工裁决的单（改期/调线/外购/停线四个选项摆齐）。
+
+    默认 `apply=false` 只报判定。要真的关单、挂升级单得显式带 `apply=true` ——
+    关闭与升级都是动库的动作，先看判定准不准再让它落地。
+    """
+    del current_user
+    from api.services.followup_lifecycle import (
+        audit_false_closures, open_shortage_tasks, sync_shortage_task,
+    )
+
+    tasks = await open_shortage_tasks(db, factory_id, limit=limit)
+    items = []
+    for task in tasks:
+        try:
+            items.append(await sync_shortage_task(db, task, apply=apply))
+        except Exception as exc:  # noqa: BLE001 — 一张单的判定失败不影响其余
+            # 语句报错会把整个事务打成 aborted，不回滚的话后面每张单都只会报同一个错
+            await db.rollback()
+            items.append({"task_id": str(task.get("id")), "action": "error",
+                          "note": f"{type(exc).__name__}: {exc}"})
+    counts: Dict[str, int] = {}
+    for item in items:
+        counts[str(item.get("action"))] = counts.get(str(item.get("action")), 0) + 1
+    # 关闭过的也要复核：只看未关闭的催办会把"被误判完成"的阻塞整个看不见
+    closure_audit = (await audit_false_closures(db, factory_id, days=closed_within_days,
+                                                limit=limit, apply=apply)
+                     if closed_within_days else None)
+    return {
+        "factory_id": factory_id,
+        "apply": apply,
+        "examined": len(items),
+        "action_counts": counts,
+        "items": items,
+        "closure_audit": closure_audit,
+        "rule": ("关闭与升级都按齐套台账的缺口数判定；快照没有行的单不判齐套（空集合不等于通过）。"
+                 "升级承接人从 HR 岗位台账找，找不到就把缺口写在单上等人认领，不编名字。"),
+    }
 
 
 @router.get("/data-authority", summary="仿真输入的数据源台账（只读）")

@@ -85,7 +85,11 @@ async def list_tasks(
                created_at, updated_at, closed_at
         FROM followup_tasks
         WHERE {' AND '.join(conditions)}
-        ORDER BY (status IN ('open','blocked')) DESC, next_follow_at ASC NULLS LAST, created_at DESC
+        -- open（还在跟）排在 blocked（已停下等人）之前：线上 225 条未关闭任务里 200 条是
+        -- blocked（多为死账户时代留下的冷却任务），原先两者同权重 + 收件箱只取 100 条，
+        -- 新挂的升级单被挤到 216~225 名 —— 界面上等于没挂过。
+        ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END,
+                 next_follow_at ASC NULLS LAST, created_at DESC
         LIMIT :limit
     """), params)
     return [dict(r._mapping) for r in result.fetchall()]
@@ -437,6 +441,25 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
     task_id = str(task["id"])
     factory_id = task["factory_id"]
 
+    # 缺料催办先按台账证据走一遍：齐套了自己关、催不动了就升级，这两步不等模型怎么说。
+    # 判定落在"继续催"时才进核实，并把当前缺口数塞进上下文 —— 让它读数，不是读上一轮自己的结论。
+    lifecycle: Dict[str, Any] = {}
+    try:
+        from api.services.followup_lifecycle import sync_shortage_task
+        lifecycle = await sync_shortage_task(db, task, apply=True)
+    except Exception as exc:  # noqa: BLE001 — 证据推进异常不能把整轮跟进拖崩
+        _logger.warning("缺料催办生命周期异常 %s: %s", task_id, exc)
+        await db.rollback()   # 语句失败会打脏事务，不回滚则这轮后面的写入全部连带报错
+    if lifecycle.get("action") in {"close_kit_complete", "escalated", "escalation_already_open"}:
+        closed = lifecycle["action"] == "close_kit_complete"
+        return {
+            "task_id": task_id,
+            "status": "done" if closed else "blocked",
+            "progress_pct": 100.0 if closed else float(task.get("progress_pct") or 0),
+            "note": lifecycle.get("note") or "",
+            "lifecycle": lifecycle["action"],
+        }
+
     messages: List[Dict[str, Any]] = [{"role": "system", "content": FOLLOWUP_PROMPT}]
     if task.get("agent_key"):
         agent_prompt = build_agent_system_prompt(task["agent_key"])
@@ -451,6 +474,15 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
     ]
     if task.get("ai_summary"):
         context_bits.append(f"AI 分诊摘要：{task['ai_summary']}")
+    if lifecycle.get("kit"):
+        kit = lifecycle["kit"]
+        context_bits.append(
+            f"齐套台账当前实况（{kit['basis']}）：{kit['note']}；"
+            f"催办创建时记录缺口 {lifecycle.get('recorded_shortage')} 件，"
+            f"已跟进 {lifecycle.get('follow_count')} 轮；"
+            f"按缺口下降算的进度 {lifecycle.get('evidence_progress_pct')}%。"
+            f"核实只回答『这些料什么时候到、卡在哪一环』，齐套与否以台账为准。"
+        )
     if task.get("ai_suggestion"):
         context_bits.append(f"待跟进行动项：\n{task['ai_suggestion']}")
     if task.get("payload"):
@@ -509,6 +541,11 @@ async def run_followup(db: AsyncSession, task: Dict[str, Any], trigger_type: str
                       "note": f"本次跟进异常（{type(exc).__name__}），下轮重试"}
 
     new_status = "done" if conclusion["state"] == "done" else conclusion["state"]
+
+    # 否决权：缺料催办不能凭模型一句话关闭，规则本体在 followup_lifecycle（可单测）
+    from api.services.followup_lifecycle import veto_model_closure
+    new_status = veto_model_closure(new_status, conclusion, lifecycle)
+
     follow_count = int(task.get("follow_count") or 0) + 1
     reached_limit = follow_count >= int(task.get("max_follows") or 60) and new_status not in {"done"}
     if reached_limit:
