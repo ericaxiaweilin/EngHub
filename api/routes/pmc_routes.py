@@ -341,6 +341,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/production-options", "mode": "read_only"},
             {"key": "sim_sensitivity", "name": "建模精度×敏感度（每个输入动一档，交期/准点/钱变多少；含补数据的量化价值）",
              "path": "/api/v1/pmc/sim-sensitivity", "mode": "read_only"},
+            {"key": "engine_layers", "name": "仿真引擎分层验收（五层判据+过线闸门，下层不过线上层不引用）",
+             "path": "/api/v1/pmc/engine-layers", "mode": "read_only"},
             {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
              "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
             {"key": "partial_kit", "name": "部分齐投产机会（还能先开几台，只读）",
@@ -484,6 +486,29 @@ async def get_sim_tradeoffs(
     from api.services.portfolio_flywheel import record_tradeoffs
 
     return await record_tradeoffs(db, factory_id, apply=apply)
+
+
+@router.get("/engine-layers", summary="仿真引擎分层验收：五层各自过线才算数，下层不过线上层不引用")
+async def get_engine_layers(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """分层验收（只读）：L1 内核 / L2A 敏感度 / L2B 准确度 / L3 决策 / L4 Agent 接口。
+
+    每层的判据不一样，而且必须是算出来的数；样本不够或来源不存在就写 not_computable
+    并点名缺哪个输入 —— 不打"0 分"，也不用别的层的数冒充。自下而上找第一个不过线的层，
+    它以上的读数一律标 `reportable=false`：平行堆指标最后会变成"我们全都做得好"的自嗨报告。
+    """
+    del current_user
+    from api.services.engine_layers import layered_acceptance
+    from api.services.virtual_run import default_models
+
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await layered_acceptance(db, factory_id, models)
 
 
 @router.get("/sim-sensitivity", summary="建模精度×敏感度：每个输入动一档，交期/准点/钱各变多少")

@@ -70,7 +70,10 @@ async def record(loop_name: str, status: str = "tick", detail: Optional[Dict[str
                      last_tick_at, ticks, failures, last_status, last_error, last_detail, updated_at)
                 VALUES (:loop, :host, :pid, :interval, :now, :now, 1,
                         CASE WHEN :status = 'failed' THEN 1 ELSE 0 END,
-                        :status, :error, CAST(:detail AS jsonb), :now)
+                        :status, :error, CAST(:detail AS jsonb), :now,
+                        CASE WHEN :status = 'failed'
+                             THEN jsonb_build_array(jsonb_build_object('at', :now, 'error', :error))
+                             ELSE '[]'::jsonb END)
                 ON CONFLICT (loop_name) DO UPDATE SET
                     host = EXCLUDED.host,
                     pid = EXCLUDED.pid,
@@ -79,7 +82,16 @@ async def record(loop_name: str, status: str = "tick", detail: Optional[Dict[str
                     ticks = {TABLE}.ticks + 1,
                     failures = {TABLE}.failures + CASE WHEN EXCLUDED.last_status = 'failed' THEN 1 ELSE 0 END,
                     last_status = EXCLUDED.last_status,
-                    last_error = EXCLUDED.last_error,
+                    last_error = CASE WHEN EXCLUDED.last_status = 'failed'
+                                      THEN EXCLUDED.last_error ELSE {TABLE}.last_error END,
+                    -- 成功心跳不再抹掉错误原文；失败时把这条错误推进最近 5 条的小环
+                    recent_errors = CASE WHEN EXCLUDED.last_status = 'failed'
+                        THEN (SELECT jsonb_path_query_array(
+                                  (EXCLUDED.recent_errors
+                                   || CASE WHEN jsonb_typeof({TABLE}.recent_errors) = 'array'
+                                           THEN {TABLE}.recent_errors ELSE '[]'::jsonb END),
+                                  '$[0 to 4]'))
+                        ELSE {TABLE}.recent_errors END,
                     last_detail = EXCLUDED.last_detail,
                     updated_at = EXCLUDED.updated_at
             """), {

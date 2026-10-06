@@ -899,6 +899,21 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_engine_capability_layers",
+            "description": (
+                "仿真引擎的分层验收（只读）：L1 内核（单轮耗时/可复现率/崩溃率）、"
+                "L2A 敏感度（弹性可算覆盖率、已知冲击的方向命中率、弹性置信区间）、"
+                "L2B 准确度（瓶颈位置命中率、回测 MAPE、输入映射精度）、"
+                "L3 决策（推荐相对基线的再跑差值、人工采纳率、推荐翻转率）、"
+                "L4 Agent 接口（问法→工具命中率、回答真调工具比例、数字可回溯率）。"
+                "每层判据不同且都是算出来的数；自下而上第一个不过线的层以上，读数标 reportable=false —— "
+                "用于「你们引擎到底行不行」「哪层是短板」「这些数字能对外说吗」类问题。"),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_plan_commit_gate",
             "description": "计划逐单下达就绪门（只读）：这一版排程里哪些工单真的能开工、哪些被哪条门压住（没排进本版本/工序没排齐/物料没齐套/首道工位映射不到），以及已经下达过的张数。用于'这版计划能开工几张''还有哪些单卡着''为什么没下达''计划生效了没'类问题。只报判定，不改工单状态、不下达。",
             "parameters": {"type": "object", "properties": {}},
@@ -2603,6 +2618,28 @@ async def _tool_query_simulation_sensitivity(
     }
 
 
+async def _tool_query_engine_capability_layers(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """分层验收（只读）：判据与阈值只在 engine_layers 一处，这里只转述，不改判据。"""
+    from api.services.engine_layers import layered_acceptance
+    from api.services.virtual_run import default_models
+
+    fid = factory_id or "FAC_MECH_001"
+    models = await default_models(db, fid, n=5)
+    if not models:
+        return {"status": "ok", "factory_id": fid, "has_data": False,
+                "message": "没有可推演的机种（BOM 镜像为空？）"}
+    out = await layered_acceptance(db, fid, models)
+    return {"status": "ok", "factory_id": fid, "has_data": True, "models": models,
+            "gate": out.get("gate"), "rule": out.get("rule"),
+            "layers": [{k: line.get(k) for k in ("layer", "name", "pass", "reportable",
+                                                  "quote_rule", "failed", "not_computable", "metrics")}
+                       for line in out.get("layers") or []],
+            "note": ("任何 reportable=false 的层，它的数只能内部看；"
+                     "not_computable 的项要连缺哪个输入一起说，不许折算成 0 分或别的数")}
+
+
 async def _tool_query_simulation_recommendation(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3208,6 +3245,7 @@ _TOOL_EXECUTORS = {
     "query_maintenance_due": _tool_query_maintenance_due,
     "query_wms_inventory_health": _tool_query_wms_inventory_health,
     "query_bom_data_quality": _tool_query_bom_data_quality,
+    "query_engine_capability_layers": _tool_query_engine_capability_layers,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
     "query_simulation_sensitivity": _tool_query_simulation_sensitivity,
     "query_chain_convergence": _tool_query_chain_convergence,
@@ -3604,6 +3642,7 @@ TOOL_LABELS = {
     "query_plan_commit_gate": "计划逐单下达就绪门",
     "query_chain_convergence": "链条收敛自检",
     "query_simulation_recommendation": "推演建议与落地复查",
+    "query_engine_capability_layers": "引擎分层验收",
     "query_simulation_sensitivity": "建模精度与敏感度",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
