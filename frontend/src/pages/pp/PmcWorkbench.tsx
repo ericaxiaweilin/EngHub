@@ -87,6 +87,7 @@ export default function PmcWorkbench() {
   const [matrixLoading, setMatrixLoading] = useState(false)
   const [recalculating, setRecalculating] = useState(false)
   const [error, setError] = useState('')
+  const [attendance, setAttendance] = useState<any>(null)
 
   const loadMatrix = useCallback(async (workOrderCode: string) => {
     if (!workOrderCode) return
@@ -140,8 +141,21 @@ export default function PmcWorkbench() {
     }
   }, [])
 
+  const loadAttendance = useCallback(async () => {
+    try {
+      const response: any = await api.get('/api/v1/pmc/expected-attendance', {
+        params: { factory_id: factoryId },
+      })
+      setAttendance(response)
+    } catch {
+      // 取不到依据就不在界面上装成有数：宁可这一栏不出现。
+      setAttendance(null)
+    }
+  }, [factoryId])
+
   useEffect(() => { loadOrders() }, [loadOrders])
   useEffect(() => { loadCapabilities() }, [loadCapabilities])
+  useEffect(() => { loadAttendance() }, [loadAttendance])
 
   const recalculate = async () => {
     if (!selectedCode) return
@@ -307,6 +321,31 @@ export default function PmcWorkbench() {
             <Text type="secondary">参数来自接口；缺数据明确标记，不用虚构值补齐。</Text>
           </div>
         </Card>
+
+        {attendance && (
+          <Card size="small" style={{ marginBottom: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+              <Text strong>今日预计出勤</Text>
+              <Text>在册 <Text strong>{attendance.roster_active}</Text> 人</Text>
+              <Text>预计到岗 <Text strong style={{ color: '#1677ff' }}>{attendance.expected_present}</Text> 人</Text>
+              <Text>缺勤 <Text strong style={{ color: '#d4380d' }}>{attendance.expected_absent}</Text> 人</Text>
+              <Tag color={attendance.weather?.condition === 'storm' ? 'red' : attendance.weather?.condition === 'rain' ? 'orange' : 'green'}>
+                {attendance.weather?.condition === 'storm' ? '暴雨 70%' : attendance.weather?.condition === 'rain' ? '雨 92%' : '好天 97%'}
+              </Tag>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {attendance.basis}
+                {(attendance.real_attendance?.stale_days ?? 0) > 7
+                  ? ` · 现场打卡表已 ${attendance.real_attendance.stale_days} 天没更新，这里不是打卡实测`
+                  : ''}
+              </Text>
+            </div>
+            <Tooltip title={attendance.verdict}>
+              <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
+                排产的人力项与闲置台账都按这一栏折算（人没来不算空闲产能）
+              </Text>
+            </Tooltip>
+          </Card>
+        )}
 
         {(ordersLoading || matrixLoading) && <Card><div style={{ minHeight: 240, display: 'grid', placeItems: 'center' }}><Spin tip="正在汇总 PMC 评审证据" /></div></Card>}
         {!ordersLoading && !matrixLoading && error && <Alert type="error" showIcon message="PMC 工作台未形成闭环" description={error} action={<Button onClick={() => selectedCode ? loadMatrix(selectedCode) : loadOrders()}>重试</Button>} />}
