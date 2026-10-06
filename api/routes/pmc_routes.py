@@ -465,6 +465,35 @@ async def get_fake_output_revert(
     return report
 
 
+@router.post("/virtual-run", summary="沙箱执行推演：引擎自己拆单/借路线/开采购/按天推进")
+async def post_virtual_run(
+    body: Dict[str, Any] = Body(..., description="factory_id, targets:[{model_code,units,due_in_days}], "
+                                                "attendance_rate?, expedite_lead_days?"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """给目标（机种+数量+交期），引擎在沙箱里把它跑成一条时间线：借同族路线、按线节拍补工时、
+    现料够就先开一批、缺的料按 lead_time_days 开采购、按天推进出勤与产能，最后出货期、用工、钱、瓶颈件。
+
+    只在内存里执行，不写业务表、不回写真实系统；每一步动作都留在 actions 里可核对。
+    `attendance_rate` 给一条恒定到岗率（好天 0.97 / 雨 0.92 / 暴雨 0.70），
+    `expedite_lead_days` 回答"把瓶颈件压到 N 天能提前几天交"。
+    """
+    del current_user
+    from api.services.virtual_run import run_sandbox
+
+    factory_id = str(body.get("factory_id") or "")
+    targets = body.get("targets") or []
+    if not factory_id or not targets:
+        raise HTTPException(status_code=422, detail="需要 factory_id 和 targets[{model_code,units,due_in_days}]")
+    rate = body.get("attendance_rate")
+    curve = None if rate is None else {d: float(rate) for d in range(0, 400)}
+    return await run_sandbox(db, factory_id, targets,
+                             attendance_curve=curve,
+                             expedite_lead_days=(int(body["expedite_lead_days"])
+                                                 if body.get("expedite_lead_days") else None))
+
+
 @router.get("/portfolio-flywheel", summary="跑一轮组合推演并记记分卡（默认只算不写）")
 async def get_portfolio_flywheel(
     factory_id: str = Query(..., description="厂区"),
