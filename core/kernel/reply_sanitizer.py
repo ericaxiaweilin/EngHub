@@ -372,3 +372,24 @@ class StreamSanitizer:
         out = _PARTIAL_TAG.sub("", out)
         out = strip_tool_json(out)
         return out.strip()
+
+
+# ──────────────────────────────────────────────
+# 「正文里的数字算不算数据引用」—— 对话核实与 L4 可回溯率共用这一份口径
+# ──────────────────────────────────────────────
+_DATA_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9.])\d[\d,]{2,}(?:\.\d+)?(?![A-Za-z0-9])")
+
+
+def numeric_claims(text: str) -> list:
+    """返回正文里像"数据读数"的数字串。
+
+    刻意排掉三类看着像数字的东西：年份（2026）、ID/UUID 里的一段（e085、2448a9 ——
+    前后粘着字母或数字就不算）、日期分片（2026-10-02 只剩年份，已被排掉）。
+    判"这句话有没有引用台账数"统一用这里，别各处再各写一条正则。"""
+    out = []
+    for tok in _DATA_NUMBER_RE.findall(str(text or "")):
+        plain = tok.replace(",", "")
+        if re.fullmatch(r"20\d\d", plain):
+            continue
+        out.append(tok)
+    return out

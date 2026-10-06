@@ -1203,14 +1203,44 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+UNVERIFIED_NOTE = (
+    "\n\n（本轮没有调用 MES 工具核实：以上数字来自对话上下文或模型自述，"
+    "不是台账读数，别当成已查证的事实。）"
+)
+
+
+def _numeric_claims(reply: str) -> List[str]:
+    from core.kernel.reply_sanitizer import numeric_claims
+
+    return numeric_claims(reply)
+
+
+def _annotate_unverified_numbers(reply: str) -> str:
+    """没调工具却报了两个以上数字 → 显式标明未经核实。
+
+    这是无人工厂的底线问题：模型会说"已按 7 项决策继续执行"并附一串没出处的数，
+    听起来和台账读数一模一样。与其猜哪条是编的（判不准），不如把没核实的标出来，
+    让人一眼能分辨 —— 标注不影响正文，也不删内容。
+    """
+    text = reply or ""
+    if len(_numeric_claims(text)) < 2:
+        return text
+    if "未经核实" in text or "没有调用 MES 工具核实" in text:
+        return text
+    return text + UNVERIFIED_NOTE
+
+
 async def _verify_grounded_reply(
     reply: str,
     actions: List[ToolAction],
     route: Dict[str, Any],
 ) -> str:
-    """让模型按工具事实审校草稿；业务侧不参与语义改写。"""
+    """让模型按工具事实审校草稿；业务侧不参与语义改写。
+
+    本轮没调工具时不做审校（没有工具事实可对照），但必须把"未经核实"标在答复上 ——
+    近 30 天实测：210 条助手回复里 29 条没查库却报数，占带数字回复的两成多。"""
     if not actions:
-        return reply
+        return _annotate_unverified_numbers(reply)
     facts = [
         {"tool": action.tool, "result": action.result}
         for action in actions

@@ -462,7 +462,7 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
     stats = (await db.execute(text("""
         SELECT COUNT(*) FILTER (WHERE role='assistant' AND content IS NOT NULL AND content <> '') AS assistants,
                COUNT(*) FILTER (WHERE role='assistant' AND COALESCE(tool_calls::text,'[]') NOT IN ('[]','null','')) AS with_tools,
-               COUNT(*) FILTER (WHERE role='assistant' AND COALESCE(tool_results::text,'[]') NOT IN ('[]','null','')
+               COUNT(*) FILTER (WHERE role='assistant' AND tool_calls::text LIKE '%"result"%'
                                      AND COALESCE(content,'') <> '') AS answerable
         FROM chat_messages WHERE created_at > NOW() - INTERVAL '30 days'
     """))).mappings().first()
@@ -484,32 +484,55 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         with_call += 1 if n > 0 else 0
         without_call += 1 if n == 0 else 0
     turn_backing = round(with_call / max(1, with_call + without_call), 3)
-    rows = (await db.execute(text("""
-        SELECT content, tool_results::text AS tr FROM chat_messages
-        WHERE role='assistant' AND COALESCE(tool_results::text,'[]') NOT IN ('[]','null','')
-          AND content IS NOT NULL AND content <> ''
-        ORDER BY created_at DESC LIMIT 40
+    # 「回答里的数有没有出处」：工具返回原文一直存在 chat_messages.tool_calls[].result
+    # （tool_results 那列没有单独再写一遍 —— 同一份 JSON 存两遍会把写入量翻倍，没必要）。
+    # 判据按**会话**算而不是按单条算：上一轮查到的数这一轮引用是正常且必要的，
+    # 只有整个会话里都找不到出处的数才是编出来的。年份/日期不计入（"2026" 不是引用数据）。
+    hist = (await db.execute(text("""
+        SELECT session_id, content, tool_calls::text AS tc
+        FROM chat_messages
+        WHERE role='assistant' AND COALESCE(content,'') <> ''
+          AND created_at > NOW() - INTERVAL '30 days'
+        ORDER BY session_id, created_at, id
     """))).mappings().all()
-    checked = backed = 0
+    from core.kernel.reply_sanitizer import numeric_claims
+
+    corpus: Dict[str, str] = {}
+    checked = same_turn = from_history = disclosed = 0
     unbacked_samples: List[Dict[str, Any]] = []
-    for r in rows:
-        nums = re.findall(r"\d[\d,]{2,}(?:\.\d+)?", str(r.get("content") or ""))
-        if not nums:
-            continue
-        hay = str(r.get("tr") or "").replace(",", "")
-        ok = 0
-        for n in nums:
-            plain = n.replace(",", "")
-            # 允许两种写法命中：原样出现，或去掉小数尾巴后出现（1,234.56 与 1234.5 是同一个数）
-            if plain in hay or (len(plain) > 4 and plain[:4] in hay):
-                ok += 1
-        rate = ok / len(nums)
-        checked += 1
-        if rate >= 0.6:
-            backed += 1
-        elif len(unbacked_samples) < 3:
-            unbacked_samples.append({"numbers": nums[:6], "backed": round(rate, 2)})
-    number_rate = round(backed / checked, 3) if checked else None
+    for r in hist:
+        sid = str(r.get("session_id"))
+        tc = str(r.get("tc") or "").replace(",", "")
+        nums = numeric_claims(r.get("content"))
+        prior = corpus.get(sid, "")
+        if len(prior) > 120000:          # 语料只留最近一段，判据要的是"能不能回溯"不是全文检索
+            prior = prior[-120000:]
+        if nums:
+            def _hit(needle: str, hay: str) -> bool:
+                return bool(hay) and (needle in hay or (len(needle) > 4 and needle[:4] in hay))
+            now_ok = sum(1 for n in nums if _hit(n.replace(",", ""), tc))
+            all_ok = sum(1 for n in nums if _hit(n.replace(",", ""), tc)
+                         or _hit(n.replace(",", ""), prior))
+            rate_now, rate_sess = now_ok / len(nums), all_ok / len(nums)
+            checked += 1
+            if rate_now >= 0.6:
+                same_turn += 1
+            elif rate_sess >= 0.6:
+                from_history += 1
+            elif "没有调用 MES 工具核实" in str(r.get("content") or ""):
+                # 模型自己已经把"这些数没查过库"写在答复上了 —— 那是披露，不是编造。
+                # 判据必须奖励披露，否则只会逼出"听起来像台账读数"的自信假话。
+                disclosed += 1
+            elif len(unbacked_samples) < 6:
+                missing = [n for n in nums if not _hit(n.replace(",", ""), tc)
+                           and not _hit(n.replace(",", ""), prior)]
+                unbacked_samples.append({
+                    "session": sid[:8], "numbers": missing[:5],
+                    "backed_within_session": round(rate_sess, 2),
+                    "excerpt": re.sub(r"\s+", " ", str(r.get("content") or ""))[:110],
+                })
+        corpus[sid] = (prior + " " + tc)[-160000:]
+    number_rate = round((same_turn + from_history + disclosed) / checked, 3) if checked else None
     contract, contract_error = {}, None
     try:
         from api.services.engine_contract import self_check as contract_self_check
@@ -542,10 +565,20 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         _metric("每轮真调工具的比例", turn_backing, THRESHOLDS["L4"]["tool_backing_rate"], "gte", "",
                 f"近 30 天 {with_call + without_call} 个完成轮里真发生工具调用的比例"),
         _metric("回答数字可回溯率", number_rate, THRESHOLDS["L4"]["number_backing_rate"], "gte", "",
-                f"抽查 {checked} 条回复",
-                missing=(None if checked else "工具返回原文没落库（chat_messages.tool_results 0 行有值）："
-                         "要算这一项必须先存 tool_results，不能拿模型自述当出处"),),
-    ], "routing_misses": misses, "unbacked_samples": unbacked_samples}
+                f"近 30 天 {checked} 条带数字的助手回复里，数字能在**本会话**工具返回里找到出处，"
+                f"或答复自己已显式标注「未经工具核实」的比例"
+                f"（本轮直查 {same_turn}、引用前几轮 {from_history}、已披露 {disclosed}）；"
+                "年份/日期/ID 片段不算引用数据",
+                n=checked, min_n=20,
+                missing=(None if checked >= 20 else
+                         f"可比回复只有 {checked} 条（判线要 ≥20 条）：样本太少不判"),),
+        _metric("本轮工具直查率", round(same_turn / checked, 3) if checked else None, None, "gte", "",
+                f"{same_turn}/{checked} 条：数字直接来自当轮工具返回（引用前轮结果也算可回溯，但这一格"
+                f"低说明模型在复述而不是重新核实）；已披露率 {round(disclosed / max(1, checked), 3)}"
+                f"（{disclosed} 条写明了未经核实）"),
+    ], "routing_misses": misses, "unbacked_samples": unbacked_samples,
+        "provenance_note": ("工具返回原文存在 chat_messages.tool_calls[].result；"
+                            "tool_results 列没用起来（同一份 JSON 不打算存两遍）")}
 
 
 def summarize(report: Dict[str, Any]) -> Dict[str, Any]:

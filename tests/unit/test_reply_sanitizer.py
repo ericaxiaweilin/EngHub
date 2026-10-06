@@ -333,3 +333,24 @@ def test_truncated_tag_rule_keeps_legit_angle_brackets():
     for raw in ("当 a<b", "x<y", "5 < 10"):
         assert strip_tool_call_markup(raw) == raw, raw
 
+
+# ── numeric_claims：什么算正文引用了一个数据读数（对话核实与 L4 同一口径）──
+
+def test_numeric_claims_keeps_real_readings():
+    from core.kernel.reply_sanitizer import numeric_claims
+
+    assert numeric_claims('共处理 371 项、575 项') == ['371', '575']
+    assert numeric_claims('人工成本 $52,380 美元') == ['52,380']
+    assert numeric_claims('延后 12.5 天，共 1,234 台') == ['1,234']
+    # 阈值是「3 位起」：12.5 这种两位小数不算数据引用（口径写在 numeric_claims 里）
+    assert numeric_claims('承诺 10,131 台 vs 5 天延误') == ['10,131']
+
+
+def test_numeric_claims_ignores_years_ids_and_dates():
+    from core.kernel.reply_sanitizer import numeric_claims
+
+    assert numeric_claims('2026 年第 37 周正常') == []
+    assert numeric_claims('交期 2026-10-02 已确认') == []
+    # UUID / 编码里的一段数字不是数据引用（前后粘着字母或数字）
+    assert numeric_claims('工作簿 ID 2edc79f5-e085-4b88-832c-2448a9fa7615') == []
+    assert numeric_claims('未排产工单：0 张') == []
