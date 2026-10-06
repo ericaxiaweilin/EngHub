@@ -347,9 +347,12 @@ class _FakeDB:
 @pytest.mark.asyncio
 async def test_followthrough_uses_ledger_evidence_not_hope():
     """建议有没有落地只看两处台账：主档提前期压没压、这阵子有没有对该料号开过采购单。"""
-    rows = [{"material_code": "RM-A", "lead_now": 10, "default_supplier": "VN-1", "pos_since": 0},
-            {"material_code": "RM-B", "lead_now": 20, "default_supplier": "VN-2", "pos_since": 0},
-            {"material_code": "RM-C", "lead_now": 20, "default_supplier": "VN-3", "pos_since": 2}]
+    rows = [{"material_code": "RM-A", "lead_now": 10, "default_supplier": "VN-1",
+             "pos_since": 0, "req_since": 0, "requisition_since": 0},
+            {"material_code": "RM-B", "lead_now": 20, "default_supplier": "VN-2",
+             "pos_since": 0, "req_since": 0, "requisition_since": 0},
+            {"material_code": "RM-C", "lead_now": 20, "default_supplier": "VN-3",
+             "pos_since": 0, "req_since": 2, "requisition_since": 0}]
     db = _FakeDB(rows)
     acts = [{"type": "expedite_purchase", "material_code": c, "target_lead_days": 10}
             for c in ("RM-A", "RM-B", "RM-C")]
@@ -359,12 +362,17 @@ async def test_followthrough_uses_ledger_evidence_not_hope():
     assert {n["material_code"] for n in out["not_acted"]} == {"RM-B"}
     assert "部分落地" in out["verdict"]
     assert "materials.lead_time_days" in out["note"]
+    # 只查 PO 会把"先走请购"当成没落地：三类台账都要看
+    c = [x for x in out["adopted"] if x["material_code"] == "RM-C"][0]
+    assert c["evidence"]["purchase_requests"] == 2 and c["records_since"] == 2
 
 
 @pytest.mark.asyncio
 async def test_supplier_gap_is_rechecked_against_the_master_row():
-    rows = [{"material_code": "RM-D", "lead_now": None, "default_supplier": None, "pos_since": 0},
-            {"material_code": "RM-E", "lead_now": None, "default_supplier": "VN-9", "pos_since": 0}]
+    rows = [{"material_code": "RM-D", "lead_now": None, "default_supplier": None,
+             "pos_since": 0, "req_since": 0, "requisition_since": 0},
+            {"material_code": "RM-E", "lead_now": None, "default_supplier": "VN-9",
+             "pos_since": 0, "req_since": 0, "requisition_since": 0}]
     db = _FakeDB(rows)
     out = await vr.recommendation_followthrough(
         db, "FAC_MECH_001",

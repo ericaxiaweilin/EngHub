@@ -554,11 +554,22 @@ def _tune_one(cal: Dict[str, float], disc: Dict[str, Any]) -> Optional[str]:
 
 
 
+# "有没有人动过"要一次问全三类台账：只查 purchase_orders 会把请购/申购当成没落地，
+# 而厂里催一个料通常先走请购或申购，PO 是后面的事。
 FOLLOWTHROUGH_SQL = text("""
     SELECT m.material_code, m.lead_time_days AS lead_now, m.default_supplier,
            (SELECT COUNT(*) FROM purchase_orders po
              WHERE po.factory_id = :fid AND po.material_code = m.material_code
-               AND po.created_at >= CAST(:since AS timestamp)) AS pos_since
+               AND po.created_at >= CAST(:since AS timestamp)
+               AND UPPER(COALESCE(po.status, '')) <> 'CANCELLED') AS pos_since,
+           (SELECT COUNT(*) FROM purchase_requests pr
+             WHERE pr.factory_id = :fid AND pr.material_code = m.material_code
+               AND pr.created_at >= CAST(:since AS timestamp)
+               AND UPPER(COALESCE(pr.status, '')) NOT IN ('CANCELLED', 'REJECTED')) AS req_since,
+           (SELECT COUNT(*) FROM purchase_requisitions rq
+             WHERE rq.factory_id = :fid AND rq.material_code = m.material_code
+               AND rq.created_at >= CAST(:since AS timestamp)
+               AND UPPER(COALESCE(rq.status, '')) NOT IN ('CANCELLED', 'REJECTED')) AS requis_since
     FROM materials m
     WHERE m.factory_id = :fid AND m.material_code = ANY(CAST(:codes AS text[]))
 """)
@@ -595,24 +606,31 @@ async def recommendation_followthrough(db: AsyncSession, factory_id: str,
         lead_now = row.get("lead_now")
         target = int(a.get("target_lead_days") or 0)
         pos = int(row.get("pos_since") or 0)
+        evidence = {"purchase_orders": pos,
+                    "purchase_requests": int(row.get("req_since") or 0),
+                    "purchase_requisitions": int(row.get("requisition_since") or 0)}
+        raised = sum(evidence.values())
         if str(a.get("type")) == "supplier_master_missing":
             item = {"material_code": code, "check": "补供应商",
                     "default_supplier": row.get("default_supplier")}
             (adopted if row.get("default_supplier") else not_acted).append(item)
             continue
         pressed = lead_now is not None and target and int(lead_now) <= target
-        (adopted if (pressed or pos > 0) else not_acted).append(
+        (adopted if (pressed or raised > 0) else not_acted).append(
             {"material_code": code,
-             "check": f"提前期压到 {target} 天或已开采购单",
-             "lead_now": lead_now, "lead_target": target, "purchase_orders_since": pos})
-    verdict = ("建议有下落：提前期已压缩或已开采购单" if adopted and not not_acted else
-               ("建议还没落地：主档提前期没变，也没查到新采购单" if not_acted and not adopted else
+             "check": f"提前期压到 {target} 天，或采购/请购/申购里查到记录",
+             "lead_now": lead_now, "lead_target": target,
+             "evidence": evidence, "records_since": raised})
+    verdict = ("建议有下落：提前期已压缩，或采购/请购/申购里查到了记录" if adopted and not not_acted else
+               ("建议还没落地：主档提前期没变，采购/请购/申购三类台账都查不到记录"
+                if not_acted and not adopted else
                 "部分落地：见明细，未落地的部分继续挂在建议里"))
     return {"checked": len(wanted), "adopted": adopted, "not_acted": not_acted,
             "no_master_row": sorted(set(no_master)), "since": str(until),
             "verdict": verdict,
-            "note": ("复查只看台账证据（materials.lead_time_days、purchase_orders.created_at），"
-                     "没有证据就报没证据，不猜有没有人口头催过")}
+            "note": ("复查只看台账证据：materials.lead_time_days 是否压到建议值，"
+                     "以及 purchase_orders / purchase_requests / purchase_requisitions 里该料号"
+                     "在建议之后有没有新增单据（取消/驳回的不算）。查不到就说查不到，不猜有没有人口头催过")}
 
 
 # 动作排序：先"今天就能下单/开工"的，再"要人去确认"的，最后是主数据缺口。
