@@ -503,6 +503,8 @@ MIN_UNDECLARED_ACTIONS = 3
 # 模式要攒够几个样本才敢提"这条规律值得确认"
 MIN_PATTERN_SAMPLES = 5
 MIN_PENDING_RULES = 1
+# 政策网格想过这么多次、现场一次记录都没有 —— 才值得占一格收件箱
+MIN_SILENT_CONSIDERED = 10
 
 LEAD_DEFAULT_SQL = """
     WITH g AS (
@@ -536,7 +538,7 @@ MOB_CONTRADICTION_SQL = """
 DATA_LOOPS = frozenset({
     "kit_line_generation", "kit_line_missing", "supplier_master",
     "lead_time_evidence", "material_make_or_buy_conflict",
-    "action_constraints", "candidate_rules",
+    "action_constraints", "action_execution_silence", "candidate_rules",
 })
 
 
@@ -655,6 +657,31 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             {"undeclared_actions": [str(a.get("action")) for a in undeclared],
              "gaps": gaps}))
 
+    # 第六格B：引擎想过但现场一次都没记的动作 —— 学习侧的"沉默"，和"没规则"是两种病
+    silent = [a for a in ((cons or {}).get("actions") or [])
+              if int((((a.get("usage") or {}).get("considered_last_grid")) or 0)) >= MIN_SILENT_CONSIDERED
+              and int(((a.get("usage") or {}).get("recorded_executions_30d")) or 0) == 0]
+    basis = (cons or {}).get("grid_usage_basis") or {}
+    if basis.get("coverage_known") and silent:
+        ranked = sorted(silent, key=lambda a: -int((a.get("usage") or {}).get("considered_last_grid") or 0))
+        out.append(_gap(
+            "action_execution_silence", "considered_but_unrecorded",
+            f"silent|{len(silent)}|{sum(int((a.get('usage') or {}).get('considered_last_grid') or 0) for a in silent) // 10}",
+            f"补数据｜{len(silent)} 个动作引擎这轮想过 "
+            f"{sum(int((a.get('usage') or {}).get('considered_last_grid') or 0) for a in silent)} 次，现场 30 天 0 记录"
+            f"（{'、'.join(str(a.get('action')) for a in ranked[:4])}）",
+            "推演推荐每轮都在比较这些杠杆，但决策台账里没有一笔执行记录 —— 那就永远只能拿仿真数自证。\n"
+            "两种可能都要分开写：现场真没做（那这条动作该降权），还是做了没记（那缺的是记录入口）。\n"
+            "记一笔的入口：POST /api/v1/pmc/execution-events（或对助手说一句\"XX线今天加了3小时班\"）。\n"
+            f"覆盖度取自最近一张带 action_coverage 的记分卡（{basis.get('card_at')}）；"
+            "没有这张卡时这一格不响 —— 读不到数不等于没人做过。",
+            f"{len(silent)} 个动作被反复考虑却没有任何现场执行记录，效果无从验证",
+            "pmc_agent", "先确认是没做还是没记；没记就把执行事件补进 execution_events，别改推荐口径。",
+            {"silent_actions": [{"action": str(a.get("action")),
+                                 "considered": int((a.get("usage") or {}).get("considered_last_grid") or 0)}
+                                for a in ranked],
+             "coverage_card_at": basis.get("card_at")}))
+
     # 第七格：系统自己挖出来的 candidate 规则等着人确认（不确认就永远不拦引擎）
     pending = list(pending or [])
     if len(pending) >= MIN_PENDING_RULES:
@@ -771,6 +798,7 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
             "unverified_lead_parts": MIN_UNVERIFIED_LEAD_PARTS,
             "mob_contradiction_rows": MIN_MOB_CONTRADICTION_ROWS,
             "undeclared_actions": MIN_UNDECLARED_ACTIONS,
+            "silent_considered_actions": MIN_SILENT_CONSIDERED,
             "pending_rule_samples": MIN_PATTERN_SAMPLES,
         },
         "counts": outcome["counts"], "findings": found, "items": outcome["items"],

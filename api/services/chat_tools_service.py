@@ -213,7 +213,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "record_execution",
-            "description": "记一件现场真做过的事：加了几天班（几小时）、从哪个组调了几个人顶什么岗、开了几条并联线、先交了几台。这些动作以前没有落库地方，所以「加班上限 2 小时」「跨线调人要技能匹配」这类厂规没法核对、系统也永远算不出某个动作的成功率。记完会立刻对着已声明的厂规校一遍，超上限当场报。",
+            "description": "记一件现场真做过的事：加了几天班（几小时）、从哪个组调了几个人顶什么岗、开了几条并联线、先交了几台。这些动作以前没有落库地方，所以「加班上限 2 小时」「跨线调人要技能匹配」这类厂规没法核对、系统也永远算不出某个动作的成功率。记完会立刻对着已声明的厂规校一遍，超上限当场报。**如果这句话说的是「已经做了」（今天/已经/插到前面先做了），用本工具；说的是「以后都这样」（不许/禁止/上限/只能），那是定规矩，用 record_factory_rule。**",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3259,7 +3259,55 @@ def _stamp_factory(out: Dict[str, Any], scope: Dict[str, Any]) -> Dict[str, Any]
     out["answer_must_name_factory"] = label
     if scope.get("warning"):
         out["factory_warning"] = scope["warning"]
+    if scope.get("factory_notes"):
+        out["factory_notes"] = scope["factory_notes"]
     return out
+
+
+MODEL_FACTORY_SQL = text("""
+    SELECT DISTINCT factory_id FROM products WHERE product_code = :c
+    UNION
+    SELECT DISTINCT factory_id FROM work_orders WHERE product_id = :c
+""")
+
+LINE_FACTORY_SQL = text("""
+    SELECT DISTINCT factory_id FROM line_profiles WHERE line_code = :c
+""")
+
+
+async def _write_scoped_factory(db: AsyncSession, args: Dict[str, Any],
+                                session_factory_id: Optional[str],
+                                *, model_code: Optional[str] = None,
+                                line_code: Optional[str] = None) -> Dict[str, Any]:
+    """写入前的厂区归属：先认名字，再拿句子里的机种/线编码反查归属，两者冲突时信数据。
+
+    实测踩过：说"记下：今天把 FG-TREAD-003 插到 A-50-04-F 前面，机械厂已经这样排了"，
+    工具没有厂区参数可用，事件就落到登录用户的会话厂区（电子厂）—— 记是记了，记错厂。
+    机种/线编码是库里有的东西，归属比人的一句话更硬，所以以它为准并说明改了什么。
+    """
+    scope = await _factory_scoped_id(db, args, session_factory_id)
+    fid = scope["factory_id"]
+    notes: List[str] = []
+    for kind, code, sql in (("机种", model_code, MODEL_FACTORY_SQL),
+                            ("线", line_code, LINE_FACTORY_SQL)):
+        if not str(code or "").strip():
+            continue
+        found = sorted({str(r["factory_id"]) for r in
+                        (await db.execute(sql, {"c": str(code).strip()})).mappings().all()})
+        if not found:
+            notes.append(f"{kind} {code} 在 products/work_orders/line_profiles 里查不到归属厂区，"
+                         f"按 {fid} 记（归属没核实过，别当已确认）")
+        elif len(found) > 1:
+            notes.append(f"{kind} {code} 同时出现在 {found} 个厂区，归属有歧义，"
+                         f"这条按 {fid} 记 —— 要按别的厂说得点名 factory_id")
+        elif found[0] != fid:
+            notes.append(f"{kind} {code} 的归属是 {found[0]}，而会话/默认厂区是 {fid} —— "
+                         f"已按机种归属改记到 {found[0]}")
+            fid = found[0]
+            scope["factory_id"] = fid
+    if notes:
+        scope["factory_notes"] = notes
+    return scope
 
 
 async def _tool_list_measurement_priority(
@@ -3336,7 +3384,10 @@ async def _tool_record_execution(
     """现场执行入表 + 当场按厂规校验。actor 用登录用户，机器写的只算 agent 证据。"""
     from core.mes.factory_rules import record_execution
 
-    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    scope = await _write_scoped_factory(db, args, factory_id,
+                                         model_code=args.get("model_code"),
+                                         line_code=args.get("line_code"))
+    fid = scope["factory_id"]
     res = await record_execution(
         db, fid, action=str(args.get("action") or ""), line_code=args.get("line_code"),
         section=args.get("section"), model_code=args.get("model_code"),
@@ -3344,6 +3395,7 @@ async def _tool_record_execution(
         note=str(args.get("note") or ""), actor=str(operator or "unknown"))
     if res.get("error"):
         return {"error": res["error"]}
+    res.update(_stamp_factory({}, scope))
     rc = res.get("rule_check") or {}
     res["rule_check_note"] = {"violates_forbidden": "厂规禁止这个动作，但这次做了 —— 要么规则要改，要么这是例外，得留痕",
                               "over_cap": "超出厂规上限（规则写的是上限，不是建议值）",
@@ -3360,7 +3412,18 @@ async def _tool_adopt_recommendation(
     """现场确认"这件事做了" → 记进决策台账。actor 用登录用户，机器冒名确认不算 verified_human。"""
     from core.mes.factory_rules import record_adoption
 
-    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    scope = await _write_scoped_factory(db, args, factory_id)
+    fid = scope["factory_id"]
+    did = str(args.get("decision_id") or "").strip()
+    if did:
+        # 确认的是台账里那一行做的没有 —— 那行的厂区就是它自己的厂区，比会话默认值可信
+        owner = (await db.execute(text("SELECT factory_id FROM decision_records WHERE id = :i"),
+                                  {"i": did})).scalar()
+        if owner and str(owner) != fid:
+            scope["factory_id"] = str(owner)
+            scope.setdefault("factory_notes", []).append(
+                f"决策 {did} 属于厂区 {owner}（会话厂区是 {fid}）—— 已按台账归属记录")
+            fid = str(owner)
     res = await record_adoption(
         db, fid, decision_id=(str(args["decision_id"]) if args.get("decision_id") else None),
         action_type=(str(args["action_type"]) if args.get("action_type") else None),
@@ -3368,6 +3431,7 @@ async def _tool_adopt_recommendation(
         actor=str(operator or "unknown"), evidence=args.get("evidence") or {})
     if res.get("error"):
         return {"error": res["error"]}
+    res.update(_stamp_factory({}, scope))
     res["next"] = ("这一行进入挖掘分母；攒够样本后系统会提出候选规律，等人确认才拦引擎")
     return res
 
@@ -3379,9 +3443,12 @@ async def _tool_record_factory_rule(
     """把现场口述的厂规写进 factory_rules（只这一张表，不动任何事实表）。"""
     from core.mes.factory_rules import upsert_rule
 
-    # 规则属于哪个厂必须跟着当前会话的厂区走：写错厂相当于给另一家工厂立规矩
-    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
-    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    # 规则属于哪个厂必须落在真实归属上：写错厂相当于给另一家工厂立规矩。
+    # 句子里点了机种/线编码时以库里的归属为准（会话默认值是登录用户的厂，不一定是对的那家）。
+    scope = await _write_scoped_factory(db, args, factory_id,
+                                         model_code=args.get("model_code"),
+                                         line_code=args.get("line_code"))
+    fid = scope["factory_id"]
     # 现场说的是"不许外发"还是"不许加班"决定这条规则拦哪个动作 —— 动作选错，
     # 引擎就会按错的边界过滤候选（实测模型把"暴雨不许外发"记到了 reroute_line 上）。
     # 所以先从话术里找线索：只有一个动作被提到却和传进来的 subject 不一致时，结构化拒绝，
@@ -3415,6 +3482,7 @@ async def _tool_record_factory_rule(
         asked_by=str(operator or ""), confirmed_by=str(operator or ""))
     if res.get("error"):
         return {"error": res["error"]}
+    res.update(_stamp_factory({}, scope))
     res["next"] = ("这条规则现在参与约束判定（verdict=%s, status=%s）；"
                    "引擎下一轮推演就会按它过滤候选动作" % (res["verdict"], res["status"])
                    if res.get("binding") else "已记录为候选，等人确认后才拦引擎")
@@ -4262,6 +4330,9 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "加了班", "加了 3 小时", "加了3小时", "加班 3", "排了加班", "几点下班",
             "调了 2 人", "调了2人", "调了 2 个人", "调人顶岗", "顶了检测", "顶检测岗",
             "开了第二条线", "开并联线", "先交了", "部分交付了",
+            # "记下"本身分不清是记事件还是记规矩，所以只认带"已经做了"说法的整句
+            "已经这样排", "已经插到", "插到前面", "先做了", "今天已经排", "上了夜班",
+            "顶了一天", "干到晚上", "已经加了", "今天加班", "记一笔今天", "记下今天",
         ],
     },
     {
@@ -4279,7 +4350,9 @@ INTENT_RULES: List[Dict[str, Any]] = [
         # "记一条厂规/以后不许"是写动作，必须排在提问类规则之前，否则会被读工具抢走
         "tool": "record_factory_rule",
         "keywords": [
-            "记一条", "记下", "记住", "写进规则", "定条规矩", "立规矩", "以后都",
+            # 只认"定规矩"的说法；"记下/记住/记一条"是日常记账口吻，会把
+            # "记下：今天把 003 插到前面先做" 这种既成事件写成厂规（实测错过一次）
+            "写进规则", "定条规矩", "立规矩", "以后都", "以后一律", "记成规则", "定个规则",
             "不允许外发", "禁止外发", "可以外发", "加班上限", "不许外发", "规定：",
             "组立不允许", "检测岗只能", "只能由", "算违约", "允许部分交付",
         ],
