@@ -1527,11 +1527,11 @@ async def constraint_overlay(db: AsyncSession, factory_id: str,
                              targets: List[Dict[str, Any]],
                              policies: List[Dict[str, Any]],
                              lines: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """把这一轮政策用到的动作送去约束层过一遍，只报不删（enforced=False）。
+    """把这一轮政策用到的动作送去约束层过一遍，读数随结论一起出门。
 
     默认没人看得到这层的话，引擎就会继续推荐厂里根本没声明过的动作。
-    这里刻意不改变推演结果：改了就是把判据和算法又搅回一坨，先让读数出来，
-    再由 IE 把规则填实、由用户决定什么时候让它真的拦。
+    `enforce_constraints=False` 时只报不删（政策照跑）；True 时被规则判死的政策整条摘掉。
+    拦不拦都留下读数：几条规则在生效、挡了哪几条政策、多少个动作没有依据 —— 不挡也要能看见没挡。
     """
     from core.mes.action_constraints import action_constraints, policy_actions
 
@@ -1563,7 +1563,12 @@ async def constraint_overlay(db: AsyncSession, factory_id: str,
             blocked.append(name)
         per_policy.append({"policy": name, "actions": acts, "blocked_by_rule": hard,
                            "unsupported": {k: v for k, v in unsupported.items() if v}})
-    return {"enforced": bool(blocked), "blocked_policies": blocked,
+    return {"enforced": bool(blocked),
+            "policies_blocked": len(blocked),
+            "rules_in_effect": sorted({a for m in per_model for a in (m.get("declared") or {})}),
+            "actions_unsupported_marks": sum(len(v or []) for p in per_policy
+                                             for v in (p.get("unsupported") or {}).values()),
+            "blocked_policies": blocked,
             "rule": ("只报不删：政策照跑，但每个动作有没有厂里的规则支撑要跟着结论出门。"
                      "要真拦下来得由 IE 先把规则填实，再由用户点一次开关。"),
             "per_model": per_model, "per_policy": per_policy}
