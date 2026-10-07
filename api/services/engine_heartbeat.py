@@ -163,7 +163,7 @@ async def read_states() -> list:
     async with db_config.session_factory() as db:
         rows = (await db.execute(text(f"""
             SELECT loop_name, host, pid, interval_seconds, started_at, last_tick_at,
-                   ticks, failures, last_status, last_error,
+                   ticks, failures, last_status, last_error, last_detail, recent_errors,
                    window_started_at, window_ticks, window_failures
             FROM {TABLE} ORDER BY loop_name
         """))).mappings().all()
@@ -198,6 +198,10 @@ async def read_states() -> list:
             "failures": row["failures"],
             "last_status": status,
             "last_error": row["last_error"],
+            # 催办要说"断在几点"，只有 stale_seconds 就得每次现算，还会跟着扫描时刻漂
+            "last_tick_at": str(row["last_tick_at"]) if row["last_tick_at"] else None,
+            "started_at": str(row["started_at"]) if row["started_at"] else None,
+            "recent_errors": row["recent_errors"],
             "window_started_at": str(row["window_started_at"]) if row["window_started_at"] else None,
             "window_ticks": int(row["window_ticks"] or 0),
             "window_failures": int(row["window_failures"] or 0),

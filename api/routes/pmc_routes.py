@@ -347,6 +347,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/engine-contract", "mode": "read_only"},
             {"key": "sim_readiness", "name": "精度判据就绪度（可比机种、回测成对样本、缺齐套行的归因）",
              "path": "/api/v1/pmc/sim-readiness", "mode": "read_only"},
+            {"key": "engine_watchdog", "name": "引擎自身故障巡检：心跳断写/崩溃越线自动挂催办，恢复自动关（默认预演）",
+             "path": "/api/v1/pmc/engine-watchdog", "mode": "read_only"},
             {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
              "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
             {"key": "partial_kit", "name": "部分齐投产机会（还能先开几台，只读）",
@@ -568,6 +570,25 @@ async def get_sim_readiness(
     from api.services.sim_backtest import readiness
 
     return await readiness(db, factory_id)
+
+
+@router.get("/engine-watchdog", summary="引擎自身故障巡检：心跳断写/循环退出/窗口崩溃越线会挂成哪条催办")
+async def get_engine_watchdog(
+    factory_id: str = Query(..., description="催办挂在哪个厂区的收件箱"),
+    apply: bool = Query(False, description="false=只出判定不动库；true 才真的挂/刷新/关闭"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """引擎的故障由引擎自己报，不等人去翻 /engine-layers。
+
+    判据不另立一套：直接取分层验收 L1 那两条（心跳超过 2 个预期间隔没跳、窗口崩溃率 >1%），
+    所以待办上写的数和验收页那格永远是同一个数。一条 (循环, 故障种类) 只留一条未关闭催办，
+    签名没变不动库；台账恢复后自动关闭并写明恢复。一次性任务跑完退出不算故障。
+    """
+    del current_user
+    from api.services.engine_watchdog import scan
+
+    return await scan(db, factory_id, apply=apply)
 
 
 @router.get("/engine-contract", summary="引擎对外契约：三个接口的签名与业务词表（与模型内部无关）")

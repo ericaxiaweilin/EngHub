@@ -168,6 +168,7 @@ async def _periodic_scheduler():
         "exception_escalation": "_last_escalation",
         "agent_stalled_check": "_last_agent_check",
         "warehouse_replenish": "_last_warehouse_check",
+        "engine_watchdog": "_last_engine_watchdog",
     }
     while True:
         did = {}
@@ -442,6 +443,31 @@ async def _periodic_scheduler():
                             _logger.warning(f"[scheduling] 产能检查失败 {fid}: {ex}")
         except Exception as e:
             _logger.warning(f"[scheduler] 排产智能体任务异常: {e}")
+
+        # 引擎自身健康巡检 —— 每 10 分钟：心跳断写、循环退出、窗口崩溃越线自动挂催办
+        # 10-06 那次心跳断写写坏了几个小时，全靠人翻库才发现；判据本来就是 L1 那一格，
+        # 现在让它自己开口：挂了哪条、恢复了自己关，同一条故障不重复挂。
+        try:
+            import time as _t_ew
+            if not hasattr(_periodic_scheduler, "_last_engine_watchdog"):
+                _periodic_scheduler._last_engine_watchdog = 0
+            if _t_ew.time() - _periodic_scheduler._last_engine_watchdog > 600:  # 10min
+                _periodic_scheduler._last_engine_watchdog = _t_ew.time()
+                from api.services.engine_watchdog import scan as _watchdog_scan
+                async with db_config.session_factory() as db:
+                    res = await _watchdog_scan(
+                        db, apply=os.getenv("ENGINE_WATCHDOG_APPLY", "true").lower()
+                            not in {"0", "false", "no", "off"})
+                    changed = {k: v for k, v in res["counts"].items()
+                               if v and k != "unchanged"}
+                    if changed:
+                        _logger.info(f"[engine-watchdog] {changed}")
+                    did["engine_watchdog"] = {
+                        "loops_alive": res["alive"], "loops_seen": res["loops_seen"],
+                        "findings": len(res["findings"]), "actions": changed,
+                    }
+        except Exception as e:
+            _logger.warning(f"[scheduler] 引擎健康巡检异常: {e}")
 
         from api.services.engine_heartbeat import record as _heartbeat
         import time as _gt
