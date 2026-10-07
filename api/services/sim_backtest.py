@@ -16,9 +16,20 @@ from typing import Any, Dict, List
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# 仿真的 BOM 取数源（这是命中率算不对的根因之一，profile 里逐机种量出来）
+# 仿真的 BOM 取数源（这是命中率算不对的根因之一，profile 里逐机种量出来）。
+# 机种全集必须同时取两头：只从本地 bom_items 出发，镜像里那些"本地压根没有"的机种就永远不出现在
+# 画像上 —— 实测本机镜像有 473 个机种，与本地 bom_items 重合的只有 1 个，而有工单的镜像机种 3 个
+# 里有 2 个是本画像原先看不见的（10-07 由 bom_source 探针对撞出来）。
+# 镜像侧只收"真被工单要求过"的机种，否则 473 行画像没人看。
 BOM_SOURCE_SQL = """
-WITH ms AS (SELECT DISTINCT product_id AS model FROM bom_items WHERE factory_id = :fid)
+WITH ms AS (
+    SELECT DISTINCT product_id AS model FROM bom_items WHERE factory_id = :fid
+    UNION
+    SELECT DISTINCT e.product_model FROM enghub_bom_items e
+      WHERE e.factory_id = :fid
+        AND e.product_model IN (SELECT DISTINCT product_id FROM work_orders
+                                 WHERE factory_id = :fid)
+)
 SELECT s.model,
        (SELECT COUNT(*) FROM bom_items b
          WHERE b.factory_id = :fid AND b.product_id = s.model) AS local_lines,
@@ -28,13 +39,14 @@ SELECT s.model,
        (SELECT COUNT(*) FROM bom_items b
          WHERE b.factory_id = :fid AND b.product_id = s.model
            AND b.material_code LIKE 'RM-%') AS local_synthetic_lines,
-       (SELECT COUNT(*) FROM enghub_bom_items e WHERE e.product_model = s.model) AS mirror_lines,
+       (SELECT COUNT(*) FROM enghub_bom_items e
+         WHERE e.factory_id = :fid AND e.product_model = s.model) AS mirror_lines,
        (SELECT COALESCE(MAX(e.level), 0) FROM enghub_bom_items e
-         WHERE e.product_model = s.model) AS mirror_levels,
+         WHERE e.factory_id = :fid AND e.product_model = s.model) AS mirror_levels,
        (SELECT COUNT(DISTINCT e.part_number) FROM enghub_bom_items e
-         WHERE e.product_model = s.model AND e.level = 1) AS mirror_level1_parts,
+         WHERE e.factory_id = :fid AND e.product_model = s.model AND e.level = 1) AS mirror_level1_parts,
        (SELECT COUNT(*) FROM (SELECT DISTINCT e.part_number FROM enghub_bom_items e
-              WHERE e.product_model = s.model AND e.level = 1) x
+              WHERE e.factory_id = :fid AND e.product_model = s.model AND e.level = 1) x
          JOIN materials m ON m.material_code = x.part_number AND m.factory_id = :fid
           WHERE m.lead_time_days IS NOT NULL) AS mirror_level1_with_lead
 FROM ms s
@@ -285,9 +297,12 @@ async def readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
             else:
                 backtest["pairs_ok"] += 1
 
-    # BOM 取数源画像：仿真现在只读本地 bom_items，而台账/领料走 engflow 真源镜像。
-    # 逐机种量出两边各有多少行、真源有几层、level-1 件在 materials 里有没有提前期 ——
-    # 没有这些数，"切到真源"就是一句口号；切了会不会没料可算也只有这里能看出来。
+    # BOM 取数源画像。600a7772 之前这里是"两套源"（仿真读本地 bom_items、台账读 engflow 镜像），
+    # 现在仿真也走 bom_source 这一个入口，所以画像要回答的是另一个问题：
+    # **同一个入口在这个机种上会落到哪一头**，落下去还剩几行、几层、level-1 件有没有提前期。
+    # 画像是按行数预测落点的，所以再拿入口自己的返回值对撞一遍 —— 两者说得不一样就是画像过期了。
+    from api.services import bom_source as bs
+
     src_rows = (await db.execute(text(BOM_SOURCE_SQL), {"fid": factory_id})).mappings().all()
     bom_sources = []
     for r in src_rows:
@@ -301,9 +316,33 @@ async def readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
             "real_source_level1_parts": int(r["mirror_level1_parts"] or 0),
             "real_source_level1_with_lead": int(r["mirror_level1_with_lead"] or 0),
             "switchable": bool(int(r["mirror_lines"] or 0) > 0),
+            "sim_resolves": bs.label("engflow_mirror" if int(r["mirror_lines"] or 0) > 0
+                                     else "mes_bom_items"),
         })
+    by_model = {b["model"]: b for b in bom_sources}
     switchable = [b for b in bom_sources if b["switchable"]]
     comparable = sorted(m for m, v in per_model.items() if v["comparable_for_bottleneck"])
+
+    # 探针只挑判据真用得上的那几台：可比机种 + 真源有行的 + 缺口行最多的，上限 12 台
+    probe_models = sorted(set(
+        comparable[:5]
+        + [b["model"] for b in bom_sources if b["switchable"]][:3]
+        + [v["model"] for v in sorted(per_model.values(),
+                                      key=lambda v: -int(v["shortage_lines"]))[:5]]))[:12]
+    resolved: Dict[str, int] = {}
+    mismatch: List[Dict[str, Any]] = []
+    for model in probe_models:
+        _, source = await bs.latest_bom_lines(db, factory_id, model)
+        resolved[source] = resolved.get(source, 0) + 1
+        row = by_model.get(model)
+        predicted = ("engflow_mirror" if row and row["real_source_lines"] > 0 else
+                     "mes_bom_items" if row and row["sim_source_lines"] > 0 else "none")
+        if row is not None:
+            row["probe_source"] = source
+        if predicted != source:
+            mismatch.append({"model": model, "entry_returns": bs.label(source),
+                             "profile_predicts": bs.label(predicted)})
+
     with_bom = sorted(m for m, v in per_model.items() if v["has_bom"])
     gap_out = [{"reason": k, "label": BUCKET_LABELS.get(k, k), "orders": v["count"],
                 "top_models": [f"{m}×{n}" for m, n in
@@ -323,8 +362,17 @@ async def readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
                      "verdict": ("可判" if backtest["pairs_ok"] >= MIN_BACKTEST_PAIRS else
                                  f"不可判：成对样本 {backtest['pairs_ok']} < {MIN_BACKTEST_PAIRS}")},
         "bom_source": {
-            "sim_reads": "bom_items（本地）",
-            "ledger_reads": "enghub_bom_items（engflow 真源镜像）+ materials 提前期",
+            "sim_reads": ("api/services/bom_source.latest_bom_lines() —— 镜像 level-1 优先，"
+                         "没有才回落本地 bom_items（仿真、台账、领料现在同一个入口）"),
+            "ledger_reads": "同一个入口 + materials 提前期",
+            "sim_reads_probe": {
+                "models_probed": len(probe_models),
+                "model_list": probe_models,
+                "resolved": {bs.label(k): v for k, v in resolved.items()},
+                "mismatch_with_profile": mismatch,
+                "note": ("画像是拿行数预测入口会落到哪一头，探针是直接问入口它取到了哪一头；"
+                         "对不上就说明画像过期，得改画像而不是改说法"),
+            },
             "models_total": len(bom_sources),
             "models_with_real_source": len(switchable),
             "models_with_real_source_list": sorted(b["model"] for b in switchable),
