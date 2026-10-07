@@ -554,13 +554,22 @@ def _gap(loop: str, kind: str, sig: str, title: str, description: str, block: st
 
 
 async def data_findings(db: AsyncSession, factory_id: str, *,
-                        readiness_out: Optional[Dict[str, Any]] = None
+                        readiness_out: Optional[Dict[str, Any]] = None,
+                        evaluated_out: Optional[set] = None
                         ) -> List[Dict[str, Any]]:
-    """把五格查数收齐交给 gap_readings()：查询与判据分开，判据才单测得到。"""
+    """把五格查数收齐交给 gap_readings()：查询与判据分开，判据才单测得到。
+
+    evaluated_out 是一份"这一格本轮真的跑过判据"的名单（调用方传集合进来）：
+    缺数据/查不动的格不能既不出声又被当成修好了。
+    """
     gen = (await db.execute(text(KIT_GENERATION_SQL), {"fid": factory_id})).mappings().first()
     sup = (await db.execute(text(SUPPLIER_GAP_SQL), {"fid": factory_id})).mappings().first()
     lead = (await db.execute(text(LEAD_DEFAULT_SQL), {"fid": factory_id})).mappings().first()
     mob = (await db.execute(text(MOB_CONTRADICTION_SQL), {"fid": factory_id})).mappings().first()
+    if evaluated_out is not None:
+        evaluated_out.update({"kit_line_generation", "supplier_master",
+                              "lead_time_evidence", "material_make_or_buy_conflict",
+                              "candidate_rules"})
     try:
         from core.mes.action_constraints import action_constraints
 
@@ -591,7 +600,8 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
-                        pending=list(pending or []), mp=dict(mp or {}))
+                        pending=list(pending or []), mp=dict(mp or {}),
+                        evaluated_out=evaluated_out)
 
 
 def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
@@ -599,13 +609,23 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  mob: Optional[Dict[str, Any]] = None,
                  cons: Optional[Dict[str, Any]] = None,
                  pending: Optional[List[Dict[str, Any]]] = None,
-                 mp: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                 mp: Optional[Dict[str, Any]] = None,
+                 evaluated_out: Optional[set] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
     阈值写成张数/料号数而不是比例：少于十几张时重跑一次的成本比挂一条待办更划算，
     不值得占收件箱。签名按 10 张/10 个一档，补掉一档就刷新、缩到线下就自动关。
+    evaluated_out 会被填上"本轮真跑过判据的格子"：调用方据此区分"缩到线下"与"这格没查成"。
     """
     out: List[Dict[str, Any]] = []
+    ev = evaluated_out if evaluated_out is not None else set()
+    if ready:
+        ev.add("kit_line_missing")
+    if cons:
+        ev.add("action_constraints")
+        basis = cons.get("grid_usage_basis") or {}
+        if basis.get("coverage_known"):
+            ev.add("action_execution_silence")
     stale = int(gen.get("stale_gen") or 0)
     in_flow = int(gen.get("in_flow") or 0)
     if stale >= MIN_STALE_ORDERS:
@@ -684,6 +704,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
 
     # 第七格：系统自己挖出来的 candidate 规则等着人确认（不确认就永远不拦引擎）
     pending = list(pending or [])
+    ev.add("candidate_rules")
     if len(pending) >= MIN_PENDING_RULES:
         kinds = sorted({str(r.get("source") or "") for r in pending})
         out.append(_gap(
@@ -784,10 +805,14 @@ async def _readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
 async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
                     apply: bool = False) -> Dict[str, Any]:
     """数据缺口巡检：判据被主数据封顶时自动成一条补数据催办，补齐后自动关闭。"""
-    found = await data_findings(db, factory_id)
+    evaluated: set = set()
+    found = await data_findings(db, factory_id, evaluated_out=evaluated)
     seen = {str(f["loop"]) for f in found}
-    # 判据本轮没跑出来的格子：不做关闭，但也得让"看住的是哪几格"这件事本身可查。
-    protected = frozenset(DATA_LOOPS - seen)
+    # 分三种：这轮报了缺口的（正常刷新）、这轮跑过判据但没报的（真缩到线下，允许自动关）、
+    # 这轮压根没跑成判据的（不许关，只保护）。上一版把第二、第三种混在一起一律不关，
+    # 结果是修好的红条永远挂在收件箱里 —— 过期判据也是红。
+    cleared = frozenset((evaluated - seen) & DATA_LOOPS)
+    protected = frozenset(DATA_LOOPS - seen - evaluated)
     outcome = await _reconcile(db, factory_id, found, DATA_CATEGORY, apply,
                                protected_loops=protected)
     return {
@@ -803,7 +828,10 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
         },
         "counts": outcome["counts"], "findings": found, "items": outcome["items"],
         "held_open": sorted(protected),
+        "cleared_this_round": sorted(cleared),
         "cells_without_guard": sorted(l for l in seen if l not in DATA_LOOPS),
         "rule": ("这几格不是引擎算不出，是台账/主数据没跟上：齐套行登记世代、可重跑补齐的缺行单、"
-                 "外购缺口的供应商、没量过的提前期、自制/外购两列矛盾。缩到阈值以下自动关闭。"),
+                 "外购缺口的供应商、没量过的提前期、自制/外购两列矛盾、动作想过没人记。"
+                 "跑过判据又缩到线下的自动关；这轮没跑成判据的一律不关（held_open），"
+                 "读不到数不等于没人做过。"),
     }

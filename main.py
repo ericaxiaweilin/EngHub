@@ -495,6 +495,7 @@ async def _periodic_scheduler():
                         # 判据住在本文件里，所以不关闭"的格子，cells_without_guard 非空说明
                         # 新增了数据格子却没进保护名单（缺席就会被当修好，等于自动放行假绿灯）。
                         "held_open": res.get("held_open"),
+                        "cleared": res.get("cleared_this_round"),
                         "cells_without_guard": res.get("cells_without_guard"),
                     }
         except Exception as e:
