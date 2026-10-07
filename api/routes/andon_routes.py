@@ -311,6 +311,8 @@ async def process_reminders():
 @router.get("/categories", summary="工单类别列表")
 async def list_categories():
     """返回预设的5大类安灯工单"""
+    from api.services.andon_service import AndonService
+
     return {
         "categories": [
             {"code": k, **v} for k, v in AndonService.CATEGORIES.items()

@@ -601,10 +601,11 @@ async def list_change_requests(
     current_user: User = Depends(get_current_user),
 ):
     """列出计划的变更请求历史"""
-    from api.services.pp_service import PPService
-    pp = PPService(db)
-    
-    requests = pp.change_mgmt.list_requests(plan_id=plan_id)
+    # 原来 import api.services.pp_service（这个模块在仓库里不存在），命中即 ModuleNotFound；
+    # 变更管理的真实实现在 core/pp/change_management.py。
+    from core.pp.change_management import ChangeManagementService
+    cm = ChangeManagementService()
+    requests = cm.list_requests(plan_id=plan_id)
     return {
         "success": True,
         "data": [
@@ -620,10 +621,9 @@ async def list_plan_versions(
     current_user: User = Depends(get_current_user),
 ):
     """查看计划的版本历史追溯记录"""
-    from api.services.pp_service import PPService
-    pp = PPService(db)
-    
-    versions = pp.change_mgmt.get_versions(plan_id)
+    from core.pp.change_management import ChangeManagementService
+    cm = ChangeManagementService()
+    versions = cm.get_versions(plan_id)
     return {
         "success": True,
         "data": [v.to_dict() for v in versions]

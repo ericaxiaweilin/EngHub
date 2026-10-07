@@ -95,8 +95,8 @@ class UserRole(Base):
     __tablename__ = "user_roles"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    role_id = Column(String(36), ForeignKey("roles.id"), nullable=False, index=True)
     is_primary = Column(Boolean, default=True)  # 是否主角色
     assigned_by = Column(String(50))
     assigned_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -117,8 +117,8 @@ class RolePermission(Base):
     __tablename__ = "role_permissions"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False, index=True)
-    permission_id = Column(UUID(as_uuid=True), ForeignKey("permissions.id"), nullable=False, index=True)
+    role_id = Column(String(36), ForeignKey("roles.id"), nullable=False, index=True)
+    permission_id = Column(String(36), ForeignKey("permissions.id"), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -138,7 +138,7 @@ class User(Base):
     full_name = Column(String(100))
     factory_id = Column(String(50), index=True)
     role = Column(String(50), default="operator", index=True)  # 兼容字段：快捷角色编码
-    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=True, index=True)  # 关联角色表
+    role_id = Column(String(36), ForeignKey("roles.id"), nullable=True, index=True)  # 关联角色表
     is_active = Column(Boolean, default=True)
     is_superuser = Column(Boolean, default=False)
     work_center = Column(String(20), nullable=True, index=True)  # 工序组编码（WCUT/EDM/CUT...），null=管理岗不绑定
@@ -1242,7 +1242,7 @@ class EmployeeSkill(Base):
     __tablename__ = "employee_skills"
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False, index=True)
     level = Column(String(10), nullable=False)  # L1-L5
     certified_date = Column(DateTime)
@@ -1252,7 +1252,7 @@ class EmployeeSkill(Base):
     competency_assessment_score = Column(Numeric(5, 2), nullable=True)
     skill_level_date = Column(Date, nullable=True)
     remarks = Column(Text)
-    evaluated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    evaluated_by = Column(String(36), ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -1268,7 +1268,7 @@ class TrainingRecord(Base):
     __tablename__ = "training_records"
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
     training_type = Column(String(50))
     trainer = Column(String(100))

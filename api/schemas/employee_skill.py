@@ -1,7 +1,7 @@
 """
 员工能力标签 Schema 定义
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import date, datetime
 from enum import Enum
@@ -49,7 +49,24 @@ class SkillResponse(BaseModel):
 
 # ==================== EmployeeSkill ====================
 
-class EmployeeSkillCreate(BaseModel):
+class _NormalizesSkillLevel:
+    """`employee_skills.level` 在库里存的是裸数字（'3'），接口契约是 'L1'..'L5'。
+
+    读取时按同一含义归一：既不把已有数据改库，也不为了迁就脏值把契约放宽成任意字符串。
+    数字超出 1-5 或形态不认识时原样交给枚举校验拒绝，而不是硬凑一个等级。
+    """
+
+    @field_validator("level", mode="before")
+    @classmethod
+    def _normalize_level(cls, value):
+        if isinstance(value, str) and value.strip().isdigit():
+            number = int(value.strip())
+            if 1 <= number <= 5:
+                return f"L{number}"
+        return value
+
+
+class EmployeeSkillCreate(_NormalizesSkillLevel, BaseModel):
     """给员工添加技能"""
     skill_id: int = Field(..., description="技能 ID")
     level: SkillLevelEnum = Field(..., description="技能等级")
@@ -59,7 +76,7 @@ class EmployeeSkillCreate(BaseModel):
     remarks: Optional[str] = Field(None, description="备注")
 
 
-class EmployeeSkillUpdate(BaseModel):
+class EmployeeSkillUpdate(_NormalizesSkillLevel, BaseModel):
     """更新员工技能"""
     level: Optional[SkillLevelEnum] = None
     score: Optional[float] = Field(None, ge=0, le=100)
@@ -68,7 +85,7 @@ class EmployeeSkillUpdate(BaseModel):
     remarks: Optional[str] = None
 
 
-class EmployeeSkillItem(BaseModel):
+class EmployeeSkillItem(_NormalizesSkillLevel, BaseModel):
     """员工技能项"""
     id: int
     skill_id: int
@@ -84,17 +101,17 @@ class EmployeeSkillItem(BaseModel):
         from_attributes = True
 
 
-class EmployeeSkillResponse(BaseModel):
+class EmployeeSkillResponse(_NormalizesSkillLevel, BaseModel):
     """员工技能详情"""
     id: int
-    user_id: int
+    user_id: str
     skill_id: int
     level: SkillLevelEnum
     score: Optional[float]
     certified_date: Optional[date]
     expiry_date: Optional[date]
     remarks: Optional[str]
-    evaluated_by: Optional[int]
+    evaluated_by: Optional[str]
     created_at: datetime
     updated_at: Optional[datetime]
     
@@ -127,7 +144,7 @@ class SkillMatrixResponse(BaseModel):
 
 class TrainingRecordCreate(BaseModel):
     """创建培训记录"""
-    user_id: int = Field(..., description="员工 ID")
+    user_id: str = Field(..., description="员工 ID")
     skill_id: int = Field(..., description="技能 ID")
     training_type: str = Field(..., description="培训类型")
     trainer: Optional[str] = Field(None, description="培训师")
@@ -141,7 +158,7 @@ class TrainingRecordCreate(BaseModel):
 class TrainingRecordResponse(BaseModel):
     """培训记录响应"""
     id: int
-    user_id: int
+    user_id: str
     skill_id: int
     training_type: str
     trainer: Optional[str]
@@ -160,7 +177,7 @@ class TrainingRecordResponse(BaseModel):
 
 class EmployeeSkillMatch(BaseModel):
     """员工技能匹配结果"""
-    user_id: int
+    user_id: str
     username: str
     department: Optional[str]
     matched_skills: List[dict]

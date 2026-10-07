@@ -80,7 +80,7 @@ async def update_skill(
 
 @router.get("/employees/{user_id}/skills", response_model=List[EmployeeSkillResponse])
 async def get_employee_skills(
-    user_id: int,
+    user_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -91,7 +91,7 @@ async def get_employee_skills(
 
 @router.post("/employees/{user_id}/skills", response_model=EmployeeSkillResponse)
 async def add_skill_to_employee(
-    user_id: int,
+    user_id: str,
     skill_data: EmployeeSkillCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -173,7 +173,7 @@ async def create_training_record(
 
 @router.get("/employees/{user_id}/training-history", response_model=List[TrainingRecordResponse])
 async def get_employee_training_history(
-    user_id: int,
+    user_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):

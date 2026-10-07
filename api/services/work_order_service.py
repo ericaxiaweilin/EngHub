@@ -858,7 +858,8 @@ class WorkOrderService:
         parameters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """拆分预览：模拟并返回拟生成的工单列表，支持多种模式"""
-        from sqlalchemy import json
+        # SQLAlchemy 2.x 没有 `from sqlalchemy import json` 这个顶层名字，
+        # 原来这行直接 ImportError，拆分预览永远 500
         
         original_wo = await self.get_work_order_by_id(work_order_id)
         if not original_wo:
@@ -1090,7 +1091,17 @@ class WorkOrderService:
     
     async def get_split_history(self, work_order_id: str) -> List[Dict]:
         from sqlalchemy import text
-        result = await self.db.execute(text("""SELECT * FROM order_decomposition_logs WHERE work_order_id = :id ORDER BY created_at DESC""", {"id": work_order_id}))
+        # order_decomposition_logs 没有 work_order_id 这一列（真实列是
+        # sales_order_id / action / result / work_orders_created / operator / created_at），
+        # 原来按不存在的列查，端点必然 500。拆分日志是按销售单记的，
+        # 所以先用这张工单所属销售单去取，并如实说明归属口径。
+        wo = await self.get_work_order_by_id(work_order_id)
+        if not wo or not getattr(wo, "sales_order_id", None):
+            return []
+        result = await self.db.execute(text(
+            "SELECT id, action, result, work_orders_created, operator, created_at "
+            "FROM order_decomposition_logs WHERE sales_order_id = :sid ORDER BY created_at DESC"
+        ), {"sid": str(wo.sales_order_id)})
         logs = result.mappings().all()
         return [dict(log) for log in logs]
     

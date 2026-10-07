@@ -10,12 +10,14 @@ FactorySimResult 结构，供生产看板复用仿真结果 UI 组件。
 - 前端复用相同的展示组件，但数据语义完全不同
 """
 
+import asyncio
+
 from fastapi import APIRouter, Depends, Query, HTTPException
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, cast, String, text, func, and_, distinct
+from sqlalchemy import select, cast, String, text, func, and_, case, distinct
 
 from database.db_config import get_db
 from database.models import (
@@ -616,10 +618,9 @@ async def production_dashboard_live(
         func.coalesce(func.sum(ProductionReport.good_qty), 0),
         func.coalesce(func.sum(ProductionReport.defect_qty + ProductionReport.scrap_qty), 0),
         func.count(ProductionReport.id),
-        select(distinct(WorkOrder.id)).where(
-            WorkOrder.factory_id == factory_id,
-            WorkOrder.status.in_(["released", "in_progress"]),
-        ).scalar_subquery(),
+        # 原来这里把 `select(distinct(WorkOrder.id))` 当标量表达式塞进聚合列：子查询返回多行，
+        # asyncpg 直接 CardinalityViolationError，这个实时看板端点每次 500。
+        # 在制工单数改成单独一次 count 查询（见下），聚合查询只留真正可聚合的列。
     ).join(
         WorkOrder, WorkOrder.id == ProductionReport.work_order_id, isouter=True
     ).where(
@@ -631,7 +632,13 @@ async def production_dashboard_live(
     )
     result = await db.execute(stmt)
     row = result.first()
-    total_output, good_qty, defect_qty, report_count, wip_count = row[:5]
+    total_output, good_qty, defect_qty, report_count = row[:4]
+    wip_count = int((await db.execute(
+        select(func.count()).select_from(WorkOrder).where(
+            WorkOrder.factory_id == factory_id,
+            WorkOrder.status.in_(["released", "in_progress"]),
+        )
+    )).scalar() or 0)
 
     yield_rate = (good_qty / total_output * 100) if total_output > 0 else 0
 
@@ -779,7 +786,8 @@ async def production_dashboard_hourly_trend(
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """小时产出趋势（今日 vs 昨日）"""
-    from dateutil import parser
+    # 原来 import dateutil.parser（镜像里根本没装，requirements 也没有），
+    # 而且导入后一次都没用 —— 命中即 ModuleNotFoundError 500。
     today = date.fromisoformat(target_date) if target_date else date.today()
     yesterday = today - timedelta(days=1)
 

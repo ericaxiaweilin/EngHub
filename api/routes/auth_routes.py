@@ -348,7 +348,33 @@ async def list_roles(
     """获取角色列表（需查看角色权限）"""
     user_service = UserService(db)
     roles = await user_service.list_roles()
-    return roles
+    # roles.permissions 在库里存的是 {"purchase": {"view": true, ...}} 权限映射，
+    # 而 RoleResponse 声明 permissions: list —— 声明与真实形状不一致时 FastAPI 在
+    # 序列化阶段抛 ResponseValidationError，这个端点每次 500。
+    # 这里按接口已承诺的形状把映射展开：不改公开契约，也不动库里数据。
+    items = []
+    for role in roles:
+        raw = role.permissions or {}
+        if isinstance(raw, dict):
+            permissions = [
+                {"module": module, "actions": [a for a, allowed in (actions or {}).items() if allowed]}
+                for module, actions in raw.items()
+            ]
+        else:
+            permissions = list(raw)
+        items.append({
+            "id": role.id,
+            "role_code": role.role_code,
+            "role_name": role.role_name,
+            "position": role.position,
+            "department": role.department,
+            "description": role.description,
+            "is_system": bool(role.is_system),
+            "level": role.level,
+            "data_scope": role.data_scope,
+            "permissions": permissions,
+        })
+    return items
 
 
 @router.post("/users/{user_id}/assign-role", response_model=UserResponse)

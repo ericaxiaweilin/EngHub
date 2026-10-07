@@ -519,7 +519,7 @@ async def calculate_operator_performance_rating(
     current_user = Depends(get_current_user)
 ):
     """计算操作员绩效评级（基于标准工时）"""
-    from services.ie_service_extended import PerformanceRatingService
+    from api.services.ie_service_extended import PerformanceRatingService
     
     start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
     end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
@@ -547,7 +547,7 @@ async def value_stream_mapping(
     current_user = Depends(get_current_user)
 ):
     """价值流映射（VSM）分析"""
-    from services.ie_service_extended import ComprehensiveProcessAnalysisService
+    from api.services.ie_service_extended import ComprehensiveProcessAnalysisService
     
     service = ComprehensiveProcessAnalysisService(db)
     try:

@@ -176,23 +176,33 @@ async def list_param_audit(
     db: AsyncSession = Depends(get_db),
 ):
     """查询参数变更审计记录"""
-    from database.models import ParameterChangeAudit
-    from sqlalchemy import select as sa_select
+    # database.models 里没有 ParameterChangeAudit 这个类（表 parameter_change_audit 是有的），
+    # 原来那行 import 必然 ImportError，端点每次命中都 500。改成按真实表查。
+    from sqlalchemy import text as sa_text
 
-    query = sa_select(ParameterChangeAudit)
+    conditions = ["TRUE"]
+    params = {"limit": page_size, "offset": (page - 1) * page_size}
     if param_id:
-        query = query.where(ParameterChangeAudit.param_id == param_id)
+        conditions.append("param_id = :param_id")
+        params["param_id"] = param_id
     if changed_by:
-        query = query.where(ParameterChangeAudit.changed_by == changed_by)
-    query = query.order_by(ParameterChangeAudit.changed_at.desc()).offset((page-1)*page_size).limit(page_size)
-    
-    records = list((await db.execute(query)).scalars().all())
+        conditions.append("changed_by = :changed_by")
+        params["changed_by"] = changed_by
+    stmt = sa_text(
+        "SELECT id, param_id, from_value, to_value, changed_by, changed_at, reason, "
+        "       approval_required, approval_status, approval_record_id, source, impact_summary "
+        "FROM parameter_change_audit WHERE " + " AND ".join(conditions) +
+        " ORDER BY changed_at DESC NULLS LAST LIMIT :limit OFFSET :offset"
+    )
+    records = [dict(r) for r in (await db.execute(stmt, params)).mappings().all()]
+
     return {"items": [
         {
-            "id": r.id, "param_id": r.param_id, "from_value": r.from_value,
-            "to_value": r.to_value, "changed_by": r.changed_by,
-            "changed_at": r.changed_at.isoformat() if r.changed_at else None,
-            "reason": r.reason, "approval_status": r.approval_status, "source": r.source,
+            "id": r.get("id"), "param_id": r.get("param_id"), "from_value": r.get("from_value"),
+            "to_value": r.get("to_value"), "changed_by": r.get("changed_by"),
+            "changed_at": r["changed_at"].isoformat() if r.get("changed_at") else None,
+            "reason": r.get("reason"), "approval_status": r.get("approval_status"),
+            "source": r.get("source"), "impact_summary": r.get("impact_summary"),
         } for r in records
     ], "total": len(records)}
 

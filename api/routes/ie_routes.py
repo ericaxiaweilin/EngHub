@@ -583,7 +583,9 @@ async def get_product_standard_times(
         query = query.where(StandardOperationTime.factory_id == factory_id)
     
     query = query.order_by(StandardOperationTime.routing_step)
-    result = await query.all()
+    # SQLAlchemy 2.x 里 Statement 不能自带 execute（`await query.all()` 报
+    # 'Select' object has no attribute 'all'），必须走 session
+    result = (await db.execute(query)).mappings().all()
     
     return [{
         "product_id": r.product_id,
