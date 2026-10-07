@@ -664,16 +664,20 @@ async def post_engine_attribution(
 @router.get("/engine-contract-check", summary="契约自检：泄漏内部标识数 / 信封违规数 / 内部名被拒率")
 async def get_engine_contract_check(
     factory_id: str = Query(..., description="厂区"),
+    refresh: bool = Query(False, description="跳过缓存重算一遍（刚改过契约时用；一轮要 30 秒上下）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """接口是不是真的与模型无关，看三个数：内部名当键出现的次数、信封缺单位/依据的次数、
     把内部 kwarg 名当参数传进来被结构化拒绝的比例。这三条破了就说明接口和实现黏住了。
+
+    自检要真跑三个接口加五个内部名探针（实测一轮 26~34 秒），所以结果按厂区缓存 15 分钟；
+    `cache.from_cache` 会说明这一份是复用的还是现算的 —— agent 拿旧读数必须看得见。
     """
     del current_user
     from api.services.engine_contract import self_check
 
-    return await self_check(db, factory_id)
+    return await self_check(db, factory_id, use_cache=not refresh)
 
 
 @router.post("/virtual-run", summary="沙箱执行推演：引擎自己拆单/借路线/开采购/按天推进")

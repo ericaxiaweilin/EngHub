@@ -17,8 +17,9 @@
 
 from __future__ import annotations
 
+import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -840,9 +841,45 @@ def envelope_violations(payload: Any, _path: str = "$") -> List[str]:
     return bad
 
 
+# 自检的产物是"接口有没有和实现黏住"这种结构事实，一轮 33 秒（要真跑 3 个接口 + 5 个内部名探针），
+# 但它被 /engine-contract-check 和 L4 每一层验收各调一次 —— 不缓存的话 agent 一轮对话就要等半分钟，
+# 慢到没人调的判据等于没有判据。缓存口径与 engine_layers 的分层验收一致：同输入 15 分钟内复用，
+# 刚改过契约要立刻看结果时传 refresh=True。
+SELF_CHECK_CACHE: Dict[tuple, tuple] = {}
+SELF_CHECK_TTL_SECONDS = 900
+
+
+def _self_check_key(factory_id: str, models: Optional[List[str]]) -> tuple:
+    return (str(factory_id), tuple(str(m) for m in (models or [])))
+
+
 async def self_check(db: AsyncSession, factory_id: str,
-                     models: Optional[List[str]] = None) -> Dict[str, Any]:
-    """契约自检：三个数，任何一条破了就说明接口已经和实现黏住了。"""
+                     models: Optional[List[str]] = None, *,
+                     use_cache: bool = True,
+                     ttl_seconds: Optional[int] = None) -> Dict[str, Any]:
+    """契约自检：三个数，任何一条破了就说明接口已经和实现黏住了（结果按厂区+机种缓存）。"""
+    key = _self_check_key(factory_id, models)
+    ttl = int(ttl_seconds if ttl_seconds is not None else SELF_CHECK_TTL_SECONDS)
+    hit = SELF_CHECK_CACHE.get(key)
+    if use_cache and hit:
+        computed_at, blob = hit
+        age = (datetime.now(timezone.utc) - computed_at).total_seconds()
+        if age <= ttl:
+            out = json.loads(blob)
+            out["cache"] = {"from_cache": True, "age_seconds": round(age, 1),
+                            "ttl_seconds": ttl, "computed_at": computed_at.isoformat()}
+            return out
+    out = await _self_check_run(db, factory_id, models)
+    out.pop("cache", None)
+    stamp = datetime.now(timezone.utc)
+    out["cache"] = {"from_cache": False, "age_seconds": 0.0, "ttl_seconds": ttl,
+                    "computed_at": stamp.isoformat()}
+    SELF_CHECK_CACHE[key] = (stamp, json.dumps(out, ensure_ascii=False, default=str))
+    return out
+
+
+async def _self_check_run(db: AsyncSession, factory_id: str,
+                          models: Optional[List[str]] = None) -> Dict[str, Any]:
     req = {"n_models": 2, "conditions": {"weather": "storm"}}
     if models:
         req["models"] = models
