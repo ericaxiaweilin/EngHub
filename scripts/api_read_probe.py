@@ -57,8 +57,45 @@ LOOKUPS = {
     'center': ["SELECT station_code FROM stations LIMIT 1"],
     'category': ["SELECT station_type FROM stations WHERE station_type IS NOT NULL LIMIT 1"],
     'date': [None],
+    'approval': ["SELECT id FROM rush_order_approvals LIMIT 1", "SELECT id FROM ai_action_approvals LIMIT 1"],
+    'session': ["SELECT id FROM chat_sessions LIMIT 1"],
+    'request': ["SELECT request_id FROM chat_messages WHERE request_id IS NOT NULL LIMIT 1"],
+    'fai': ["SELECT id FROM quality_inspections WHERE inspect_type='FAI' LIMIT 1"],
+    'emp': ["SELECT id FROM hr_employees LIMIT 1"],
+    'sot': ["SELECT id FROM standard_operation_times LIMIT 1"],
+    'lba': ["SELECT id FROM line_balance_analyses LIMIT 1"],
+    'pa': ["SELECT id FROM process_analyses LIMIT 1"],
+    'process_analysis': ["SELECT id FROM process_analyses LIMIT 1"],
+    'workbook': ["SELECT id FROM workbooks LIMIT 1"],
+    'group': ["SELECT id FROM chat_sessions LIMIT 1"],
+    'part_number': ["SELECT material_code FROM bom_items LIMIT 1"],
+    'model_name': ["SELECT DISTINCT model_name FROM bom_items WHERE model_name IS NOT NULL LIMIT 1"],
+    'model': ["SELECT product_id FROM products LIMIT 1", "SELECT code FROM products LIMIT 1"],
     'id': ["SELECT id FROM work_orders LIMIT 1"],
 }
+
+
+# 自由文本类参数：给一个合理取值而不是跳过 —— 目的不是查出数据，是看它会不会崩
+TEXT_DEFAULTS = {
+    'year': '2026',
+    'q': 'A',
+    'question': '今天产量多少',
+    'topic': '焊接',
+    'fault_type': '主轴振动异常',
+    'target_level': '2',
+    'action': 'view',
+    'event_key': 'equipment_breakdown',
+    'from_date': '2026-10-01',
+    'to_date': '2026-10-07',
+    'date': '2026-10-07',
+    'operator_id': None,
+    'product_id': None,
+    'station_id': None,
+    'start_date': '2026-09-01',
+    'end_date': '2026-10-07',
+}
+
+
 
 SKIP_WORDS = ('sync', 'refresh', 'generate', 'backfill', 'trigger', 'migrate', 'recompute',
               'run_', 'recalculate', 'warmup', 'restart', 'export', 'download', 'file')
@@ -79,6 +116,12 @@ _cache = {}
 
 
 def value_for(name, factory):
+    key = (str(name).lower(), factory)
+    if key in _cache:
+        return _cache[key]
+    if name in ('from_date',):
+        _cache[key] = TEXT_DEFAULTS.get('from_date', '')
+        return _cache[key]
     key = (name, factory)
     if key in _cache:
         return _cache[key]
@@ -91,6 +134,9 @@ def value_for(name, factory):
         result = psql(cand, factory)
         if result:
             break
+    if not result and name.lower() in TEXT_DEFAULTS:
+        # 自由文本参数：给一个合理值，目标是"它会不会崩"，不是"能不能查到数据"
+        result = TEXT_DEFAULTS[name.lower()] or ''
     _cache[key] = result
     return result
 

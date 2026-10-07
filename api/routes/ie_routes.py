@@ -5,7 +5,7 @@ IE Module API Routes - Industrial Engineering Module
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, BaseModel as PydanticModel
+from pydantic import BaseModel, BaseModel as PydanticModel, Field, model_validator
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
@@ -83,8 +83,10 @@ class StandardTimeResponse(BaseModel):
     effective_standard_time: float
     version: str
     is_active: bool
-    validity_start: str
-    validity_end: Optional[str]
+    # to_dict() 给的是 datetime，原来声明成 str 会在 model_validate 阶段直接抛
+    # ValidationError（详情端点必 500）。JSON 出去仍然是 ISO 字符串，线上契约不变。
+    validity_start: datetime
+    validity_end: Optional[datetime]
     created_by: str
     updated_by: str
 
@@ -135,7 +137,26 @@ class LineBalanceInput(BaseModel):
     takt_time: Optional[float] = None  # 可选，如不传入则自动计算
 
 
-class LineBalanceResponse(BaseModel):
+class _DatetimeToStringInputs:
+    """把输入里的 datetime 先转成 ISO 字符串。
+
+    这些响应模型把 created_at/updated_at 之类声明成 str（JSON 出去本来就是字符串），
+    但 to_dict() 交回来的是 datetime 对象，于是详情端点在 model_validate 阶段必 500。
+    在入口统一转换：契约不变，也不用一个字段一个字段改类型。
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _isoformat_datetimes(cls, data):
+        if not isinstance(data, dict):
+            return data
+        return {
+            key: (value.isoformat() if isinstance(value, datetime) else value)
+            for key, value in data.items()
+        }
+
+
+class LineBalanceResponse(_DatetimeToStringInputs, BaseModel):
     """产线平衡分析报告"""
     id: str
     factory_id: str
@@ -149,7 +170,7 @@ class LineBalanceResponse(BaseModel):
     idle_time_total: float
     workstation_count: int
     is_balanced: bool
-    station_details: List[Dict[str, Any]]
+    workstation_details: List[Dict[str, Any]] = Field(default_factory=list)
     bottleneck_station: Optional[str]
     bottleneck_time: Optional[float]
     recommendations: List[str]
@@ -169,7 +190,7 @@ class ProcessAnalysisInput(BaseModel):
     lead_time: float
 
 
-class ProcessAnalysisResponse(BaseModel):
+class ProcessAnalysisResponse(_DatetimeToStringInputs, BaseModel):
     """工序价值分析报告"""
     id: str
     factory_id: str
@@ -531,7 +552,8 @@ async def get_process_analysis(
     """获取工序价值分析报告详情"""
     service = ProcessAnalysisService(db)
     query = select(ProcessAnalysis).where(ProcessAnalysis.id == pa_id)
-    result = await query
+    # SQLAlchemy 2.x：Statement 不能直接 await，必须走 session
+    result = await db.execute(query)
     pa = result.scalar_one_or_none()
     if not pa:
         raise HTTPException(status_code=404, detail="Process analysis not found")

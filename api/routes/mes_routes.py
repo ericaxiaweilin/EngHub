@@ -12,7 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database.db_config import get_db
-from database.models import User, Product, RoutingTemplate, RoutingTemplateStep, WorkOrder as WorkOrderModel
+from database.models import (
+    User, Product, Station, RoutingTemplate, RoutingTemplateStep,
+    WorkOrder as WorkOrderModel,
+)
 from api.services.work_order_service import WorkOrderService, WOStatus, WoPermissionError
 from api.services.mes_services import (
     ProductionReportService,
@@ -962,11 +965,19 @@ async def list_stations(
 
 @router.get("/stations/{station_id}")
 async def get_station(station_id: str, db: AsyncSession = Depends(get_db)):
-    """获取工位详情"""
+    """获取工位详情：主键 UUID 或工位编码都能查。
+
+    APS 排程任务、station_capacity、工单的 assigned_station 全部按**编码**记工位，
+    详情页却只认 UUID，等于查不到自己系统里到处在用的那个标识。
+    """
     service = StationService(db)
     station = await service.get_station_by_id(station_id)
     if not station:
-        raise HTTPException(status_code=404, detail="Station not found")
+        station = (await db.execute(
+            select(Station).where(Station.station_code == station_id)
+        )).scalars().first()
+    if not station:
+        raise HTTPException(status_code=404, detail=f"工位 {station_id} 不存在（UUID 与编码都查过）")
     return {
         "id": str(station.id), "station_code": station.station_code,
         "station_name": station.station_name, "factory_id": station.factory_id,

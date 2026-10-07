@@ -501,7 +501,9 @@ class LineBalanceService:
     
     async def get_line_balance_report(self, lba_id: str) -> Optional[LineBalanceAnalysis]:
         """获取平衡分析报告"""
-        result = select(LineBalanceAnalysis).where(LineBalanceAnalysis.id == lba_id)
+        result = await self.db.execute(
+            select(LineBalanceAnalysis).where(LineBalanceAnalysis.id == lba_id)
+        )
         return result.scalar_one_or_none()
     
     async def list_line_balances(
