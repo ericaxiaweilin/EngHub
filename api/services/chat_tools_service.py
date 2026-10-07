@@ -390,7 +390,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_compliance_simulation",
-            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/连续作业时长/负重/姿势等），返回合规判定、违规规则、疲劳分、所需休息等。所有参数可选，默认一个标准装配场景。",
+            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/连续作业时长/负重/姿势等），返回合规判定、违规规则、疲劳分、所需休息等。所有参数可选，默认一个标准装配场景。**注意模型的边界**：能耗只由步数/负重/坡度/地形决定，温度与湿度都不进能耗；温度仅在超过法规高温阈值时放大疲劳并触发高温补贴；humidity_percent 目前不进任何计算（返回体的 model_drivers / inputs_supplied_but_inert 会点名）。所以两个温度给出相同能耗不是「参数没生效」，是公式里没有这一项 —— 答复要按返回体说，不要猜原因。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -521,6 +521,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "quality_alert_triage(质量异常分诊)、"
                 "full_compliance_check(全面合规检查)。"
                 "当用户请求复合任务（如'帮我复盘今天生产'）时优先调用本工具。"
+                "full_compliance_check 可带 params（用户说了几度就要传 temperature_c，不传就跑默认 30℃ 场景）："
+                "temperature_c / humidity_percent / continuous_work_minutes / "
+                "load_weight_kg / posture_angle_deg / step_count / task_type。"
             ),
             "parameters": {
                 "type": "object",
@@ -1758,6 +1761,19 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     plugins = _sim_registry.create_many(DEFAULT_SIM_PLUGINS)
     record = _sim_engine.evaluate(phys, plugins)
 
+    # 阈值从法规包读一次：答复里说的"高温线/连续工时线"必须和判据用的是同一个数
+    from core.sim_erp.physics import PhysicsCore
+
+    heat_gt, cont_limit = None, None
+    try:
+        for pack_name in {p.manifest.legislation_pack for p in plugins if p.manifest.legislation_pack}:
+            pack = _sim_engine.legislation_catalog.load_pack(pack_name)
+            heat_gt = (pack.get("heat_allowance") or {}).get("temperature_c_gt", heat_gt)
+            cont_limit = (pack.get("continuous_work_limit") or {}).get("max_minutes", cont_limit)
+    except Exception:  # noqa: BLE001  包读不到时照样出数，只是不编阈值
+        pass
+    drivers = PhysicsCore.describe_model(heat_threshold_c=heat_gt, continuous_limit_minutes=cont_limit)
+
     # 落审计记录（独立事务，失败不影响返回仿真结果）
     try:
         await SimERPAuditService(db).create_audit_log(record)
@@ -1767,9 +1783,24 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
 
     arb = record.arbiter_result
     snap = record.snapshot
+    # 传了却没反应的参数要点名：不然"40℃ 与 30℃ 能耗一样"会被当成参数没送进去
+    inert_map = {"humidity_percent": "environment.humidity_percent", "noise_db": "environment.noise_db",
+                 "dust_mg_m3": "environment.dust_mg_m3", "distance_meters": "distance_meters",
+                 "time_step_minutes": "time_step_minutes", "action_type": "work_context.action_type"}
+    supplied_inert = sorted(k for k, path in inert_map.items()
+                            if args.get(k) is not None and path in drivers["inert_inputs"])
+    heat_effect = (
+        f"温度 {snap.environment.temperature_c:g}℃ "
+        + (f"高于 {drivers['rule_thresholds']['heat_allowance_triggers_above_c']:g}℃ → "
+           "疲劳基础项乘 1.3、并发高温补贴"
+           if snap.environment.temperature_c > float(drivers["rule_thresholds"]
+                                                    ["heat_allowance_triggers_above_c"])
+           else f"不高于 {drivers['rule_thresholds']['heat_allowance_triggers_above_c']:g}℃ → "
+                "温度这一项对疲劳与判定都没有反应"))
     return {
         "success": True,
-        "message": "合规仿真完成",
+        "message": (f"合规仿真完成：疲劳 {round(snap.fatigue_score, 1)}、能耗 {round(snap.energy_kcal, 1)} kcal。"
+                    f"{heat_effect}。能耗只由步数/负重/坡度/地形决定，**温度与湿度都不进这一项**。"),
         "simulation_id": record.simulation_id,
         "final_status": arb.final_status,
         "legal_blocked": arb.legal_blocked,
@@ -1777,6 +1808,8 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
         "energy_kcal": round(snap.energy_kcal, 1),
         "max_required_break_minutes": arb.max_required_break_minutes,
         "total_penalty_score": arb.total_penalty_score,
+        "total_cost_delta": arb.total_cost_delta,
+        "cost_currency": "VND",
         "blocking_rules": [d.rule_code for d in arb.blocking_decisions],
         "warnings": [d.rule_code for d in arb.warnings],
         "applied_actions": [
@@ -1784,12 +1817,16 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
             for a in arb.applied_actions
         ],
         "decision_count": len(arb.decisions),
+        "model_drivers": drivers,
+        "inputs_supplied_but_inert": supplied_inert,
         "scenario": {
             "task_type": task_type,
             "continuous_work_minutes": snap.continuous_work_minutes,
             "temperature_c": snap.environment.temperature_c,
+            "humidity_percent": snap.environment.humidity_percent,
             "load_weight_kg": snap.load_weight_kg,
             "posture_angle_deg": snap.posture_angle_deg,
+            "step_count": snap.step_count,
         },
     }
 

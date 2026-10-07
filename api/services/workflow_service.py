@@ -73,12 +73,30 @@ WORKFLOW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "full_compliance_check": {
         "label": "全面合规检查",
-        "description": "全面人机工程/劳动合规检查：运行一次合规仿真，并回看最近的仿真审计记录。",
+        "description": "全面人机工程/劳动合规检查：运行一次合规仿真，并回看最近的仿真审计记录。"
+                       "可带参数（不带就用标准装配场景）：temperature_c 温度、humidity_percent 湿度、"
+                       "continuous_work_minutes 连续作业分钟、load_weight_kg 负重、"
+                       "posture_angle_deg 姿势角、step_count 步数、task_type 作业类型。"
+                       "用户说了几度就必须把 temperature_c 传进来 —— 早先这里写死空参数，"
+                       "「40℃ 合规检查」实际跑的是默认 30℃，读数没错但答的是另一个场景。",
         "trigger_keywords": [
             "全面合规", "合规检查", "合规自查", "全面合规检查",
         ],
+        # 不带参数也能跑（回落默认场景），所以允许确定性路由；带参数时由模型提取后透传
+        "deterministic_without_params": True,
         "steps": [
-            {"tool": "run_compliance_simulation", "args": {}},
+            {
+                "tool": "run_compliance_simulation",
+                "args": {
+                    "temperature_c": "{user.temperature_c}",
+                    "humidity_percent": "{user.humidity_percent}",
+                    "continuous_work_minutes": "{user.continuous_work_minutes}",
+                    "load_weight_kg": "{user.load_weight_kg}",
+                    "posture_angle_deg": "{user.posture_angle_deg}",
+                    "step_count": "{user.step_count}",
+                    "task_type": "{user.task_type}",
+                },
+            },
             {"tool": "query_simulation_audits", "args": {"limit": 5}},
         ],
     },
@@ -176,7 +194,7 @@ def match_workflow(message: str) -> Optional[str]:
     if not message:
         return None
     for name, wf in WORKFLOW_DEFINITIONS.items():
-        if _workflow_needs_user_params(wf):
+        if _workflow_needs_user_params(wf) and not wf.get("deterministic_without_params"):
             continue
         if any(kw in message for kw in wf.get("trigger_keywords", [])):
             return name

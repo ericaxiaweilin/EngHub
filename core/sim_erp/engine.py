@@ -36,7 +36,13 @@ class SimERPEngine:
     def evaluate(self, physical_input: PhysicalInput, plugins: Iterable[SimulationPlugin]) -> AuditRecord:
         plugin_list = list(plugins)
         legislation_catalog = self._load_legislation_packs(plugin_list)
-        snapshot = self.physics_core.simulate_step(physical_input)
+        # 高温线只在法规包里写一次：物理层与规则层共用同一个阈值，
+        # 否则会出现"规则按 35℃ 判、疲劳按另一个数放大"这种两边都自洽的假象
+        heat_gt = next(
+            (pack.get("heat_allowance", {}).get("temperature_c_gt")
+             for pack in legislation_catalog.values()
+             if isinstance(pack.get("heat_allowance"), dict)), None)
+        snapshot = self.physics_core.simulate_step(physical_input, heat_threshold_c=heat_gt)
         plugin_records = self.plugin_executor.execute_plugins(snapshot, plugin_list, legislation_catalog)
         arbiter_result = self.arbiter.resolve(plugin_records)
         plugin_manifest_hash = self.plugin_executor.hash_manifests(plugin_list)
