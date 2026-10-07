@@ -294,3 +294,200 @@ async def lead_time_evidence(db: AsyncSession, factory_id: str,
                   f"unverified_default 判据：同组料号≥{DEFAULT_SUSPECT_MIN_PARTS} 且该组提前期取值≤"
                   f"{DEFAULT_SUSPECT_MAX_DISTINCT} 个，本件取值==该组众数。"),
     }
+
+# ── 到岗/加班普查：把 attendance 变成引擎能引用的现场边界 ────────────────────
+# 动作约束那一层一直只能说"没人声明过"：加班、双班、缺勤其实现场天天在发生，
+# 只是没人往规则表里写。这几张表有一万一千多行真实打卡，够把"没声明"换成"实测是多少"，
+# 让引擎在缺规则时引用观测值而不是凭空假设（观测仍是候选，不当 binding）。
+OT_FLOOR_HOURS = 10.2      # 超过标称班时 0.2h 以上才算加了班（打卡分钟抖动作不算）
+DOUBLE_SHIFT_FLOOR_HOURS = 19.0
+
+
+ATT_SUMMARY_SQL = text("""
+    SELECT count(*) AS rows, count(DISTINCT operator_id) AS people, count(DISTINCT date) AS days,
+           min(date)::text AS from_day, max(date)::text AS to_day,
+           count(*) FILTER (WHERE status = 'leave') AS leave_rows,
+           count(*) FILTER (WHERE status = 'late') AS late_rows,
+           count(*) FILTER (WHERE status = 'present') AS present_rows,
+           count(*) FILTER (WHERE check_in IS NULL OR check_out IS NULL) AS missing_clock
+    FROM attendance WHERE factory_id = :fid
+""")
+
+ATT_SHIFTS_SQL = text("""
+    WITH h AS (
+        SELECT shift, EXTRACT(EPOCH FROM (check_out - check_in)) / 3600.0 AS hours
+        FROM attendance
+        WHERE factory_id = :fid AND check_in IS NOT NULL AND check_out IS NOT NULL
+    )
+    SELECT shift, count(*) AS rows,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY hours) AS median_hours,
+           max(hours) AS max_hours,
+           count(*) FILTER (WHERE hours > :dbl) AS double_shift,
+           count(*) FILTER (WHERE hours > :ot AND hours <= :dbl) AS over_norm
+    FROM h GROUP BY shift ORDER BY count(*) DESC
+""")
+
+# 段级归属：attendance.operator_id → operators → hr_employees.station（实测机械厂 100% 接得上）
+ATT_SECTIONS_SQL = text("""
+    WITH j AS (
+        SELECT h.station, a.status,
+               EXTRACT(EPOCH FROM (a.check_out - a.check_in)) / 3600.0 AS hours
+        FROM attendance a
+        JOIN operators o ON o.id = a.operator_id
+        JOIN hr_employees h ON h.factory_id = o.factory_id
+             AND (h.employee_code = o.employee_id OR h.id::text = o.employee_id)
+        WHERE a.factory_id = :fid
+    )
+    SELECT station, count(*) AS rows,
+           count(*) FILTER (WHERE status = 'leave') AS leave_rows,
+           (count(*) FILTER (WHERE status = 'leave'))::numeric / nullif(count(*), 0) AS leave_rate,
+           count(*) FILTER (WHERE status = 'late') AS late_rows,
+           count(*) FILTER (WHERE hours > :dbl) AS double_shift,
+           count(*) FILTER (WHERE hours > :ot AND hours <= :dbl) AS over_norm,
+           max(hours) FILTER (WHERE hours <= :dbl) AS max_single_shift_hours
+    FROM j GROUP BY station ORDER BY (count(*) FILTER (WHERE status = 'leave'))::numeric
+         / nullif(count(*), 0) DESC NULLS LAST, count(*) DESC
+""")
+
+ATT_WORST_SECTION_DAY_SQL = text("""
+    WITH j AS (
+        SELECT a.date, h.station, count(*) AS n,
+               count(*) FILTER (WHERE a.status = 'leave') AS lv
+        FROM attendance a
+        JOIN operators o ON o.id = a.operator_id
+        JOIN hr_employees h ON h.factory_id = o.factory_id
+             AND (h.employee_code = o.employee_id OR h.id::text = o.employee_id)
+        WHERE a.factory_id = :fid
+        GROUP BY a.date, h.station
+    )
+    SELECT date::text AS day, station, n AS headcount, lv AS absent,
+           lv::numeric / nullif(n, 0) AS absence_rate
+    FROM j WHERE n >= 4 ORDER BY lv::numeric / nullif(n, 0) DESC NULLS LAST LIMIT 8
+""")
+
+ATT_ATTRIBUTION_SQL = text("""
+    SELECT count(*) AS rows,
+           count(*) FILTER (WHERE h.station IS NOT NULL) AS attributed
+    FROM attendance a
+    JOIN operators o ON o.id = a.operator_id
+    LEFT JOIN hr_employees h ON h.factory_id = o.factory_id
+         AND (h.employee_code = o.employee_id OR h.id::text = o.employee_id)
+    WHERE a.factory_id = :fid
+""")
+
+# 一个人在窗口里是否换过段：换过才谈得上"跨线调人有先例"
+ATT_CROSS_STATION_SQL = text("""
+    WITH p AS (
+        SELECT a.operator_id, count(DISTINCT h.station) AS s
+        FROM attendance a
+        JOIN operators o ON o.id = a.operator_id
+        JOIN hr_employees h ON h.factory_id = o.factory_id
+             AND (h.employee_code = o.employee_id OR h.id::text = o.employee_id)
+        WHERE a.factory_id = :fid
+        GROUP BY a.operator_id
+    )
+    SELECT count(*) FILTER (WHERE s > 1) AS people_changed_station, count(*) AS people
+    FROM p
+""")
+
+
+async def attendance_evidence(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """到岗/加班只读普查：标称班时、加班实例、双班实例、段级缺勤率、最坏段-日。
+
+    取不到的东西一律写进 checked/empty_reason，不折算成假设值：缺 check_out 的行不参与班时
+    统计（另报 missing_clock），接不上人的行不参与段级统计（报 attributed）。
+    """
+    sm = dict((await db.execute(ATT_SUMMARY_SQL, {"fid": factory_id})).mappings().first() or {})
+    if int(sm.get("rows") or 0) == 0:
+        return {
+            "factory_id": factory_id, "available": False,
+            "empty_reason": (f"厂区 {factory_id} 在 attendance 里 0 行 —— 到岗/加班没有任何现场观测，"
+                             "引擎不许把缺勤率当已知量用，只能等人声明或换厂区"),
+            "checked": {"attendance_rows": 0},
+        }
+
+    floors = {"fid": factory_id, "ot": OT_FLOOR_HOURS, "dbl": DOUBLE_SHIFT_FLOOR_HOURS}
+    shifts = [dict(r) for r in (await db.execute(ATT_SHIFTS_SQL, floors)).mappings().all()]
+    sections = [dict(r) for r in (await db.execute(ATT_SECTIONS_SQL, floors)).mappings().all()]
+    worst = [dict(r) for r in (await db.execute(ATT_WORST_SECTION_DAY_SQL, {"fid": factory_id})).mappings().all()]
+    attr = dict((await db.execute(ATT_ATTRIBUTION_SQL, {"fid": factory_id})).mappings().first() or {})
+    cross = dict((await db.execute(ATT_CROSS_STATION_SQL, {"fid": factory_id})).mappings().first() or {})
+
+    # 标称班时取行数最多那个班次（最大班）的中位：加班/双班都相对它算，不在下游再设常数
+    norm = _f(shifts[0]["median_hours"]) if shifts else None
+    over = sum(int(s.get("over_norm") or 0) for s in shifts)
+    dbl = sum(int(s.get("double_shift") or 0) for s in shifts)
+    singles = [_f(s.get("max_single_shift_hours")) for s in sections
+               if _f(s.get("max_single_shift_hours")) is not None]
+    max_single = max(singles) if singles else None
+    leave_rows = int(sm.get("leave_rows") or 0)
+    clocked = int(sm.get("rows") or 0) - int(sm.get("missing_clock") or 0)
+    extra = (round(max_single - norm, 2) if norm and max_single is not None else None)
+
+    out_sections = [{
+        "section": str(s.get("station") or ""), "rows": int(s.get("rows") or 0),
+        "absent_rows": int(s.get("leave_rows") or 0),
+        "absence_rate": round(_f(s.get("leave_rate")) or 0, 4),
+        "late_rows": int(s.get("late_rows") or 0),
+        "double_shift_person_days": int(s.get("double_shift") or 0),
+        "overtime_person_days": int(s.get("over_norm") or 0),
+        "max_single_shift_hours": (round(_f(s.get("max_single_shift_hours")), 2)
+                                   if s.get("max_single_shift_hours") is not None else None),
+    } for s in sections]
+    worst_section = out_sections[0] if out_sections else None
+
+    return {
+        "factory_id": factory_id, "available": True,
+        "window": {"from_day": sm.get("from_day"), "to_day": sm.get("to_day"),
+                   "days": int(sm.get("days") or 0), "people": int(sm.get("people") or 0)},
+        "checked": {"attendance_rows": int(sm.get("rows") or 0), "clocked_rows": clocked,
+                    "missing_clock_rows": int(sm.get("missing_clock") or 0),
+                    "attributed_rows": int(attr.get("attributed") or 0),
+                    "sections_computed": len(out_sections),
+                    "sections_with_absent": sum(1 for o in out_sections if o["absent_rows"])},
+        "shift_norm": {"norm_hours": norm,
+                       "by_shift": [{"shift": str(s.get("shift") or ""),
+                                     "rows": int(s.get("rows") or 0),
+                                     "median_hours": _f(s.get("median_hours")),
+                                     "max_hours": _f(s.get("max_hours")),
+                                     "double_shift": int(s.get("double_shift") or 0),
+                                     "overtime": int(s.get("over_norm") or 0)} for s in shifts]},
+        "overtime": {
+            "observed_person_days": over,
+            "max_observed_hours": round(max_single, 2) if max_single is not None else None,
+            "max_observed_extra_hours": extra,
+            "reading": (f"加班 {over} 人次，单人单日额外最长 {extra}h"
+                        if over and extra is not None else
+                        f"窗口内没有超过 {norm}h 标称班的打卡（加班 0 人次）")},
+        "double_shift": {
+            "observed_person_days": dbl,
+            "top_sections": [{"section": o["section"], "person_days": o["double_shift_person_days"]}
+                             for o in sorted(out_sections, key=lambda x: -x["double_shift_person_days"])[:5]],
+            "reading": (f"两班倒 {dbl} 人次（打卡 ≥{DOUBLE_SHIFT_FLOOR_HOURS:.0f}h）—— "
+                        "这是本店真用过的产能动作，不是假设" if dbl else
+                        f"窗口内没有 ≥{DOUBLE_SHIFT_FLOOR_HOURS:.0f}h 的双班打卡")},
+        "absence": {
+            "overall_rate": (round(leave_rows / clocked, 4) if clocked else None),
+            "absent_rows": leave_rows, "late_rows": int(sm.get("late_rows") or 0),
+            "by_section": out_sections,
+            "worst_section_days": [{"day": w.get("day"), "section": w.get("station"),
+                                    "headcount": int(w.get("headcount") or 0),
+                                    "absent": int(w.get("absent") or 0),
+                                    "absence_rate": round(_f(w.get("absence_rate")) or 0, 4)}
+                                   for w in worst],
+            "reading": (f"段级缺勤最高 {worst_section['section']} "
+                        f"{round(worst_section['absence_rate'] * 100, 1)}%"
+                        if worst_section else "无段级数据")},
+        "observability": {
+            "people_changed_section": int(cross.get("people_changed_station") or 0),
+            "people_tracked": int(cross.get("people") or 0),
+            "note": ("每人在这几张表里静态归属一段，窗口内换段的有 "
+                     f"{int(cross.get('people_changed_station') or 0)} 人 —— 0 说明「跨线调人」在打卡里"
+                     "看不出来（不是没发生，是这张表记不了），引擎不许把它当成「从没调过人」的证据")},
+        "basis": ("attendance(factory_id,date,operator_id,check_in,check_out,shift,status)；"
+                  "段归属=operators.id→operator_id，再按 employee_code/employee_id 接 "
+                  "hr_employees.station；标称班时=行数最多班次的打卡中位；"
+                  f"加班=打卡 >{OT_FLOOR_HOURS}h 且 ≤{DOUBLE_SHIFT_FLOOR_HOURS:.0f}h，"
+                  f"双班=打卡 >{DOUBLE_SHIFT_FLOOR_HOURS:.0f}h；缺勤=status='leave'。"
+                  "本普查只读数，不写回任何表。"),
+    }

@@ -491,6 +491,11 @@ async def _periodic_scheduler():
                         "findings": len(res["findings"]),
                         "actions": changed,
                         "titles": [f["title"][:60] for f in res["findings"]][:3],
+                        # 这一格只在真的跑过那一轮的 tick 里出现；held_open 是"这轮没报但
+                        # 判据住在本文件里，所以不关闭"的格子，cells_without_guard 非空说明
+                        # 新增了数据格子却没进保护名单（缺席就会被当修好，等于自动放行假绿灯）。
+                        "held_open": res.get("held_open"),
+                        "cells_without_guard": res.get("cells_without_guard"),
                     }
         except Exception as e:
             _logger.warning(f"[scheduler] 引擎数据缺口巡检异常: {e}")

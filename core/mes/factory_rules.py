@@ -302,9 +302,21 @@ async def pending_rules(db: AsyncSession, factory_id: str, *, limit: int = 20) -
         FROM factory_rules WHERE factory_id = :fid AND status = 'candidate'
         ORDER BY updated_at DESC LIMIT :lim
     """), {"fid": factory_id, "lim": int(limit)})).mappings().all()
-    return [{"rule_id": r["id"], "kind": r["kind"], "subject": r["subject"], "verdict": r["verdict"],
-             "statement": r["statement"], "params": _json(r["params"]), "source": r["source"],
-             "evidence": _json(r["evidence"]), "observed_at": str(r["updated_at"])} for r in rows]
+    # 同一条事实被不同版本各写过一次时（旧版本没带判别键），列表里会并排出现两行一样的话，
+    # 读起来像"发现了两条规律"。按 (subject, statement) 去重留最新一条，其余不重复问人。
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        sig = (str(r["subject"]), str(r["statement"]))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append({"rule_id": r["id"], "kind": r["kind"], "subject": r["subject"],
+                    "verdict": r["verdict"], "statement": r["statement"],
+                    "params": _json(r["params"]), "source": r["source"],
+                    "evidence": _json(r["evidence"]), "observed_at": str(r["updated_at"]),
+                    "duplicate_rows": 0})
+    return out
 
 
 async def confirm_rule(db: AsyncSession, factory_id: str, *, rule_id: str, agree: bool,
@@ -313,7 +325,8 @@ async def confirm_rule(db: AsyncSession, factory_id: str, *, rule_id: str, agree
 
     只动 candidate 状态的行：已声明的厂规不是系统能替人改的东西。
     """
-    row = (await db.execute(text("SELECT id, status, subject, kind FROM factory_rules WHERE id = :id"),
+    row = (await db.execute(text("SELECT id, status, subject, kind, statement FROM factory_rules "
+                                 "WHERE id = :id"),
                             {"id": str(rule_id)})).mappings().first()
     if not row:
         return {"error": f"rule_id {rule_id} 不存在"}
@@ -328,9 +341,17 @@ async def confirm_rule(db: AsyncSession, factory_id: str, *, rule_id: str, agree
         WHERE id = :id
     """), {"st": new_status, "who": str(actor or "unknown"), "note": str(note or "")[:300],
            "id": str(rule_id)})
+    # 同一条事实的重复行（旧版本没带判别键留下的）一起收：只改人点的那一行的话，
+    # 另一行还挂着 candidate，下一轮又会拿同一句话再问一次人。
+    dup = (await db.execute(text("""
+        UPDATE factory_rules SET status = :st, confirmed_by = :who, updated_at = NOW()
+        WHERE factory_id = :fid AND subject = :sub AND statement = :stmt AND id <> :id
+          AND status = 'candidate'
+    """), {"st": new_status, "who": str(actor or "unknown"), "fid": factory_id,
+           "sub": row["subject"], "stmt": row["statement"], "id": str(rule_id)})).rowcount
     await db.commit()
     return {"rule_id": str(rule_id), "subject": row["subject"], "status": new_status,
-            "confirmed_by": actor,
+            "confirmed_by": actor, "duplicate_rows_collapsed": int(dup or 0),
             "effect": ("这条现在开始过滤引擎的候选动作" if agree else
                        "已驳回：不再当候选提出，记录留着，规则要改就明确改判")}
 
@@ -438,8 +459,73 @@ async def record_candidates_from_census(db: AsyncSession, factory_id: str, *,
             await upsert_rule(db, factory_id, subject=subject, verdict=verdict, kind="constraint",
                               statement=stmt[:900], status="candidate", source="derived",
                               params=item["params"], evidence=item["evidence"], discriminator=key)
+    try:
+        from core.mes.data_evidence import attendance_evidence
+
+        att = await attendance_evidence(db, factory_id)
+    except Exception:  # noqa: BLE001  打卡普查查不动时只出花名册那几条，别把整段带崩
+        att = {}
+    norm = (att.get("shift_norm") or {}).get("norm_hours")
+    att_items: List[Dict[str, Any]] = []
+    if att.get("available"):
+        ds = att.get("double_shift") or {}
+        ot = att.get("overtime") or {}
+        ab = att.get("absence") or {}
+        n_ds = int(ds.get("observed_person_days") or 0)
+        extra = ot.get("max_observed_extra_hours")
+        if n_ds:
+            top = "、".join(f"{s.get('section')} {s.get('person_days')} 人次"
+                            for s in (ds.get("top_sections") or [])[:3])
+            att_items.append({
+                "subject": "extra_crew", "verdict": "bounded",
+                "statement": (f"打卡实测两班倒 {n_ds} 人次（{top}），标称班时 {norm}h —— "
+                              "双班是这座厂真用过的加人/顶班动作，引擎该把它列为可用动作，"
+                              "而不是停在'没人声明过'"),
+                "params": {"observed_person_days": n_ds, "norm_hours": norm,
+                           "top_sections": ds.get("top_sections")},
+                "discriminator": "attendance_double_shift",
+                "evidence": {"window": att.get("window"), "checked": att.get("checked"),
+                             "basis": att.get("basis")}})
+        if extra is not None:
+            att_items.append({
+                "subject": "add_overtime", "verdict": "bounded",
+                "statement": (f"打卡实测加班 {ot.get('observed_person_days')} 人次，"
+                              f"单人单日额外最长 {extra}h（标称 {norm}h）—— "
+                              "现场加班没越过 2h，这条上限有实到依据，不是拍出来的"),
+                "params": {"observed_person_days": ot.get("observed_person_days"),
+                           "max_extra_hours": extra, "norm_hours": norm},
+                "discriminator": "attendance_overtime",
+                "evidence": {"window": att.get("window"), "checked": att.get("checked"),
+                             "basis": att.get("basis")}})
+        worst = (ab.get("worst_section_days") or [])[:1]
+        if worst:
+            w = worst[0]
+            att_items.append({
+                "subject": "cross_line_transfer", "verdict": "bounded",
+                "statement": (f"整段同时缺人的极值：{w.get('day')} {w.get('section')} "
+                              f"{w.get('absent')}/{w.get('headcount')} 人没来"
+                              f"（{round((w.get('absence_rate') or 0) * 100, 1)}%）—— "
+                              "顶班/借人该按这种段-日极值配，全厂平均缺勤率会把风险摊平看不出来"),
+                "params": {"day": w.get("day"), "section": w.get("section"),
+                           "absence_rate": w.get("absence_rate"),
+                           "overall_absence_rate": ab.get("overall_rate")},
+                "discriminator": "attendance_worst_section_day",
+                "evidence": {"window": att.get("window"),
+                             "worst_section_days": ab.get("worst_section_days"),
+                             "basis": att.get("basis")}})
+    for item in att_items:
+        made.append(item)
+        if apply:
+            await upsert_rule(db, factory_id, subject=item["subject"], verdict=item["verdict"],
+                              kind="constraint", statement=str(item["statement"])[:900],
+                              status="candidate", source="derived", params=item["params"],
+                              evidence=item["evidence"], discriminator=item["discriminator"])
+
     return {"factory_id": factory_id, "candidates": made, "written": bool(apply),
-            "note": "全是 candidate：从花名册推出来的人数不能当放行依据，要现场确认才升 declared/validated"}
+            "attendance_available": bool(att.get("available")),
+            "attendance_empty_reason": att.get("empty_reason"),
+            "note": ("全是 candidate：从花名册与打卡表推出来的数不能当放行依据，要现场确认才升 "
+                     "declared/validated。打卡表只证明「做过多少次」，不证明「做了就更早完工」")}
 
 
 async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: int = 50,
@@ -462,6 +548,22 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
     by_product: Dict[str, List[Dict[str, Any]]] = {}
     for o in orders:
         by_product.setdefault(str(o["product_id"]), []).append(o)
+    # 执行台账按动作聚合一次：这 6 个动作原来只能挂"没通道"，现在现场记过一笔就能升档。
+    # 分级看的是"谁记的"，仿真身份记的仍算仿真，不会因为表里有行就变成现场事实。
+    exec_by_action: Dict[str, Dict[str, Any]] = {}
+    for r in (await db.execute(text("""
+        SELECT action, count(*) AS n, array_agg(DISTINCT actor) AS actors
+        FROM execution_events WHERE factory_id = :fid GROUP BY action
+    """), {"fid": factory_id})).mappings().all():
+        exec_by_action[str(r["action"])] = {"n": int(r["n"] or 0),
+                                            "actors": [str(x) for x in (r["actors"] or []) if x]}
+    cls_cache: Dict[str, str] = {}
+
+    async def _cls(name: str) -> str:
+        if name not in cls_cache:
+            cls_cache[name] = await actor_class(db, name)
+        return cls_cache[name]
+
     rows: List[Dict[str, Any]] = []
     for t in tasks:
         payload = _json(t["payload"])
@@ -477,13 +579,17 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
             # 结果质量必须分级：这些工单的计划量/交期是厂里的，但 good_qty 是自家仿真时钟报的工
             # 质量分级看三件事：有没有连到工单、工单里那笔量是谁写的、动作本身有没有执行通道
             actors = {str(c.get("updated_by") or c.get("created_by") or "") for c in linked} - {""}
-            classes = {await actor_class(db, x) for x in actors}
-            human = "human" in classes
+            classes = {await _cls(x) for x in actors}
             started = any(c.get("actual_start") for c in linked)
-            quality = ("no_execution_channel" if str(a.get("type") or "") in NO_CHANNEL_ACTIONS else
-                       "verified_human" if (linked and human and started) else
-                       "verified_agent" if (linked and started and classes & {"agent", "unknown"}) else
-                       "verified_simulation" if (linked and started) else
+            atype = str(a.get("type") or "")
+            ev = exec_by_action.get(atype) or {"n": 0, "actors": []}
+            classes |= {await _cls(x) for x in ev["actors"]}
+            # "确实做过"有两种凭证：连到的工单真开了工，或执行台账里记了这一动作一笔
+            did = bool(linked and started) or int(ev["n"]) > 0
+            quality = ("no_execution_channel" if (atype in NO_CHANNEL_ACTIONS and not ev["n"]) else
+                       "verified_human" if ("human" in classes and did) else
+                       "verified_agent" if (did and classes & {"agent", "unknown"}) else
+                       "verified_simulation" if did else
                        "mixed_simulation" if linked else "no_linked_order")
             rows.append({
                 "id": f"dec-{t['id']}-{i}", "factory_id": factory_id, "occurred_at": t["created_at"],
@@ -497,8 +603,11 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
                             "orders_linked": len(linked), "planned_units": planned,
                             "good_units": good,
                             "achievement_rate": round(good / planned, 3) if planned else None,
+                            "executions_recorded": int(ev["n"]),
                             "outcome_quality": quality},
-                "outcome_source": ("work_order_actuals" if quality.startswith("verified") else
+                "outcome_source": ("execution_events" if (quality.startswith("verified")
+                                                           and ev["n"] and not linked) else
+                                   "work_order_actuals" if quality.startswith("verified") else
                                    "work_order_with_sim_reports" if quality == "mixed_simulation" else
                                    "no_channel" if quality == "no_execution_channel" else
                                    "no_linked_order"),

@@ -139,14 +139,17 @@ export default function PmcWorkbench() {
 
   const loadRuleFlow = useCallback(async () => {
     try {
-      const [q, e]: any = await Promise.all([
+      const [q, e, c]: any = await Promise.all([
         api.get('/api/v1/pmc/open-rule-questions', { params: { factory_id: factoryId } }),
         api.get('/api/v1/pmc/execution-events', { params: { factory_id: factoryId, days: 30 } }),
+        api.get('/api/v1/pmc/action-constraints', { params: { factory_id: factoryId } }),
       ])
       const pr: any = await api.get('/api/v1/pmc/measurement-priority', {
         params: { factory_id: factoryId, units: 1200 } })
       setRuleFlow({ questions: q?.open_questions || [], pending: q?.pending_candidates || [],
-                   census: q?.workforce_census || null, events: e?.events || [] })
+                   census: q?.workforce_census || null, events: e?.events || [],
+                   staff: c?.attendance_observed || null,
+                   otRule: (c?.actions || []).find((a: any) => a.action === 'add_overtime') || null })
       setPriority({ parts: pr?.total_parts_in_critical_tiers ?? null,
                     ratio: pr?.calibration?.median_ratio ?? null,
                     n: pr?.calibration?.n_materials ?? 0,
@@ -471,6 +474,43 @@ export default function PmcWorkbench() {
                     </Space>
                   </List.Item>
                 )} />
+            )}
+            {!!ruleFlow.staff && (
+              <div style={{ marginTop: 8 }}>
+                <Text strong style={{ fontSize: 12 }}>到岗与加班实测（打卡表读出来的，不是声明）</Text>
+                {ruleFlow.staff.available === false ? (
+                  <div><Text type="danger" style={{ fontSize: 12 }}>
+                    {ruleFlow.staff.why || '这个厂区在 attendance 里没有行，缺勤率无从谈起'}
+                  </Text></div>
+                ) : (
+                  <>
+                    <div><Text type="secondary" style={{ fontSize: 12 }}>
+                      {ruleFlow.staff.window?.from_day} ~ {ruleFlow.staff.window?.to_day}
+                      （{ruleFlow.staff.window?.days} 天 · {ruleFlow.staff.window?.people} 人）
+                      · 标称班时 {ruleFlow.staff.shift_norm?.norm_hours}h
+                      · {ruleFlow.staff.overtime?.reading}
+                      · {ruleFlow.staff.double_shift?.reading}
+                    </Text></div>
+                    <div><Text type="secondary" style={{ fontSize: 12 }}>
+                      缺勤 {Math.round((ruleFlow.staff.absence?.overall_rate || 0) * 1000) / 10}%
+                      ，最高 {(ruleFlow.staff.sections || []).slice(0, 3).map((s: any) =>
+                        `${s.section} ${Math.round(s.absence_rate * 1000) / 10}%`).join('、')}
+                      {(() => {
+                        // 是否越线只认后端算好的布尔值：读不到就不写结论，
+                        // 更不许把 undefined 当成"没超线/超线"报给人看。
+                        const o = ruleFlow.otRule?.observed
+                        const cap = ruleFlow.otRule?.binding_rule?.params?.max_hours_per_day
+                        if (typeof o?.respects_declared_cap !== 'boolean' || cap == null) return null
+                        return (
+                          <Text style={{ fontSize: 12 }}> ｜ 声明的上限 {cap}h
+                            ，实测额外最长 {o.max_extra_hours}h
+                            —— {o.respects_declared_cap ? '窗口内现场没越过线' : '现场已经超线'}</Text>
+                        )
+                      })()}
+                    </Text></div>
+                  </>
+                )}
+              </div>
             )}
             {!!priority && (
               <div style={{ marginTop: 8 }}>

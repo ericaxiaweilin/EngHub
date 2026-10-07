@@ -100,15 +100,58 @@ def _tokens(arr_text: Any) -> List[str]:
 
 
 def _verdict(action: str, verdict: str, why: str, *, checked: Dict[str, Any],
-             bound: Optional[Dict[str, Any]] = None, gap: Optional[str] = None) -> Dict[str, Any]:
+             bound: Optional[Dict[str, Any]] = None, gap: Optional[str] = None,
+             observed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     out = {"action": action, "meaning": ACTIONS.get(action, action), "verdict": verdict,
            "why": why, "checked": checked}
     if bound:
         out["bound"] = bound
+    if observed:
+        # 现场观测不等于声明：规则没落库时这里给"厂里实际怎么做过的数"，
+        # 引擎可以引用它排序候选，但不许拿它当 binding 边界。
+        out["observed"] = observed
     if gap:
         out["gap_to_make_it_binding"] = gap
         out["gap_owner"] = GAP_OWNER.get(gap)
     return out
+
+
+def _opt_float(v: Any) -> Optional[float]:
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _observed_attendance(att: Dict[str, Any], *, action: str,
+                         cap_hours: Optional[float] = None) -> Dict[str, Any]:
+    """把到岗普查里跟这个动作有关的读数挑出来；查不到就明说查不到，不填假设值。"""
+    if not att or not att.get("available"):
+        return {"available": False,
+                "why": (att or {}).get("empty_reason")
+                       or "attendance 普查没跑成（不是没有加班，是没读到数）"}
+    if action == "add_overtime":
+        ot = att.get("overtime") or {}
+        extra = ot.get("max_observed_extra_hours")
+        block = {"window": att.get("window"), "person_days": ot.get("observed_person_days"),
+                 "max_extra_hours": extra, "reading": ot.get("reading"),
+                 "norm_hours": (att.get("shift_norm") or {}).get("norm_hours")}
+        if cap_hours is not None and extra is not None:
+            block["respects_declared_cap"] = float(extra) <= float(cap_hours)
+            block["cap_hours"] = float(cap_hours)
+        return block
+    if action == "extra_crew":
+        ds = att.get("double_shift") or {}
+        ab = att.get("absence") or {}
+        return {"window": att.get("window"), "double_shift_person_days": ds.get("observed_person_days"),
+                "top_sections": ds.get("top_sections"), "reading": ds.get("reading"),
+                "overall_absence_rate": ab.get("overall_rate"),
+                "worst_sections": [{"section": s["section"], "absence_rate": s["absence_rate"]}
+                                   for s in (ab.get("by_section") or [])[:4]]}
+    if action == "cross_line_transfer":
+        return dict(att.get("observability") or {}, window=att.get("window"))
+    return {"available": True, "window": att.get("window"),
+            "why": f"{action} 没有对应的到岗观测口径（attendance 只记出勤/班时）"}
 
 
 def policy_actions(pol: Dict[str, Any]) -> List[str]:
@@ -152,6 +195,12 @@ async def action_constraints(db: AsyncSession, factory_id: str,
         declared = await binding_rules(db, factory_id)
     except Exception:  # noqa: BLE001  规则表查不动时退回 undeclared，不能把"没读到"当成"没规则"
         declared = {}
+    try:
+        from core.mes.data_evidence import attendance_evidence
+
+        att = await attendance_evidence(db, factory_id)
+    except Exception:  # noqa: BLE001  普查查不动时报"没读到数"，不许退化成"厂里没加过班"
+        att = {}
     out: List[Dict[str, Any]] = []
     gaps: Dict[str, Dict[str, Any]] = {}
 
@@ -217,18 +266,24 @@ async def action_constraints(db: AsyncSession, factory_id: str,
                             "系统现在无法判断「谁能顶哪个工位」，任何调人建议都没有依据；"
                             f"人的技能有 {emp.get('with_skill_level') or 0} 人填了等级，但资格证书只有 "
                             f"{emp.get('with_certs') or 0} 行",
-                            checked=checked, gap="station_capacity.required_skills"))
+                            checked=checked,
+                            observed=_observed_attendance(att, action="cross_line_transfer"),
+                            gap="station_capacity.required_skills"))
         add_gap("station_capacity.required_skills", ["cross_line_transfer"], checked)
     else:
         out.append(_verdict("cross_line_transfer", "allowed_bounded",
                             f"{filled}/{len(stations)} 个工位声明了技能需求，可按等级匹配筛人",
-                            checked=checked, bound={"stations_with_requirements": filled}))
+                            checked=checked, bound={"stations_with_requirements": filled},
+                            observed=_observed_attendance(att, action="cross_line_transfer")))
 
     # 4) 加班：没有任何加班上限落库 → 不能自动推荐，只能等人写规则
+    ot_cap = ((declared.get("add_overtime") or {}).get("params") or {}).get("max_hours_per_day")
     out.append(_verdict("add_overtime", "undeclared",
                         "厂里没有加班上限这张表/这一列（hours_per_day 是班时，不是加班上限）→ "
                         "系统不能自动建议加班多少小时",
                         checked={"line_profiles": len(lines), "overtime_policy_rows": 0},
+                        observed=_observed_attendance(att, action="add_overtime",
+                                                      cap_hours=_opt_float(ot_cap)),
                         gap="overtime_policy.max_hours_per_day"))
     add_gap("overtime_policy.max_hours_per_day", ["add_overtime"], {"overtime_policy_rows": 0})
 
@@ -241,7 +296,8 @@ async def action_constraints(db: AsyncSession, factory_id: str,
                          " —— 人多不等于产出高，除非瓶颈在工时那一侧")
                         if line is not None else "没给线",
                         checked={"line": (line or {}).get("line_code"), "crew_size": crew,
-                                 "declared_units_per_day": per_day}))
+                                 "declared_units_per_day": per_day},
+                        observed=_observed_attendance(att, action="extra_crew")))
 
     # 6) 加急：目标值取决于原提前期有没有实测；台账是铺的默认值时"加急到 N 天"无从校验
     buy_rows = int(lead.get("buy_rows") or 0)
@@ -309,6 +365,17 @@ async def action_constraints(db: AsyncSession, factory_id: str,
               **({"resolved_by_rule": g["resolved_by_rule"]} if g.get("resolved_by_rule") else {})}
              for g in gaps.values() if g["actions"]],
             key=lambda x: x["column"]),
+        "attendance_observed": ({
+            "window": att.get("window"), "checked": att.get("checked"),
+            "shift_norm": att.get("shift_norm"), "overtime": att.get("overtime"),
+            "double_shift": att.get("double_shift"),
+            "absence": {k: v for k, v in (att.get("absence") or {}).items() if k != "by_section"},
+            "sections": (att.get("absence") or {}).get("by_section"),
+            "observability": att.get("observability"), "basis": att.get("basis"),
+        } if att.get("available") else {
+            "available": False,
+            "why": att.get("empty_reason") or "到岗普查没跑成（不是厂里没有出勤）",
+        }),
         "rule": ("forbidden=有声明说不行；allowed_bounded=能做但上限来自落库数据；"
                  "undeclared=厂里没人写过这条规则 —— 一律不进候选推荐，并点名要填哪一列。"
                  "规则负责'不能胡来'，数据只在能做的事情里比较哪个最有效。"),
