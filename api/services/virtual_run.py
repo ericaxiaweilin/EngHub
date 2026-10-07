@@ -401,7 +401,9 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
             if kind == "外购":
                 if str(lead or "").isdigit() and int(lead) >= 0:
                     scaled = max(0, int(round(int(lead) * max(0.0, float(lead_multiplier)))))
-                    buy_arrival_days.append(start_day + scaled)
+                    arrival_day = start_day + scaled
+                    buy_arrival_days.append(arrival_day)
+                    entry["arrival_day"] = arrival_day
                     entry["action"] = f"开采购 {round(short, 3)}，{scaled} 天后到"
                 else:
                     entry["action"] = "外购缺料但没有提前期 → 无法排到货日"
@@ -412,7 +414,25 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
                 entry["action"] = "采购属性未知 → 不假设有货，列为主数据缺口"
                 blockers.append(f"{code} 未标自制/外购")
         lines.append(entry)
+    # "先去量哪几个件"要能回答：决定开工日的是**最长那批到货日**，并列的几个必须一起量 ——
+    # 只量其中一个，second_arrival_day 还是同一天，交期一天也买不回来。
+    arrival_pairs = sorted(
+        [(int(l.get("arrival_day")), l) for l in lines
+         if l.get("make_or_buy") == "外购" and l.get("short", 0) > 0 and l.get("arrival_day") is not None],
+        key=lambda x: -x[0])
+    top_arrival = arrival_pairs[0][0] if arrival_pairs else None
+    critical_parts = [{"material_code": str(l["material_code"]), "arrival_day": d,
+                       "lead_time_days": l.get("lead_time_days"),
+                       "lead_evidence": l.get("lead_evidence"),
+                       "short": l.get("short")} for d, l in arrival_pairs
+                      if top_arrival is not None and d == top_arrival][:20]
+    lower = [d for d, _ in arrival_pairs if top_arrival is not None and d < top_arrival]
+    second_arrival = lower[0] if lower else None
     return {"lines": lines, "buy_arrival_days": buy_arrival_days,
+            "arrival_critical_parts": critical_parts,
+            "arrival_critical_count": sum(1 for d, _ in arrival_pairs
+                                          if top_arrival is not None and d == top_arrival),
+            "second_arrival_day": second_arrival,
             "bottleneck_part": kit_bottleneck[0],
             "blockers": blockers, "material_cost": round(cost, 2),
             "materials_without_price": int(cost_unknown)}
@@ -703,6 +723,9 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "standby_cost_if_line_held_usd": round(run["idle_person_days_before_start"]
                                                * DEFAULT_LABOR_COST_PER_PERSON_DAY * IDLE_COST_WEIGHT, 2),
         "bottleneck_part": kit["bottleneck_part"],
+        "arrival_critical_parts": kit.get("arrival_critical_parts"),
+        "arrival_critical_count": kit.get("arrival_critical_count"),
+        "second_arrival_day": kit.get("second_arrival_day"),
         # 峰值负载 = 需要的相对人力。健康是 0.70~0.95：太低是养闲，太高没有缓冲。
         # 不能写成"越低越好"，否则引擎会永远多开线（那条线的代价没人付）。
         "load_band_gap": load_band_gap(peak_load_ratio(kit_lead_of(kit), due, today, units,
