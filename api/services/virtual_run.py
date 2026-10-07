@@ -956,7 +956,7 @@ async def recommendation_followthrough(db: AsyncSession, factory_id: str,
 # 动作排序：先"今天就能下单/开工"的，再"要人去确认"的，最后是主数据缺口。
 _ACTION_PRIORITY = {"expedite_purchase": 0, "supplier_master_missing": 1, "start_first_batch": 2,
                     "schedule_second_batch_after_arrival": 3, "activate_parallel_line": 4,
-                    "authorize_overtime": 5, "model_data_gap": 6, "master_data_gap": 7}
+                    "extra_crew": 5, "model_data_gap": 6, "master_data_gap": 7}
 
 
 def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
@@ -1009,9 +1009,16 @@ def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
                         "note": ("开第二条线按组内声明的合并产能算（不是单线×线数）；"
                                  "要的人手没有技能矩阵佐证，先按'能开'算钱、按'待确认'报人")})
         if float(pol.get("crew_bonus") or 0) > 0:
-            out.append({**base, "type": "authorize_overtime",
-                        "extra_crew_share": round(float(pol["crew_bonus"]), 3),
-                        "note": f"加班加人 {float(pol['crew_bonus']):.0%}，成本已计入人工口径"})
+            # 词表里只有 extra_crew / add_overtime 两个动作名；引擎这一档是"产能乘一个系数"，
+            # 到底是加人/双班还是加班，是厂里的决定，模型不能替它选（写成 authorize_overtime
+            # 会让约束层、决策台账、采纳回查三处都认不出这个动作）。
+            out.append({**base, "type": "extra_crew",
+                        "capacity_share": round(float(pol["crew_bonus"]), 3),
+                        "basis": "capacity_multiplier",
+                        "could_be": ["extra_crew", "add_overtime"],
+                        "note": (f"这一档把日产能乘 {1 + float(pol['crew_bonus']):.2f}"
+                                 "（成本已计入人工口径）。落地要选一种：加人/双班，还是加班——"
+                                 "加班受厂规上限与现场实测约束，双班要有夜班人手，这个选择引擎不替做")})
         bp = d.get("bottleneck_part") or {}
         if pol.get("expedite_lead_days") is not None and bp and float(bp.get("short") or 0) > 0:
             target = int(pol["expedite_lead_days"])

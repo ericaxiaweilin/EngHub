@@ -149,7 +149,13 @@ export default function PmcWorkbench() {
       setRuleFlow({ questions: q?.open_questions || [], pending: q?.pending_candidates || [],
                    census: q?.workforce_census || null, events: e?.events || [],
                    staff: c?.attendance_observed || null,
-                   otRule: (c?.actions || []).find((a: any) => a.action === 'add_overtime') || null })
+                   otRule: (c?.actions || []).find((a: any) => a.action === 'add_overtime') || null,
+                   usage: (c?.actions || [])
+                     .filter((a: any) => a.usage && (a.usage.considered_last_grid || a.usage.recorded_executions_30d))
+                     .map((a: any) => ({ action: a.action,
+                                         considered_last_grid: a.usage.considered_last_grid,
+                                         recorded: a.usage.recorded_executions_30d,
+                                         reading: a.usage.reading })) })
       setPriority({ parts: pr?.total_parts_in_critical_tiers ?? null,
                     ratio: pr?.calibration?.median_ratio ?? null,
                     n: pr?.calibration?.n_materials ?? 0,
@@ -510,6 +516,14 @@ export default function PmcWorkbench() {
                     </Text></div>
                   </>
                 )}
+              </div>
+            )}
+            {!!ruleFlow.usage && (
+              <div style={{ marginTop: 8 }}>
+                <Text strong style={{ fontSize: 12 }}>动作有没有人碰过（引擎网格想过几次 vs 现场记了几次）</Text>
+                <div><Text type="secondary" style={{ fontSize: 12 }}>
+                  {ruleFlow.usage.map((u: any) => `${u.action}：想 ${u.considered_last_grid ?? '—'} / 记 ${u.recorded}`).join('　·　')}
+                </Text></div>
               </div>
             )}
             {!!priority && (

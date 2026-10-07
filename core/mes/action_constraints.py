@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
@@ -172,6 +173,56 @@ def policy_actions(pol: Dict[str, Any]) -> List[str]:
     return acts
 
 
+CARD_COVERAGE_SQL = text("""
+    SELECT detail->'action_coverage' AS cov, created_at
+    FROM simulation_scorecards
+    WHERE factory_id = :fid AND jsonb_exists(detail, 'action_coverage')
+    ORDER BY created_at DESC LIMIT 1
+""")
+
+EXEC_30D_SQL = text("""
+    SELECT action, count(*) AS n FROM execution_events
+    WHERE factory_id = :fid AND occurred_at >= NOW() - INTERVAL '30 days'
+    GROUP BY action
+""")
+
+
+def _usage_reading(considered: Optional[int], recorded: int,
+                  coverage_known: bool) -> str:
+    """把"现场没做"和"引擎没提"分开说 —— 这两个的下一步动作完全不同。"""
+    if not coverage_known:
+        return (f"近 30 天现场记了 {recorded} 次；引擎侧没有上一张记分卡，"
+                "覆盖度无从判断（读成 0 次是假话）")
+    n = int(considered or 0)
+    if n and not recorded:
+        return f"引擎这轮的政策网格想过 {n} 次，现场 30 天一次都没记 —— 要么没做，要么做了没记"
+    if not n and recorded:
+        return f"现场记了 {recorded} 次，但引擎这轮没把它列进候选（政策网格缺这个杠杆）"
+    if n and recorded:
+        return f"引擎想过 {n} 次、现场记了 {recorded} 次 —— 这个动作有来有回"
+    return "引擎没提、现场没记：这条动作现在是空的"
+
+
+async def _grid_usage(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """上一张记分卡的动作覆盖度 + 近 30 天执行台账计数（都取不到时返回空，不假装是 0）。"""
+    cov: Dict[str, Any] = {}
+    at = None
+    row = (await db.execute(CARD_COVERAGE_SQL, {"fid": factory_id})).mappings().first()
+    if row:
+        at = str(row["created_at"])
+        raw = row["cov"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                raw = {}
+        cov = dict(raw or {})
+    execs = {str(r["action"]): int(r["n"] or 0) for r in
+             (await db.execute(EXEC_30D_SQL, {"fid": factory_id})).mappings().all()}
+    return {"coverage": cov, "coverage_known": bool(cov), "card_at": at,
+            "executions_30d": execs}
+
+
 async def action_constraints(db: AsyncSession, factory_id: str,
                              model: Optional[str] = None,
                              line_code: Optional[str] = None,
@@ -201,6 +252,10 @@ async def action_constraints(db: AsyncSession, factory_id: str,
         att = await attendance_evidence(db, factory_id)
     except Exception:  # noqa: BLE001  普查查不动时报"没读到数"，不许退化成"厂里没加过班"
         att = {}
+    try:
+        usage = await _grid_usage(db, factory_id)
+    except Exception:  # noqa: BLE001  记分卡读不动时不写覆盖度，也不写 0
+        usage = {"coverage": {}, "coverage_known": False, "card_at": None, "executions_30d": {}}
     out: List[Dict[str, Any]] = []
     gaps: Dict[str, Dict[str, Any]] = {}
 
@@ -353,10 +408,27 @@ async def action_constraints(db: AsyncSession, factory_id: str,
     counts: Dict[str, int] = {}
     for o in out:
         counts[o["verdict"]] = counts.get(o["verdict"], 0) + 1
+        name = str(o["action"])
+        cov = (usage["coverage"].get(name) or {})
+        rec = int(usage["executions_30d"].get(name) or 0)
+        o["usage"] = {"considered_last_grid": (int(cov.get("times_considered") or 0)
+                                              if usage["coverage_known"] else None),
+                      "grid_policies": cov.get("policies") or [],
+                      "grid_scenarios": cov.get("scenarios") or [],
+                      "recorded_executions_30d": rec,
+                      "reading": _usage_reading(cov.get("times_considered"), rec,
+                                                usage["coverage_known"])}
     return {
         "factory_id": factory_id, "model": model, "line": line_code, "state": state,
         "generated": len(out), "of_candidate_actions": len(ACTIONS),
         "verdict_counts": counts,
+        "grid_usage_basis": {"card_at": usage["card_at"],
+                             "coverage_known": usage["coverage_known"],
+                             "note": ("considered_last_grid 取自**最近一张带覆盖度的记分卡**"
+                                      f"（{usage['card_at'] or '无'}）的政策×天气网格，含没被选中的政策；"
+                                      "recorded_executions_30d 来自 execution_events。"
+                                      "两边都是 0 才叫「这动作没人碰过」"),
+                             "actions_in_grid": sorted(usage["coverage"].keys())},
         "actions": out,
         "declared_rules_applied": sorted(str(v.get("subject")) for v in declared.values()),
         "constraint_gaps": sorted(

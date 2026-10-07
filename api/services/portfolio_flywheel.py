@@ -62,6 +62,31 @@ LATEST_SQL = text("""
 """)
 
 
+def _action_coverage(scan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """这一轮的政策×天气网格里，每个动作被考虑过几次 —— 没被考虑过的动作不可能有现场采纳记录。
+
+    只有赢家进 actions，学习侧就永远收不到其余动作的样本（实测 17 条动作全是催购/分批那几类）。
+    这份覆盖度不改任何推演结论，只是把"引擎想过但没选中"记下来，供约束层和界面区分
+    "现场没做" 与 "引擎根本没提"。
+    """
+    from core.mes.action_constraints import policy_actions
+
+    cov: Dict[str, Dict[str, Any]] = {}
+    for sname, block in (scan.get("by_scenario") or scan.get("per_scenario") or {}).items():
+        for sol in (block.get("solutions") or []):
+            pol = sol.get("policy") or {}
+            for a in policy_actions(pol):
+                c = cov.setdefault(a, {"times_considered": 0, "policies": set(),
+                                       "scenarios": set()})
+                c["times_considered"] += 1
+                c["policies"].add(str(sol.get("name") or ""))
+                c["scenarios"].add(str(sname))
+    return {k: {"times_considered": int(v["times_considered"]),
+                "policies": sorted(x for x in v["policies"] if x),
+                "scenarios": sorted(v["scenarios"])}
+            for k, v in sorted(cov.items(), key=lambda kv: -kv[1]["times_considered"])}
+
+
 def _as_dict(val: Any) -> Dict[str, Any]:
     """jsonb 列在 asyncpg 下可能是 str 也可能是 dict：两种都接，别让解析失败静默变成空读数。"""
     if isinstance(val, dict):
@@ -368,9 +393,11 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
     signature = receipt_signature
     last = prev      # 同一张上一轮记分卡，热启动标定与变更比较都读它，不查第二遍
     changed = (not last) or str((last or {}).get("top_constraint") or "") != signature
+    coverage = _action_coverage(tuned.get("final_scan") or {})
     receipt = {"factory_id": factory_id, "apply": apply, "changed": changed,
                "robust_recommendation": robust, "by_scenario": per_scenario,
                "actions": actions, "action_count": len(actions),
+               "action_coverage": coverage,
                "lever_economics": levers.get("ranked") or [],
                "mapping_accuracy": levers.get("overall_accuracy"),
                "followthrough": followthrough or {"checked": 0,
@@ -429,6 +456,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         "top": signature,
         "levers": json.dumps(robust, ensure_ascii=False),
         "detail": json.dumps({"actions": actions[:20],
+                              "action_coverage": _action_coverage(tuned.get("final_scan") or {}),
                               "lever_economics": (levers.get("ranked") or [])[:8],
                               "mapping_accuracy": levers.get("overall_accuracy"),
                               "by_scenario": per_scenario,
@@ -486,6 +514,12 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                    if ft.get("checked") else "")
         lever_lines = [f"· {r['lever']}：{r['reads_as']}" for r in (levers.get("ranked") or [])[:4]]
         act_lines = []
+        try:
+            from core.mes.data_evidence import attendance_evidence
+
+            att = await attendance_evidence(db, factory_id)
+        except Exception:  # noqa: BLE001  打卡普查读不动时这条动作线照写，只是没有现场对照
+            att = {}
         for a in actions[:8]:
             t = a.get("type")
             if t == "expedite_purchase":
@@ -505,9 +539,18 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
             elif t == "activate_parallel_line":
                 act_lines.append(f"· {a['model_code']} 开并联线 {a.get('line')}"
                                  f"（{a.get('capacity_basis')}，人手无技能矩阵佐证）")
-            elif t == "authorize_overtime":
-                act_lines.append(f"· {a['model_code']} 加班加人 "
-                                 f"{float(a['extra_crew_share']):.0%}")
+            elif t == "extra_crew":
+                share = float(a.get("capacity_share") or 0)
+                obs = ""
+                if att.get("available"):
+                    ot = att.get("overtime") or {}
+                    ds = att.get("double_shift") or {}
+                    win = (att.get("window") or {}).get("to_day")
+                    obs = (f"；现场实测（截至 {win}）：加班 {ot.get('observed_person_days')} 人次"
+                           f"/额外最长 {ot.get('max_observed_extra_hours')}h，两班倒 "
+                           f"{ds.get('observed_person_days')} 人次")
+                act_lines.append(f"· {a['model_code']} 加产能 {share:.0%}"
+                                 f" —— 落地要选一种：加人/双班 还是 加班{obs}")
             elif t in ("master_data_gap", "model_data_gap"):
                 act_lines.append(f"· {'机种推演不了' if t == 'model_data_gap' else '主数据缺口'}："
                                  f"{a.get('detail')}")
