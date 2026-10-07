@@ -28,8 +28,9 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
            "p50_seconds": 120.0,            # 链条一轮预算 900 秒，内核最多占 1/8
            # 崩溃率判窗口不判累计：插桩前查不到成因的历史失败不该永久压住上层
            "crash_rate": 0.01, "crash_window_min_ticks": 12,
-           # 心跳必须新鲜：这次心跳台账断写了几小时，库里所有读数都还在"上一次成功"上
-           "heartbeat_alive_rate": 1.0},
+           # 心跳判生死交给"真断写数"：2×预期间隔那一格会被长轮（一轮里落进 4-6 小时的闸门）压住，
+           # 那是慢不是死。断写仍然要拦 —— 台账里的每个数都停在最后一次成功上，比崩溃更隐蔽。
+           "heartbeat_stalled_loops_max": 0},
     "L2A": {"elastic_coverage": 0.60,       # 六成以上参数能算出弹性，才谈"弹性表"
             "direction_hit_rate": 1.0,      # 符号错就是模型坏，不是精度问题
             "ci_width_steps": 1.5,           # 90% 置信区间宽过 1.5 个档距就等于没测出来
@@ -264,6 +265,16 @@ async def _l1_kernel(db: AsyncSession, factory_id: str, models: List[str],
     stale = [x for x in ticking if not x.get("alive")]
     hb_rate = round((len(ticking) - len(stale)) / len(ticking), 3) if ticking else None
     crash_attr = [str(x.get("error"))[:120] for x in recent_errs][-3:]
+    # 判线交给催办用的那条线（2×预期间隔再宽一倍），2× 那一格只报数：
+    # 调度器一轮里落进 4-6 小时那道闸门时单轮会 >240 秒 —— 那是长轮不是断写，
+    # 10-07 有两次 L1 被它压住、上面四层全部标成不可引用。两处共用一把尺，
+    # 界面与判据不会各说各话（判线函数只定义在 engine_watchdog 一处）。
+    try:
+        from api.services.engine_watchdog import is_down as _watchdog_down
+        hard_stuck = [str(x.get("loop")) for x in ticking if _watchdog_down(x)]
+    except Exception as exc:  # noqa: BLE001
+        hard_stuck = []
+        hb_error = hb_error or f"断写判线读取失败：{type(exc).__name__}: {exc}"
     return {"metrics": [
         _metric("同输入可复现率", repro, THRESHOLDS["L1"]["reproducible_rate"], "gte", "",
                 "同一输入跑 3 轮，比较目标向量与完工日摘要（3 次里 2 次比对）"),
@@ -278,12 +289,19 @@ async def _l1_kernel(db: AsyncSession, factory_id: str, models: List[str],
                 missing=(None if w_ticks >= int(THRESHOLDS["L1"]["crash_window_min_ticks"])
                          else f"窗口才 {w_ticks} 跳（判线要 ≥{THRESHOLDS['L1']['crash_window_min_ticks']} 跳）："
                               "心跳 900 秒一跳，得等窗口攒够样本；0/2 不算通过"),),
-        _metric("逐轮心跳新鲜率", hb_rate, THRESHOLDS["L1"]["heartbeat_alive_rate"], "gte", "比例",
+        _metric("逐轮心跳新鲜率（2×标称间隔，只报数）", hb_rate, None, "gte", "比例",
                 f"{len(ticking) - len(stale)}/{len(ticking)} 个已报过完整一轮的循环在 2 个间隔内跳过；"
-                f"另有 {len(waiting)} 个刚启动还没跳过手（不判生死：{[w['loop'] for w in waiting]}）；"
-                "心跳断写时台账里的每个数都停在最后一次成功上，比崩溃更隐蔽"
-                + (f"（自检读取失败：{hb_error}）" if hb_error else ""),
-                missing=(hb_error or (None if ticking else "没有任何循环在逐轮报心跳")),),
+                f"另有 {len(waiting)} 个刚启动还没跳过手（不判生死：{[w['loop'] for w in waiting]}）。"
+                "这一格只报敏感度不判线 —— 长轮（一轮里落进 4-6 小时的闸门）会把它压到 1.0 以下，"
+                "真断写由下面那一格判",
+                missing=(hb_error or (None if ticking else "没有任何循环在逐轮报心跳"))),
+        _metric("引擎循环真断写数（与催办同一条线）", (len(hard_stuck) if ticking else None),
+                THRESHOLDS["L1"]["heartbeat_stalled_loops_max"], "lte", "个",
+                "判线 = engine_watchdog.stall_deadline_seconds（2×预期间隔 ×2），和收件箱里那条催办同一把尺。"
+                f"当前不过线的循环：{hard_stuck or '无'}。"
+                "心跳断写时台账里的每个数都停在最后一次成功上，比崩溃更隐蔽，"
+                "所以这一格不过线就不许引用上层",
+                missing=(hb_error or (None if ticking else "没有任何循环在逐轮报心跳"))),
         _metric("窗口内已归因失败数", len(crash_attr), None, "lte", "条",
                 f"recent_errors 小环里带时间戳的最近几条：崩溃必须能被归因才有意义；"
                 f"内容见 detail.recent_errors（{'; '.join(crash_attr)[:120] or '环是空的，说明窗口内没崩过'}）"),
