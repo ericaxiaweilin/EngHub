@@ -494,6 +494,30 @@ async def get_sim_tradeoffs(
     return await record_tradeoffs(db, factory_id, apply=apply)
 
 
+@router.get("/action-constraints", summary="动作约束层：这个厂现在哪些动作根本不存在、哪些没规则支撑")
+async def get_action_constraints(
+    factory_id: str = Query(..., description="厂区"),
+    model: str = Query("", description="机种（查改派/并联可行性用）"),
+    line: str = Query("", description="线编码（查线组/班组上限用）"),
+    weather: str = Query("", description="现场状况，如 storm / rain，只用于说明触发条件"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """候选方案生成前先过这一层：`forbidden`（厂里声明过不行）/ `allowed_bounded`（能做但有上限）/
+    `undeclared`（没人写过这条规则，引擎不许自动推荐）。
+
+    路线是两段式：先用显式领域约束把 AI 关进现实边界，再让真实运行数据在"能做的事"里挖哪条最有效。
+    所以这里只读现有落库数据，不编规则：资格约束、加班上限、外发政策目前基本没落库，
+    返回值里的 `constraint_gaps` 会点名要谁填哪一列、影响几个动作。
+    """
+    del current_user
+    from core.mes.action_constraints import action_constraints
+
+    return await action_constraints(db, factory_id, model=(model or None),
+                                    line_code=(line or None),
+                                    state=({"weather": weather} if weather else None))
+
+
 @router.get("/data-evidence", summary="料号提前期的证据普查：台账值是不是量出来的，一调就知道")
 async def get_data_evidence(
     factory_id: str = Query(..., description="厂区"),

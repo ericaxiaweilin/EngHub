@@ -487,6 +487,8 @@ MIN_SUPPLIER_GAP_PARTS = 20
 # 自制/外购在两列上互相矛盾的行数，决定"同一个件会不会被两头做出不同动作"。
 MIN_UNVERIFIED_LEAD_PARTS = 1000
 MIN_MOB_CONTRADICTION_ROWS = 500
+# 少于这么多个动作没支撑，就不值得占收件箱（一个工段本来就可能有一两条没写过的规则）
+MIN_UNDECLARED_ACTIONS = 3
 
 LEAD_DEFAULT_SQL = """
     WITH g AS (
@@ -532,14 +534,21 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     sup = (await db.execute(text(SUPPLIER_GAP_SQL), {"fid": factory_id})).mappings().first()
     lead = (await db.execute(text(LEAD_DEFAULT_SQL), {"fid": factory_id})).mappings().first()
     mob = (await db.execute(text(MOB_CONTRADICTION_SQL), {"fid": factory_id})).mappings().first()
+    try:
+        from core.mes.action_constraints import action_constraints
+
+        cons = await action_constraints(db, factory_id)
+    except Exception:  # noqa: BLE001  约束层查不动时不挂这一格，别把整轮巡检带崩
+        cons = {}
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
-                        lead=dict(lead or {}), mob=dict(mob or {}))
+                        lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}))
 
 
 def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  ready: Dict[str, Any], lead: Optional[Dict[str, Any]] = None,
-                 mob: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                 mob: Optional[Dict[str, Any]] = None,
+                 cons: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
     阈值写成张数/料号数而不是比例：少于十几张时重跑一次的成本比挂一条待办更划算，
@@ -577,6 +586,25 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             f"{rerun} 张在流程单没有齐套行但可重跑补齐",
             "pmc_agent", "重跑齐套登记前先看这批单是不是已经停工，停工单不用补。",
             {"rerunnable_orders": rerun}))
+
+    # 第六格：引擎能想到的动作里，有多少根本没有规则支撑（约束层只读现有落库数据）
+    undeclared = [a for a in ((cons or {}).get("actions") or [])
+                  if str(a.get("verdict") or "").startswith(("undeclared", "forbidden"))]
+    if len(undeclared) >= MIN_UNDECLARED_ACTIONS:
+        gaps = (cons or {}).get("constraint_gaps") or []
+        out.append(_gap(
+            "action_constraints", "undeclared_actions", f"act|{len(undeclared)}",
+            f"补数据｜引擎候选动作里 {len(undeclared)} 个没有规则支撑（{'、'.join(str(a.get('action')) for a in undeclared[:4])}）",
+            "约束层的三类判定里，`undeclared` = 厂里没人写过这条规则，引擎就不该把它当可选项端出来："
+            f"暴雨能不能外发、加班上限几小时、普通作业员能不能顶检测员，现在系统里一个都没落库。\n"
+            f"要填的列（含该谁填）：{json.dumps(gaps, ensure_ascii=False)[:900]}\n"
+            "这些是专家脑中的经验，第一阶段就得由人写进来；写进来之后引擎的候选集才会被真实边界过滤，"
+            "之后才谈得上用运行数据比较'能做的事里哪个最有效'。\n"
+            "复核：GET /api/v1/pmc/action-constraints?factory_id=<厂区>&model=<机种>&line=<线>",
+            f"{len(undeclared)} 个候选动作没有落库规则支撑，方案空间等于没被现实约束过",
+            "pmc_agent", "由 IE/厂里把不能做什么写进对应列或政策表；写不出的先明确允许默认值。",
+            {"undeclared_actions": [str(a.get("action")) for a in undeclared],
+             "gaps": gaps}))
 
     lt = int((lead or {}).get("unverified") or 0)
     if lt >= MIN_UNVERIFIED_LEAD_PARTS:
@@ -654,6 +682,7 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
             "supplier_gap_parts": MIN_SUPPLIER_GAP_PARTS,
             "unverified_lead_parts": MIN_UNVERIFIED_LEAD_PARTS,
             "mob_contradiction_rows": MIN_MOB_CONTRADICTION_ROWS,
+            "undeclared_actions": MIN_UNDECLARED_ACTIONS,
         },
         "counts": outcome["counts"], "findings": found, "items": outcome["items"],
         "rule": ("这几格不是引擎算不出，是台账/主数据没跟上：齐套行登记世代、可重跑补齐的缺行单、"

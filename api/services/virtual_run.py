@@ -168,7 +168,7 @@ STOCK_SQL = text("""
 
 LINES_SQL = text("""
     SELECT line_code, line_group, hours_per_day, units_per_day, group_units_per_day, crew_size,
-           can_make_models::text AS can_models, default_model
+           can_make_models::text AS can_models, cannot_make_models::text AS cannot_models, default_model
     FROM line_profiles WHERE factory_id = :fid AND is_active = true ORDER BY line_code
 """)
 
@@ -246,12 +246,24 @@ def family_prefix(model: str) -> str:
 SIM_CHANGEOVER_HOURS = float(os.getenv("SIM_CHANGEOVER_HOURS", "0.0833"))
 
 
+def line_declares_cannot(line: Dict[str, Any], model: str) -> bool:
+    """厂里明确写了"这条线做不了这台机"就不许再排上去 —— 负向声明优先于正向。
+
+    `line_profiles.cannot_make_models` 是专门放这个的列（现在 3 条线都还是空 `{}`，
+    所以"跑步机线不能做 bike"目前只靠正向白名单隐式表达）。以前 LINES_SQL 根本没取这列，
+    于是 IE 哪怕填了也会被静默忽略：声明"不能做"和"没说"在系统里变成同一件事。
+    """
+    return str(model or "") in str((line or {}).get("cannot_models") or "")
+
+
 def capable_lines(model: str, lines: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], str]]:
-    """能接这个机种的线，按依据强弱排序：先声明 can_make_models，再 default_model，最后同族前缀。
+    """能接这个机种的线，按依据强弱排序：先排除厂里声明做不了的，再按 can_make_models、
+    default_model、同族前缀。
 
     这是"能不能改派到别条线"的唯一口径 —— `pick_line` 和改派逻辑必须共用它，
     否则会出现"首选线没人在岗、改派却挑了一条工艺上做不了这台机的线"。
     """
+    lines = [l for l in lines if not line_declares_cannot(l, model)]
     cands: List[Tuple[Dict[str, Any], str]] = []
     for l in lines:
         if model in str(l["can_models"]):
@@ -1279,6 +1291,13 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
                                        - float(alt.get("standby_person_days_if_line_held") or 0)),
             }
         runs.append(run)
+    try:
+        # 沙箱是一次人交互的调用，值得把"这些动作厂里有没有规则支撑"一起端出来
+        constraints = await constraint_overlay(db, factory_id, targets,
+                                               [{"name": "本次沙箱参数"}], lines)
+    except Exception as exc:  # noqa: BLE001  约束层查不到不能让沙箱整体失败，但必须写出来
+        constraints = {"enforced": False, "error": f"{type(exc).__name__}: {exc}"[:200],
+                       "note": "约束层本轮没跑成 —— 这不代表这些动作都有规则支撑"}
     ok = [r for r in runs if r["status"] == "simulated"]
     waiting = [r for r in runs if r["status"] == "no_staffed_line"]
     total_late = sum(max(0, int(r["days_late"] or 0)) for r in ok)
@@ -1293,7 +1312,7 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
         "material_cost_usd": round(sum(float(r["material_cost_usd"] or 0) for r in ok), 2),
         "labor_cost_usd": round(sum(float(r["labor_cost_usd"] or 0) for r in ok), 2),
         "standby_cost_total_usd": round(sum(float(r["standby_cost_if_line_held_usd"] or 0) for r in ok), 2),
-        "runs": runs,
+        "runs": runs, "constraints": constraints,
         "assumptions": {
             "attendance_curve": "按天到岗率（沙箱默认 0.97，可传曲线：干旱/雨/暴雨档）",
             "labor_cost_per_person_day": DEFAULT_LABOR_COST_PER_PERSON_DAY,
@@ -1477,12 +1496,50 @@ def _blocked_note(blocked: List[Dict[str, Any]]) -> str:
     return "本轮不产出解：" + "；".join(label.get(k, k) for k in kinds)
 
 
+async def constraint_overlay(db: AsyncSession, factory_id: str,
+                             targets: List[Dict[str, Any]],
+                             policies: List[Dict[str, Any]],
+                             lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """把这一轮政策用到的动作送去约束层过一遍，只报不删（enforced=False）。
+
+    默认没人看得到这层的话，引擎就会继续推荐厂里根本没声明过的动作。
+    这里刻意不改变推演结果：改了就是把判据和算法又搅回一坨，先让读数出来，
+    再由 IE 把规则填实、由用户决定什么时候让它真的拦。
+    """
+    from core.mes.action_constraints import action_constraints, policy_actions
+
+    per_model: List[Dict[str, Any]] = []
+    for t in targets[:3]:
+        model = str(t.get("model_code") or "")
+        line = pick_line(model, lines)[0] or {}
+        c = await action_constraints(db, factory_id, model=model,
+                                     line_code=(line or {}).get("line_code"))
+        per_model.append({"model": model, "line": (line or {}).get("line_code"),
+                          "verdicts": {a["action"]: a["verdict"] for a in c["actions"]},
+                          "why": {a["action"]: a["why"] for a in c["actions"]
+                                  if a["verdict"] not in ("allowed_bounded",)},
+                          "constraint_gaps": c["constraint_gaps"]})
+    per_policy: List[Dict[str, Any]] = []
+    for pol in policies:
+        acts = policy_actions(pol)
+        unsupported = {m["model"]: [a for a in acts
+                                    if str((m["verdicts"] or {}).get(a) or "").startswith(("undeclared", "forbidden"))]
+                       for m in per_model}
+        per_policy.append({"policy": str(pol.get("name") or ""), "actions": acts,
+                           "unsupported": {k: v for k, v in unsupported.items() if v}})
+    return {"enforced": False,
+            "rule": ("只报不删：政策照跑，但每个动作有没有厂里的规则支撑要跟着结论出门。"
+                     "要真拦下来得由 IE 先把规则填实，再由用户点一次开关。"),
+            "per_model": per_model, "per_policy": per_policy}
+
+
 async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                         *, today: Optional[date] = None,
                         policies: Optional[List[Dict[str, Any]]] = None,
                         scenarios: Optional[List[Dict[str, Any]]] = None,
                         targets_by_scenario: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                        perturb: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+                        perturb: Optional[Dict[str, float]] = None,
+                        with_constraints: bool = False) -> Dict[str, Any]:
     """让引擎自己扫政策组合：同一批目标在多种产能/出勤/采购/分批政策下的多目标结果。
 
     这里刻意不给"唯一总分"。每个政策产出一个目标向量，交给 pareto_eval 判前沿与平衡解 ——
@@ -1637,10 +1694,12 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
       grouped[scen["name"]] = {"attendance": float(scen.get("attendance", 0.97)),
                                "solutions": solutions}
     total = sum(len(v["solutions"]) for v in grouped.values())
+    overlay = (await constraint_overlay(db, factory_id, targets, policies, lines)
+               if with_constraints else None)
     return {"factory_id": factory_id, "today": str(today), "demand_units": demand_units,
             "demand_by_scenario": demand_by_scenario,
             "policies_tried": total, "scenarios": list(grouped),
-            "by_scenario": grouped,
+            "constraints": overlay,
             "note": ("前沿在每个天气场景内部各算一次：天气不是可选政策。"
                      "跨场景的推荐按'各场景推荐解里后悔向量最稳的那个'给。")}
 
