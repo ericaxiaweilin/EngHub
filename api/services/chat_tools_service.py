@@ -935,6 +935,26 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_sim_evidence_readiness",
+            "description": (
+                "仿真精度判据的证据就绪度（只读）：L2B 那两个数（瓶颈件一致率、回测 MAPE）"
+                "到底有多少真实样本可比 —— 逐机种报 工单数/齐套行/外购缺口行，把没有齐套行的单"
+                "归成四类可行动原因（子工单没自己的 BOM、键在镜像里根本没 BOM 行、出货柜这类伪产品、"
+                "种子演示单），并报台账齐套行的**登记世代**（多数单还是旧的单层快照，"
+                "同机种多层登记过的能到 680 行、深 9 层）；带 agreement=true 时同时给出"
+                "瓶颈件一致率的三种分母：快照口径、同宇宙口径（两边都点到名的单）、"
+                "同世代对照（台账行不动、缺口按今天库存重算），以及毛/净需求算法差的行数分布。"
+                "用于「先补哪个数据」「样本够不够」「为什么命中率上不去」「这些单为什么没齐套行」"
+                "「一致率低是谁的锅」类问题。不改工单、不写台账。"),
+            "parameters": {"type": "object", "properties": {
+                "agreement": {"type": "boolean",
+                              "description": "是否连瓶颈件一致率的三种分母一起算（要多跑一遍展开，默认算）"},
+                "limit": {"type": "integer", "description": "参与比对的在流程单数上限，默认 40"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_plan_commit_gate",
             "description": "计划逐单下达就绪门（只读）：这一版排程里哪些工单真的能开工、哪些被哪条门压住（没排进本版本/工序没排齐/物料没齐套/首道工位映射不到），以及已经下达过的张数。用于'这版计划能开工几张''还有哪些单卡着''为什么没下达''计划生效了没'类问题。只报判定，不改工单状态、不下达。",
             "parameters": {"type": "object", "properties": {}},
@@ -2690,6 +2710,47 @@ async def _tool_query_engine_capability_layers(
                      "not_computable 的项要连缺哪个输入一起说，不许折算成 0 分或别的数")}
 
 
+async def _tool_query_sim_evidence_readiness(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """精度判据的证据就绪度（只读）：判据在 sim_backtest 一处定义，这里只转述、不重判。"""
+    from api.services.sim_backtest import bottleneck_agreement, readiness
+
+    fid = factory_id or "FAC_MECH_001"
+    out = await readiness(db, fid)
+    want_agree = args.get("agreement")
+    agreement = None
+    if want_agree is not False:
+        try:
+            limit = max(5, min(120, int(args.get("limit") or 40)))
+        except (TypeError, ValueError):
+            limit = 40
+        agree = await bottleneck_agreement(db, fid, limit=limit)
+        agreement = {
+            "orders_compared": agree.get("orders_compared"),
+            "lead_based": agree.get("lead_based"),
+            "quantity_based": agree.get("quantity_based"),
+            "top5_overlap_rate": agree.get("top5_overlap_rate"),
+            "median_shortage_parts": agree.get("median_shortage_parts"),
+            "median_ledger_parts": agree.get("median_ledger_parts"),
+            "bom_universe": agree.get("bom_universe"),
+        }
+    return {"status": "ok", "factory_id": fid, "has_data": True,
+            "models_with_orders": out.get("models_with_orders"),
+            "bottleneck_comparable_models": out.get("bottleneck_comparable_models"),
+            "bottleneck_comparable_list": out.get("bottleneck_comparable_list"),
+            "bottleneck_verdict": out.get("bottleneck_verdict"),
+            "backtest": out.get("backtest"),
+            "kit_gaps": out.get("kit_gaps"),
+            "bom_source": out.get("bom_source"),
+            "fixable_by_rerun_orders": out.get("fixable_by_rerun_orders"),
+            "agreement": agreement,
+            "note": out.get("how_to_read"),
+            "caveat": ("一致率低有三条可能的解释（料号不同批 / 快照过期 / 需求算法毛净之差），"
+                       "这一格把三种分母都摆出来才是可判的；台账齐套行的登记世代没跟上时，"
+                       "先重跑齐套登记再谈命中率准不准")}
+
+
 async def _tool_query_simulation_recommendation(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3296,6 +3357,7 @@ _TOOL_EXECUTORS = {
     "query_wms_inventory_health": _tool_query_wms_inventory_health,
     "query_bom_data_quality": _tool_query_bom_data_quality,
     "query_engine_capability_layers": _tool_query_engine_capability_layers,
+    "query_sim_evidence_readiness": _tool_query_sim_evidence_readiness,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
     "query_simulation_sensitivity": _tool_query_simulation_sensitivity,    "query_engine_attribution": _tool_query_engine_attribution,
     "query_chain_convergence": _tool_query_chain_convergence,
@@ -3693,6 +3755,7 @@ TOOL_LABELS = {
     "query_chain_convergence": "链条收敛自检",
     "query_simulation_recommendation": "推演建议与落地复查",
     "query_engine_capability_layers": "引擎分层验收",
+    "query_sim_evidence_readiness": "精度判据就绪度",
     "query_simulation_sensitivity": "建模精度与敏感度",    "query_engine_attribution": "交期为什么是这个数（归因）",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
