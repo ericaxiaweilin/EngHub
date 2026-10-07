@@ -354,3 +354,22 @@ def test_numeric_claims_ignores_years_ids_and_dates():
     # UUID / 编码里的一段数字不是数据引用（前后粘着字母或数字）
     assert numeric_claims('工作簿 ID 2edc79f5-e085-4b88-832c-2448a9fa7615') == []
     assert numeric_claims('未排产工单：0 张') == []
+
+def test_disclosure_is_one_phrase_list_for_kernel_and_judge():
+    """模型自己标"这是估算/不调用接口"和内核追加的标注，必须被同一份短语表认下来：
+    一处认、一处不认，就会出现"判据说已披露、出口又追加第二遍免责声明"的自相矛盾。"""
+    from core.kernel.reply_sanitizer import is_disclosed
+
+    assert is_disclosed("这些数没有调用 MES 工具核实")
+    assert is_disclosed("按 1200 台设备估算，不调用接口：OEE 约 78%")
+    assert is_disclosed("先强调这是经验值，不是实时数据：不良率约 2%")
+    assert not is_disclosed("当前在制工单 84 单，待排 68 单")
+    assert not is_disclosed("")
+
+
+def test_numeric_claims_ignores_years_and_short_numbers():
+    from core.kernel.reply_sanitizer import is_disclosed, numeric_claims
+
+    assert numeric_claims("2026 年 10 月完成 1,204 件") == ["1,204"]
+    assert numeric_claims("没有数字") == []
+

@@ -3,7 +3,8 @@
 平行堆指标最后会变成"我们全都做得好"的自嗨报告。所以这里规定死了：
 · 每层的判据不一样，且必须是算出来的数（不是打分表）；
 · 依赖关系是硬的：从最低一层往上找第一个不过线的，它**以上**的读数一律标 `not_reportable`；
-· 算不出来的项写 `not_computable` 并点名缺哪个输入，不许用别的数冒充，也不许算 0 分。
+· 算不出来的项写 `not_computable` 并点名缺哪个输入，不许用别的数冒充，也不许算 0 分；
+  量出来了但没有判线的项写 `reported` —— "有数没线"和"没数"是两回事，混着标会让人去补本来就有的数。
 
 五层（L1 内核 / L2A 敏感度 / L2B 准确度 / L3 决策 / L4 Agent 接口）。
 """
@@ -15,6 +16,7 @@ import os
 import re
 import statistics
 import time
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
@@ -56,6 +58,11 @@ LAYER_QUESTIONS = {"L1": "跑得动、跑得稳、同输入同结果吗",
                    "L2B": "和真实对得上吗",
                    "L3": "结论能指导行动吗",
                    "L4": "能被问、被解释、被复现吗"}
+
+# 「未经核实」标注真正挂到 kernel 出口的那一刻（提交 22c71493，2026-10-06 15:51 UTC）。
+# 早于它的轮次没有标注机会，会被算成"无出处" —— 那是在为历史扣分，不是在测现在的行为，
+# 所以另报一格"上线以来"，并在判线那格的依据里写清有多少条属于历史。
+PROVENANCE_NOTE_SINCE = datetime(2026, 10, 6, 15, 51)
 
 # 自然问法 → 应该被选中的工具。这是路由的回归集，不是模型评分。
 ROUTING_GOLDEN: List[Tuple[str, str]] = [
@@ -665,20 +672,31 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
     # （tool_results 那列没有单独再写一遍 —— 同一份 JSON 存两遍会把写入量翻倍，没必要）。
     # 判据按**会话**算而不是按单条算：上一轮查到的数这一轮引用是正常且必要的，
     # 只有整个会话里都找不到出处的数才是编出来的。年份/日期不计入（"2026" 不是引用数据）。
+    # 出处语料要分两条：工具返回（引擎给的数）与用户自己说的话（人给的数）。
+    # 把用户刚报的数当"无出处编造"是误判，把正文里复述的数字当"有出处"是放水 ——
+    # 所以两边分开存、分开算，用户给的那一类不进判线分母，单列报出来给人看。
     hist = (await db.execute(text("""
-        SELECT session_id, content, tool_calls::text AS tc
+        SELECT session_id, role, content, tool_calls::text AS tc, created_at
         FROM chat_messages
-        WHERE role='assistant' AND COALESCE(content,'') <> ''
+        WHERE role IN ('assistant', 'user') AND COALESCE(content,'') <> ''
           AND created_at > NOW() - INTERVAL '30 days'
         ORDER BY session_id, created_at, id
     """))).mappings().all()
-    from core.kernel.reply_sanitizer import numeric_claims
+    from core.kernel.reply_sanitizer import is_disclosed, numeric_claims
 
     corpus: Dict[str, str] = {}
+    asked: Dict[str, str] = {}
     checked = same_turn = from_history = disclosed = 0
+    from_user = 0
+    claims_with_tool = 0
+    unbacked_total = unbacked_before_note = 0
+    since_checked = since_ok = 0
     unbacked_samples: List[Dict[str, Any]] = []
     for r in hist:
         sid = str(r.get("session_id"))
+        if str(r.get("role") or "") == "user":
+            asked[sid] = (asked.get(sid, "") + " " + str(r.get("content") or ""))[-40000:]
+            continue
         tc = str(r.get("tc") or "").replace(",", "")
         nums = numeric_claims(r.get("content"))
         prior = corpus.get(sid, "")
@@ -687,27 +705,47 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         if nums:
             def _hit(needle: str, hay: str) -> bool:
                 return bool(hay) and (needle in hay or (len(needle) > 4 and needle[:4] in hay))
-            now_ok = sum(1 for n in nums if _hit(n.replace(",", ""), tc))
-            all_ok = sum(1 for n in nums if _hit(n.replace(",", ""), tc)
+            # 人自己刚报过的数不算引擎的读数：把它算进"无出处"是冤枉，
+            # 算进"可回溯"是放水 —— 所以整条轮次从判线分母里拿出来，单列报数。
+            claims = [n for n in nums if not _hit(n.replace(",", ""), asked.get(sid, ""))]
+            if not claims:
+                from_user += 1
+                corpus[sid] = (prior + " " + tc)[-160000:]
+                continue
+            now_ok = sum(1 for n in claims if _hit(n.replace(",", ""), tc))
+            all_ok = sum(1 for n in claims if _hit(n.replace(",", ""), tc)
                          or _hit(n.replace(",", ""), prior))
-            rate_now, rate_sess = now_ok / len(nums), all_ok / len(nums)
+            rate_now, rate_sess = now_ok / len(claims), all_ok / len(claims)
             checked += 1
+            if tc.strip(' \"{}[]null'):       # 这一轮真发生了工具调用（不管数是不是从它里面来的）
+                claims_with_tool += 1
+            stamp = r.get("created_at")
+            after_note = bool(stamp) and stamp.replace(tzinfo=None) >= PROVENANCE_NOTE_SINCE
+            if after_note:
+                since_checked += 1
             if rate_now >= 0.6:
                 same_turn += 1
+                since_ok += 1 if after_note else 0
             elif rate_sess >= 0.6:
                 from_history += 1
-            elif "没有调用 MES 工具核实" in str(r.get("content") or ""):
+                since_ok += 1 if after_note else 0
+            elif is_disclosed(r.get("content")):
                 # 模型自己已经把"这些数没查过库"写在答复上了 —— 那是披露，不是编造。
                 # 判据必须奖励披露，否则只会逼出"听起来像台账读数"的自信假话。
                 disclosed += 1
-            elif len(unbacked_samples) < 6:
-                missing = [n for n in nums if not _hit(n.replace(",", ""), tc)
-                           and not _hit(n.replace(",", ""), prior)]
-                unbacked_samples.append({
-                    "session": sid[:8], "numbers": missing[:5],
-                    "backed_within_session": round(rate_sess, 2),
-                    "excerpt": re.sub(r"\s+", " ", str(r.get("content") or ""))[:110],
-                })
+                since_ok += 1 if after_note else 0
+            else:
+                unbacked_total += 1
+                if not after_note:
+                    unbacked_before_note += 1
+                if len(unbacked_samples) < 6:
+                    missing = [n for n in claims if not _hit(n.replace(",", ""), tc)
+                               and not _hit(n.replace(",", ""), prior)]
+                    unbacked_samples.append({
+                        "session": sid[:8], "numbers": missing[:5],
+                        "backed_within_session": round(rate_sess, 2),
+                        "excerpt": re.sub(r"\s+", " ", str(r.get("content") or ""))[:110],
+                    })
         corpus[sid] = (prior + " " + tc)[-160000:]
     number_rate = round((same_turn + from_history + disclosed) / checked, 3) if checked else None
     contract, contract_error = {}, None
@@ -737,18 +775,48 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         _metric("问题→查询准确率", round(hits / len(ROUTING_GOLDEN), 3),
                 THRESHOLDS["L4"]["routing_accuracy"], "gte", "",
                 f"{hits}/{len(ROUTING_GOLDEN)} 条自然问法命中应选工具（回归集在 ROUTING_GOLDEN）"),
-        _metric("回答带仿真调用率", backing, THRESHOLDS["L4"]["tool_backing_rate"], "gte", "",
-                f"近 30 天 {assistants} 条助手回复里 {with_tools} 条真调了工具"),
-        _metric("每轮真调工具的比例", turn_backing, THRESHOLDS["L4"]["tool_backing_rate"], "gte", "",
-                f"近 30 天 {with_call + without_call} 个完成轮里真发生工具调用的比例"),
+        _metric("助手回复里调过工具的比例（只报数）", backing, None, "gte", "",
+                f"近 30 天 {assistants} 条助手回复里 {with_tools} 条真调了工具。"
+                "这一格和下面那格是同一个毛口径的两件外衣，都不再当判据 —— "
+                "分母里全是追问、确认、引用前轮这些本来就不该查库的回复；"
+                "要判的是「报了数的回复有没有出处」，看「报数轮次里本轮真查的比例」和「回答数字可回溯率」"),
+        _metric("报数轮次里本轮真查的比例",
+                round(claims_with_tool / checked, 3) if checked else None,
+                THRESHOLDS["L4"]["tool_backing_rate"], "gte", "",
+                f"近 30 天 {checked} 条「引擎自己给数」的回复里，{claims_with_tool} 条本轮真调了工具"
+                f" = {round(claims_with_tool / max(1, checked), 3)}。分母从「所有完成轮」换成「报了数的轮」："
+                "判据要管的是「给数必须有出处」，不是「每轮都得调一次工具」—— 追问、确认、"
+                "用户自己报数的轮次调工具没有意义（近 30 天没调工具的回复里 76% 根本没给数字）",
+                n=checked, min_n=20,
+                missing=(None if checked >= 20 else
+                         f"报数回复只有 {checked} 条（判线要 ≥20 条）：样本太少不判"),),
+        _metric("所有完成轮里调工具的比例（只报数）", turn_backing, None, "gte", "",
+                f"近 30 天 {with_call + without_call} 个完成轮里 {with_call} 个发生过工具调用。"
+                "这一格不再当判据：里面一大半是不需要查库的轮次（追问/确认/引用前轮），"
+                "拿它判线只会逼人为了调工具而调工具"),
         _metric("回答数字可回溯率", number_rate, THRESHOLDS["L4"]["number_backing_rate"], "gte", "",
-                f"近 30 天 {checked} 条带数字的助手回复里，数字能在**本会话**工具返回里找到出处，"
-                f"或答复自己已显式标注「未经工具核实」的比例"
+                f"近 30 天 {checked} 条**引擎自己给数**的助手回复里，数字能在本会话工具返回里找到出处、"
+                f"或答复自己已显式标注未经核实 的比例"
                 f"（本轮直查 {same_turn}、引用前几轮 {from_history}、已披露 {disclosed}）；"
+                f"另有 {from_user} 条报的全是用户自己刚给的数，从判线分母里拿出来单列（见下一格）；"
                 "年份/日期/ID 片段不算引用数据",
                 n=checked, min_n=20,
                 missing=(None if checked >= 20 else
                          f"可比回复只有 {checked} 条（判线要 ≥20 条）：样本太少不判"),),
+        _metric("报的是用户自己给的数（不进判线分母）", from_user if checked else None, None,
+                "gte", "条",
+                f"{from_user} 条：正文里的数字全部能在用户自己的话里找到 —— 人给的数不需要引擎核实，"
+                "但也不许算进「可回溯」把上面那个率抬上去。这一格存在是为了让判线分母说得出是什么"),
+        _metric("标注上线以来的数字可回溯率",
+                (round(since_ok / since_checked, 3) if since_checked else None),
+                THRESHOLDS["L4"]["number_backing_rate"], "gte", "",
+                f"只看 {PROVENANCE_NOTE_SINCE:%Y-%m-%d %H:%M} UTC（提交 22c71493，标注挂上 kernel 出口）"
+                f"之后的 {since_checked} 条：可回溯 {since_ok} 条。"
+                f"判线那格里 {unbacked_total} 条无出处的回复有 {unbacked_before_note} 条早于这次上线 —— "
+                "它们在为历史扣分，不该被当成现在还在编数；这一格攒够 20 条才顶上去判线",
+                n=since_checked, min_n=20,
+                missing=(None if since_checked >= 20 else
+                         f"上线后只有 {since_checked} 条可比回复（判线要 ≥20 条）：样本太少不判"),),
         _metric("本轮工具直查率", round(same_turn / checked, 3) if checked else None, None, "gte", "",
                 f"{same_turn}/{checked} 条：数字直接来自当轮工具返回（引用前轮结果也算可回溯，但这一格"
                 f"低说明模型在复述而不是重新核实）；已披露率 {round(disclosed / max(1, checked), 3)}"

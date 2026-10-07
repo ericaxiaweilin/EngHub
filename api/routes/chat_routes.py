@@ -1241,7 +1241,9 @@ def _annotate_unverified_numbers(reply: str) -> str:
     text = reply or ""
     if len(_numeric_claims(text)) < 2:
         return text
-    if "未经核实" in text or "没有调用 MES 工具核实" in text:
+    from core.kernel.reply_sanitizer import is_disclosed
+
+    if is_disclosed(text):
         return text
     return text + UNVERIFIED_NOTE
 

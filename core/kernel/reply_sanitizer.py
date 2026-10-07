@@ -380,6 +380,18 @@ class StreamSanitizer:
 _DATA_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9.])\d[\d,]{2,}(?:\.\d+)?(?![A-Za-z0-9])")
 
 
+# 「这条答复自己已经把数标成没查过库」的说法不止一种：内核追加的标注是一句固定话，
+# 模型自己也会写"按经验估算/不调用接口/不是实时数据"。判据和标注必须认同一份短语表，
+# 否则一边算披露、另一边追加第二遍标注，读者看到两段互相矛盾的免责声明。
+DISCLOSURE_PHRASES = ("未经核实", "没有调用 MES 工具核实", "不调用接口", "不用调接口",
+                      "经验估算", "按经验估", "不是实时数据", "非实时数据", "估算值")
+
+
+def is_disclosed(text) -> bool:
+    body = str(text or "")
+    return any(phrase in body for phrase in DISCLOSURE_PHRASES)
+
+
 def numeric_claims(text: str) -> list:
     """返回正文里像"数据读数"的数字串。
 
