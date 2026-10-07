@@ -330,6 +330,32 @@ def test_queue_jumping_is_not_counted_as_capacity(monkeypatch):
     assert {s["name"] for s in out2["frontier"]} | {s["name"] for s in out2["dominated"]} == {"good", "jump"}
 
 
+def test_robust_pick_is_not_decided_by_objective_key_order():
+    """回归：稳健比较曾按 FIXED_ORDER 的字典键序取元组，而键序第一位是 labor_cost_usd、
+    交期在最后一位 —— 于是"加急费多 0.54 档"能压过"延期整格 1.0 档"，
+    三个天气场景里都赢的政策在稳健推荐里输给了现况（10-07 线上实测到）。
+    现在两边都用降序向量：谁最吃亏先比那一项。"""
+    def mk(scen, name, cost, exp, late):
+        return {"id": f"{scen}-{name}", "name": name, "scenario": scen,
+                "objectives": {"on_time_rate": 1.0 if late == 0 else 0.0,
+                               "throughput_units": 600, "labor_cost_usd": cost,
+                               "expedite_cost_usd": exp, "standby_person_days": 0,
+                               "data_confidence": 1.0, "load_band_gap": 0.0,
+                               "line_activation_cost_usd": 0, "days_late_worst": late},
+                "evidence": {}}
+    by = {scen: {"solutions": [mk(scen, "cheap_late", 100, 0, 20),
+                               mk(scen, "paid_on_time", 100, 60, 0)]}
+          for scen in ("好天", "暴雨")}
+    out = pe.evaluate_by_scenario(by, demand_units=600)
+    # 不加权：晚 20 天但一分钱不花的解，不许因为键序把交期排最后就当上稳健推荐
+    assert out["robust_recommendation"]["policy"] in ("cheap_late", "paid_on_time")
+    assert out["robust_recommendation"]["policy"] == "paid_on_time" or late_free_wins(out)
+
+
+def late_free_wins(out):
+    return False
+
+
 def test_robust_pick_ignores_scenarios_loosened_beyond_the_promise():
     """跨场景稳健推荐只认承诺口径内的场景：把题目改简单之后得到的"准点"不算兑现能力。"""
     def block_for(vals):

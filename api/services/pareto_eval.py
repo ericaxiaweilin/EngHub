@@ -206,7 +206,14 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any],
         pool = {str(s.get("id")): s for s in (res.get("frontier") or []) + (res.get("dominated") or [])}
         for sol in pool.values():
             reg = sol.get("regret_by_objective") or {}
-            prof = tuple(reg.get(k) or 0.0 for k in FIXED_ORDER)
+            # 与场景内选择同一套比法：把后悔值降序排好再比（谁最吃亏先比那一项）。
+            # 原来这里是按 FIXED_ORDER 的**字典键序**取元组，而键序第一位是 labor_cost_usd、
+            # 交期在最后 —— 于是"加急费多 0.54 档"能压过"延期整格 1.0 档"，
+            # 与本文件自己写的「交期是合同约束，不许靠成本低把分补回来」互相打脸。
+            # 10-07 实测：三个天气场景里都赢的政策（提前期减半）在稳健推荐里落选，选了现况。
+            # 仍按 FIXED_ORDER 取值补齐（死维度占位为 0，向量必须同长 —— 短元组会靠长度赢），
+            # 但比的是降序排好的那一份：谁最吃亏先比那一项，键序不再决定谁当选。
+            prof = tuple(sorted((float(reg.get(k) or 0.0) for k in FIXED_ORDER), reverse=True))
             if not prof:
                 continue      # 没有后悔向量的解不参与稳健比较
             by_policy.setdefault(str(sol.get("name") or sol.get("id")), []).append((sol.get("max_regret"), prof))
@@ -251,8 +258,8 @@ def evaluate_by_scenario(by_scenario: Dict[str, Any],
                    "选它不是因为它分数最高，而是因为它不赌天气。"},
         "robust_scenario_pool": sorted(robust_pool),
         "diagnostic_only_scenarios": sorted(set(per_scenario) - set(robust_pool)),
-        "selection_rule": ("场景内：可行解 → 帕累托前沿 → 后悔向量字典序最小；"
-                           "跨场景：取最坏场景后悔最小的政策（minimax），不是平均最好。"
+        "selection_rule": ("场景内：可行解 → 帕累托前沿 → 后悔向量降序字典序最小（谁最吃亏先比那一项）；"
+                           "跨场景：取最坏场景后悔最小的政策（minimax，同一套降序比法），不是平均最好。"
                            "各场景的批量是各自标定的，跨场景比的是场景内归一化之后的后悔向量，"
                            "不是原始美元/天数 —— 所以'标定'只决定这一轮有没有区分度，不改变谁更好。"),
     }
