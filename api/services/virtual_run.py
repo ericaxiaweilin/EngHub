@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -1550,6 +1551,48 @@ async def constraint_overlay(db: AsyncSession, factory_id: str,
                           "constraint_gaps": c["constraint_gaps"]})
     per_policy: List[Dict[str, Any]] = []
     blocked: List[str] = []
+    # 人力杠杆能买多少产能，要拿"标称班时 + 声明的加班上限"算，不能只看政策名字里的百分比
+    try:
+        from core.mes.data_evidence import attendance_evidence
+
+        att = await attendance_evidence(db, factory_id)
+    except Exception:  # noqa: BLE001  查不动时不折算，标注成无从判断
+        att = {}
+    norm = (att.get("shift_norm") or {}).get("norm_hours") if att.get("available") else None
+    ot_cap = None
+    for m in per_model:
+        cap = ((m.get("declared") or {}).get("add_overtime") or {}).get("params")
+        if isinstance(cap, str):
+            try:
+                cap = json.loads(cap or "{}")
+            except (TypeError, ValueError):
+                cap = {}
+        if isinstance(cap, dict) and cap.get("max_hours_per_day") is not None:
+            ot_cap = float(cap["max_hours_per_day"])
+            break
+    ds_days = int(((att.get("double_shift") or {}).get("observed_person_days")) or 0)
+
+    def _workforce_feasibility(pol: Dict[str, Any]) -> Dict[str, Any]:
+        share = float(pol.get("crew_bonus") or 0)
+        if share <= 0:
+            return {}
+        out = {"crew_share": round(share, 3), "norm_hours": norm, "declared_ot_cap_hours": ot_cap,
+               "observed_double_shift_person_days": ds_days}
+        if norm and ot_cap is not None:
+            ot_max_share = ot_cap / float(norm)
+            out["ot_only_max_share"] = round(ot_max_share, 3)
+            out["ot_hours_implied"] = round(share * float(norm), 2)
+            out["achievable_by_overtime_only"] = bool(share <= ot_max_share + 1e-9)
+            out["note"] = (
+                f"{share:.0%} 折成每人日额外 {share * float(norm):.2f}h，"
+                + (f"在厂规 {ot_cap:g}h 上限之内" if out["achievable_by_overtime_only"]
+                   else f"超出厂规 {ot_cap:g}h 上限 —— 超出部分只能靠加人/双班"
+                       f"（本厂实测两班倒 {ds_days} 人次，见 attendance_observed）"
+                       "，引擎不许把它当成加班就能做到的事"))
+        elif not norm:
+            out["note"] = "没有到岗实测（attendance 读不到），这一档买多少产能无从判断"
+        return out
+
     for pol in policies:
         acts = policy_actions(pol)
         unsupported = {m["model"]: [a for a in acts
@@ -1562,9 +1605,15 @@ async def constraint_overlay(db: AsyncSession, factory_id: str,
         if hard:
             blocked.append(name)
         per_policy.append({"policy": name, "actions": acts, "blocked_by_rule": hard,
+                           "workforce_feasibility": _workforce_feasibility(pol),
                            "unsupported": {k: v for k, v in unsupported.items() if v}})
+    wf = [p.get("workforce_feasibility") or {} for p in per_policy]
+    wf = [x for x in wf if x]
     return {"enforced": bool(blocked),
             "policies_blocked": len(blocked),
+            "workforce_levers": len(wf),
+            "workforce_levers_beyond_ot_cap": sum(1 for x in wf
+                                                  if x.get("achievable_by_overtime_only") is False),
             "rules_in_effect": sorted({a for m in per_model for a in (m.get("declared") or {})}),
             "actions_unsupported_marks": sum(len(v or []) for p in per_policy
                                              for v in (p.get("unsupported") or {}).values()),
