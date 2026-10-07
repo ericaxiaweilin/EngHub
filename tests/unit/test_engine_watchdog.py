@@ -69,9 +69,28 @@ def test_crashed_loop_that_never_resumed_is_an_incident():
         {("routing-backfill", FAILED)}
 
 
-def test_spawned_but_never_ticked_is_an_incident():
+def test_spawned_but_never_ticked_is_an_incident_once_the_grace_is_past():
+    """只记到 spawned 且已过 2 个预期间隔 = 起了进程没人证明它在跑。"""
     assert _kinds([_state("commander-watch", alive=False, last_status="spawned",
-                          state="spawned-unverified")]) == {("commander-watch", NEVER)}
+                          state="spawned-unverified", stale_seconds=900)]) == \
+        {("commander-watch", NEVER)}
+
+
+def test_a_loop_that_just_came_up_is_not_an_alarm():
+    """引擎重启的头几分钟所有循环都停在 spawned；没有宽限就会一次挂出 N 条假警报。
+
+    这正是 10-07 火警演练里真发生过的：巡检把刚起来的 3 个循环报成"从未确认在跑"，
+    十几分钟后又自己关掉 —— 待办成了重启的副产品，不是故障。
+    """
+    assert _kinds([_state("commander-watch", alive=False, last_status="spawned",
+                          state="spawned-unverified", interval_seconds=300,
+                          stale_seconds=38.0)]) == set()
+
+
+def test_repeated_failures_are_an_alarm_even_with_fresh_timestamps():
+    """每轮都崩会把 last_tick_at 一直刷新；只等"没动静"就永远等不到，所以按自述状态判。"""
+    assert _kinds([_state("routing-backfill", alive=False, last_status="failed",
+                          stale_seconds=12.0)]) == {("routing-backfill", FAILED)}
 
 
 def test_crash_rate_only_judged_inside_the_window_and_over_the_line():
@@ -90,6 +109,24 @@ def test_crash_and_stall_are_separate_findings_for_the_same_loop():
                           window_ticks=100, window_failures=20,
                           window_crash_rate=0.2)]) == {
         ("routing-backfill", STALLED), ("routing-backfill", CRASH)}
+
+
+def test_loops_stalling_together_are_reported_as_one_process_not_n_bugs():
+    """引擎循环共用一个进程：一起停跳时人该先看进程，不该被 N 条独立故障牵着逐个查代码。"""
+    states = [_state(n, alive=False, stale_seconds=900) for n in
+              ("periodic-scheduler", "followup-scanner", "commander-watch")]
+    found = findings(states, crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)
+    assert len(found) == 3
+    assert all(f["evidence"]["loops_not_ticking"] == 3 for f in found)
+    assert "同时有 3 个循环没在跳" in found[0]["description"]
+    assert "docker ps enghub-engine" in found[0]["description"]
+
+
+def test_single_stall_does_not_claim_a_process_outage():
+    found = findings([_state("periodic-scheduler", alive=False), _state("followup-scanner")],
+                     crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)
+    assert len(found) == 1
+    assert "同时有" not in found[0]["description"]
 
 
 # ── 签名：什么算"同一条故障" ─────────────────────────────────────────────────

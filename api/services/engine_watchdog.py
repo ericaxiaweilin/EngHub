@@ -51,6 +51,28 @@ OPEN_SQL = text("""
 
 
 # ── 判据：台账 → 需要人看的条目（纯函数，不动库）────────────────────────────
+def is_down(row: Dict[str, Any]) -> bool:
+    """这个循环现在能不能被算成"没在跑"。
+
+    分两种死法：台账**自己报出来的**（failed / exited）是事实，立刻成立；
+    靠"没动静"推断出来的（只记到 spawned 或状态不认识）要给宽限 ——
+    read_states 把"活着"定义成"逐轮心跳新鲜"，刚起来的进程那一笔是 spawned，
+    没有宽限就会在引擎重启后的头 1-2 分钟挂出 N 条"从未在跑"的假警报。
+    """
+    if row.get("alive"):
+        return False
+    status = str(row.get("last_status") or "")
+    loop = str(row.get("loop") or "")
+    if status == "tick":
+        return True                        # 报着报着不跳了：判死线由 read_states 算过了
+    if status in ("failed", "exited"):
+        # 引擎自己记下"这一跳崩了/这循环结束了"就是事实：每轮失败都会把 last_tick_at 刷新，
+        # 再等 2 个间隔就永远等不到 —— 恢复了 last_status 会变回 tick，这条判据自己就消失。
+        return status == "failed" or loop not in ONE_SHOT_LOOPS
+    interval = int(row.get("interval_seconds") or 0)
+    return float(row.get("stale_seconds") or 0) > 2 * max(interval, 1)
+
+
 def _one_line(value: Any, limit: int = 200) -> str:
     return " ".join(str(value or "").split())[:limit]
 
@@ -120,36 +142,31 @@ def findings(states: List[Dict[str, Any]], *, crash_rate_limit: float,
     "已断 3.1 小时 / 3.2 小时"这种每轮都动的数只出现在正文里 —— 拿它当签名就会每 10 分钟
     刷新一次待办，跟进日志被同一条故障刷满。
     """
+    # 台账是全局的：整台引擎进程停掉时，所有循环会一起不再跳。
+    # 那时挂出来的是 N 条"独立故障"，人得先看 docker ps 而不是逐个查代码 —— 所以把同时停跳
+    # 的台数算出来写进正文。判据不变（每条还是各挂各的），只是别让人误以为是 N 个 bug。
+    stopped = [row for row in states if is_down(row)]
+    concurrent = len(stopped)
     out: List[Dict[str, Any]] = []
     for row in states:
         ev = _evidence(row)
-        loop = ev["loop"]
-        alive = bool(row.get("alive"))
         status = ev["last_status"]
 
-        if not alive:
-            if status == "exited" and loop in ONE_SHOT_LOOPS:
-                pass
-            elif status == "tick":
-                out.append(_build(ev, STALLED, crash_rate_limit, min_window_ticks))
-            elif status == "failed":
-                out.append(_build(ev, FAILED, crash_rate_limit, min_window_ticks))
-            elif status == "exited":
-                out.append(_build(ev, EXITED, crash_rate_limit, min_window_ticks))
-            elif status == "spawned":
-                out.append(_build(ev, NEVER, crash_rate_limit, min_window_ticks))
-            else:
-                out.append(_build(ev, NEVER, crash_rate_limit, min_window_ticks))
+        if is_down(row):
+            kind = (STALLED if status == "tick" else
+                    FAILED if status == "failed" else
+                    EXITED if status == "exited" else NEVER)
+            out.append(_build(ev, kind, crash_rate_limit, min_window_ticks, concurrent))
 
         rate = ev["window_crash_rate"]
         if (rate is not None and ev["window_ticks"] >= min_window_ticks
                 and float(rate) > float(crash_rate_limit)):
-            out.append(_build(ev, CRASH, crash_rate_limit, min_window_ticks))
+            out.append(_build(ev, CRASH, crash_rate_limit, min_window_ticks, concurrent))
     return out
 
 
 def _build(ev: Dict[str, Any], kind: str, crash_rate_limit: float,
-           min_window_ticks: int) -> Dict[str, Any]:
+           min_window_ticks: int, concurrent: int = 1) -> Dict[str, Any]:
     loop = ev["loop"]
     interval = ev["interval_seconds"] or 0
     deadline = f"2 × {int(interval)} 秒" if interval else "预期间隔未知"
@@ -157,7 +174,8 @@ def _build(ev: Dict[str, Any], kind: str, crash_rate_limit: float,
     errors = ev["recent_errors"]
     rate = ev["window_crash_rate"]
     facts = {**ev, "kind": kind, "crash_rate_limit": float(crash_rate_limit),
-             "min_window_ticks": int(min_window_ticks)}
+             "min_window_ticks": int(min_window_ticks),
+             "loops_not_ticking": int(concurrent)}
 
     if kind == STALLED:
         sig = f"stalled|{_stamp(ev['last_tick_at'])}"
@@ -207,6 +225,10 @@ def _build(ev: Dict[str, Any], kind: str, crash_rate_limit: float,
         block = f"{loop} 窗口崩溃率 {float(rate):.1%} 越过 {float(crash_rate_limit):.0%}"
 
     lines = [why, ""]
+    if kind != CRASH and concurrent >= 3:
+        lines.insert(1, (f"注意：台账上同时有 {concurrent} 个循环没在跳。引擎的循环跑在同一个进程里，"
+                         f"一起停跳更像整个进程停了（先看 docker ps enghub-engine 与最后一次重启时间），"
+                         f"而不是 {concurrent} 个独立故障。"))
     if errors:
         lines.append("最近错误小环（引擎逐跳记的原文，不是复述）：")
         lines.extend(f"· {e}" for e in errors)
