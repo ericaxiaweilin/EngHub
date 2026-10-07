@@ -865,10 +865,41 @@ def summarize(report: Dict[str, Any]) -> Dict[str, Any]:
                      "reported=量出来了但这一格没有判线，两者不是一回事。")}
 
 
+# 分层验收一次要 35~52 秒（L2A 的 bootstrap 重采样、L2B 的 70 单回测、L3 的 12 张
+# 记分卡重跑都是真算），agent 与前端拿不动这个延迟：一轮对话等 50 秒等于没有这个功能。
+# 所以按"厂区 + 机种集合 + 当天"缓存一份结果，默认 15 分钟；缓存命中如实标 from_cache，
+# 并且提供 refresh 让"刚改完输入"的人立刻拿到新数 —— 不能让人对着缓存猜输入生效没有。
+LAYERS_CACHE: Dict[tuple, tuple] = {}
+LAYERS_CACHE_TTL_SECONDS = 900
+
+
+def _layers_cache_key(factory_id: str, models: List[Any]) -> tuple:
+    parts = []
+    for m in models or []:
+        if isinstance(m, dict):
+            parts.append(f"{m.get('model_code')}:{m.get('units')}:{m.get('due_date')}")
+        else:
+            parts.append(str(m))
+    return (str(factory_id), datetime.utcnow().date().isoformat(), "|".join(sorted(parts)))
+
+
 async def layered_acceptance(db: AsyncSession, factory_id: str,
-                              models: List[str]) -> Dict[str, Any]:
+                              models: List[str], *,
+                              use_cache: bool = True,
+                              ttl_seconds: Optional[int] = None) -> Dict[str, Any]:
     """五层逐层自测。任何一层查崩了只让那一层 not_computable，不拖垮整份报告，
     也不许把事务打成脏的（那样后面四层会一起报同一个假错）。"""
+    ttl = LAYERS_CACHE_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+    key = _layers_cache_key(factory_id, models)
+    hit = LAYERS_CACHE.get(key)
+    if use_cache and hit:
+        age = (datetime.utcnow() - hit[0]).total_seconds()
+        if age <= ttl:
+            cached = json.loads(hit[1])
+            cached["cache"] = {"from_cache": True, "age_seconds": round(age, 1),
+                               "ttl_seconds": ttl, "computed_at": hit[0].isoformat()}
+            return cached
+
     report: Dict[str, Any] = {"factory_id": factory_id, "models": models}
     layers = (("L1", _l1_kernel(db, factory_id, models, None)),
               ("L2A", _l2a_sensitivity(db, factory_id, models, None)),
@@ -884,4 +915,8 @@ async def layered_acceptance(db: AsyncSession, factory_id: str,
                                                 f"探针失败：{type(exc).__name__}: {str(exc)[:160]}")]}
     out = summarize(report)
     out["detail"] = {k: v for k, v in report.items() if k in LAYER_ORDER}
+    computed_at = datetime.utcnow()
+    out["cache"] = {"from_cache": False, "age_seconds": 0.0, "ttl_seconds": ttl,
+                    "computed_at": computed_at.isoformat()}
+    LAYERS_CACHE[key] = (computed_at, json.dumps(out, ensure_ascii=False, default=str))
     return out

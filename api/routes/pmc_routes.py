@@ -498,6 +498,7 @@ async def get_sim_tradeoffs(
 async def get_engine_layers(
     factory_id: str = Query(..., description="厂区"),
     n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
+    refresh: bool = Query(False, description="跳过缓存重算一遍（刚改过输入时用）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -514,7 +515,7 @@ async def get_engine_layers(
     models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
     if not models:
         raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
-    return await layered_acceptance(db, factory_id, models)
+    return await layered_acceptance(db, factory_id, models, use_cache=not refresh)
 
 
 @router.get("/sim-sensitivity", summary="建模精度×敏感度：每个输入动一档，交期/准点/钱各变多少")
