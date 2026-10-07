@@ -267,10 +267,12 @@ def _build(ev: Dict[str, Any], kind: str, crash_rate_limit: float,
 
 # ── 对账：新挂 / 刷新 / 关闭 / 不动（纯函数）───────────────────────────────
 def plan_actions(open_tasks: List[Dict[str, Any]],
-                 found: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                 found: List[Dict[str, Any]], *,
+                 protected_loops: Optional[frozenset] = None) -> List[Dict[str, Any]]:
     """一条 (loop, kind) 只留一条未关闭催办；签名没变就不动库。
 
     同一键下的历史重复条目（旧版本代码留下的）一并收掉，不然收件箱里三条说的是同一件事。
+    protected_loops 里的格子只做 create/refresh/去重，不做关闭（见 DATA_LOOPS）。
     """
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for task in open_tasks:
@@ -310,6 +312,13 @@ def plan_actions(open_tasks: List[Dict[str, Any]],
     for key, rows in grouped.items():
         if key in keys:
             continue
+        if protected_loops and key[0] in protected_loops:
+            actions.append({"action": "protected", "task_id": rows[0].get("id"),
+                            "task": rows[0],
+                            "finding": {"loop": key[0], "kind": key[1],
+                                        "sig": str(rows[0]["watchdog"].get("sig") or ""),
+                                        "title": rows[0].get("title")}})
+            continue
         actions.append({"action": "close", "task_id": rows[0].get("id"),
                         "task": rows[0],
                         "finding": {"loop": key[0], "kind": key[1],
@@ -342,13 +351,15 @@ async def scan(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
 
 
 async def _reconcile(db: AsyncSession, factory_id: str, found: List[Dict[str, Any]],
-                     category: str, apply: bool) -> Dict[str, Any]:
+                     category: str, apply: bool, *,
+                     protected_loops: Optional[frozenset] = None) -> Dict[str, Any]:
     """对账 + 落库的公共一段：运行时故障与数据缺口走同一条路（只有判据来源不同）。"""
     open_rows = [dict(r) for r in (await db.execute(
         OPEN_SQL, {"fid": factory_id, "cat": category})).mappings().all()]
-    counts = {"create": 0, "refresh": 0, "close": 0, "close_duplicate": 0, "unchanged": 0}
+    counts = {"create": 0, "refresh": 0, "close": 0, "close_duplicate": 0,
+              "unchanged": 0, "protected": 0}
     items: List[Dict[str, Any]] = []
-    for act in plan_actions(open_rows, found):
+    for act in plan_actions(open_rows, found, protected_loops=protected_loops):
         counts[act["action"]] = counts.get(act["action"], 0) + 1
         item = {"action": act["action"], "loop": act["finding"]["loop"],
                 "kind": act["finding"]["kind"], "sig": act["finding"]["sig"],
@@ -518,6 +529,17 @@ MOB_CONTRADICTION_SQL = """
 """
 
 
+# 这几格的判据住在本文件里：data_findings 这轮没报某格，有两种可能 —— 缺口真的缩到
+# 判据线以下，或者那一格的查数没跑成（列没了、厂区没数据、依赖的服务抛异常被吞）。
+# 光看"没报"分不出这两种，而分不出就自动关闭会把"暂时没查"写成"已经修好"，补数据的人
+# 丢的正是那条待办。所以这一组只刷新、不关闭；要真收掉得有人明确判一次。
+DATA_LOOPS = frozenset({
+    "kit_line_generation", "kit_line_missing", "supplier_master",
+    "lead_time_evidence", "material_make_or_buy_conflict",
+    "action_constraints", "candidate_rules",
+})
+
+
 def _gap(loop: str, kind: str, sig: str, title: str, description: str, block: str,
          agent_key: str, hint: str, evidence: Dict[str, Any],
          interval: int = DATA_FOLLOW_INTERVAL_MINUTES) -> Dict[str, Any]:
@@ -544,6 +566,12 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     except Exception:  # noqa: BLE001  约束层查不动时不挂这一格，别把整轮巡检带崩
         cons = {}
     try:
+        from core.mes.measurement_priority import measurement_priority
+
+        mp = await measurement_priority(db, factory_id, units=1200)
+    except Exception:  # noqa: BLE001  活单查不动不影响别的格，但不能当成"没有活要干"
+        mp = {}
+    try:
         # 先记账再挖：台账是"事件→动作→结果"的唯一载体，挖出来的 candidate 全靠它
         # 挂在巡检里（6 小时一轮），不靠人记得去点；推荐变了没变都刷，实绩一变达成率就跟变
         from core.mes.factory_rules import (backfill_decision_ledger, mine_patterns,
@@ -561,14 +589,15 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
-                        pending=list(pending or []))
+                        pending=list(pending or []), mp=dict(mp or {}))
 
 
 def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  ready: Dict[str, Any], lead: Optional[Dict[str, Any]] = None,
                  mob: Optional[Dict[str, Any]] = None,
                  cons: Optional[Dict[str, Any]] = None,
-                 pending: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+                 pending: Optional[List[Dict[str, Any]]] = None,
+                 mp: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
     阈值写成张数/料号数而不是比例：少于十几张时重跑一次的成本比挂一条待办更划算，
@@ -662,7 +691,8 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             "这不是算法能补的：要么按料号量出实际到货天数（先量决定交期的那几十个），"
             "要么把承诺口径改成不依赖未量的提前期。\n"
             "复核：GET /api/v1/pmc/data-evidence?factory_id=<厂区>、"
-            "POST /api/v1/pmc/virtual-run 看 bottleneck_part.lead_evidence。",
+            "GET /api/v1/pmc/measurement-priority（该先量哪一档、几个件、值几天）。\n"
+            f"先量这些：{json.dumps((mp or {}).get('per_model') or [], ensure_ascii=False, default=str)[:900]}",
             f"{lt} 个外购料号的提前期没有实测证据，交期结论建在铺出来的默认值上",
             "procurement_agent", "按料号量到货天数，先量引擎点名的瓶颈件，别铺全厂默认值。",
             {"unverified_buy_rows": lt, "buy_rows": int((lead or {}).get("buy_rows") or 0),
@@ -728,7 +758,11 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
                     apply: bool = False) -> Dict[str, Any]:
     """数据缺口巡检：判据被主数据封顶时自动成一条补数据催办，补齐后自动关闭。"""
     found = await data_findings(db, factory_id)
-    outcome = await _reconcile(db, factory_id, found, DATA_CATEGORY, apply)
+    seen = {str(f["loop"]) for f in found}
+    # 判据本轮没跑出来的格子：不做关闭，但也得让"看住的是哪几格"这件事本身可查。
+    protected = frozenset(DATA_LOOPS - seen)
+    outcome = await _reconcile(db, factory_id, found, DATA_CATEGORY, apply,
+                               protected_loops=protected)
     return {
         "factory_id": factory_id, "apply": apply, "thresholds": {
             "stale_generation_orders": MIN_STALE_ORDERS,
@@ -740,6 +774,8 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
             "pending_rule_samples": MIN_PATTERN_SAMPLES,
         },
         "counts": outcome["counts"], "findings": found, "items": outcome["items"],
+        "held_open": sorted(protected),
+        "cells_without_guard": sorted(l for l in seen if l not in DATA_LOOPS),
         "rule": ("这几格不是引擎算不出，是台账/主数据没跟上：齐套行登记世代、可重跑补齐的缺行单、"
                  "外购缺口的供应商、没量过的提前期、自制/外购两列矛盾。缩到阈值以下自动关闭。"),
     }

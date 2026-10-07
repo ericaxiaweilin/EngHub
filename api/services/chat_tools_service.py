@@ -150,6 +150,20 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_measurement_priority",
+            "description": "回答「台账的数不可信，那该先去量哪些件」：按机种给出决定开工日的那一档、档里几个料号、把它们换成实测量级后交期值几天，并附前 20 个该量的料号。关键点是按档给——并列那一档有几百个件时，只量其中一个交期一天也不会动。校准比来自本厂采购下单→到货实测÷台账的中位数，一个实测都没有时会明写只是量级演示。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "models": {"type": "string", "description": "逗号分隔机种；不给就取 BOM 最完整的几个"},
+                    "units": {"type": "number", "description": "每张单台数，默认 1200"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_open_rule_questions",
             "description": "列出引擎想知道、但厂里还没写成规则的现场约束（外发允不允许、加班上限几小时、缺人时能从哪些组调人、能不能部分交付、并联线的合并产能上限）。每条问题带「为什么现在要问」和已经挖到的证据（例如册上能顶检测岗只剩 2 人），要问现场时优先用这个，而不是把空表甩给人填。",
             "parameters": {
@@ -3185,6 +3199,22 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _tool_list_measurement_priority(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """该先量哪些件（只读）。口径只在 core/mes/measurement_priority 一处，这里只转述。"""
+    from core.mes.measurement_priority import measurement_priority
+
+    fid = factory_id or "FAC_MECH_001"
+    codes = [m.strip() for m in str(args.get("models") or "").replace("，", ",").split(",") if m.strip()]
+    out = await measurement_priority(db, fid, models=codes or None,
+                                     units=(float(args["units"]) if args.get("units") else None))
+    out["reading_hint"] = ("swing_days_if_measured 是把这一档提前期换成实测量级后完工日差几天；"
+                           "critical_part_count 很大时要整批量，单量一个件交期不动。"
+                           "校准比 n_materials=0 时结论只是量级演示，不能拿去承诺交期")
+    return out
+
+
 async def _tool_list_open_rule_questions(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3581,6 +3611,7 @@ _TOOL_EXECUTORS = {
     "get_work_order_detail": _tool_get_work_order_detail,
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
+    "list_measurement_priority": _tool_list_measurement_priority,
     "list_open_rule_questions": _tool_list_open_rule_questions,
     "confirm_rule": _tool_confirm_rule,
     "record_execution": _tool_record_execution,
@@ -3984,6 +4015,7 @@ TOOL_LABELS = {
     "get_work_order_detail": "工单详情",
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
+    "list_measurement_priority": "该先量哪些件",
     "list_open_rule_questions": "现场规则缺口提问",
     "confirm_rule": "确认或驳回候选规则",
     "record_execution": "记一件现场执行",
@@ -4165,6 +4197,14 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "记一条", "记下", "记住", "写进规则", "定条规矩", "立规矩", "以后都",
             "不允许外发", "禁止外发", "可以外发", "加班上限", "不许外发", "规定：",
             "组立不允许", "检测岗只能", "只能由", "算违约", "允许部分交付",
+        ],
+    },
+    {
+        # 「先去量哪些件」是补数据的行动问题，必须有清单而不是回"数据不全"
+        "tool": "list_measurement_priority",
+        "keywords": [
+            "先量哪些", "该量哪些", "先量哪", "要量哪些", "哪些件要量", "哪些料号要实测",
+            "值得量", "补哪个件", "先补哪些数", "量了能提前几天", "该补哪些料号",
         ],
     },
     {
