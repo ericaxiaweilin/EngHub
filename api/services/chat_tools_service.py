@@ -3120,6 +3120,7 @@ async def _tool_query_lead_time_evidence(
         "type": "lead_time_evidence",
         "factory_id": fid,
         "queried_codes": codes,
+        "empty_reason": out.get("empty_reason"),
         "checked": out["checked"],
         "coverage": out["coverage"],
         "verdict_counts": out["verdict_counts"],
@@ -3136,7 +3137,8 @@ async def _tool_query_lead_time_evidence(
         "basis": out["basis"],
         "reading_hint": ("unverified_default = 同组几十~几千个料号共用同一个众数取值，这个数没被量过；"
                          "ledger_default_conflicts_with_measured = 台账值比实测中位小一半以上，"
-                         "拿它算交期会系统性偏乐观；suggested_days 是「要去核对的数」，不是事实。"),
+                         "拿它算交期会系统性偏乐观；suggested_days 是「要去核对的数」，不是事实。"
+                         "empty_reason 非空时先说清那个厂没有物料台账，别把空结果讲成\"都验证过了\"。"),
     }
 
 
@@ -3911,7 +3913,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "提前期准", "提前期可信", "提前期是不是", "提前期怎么来", "提前期多少天", "提前期几天",
             "提前期够不够", "提前期安全", "提前期能不能", "提前期会不会", "提前期可靠", "台账提前期",
-            "提前期差多少", "实测到货",
+            "提前期差多少", "提前期核对", "提前期都", "提前期核实", "实测到货",
             "是不是量出来", "量出来的", "铺的默认", "默认提前期", "台账默认值", "实测到货",
             "到货天数", "到货要多久", "供应商几天到", "交期靠得住",
         ],

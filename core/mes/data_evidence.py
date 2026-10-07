@@ -260,6 +260,11 @@ async def lead_time_evidence(db: AsyncSession, factory_id: str,
             factory_verdicts["flat_group:" + key] = int(g["n_parts"])
     return {
         "factory_id": factory_id,
+        # 空结果必须能区分"没问题"和"没数据"：这个厂 materials 台账 0 行时，
+        # verdict_counts 也是空的，读的人很容易当成"提前期都查过了"。
+        "empty_reason": (None if rows else
+                         f"厂区 {factory_id} 在 materials 台账里没有行（scanned_materials=0）—— "
+                         "这是缺主数据，不是提前期都被验证过；本普查不代填，只说明无从核对"),
         "checked": {"scanned_materials": len(rows), "groups_computed": len(stats),
                     "po_evidence_materials": len(po_measured),
                     "receipt_evidence_materials": len(receipts), "suppliers": len(suppliers),
