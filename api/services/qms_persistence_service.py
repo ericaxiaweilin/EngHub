@@ -5,6 +5,8 @@ QMS 持久化服务层 - 基于 SQLAlchemy ORM 的数据库操作封装
 作为对内存服务的生产级替换。
 """
 
+import hashlib
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import select, func
@@ -175,15 +177,24 @@ class CAPAPersistenceService:
         source_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """在数据库中创建 CAPA 案件"""
-        case_number = f"CAPA-{datetime.utcnow().strftime('%Y')}-{CAPAPersistenceService._get_next_number()}"
+        case_number = f"CAPA-{datetime.utcnow().strftime('%Y')}-{await CAPAPersistenceService._get_next_number(session)}"
         
+        # CAPACase 表里没有 title/severity/source_type/source_id 这四列（列名是
+        # problem_description / defect_severity），原来按幻影列构造对象，
+        # 每次立案都是 TypeError，只是被路由层的 except 包成了 500。
+        # 来源信息没有独立列，就写进 action_logs 这条审计 jsonb，不硬塞到别的字段里。
         capa = CAPACase(
-            id=str(hash(title + str(datetime.utcnow())))[:36],  # 简化生成唯一ID
+            id=str(uuid.uuid4()),
             case_number=case_number,
-            title=title,
-            severity=severity,
-            source_type=source_type,
-            source_id=source_id if source_id else "",
+            problem_description=title,
+            defect_severity=str(severity or "").lower() or None,
+            status="open",
+            action_logs=[{
+                "action": "created",
+                "at": datetime.utcnow().isoformat(),
+                "source_type": source_type,
+                "source_id": source_id,
+            }],
             created_at=datetime.utcnow(),
         )
         
@@ -194,17 +205,32 @@ class CAPAPersistenceService:
         return {
             "id": capa.id,
             "case_number": capa.case_number,
-            "title": capa.title,
-            "severity": capa.severity,
+            "title": capa.problem_description,
+            "severity": capa.defect_severity,
             "status": capa.status,
             "created_at": capa.created_at.isoformat(),
         }
     
     @staticmethod
-    async def _get_next_number() -> int:
-        """获取下一个 CAPA 序号（简化实现）"""
-        # 实际应从数据库查询最大值 + 1
-        return 1
+    async def _get_next_number(session: AsyncSession) -> int:
+        """当年已用最大序号 +1。
+
+        原来是写死的 `return 1`：每张新案件都叫 CAPA-2026-1，而库里 case_number
+        只有普通索引没有唯一约束，所以编号重复是静默发生的，编号本身不再能指认案件。
+        """
+        prefix = f"CAPA-{datetime.utcnow().year}-"
+        existing = (await session.execute(
+            select(CAPACase.case_number).where(CAPACase.case_number.like(f"{prefix}%"))
+        )).scalars().all()
+        used = set()
+        for raw in existing:
+            tail = str(raw or "").strip()[len(prefix):]
+            if tail.isdigit():
+                used.add(int(tail))
+        number = max(used) + 1 if used else 1
+        while number in used:
+            number += 1
+        return number
     
     @staticmethod
     async def list_capa_cases(
@@ -250,7 +276,7 @@ class FAIPersistenceService:
     ) -> Dict[str, Any]:
         """创建 FAI 记录（使用 QualityInspection 表）"""
         # 简化的实现：直接在 QualityInspection 中记录 FAI
-        fai_id = str(hash(f"{work_order_id}_{product_id}"))[:36]
+        fai_id = _stable_id(f"{work_order_id}_{product_id}")
         
         fai = QualityInspection(
             id=fai_id,
@@ -297,7 +323,7 @@ class IPCPersistenceService:
         inspector_id: str,
     ) -> Dict[str, Any]:
         """创建 IPC 巡检计划（存储为 QualityInspection，inspect_type='IPC'）"""
-        ipc_id = str(hash(f"{work_order_id}_{process_stage}"))[:36]
+        ipc_id = _stable_id(f"{work_order_id}_{process_stage}")
         
         ipc = QualityInspection(
             id=ipc_id,
@@ -329,6 +355,15 @@ class IPCPersistenceService:
         }
 
 
+def _stable_id(seed: Any) -> str:
+    """由业务自然键派生主键：跨进程、跨 worker 都得到同一个值。
+
+    原来用 Python 的 `hash()`，字符串哈希带进程随机种子，两个 uvicorn worker
+    对同一张工单会算出两个不同 ID（同一自然键的重复记录因此躲过主键冲突）。
+    """
+    return hashlib.sha1(str(seed).encode('utf-8')).hexdigest()[:32]
+
+
 class OQCPersistenceService:
     """OQC 持久化服务"""
     
@@ -344,7 +379,7 @@ class OQCPersistenceService:
         inspector_id: str,
     ) -> Dict[str, Any]:
         """创建出货检验记录（QualityInspection 类型 OQC）"""
-        oqc_id = str(hash(order_id))[:36]
+        oqc_id = _stable_id(order_id)
         
         oqc = QualityInspection(
             id=oqc_id,

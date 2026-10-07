@@ -742,7 +742,7 @@ async def create_iqc_request(
 ):
     """创建IQ C记录（收货后触发）"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     try:
         record = await qms.create_iqc_record(
@@ -770,13 +770,15 @@ async def start_iqc_inspection(
 ):
     """开始IQ C检验"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
-    success = await qms.start_iqc_inspection(inspection_id, body.inspector_id)
-    if not success:
-        raise HTTPException(status_code=400, detail="无法开始检验：检验不存在或状态不正确")
-    
-    return {"success": True, "message": "检验已开始"}
+    # quality_inspections 只有 result(PENDING/PASS/FAIL) 与 hold_status，没有"检验中"
+    # 这个状态位也没有开始时间列；凭空造枚举值会让后续统计口径失真，所以明确 501。
+    raise HTTPException(
+        status_code=501,
+        detail=("IQC『开始检验』未实现：quality_inspections 没有可表达『检验中』的状态列，"
+                "需要先定状态模型（result/hold_status 的取值集合），不能临时造枚举值"),
+    )
 
 @router.put("/iqc/{inspection_id}/complete")
 async def complete_iqc_inspection(
@@ -787,7 +789,7 @@ async def complete_iqc_inspection(
 ):
     """完成IQ C检验并记录结果"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     success = await qms.complete_iqc_inspection(
         inspection_id=inspection_id,
@@ -809,7 +811,7 @@ async def dispose_iqc_record(
 ):
     """处置IQ C记录"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     success = await qms.dispose_iqc_record(
         inspection_id=inspection_id,
@@ -829,7 +831,7 @@ async def get_iqc_stats(
 ):
     """获取IQ C统计信息"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     stats = await qms.get_iqc_statistics(factory_id)
     return {"success": True, "data": stats}
@@ -932,7 +934,7 @@ async def create_ipc_request(
 ):
     """创建IPC巡检记录"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     try:
         record = await qms.create_ipc_record(
@@ -960,7 +962,7 @@ async def list_ipc_records(
 ):
     """列出IPC巡检记录列表"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     records = await qms.list_ipc_records(factory_id, limit=50)
     return {"success": True, "data": records}
@@ -1000,7 +1002,7 @@ async def create_oqc_request(
 ):
     """创建出货检验记录"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     try:
         record = await qms.create_oqc_record(
@@ -1051,7 +1053,7 @@ async def create_capa_request(
 ):
     """创建CAPA案件"""
     from api.services.qms_service import QMSService
-    qms = QMSService()
+    qms = QMSService(db)
     
     try:
         case = await qms.create_capa_case(
@@ -1071,7 +1073,7 @@ async def get_capa_case(case_id: str, db: AsyncSession = Depends(get_db), curren
     from api.services.qms_service import QMSService
     qms = QMSService(db)
     
-    case = qms.get_capa_case(case_id)
+    case = await qms.get_capa_case(case_id)
     if not case:
         raise HTTPException(status_code=404, detail="CAPA案件不存在")
     return {"success": True, "data": case}
@@ -1087,5 +1089,6 @@ async def list_capa_cases(
     from api.services.qms_service import QMSService
     qms = QMSService(db)
     
-    cases = qms.list_capa_cases(factory_id, status)
+    # capa_cases 没有 factory_id 列，不能假装按厂过滤（原来 factory_id 落到了 status 上）
+    cases = await qms.list_capa_cases(status=status)
     return {"success": True, "data": cases}
