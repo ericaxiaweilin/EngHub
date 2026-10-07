@@ -626,30 +626,47 @@ class WmsOperationService:
         """), {"fid": factory_id, "batch": batch_code})
         inv_records = [dict(r) for r in inv_result.mappings().all()]
 
-        # 2. 交易记录（出入库历史）
+        # 2. 交易记录（出入库历史）。inventory_transactions 里没有 material_code 这一列
+        #       （它用 material_id），原来那句按不存在的列做子查询，批次追溯每次 500。
         txn_result = await self.db.execute(text("""
             SELECT * FROM inventory_transactions
-            WHERE factory_id = :fid AND material_code IN (
-                SELECT DISTINCT material_code FROM inventory WHERE batch_code = :batch AND factory_id = :fid
-            ) AND batch_code = :batch
+            WHERE factory_id = :fid AND batch_code = :batch
             ORDER BY created_at ASC
         """), {"fid": factory_id, "batch": batch_code})
         transactions = [dict(r) for r in txn_result.mappings().all()]
 
-        # 3. 关联工单（通过领料出库记录）
+        # 3. 关联工单：这张表有直接的 work_order_id，reference_type/reference_id 是旧口径，
+        #    两个都要照顾到，但不重复计同一条流水。
         wo_links = []
+        seen_links = set()
         for txn in transactions:
-            if txn.get("reference_type") == "work_order" and txn.get("reference_id"):
-                wo_links.append({
-                    "work_order_id": txn["reference_id"],
-                    "qty": abs(txn.get("qty_change", 0)),
-                    "date": txn["created_at"].isoformat() if txn.get("created_at") else None,
-                })
+            wo_id = txn.get("work_order_id")
+            if not wo_id and txn.get("reference_type") == "work_order":
+                wo_id = txn.get("reference_id")
+            if not wo_id:
+                continue
+            key = (str(wo_id), str(txn.get("id")))
+            if key in seen_links:
+                continue
+            seen_links.add(key)
+            wo_links.append({
+                "work_order_id": wo_id,
+                # 数量列叫 quantity（无符号），表里没有 qty_change
+                "qty": abs(txn.get("quantity") or 0),
+                "transaction_type": txn.get("transaction_type"),
+                "date": txn["created_at"].isoformat() if txn.get("created_at") else None,
+            })
 
-        # 4. 汇总
-        total_in = sum(t.get("qty_change", 0) for t in transactions if t.get("qty_change", 0) > 0)
-        total_out = abs(sum(t.get("qty_change", 0) for t in transactions if t.get("qty_change", 0) < 0))
-        current_stock = sum(r.get("available_qty", 0) for r in inv_records)
+        # 4. 汇总：quantity 是无符号的，方向由 transaction_type 决定，不能按正负号猜
+        INBOUND = ("purchase_in", "production_in")
+        OUTBOUND = ("production_out", "adjustment_out")
+        total_in = sum((t.get("quantity") or 0) for t in transactions
+                       if t.get("transaction_type") in INBOUND)
+        total_out = sum((t.get("quantity") or 0) for t in transactions
+                        if t.get("transaction_type") in OUTBOUND)
+        moved = sum((t.get("quantity") or 0) for t in transactions
+                    if t.get("transaction_type") == "transfer")
+        current_stock = sum((r.get("available_qty") or 0) for r in inv_records)
 
         return {
             "batch_code": batch_code,
@@ -660,7 +677,10 @@ class WmsOperationService:
             "summary": {
                 "total_inbound": total_in,
                 "total_outbound": total_out,
+                "transferred": moved,
                 "current_stock": current_stock,
+                "direction_basis": "入库=purchase_in/production_in，出库=production_out/adjustment_out，transfer 单列",
+                "batch_matched_by": "transactions.batch_code（该表没有 material_code 列）",
                 "transaction_count": len(transactions),
                 "linked_work_orders": len(wo_links),
             },

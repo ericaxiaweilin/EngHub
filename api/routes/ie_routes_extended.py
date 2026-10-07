@@ -500,8 +500,26 @@ async def list_five_s_audits_by_workcenter(
         query = query.where(FiveSAudit.factory_id == factory_id)
     
     query = query.order_by(FiveSAudit.audit_date.desc()).limit(limit)
-    result = await query
-    return [r.to_dict() for r in result.scalars().all()]
+    # 两个坑：SQLAlchemy 2.x 里 `await query` 直接 TypeError；
+    # FiveSAudit 也没有 to_dict()，所以按真实列显式输出。
+    rows = (await db.execute(query)).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "factory_id": r.factory_id,
+            "work_center_id": r.work_center_id,
+            "audit_date": r.audit_date.isoformat() if r.audit_date else None,
+            "auditor_id": r.auditor_id,
+            "seiri_score": r.seiri_score,
+            "seiton_score": r.seiton_score,
+            "seiso_score": r.seiso_score,
+            "seiketsu_score": r.seiketsu_score,
+            "shitsuke_score": r.shitsuke_score,
+            "improvement_items": r.improvement_items,
+            "next_audit_date": str(r.next_audit_date) if r.next_audit_date else None,
+        }
+        for r in rows
+    ]
 
 
 # ============================================================
