@@ -55,6 +55,18 @@ OPEN_SQL = text("""
 """)
 
 
+# read_states 的判死线是 2×标称间隔，那一格报"新鲜度"没问题；拿它直接挂催办会误报：
+# periodic-scheduler 的一轮要跑多少时间取决于这一轮里落了哪几道闸门（日报/BOM 同步是 4-6 小时一道，
+# 落进同一轮时单轮就能 >240 秒），10-07 实测就被这样连挂过两条"断写"。
+# 所以挂催办要再宽一倍：真死的循环会一直不过线，正常的长轮下一轮就自己回来了。
+STALL_RAISE_FACTOR = 2
+
+
+def stall_deadline_seconds(row: Dict[str, Any]) -> float:
+    interval = int(row.get("interval_seconds") or 0)
+    return max(interval, 1) * 2 * STALL_RAISE_FACTOR
+
+
 # ── 判据：台账 → 需要人看的条目（纯函数，不动库）────────────────────────────
 def is_down(row: Dict[str, Any]) -> bool:
     """这个循环现在能不能被算成"没在跑"。
@@ -69,13 +81,13 @@ def is_down(row: Dict[str, Any]) -> bool:
     status = str(row.get("last_status") or "")
     loop = str(row.get("loop") or "")
     if status == "tick":
-        return True                        # 报着报着不跳了：判死线由 read_states 算过了
+        # 报着报着不跳了：判死线在新鲜度之上再宽一倍（见 STALL_RAISE_FACTOR）
+        return float(row.get("stale_seconds") or 0) > stall_deadline_seconds(row)
     if status in ("failed", "exited"):
         # 引擎自己记下"这一跳崩了/这循环结束了"就是事实：每轮失败都会把 last_tick_at 刷新，
         # 再等 2 个间隔就永远等不到 —— 恢复了 last_status 会变回 tick，这条判据自己就消失。
         return status == "failed" or loop not in ONE_SHOT_LOOPS
-    interval = int(row.get("interval_seconds") or 0)
-    return float(row.get("stale_seconds") or 0) > 2 * max(interval, 1)
+    return float(row.get("stale_seconds") or 0) > stall_deadline_seconds(row)
 
 
 def _one_line(value: Any, limit: int = 200) -> str:
@@ -174,7 +186,8 @@ def _build(ev: Dict[str, Any], kind: str, crash_rate_limit: float,
            min_window_ticks: int, concurrent: int = 1) -> Dict[str, Any]:
     loop = ev["loop"]
     interval = ev["interval_seconds"] or 0
-    deadline = f"2 × {int(interval)} 秒" if interval else "预期间隔未知"
+    deadline = (f"2 × {int(interval)} 秒 × {STALL_RAISE_FACTOR}（新鲜度判线再宽一倍的挂线）"
+                if interval else "预期间隔未知")
     span = _fmt_span(ev["stale_seconds"])
     errors = ev["recent_errors"]
     rate = ev["window_crash_rate"]

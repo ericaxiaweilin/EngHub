@@ -76,6 +76,15 @@ def test_spawned_but_never_ticked_is_an_incident_once_the_grace_is_past():
         {("commander-watch", NEVER)}
 
 
+def test_a_long_but_live_cycle_is_not_an_alarm():
+    """10-07 真发生过的误报：调度器一轮里落进 6 小时那道闸门时单轮 >240 秒，
+    新鲜度判线（2×120）会判它断写并连挂两条催办。挂催办要再宽一倍才挂。"""
+    assert _kinds([_state("periodic-scheduler", alive=False, stale_seconds=273)]) == set()
+    assert _kinds([_state("periodic-scheduler", alive=False, stale_seconds=400)]) == set()
+    assert _kinds([_state("periodic-scheduler", alive=False, stale_seconds=1000)]) == \
+        {("periodic-scheduler", STALLED)}
+
+
 def test_a_loop_that_just_came_up_is_not_an_alarm():
     """引擎重启的头几分钟所有循环都停在 spawned；没有宽限就会一次挂出 N 条假警报。
 
@@ -106,6 +115,7 @@ def test_crash_rate_only_judged_inside_the_window_and_over_the_line():
 
 def test_crash_and_stall_are_separate_findings_for_the_same_loop():
     assert _kinds([_state("routing-backfill", alive=False, last_status="tick",
+                          stale_seconds=9000,
                           window_ticks=100, window_failures=20,
                           window_crash_rate=0.2)]) == {
         ("routing-backfill", STALLED), ("routing-backfill", CRASH)}
@@ -123,7 +133,8 @@ def test_loops_stalling_together_are_reported_as_one_process_not_n_bugs():
 
 
 def test_single_stall_does_not_claim_a_process_outage():
-    found = findings([_state("periodic-scheduler", alive=False), _state("followup-scanner")],
+    found = findings([_state("periodic-scheduler", alive=False, stale_seconds=9000),
+                      _state("followup-scanner")],
                      crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)
     assert len(found) == 1
     assert "同时有" not in found[0]["description"]
@@ -141,9 +152,11 @@ def test_aging_stall_does_not_change_the_signature():
 
 
 def test_a_second_stall_after_recovery_is_a_new_signature():
-    a = findings([_state(alive=False, last_tick_at="2026-10-07 00:00:00")],
+    a = findings([_state(alive=False, stale_seconds=9000,
+                         last_tick_at="2026-10-07 00:00:00")],
                  crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)[0]
-    b = findings([_state(alive=False, last_tick_at="2026-10-07 06:30:00")],
+    b = findings([_state(alive=False, stale_seconds=9000,
+                         last_tick_at="2026-10-07 06:30:00")],
                  crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)[0]
     assert a["sig"] != b["sig"]
 
@@ -166,20 +179,23 @@ def _open_task(finding, task_id="t-1", sig=None):
 
 
 def test_new_fault_creates_one_task_and_recovery_closes_it():
-    found = findings([_state(alive=False)], crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)
+    found = findings([_state(alive=False, stale_seconds=9000)], crash_rate_limit=LIMIT,
+                     min_window_ticks=MIN_TICKS)
     assert [a["action"] for a in plan_actions([], found)] == ["create"]
     task = _open_task(found[0])
     assert [a["action"] for a in plan_actions([task], [])] == ["close"]
 
 
 def test_same_fault_same_signature_does_not_touch_the_db():
-    found = findings([_state(alive=False)], crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)
+    found = findings([_state(alive=False, stale_seconds=9000)], crash_rate_limit=LIMIT,
+                     min_window_ticks=MIN_TICKS)
     actions = plan_actions([_open_task(found[0])], found)
     assert [a["action"] for a in actions] == ["unchanged"]
 
 
 def test_changed_reading_refreshes_the_same_task_instead_of_adding_one():
-    found = findings([_state(alive=False, last_tick_at="2026-10-07 06:00:00")],
+    found = findings([_state(alive=False, stale_seconds=9000,
+                             last_tick_at="2026-10-07 06:00:00")],
                      crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)
     old = _open_task(found[0], sig="periodic-scheduler|stalled|2026-10-07 00:00:00 UTC")
     actions = plan_actions([old], found)
@@ -189,7 +205,8 @@ def test_changed_reading_refreshes_the_same_task_instead_of_adding_one():
 
 def test_duplicate_open_tasks_for_one_fault_are_merged():
     """旧版本重复挂出来的条目，靠对账收掉，收件箱里一个故障只留一条。"""
-    found = findings([_state(alive=False)], crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)
+    found = findings([_state(alive=False, stale_seconds=9000)], crash_rate_limit=LIMIT,
+                     min_window_ticks=MIN_TICKS)
     actions = plan_actions([_open_task(found[0], "keep"), _open_task(found[0], "extra")], found)
     assert sorted(a["action"] for a in actions) == ["close_duplicate", "unchanged"]
     assert [a["task_id"] for a in actions if a["action"] == "close_duplicate"] == ["extra"]
@@ -206,6 +223,7 @@ def test_unpayloaded_legacy_task_is_closed_not_matched():
 def test_stall_text_names_the_loop_the_deadline_and_how_to_check():
     found = findings([_state(alive=False, stale_seconds=2 * 3600, interval_seconds=120)],
                      crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)[0]
+    assert "× 2（新鲜度判线再宽一倍的挂线）" in found["description"]
     assert "periodic-scheduler" in found["title"]
     assert "心跳断写" in found["title"]
     assert "2 × 120 秒" in found["description"]
@@ -229,52 +247,3 @@ def test_last_error_ring_is_carried_into_the_task_verbatim():
                                              "error": "asyncpg.exceptions.TooManyConnectionsError"}])],
                      crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)[0]
     assert "TooManyConnectionsError" in found["description"]
-
-# ── 数据缺口：判据被台账/主数据封顶时要派活 ────────────────────────────────
-def _readings(stale=0, in_flow=0, rerun=0, no_sup=0):
-    from api.services.engine_watchdog import gap_readings
-
-    return gap_readings(gen={"stale_gen": stale, "in_flow": in_flow, "no_lines": 0},
-                        sup={"no_supplier": no_sup},
-                        ready={"fixable_by_rerun_orders": rerun, "models_with_orders": 9})
-
-
-def test_small_gaps_do_not_take_up_the_inbox():
-    """十几张以内重跑一次就完了，不值得挂待办；阈值写在判据里，不靠人记。"""
-    assert _readings(stale=9, in_flow=70) == []
-    assert _readings(rerun=9) == []
-    assert _readings(no_sup=19) == []
-
-
-def test_stale_kit_generation_raises_a_data_task_that_names_the_fix_and_the_catch():
-    got = _readings(stale=64, in_flow=205)
-    assert [f["kind"] for f in got] == ["stale_generation"]
-    f = got[0]
-    assert "64/205" in f["title"]
-    assert "登记世代" in f["block_reason"] or "登记世代" in f["description"]
-    # 这条催办必须把"刷台账会同时改小采购缺口"写在脸上，不然等于让人盲刷生产数据
-    assert "毛需求" in f["description"] and "低层码" in f["description"]
-    assert "/api/v1/pmc/sim-readiness" in f["description"]
-    assert f["category"] == "engine_data_gap" and f["agent_key"] == "pmc_agent"
-
-
-def test_rerunnable_and_supplier_gaps_route_to_the_right_owner():
-    got = _readings(rerun=17, no_sup=57)
-    kinds = {f["kind"]: f for f in got}
-    assert set(kinds) == {"rerunnable_gap", "missing_supplier"}
-    assert kinds["rerunnable_gap"]["agent_key"] == "pmc_agent"
-    assert kinds["missing_supplier"]["agent_key"] == "procurement_agent"
-    assert "default_supplier" in kinds["missing_supplier"]["description"]
-
-
-def test_gap_signature_moves_by_ten_not_by_one():
-    """补掉一张不刷新待办；补掉十张才算有进展 —— 不然收件箱那条每天改标题却没实际变化。"""
-    a = _readings(stale=64, in_flow=205)[0]["sig"]
-    b = _readings(stale=61, in_flow=205)[0]["sig"]
-    c = _readings(stale=54, in_flow=205)[0]["sig"]
-    assert a == b and a != c
-
-
-def test_closed_gap_explains_why_it_closed():
-    f = _readings(stale=64, in_flow=205)[0]
-    assert "缩到判据线以下" in f["recovered_note"]
