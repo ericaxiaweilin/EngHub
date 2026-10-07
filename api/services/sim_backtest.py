@@ -93,6 +93,109 @@ BUCKET_LABELS = {
 }
 
 
+ORDER_SHORT_SQL = """
+    WITH per_order AS (
+        SELECT w.work_order_id, o.planned_qty AS qty,
+               COALESCE(pp.product_code, p.product_code, o.product_id) AS model,
+               (ARRAY_AGG(w.material_code ORDER BY w.shortage_qty DESC))[1] AS most_missing,
+               (ARRAY_AGG(w.material_code ORDER BY COALESCE(m.lead_time_days, -1) DESC,
+                                                    w.shortage_qty DESC))[1] AS longest_lead,
+               MAX(w.shortage_qty) AS top_short_qty
+        FROM work_order_materials w
+        JOIN work_orders o ON o.id = w.work_order_id
+        LEFT JOIN materials m ON m.material_code = w.material_code AND m.factory_id = o.factory_id
+        LEFT JOIN products p ON p.factory_id = o.factory_id
+             AND (p.id::text = o.product_id OR p.product_code = o.product_id)
+        LEFT JOIN work_orders par ON par.id = o.parent_work_order_id
+        LEFT JOIN products pp ON pp.factory_id = par.factory_id
+             AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+        WHERE o.factory_id = :fid AND w.item_type = 'buy'
+          AND COALESCE(w.shortage_qty, 0) > 0
+          AND o.status NOT IN ('completed', 'cancelled') AND o.id NOT LIKE 'wo-vf-%'
+        GROUP BY 1, 2, 3)
+    SELECT model, qty, most_missing, longest_lead, top_short_qty, work_order_id
+    FROM per_order ORDER BY top_short_qty DESC
+"""
+
+
+async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int = 120) -> Dict[str, Any]:
+    """引擎选的那件料 vs 台账同一张单选的那件 —— 两种定义各算一次。
+
+    为什么必须分开算：仿真的「瓶颈件」是决定到货日的那件（外购缺料里提前期最长的），
+    台账上最直觉的「缺最多那件」是数量口径。原来我拿前者比后者，得到 0/40 ——
+    那个 0 是**指标定义错了**，不是引擎判错（实测样单里 `1000108191` 两边都是「缺最多那件」，
+    但引擎按提前期选的是另一件）。
+
+    已知偏差：引擎用今天的库存与在途重算净需求，台账那行是当时算的；对下达很久的单
+    两边不一致是预期内的。这一格读的是「有没有对错题」，不是模型达标与否。
+    """
+    from api.services import virtual_run as vr
+
+    rows = list((await db.execute(text(ORDER_SHORT_SQL), {"fid": factory_id})).mappings().all())
+    rows = rows[:max(1, int(limit))]
+    cache: Dict[tuple, Dict[str, Any]] = {}
+    per_order: List[Dict[str, Any]] = []
+    for r in rows:
+        model = str(r["model"] or "")
+        qty = float(r["qty"] or 0) or 1.0
+        key = (model, qty)
+        if key not in cache:
+            got = await vr.sim_bom_lines(db, factory_id, model, qty)
+            codes = [str(x["material_code"]) for x in got["rows"]]
+            stock_rows = (await db.execute(
+                vr.STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all() if codes else []
+            stock = {str(x["material_code"]): float(x["available"] or 0) for x in stock_rows}
+            kit = vr.build_kit(got["rows"], qty, stock, start_day=0)
+            short_buy = [l for l in kit.get("lines") or []
+                         if str(l.get("make_or_buy")) == "外购" and float(l.get("short") or 0) > 0]
+            by_qty = sorted(short_buy, key=lambda l: -float(l["short"]))
+            by_lead = sorted(short_buy, key=lambda l: (
+                -int(l["lead_time_days"]) if str(l.get("lead_time_days") or "").isdigit() else 1,
+                -float(l["short"])))
+            cache[key] = {
+                "lead_top": by_lead[0]["material_code"] if by_lead else None,
+                "qty_top": by_qty[0]["material_code"] if by_qty else None,
+                "short_parts": len(short_buy), "source": got["source"]}
+        got = cache[key]
+        per_order.append({
+            "work_order_id": str(r["work_order_id"]), "model": model, "units": qty,
+            "engine_lead_top": got["lead_top"], "engine_qty_top": got["qty_top"],
+            "ledger_longest_lead": str(r["longest_lead"]),
+            "ledger_most_missing": str(r["most_missing"]),
+            "lead_agrees": bool(got["lead_top"]) and got["lead_top"] == str(r["longest_lead"]),
+            "qty_agrees": bool(got["qty_top"]) and got["qty_top"] == str(r["most_missing"]),
+            "engine_shortage_parts": got["short_parts"], "bom_source": got["source"]})
+    n = len(per_order)
+    lead_hits = sum(1 for x in per_order if x["lead_agrees"])
+    qty_hits = sum(1 for x in per_order if x["qty_agrees"])
+    models = sorted({x["model"] for x in per_order})
+
+    def _by_model(flag):
+        out = []
+        for m in models:
+            sub = [x for x in per_order if x["model"] == m]
+            hits = sum(1 for x in sub if x[flag])
+            out.append({"model": m, "orders": len(sub), "agree": hits,
+                        "rate": round(hits / max(1, len(sub)), 3)})
+        return sorted(out, key=lambda v: -v["orders"])
+
+    return {
+        "orders_compared": n,
+        "lead_based": {"agree": lead_hits, "rate": round(lead_hits / n, 3) if n else None,
+                       "definition": "外购缺料里提前期最长的那件（决定到货日的那件）"},
+        "quantity_based": {"agree": qty_hits, "rate": round(qty_hits / n, 3) if n else None,
+                           "definition": "外购缺料里净缺口最大的那件"},
+        "models_compared": len(models), "model_list": models,
+        "per_model": _by_model("lead_agrees"),
+        "per_model_by_quantity": _by_model("qty_agrees"),
+        "bom_sources": sorted({str(x["bom_source"]) for x in per_order}),
+        "disagreements": [x for x in per_order if not x["lead_agrees"]][:8],
+        "meaning": ("这一格读的是「引擎与台账在同一张单上会不会选中同一件料」，两种定义都要看："
+                    "只看数量会漏掉「缺得多但不卡日期」的件，只看提前期会漏掉「量大到必须现在下单」的件。"
+                    "库存取今天而非当时快照，所以对老单不一致是预期内的。"),
+    }
+
+
 def classify_gap(row: Dict[str, Any]) -> str:
     """给一张没有齐套行的工单归因。顺序是讲究的：先排掉不该参与判据的（种子、伪产品），
     再看键与源侧 —— 否则会把"根本不该有行"的单算成"可补"。"""
