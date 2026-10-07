@@ -132,6 +132,26 @@ INPUTS: Dict[str, Dict[str, Any]] = {
         "moves": "换几天交期；开线代价按实际激活台数计入",
         "basis": "产能取该线组**声明的合并产能**，不是单线×条数（跑步机组 300 台/天，bike 两线合并 700 不是 800）",
     },
+    "absent_line": {
+        "label": "哪条线整班没来", "kind": "input", "text": True,
+        "units": {"line_code": "线编码（LINE-TREAD-01 / LINE-BIKE-01 这种，来自产线台账）"},
+        "default_unit": "line_code", "range": (0, 1), "step": 0,
+        "physics": "lte",
+        "translate": ("policy", "absent_line", 1.0),
+        "moves": "这条线没人在岗 → 改派到工艺上同样能做的线（结果里 staffing.rerouted_from 记从哪条挪走）；"
+                 "没有可改派的线就只给等待结论，不编完工日",
+        "basis": "line_profiles 的 can_make_models/cannot_make_models（负向声明优先）+ 到岗比例",
+    },
+    "absent_share": {
+        "label": "该线缺勤比例", "kind": "input",
+        "units": {"fraction_absent": "这条线应到人数里没来的比例（1.0=整班没来，0.5=半数缺勤）"},
+        "default_unit": "fraction_absent", "range": (0.0, 1.0), "step": 0.1,
+        "physics": "lte",
+        "translate": ("policy", "absent_share", 1.0),
+        "moves": "班组按人数折算，日产能受「班组按 IE 工时做得完的台/天」约束；"
+                 "低于临界点之前交期可以不动（那个点是线声明台/天×单件工时÷(人数×班时)）",
+        "basis": "与天气到岗曲线是两笔独立扣减（曲线按天、这条按线常驻缺口），会叠乘",
+    },
     "extra_crew": {
         "label": "加班加人比例", "kind": "input",
         "units": {"fraction_added": "在应到人数上追加的比例（0.15=加 15%）"},
@@ -219,6 +239,13 @@ def _coerce(name: str, raw: Any) -> Tuple[float, str, bool]:
     if unit not in spec["units"]:
         raise ContractError(name, f"{spec['label']} 的单位 «{unit}» 不在契约里",
                             allowed=sorted(spec["units"]))
+    if spec.get("text"):
+        # 词表里第一个非数值输入：一条线的编码。校验只做"有没有给"，
+        # 线编码对不对交给推演层的 unknown_line_codes 报回来 —— 那里查得到台账
+        text = str(val or "").strip()
+        if not text:
+            raise ContractError(name, f"{spec['label']} 需要一个线编码")
+        return text, unit, assumed
     val = _flag(val) if unit == "flag" else float(val)
     if unit in ("count", "days") and abs(val - round(val)) > 1e-9:
         raise ContractError(name, f"{spec['label']} 按 {unit} 必须是整数，收到 {val:g}")
@@ -292,7 +319,7 @@ def _translate(parsed: Dict[str, Any], *, override: Optional[Dict[str, Any]] = N
     equip_percent: Optional[float] = None
     for key, holder in inputs.items():
         where, internal, scale = INPUTS[key]["translate"]
-        val = float(holder["value"])
+        val = (holder["value"] if INPUTS[key].get("text") else float(holder["value"]))
         if where == "scope":
             scope[internal] = val
         elif where == "scenario":
@@ -305,6 +332,16 @@ def _translate(parsed: Dict[str, Any], *, override: Optional[Dict[str, Any]] = N
             perturb[internal] = round(val * scale, 6)
             if internal == "batches":
                 perturb["changeover_hours"] = float(vr.SIM_CHANGEOVER_HOURS)
+    # 缺勤的两个词要合成一个内部参数（{线: 到岗比例}）。合成放在最后做，
+    # 因为 dict 的到达顺序不保证 —— 先给比例后给线、或反过来，都得是同一个结果。
+    line = policy.pop("absent_line", None)
+    share = policy.pop("absent_share", None)
+    if share is not None and not line:
+        raise ContractError("absent_share",
+                            "只给了缺勤比例没说哪条线。全厂性人手不足请用 crew_attendance（到岗比例）；"
+                            "针对某条线要同时给 absent_line")
+    if line:
+        policy["line_staffing"] = {str(line): max(0.0, 1.0 - float(share if share is not None else 1.0))}
     return scope, perturb, policy, attendance, equip_percent
 
 
@@ -333,6 +370,19 @@ async def _measure(db: AsyncSession, factory_id: str, parsed: Dict[str, Any],
     metrics = ss._metrics(scan, scen)
     sols = ((scan.get("by_scenario") or {}).get(scen) or {}).get("solutions") or []
     metrics["detail"] = (sols[0].get("detail") or []) if sols else []
+    # 人手缺口的结论要跟着数字出门：改派到哪条线、还是只能等 —— 不问一句就没人知道
+    notes = []
+    for scen_name, block in (scan.get("by_scenario") or {}).items():
+        for sol in (block.get("solutions") or []):
+            for d in (sol.get("detail") or []):
+                st = d.get("staffing") or {}
+                if d.get("status") == "no_staffed_line":
+                    notes.append(f"{scen_name}｜{d.get('model_code')}：能做的线都没人在岗 → 只能等开工，"
+                                 "不推演完工日")
+                elif st.get("rerouted_from"):
+                    notes.append(f"{scen_name}｜{d.get('model_code')}：{st['rerouted_from']} 没人在岗，"
+                                 f"改派到 {d.get('line')}")
+    metrics["staffing"] = sorted(set(notes))[:8]
     metrics["attendance"] = attendance
     metrics["promise_margin"] = float(scope.get("lead_margin") or vr.PROMISE_LEAD_MARGIN)
     metrics["models"] = list(chosen or [])
@@ -456,6 +506,7 @@ async def simulate(db: AsyncSession, factory_id: str,
         "constrained_by": _public_terms(m.get("binding_terms")),
         "orders": orders,
         "blocked_models": m.get("blocked_models"),
+        "staffing": m.get("staffing") or [],
     }
     metrics = [
         _metric("组合完工日", answers["portfolio_completion_date"], "日历日",
@@ -474,6 +525,7 @@ async def simulate(db: AsyncSession, factory_id: str,
     ]
     caveats = ["沙箱读数：不写业务表、不回写外部系统；要落地得计划员确认后另走单据",
                "收益侧未建模（延误罚则/客户违约成本没有数），这里的钱只是成本差值，用于排序"]
+    caveats += [str(x) for x in (m.get("staffing") or [])]
     caveats.append(f"批量按「{parsed['scope'].get('days_of_output'):g} 天产量」下单 —— "
                    "它改的是要多少台，不是怎么排；引用交期时别把它当优化结果")
     return _envelope("simulate", parsed, answers=answers, metrics=metrics,
