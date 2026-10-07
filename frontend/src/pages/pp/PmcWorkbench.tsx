@@ -272,7 +272,18 @@ export default function PmcWorkbench() {
     { title: '在途', dataIndex: 'in_transit_qty', key: 'in_transit_qty', align: 'right' as const },
     { title: '未收 PO', dataIndex: 'on_order_qty', key: 'on_order_qty', align: 'right' as const },
     { title: '预计缺口', dataIndex: 'projected_shortage_qty', key: 'projected_shortage_qty', align: 'right' as const, render: (value: number) => value > 0 ? <Tag color="error">{value}</Tag> : <Tag color="success">0</Tag> },
-    { title: '供应商 LT', dataIndex: 'supplier_lead_days', key: 'supplier_lead_days', render: (value: number) => value == null ? '-' : `${value} 天` },
+    { title: '供应商 LT', dataIndex: 'supplier_lead_days', key: 'supplier_lead_days', render: (value: number, row: any) => (
+      <Space size={4}>
+        <Tooltip title={value != null ? '来自供应商报价/绑定表' : (row?.ledger_lead_time_days != null ? `供应商报价没有这个件，显示台账 materials.lead_time_days=${row.ledger_lead_time_days} 天` : '供应商报价与台账都没有这个件的提前期')}>
+          <span>{value != null ? `${value} 天` : (row?.ledger_lead_time_days != null ? `${row.ledger_lead_time_days} 天(台账)` : '-')}</span>
+        </Tooltip>
+        {row?.lead_evidence === 'unverified_default' && <Tooltip title={`台账写 ${row?.ledger_lead_time_days ?? '-'} 天，但同组几十~几千个料号共用这一个取值，且没有一条实测到货（判据在 core/mes/data_evidence）`}><Tag color="volcano">没量过</Tag></Tooltip>}
+        {row?.lead_evidence === 'no_ledger_row' && <Tooltip title="台账 materials 里没有这个料号，提前期无从可取"><Tag color="volcano">无台账</Tag></Tooltip>}
+        {row?.lead_evidence === 'ledger_default_conflicts_with_measured' && <Tooltip title={`台账 ${row?.ledger_lead_time_days ?? '-'} 天，但采购实测中位 ${row?.lead_measured_median_days} 天（${row?.lead_measured_n} 单）；建议按 ${row?.lead_suggested_days} 天去核对`}><Tag color="error">实测 {row?.lead_measured_median_days} 天</Tag></Tooltip>}
+        {(row?.lead_evidence === 'measured' || row?.lead_evidence === 'measured_over_default') && <Tooltip title={`${row?.lead_measured_n} 单采购实测，中位 ${row?.lead_measured_median_days} 天`}><Tag color="green">实测 {row?.lead_measured_median_days} 天</Tag></Tooltip>}
+        {row?.lead_evidence === 'evidence_query_failed' && <Tooltip title="提前期出处普查本次查询失败，这一轮不知道出处"><Tag color="orange">出处未知</Tag></Tooltip>}
+      </Space>
+    ) },
   ]
 
   const capacityColumns = [

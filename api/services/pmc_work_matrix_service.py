@@ -329,8 +329,11 @@ class PmcWorkMatrixService:
                     ORDER BY sm.lead_time_days ASC, sm.unit_cost ASC
                 """), {"fid": factory_id, "material_code": material_code})
                 rows = [dict(row) for row in result.mappings().all()]
+            # 降级源也是空的 → 就是没有数据，不能报 available=True：
+            # 原来这里恒为 True，于是 supplier_lead_time_data_status 显示 "ready"、
+            # 而 supplier_lead_days 是 None，界面上一格"有依据"的空数字。
             return {
-                "available": True,
+                "available": bool(rows),
                 "rows": rows,
                 "source": "supplier_materials" if rows else "missing",
             }
@@ -761,6 +764,42 @@ class PmcWorkMatrixService:
                 "source": "bom_items + inventory + inventory_transactions + purchase_orders",
             })
 
+        # 提前期的出处必须跟着数字走：`supplier_lead_days` 可能来自台账铺的默认值
+        # （本厂 31,452 个外购料号只有 10 个不同取值），也可能真有采购/仓收实测。
+        # 判据只写在 core/mes/data_evidence 一处，这里一次性批量取，不按料号循环查库。
+        lead_unverified = 0
+        lead_no_row = 0
+        lead_measured = 0
+        lead_evidence_error: Optional[str] = None
+        lead_census_basis = ""
+        if material_rows:
+            try:
+                from core.mes.data_evidence import lead_time_evidence
+
+                codes = sorted({str(r["material_code"]) for r in material_rows if r.get("material_code")})
+                census = await lead_time_evidence(self.db, factory_id, codes=codes, limit=max(1, len(codes)))
+                lead_census_basis = str(census.get("basis") or "")
+                by_code = {str(r["material_code"]): r for r in census.get("rows") or []}
+                for row in material_rows:
+                    e = by_code.get(str(row.get("material_code"))) or {}
+                    measured = e.get("measured") or {}
+                    row["ledger_lead_time_days"] = e.get("ledger_days")
+                    row["lead_evidence"] = e.get("verdict") or "no_ledger_row"
+                    row["lead_measured_median_days"] = measured.get("median_days")
+                    row["lead_measured_n"] = measured.get("n")
+                    row["lead_suggested_days"] = e.get("suggested_days")
+                    if row["lead_evidence"] == "unverified_default":
+                        lead_unverified += 1
+                    elif row["lead_evidence"] == "no_ledger_row":
+                        lead_no_row += 1
+                    if measured.get("n"):
+                        lead_measured += 1
+            except Exception as exc:  # noqa: BLE001  出处查不到要说出来，不能当成"没问题"
+                lead_evidence_error = f"{type(exc).__name__}: {exc}"[:200]
+                for row in material_rows:
+                    row["lead_evidence"] = "evidence_query_failed"
+        lead_no_evidence = len(material_rows) - lead_measured
+
         # 产能证据：工位理论可用工时 - 已排程工时。生产锤会改变“有效产能”和倒推投入量。
         capacity_rows: List[Dict[str, Any]] = []
         required_production_qty = int(ceil(demand_qty / max(options["yield_rate"], 0.01)))
@@ -968,6 +1007,15 @@ class PmcWorkMatrixService:
             {"key": "on_order_qty", "label": "未收货 PO 数量", "value": round(sum(row["on_order_qty"] for row in material_rows), 2) if material_rows else None, "unit": work_order.unit or "pcs", "status": "ready" if purchase_order_data_available else "missing", "source": "purchase_orders 未收货状态"},
             {"key": "po_count", "label": "关联 PO 数", "value": len({po for row in material_rows for po in row["po_codes"]}), "unit": "单", "status": "ready" if purchase_order_data_available else "missing", "source": "purchase_orders.po_code"},
             {"key": "supplier_lead_days", "label": "供应商最短 LT", "value": min((row["supplier_lead_days"] for row in material_rows if row["supplier_lead_days"] is not None), default=None), "unit": "天", "status": "ready" if any(row["supplier_lead_days"] is not None for row in material_rows) else "unknown", "source": "supplier_prices.lead_days"},
+            {"key": "lead_evidence", "label": "提前期出处",
+             "value": (f"{lead_no_evidence}/{len(material_rows)} 项没有实测证据"
+                       if (material_rows and not lead_evidence_error)
+                       else ("查询失败" if lead_evidence_error else None))
+                      + (f"（铺值 {lead_unverified}、无台账行 {lead_no_row}、"
+                         f"其余 {lead_no_evidence - lead_unverified - lead_no_row} 个只有台账声明）"
+                         if material_rows and not lead_evidence_error else ""),
+             "unit": "项", "status": "warning" if lead_unverified else "ready" if material_rows else "unknown",
+             "source": lead_census_basis or "core/mes/data_evidence（台账 vs 采购实测 vs 仓收 vs 供应商声明）"},
             {"key": "dead_stock_material_count", "label": "BOM涉及呆滞料数", "value": dead_stock_count, "unit": "种", "status": "warning" if dead_stock_count else "ready", "source": f"库存最后流动时间 ≥ {options['dead_stock_days']}天"},
             {"key": "required_production_qty", "label": "按直通率倒推投入量", "value": required_production_qty, "unit": work_order.unit or "pcs", "status": "warning" if yield_warning else "ready", "source": "需求量 ÷ 预期直通率"},
             {"key": "required_production_hours", "label": "需求生产工时", "value": round(production_hours, 2) if production_hours is not None else None, "unit": "h", "status": "blocked" if capacity_overloaded else "ready" if capacity_ready else "unknown", "source": "工艺 UHN；未定义时以产能速度倒推"},
@@ -985,6 +1033,15 @@ class PmcWorkMatrixService:
             risk_flags.append("缺料仅因替代料开关暂时转为条件放行，需验证替代料")
         if shortage_count and projected_material_ready is True:
             risk_flags.append("当前库存未齐套，但关联 PO/在途数量覆盖缺口，需确认按 ETA 到货并完成 IQC")
+        if lead_evidence_error:
+            risk_flags.append(f"提前期出处普查本次失败（{lead_evidence_error}）：这一轮的 LT 出处未知，"
+                              "不能按「都量过」或「都没问题」理解")
+        elif lead_no_evidence and material_rows:
+            risk_flags.append(f"BOM 涉及 {len(material_rows)} 个料号，其中 {lead_no_evidence} 个没有任何实测到货依据"
+                              f"（{lead_unverified} 个的提前期是按类别铺的默认值 —— 同组几十~几千个料号共用一个取值；"
+                              f"{lead_no_row} 个连台账行都没有）；本厂 65 单采购实测到货中位 54 天，"
+                              "而台账均值只有 9.9 天 —— ETA/齐套按这个数算会系统性偏乐观。"
+                              f"有实测的 {lead_measured} 个可在物料行看实测中位天数与建议值")
         if dead_stock_count:
             reusable_count = sum(1 for row in material_rows if row["dead_stock_reusable_for_order"])
             risk_flags.append(f"BOM涉及 {dead_stock_count} 种呆滞料，其中 {reusable_count} 种满足当前工单需求且库存状态合格")
