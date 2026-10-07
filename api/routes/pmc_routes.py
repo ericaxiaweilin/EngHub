@@ -494,6 +494,28 @@ async def get_sim_tradeoffs(
     return await record_tradeoffs(db, factory_id, apply=apply)
 
 
+@router.get("/data-evidence", summary="料号提前期的证据普查：台账值是不是量出来的，一调就知道")
+async def get_data_evidence(
+    factory_id: str = Query(..., description="厂区"),
+    material_codes: str = Query("", description="逗号分隔的料号；留空则按 limit 抽样"),
+    limit: int = Query(200, description="抽样/返回行数上限（组内分散度始终按全量算）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """只读普查：把 `materials.lead_time_days` 与采购实测、仓收实测、供应商声明摆在一起对。
+
+    为什么要单独一个端点 —— 排产、交期、仿真都吃提前期这一个数，但没人说过它是量来的还是铺的。
+    `verdict`：`measured`（有实测）/ `ledger_default_conflicts_with_measured`（台账比实测小一半以上）/
+    `unverified_default`（同组几十~几千个料号共用同一个取值）/ `ledger_declared_only` / `no_lead_time_at_all`。
+    建议值只写进 `suggested_days`，不回写台账 —— 它是"要去核对的数"，不是既成事实。
+    """
+    del current_user
+    from core.mes.data_evidence import lead_time_evidence
+
+    codes = [c.strip() for c in str(material_codes or "").split(",") if c.strip()]
+    return await lead_time_evidence(db, factory_id, codes=codes or None, limit=max(1, int(limit)))
+
+
 @router.get("/engine-layers", summary="仿真引擎分层验收：五层各自过线才算数，下层不过线上层不引用")
 async def get_engine_layers(
     factory_id: str = Query(..., description="厂区"),
