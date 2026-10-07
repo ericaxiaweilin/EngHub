@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Empty,
+  Input,
   InputNumber,
   List,
   Progress,
@@ -85,6 +86,8 @@ export default function PmcWorkbench() {
   // 现场规则与执行：候选规律要人点头才生效，做法要能被核对 —— 这两件事都在这一栏里
   const [ruleFlow, setRuleFlow] = useState<any>(null)
   const [ruleBusy, setRuleBusy] = useState('')
+  const [priority, setPriority] = useState<any>(null)
+  const [answer, setAnswer] = useState<Record<string, string>>({})
   const [options, setOptions] = useState<Record<string, any>>({})
   const [ordersLoading, setOrdersLoading] = useState(true)
   const [matrixLoading, setMatrixLoading] = useState(false)
@@ -140,8 +143,14 @@ export default function PmcWorkbench() {
         api.get('/api/v1/pmc/open-rule-questions', { params: { factory_id: factoryId } }),
         api.get('/api/v1/pmc/execution-events', { params: { factory_id: factoryId, days: 30 } }),
       ])
+      const pr: any = await api.get('/api/v1/pmc/measurement-priority', {
+        params: { factory_id: factoryId, units: 1200 } })
       setRuleFlow({ questions: q?.open_questions || [], pending: q?.pending_candidates || [],
                    census: q?.workforce_census || null, events: e?.events || [] })
+      setPriority({ parts: pr?.total_parts_in_critical_tiers ?? null,
+                    ratio: pr?.calibration?.median_ratio ?? null,
+                    n: pr?.calibration?.n_materials ?? 0,
+                    per_model: (pr?.per_model || []).slice(0, 4) })
     } catch {
       setRuleFlow({ error: '规则与执行读数加载失败' })
     }
@@ -163,6 +172,25 @@ export default function PmcWorkbench() {
       setRuleBusy('')
     }
   }, [factoryId, loadRuleFlow])
+
+  const answerQuestion = useCallback(async (action: string, verdict: 'allowed' | 'forbidden') => {
+    const text = (answer[action] || '').trim()
+    if (!text) { message.warning('先写一句现场的说法（含条件），再定允许或禁止'); return }
+    setRuleBusy(`q:${action}`)
+    try {
+      const r: any = await api.post('/api/v1/pmc/factory-rules', {
+        factory_id: factoryId, subject: action, verdict, statement: text,
+        status: 'declared', source: 'human_ui',
+      })
+      if (r?.error) { message.error(r.error); return }
+      message.success('已落成厂规，引擎下一轮推演就按它过滤候选动作')
+      await loadRuleFlow()
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || '登记失败')
+    } finally {
+      setRuleBusy('')
+    }
+  }, [answer, factoryId, loadRuleFlow])
 
   const loadCapabilities = useCallback(async () => {
     try {
@@ -444,11 +472,37 @@ export default function PmcWorkbench() {
                   </List.Item>
                 )} />
             )}
+            {!!priority && (
+              <div style={{ marginTop: 8 }}>
+                <Text strong style={{ fontSize: 12 }}>该先量的件（按决定开工日那一档给，不是一个点）</Text>
+                <div><Text type="secondary" style={{ fontSize: 12 }}>
+                  临界档合计 {priority.parts} 个料号 · 校准比 {priority.ratio ?? '—'}×
+                  （{priority.n} 个料号有采购实测；没有实测时这个倍数只是量级演示）
+                </Text></div>
+                {(priority.per_model || []).map((p: any) => (
+                  <div key={p.model_code}><Text type="secondary" style={{ fontSize: 12 }}>
+                    {p.model_code}：第 {p.critical_tier_days ?? '—'} 天那一档 {p.critical_part_count ?? 0} 个件
+                    · 量出来值 {p.swing_days_if_measured ?? '—'} 天（{p.baseline_finish ?? '—'} → {p.stressed_finish ?? '—'}）
+                  </Text></div>
+                ))}
+              </div>
+            )}
             {(ruleFlow.questions || []).length > 0 && (
               <div style={{ marginTop: 8 }}>
-                <Text strong style={{ fontSize: 12 }}>还没写规则的（在对话里答一句就能落成规则）</Text>
+                <Text strong style={{ fontSize: 12 }}>还没写规则的 —— 当场答一句就成厂规（引擎立刻按它过滤）</Text>
                 {(ruleFlow.questions || []).map((q: any, i: number) => (
-                  <div key={i}><Text type="secondary" style={{ fontSize: 12 }}>• {q.question}</Text></div>
+                  <div key={i} style={{ marginTop: 6 }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>• {q.question}</Text>
+                    <Space.Compact style={{ width: '100%', marginTop: 2 }}>
+                      <Input size="small" placeholder="现场的说法，例如：暴雨也不许外发，必须内部消化"
+                        value={answer[q.action] || ''}
+                        onChange={(ev: any) => setAnswer((prev: any) => ({ ...prev, [q.action]: ev.target.value }))} />
+                      <Button size="small" loading={ruleBusy === `q:${q.action}`}
+                        onClick={() => answerQuestion(q.action, 'allowed')}>允许</Button>
+                      <Button size="small" danger loading={ruleBusy === `q:${q.action}`}
+                        onClick={() => answerQuestion(q.action, 'forbidden')}>禁止</Button>
+                    </Space.Compact>
+                  </div>
                 ))}
               </div>
             )}
