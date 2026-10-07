@@ -82,6 +82,9 @@ export default function PmcWorkbench() {
   const [selectedCode, setSelectedCode] = useState('')
   const [matrix, setMatrix] = useState<any>(null)
   const [capabilities, setCapabilities] = useState<any[]>([])
+  // 现场规则与执行：候选规律要人点头才生效，做法要能被核对 —— 这两件事都在这一栏里
+  const [ruleFlow, setRuleFlow] = useState<any>(null)
+  const [ruleBusy, setRuleBusy] = useState('')
   const [options, setOptions] = useState<Record<string, any>>({})
   const [ordersLoading, setOrdersLoading] = useState(true)
   const [matrixLoading, setMatrixLoading] = useState(false)
@@ -131,6 +134,36 @@ export default function PmcWorkbench() {
     }
   }, [factoryId, loadMatrix])
 
+  const loadRuleFlow = useCallback(async () => {
+    try {
+      const [q, e]: any = await Promise.all([
+        api.get('/api/v1/pmc/open-rule-questions', { params: { factory_id: factoryId } }),
+        api.get('/api/v1/pmc/execution-events', { params: { factory_id: factoryId, days: 30 } }),
+      ])
+      setRuleFlow({ questions: q?.open_questions || [], pending: q?.pending_candidates || [],
+                   census: q?.workforce_census || null, events: e?.events || [] })
+    } catch {
+      setRuleFlow({ error: '规则与执行读数加载失败' })
+    }
+  }, [factoryId])
+
+  const decideRule = useCallback(async (ruleId: string, agree: boolean) => {
+    setRuleBusy(ruleId)
+    try {
+      const r: any = await api.post('/api/v1/pmc/confirm-rule', {
+        factory_id: factoryId, rule_id: ruleId, agree,
+      })
+      if (r?.error) message.error(r.error)
+      else message.success(agree ? '这条规律已升为正式规则，引擎下一轮起按它过滤候选动作'
+                                 : '已驳回，记录留着，不再反复问')
+      await loadRuleFlow()
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || '确认失败')
+    } finally {
+      setRuleBusy('')
+    }
+  }, [factoryId, loadRuleFlow])
+
   const loadCapabilities = useCallback(async () => {
     try {
       const response: any = await api.get('/api/v1/pmc/capabilities')
@@ -155,6 +188,7 @@ export default function PmcWorkbench() {
 
   useEffect(() => { loadOrders() }, [loadOrders])
   useEffect(() => { loadCapabilities() }, [loadCapabilities])
+  useEffect(() => { loadRuleFlow() }, [loadRuleFlow])
   useEffect(() => { loadAttendance() }, [loadAttendance])
 
   const recalculate = async () => {
@@ -381,7 +415,60 @@ export default function PmcWorkbench() {
           </Card>}
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))', gap: 16, marginBottom: 16 }}>
-            <Card size="small" title={<Space><FileSearchOutlined />评审判断标准</Space>} extra={<Tag color={status.color}>{status.label}</Tag>}>
+          {!!ruleFlow && (
+          <Card size="small" style={{ marginBottom: 16 }}
+            title={<Space><SafetyCertificateOutlined />现场规则与执行</Space>}
+            extra={<Tag color={(ruleFlow.pending || []).length ? 'volcano' : 'default'}>
+              待确认 {(ruleFlow.pending || []).length} 条 · 近 30 天执行 {(ruleFlow.events || []).length} 次
+            </Tag>}>
+            {(ruleFlow.error || '') && <Text type="danger">{ruleFlow.error}</Text>}
+            {(ruleFlow.pending || []).length === 0 && (ruleFlow.questions || []).length === 0 && (
+              <Text type="secondary">没有待确认的候选规律，也没有空白规则要问现场。</Text>
+            )}
+            {(ruleFlow.pending || []).length > 0 && (
+              <List size="small" dataSource={ruleFlow.pending} rowKey={(r: any) => r.rule_id}
+                renderItem={(r: any) => (
+                  <List.Item actions={[
+                    <Button key="ok" size="small" type="link" disabled={ruleBusy === r.rule_id}
+                      onClick={() => decideRule(r.rule_id, true)}>同意设为规则</Button>,
+                    <Button key="no" size="small" type="link" danger disabled={ruleBusy === r.rule_id}
+                      onClick={() => decideRule(r.rule_id, false)}>驳回</Button>,
+                  ]}>
+                    <Space direction="vertical" size={0}>
+                      <Text>{r.statement || `${r.subject} → ${r.verdict}`}</Text>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        来源 {r.source === 'pattern_mining' ? '决策台账挖掘' : r.source === 'derived' ? '从花名册/技能台账推算' : r.source}
+                        · 依据 {JSON.stringify(r.evidence || {}).slice(0, 90)}
+                      </Text>
+                    </Space>
+                  </List.Item>
+                )} />
+            )}
+            {(ruleFlow.questions || []).length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <Text strong style={{ fontSize: 12 }}>还没写规则的（在对话里答一句就能落成规则）</Text>
+                {(ruleFlow.questions || []).map((q: any, i: number) => (
+                  <div key={i}><Text type="secondary" style={{ fontSize: 12 }}>• {q.question}</Text></div>
+                ))}
+              </div>
+            )}
+            {(ruleFlow.events || []).length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <Text strong style={{ fontSize: 12 }}>最近的现场执行（用来核对厂规有没有被超出）</Text>
+                {(ruleFlow.events || []).slice(0, 5).map((e: any) => (
+                  <div key={e.id}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {String(e.at || '').slice(0, 16)} · {e.action} · {e.line_code || e.section || '-'}
+                      {e.hours ? ` · ${e.hours}h` : ''}{e.people ? ` · ${e.people}人` : ''} · 记录人 {e.actor}
+                    </Text>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        )}
+
+          <Card size="small" title={<Space><FileSearchOutlined />评审判断标准</Space>} extra={<Tag color={status.color}>{status.label}</Tag>}>
               <List size="small" dataSource={[
                 ['RDD', judgement.rdd_present ? (judgement.rdd_feasible === false ? 'ETA 晚于 RDD' : '已提供且可评估') : '缺少 RDD'],
                 ['物料', judgement.material_ready === true ? '库存齐套' : judgement.projected_material_ready === true ? '依赖 PO/在途条件齐套' : '存在缺口'],

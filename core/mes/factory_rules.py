@@ -807,9 +807,10 @@ async def mine_patterns(db: AsyncSession, factory_id: str, *, min_samples: int =
                str(detail.get("model_code") or detail.get("material_code") or ""))
         rate = outcome.get("achievement_rate")
         g = groups.setdefault(key, {"samples": 0, "rated": 0, "sum": 0.0, "policies": set(),
-                                    "outcome_sources": set()})
+                                    "outcome_sources": set(), "qualities": set()})
         g["samples"] += 1
         g["policies"].add(str(r["policy"] or ""))
+        g["qualities"].add(str(outcome.get("outcome_quality") or ""))
         if isinstance(rate, (int, float)):
             g["rated"] += 1
             g["sum"] += float(rate)
@@ -818,6 +819,7 @@ async def mine_patterns(db: AsyncSession, factory_id: str, *, min_samples: int =
         if g["samples"] < min_samples or not act_type:
             continue
         avg = round(g["sum"] / g["rated"], 3) if g["rated"] else None
+        qualities = sorted(g["qualities"])
         subject = f"cross_line_transfer:{scope}" if "transfer" in act_type else {
             "expedite_purchase": "expedite_purchase", "start_first_batch": "split_release",
             "overtime": "add_overtime", "extra_crew": "extra_crew"}.get(act_type, None)
@@ -827,9 +829,10 @@ async def mine_patterns(db: AsyncSession, factory_id: str, *, min_samples: int =
         patterns.append({"subject": subject, "scenario": scenario or None, "samples": g["samples"],
                          "with_achievement_rate": g["rated"], "mean_achievement_rate": avg,
                          "action_type": act_type, "status": "candidate",
-                         "statement": (f"在 {scenario or '未知天气'} 下做过 {g['samples']} 次 {act_type}"
-                                       f"（有达成率读数的 {g['rated']} 次，均值 {avg}）"
-                                       "—— 这是发现的模式，未经确认不拦引擎")})
+                         "statement": (f"在 {scenario or '未知天气'} 下建议过 {act_type} 共 {g['samples']} 次，"
+                                       f"其中 {g['rated']} 次对应的工单后来由真人推进过（达成率均值 {avg}；"
+                                       f"结果档 {'/'.join(qualities)}）—— 这是「建议过 + 后来有推进」，"
+                                       "不是照做才推进的因果对照；未经确认不拦引擎")})
     if apply:
         for p in patterns:
             await upsert_rule(db, factory_id, subject=p["subject"], verdict="bounded", kind="pattern",
