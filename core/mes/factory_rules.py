@@ -294,6 +294,47 @@ async def binding_rules(db: AsyncSession, factory_id: str) -> Dict[str, Dict[str
     return out
 
 
+async def pending_rules(db: AsyncSession, factory_id: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+    """等着人确认的候选规则（带 rule_id，确认时要用）。"""
+    rows = (await db.execute(text("""
+        SELECT id, kind, subject, verdict, statement, params::text AS params, source, evidence::text AS evidence,
+               updated_at
+        FROM factory_rules WHERE factory_id = :fid AND status = 'candidate'
+        ORDER BY updated_at DESC LIMIT :lim
+    """), {"fid": factory_id, "lim": int(limit)})).mappings().all()
+    return [{"rule_id": r["id"], "kind": r["kind"], "subject": r["subject"], "verdict": r["verdict"],
+             "statement": r["statement"], "params": _json(r["params"]), "source": r["source"],
+             "evidence": _json(r["evidence"]), "observed_at": str(r["updated_at"])} for r in rows]
+
+
+async def confirm_rule(db: AsyncSession, factory_id: str, *, rule_id: str, agree: bool,
+                       actor: str = "unknown", note: str = "") -> Dict[str, Any]:
+    """人选"同意"→ validated（开始拦引擎）；选"驳回"→ rejected（留痕，不再反复问）。
+
+    只动 candidate 状态的行：已声明的厂规不是系统能替人改的东西。
+    """
+    row = (await db.execute(text("SELECT id, status, subject, kind FROM factory_rules WHERE id = :id"),
+                            {"id": str(rule_id)})).mappings().first()
+    if not row:
+        return {"error": f"rule_id {rule_id} 不存在"}
+    if str(row["status"]) != "candidate":
+        return {"error": f"这条现在是 {row['status']}，只有 candidate 可以确认或驳回；"
+                         "已声明的厂规要改请用 record_factory_rule 明确改判"}
+    new_status = "validated" if agree else "rejected"
+    await db.execute(text("""
+        UPDATE factory_rules SET status = :st, confirmed_by = :who, updated_at = NOW(),
+               statement = CASE WHEN :note = '' THEN statement
+                                ELSE statement || ' ｜ 确认：' || :note END
+        WHERE id = :id
+    """), {"st": new_status, "who": str(actor or "unknown"), "note": str(note or "")[:300],
+           "id": str(rule_id)})
+    await db.commit()
+    return {"rule_id": str(rule_id), "subject": row["subject"], "status": new_status,
+            "confirmed_by": actor,
+            "effect": ("这条现在开始过滤引擎的候选动作" if agree else
+                       "已驳回：不再当候选提出，记录留着，规则要改就明确改判")}
+
+
 async def candidate_patterns(db: AsyncSession, factory_id: str) -> List[Dict[str, Any]]:
     rows = (await db.execute(text("""
         SELECT subject, verdict, statement, params::text AS params, evidence::text AS evidence, updated_at
@@ -362,7 +403,11 @@ async def open_questions(db: AsyncSession, factory_id: str, *,
                     "prefilled_evidence": hint,
                     "record_as": {"subject": action, "verdict": "allowed|forbidden|bounded",
                                   "status": "declared", "source": "chat"}})
+    pend = await pending_rules(db, factory_id, limit=10)
     return {"factory_id": factory_id, "line": line_code, "open_questions": out,
+            "pending_candidates": pend,
+            "confirm_how": "同意的用 confirm_rule(rule_id, agree=true) 升成 validated；"
+                           "不对就 agree=false 驳回（留痕，不再反复问）",
             "asked_count": len(out), "checked": {"actions_evaluated": len(by_action),
                                                  "operators_seen": census.get("operators")},
             "workforce_census": census,

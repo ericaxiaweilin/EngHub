@@ -163,6 +163,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "confirm_rule",
+            "description": "对系统从数据里发现的一条候选规律点头或摇头。同意（agree=true）就升成 validated 并开始过滤引擎的候选动作；驳回（false）就留痕、不再反复问。只有 candidate 状态能被这条改——已经声明的厂规要用 record_factory_rule 明确改判。规则编号来自 list_open_rule_questions 的 pending_candidates。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rule_id": {"type": "string", "description": "候选规则的编号，例如 rule-xxxx"},
+                    "agree": {"type": "boolean", "description": "同意=true 升为正式规则；驳回=false 留痕关闭", "default": True},
+                    "note": {"type": "string", "description": "人补的一句话（为什么同意/为什么驳回），会拼进规则说明"},
+                },
+                "required": ["rule_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_execution",
             "description": "记一件现场真做过的事：加了几天班（几小时）、从哪个组调了几个人顶什么岗、开了几条并联线、先交了几台。这些动作以前没有落库地方，所以「加班上限 2 小时」「跨线调人要技能匹配」这类厂规没法核对、系统也永远算不出某个动作的成功率。记完会立刻对着已声明的厂规校一遍，超上限当场报。",
             "parameters": {
@@ -3182,6 +3198,24 @@ async def _tool_list_open_rule_questions(
     return out
 
 
+async def _tool_confirm_rule(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant",
+    factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """人点头/摇头 → 候选规则升档或驳回。只有 candidate 能动，已声明的厂规不由系统改。"""
+    from core.mes.factory_rules import confirm_rule
+
+    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    res = await confirm_rule(db, fid, rule_id=str(args.get("rule_id") or ""),
+                             agree=bool(args.get("agree", True)),
+                             actor=str(operator or "unknown"), note=str(args.get("note") or ""))
+    if res.get("error"):
+        return {"error": res["error"]}
+    res["next"] = ("引擎下一轮推演就会按这条过滤候选动作" if res.get("status") == "validated"
+                   else "这条不再作为候选提出；要恢复请明确改判")
+    return res
+
+
 async def _tool_record_execution(
     db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant",
     factory_id: Optional[str] = None
@@ -3548,6 +3582,7 @@ _TOOL_EXECUTORS = {
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
     "list_open_rule_questions": _tool_list_open_rule_questions,
+    "confirm_rule": _tool_confirm_rule,
     "record_execution": _tool_record_execution,
     "adopt_recommendation": _tool_adopt_recommendation,
     "record_factory_rule": _tool_record_factory_rule,
@@ -3931,6 +3966,7 @@ WRITE_TOOLS = {
     "record_factory_rule",
     "adopt_recommendation",
     "record_execution",
+    "confirm_rule",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
@@ -3949,6 +3985,7 @@ TOOL_LABELS = {
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
     "list_open_rule_questions": "现场规则缺口提问",
+    "confirm_rule": "确认或驳回候选规则",
     "record_execution": "记一件现场执行",
     "adopt_recommendation": "确认推荐已执行",
     "record_factory_rule": "落一条厂规",
@@ -4090,6 +4127,14 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "PMC工作矩阵", "PMC矩阵", "工作矩阵", "预排程沙盘", "时间锤", "物料锤",
             "生产锤", "出货锤", "紧急锤", "重算ETA", "ETA推迟", "ETA延迟", "UHN",
             "可加工时间", "库存齐套", "齐套率",
+        ],
+    },
+    {
+        # 人对候选规律点头/摇头是治理动作，要早于提问与执行登记
+        "tool": "confirm_rule",
+        "keywords": [
+            "同意这条规则", "就按这条", "确认这条", "这条对", "这条不对", "驳回", "不要这条",
+            "不同意", "规则确认", "候选规则",
         ],
     },
     {
@@ -4683,7 +4728,7 @@ async def execute_tool(
         return {"error": f"未知工具：{tool_name}"}
     try:
         if tool_name in {"create_followup_task", "record_factory_rule",
-                         "adopt_recommendation", "record_execution"}:
+                         "adopt_recommendation", "record_execution", "confirm_rule"}:
             # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "edit_online_workbook":

@@ -494,6 +494,24 @@ async def get_sim_tradeoffs(
     return await record_tradeoffs(db, factory_id, apply=apply)
 
 
+@router.post("/confirm-rule", summary="确认或驳回一条系统发现的候选规则")
+async def post_confirm_rule(
+    body: Dict[str, Any] = Body(..., description="rule_id, agree(true=升为正式规则/false=驳回), note"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """规则由系统从数据里发现，但只有人点头它才开始拦引擎。
+
+    只有 `candidate` 能被这个口改状态 —— 已声明的厂规不是系统能替人改的东西。
+    """
+    from core.mes.factory_rules import confirm_rule as _confirm
+
+    return await _confirm(db, str(body.get("factory_id") or ""), rule_id=str(body.get("rule_id") or ""),
+                          agree=bool(body.get("agree", True)),
+                          actor=str(getattr(current_user, "username", None) or "unknown"),
+                          note=str(body.get("note") or ""))
+
+
 @router.post("/execution-events", summary="记一件现场真做过的事：加班几小时、从哪个组调几个人、开几条线")
 async def post_execution_event(
     body: Dict[str, Any] = Body(..., description="action, line_code/section, people, hours, units, note"),
