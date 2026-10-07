@@ -16,6 +16,30 @@ from typing import Any, Dict, List
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# 仿真的 BOM 取数源（这是命中率算不对的根因之一，profile 里逐机种量出来）
+BOM_SOURCE_SQL = """
+WITH ms AS (SELECT DISTINCT product_id AS model FROM bom_items WHERE factory_id = :fid)
+SELECT s.model,
+       (SELECT COUNT(*) FROM bom_items b
+         WHERE b.factory_id = :fid AND b.product_id = s.model) AS local_lines,
+       (SELECT COUNT(*) FROM bom_items b
+         WHERE b.factory_id = :fid AND b.product_id = s.model
+           AND b.material_code ~ '^[0-9]+$') AS local_sap_lines,
+       (SELECT COUNT(*) FROM bom_items b
+         WHERE b.factory_id = :fid AND b.product_id = s.model
+           AND b.material_code LIKE 'RM-%') AS local_synthetic_lines,
+       (SELECT COUNT(*) FROM enghub_bom_items e WHERE e.product_model = s.model) AS mirror_lines,
+       (SELECT COALESCE(MAX(e.level), 0) FROM enghub_bom_items e
+         WHERE e.product_model = s.model) AS mirror_levels,
+       (SELECT COUNT(DISTINCT e.part_number) FROM enghub_bom_items e
+         WHERE e.product_model = s.model AND e.level = 1) AS mirror_level1_parts,
+       (SELECT COUNT(*) FROM (SELECT DISTINCT e.part_number FROM enghub_bom_items e
+              WHERE e.product_model = s.model AND e.level = 1) x
+         JOIN materials m ON m.material_code = x.part_number AND m.factory_id = :fid
+          WHERE m.lead_time_days IS NOT NULL) AS mirror_level1_with_lead
+FROM ms s
+"""
+
 # 判线需要的最小样本（与 engine_layers.THRESHOLDS 同源，这里只是把口径写成人话）
 MIN_COMPARABLE_MODELS = 5
 MIN_BACKTEST_PAIRS = 10
@@ -122,6 +146,24 @@ async def readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
             else:
                 backtest["pairs_ok"] += 1
 
+    # BOM 取数源画像：仿真现在只读本地 bom_items，而台账/领料走 engflow 真源镜像。
+    # 逐机种量出两边各有多少行、真源有几层、level-1 件在 materials 里有没有提前期 ——
+    # 没有这些数，"切到真源"就是一句口号；切了会不会没料可算也只有这里能看出来。
+    src_rows = (await db.execute(text(BOM_SOURCE_SQL), {"fid": factory_id})).mappings().all()
+    bom_sources = []
+    for r in src_rows:
+        bom_sources.append({
+            "model": str(r["model"]),
+            "sim_source_lines": int(r["local_lines"] or 0),
+            "sim_source_sap_lines": int(r["local_sap_lines"] or 0),
+            "sim_source_synthetic_lines": int(r["local_synthetic_lines"] or 0),
+            "real_source_lines": int(r["mirror_lines"] or 0),
+            "real_source_levels": int(r["mirror_levels"] or 0),
+            "real_source_level1_parts": int(r["mirror_level1_parts"] or 0),
+            "real_source_level1_with_lead": int(r["mirror_level1_with_lead"] or 0),
+            "switchable": bool(int(r["mirror_lines"] or 0) > 0),
+        })
+    switchable = [b for b in bom_sources if b["switchable"]]
     comparable = sorted(m for m, v in per_model.items() if v["comparable_for_bottleneck"])
     with_bom = sorted(m for m, v in per_model.items() if v["has_bom"])
     gap_out = [{"reason": k, "label": BUCKET_LABELS.get(k, k), "orders": v["count"],
@@ -141,6 +183,16 @@ async def readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         "backtest": {**backtest, "min_pairs_required": MIN_BACKTEST_PAIRS,
                      "verdict": ("可判" if backtest["pairs_ok"] >= MIN_BACKTEST_PAIRS else
                                  f"不可判：成对样本 {backtest['pairs_ok']} < {MIN_BACKTEST_PAIRS}")},
+        "bom_source": {
+            "sim_reads": "bom_items（本地）",
+            "ledger_reads": "enghub_bom_items（engflow 真源镜像）+ materials 提前期",
+            "models_total": len(bom_sources),
+            "models_with_real_source": len(switchable),
+            "models_with_real_source_list": sorted(b["model"] for b in switchable),
+            "verdict": (f"{len(switchable)}/{len(bom_sources)} 个机种在真源镜像里有行 —— "
+                        "切取数源只能切这些；其余机种真源没有行，切过去等于没料可算"),
+            "per_model": bom_sources,
+        },
         "kit_gaps": gap_out,
         "fixable_by_rerun_orders": fixable,
         "per_model": sorted(per_model.values(),
