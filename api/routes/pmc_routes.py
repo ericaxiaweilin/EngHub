@@ -560,6 +560,28 @@ async def post_factory_rule(
         or str(body.get("confirmed_by") or ""))
 
 
+@router.post("/adopt-recommendation", summary="把「这件事我们真做了」记回台账（人确认或系统回查）")
+async def post_adopt_recommendation(
+    body: Dict[str, Any] = Body(..., description="decision_id 或 action_type, adopted, note, evidence"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """没有这个口，系统永远只有预测没有结果，挖掘也就没有燃料。
+
+    `actor` 一律取当前登录用户（真人写的才算 verified_human；程序回查写的只算 verified_agent），
+    所以不能由脚本冒名确认。
+    """
+    from core.mes.factory_rules import record_adoption
+
+    return await record_adoption(
+        db, str(body.get("factory_id") or ""),
+        decision_id=(str(body["decision_id"]) if body.get("decision_id") else None),
+        action_type=(str(body["action_type"]) if body.get("action_type") else None),
+        adopted=bool(body.get("adopted", True)), note=str(body.get("note") or ""),
+        actor=str(getattr(current_user, "username", None) or body.get("actor") or "unknown"),
+        evidence=body.get("evidence") or {})
+
+
 @router.get("/decision-ledger", summary="决策台账：推荐过的动作与后来的实绩连成一行（默认只读预演）")
 async def get_decision_ledger(
     factory_id: str = Query(..., description="厂区"),

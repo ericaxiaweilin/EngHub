@@ -547,9 +547,11 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
         # 先记账再挖：台账是"事件→动作→结果"的唯一载体，挖出来的 candidate 全靠它
         # 挂在巡检里（6 小时一轮），不靠人记得去点；推荐变了没变都刷，实绩一变达成率就跟变
         from core.mes.factory_rules import (backfill_decision_ledger, mine_patterns,
-                                            record_candidates_from_census)
+                                            record_candidates_from_census, sweep_adoption)
 
         await backfill_decision_ledger(db, factory_id, limit=60, apply=True)
+        # 自动回查"推荐过的事做了没"，做了的写进台账 —— 这样达成率才有真样本，不用人记得报
+        await sweep_adoption(db, factory_id, limit=60, apply=True)
 
         mined = await mine_patterns(db, factory_id, min_samples=MIN_PATTERN_SAMPLES, apply=True)
         derived = await record_candidates_from_census(db, factory_id, apply=True)

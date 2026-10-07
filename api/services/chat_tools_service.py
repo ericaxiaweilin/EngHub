@@ -163,6 +163,24 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "adopt_recommendation",
+            "description": "把「引擎上次推荐的那件事我们真做了」记回决策台账：例如下单把某个件压到 10 天、先开了第一批 18 台、调了 2 名检测员。这是达成率与规则挖掘的唯一真燃料来源，不记就永远只有预测。系统每 6 小时会自动回查有痕迹的动作（下单记录、工单推进），但加班/开并联线/跨线调人这类没有落库通道的动作只能靠这里确认。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action_type": {"type": "string", "description": "做了什么动作：expedite_purchase / split_release / start_first_batch / cross_line_transfer / add_overtime / parallel_line / extra_crew / reprioritize / partial_delivery / subcontract"},
+                    "decision_id": {"type": "string", "description": "台账行号（若能从上下文定位到），可选；给了就自动带出动作"},
+                    "adopted": {"type": "boolean", "description": "确实做了 true；明确没做 false", "default": True},
+                    "note": {"type": "string", "description": "现场怎么说就怎么记，含数字（例如：已按 10 天下单给 裕同包装）"},
+                    "evidence": {"type": "object", "description": "可核对的凭据，例如 {po_code: 'PO-...', orders_moved: 3}"},
+                },
+                "required": ["action_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_factory_rule",
             "description": "把现场口头说的厂规落成规则（写库，只写 factory_rules 这一张表）。用于「组立暴雨也不许外发」「加班上限 2 小时」「检测岗只能由有检验技能的人顶」「这个客户可以部分交付」这类经验。subject 必须落在封闭动作词表里；status=declared 表示现场明确声明（立刻有约束力），candidate 只是记下发现不拦引擎。",
             "parameters": {
@@ -3144,6 +3162,25 @@ async def _tool_list_open_rule_questions(
     return out
 
 
+async def _tool_adopt_recommendation(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant",
+    factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """现场确认"这件事做了" → 记进决策台账。actor 用登录用户，机器冒名确认不算 verified_human。"""
+    from core.mes.factory_rules import record_adoption
+
+    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    res = await record_adoption(
+        db, fid, decision_id=(str(args["decision_id"]) if args.get("decision_id") else None),
+        action_type=(str(args["action_type"]) if args.get("action_type") else None),
+        adopted=bool(args.get("adopted", True)), note=str(args.get("note") or ""),
+        actor=str(operator or "unknown"), evidence=args.get("evidence") or {})
+    if res.get("error"):
+        return {"error": res["error"]}
+    res["next"] = ("这一行进入挖掘分母；攒够样本后系统会提出候选规律，等人确认才拦引擎")
+    return res
+
+
 async def _tool_record_factory_rule(
     db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant",
     factory_id: Optional[str] = None
@@ -3467,6 +3504,7 @@ _TOOL_EXECUTORS = {
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
     "list_open_rule_questions": _tool_list_open_rule_questions,
+    "adopt_recommendation": _tool_adopt_recommendation,
     "record_factory_rule": _tool_record_factory_rule,
     "query_lead_time_evidence": _tool_query_lead_time_evidence,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
@@ -3846,6 +3884,7 @@ WRITE_TOOLS = {
     "acknowledge_alert", "run_alert_patrol",
     "create_followup_task",
     "record_factory_rule",
+    "adopt_recommendation",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
@@ -3864,6 +3903,7 @@ TOOL_LABELS = {
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
     "list_open_rule_questions": "现场规则缺口提问",
+    "adopt_recommendation": "确认推荐已执行",
     "record_factory_rule": "落一条厂规",
     "query_lead_time_evidence": "提前期证据普查",
     "query_pmc_material_supply": "PMC物料供应证据",
@@ -4003,6 +4043,16 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "PMC工作矩阵", "PMC矩阵", "工作矩阵", "预排程沙盘", "时间锤", "物料锤",
             "生产锤", "出货锤", "紧急锤", "重算ETA", "ETA推迟", "ETA延迟", "UHN",
             "可加工时间", "库存齐套", "齐套率",
+        ],
+    },
+    {
+        # "我们照做了/已经下单了"是执行反馈，必须早于规则登记与提问，否则会被读工具抢走
+        "tool": "adopt_recommendation",
+        "keywords": [
+            "已经下单", "已下单", "按你说的下单", "采纳了", "照做了", "做了", "执行了",
+            "排了加班", "加班排了", "调了人", "人已调到", "开了第二条线", "先开工了", "已经开工",
+            "没做", "没采纳", "先开第一批", "先开第", "开第一批", "不等齐套", "第一批已经",
+            "已经先开", "压到", "已经催", "下单了", "已经安排",
         ],
     },
     {
@@ -4574,7 +4624,7 @@ async def execute_tool(
     if not executor:
         return {"error": f"未知工具：{tool_name}"}
     try:
-        if tool_name in {"create_followup_task", "record_factory_rule"}:
+        if tool_name in {"create_followup_task", "record_factory_rule", "adopt_recommendation"}:
             # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "edit_online_workbook":

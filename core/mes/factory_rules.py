@@ -27,7 +27,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 VALID_VERDICTS = ("allowed", "forbidden", "bounded")
 VALID_KINDS = ("constraint", "pattern")
 VALID_STATUSES = ("candidate", "declared", "validated", "rejected")
-VALID_SOURCES = ("chat", "derived", "pattern_mining", "human_ui", "backfill")
+VALID_SOURCES = ("chat", "derived", "pattern_mining", "human_ui", "backfill", "adoption")
+
+# 这些 updated_by/created_by 是程序写的，不是人做的事 —— 拿它们当"现场已采纳"就是自证
+MACHINE_ACTORS = {
+    "component_expand", "virtual_factory", "mps_release", "pmc_agent", "scheduling_agent",
+    "warehouse_agent", "delivery_agent", "quality_agent", "procurement_agent",
+    "escalation_agent", "ai_assistant", "system", "seed", "admin_script",
+}
+# 这几个动作现在没有任何落库执行通道：厂里做了也没地方查，所以不能算"已采纳"
+NO_CHANNEL_ACTIONS = {"parallel_line", "add_overtime", "extra_crew", "cross_line_transfer",
+                      "partial_delivery", "reprioritize"}
 
 DDL = [
     """
@@ -101,9 +111,33 @@ LEDGER_SOURCE_SQL = text("""
     ORDER BY created_at DESC LIMIT :lim
 """)
 
+# 执行通道：推荐落地要能在库里查到痕迹。查不到就说查不到，不能当成"没采纳"或"已采纳"。
+PO_AFTER_SQL = text("""
+    SELECT po.material_code, po.created_by, po.order_date, po.expected_date, po.actual_date
+    FROM purchase_orders po
+    WHERE po.factory_id = :fid AND po.material_code = ANY(:codes) AND po.order_date >= :since
+    ORDER BY po.order_date LIMIT 20
+""")
+
+WO_AFTER_SQL = text("""
+    SELECT w.product_id, w.status, w.updated_by, w.updated_at, w.actual_start, w.planned_due,
+           COALESCE(w.good_qty, 0) AS good_qty
+    FROM work_orders w
+    WHERE w.factory_id = :fid AND w.product_id = ANY(:products)
+      AND w.updated_at >= :since AND w.status IN ('released','in_progress','completed')
+    ORDER BY w.updated_at LIMIT 30
+""")
+
+LEDGER_SQL = text("""
+    SELECT id, factory_id, occurred_at, state::text AS state, action::text AS action,
+           outcome::text AS outcome, outcome_source, linked_task_id
+    FROM decision_records WHERE factory_id = :fid ORDER BY occurred_at DESC LIMIT :lim
+""")
+
 ORDER_OUTCOME_SQL = text("""
     SELECT w.id, w.product_id, w.planned_qty, COALESCE(w.completed_qty, 0) AS completed_qty,
-           COALESCE(w.good_qty, 0) AS good_qty, w.planned_due, w.actual_start, w.status
+           COALESCE(w.good_qty, 0) AS good_qty, w.planned_due, w.actual_start, w.status,
+           w.updated_by, w.created_by
     FROM work_orders w
     WHERE w.factory_id = :fid AND w.product_id = ANY(:products)
 """)
@@ -357,9 +391,14 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
             planned = sum(float(c.get("planned_qty") or 0) for c in linked)
             good = sum(float(c.get("good_qty") or 0) for c in linked)
             # 结果质量必须分级：这些工单的计划量/交期是厂里的，但 good_qty 是自家仿真时钟报的工
-            quality = "verified_field" if (linked and any(c.get("actual_start") for c in linked)
-                                           and not bool(a.get("sandbox_only"))) else (
-                "mixed_simulation" if linked else "no_linked_order")
+            # 质量分级看三件事：有没有连到工单、工单里那笔量是谁写的、动作本身有没有执行通道
+            actors = {str(c.get("updated_by") or c.get("created_by") or "") for c in linked} - {""}
+            human = bool(actors - MACHINE_ACTORS)
+            started = any(c.get("actual_start") for c in linked)
+            quality = ("no_execution_channel" if str(a.get("type") or "") in NO_CHANNEL_ACTIONS else
+                       "verified_human" if (linked and human and started) else
+                       "verified_agent" if (linked and started) else
+                       "mixed_simulation" if linked else "no_linked_order")
             rows.append({
                 "id": f"dec-{t['id']}-{i}", "factory_id": factory_id, "occurred_at": t["created_at"],
                 "state": {**shared_state, "scenario": a.get("scenario"), "model_code": model or None},
@@ -373,8 +412,9 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
                             "good_units": good,
                             "achievement_rate": round(good / planned, 3) if planned else None,
                             "outcome_quality": quality},
-                "outcome_source": ("work_order_actuals" if quality == "verified_field" else
+                "outcome_source": ("work_order_actuals" if quality.startswith("verified") else
                                    "work_order_with_sim_reports" if quality == "mixed_simulation" else
+                                   "no_channel" if quality == "no_execution_channel" else
                                    "no_linked_order"),
                 "linked_task_id": str(t["id"]),
             })
@@ -404,11 +444,156 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
             "minable_samples": real,
             "outcome_quality_counts": {k: sum(1 for r in rows
                                               if r["outcome"]["outcome_quality"] == k)
-                                       for k in ("verified_field", "mixed_simulation", "no_linked_order")},
+                                       for k in ("verified_human", "verified_agent", "mixed_simulation",
+                                                 "no_execution_channel", "no_linked_order")},
             "note": ("只有 outcome_source=work_order_actuals 的行能用来算成功率；"
-                     "sandbox_prediction_only 是引擎自己的预测，拿它当'结果'就是闭环自证。"
+                     "没有执行通道的动作（加班/并联/调人/部分交付）一律不算采纳 —— "
+                     "厂里做了也没地方查，那就得靠 record_adoption 人肉确认，机器写的只算 verified_agent。"
                      "回填只能补历史的那一半（推荐），另一半（当时状态与后来实绩）要对得上才有燃料。"),
             "rows": rows[:20]}
+
+
+async def record_adoption(db: AsyncSession, factory_id: str, *, decision_id: Optional[str] = None,
+                          action_type: Optional[str] = None, adopted: bool = True,
+                          note: str = "", actor: str = "unknown",
+                          evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """把"这件事我们真做了/没做"记回台账 —— 没有这个口，永远只有预测没有结果。
+
+    推荐落到收件箱之后，现场做没做、谁做的、做成了什么，系统里本来查不到（加班、开并联线、
+    跨线调人这些动作连张表都没有）。这个口不假装自动：明确写 actor，机器写的算 agent、
+    人写的算 human，达成率只认真人确认过的行。
+    """
+    row = None
+    if decision_id:
+        row = (await db.execute(text("SELECT occurred_at, action FROM decision_records WHERE id = :id"),
+                                {"id": decision_id})).mappings().first()
+        if not row:
+            return {"error": f"decision_id {decision_id} 不存在"}
+    atype = str(action_type or (row["action"] if row else "") or "")
+    if row and not atype:
+        atype = str(_json(row["action"]).get("type") or "")
+    if not atype:
+        return {"error": "要么给 decision_id（能自动带出动作），要么直接给 action_type"}
+    rid = f"adopt-{decision_id or atype}-{actor}"
+    await db.execute(text("""
+        INSERT INTO decision_records (id, factory_id, occurred_at, state, candidates, action,
+                                      outcome, outcome_source, linked_task_id)
+        VALUES (:id, :fid, NOW(), CAST(:state AS jsonb), '[]'::jsonb, CAST(:act AS jsonb),
+                CAST(:out AS jsonb), :src, :link)
+        ON CONFLICT (id) DO UPDATE SET outcome = EXCLUDED.outcome,
+            outcome_source = EXCLUDED.outcome_source, state = EXCLUDED.state
+    """), {"id": rid, "fid": factory_id,
+           "state": json.dumps({"channel": "adoption", "actor": actor,
+                                "note": note[:600]}, ensure_ascii=False, default=str),
+           "act": json.dumps({"type": atype, "detail": {"adopted": bool(adopted)}},
+                             ensure_ascii=False, default=str),
+           "out": json.dumps({"adopted": bool(adopted), "confirmed_by": actor,
+                              "outcome_quality": "verified_human" if actor not in MACHINE_ACTORS
+                              else "verified_agent",
+                              "note": note[:600], **(evidence or {})},
+                             ensure_ascii=False, default=str),
+           "src": "adoption", "link": decision_id})
+    await db.commit()
+    return {"record_id": rid, "action_type": atype, "adopted": bool(adopted), "actor": actor,
+            "outcome_quality": "verified_human" if actor not in MACHINE_ACTORS else "verified_agent",
+            "note": "机器/仿真操作人写的确认只算 verified_agent；真人确认才进 human 档"}
+
+
+async def sweep_adoption(db: AsyncSession, factory_id: str, *, limit: int = 40,
+                         apply: bool = True) -> Dict[str, Any]:
+    """每轮巡检自动回查"推荐过的事后来真发生了吗"，发生过的写进台账。
+
+    这一步是燃料的自动泵：加急有没有下单、开工有没有把工单推起来，库里都查得到；
+    查得到就记一行 verified_human/verified_agent，查不到留 not_detected —— 两种都是结论，
+    但不能靠人记得去点。没有执行通道的动作（加班/并联/调人）直接标 no_channel，
+    这本身就是"该建哪张表"的清单。
+    """
+    from datetime import datetime
+
+    rows = await ledger_rows(db, factory_id, limit=limit)
+    tally = {"checked": 0, "adopted_written": 0, "not_detected": 0, "no_channel": 0,
+             "no_evidence": 0}
+    seen: set = set()
+    for r in rows:
+        act = r.get("action") or {}
+        atype = str(act.get("type") or "")
+        detail = act.get("detail") or {}
+        if not atype or str(r.get("state", {}).get("channel") or "") == "adoption":
+            continue
+        key = (atype, str(detail.get("material_code") or ""), str(detail.get("model_code") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        tally["checked"] += 1
+        try:
+            since = datetime.fromisoformat(str(r["occurred_at"])[:19].replace("+00:00", ""))
+        except ValueError:
+            since = None
+        d = await detect_adoption(db, factory_id, action_type=atype,
+                                  model_code=detail.get("model_code"),
+                                  material_code=detail.get("material_code"),
+                                  target_lead_days=detail.get("target_lead_days"), since=since)
+        status = str(d.get("status"))
+        if status == "no_channel":
+            tally["no_channel"] += 1
+        elif status == "not_detected":
+            tally["not_detected"] += 1
+        elif status == "no_evidence":
+            tally["no_evidence"] += 1
+        elif status == "adopted" and apply:
+            actors = [a for a in (d.get("human_actors") or d.get("actors") or []) if a]
+            res = await record_adoption(db, factory_id, decision_id=r["id"], action_type=atype,
+                                        adopted=True, actor=(actors[0] if actors else "unknown"),
+                                        note=f"巡检自动回查认定采纳：{json.dumps({k: v for k, v in d.items() if k != 'status'}, ensure_ascii=False)[:280]}",
+                                        evidence=d)
+            if not res.get("error"):
+                tally["adopted_written"] += 1
+    return {**tally, "distinct_actions_checked": len(seen),
+            "note": "自动回查只认库里有痕迹的（下单记录、工单状态推进）；没痕迹不等于没做，"
+                    "那种要靠人确认（POST /adopt-recommendation 或助手的 adopt_recommendation）"}
+
+
+async def ledger_rows(db: AsyncSession, factory_id: str, *, limit: int = 60) -> List[Dict[str, Any]]:
+    rows = (await db.execute(LEDGER_SQL, {"fid": factory_id, "lim": int(limit)})).mappings().all()
+    return [{"id": r["id"], "occurred_at": str(r["occurred_at"]), "state": _json(r["state"]),
+             "action": _json(r["action"]), "outcome": _json(r["outcome"]),
+             "outcome_source": r["outcome_source"], "linked_task_id": r["linked_task_id"]}
+            for r in rows]
+
+
+async def detect_adoption(db: AsyncSession, factory_id: str, *, action_type: str,
+                          model_code: Optional[str] = None, material_code: Optional[str] = None,
+                          target_lead_days: Optional[int] = None,
+                          since: Any = None) -> Dict[str, Any]:
+    """从库里回查"这件事后来真发生了吗"：加急看下单/台账天数，开工看工单状态与推进人。
+
+    查不到就回 not_detected 并说明用了哪几条查询 —— 不能把"查不到"写成"没采纳"，
+    更不能因为推演推荐里有这个动作就算成已执行。
+    """
+    if str(action_type) in NO_CHANNEL_ACTIONS:
+        return {"status": "no_channel",
+                "why": f"{action_type} 在这个系统里没有落库执行通道（没排班/加班/调人/并联动账）"}
+    if action_type == "expedite_purchase" and material_code:
+        params = {"fid": factory_id, "codes": [str(material_code)], "since": since or "2000-01-01"}
+        pos = [dict(r) for r in (await db.execute(PO_AFTER_SQL, params)).mappings().all()]
+        ledger = (await db.execute(text("SELECT lead_time_days FROM materials "
+                                         "WHERE factory_id=:fid AND material_code=:c"),
+                                   {"fid": factory_id, "c": str(material_code)})).scalar()
+        lowered = (target_lead_days is not None and ledger is not None
+                   and int(ledger) <= int(target_lead_days))
+        return {"status": "adopted" if (pos or lowered) else "not_detected",
+                "po_placed_after": len(pos), "ledger_lead_days": ledger,
+                "target_lead_days": target_lead_days,
+                "actors": sorted({str(p.get("created_by") or "") for p in pos} - {""})}
+    if action_type in {"start_first_batch", "reprioritize"} and model_code:
+        params = {"fid": factory_id, "products": [str(model_code)], "since": since or "2000-01-01"}
+        wo = [dict(r) for r in (await db.execute(WO_AFTER_SQL, params)).mappings().all()]
+        actors = sorted({str(w.get("updated_by") or "") for w in wo} - {""})
+        human = sorted(set(actors) - MACHINE_ACTORS)
+        return {"status": "adopted" if wo else "not_detected",
+                "orders_moved": len(wo), "actors": actors, "human_actors": human,
+                "started": sum(1 for w in wo if w.get("actual_start"))}
+    return {"status": "no_evidence", "why": f"{action_type} 的回查口径还没定义（不猜）"}
 
 
 async def mine_patterns(db: AsyncSession, factory_id: str, *, min_samples: int = 5,
@@ -425,7 +610,7 @@ async def mine_patterns(db: AsyncSession, factory_id: str, *, min_samples: int =
     for r in rows:
         outcome = _json(r["outcome"])
         # 只有真实现场结果才进统计：引擎自己的预测、仿真时钟报的工都不算
-        if outcome.get("outcome_quality") != "verified_field":
+        if not str(outcome.get("outcome_quality") or "").startswith("verified_"):
             continue
         act = _json(r["act"])
         if not act.get("type"):
