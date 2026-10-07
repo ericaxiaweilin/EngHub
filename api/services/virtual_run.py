@@ -236,19 +236,91 @@ def family_prefix(model: str) -> str:
 SIM_CHANGEOVER_HOURS = float(os.getenv("SIM_CHANGEOVER_HOURS", "0.0833"))
 
 
-def pick_line(model: str, lines: List[Dict[str, Any]]) -> tuple:
-    """先按声明（can_make_models），再按 default_model，最后按同族前缀归线。返回 (线, 依据)。"""
+def capable_lines(model: str, lines: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], str]]:
+    """能接这个机种的线，按依据强弱排序：先声明 can_make_models，再 default_model，最后同族前缀。
+
+    这是"能不能改派到别条线"的唯一口径 —— `pick_line` 和改派逻辑必须共用它，
+    否则会出现"首选线没人在岗、改派却挑了一条工艺上做不了这台机的线"。
+    """
+    cands: List[Tuple[Dict[str, Any], str]] = []
     for l in lines:
         if model in str(l["can_models"]):
-            return l, ("line_declared_can_make" if l["default_model"] != model else "line_declared_home")
+            cands.append((l, "line_declared_can_make" if l["default_model"] != model else "line_declared_home"))
     for l in lines:
         if str(l["default_model"] or "") == model:
-            return l, "line_declared_default_model"
+            cands.append((l, "line_declared_default_model"))
     stem = str(model).split("-")[1] if "-" in str(model) else ""
     for l in lines:
         if stem and stem in str(l["line_code"]):
-            return l, "line_inferred_by_family_name"
-    return None, "no_line"
+            cands.append((l, "line_inferred_by_family_name"))
+    seen: List[str] = []
+    ordered: List[Tuple[Dict[str, Any], str]] = []
+    for l, basis in cands:
+        code = str(l["line_code"])
+        if code not in seen:
+            seen.append(code)
+            ordered.append((l, basis))
+    return ordered
+
+
+def pick_line(model: str, lines: List[Dict[str, Any]]) -> tuple:
+    """取工艺上最能接这台机的线（不看人在不在岗）。返回 (线, 依据)。"""
+    cands = capable_lines(model, lines)
+    return cands[0] if cands else (None, "no_line")
+
+
+def normalize_staffing(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """把外部传来的"每条线到岗比例"收成 {线编码: 0~1}。
+
+    越界按截断处理并记进 audit（0.5 是"一半人没来"，150 是传错了单位 —— 后者必须看得见，
+    否则整盘推演会被一个手滑的输入悄悄改光）。未在线台账里的编码也留痕，不当没发生。
+    """
+    out: Dict[str, float] = {}
+    for k, v in (raw or {}).items():
+        code = str(k or "").strip()
+        if not code:
+            continue
+        try:
+            ratio = float(v)
+        except (TypeError, ValueError):
+            ratio = 1.0
+        out[code] = max(0.0, min(1.0, ratio))
+    return out
+
+
+def pick_staffed_line(model: str, lines: List[Dict[str, Any]],
+                      staffing: Dict[str, float]) -> Dict[str, Any]:
+    """物理规则：这条线一个人都没来 → 这台机不能排在这条线上，改派到工艺上同样能做的下一条；
+    所有能做的线都没人 → 只能等（不编日期）。到岗不满 1 但不为 0 的线仍然接活，
+    人头的损失由 `crew` 折算进产能（见 run_target），不在这里改路由。
+    """
+    cands = capable_lines(model, lines)
+    if not cands:
+        return {"line": None, "basis": "no_line", "rerouted_from": None,
+                "present_ratio": None, "candidates": []}
+    known = {str(l["line_code"]) for l in lines}
+    audit = {"checked_lines": sorted(known),
+             "unknown_line_codes": sorted(set(staffing) - known)}
+    if not staffing:
+        line, basis = cands[0]
+        return {"line": line, "basis": basis, "rerouted_from": None,
+                "present_ratio": 1.0, "candidates": [], **audit}
+    for i, (line, basis) in enumerate(cands):
+        ratio = float(staffing.get(str(line["line_code"]), 1.0))
+        if ratio > 0:
+            return {"line": line, "basis": basis,
+                    "rerouted_from": str(cands[0][0]["line_code"]) if i else None,
+                    "present_ratio": ratio,
+                    "candidates": [{"line_code": str(l["line_code"]),
+                                    "present_ratio": float(staffing.get(str(l["line_code"]), 1.0))}
+                                   for l, _ in cands],
+                    **audit}
+    return {"line": None, "basis": "all_capable_lines_unstaffed",
+            "rerouted_from": None, "present_ratio": 0.0,
+            "candidates": [{"line_code": str(l["line_code"]),
+                            "present_ratio": float(staffing.get(str(l["line_code"]), 1.0))}
+                           for l, _ in cands],
+            **audit}
 
 
 def resolve_route(route_own: List[Dict[str, Any]], family_rows: List[Dict[str, Any]]) -> tuple:
@@ -394,6 +466,51 @@ async def load_family_route(db: AsyncSession, factory_id: str, model: str) -> Li
     return out
 
 
+def staffing_clamped(raw: Optional[Dict[str, Any]], norm: Dict[str, float]) -> List[Dict[str, Any]]:
+    """把被截断的输入原样列出来：0.5 是"一半人没来"，150 是传错了单位 —— 后者必须看得见，
+    否则一个手滑的输入会把整盘推演悄悄改光，而结果里读不出任何异常。"""
+    out: List[Dict[str, Any]] = []
+    for k, v in (raw or {}).items():
+        code = str(k or "").strip()
+        if not code:
+            continue
+        try:
+            ratio = float(v)
+        except (TypeError, ValueError):
+            out.append({"line_code": code, "raw": str(v), "applied": norm.get(code, 1.0),
+                        "reason": "不是数字，按 1.0（没请假）处理"})
+            continue
+        if abs(ratio - norm.get(code, 1.0)) > 1e-9:
+            out.append({"line_code": code, "raw": ratio, "applied": norm[code],
+                        "reason": "截断到 0~1（到岗比例是分数，人数请换算成比例）"})
+    return out
+
+
+def staffing_crew_factor(lines: List[Dict[str, Any]], line: Dict[str, Any],
+                         parallel_lines: int,
+                         staffing: Dict[str, float]) -> Tuple[float, List[Dict[str, Any]]]:
+    """这条线（组）真正要用到的班组里，按人数加权的平均到岗比例。
+
+    成员取法必须与 `group_capacity` 一致（同组前 n 条），否则人数和产能按两套口径折，
+    并联开线时会出现"产能按 2 条线算、人却按 1 条线扣"。没传 staffing 就是 1.0 —— 老行为一字不变。
+    """
+    if not staffing or not line:
+        return 1.0, []
+    n = max(1, int(parallel_lines))
+    group = str(line.get("line_group") or "")
+    if n <= 1 or not group:
+        members = [line]
+    else:
+        members = [l for l in lines if str(l.get("line_group") or "") == group][:n] or [line]
+    ratios = [{"line_code": str(l.get("line_code")),
+               "crew": float(l.get("crew_size") or 0),
+               "present_ratio": float(staffing.get(str(l.get("line_code")), 1.0))} for l in members]
+    weight = sum(r["crew"] for r in ratios)
+    if weight <= 0:
+        return (sum(r["present_ratio"] for r in ratios) / len(ratios) if ratios else 1.0), ratios
+    return sum(r["crew"] * r["present_ratio"] for r in ratios) / weight, ratios
+
+
 async def run_target(db: AsyncSession, factory_id: str, model: str, units: float,
                      due: date, today: date, attendance_curve: Dict[int, float],
                      lines: List[Dict[str, Any]], shift_days: set,
@@ -403,7 +520,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                      line_busy_days: float = 0.0, equip_rate: float = 1.0,
                      hours_multiplier: float = 1.0, lead_multiplier: float = 1.0,
                      stock_multiplier: float = 1.0, batches: int = 1,
-                     changeover_hours: float = 0.0) -> Dict[str, Any]:
+                     changeover_hours: float = 0.0,
+                     line_staffing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把一个目标跑成一条演变时间线。"""
     cache = (cached or {}).get(model)
     if not cache:
@@ -425,7 +543,9 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     bom_parts = cache.get("bom_parts")
     bom_levels = cache.get("bom_levels")
     route, route_basis = resolve_route(list(route_own), family_rows)
-    line, line_basis = pick_line(model, lines)
+    staffing = normalize_staffing(line_staffing)
+    choice = pick_staffed_line(model, lines, staffing)
+    line, line_basis = choice["line"], choice["basis"]
     hours_per_unit, hours_basis = hours_per_unit_from(route, line)
     if hours_per_unit:
         hours_per_unit = round(hours_per_unit * max(0.05, float(hours_multiplier)), 6)
@@ -446,6 +566,25 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
 
     # 开工要排在三件事之后：料齐、子件做完、这条线手上已承诺的活干完
     earliest_start = max(arrival, child_days, int(line_busy_days))
+    # 工艺上能接这台机的线全都一个人都没来 —— 这不是"厂里做不到"，是这段时间没人可做，
+    # 结论只能是等：不给完工日、不给延期天数，更不许把产能摊到一条根本没人的线上。
+    if line is None and staffing and choice["basis"] == "all_capable_lines_unstaffed":
+        idle = "、".join(f"{c['line_code']}（到岗 {c['present_ratio']:.0%}）"
+                         for c in (choice["candidates"] or []))
+        return {"model_code": model, "units": units, "status": "no_staffed_line",
+                "why": f"能这道工艺的线都没人在岗：{idle} → 只能等开工，不推演完工日",
+                "route_basis": route_basis, "line_basis": line_basis,
+                "staffing": {"requested": True, "input": staffing,
+                             "clamped": staffing_clamped(line_staffing, staffing),
+                             "rerouted_from": None, "candidates": choice["candidates"],
+                             "checked_lines": choice["checked_lines"],
+                             "unknown_line_codes": choice["unknown_line_codes"],
+                             "by_line": [], "present_ratio": 0.0,
+                             "action": "改线（别的线有人）或等人（都没人）—— 引擎不替厂里选放假"},
+                "kit": {k: kit[k] for k in ("buy_arrival_days", "blockers", "material_cost",
+                                            "materials_without_price")},
+                "due": str(due)}
+
     if hours_basis == "no_time_basis":
         return {"model_code": model, "units": units, "status": "no_time_basis",
                 "why": "既没有路线工时，也没有可归属的线节拍（线都没声明能做它）",
@@ -456,7 +595,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
 
     hours_per_day = float((line or {}).get("hours_per_day") or 11)
     group_cap = group_capacity(lines, line or {}, parallel_lines)
-    crew = round(group_cap["crew"] * (1.0 + crew_bonus), 1)
+    present, present_by_line = staffing_crew_factor(lines, line or {}, parallel_lines, staffing)
+    crew = round(group_cap["crew"] * (1.0 + crew_bonus) * present, 1)
     cap_line = round(group_cap["units_per_day"] * max(0.1, min(1.0, equip_rate)), 2)  # 设备可用率折进日产能
     caps = capacity_limits(crew=crew, hours_per_day=hours_per_day, hours_per_unit=hours_per_unit,
                            line_declared=cap_line)
@@ -514,6 +654,19 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "bom_problems": bom_problems,
         "route_steps": len(route), "route_basis": route_basis,
         "line": (line or {}).get("line_code"), "line_basis": line_basis,
+        "staffing": {"requested": bool(staffing), "input": staffing,
+                     "clamped": staffing_clamped(line_staffing, staffing),
+                     "line": (line or {}).get("line_code"),
+                     "present_ratio": round(present, 4),
+                     "crew_before_staffing": round(group_cap["crew"] * (1.0 + crew_bonus), 1),
+                     "crew_effective": crew,
+                     "rerouted_from": choice.get("rerouted_from"),
+                     "candidates": choice.get("candidates") or [],
+                     "checked_lines": choice.get("checked_lines") or [],
+                     "unknown_line_codes": choice.get("unknown_line_codes") or [],
+                     "by_line": present_by_line,
+                     "note": ("到岗比例按人数折算进班组，产能再取 min(线声明台/天, 班组按 IE 工时做得完的台/天)；"
+                              "它与天气出勤曲线是两笔独立扣减（曲线按天、这条按线常驻缺口），会叠乘。")},
         "hours_per_unit": hours_per_unit, "hours_basis": hours_basis,
         "earliest_start_day": earliest_start,
         "material_arrival_day": arrival,
@@ -551,7 +704,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                     hours_basis: len(route) or 1,
                     line_basis: 1},
         "policy": {"allow_partial": allow_partial, "parallel_lines": parallel_lines,
-                   "crew_bonus": crew_bonus, "expedite_lead_days": expedite_lead_days},
+                   "crew_bonus": crew_bonus, "expedite_lead_days": expedite_lead_days,
+                   "line_staffing": staffing},
         "line_busy_days_before_order": line_busy_days,
         "equipment_rate_applied": round(equip_rate, 4),
         "capacity_after_equipment": cap,
@@ -1058,8 +1212,13 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
 async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                       *, today: Optional[date] = None,
                       attendance_curve: Optional[Dict[int, float]] = None,
-                     expedite_lead_days: Optional[int] = None) -> Dict[str, Any]:
-    """跑一批目标（每台一个时间线），并汇总组合结果。targets: [{model_code, units, due_in_days}]"""
+                      expedite_lead_days: Optional[int] = None,
+                      line_staffing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """跑一批目标（每台一个时间线），并汇总组合结果。targets: [{model_code, units, due_in_days}]
+
+    `line_staffing` 是 {线编码: 到岗比例}：0 = 整班没来（改派到工艺上同样能做的线，无路可改则等），
+    0.5 = 半数到岗（班组人数按比例折，产能随之受班组可完成量约束）。不给就是 1.0，与老行为一致。
+    """
     today = today or date.today()
     lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
     shift_days = {int(r["weekday"]) + 1 for r in
@@ -1070,11 +1229,11 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
     for t in targets:
         due = today + timedelta(days=int(t.get("due_in_days") or 25))
         run = await run_target(db, factory_id, str(t["model_code"]), float(t.get("units") or 0),
-                               due, today, curve, lines, shift_days)
+                               due, today, curve, lines, shift_days, line_staffing=line_staffing)
         if expedite_lead_days is not None and run.get("bottleneck_part"):
             alt = await run_target(db, factory_id, str(t["model_code"]), float(t.get("units") or 0),
                                    due, today, curve, lines, shift_days,
-                                   expedite_lead_days=expedite_lead_days)
+                                   expedite_lead_days=expedite_lead_days, line_staffing=line_staffing)
             run["expedite_whatif"] = {
                 "to_lead_days": expedite_lead_days,
                 "finish_date": alt.get("finish_date"), "finish_day": alt.get("finish_day"),
@@ -1085,11 +1244,13 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
             }
         runs.append(run)
     ok = [r for r in runs if r["status"] == "simulated"]
+    waiting = [r for r in runs if r["status"] == "no_staffed_line"]
     total_late = sum(max(0, int(r["days_late"] or 0)) for r in ok)
     on_time = sum(1 for r in ok if (r["days_late"] or 0) <= 0)
     return {
         "factory_id": factory_id, "today": str(today), "targets": len(runs),
         "simulated": len(ok), "no_basis": len(runs) - len(ok),
+        "waiting_for_manpower": len(waiting),
         "on_time_orders": on_time, "total_days_late": total_late,
         "person_days_total": round(sum(float(r["person_days"] or 0) for r in ok), 1),
         "standby_person_days_total": round(sum(float(r["standby_person_days_if_line_held"] or 0) for r in ok), 1),
@@ -1272,6 +1433,14 @@ def _objectives(run: Dict[str, Any], demand_units: float, due_day: int) -> Dict[
     }
 
 
+def _blocked_note(blocked: List[Dict[str, Any]]) -> str:
+    """阻塞原因要说清是"没人"还是"没依据" —— 前者是等，后者是模型代表不了，处置完全不同。"""
+    label = {"no_staffed_line": "能做的线都没人在岗（只能等开工，不推演完工日）",
+             "no_time_basis": "缺工时/缺可归属线（模型还没代表得了这台机）"}
+    kinds = sorted({str(b.get("status")) for b in blocked})
+    return "本轮不产出解：" + "；".join(label.get(k, k) for k in kinds)
+
+
 async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                         *, today: Optional[date] = None,
                         policies: Optional[List[Dict[str, Any]]] = None,
@@ -1316,11 +1485,14 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
         # "真实已承诺量"，于是三台跑步机机种各占 GROUP-TREAD 十几天却互不遮挡，
         # 交期普遍算得偏乐观 —— 而"谁先做"本来是引擎要做的决定，不是背景假设。
         allocated: Dict[str, float] = {} if pol.get("ignore_backlog") else dict(group_busy)
+        # 按线到岗是"这一轮政策"的属性：改派之后占用的是**改派后那条线**的队列，
+        # 所以排队口径必须与 run_target 用同一个解析函数，不能在这里另算一遍。
+        pol_staffing = normalize_staffing(pol.get("line_staffing"))
         ordered = sorted(scen_targets, key=lambda x: (int(x.get("due_in_days") or 999),
                                                       str(x.get("model_code"))))
         for t in ordered:
             due_day = int(t.get("due_in_days") or 30)
-            line_of_t = pick_line(str(t["model_code"]), lines)[0] or {}
+            line_of_t = pick_staffed_line(str(t["model_code"]), lines, pol_staffing)["line"] or {}
             grp = str(line_of_t.get("line_group") or line_of_t.get("line_code") or "")
             busy = float(allocated.get(grp, 0.0) or 0.0)
             run = await run_target(db, factory_id, str(t["model_code"]), float(t.get("units") or 0),
@@ -1329,6 +1501,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                    allow_partial=bool(pol.get("allow_partial", True)),
                                    parallel_lines=int(pol.get("parallel_lines", 1)),
                                    crew_bonus=float(pol.get("crew_bonus", 0.0)),
+                                   line_staffing=pol.get("line_staffing"),
                                    cached=cache, line_busy_days=(0.0 if pol.get("ignore_backlog") else busy),
                                    equip_rate=float((perturb or {}).get("equip_rate")
                                                     or equip.get("rate") or 1.0),
@@ -1356,7 +1529,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                               "policy": pol, "objectives": {}, "evidence": {},
                               "blocked_models": blocked, "detail": [],
                               "displaces_committed_work": bool(pol.get("ignore_backlog")),
-                              "note": "这些机种都没有可推演的依据（缺工时/缺可归属线），本轮不产出解"})
+                              "note": _blocked_note(blocked)})
             continue
         demand_by_scenario[scen["name"]] = round(sum(float(x["units"] or 0) for x in work), 2)
         worst_late = max(_objectives(x["run"], x["units"], x["due_day"])["days_late"] for x in work)
@@ -1397,6 +1570,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         "units": x["run"].get("units"), "finish_date": x["run"].get("finish_date"),
                         "due_date": x["run"].get("due_date"), "days_late": x["run"].get("days_late"),
                         "status": x["run"].get("status"), "line": x["run"].get("line"),
+                        "staffing": x["run"].get("staffing"),
                         "why": x["run"].get("why"),
                         "binding_terms": x["run"].get("binding_terms"),
                         "bom_source": x["run"].get("bom_source"),

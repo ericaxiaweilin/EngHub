@@ -667,6 +667,10 @@ async def post_virtual_run(
     只在内存里执行，不写业务表、不回写真实系统；每一步动作都留在 actions 里可核对。
     `attendance_rate` 给一条恒定到岗率（好天 0.97 / 雨 0.92 / 暴雨 0.70），
     `expedite_lead_days` 回答"把瓶颈件压到 N 天能提前几天交"。
+    `line_staffing` 是 {线编码: 到岗比例}，回答"某条线整班请假/减半到岗会怎样"：
+    比例 0 → 这台单改派到工艺上同样能做的线（结果里 `staffing.rerouted_from` 记从哪条挪走），
+    没有可改派的线 → `status:"no_staffed_line"`，只给等待结论、不编完工日；
+    0 到 1 之间 → 按人数折算这条线的班组，产能受"班组按 IE 工时做得完的台/天"约束。
     """
     del current_user
     from api.services.virtual_run import run_sandbox
@@ -677,8 +681,12 @@ async def post_virtual_run(
         raise HTTPException(status_code=422, detail="需要 factory_id 和 targets[{model_code,units,due_in_days}]")
     rate = body.get("attendance_rate")
     curve = None if rate is None else {d: float(rate) for d in range(0, 400)}
+    staffing = body.get("line_staffing")
+    if staffing is not None and not isinstance(staffing, dict):
+        raise HTTPException(status_code=422, detail='line_staffing 要传对象，例如 {"LINE-TREAD-01": 0.5}')
     return await run_sandbox(db, factory_id, targets,
                              attendance_curve=curve,
+                             line_staffing=staffing,
                              expedite_lead_days=(int(body["expedite_lead_days"])
                                                  if body.get("expedite_lead_days") else None))
 
