@@ -548,6 +548,21 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
             await db.commit()
         receipt["recommendation_task"] = {"task_id": created.get("task_id"),
                                           "superseded": int(superseded or 0)}
+    # 推荐一旦落进收件箱，就顺手把它记进决策台账：状态（场景/政策/机种）、被执行的动作、
+    # 以及后来工单的量与达成率。没这一步"成功率"永远算不出来，而人不该每次手动触发记账。
+    # 同一条推荐重复跑只是 upsert，不会越记越多。
+    try:
+        from core.mes.factory_rules import backfill_decision_ledger
+
+        led = await backfill_decision_ledger(db, factory_id, limit=60, apply=apply)
+        receipt["decision_ledger"] = {
+            "records": led["records"], "written": led["written"],
+            "outcome_quality": led["outcome_quality_counts"],
+            "minable_samples": led["minable_samples"],
+        }
+    except Exception as exc:  # noqa: BLE001  记账失败不能把这一轮的推荐带崩，但要写进读数
+        receipt["decision_ledger"] = {"error": f"{type(exc).__name__}: {exc}"[:200],
+                                      "note": "台账本轮没记上，推荐本身不受影响"}
     return receipt
 
 

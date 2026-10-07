@@ -489,6 +489,9 @@ MIN_UNVERIFIED_LEAD_PARTS = 1000
 MIN_MOB_CONTRADICTION_ROWS = 500
 # 少于这么多个动作没支撑，就不值得占收件箱（一个工段本来就可能有一两条没写过的规则）
 MIN_UNDECLARED_ACTIONS = 3
+# 模式要攒够几个样本才敢提"这条规律值得确认"
+MIN_PATTERN_SAMPLES = 5
+MIN_PENDING_RULES = 1
 
 LEAD_DEFAULT_SQL = """
     WITH g AS (
@@ -540,15 +543,30 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
         cons = await action_constraints(db, factory_id)
     except Exception:  # noqa: BLE001  约束层查不动时不挂这一格，别把整轮巡检带崩
         cons = {}
+    try:
+        # 先记账再挖：台账是"事件→动作→结果"的唯一载体，挖出来的 candidate 全靠它
+        # 挂在巡检里（6 小时一轮），不靠人记得去点；推荐变了没变都刷，实绩一变达成率就跟变
+        from core.mes.factory_rules import (backfill_decision_ledger, mine_patterns,
+                                            record_candidates_from_census)
+
+        await backfill_decision_ledger(db, factory_id, limit=60, apply=True)
+
+        mined = await mine_patterns(db, factory_id, min_samples=MIN_PATTERN_SAMPLES, apply=True)
+        derived = await record_candidates_from_census(db, factory_id, apply=True)
+    except Exception:  # noqa: BLE001  挖不动就不挂这一格，绝不把没跑到说成没有候选
+        mined, derived = {"error": "mining_unavailable"}, {"error": "derive_unavailable"}
+    pending = await _pending_rules(db, factory_id)
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
-                        lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}))
+                        lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
+                        pending=list(pending or []))
 
 
 def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  ready: Dict[str, Any], lead: Optional[Dict[str, Any]] = None,
                  mob: Optional[Dict[str, Any]] = None,
-                 cons: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                 cons: Optional[Dict[str, Any]] = None,
+                 pending: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
     阈值写成张数/料号数而不是比例：少于十几张时重跑一次的成本比挂一条待办更划算，
@@ -606,6 +624,24 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             {"undeclared_actions": [str(a.get("action")) for a in undeclared],
              "gaps": gaps}))
 
+    # 第七格：系统自己挖出来的 candidate 规则等着人确认（不确认就永远不拦引擎）
+    pending = list(pending or [])
+    if len(pending) >= MIN_PENDING_RULES:
+        kinds = sorted({str(r.get("source") or "") for r in pending})
+        out.append(_gap(
+            "candidate_rules", "awaiting_confirmation", f"cand|{len(pending)}",
+            f"补数据｜{len(pending)} 条系统自己发现的规则等着人确认（来源 {'、'.join(kinds)}）",
+            "这些不是空白，是**从数据里挖出来的候选规律**：人手能顶哪个工位（从技能台账推）、"
+            "某种状态下哪个动作历史上达成率高（从决策台账推）。它们现在只是 candidate，不拦引擎；"
+            "确认过的才升成 declared/validated 并开始过滤候选动作。\n"
+            f"待确认清单：{json.dumps(pending[:8], ensure_ascii=False)[:1200]}\n"
+            "确认方式：对话里说一句或在界面 POST /api/v1/pmc/factory-rules（status=validated）。\n"
+            "复核：GET /api/v1/pmc/decision-ledger?factory_id=<厂区>&mine=true、"
+            "GET /api/v1/pmc/action-constraints?factory_id=<厂区>",
+            f"{len(pending)} 条候选规则没人确认",
+            "pmc_agent", "逐条确认或驳回；驳回也是结果，别让它一直挂着。",
+            {"pending": len(pending), "sources": kinds}))
+
     lt = int((lead or {}).get("unverified") or 0)
     if lt >= MIN_UNVERIFIED_LEAD_PARTS:
         out.append(_gap(
@@ -661,6 +697,22 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
     return out
 
 
+async def _pending_rules(db: AsyncSession, factory_id: str) -> List[Dict[str, Any]]:
+    """等着人确认的候选规则（candidate），按发现时间倒序取前若干条。"""
+    try:
+        rows = (await db.execute(text("""
+            SELECT subject, verdict, statement, source, params::text AS params, updated_at
+            FROM factory_rules
+            WHERE factory_id = :fid AND status = 'candidate'
+            ORDER BY updated_at DESC LIMIT 20
+        """), {"fid": factory_id})).mappings().all()
+    except Exception:  # noqa: BLE001  表还没建好时这格不挂，别把整轮巡检带崩
+        return []
+    return [{"subject": r["subject"], "verdict": r["verdict"], "statement": r["statement"],
+             "source": r["source"], "params": r["params"], "observed_at": str(r["updated_at"])}
+            for r in rows]
+
+
 async def _readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
     try:
         from api.services.sim_backtest import readiness
@@ -683,6 +735,7 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
             "unverified_lead_parts": MIN_UNVERIFIED_LEAD_PARTS,
             "mob_contradiction_rows": MIN_MOB_CONTRADICTION_ROWS,
             "undeclared_actions": MIN_UNDECLARED_ACTIONS,
+            "pending_rule_samples": MIN_PATTERN_SAMPLES,
         },
         "counts": outcome["counts"], "findings": found, "items": outcome["items"],
         "rule": ("这几格不是引擎算不出，是台账/主数据没跟上：齐套行登记世代、可重跑补齐的缺行单、"
