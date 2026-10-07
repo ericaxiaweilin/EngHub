@@ -32,7 +32,8 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
             "direction_hit_rate": 1.0,      # 符号错就是模型坏，不是精度问题
             "ci_width_steps": 1.5,           # 90% 置信区间宽过 1.5 个档距就等于没测出来
             "elastic_ci_usable": 0.5},      # 至少一半杠杆的弹性是"测得出来的"，才算这一层成立
-    "L2B": {"backtest_mape": 0.20,        # 预测与实际工期之比，偏差 20% 以内才算能用
+    "L2B": {"bottleneck_min_orders": 20,   # 按单算命中率：20 张才有对错可言（1 张不算命中率）
+            "backtest_mape": 0.20,        # 预测与实际工期之比，偏差 20% 以内才算能用
             "backtest_min_pairs": 10,      # 少于 10 张成对样本不判线（3 张能算出数但说明不了精度）
             "bottleneck_hit_rate": 0.70},
     "L3": {"retest_improvement_days": 0.5,  # 推荐相对基线至少要值半天，否则别推荐
@@ -332,6 +333,7 @@ async def _l2a_sensitivity(db: AsyncSession, factory_id: str, models: List[str],
 
 
 async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) -> Dict[str, Any]:
+    from api.services.sim_backtest import readiness as _readiness
     from api.services.sim_sensitivity import mapping_accuracy
     acc = await mapping_accuracy(db, factory_id, models)
     # 瓶颈命中率：仿真点名的瓶颈件 vs 台账里该机型缺口最大的外购料号
@@ -359,6 +361,28 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
     """), {"fid": factory_id})).mappings().all()
     ledger = {str(r["model"]): str(r["top_short_code"]) for r in hit_rows}
     ledger_lines = {str(r["model"]): int(r["short_lines"] or 0) for r in hit_rows}
+    # 逐单口径：同一机种下每张单缺口最大的料号可能不同，命中率按单算才有样本量
+    per_order_rows = (await db.execute(text("""
+        WITH led AS (
+            SELECT w.work_order_id, o.status,
+                   COALESCE(pp.product_code, p.product_code, o.product_id) AS model,
+                   (ARRAY_AGG(w.material_code ORDER BY w.shortage_qty DESC))[1] AS top_short
+            FROM work_order_materials w
+            JOIN work_orders o ON o.id = w.work_order_id
+            LEFT JOIN products p ON p.factory_id = o.factory_id
+                 AND (p.id::text = o.product_id OR p.product_code = o.product_id)
+            LEFT JOIN work_orders par ON par.id = o.parent_work_order_id
+            LEFT JOIN products pp ON pp.factory_id = par.factory_id
+                 AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+            WHERE o.factory_id = :fid AND w.item_type = 'buy'
+              AND COALESCE(w.shortage_qty,0) > 0 AND o.id NOT LIKE 'wo-vf-%'
+            GROUP BY 1, 2, 3)
+        SELECT model, top_short, COUNT(*) AS orders FROM led
+        WHERE status NOT IN ('completed','cancelled')
+        GROUP BY 1, 2
+    """), {"fid": factory_id})).mappings().all()
+    per_order = [(str(r["model"]), str(r["top_short"]), int(r["orders"] or 0))
+                 for r in per_order_rows]
     from api.services.virtual_run import derive_targets, scan_policies
     targets = await derive_targets(db, factory_id, models, days_of_output=6.0, lead_margin=1.15)
     scan = await scan_policies(db, factory_id, targets,
@@ -369,6 +393,25 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
            for d in detail if d.get("bottleneck_part")}
     both = [m for m in sim if m in ledger]
     hits = sum(1 for m in both if sim[m] == ledger[m])
+    order_n = sum(n for m, _sc, n in per_order if m in sim)
+    order_hits = sum(n for m, sc, n in per_order if m in sim and sc == sim[m])
+    order_models = sorted({m for m, _sc, _n in per_order if m in sim})
+    # 0 命中要先分清"模型判错"和"两边根本不在同一套料号上比"：
+    # 仿真的瓶颈件取自本地 bom_items（实测机械厂 1,055 行全是 RM-* 合成料号，SAP 数字料号 0 行），
+    # 而台账缺口行多是 engflow 真源的 SAP 料号（1000108191 螺絲 这类）。料号不同源时命中率必为 0。
+    ledger_codes = {str(c) for (c,) in (await db.execute(text("""
+        SELECT DISTINCT w.material_code FROM work_order_materials w
+        JOIN work_orders o ON o.id = w.work_order_id
+        WHERE o.factory_id = :fid AND w.item_type = 'buy'
+          AND COALESCE(w.shortage_qty,0) > 0
+    """), {"fid": factory_id})).all()}
+    sim_codes = {c for c in sim.values() if c}
+    same_system = sorted(c for c in sim_codes if c in ledger_codes)
+    mirror_real_lines = int((await db.execute(text(
+        "SELECT COUNT(*) FROM enghub_bom_items WHERE product_model = ANY(CAST(:ms AS text[]))"
+    ), {"ms": list(sim.keys())})).scalar() or 0)
+    sim_bom_system = ("合成 RM-*" if any(str(c).startswith("RM-") for c in sim_codes)
+                      else "SAP 数字料号")
     # 回测不靠 aps_schedule_tasks（实测已完工 28 张里 0 张留有排程任务行，等于永远回测不了）：
     # 用"计划开工日为今天、按现主数据重跑一次"得到预测完工日，与实际完工日成对比。
     # 局限必须一起报：重跑用的是**现在**的 BOM/工时/提前期，不是当时的主数据快照。
@@ -430,20 +473,30 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
     mape = len(pairs)
     priced = float(acc.get("overall_accuracy") or 0)
     return {"metrics": [
-        _metric(
-            "瓶颈位置命中率", round(hits / len(both), 3) if both else None,
-            THRESHOLDS["L2B"]["bottleneck_hit_rate"], "gte", "",
-            f"可比 {len(both)} 台：仿真点名的瓶颈件 == 台账缺口最大的外购料号",
-            n=len(both), min_n=5,
-            missing=(f"可比机种只有 {len(both)} 个（判线要 ≥5）：产品键本身能归一"
-                     f"（products.product_code 对上 159/160 个工单键，子单滚一层再并进来），"
-                     f"卡住的是**外购缺口行的覆盖面** —— 工单键能归一，但缺口行只落在 "
-                     f"{len(ledger_lines)} 个机种上："
-                     + "、".join(f"{k} {v} 行" for k, v in
-                                 sorted(ledger_lines.items(), key=lambda x: -x[1])[:4])
-                     + f"；仿真这轮给出瓶颈件的机种有 {len(sim)} 个，交集只有 {len(both)} 个。"
-                       "这是齐套行没生成，不是算法命中率低"),
-        ),
+        _metric("瓶颈位置命中率（按单）", round(order_hits / order_n, 3) if order_n else None,
+                THRESHOLDS["L2B"]["bottleneck_hit_rate"], "gte", "",
+                f"{order_hits}/{order_n} 张在流程单：仿真给该机种点名的瓶颈件 == 该单台账缺口最大的外购料号；"
+                f"覆盖机种 {len(order_models)} 个（{order_models}）。计数单位从机种换成单才有对错可言"
+                "（机种数被主数据卡在 1 个，不是算法能补的），但**只在一个机种上成立就不能外推到全厂**",
+                n=order_n, min_n=int(THRESHOLDS["L2B"]["bottleneck_min_orders"]),
+                missing=(None if order_n >= int(THRESHOLDS["L2B"]["bottleneck_min_orders"])
+                         else f"可比单数 {order_n}（判线要 ≥{THRESHOLDS['L2B']['bottleneck_min_orders']} 张）")),
+        _metric("可比机种数（旧口径，只报数）", len(both), None, "gte", "个",
+                f"仿真给出瓶颈件且台账有缺口行的机种 {len(both)} 个："
+                + "、".join(f"{k} {v} 行" for k, v in
+                            sorted(ledger_lines.items(), key=lambda x: -x[1])[:4])
+                + f"；机种数由主数据决定（键能归一：products.product_code 对上 159/160 个工单键，"
+                  "子单滚一层再并进来），不是算法命中率问题。分类明细见 /api/v1/pmc/sim-readiness"),
+        _metric("瓶颈件料号同源性", round(len(same_system) / max(1, len(sim_codes)), 3),
+                None, "gte", "比例",
+                f"仿真点名的 {len(sim_codes)} 个瓶颈件料号里，能在台账缺口料号里找到同一串的只有 "
+                f"{len(same_system)} 个；仿真相取自本地 bom_items（料号形态：{sim_bom_system}），"
+                f"而 engflow 真源镜像 enghub_bom_items 对这几个机种有 {mirror_real_lines} 行 SAP 料号 —— "
+                "两套料号体系不接通时，命中率 0 是**口径不重叠**，不是模型判错；"
+                "这条已单列为待办（仿真 BOM 取数源统一到 engflow 真源）"),
+        _metric("命中率能覆盖几个机种", round(len(order_models) / max(1, len(sim)), 3),
+                None, "gte", "比例",
+                f"仿真这轮给出瓶颈件的 {len(sim)} 个机种里，{len(order_models)} 个有真实缺口单可比"),
         _metric("回测 MAPE", mape_value, THRESHOLDS["L2B"]["backtest_mape"], "lte", "",
                 "已完工单按计划开工日重跑一次沙箱（政策=现况、好天），比预测完工日与实际完工日；"
                 "误差按实际工期归一。**已知偏差方向**：重跑用的是**今天**的库存与提前期，"
@@ -458,7 +511,9 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                          "要补的是下达/完工时把计划开工日与预测完工日一起落到工单上（#54）")),
         _metric("输入映射精度", round(priced / 100.0, 3), None, "gte", "0~1",
                 "六项输入的加权覆盖率（工时/提前期/供应商/库存/自制外购/单价），只作分母透明化"),
-    ], "sim_bottleneck": sim, "ledger_top_short": ledger,
+    ], "readiness": await _readiness(db, factory_id),
+        "hit_rate_orders": {"hits": order_hits, "n": order_n, "models": order_models},
+        "sim_bottleneck": sim, "ledger_top_short": ledger,
         "ledger_short_lines": ledger_lines,
         "backtest_pairs": pairs[:12], "backtest_skipped": skipped,
         "backtest_pairs_available": int(mape or 0)}

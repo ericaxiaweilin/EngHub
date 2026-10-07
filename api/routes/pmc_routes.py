@@ -345,6 +345,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/engine-layers", "mode": "read_only"},
             {"key": "engine_contract", "name": "引擎对外契约（三接口签名+业务词表，与模型内部无关；自检见 /engine-contract-check）",
              "path": "/api/v1/pmc/engine-contract", "mode": "read_only"},
+            {"key": "sim_readiness", "name": "精度判据就绪度（可比机种、回测成对样本、缺齐套行的归因）",
+             "path": "/api/v1/pmc/sim-readiness", "mode": "read_only"},
             {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
              "path": "/api/v1/pmc/time-basis", "mode": "read_only"},
             {"key": "partial_kit", "name": "部分齐投产机会（还能先开几台，只读）",
@@ -549,6 +551,23 @@ async def _engine_contract_call(iface: str, db: AsyncSession, factory_id: str,
         return await fn(db, factory_id, body)
     except ContractError as exc:
         raise HTTPException(status_code=422, detail=exc.as_dict())
+
+
+@router.get("/sim-readiness", summary="精度判据就绪度：L2B 那两个数为什么算不出，缺的是哪一类数据")
+async def get_sim_readiness(
+    factory_id: str = Query(..., description="厂区"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """只读：按机种列出 工单/齐套行/外购缺口行 与回测成对样本，再把缺口归成可行动的四类。
+
+    这一页存在的意义是：判据说"算不出"时，得同时说清是**源侧没有**（组件级子 BOM、
+    这台机种的 BOM 压根不在镜像里、出货柜这类伪产品、种子单）还是**我们跑一次就能补**。
+    """
+    del current_user
+    from api.services.sim_backtest import readiness
+
+    return await readiness(db, factory_id)
 
 
 @router.get("/engine-contract", summary="引擎对外契约：三个接口的签名与业务词表（与模型内部无关）")
