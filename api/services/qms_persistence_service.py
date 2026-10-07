@@ -251,8 +251,11 @@ class CAPAPersistenceService:
             {
                 "id": c.id,
                 "case_number": c.case_number,
-                "title": c.title,
-                "severity": c.severity,
+                # 表里没有 title/severity 两列，真实列名是 problem_description/defect_severity；
+                # 读不存在的属性会让这个列表端点每次 500
+                "title": c.problem_description,
+                "severity": c.defect_severity,
+                "assigned_to": c.assigned_to,
                 "status": c.status,
                 "created_at": c.created_at.isoformat(),
             }

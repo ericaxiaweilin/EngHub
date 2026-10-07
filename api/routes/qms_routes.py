@@ -1067,17 +1067,6 @@ async def create_capa_request(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/cases/{case_id}")
-async def get_capa_case(case_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """获取CAPA案件详情"""
-    from api.services.qms_service import QMSService
-    qms = QMSService(db)
-    
-    case = await qms.get_capa_case(case_id)
-    if not case:
-        raise HTTPException(status_code=404, detail="CAPA案件不存在")
-    return {"success": True, "data": case}
-
 @router.get("/cases/list")
 async def list_capa_cases(
     factory_id: Optional[str] = None,
@@ -1092,3 +1081,14 @@ async def list_capa_cases(
     # capa_cases 没有 factory_id 列，不能假装按厂过滤（原来 factory_id 落到了 status 上）
     cases = await qms.list_capa_cases(status=status)
     return {"success": True, "data": cases}
+
+@router.get("/cases/{case_id}")
+async def get_capa_case(case_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """获取CAPA案件详情"""
+    from api.services.qms_service import QMSService
+    qms = QMSService(db)
+    
+    case = await qms.get_capa_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="CAPA案件不存在")
+    return {"success": True, "data": case}

@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import statistics
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 # Older production images do not contain the optional phase-specific adapters.
 # Core inspection and SPC operations below remain available without them.
@@ -26,7 +26,7 @@ except ImportError:
     CAPAPersistenceService = None
 
 # 导入模型（用于软删除操作）
-from database.models import DefectRecord, QualityInspection, QmsSpcPoint
+from database.models import CAPACase, DefectRecord, QualityInspection, QmsSpcPoint
 
 class QMSService:
     """
@@ -376,6 +376,175 @@ class QMSService:
         db = await self._get_db()
         return await CAPAPersistenceService.list_capa_cases(session=db, status=status, limit=limit)
     
+
+    # ==================== 阶段检验的读取与统计 ====================
+    # qms_routes 里 /iqc/stats、/ipc/list、/fai/{id}、/capa/{id} 等端点一直在调用
+    # 服务上根本不存在的方法名，任何一次命中都是 AttributeError 500。IQC/FAI/IPC/OQC
+    # 本来就存在同一张 quality_inspections 里（inspect_type 区分、defect_details 放各阶段
+    # 自有字段），所以这里只是把已有事实读出来，不新增任何判定口径。
+
+    @staticmethod
+    def _phase_row(row: QualityInspection) -> Dict[str, Any]:
+        details = row.defect_details or {}
+        return {
+            "id": row.id,
+            "factory_id": row.factory_id,
+            "work_order_id": row.work_order_id,
+            "inspect_type": row.inspect_type,
+            "inspector_id": row.inspector_id,
+            "sample_qty": row.sample_qty,
+            "defect_qty": row.defect_qty,
+            "result": row.result,
+            "status": str(row.result or "").lower(),
+            "batch_no": details.get("batch_no"),
+            "supplier_id": details.get("supplier"),
+            "process_stage": details.get("process_stage"),
+            "check_items": details.get("check_items"),
+            "remark": row.remark,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+
+    async def _list_phase(self, factory_id: str, inspect_type: str,
+                          status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        db = await self._get_db()
+        conditions = [
+            QualityInspection.factory_id == factory_id,
+            QualityInspection.inspect_type == inspect_type,
+        ]
+        if status:
+            conditions.append(QualityInspection.result == str(status).upper())
+        rows = (await db.execute(
+            select(QualityInspection).where(*conditions)
+            .order_by(QualityInspection.created_at.desc()).limit(limit)
+        )).scalars().all()
+        return [self._phase_row(r) for r in rows]
+
+    async def list_ipc_records(self, factory_id: str, work_order_id: Optional[str] = None,
+                               status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        items = await self._list_phase(factory_id, "IPC", status=status, limit=limit)
+        if work_order_id:
+            items = [i for i in items if str(i["work_order_id"]) == str(work_order_id)]
+        return items
+
+    async def list_oqc_records(self, factory_id: str, status: Optional[str] = None,
+                               limit: int = 100) -> List[Dict[str, Any]]:
+        return await self._list_phase(factory_id, "OQC", status=status, limit=limit)
+
+    async def list_fai_records(self, factory_id: str, status: Optional[str] = None,
+                               limit: int = 100) -> List[Dict[str, Any]]:
+        return await self._list_phase(factory_id, "FAI", status=status, limit=limit)
+
+    async def get_ipc_record(self, inspection_id: str) -> Optional[Dict[str, Any]]:
+        return await self._get_phase_row(inspection_id, "IPC")
+
+    async def get_fai_record(self, fai_id: str) -> Optional[Dict[str, Any]]:
+        return await self._get_phase_row(fai_id, "FAI")
+
+    async def _get_phase_row(self, inspection_id: str, inspect_type: str) -> Optional[Dict[str, Any]]:
+        db = await self._get_db()
+        row = (await db.execute(
+            select(QualityInspection).where(
+                QualityInspection.id == str(inspection_id),
+                QualityInspection.inspect_type == inspect_type,
+            )
+        )).scalars().first()
+        return self._phase_row(row) if row else None
+
+    async def get_iqc_statistics(self, factory_id: str) -> Dict[str, Any]:
+        """IQC 达成情况：按 result 分组计数，合格率只在已判定记录上算。
+
+        分母刻意用 pass+fail 而不是全部，因为 PENDING（还没检完）混进分母会把
+        "合格率"随待检积压越拖越低，那不是质量结论。
+        """
+        db = await self._get_db()
+        rows = (await db.execute(
+            select(QualityInspection.result, func.count())
+            .where(QualityInspection.factory_id == factory_id,
+                   QualityInspection.inspect_type == "IQC")
+            .group_by(QualityInspection.result)
+        )).all()
+        counts = {str(result or "unknown").upper(): int(n) for result, n in rows}
+        judged = counts.get("PASS", 0) + counts.get("FAIL", 0)
+        return {
+            "factory_id": factory_id,
+            "total": sum(counts.values()),
+            "by_result": counts,
+            "pending": counts.get("PENDING", 0),
+            "pass": counts.get("PASS", 0),
+            "fail": counts.get("FAIL", 0),
+            "pass_rate": round(counts.get("PASS", 0) / judged * 100, 1) if judged else None,
+            "pass_rate_basis": "合格数 ÷ 已判定(PASS+FAIL)记录数，未把待检 PENDING 算进分母",
+        }
+
+    async def create_ipc_record(self, work_order_id: str, factory_id: str, product_id: str,
+                                process_stage: str, frequency_type: str, frequency_value: int,
+                                operator_id: str, inspector_id: str,
+                                check_items: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """IPC 巡检计划。路由用的方法名是 create_ipc_record，服务里原来叫 create_ipc_plan。"""
+        db = await self._get_db()
+        created = await IPCPersistenceService.create_ipc_plan(
+            session=db,
+            work_order_id=work_order_id,
+            factory_id=factory_id,
+            product_id=product_id,
+            process_stage=process_stage,
+            frequency_type=frequency_type,
+            frequency_value=frequency_value,
+            operator_id=operator_id,
+            inspector_id=inspector_id,
+        )
+        if check_items:
+            row = await db.get(QualityInspection, created.get("id"))
+            if row:
+                details = dict(row.defect_details or {})
+                details["check_items"] = check_items
+                row.defect_details = details
+                await db.commit()
+                created["check_items"] = check_items
+        return created
+
+    async def create_capa_case(self, title: str, severity: str, source_type: Optional[str] = None,
+                               source_id: Optional[str] = None, creator: Optional[str] = None) -> Dict[str, Any]:
+        """CAPA 立案。capa_cases 没有 created_by 列，开案人写进 assigned_to（默认由开案人跟进）。"""
+        case = await self.capa_create_case(title=title, severity=severity,
+                                           source_type=source_type, source_id=source_id)
+        if creator and case.get("id"):
+            db = await self._get_db()
+            row = await db.get(CAPACase, case["id"])
+            if row and not row.assigned_to:
+                row.assigned_to = creator
+                await db.commit()
+                case["assigned_to"] = creator
+                case["assignee_basis"] = "capa_cases 没有开案人列，creator 写入 assigned_to"
+        return case
+
+    async def get_capa_case(self, case_id: str) -> Optional[Dict[str, Any]]:
+        db = await self._get_db()
+        row = await db.get(CAPACase, str(case_id))
+        if not row:
+            return None
+        return {
+            "id": row.id,
+            "case_number": row.case_number,
+            # 立案时 title 落在 problem_description 上（表里没有 title 列）
+            "title": row.problem_description,
+            "problem_description": row.problem_description,
+            "severity": getattr(row, "severity", None) or row.defect_severity,
+            "root_cause": row.root_cause,
+            "corrective_action": row.corrective_action,
+            "preventive_action": row.preventive_action,
+            "assigned_to": row.assigned_to,
+            "status": row.status,
+            "deadline": row.deadline.isoformat() if row.deadline else None,
+            "why_analysis": row.why_analysis,
+            "fishbone_dimensions": row.fishbone_dimensions,
+            # 库里另有 verification_before/after/improved 三列，但 ORM 模型没声明，
+            # 按未声明属性取值会 AttributeError —— 只读模型确认存在的字段。
+            "verification_result": row.verification_result,
+            "action_logs": row.action_logs,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+
     # ==================== 辅助方法（简化的内存版本，生产时需改为持久化） ====================
     
     async def capa_add_why_step(self, case_id: str, step_num: int, question: str, answer: str) -> bool:
