@@ -169,6 +169,7 @@ async def _periodic_scheduler():
         "agent_stalled_check": "_last_agent_check",
         "warehouse_replenish": "_last_warehouse_check",
         "engine_watchdog": "_last_engine_watchdog",
+        "engine_data_gap": "_last_engine_data_gap",
     }
     while True:
         did = {}
@@ -468,6 +469,31 @@ async def _periodic_scheduler():
                     }
         except Exception as e:
             _logger.warning(f"[scheduler] 引擎健康巡检异常: {e}")
+
+        # 数据缺口巡检 —— 每 6 小时：判据被台账/主数据封顶时自动挂一条补数据催办
+        # L2B 那几格读着"覆盖率 0.25 fail"却没人被派活，缺的就是这一道。
+        try:
+            import time as _t_ed
+            if not hasattr(_periodic_scheduler, "_last_engine_data_gap"):
+                _periodic_scheduler._last_engine_data_gap = 0
+            if _t_ed.time() - _periodic_scheduler._last_engine_data_gap > 21600:  # 6h
+                _periodic_scheduler._last_engine_data_gap = _t_ed.time()
+                from api.services.engine_watchdog import scan_data as _data_scan
+                async with db_config.session_factory() as db:
+                    res = await _data_scan(
+                        db, apply=os.getenv("ENGINE_WATCHDOG_APPLY", "true").lower()
+                            not in {"0", "false", "no", "off"})
+                    changed = {k: v for k, v in res["counts"].items()
+                               if v and k != "unchanged"}
+                    if changed:
+                        _logger.info(f"[engine-data] {changed}")
+                    did["engine_data_gap"] = {
+                        "findings": len(res["findings"]),
+                        "actions": changed,
+                        "titles": [f["title"][:60] for f in res["findings"]][:3],
+                    }
+        except Exception as e:
+            _logger.warning(f"[scheduler] 引擎数据缺口巡检异常: {e}")
 
         from api.services.engine_heartbeat import record as _heartbeat
         import time as _gt

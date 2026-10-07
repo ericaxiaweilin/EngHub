@@ -21,6 +21,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 CATEGORY = "engine_watchdog"
+# 引擎跑不跑得动是一回事，判据被数据封顶是另一回事：L2B 那几格卡在台账登记世代时，
+# 报告里只是一句"覆盖率 0.25 fail"，没人被派活。数据缺口走同一条对账/催办通路，
+# 换一个新类别，让收件箱里"补数据"和"救引擎"不混成一堆。
+DATA_CATEGORY = "engine_data_gap"
+DATA_FOLLOW_INTERVAL_MINUTES = 24 * 60
 CREATED_BY = "virtual_factory"
 AGENT_KEY = "escalation_agent"
 FOLLOW_INTERVAL_MINUTES = 60
@@ -306,33 +311,37 @@ async def scan(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
               "min_window_ticks": int(THRESHOLDS["L1"]["crash_window_min_ticks"])}
     rows = states if states is not None else await read_states()
     found = findings(rows, **limits)
-    open_rows = [dict(r) for r in (await db.execute(
-        OPEN_SQL, {"fid": factory_id, "cat": CATEGORY})).mappings().all()]
-    actions = plan_actions(open_rows, found)
-
-    counts = {"create": 0, "refresh": 0, "close": 0, "close_duplicate": 0, "unchanged": 0}
-    items: List[Dict[str, Any]] = []
-    for act in actions:
-        counts[act["action"]] = counts.get(act["action"], 0) + 1
-        item = {"action": act["action"], "loop": act["finding"]["loop"],
-                "kind": act["finding"]["kind"], "sig": act["finding"]["sig"],
-                "title": act["finding"].get("title"),
-                "task_id": act.get("task_id")}
-        if apply:
-            item.update(await _apply(db, factory_id, act))
-        items.append(item)
-    if not apply:
-        await db.rollback()
+    outcome = await _reconcile(db, factory_id, found, CATEGORY, apply)
 
     return {
         "factory_id": factory_id, "apply": apply,
         "loops_seen": len(rows), "alive": sum(1 for r in rows if r.get("alive")),
         "thresholds": limits, "window_hours": _window_hours(),
-        "counts": counts, "findings": found, "items": items,
+        "counts": outcome["counts"], "findings": found, "items": outcome["items"],
         "rule": ("心跳超过 2 个预期间隔没跳、循环退出/异常后无新心跳、窗口崩溃率越过 L1 判线 —— "
                  "每一种挂一条催办；同一条故障签名不变就不重复动库，恢复后自动关闭。"
                  "一次性任务（跑完退出）不算故障。"),
     }
+
+
+async def _reconcile(db: AsyncSession, factory_id: str, found: List[Dict[str, Any]],
+                     category: str, apply: bool) -> Dict[str, Any]:
+    """对账 + 落库的公共一段：运行时故障与数据缺口走同一条路（只有判据来源不同）。"""
+    open_rows = [dict(r) for r in (await db.execute(
+        OPEN_SQL, {"fid": factory_id, "cat": category})).mappings().all()]
+    counts = {"create": 0, "refresh": 0, "close": 0, "close_duplicate": 0, "unchanged": 0}
+    items: List[Dict[str, Any]] = []
+    for act in plan_actions(open_rows, found):
+        counts[act["action"]] = counts.get(act["action"], 0) + 1
+        item = {"action": act["action"], "loop": act["finding"]["loop"],
+                "kind": act["finding"]["kind"], "sig": act["finding"]["sig"],
+                "title": act["finding"].get("title"), "task_id": act.get("task_id")}
+        if apply:
+            item.update(await _apply(db, factory_id, act))
+        items.append(item)
+    if not apply:
+        await db.rollback()
+    return {"counts": counts, "items": items}
 
 
 def _window_hours() -> int:
@@ -345,19 +354,29 @@ async def _apply(db: AsyncSession, factory_id: str, act: Dict[str, Any]) -> Dict
     from api.services.followup_task_service import _append_log, create_task
 
     finding = act["finding"]
+
+    def _payload() -> str:
+        # 只有 create/refresh 需要整份读数；close 那条的 finding 是对账时现造的最小字典
+        # （只有 loop/kind/sig），在这里统一算 payload 会把关闭动作直接带崩。
+        return json.dumps({
+            "category": finding.get("category") or CATEGORY, "loop": finding["loop"],
+            "kind": finding["kind"], "sig": finding["sig"], "severity": finding.get("severity"),
+            **(finding.get("evidence") or {}),
+        }, ensure_ascii=False, default=str)
+
+    payload = _payload()
     if act["action"] == "create":
         created = await create_task(
             db, factory_id, CREATED_BY, finding["title"],
             description=finding["description"],
-            agent_key=AGENT_KEY, item_type="followup",
+            agent_key=finding.get("agent_key") or AGENT_KEY, item_type="followup",
             block_reason=finding["block_reason"], source=CREATED_BY,
-            conversation_hint="先确认循环是真停了还是在跑长任务；要重启引擎得先说影响面。",
-            follow_interval_minutes=FOLLOW_INTERVAL_MINUTES,
-            payload=json.dumps({
-                "category": CATEGORY, "loop": finding["loop"], "kind": finding["kind"],
-                "sig": finding["sig"], "severity": finding["severity"],
-                **finding["evidence"],
-            }, ensure_ascii=False, default=str),
+            conversation_hint=finding.get(
+                "hint") or "先确认循环是真停了还是在跑长任务；要重启引擎得先说影响面。",
+            # 数据缺口按天跟就够了：主数据不是 60 分钟能补出来的东西，
+            # 一小时一次的 LLM 跟进只会把网关和收件箱一起刷满。
+            follow_interval_minutes=int(finding.get("interval") or FOLLOW_INTERVAL_MINUTES),
+            payload=payload,
         )
         task_id = created.get("task_id")
         if task_id:
@@ -378,21 +397,18 @@ async def _apply(db: AsyncSession, factory_id: str, act: Dict[str, Any]) -> Dict
         """), {
             "title": finding["title"], "desc": finding["description"],
             "block": finding["block_reason"], "id": str(act["task_id"]),
-            "payload": json.dumps({
-                "category": CATEGORY, "loop": finding["loop"], "kind": finding["kind"],
-                "sig": finding["sig"], "severity": finding["severity"],
-                **finding["evidence"],
-            }, ensure_ascii=False, default=str),
+            "payload": payload,
         })
         await _append_log(db, str(act["task_id"]), factory_id, "watchdog_refresh",
-                          f"同一条故障有新读数：{finding['title']}", "open", 0, CREATED_BY)
+                          f"同一条判据有新读数：{finding['title']}", "open", 0, CREATED_BY)
         await db.commit()
         return {"task_id": str(act["task_id"]), "written": True}
 
     if act["action"] in ("close", "close_duplicate"):
-        note = (f"自动关闭：台账恢复 —— {finding['loop']} 现在活着且窗口崩溃率没过 L1 判线。"
-                if act["action"] == "close" else
-                f"自动关闭：同一故障重复挂的条目，并入最新一条（{finding['title']}）。")
+        note = (finding.get("recovered_note")
+                or f"自动关闭：台账恢复 —— {finding['loop']} 现在活着且窗口崩溃率没过 L1 判线。"
+                ) if act["action"] == "close" else (
+            f"自动关闭：同一故障重复挂的条目，并入最新一条（{finding['title']}）。")
         await db.execute(text("""
             UPDATE followup_tasks
             SET status = 'done', progress_pct = 100.0, last_follow_note = :note,
@@ -407,3 +423,149 @@ async def _apply(db: AsyncSession, factory_id: str, act: Dict[str, Any]) -> Dict
         return {"task_id": str(act["task_id"]), "note": note, "written": True}
 
     return {"written": False}
+
+
+# ── 数据缺口：判据被主数据封顶时，把"补哪个数据"挂成催办 ────────────────────
+# 机种归属沿用齐套判据那条规则（ORDER_SHORT_SQL）：子工单算到**父工单的机种**头上。
+# 不这么写的话，A-50-04-F 那批半成品子单的键是组件编码，在镜像里查不到行，
+# 登记世代这一格就永远不响 —— 同一个厂里两套"这台单属于哪个机种"的口径是量不准的根源。
+KIT_GENERATION_SQL = """
+WITH o AS (
+    SELECT w.id, COALESCE(pp.product_code, p.product_code, w.product_id) AS model
+    FROM work_orders w
+    LEFT JOIN products p ON p.factory_id = w.factory_id
+         AND (p.id::text = w.product_id OR p.product_code = w.product_id)
+    LEFT JOIN work_orders par ON par.id = w.parent_work_order_id
+    LEFT JOIN products pp ON pp.factory_id = par.factory_id
+         AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+    WHERE w.factory_id = :fid AND w.status IN ('pending', 'released', 'in_progress')
+      AND w.id NOT LIKE 'wo-vf-%'
+), k AS (
+    SELECT o.id, o.model,
+           COUNT(*) FILTER (WHERE wm.item_type = 'buy') AS buy_lines
+    FROM o LEFT JOIN work_order_materials wm ON wm.work_order_id = o.id
+    GROUP BY 1, 2
+)
+SELECT COUNT(*) AS in_flow,
+       COUNT(*) FILTER (WHERE k.buy_lines BETWEEN 1 AND 20
+                        AND EXISTS (SELECT 1 FROM enghub_bom_items e
+                                     WHERE e.factory_id = :fid AND e.product_model = k.model)) AS stale_gen,
+       COUNT(*) FILTER (WHERE k.buy_lines = 0) AS no_lines
+FROM k
+"""
+
+SUPPLIER_GAP_SQL = """
+    SELECT COUNT(DISTINCT wm.material_code) AS no_supplier
+    FROM work_order_materials wm
+    JOIN work_orders o ON o.id = wm.work_order_id
+    LEFT JOIN materials m ON m.material_code = wm.material_code AND m.factory_id = o.factory_id
+    WHERE o.factory_id = :fid AND wm.item_type = 'buy' AND COALESCE(wm.shortage_qty, 0) > 0
+      AND COALESCE(m.default_supplier, '') = ''
+"""
+
+MIN_STALE_ORDERS = 10
+MIN_RERUNNABLE_ORDERS = 10
+MIN_SUPPLIER_GAP_PARTS = 20
+
+
+def _gap(loop: str, kind: str, sig: str, title: str, description: str, block: str,
+         agent_key: str, hint: str, evidence: Dict[str, Any],
+         interval: int = DATA_FOLLOW_INTERVAL_MINUTES) -> Dict[str, Any]:
+    return {"loop": loop, "kind": kind, "sig": f"{loop}|{sig}"[:200], "severity": "warning",
+            "category": DATA_CATEGORY, "agent_key": agent_key, "hint": hint,
+            "interval": interval,
+            "title": title[:200], "description": description[:4000],
+            "block_reason": block[:500], "evidence": evidence,
+            "recovered_note": f"自动关闭：{loop} 这一格的数据缺口已经缩到判据线以下（曾报：{title}）。"}
+
+
+async def data_findings(db: AsyncSession, factory_id: str, *,
+                        readiness_out: Optional[Dict[str, Any]] = None
+                        ) -> List[Dict[str, Any]]:
+    """把三条查数收齐交给 gap_readings()：查询与判据分开，判据才单测得到。"""
+    gen = (await db.execute(text(KIT_GENERATION_SQL), {"fid": factory_id})).mappings().first()
+    sup = (await db.execute(text(SUPPLIER_GAP_SQL), {"fid": factory_id})).mappings().first()
+    ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
+    return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {})
+
+
+def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
+                 ready: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """三条"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
+
+    阈值写成张数/料号数而不是比例：少于十几张时重跑一次的成本比挂一条待办更划算，
+    不值得占收件箱。签名按 10 张/10 个一档，补掉一档就刷新、缩到线下就自动关。
+    """
+    out: List[Dict[str, Any]] = []
+    stale = int(gen.get("stale_gen") or 0)
+    in_flow = int(gen.get("in_flow") or 0)
+    if stale >= MIN_STALE_ORDERS:
+        out.append(_gap(
+            "kit_line_generation", "stale_generation", f"gen|{stale // 10}",
+            f"补数据｜{stale}/{in_flow} 张在流程单的齐套行还是旧单层快照（≤20 行外购行）",
+            "L2B 的「台账缺口行覆盖率」被这一格压着（当前读数见 /engine-layers），"
+            "一致率与 top-5 重叠都到不了顶：这些单的机种"
+            f"在 engflow 镜像里有行，可台账只登记了十几行外购件（同机种按多层展开登记过的单能到 "
+            f"680 行、深 9 层）。\n这是**登记世代**差，不是源侧没结构 —— 修法是把这 {stale} 张单的"
+            "齐套行按 bom_source 重登记一次（component_orders 那条路径）。\n"
+            "动手前必须先定一件事：重登记会把台账的毛需求换成引擎用的低层码净额，"
+            "采购缺口会变小（实测 3,299 行配对里 861 行引擎判 0），直接影响催办量与齐套放行门。\n"
+            "复核：GET /api/v1/pmc/sim-readiness、GET /api/v1/pmc/engine-layers 的 L2B 那几格。",
+            f"{stale} 张单的齐套行停在旧登记世代，L2B 命中率被封顶",
+            "pmc_agent", "先定毛/净口径再批量重登记：刷台账会同时改变采购缺口读数。",
+            {"in_flow_orders": in_flow, "stale_orders": stale,
+             "no_kit_line_orders": int((gen or {}).get("no_lines") or 0)}))
+
+    rerun = int((ready or {}).get("fixable_by_rerun_orders") or 0)
+    if rerun >= MIN_RERUNNABLE_ORDERS:
+        out.append(_gap(
+            "kit_line_missing", "rerunnable_gap", f"rerun|{rerun // 10}",
+            f"补数据｜{rerun} 张在流程单没有齐套行，但键有 BOM 行（重跑一次就能补）",
+            "这类单既不能被判齐套，也不能算进精度对照 —— 齐套门只能写 no_evidence。\n"
+            f"它们和「镜像里没有组件级子 BOM」那类不一样：这 {rerun} 张的产品键在 BOM 源里"
+            "是有行的，跑一次展开就有依据（子 BOM 缺的那部分另见 #46，不是这一格）。"
+            "复核：GET /api/v1/pmc/sim-readiness 的 kit_gaps（reason=flow_missing_kit）。",
+            f"{rerun} 张在流程单没有齐套行但可重跑补齐",
+            "pmc_agent", "重跑齐套登记前先看这批单是不是已经停工，停工单不用补。",
+            {"rerunnable_orders": rerun}))
+
+    no_sup = int((sup or {}).get("no_supplier") or 0)
+    if no_sup >= MIN_SUPPLIER_GAP_PARTS:
+        out.append(_gap(
+            "supplier_master", "missing_supplier", f"sup|{no_sup // 10}",
+            f"补数据｜{no_sup} 个外购缺口料号没有供应商主数据，缺口永远算不平",
+            "这些料号在台账里被判为外购缺口，但 materials 主数据没有 default_supplier："
+            "引擎能给「该催哪件、催多少」，却给不出「向谁催、几天到」——"
+            "催购建议落到人工请购单时就断在这儿（源侧 engflow 的 BOM 行 vendor_code/vendor_name "
+            "本来就是空的，不是镜像丢的）。\n复核：GET /api/v1/pmc/data-authority、"
+            "GET /api/v1/pmc/engine-layers 的 L2B「BOM 取数来源」。",
+            f"{no_sup} 个外购缺口料号缺供应商主数据",
+            "procurement_agent", "供应商要么从采购台账补进 materials，要么改承诺口径（按提前期不指名供应商）。",
+            {"shortage_parts_without_supplier": no_sup}))
+    return out
+
+
+async def _readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    try:
+        from api.services.sim_backtest import readiness
+
+        return await readiness(db, factory_id)
+    except Exception:  # noqa: BLE001  就绪度查不动就不挂这一格，别把整轮巡检带崩
+        return {}
+
+
+async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
+                    apply: bool = False) -> Dict[str, Any]:
+    """数据缺口巡检：判据被主数据封顶时自动成一条补数据催办，补齐后自动关闭。"""
+    found = await data_findings(db, factory_id)
+    outcome = await _reconcile(db, factory_id, found, DATA_CATEGORY, apply)
+    return {
+        "factory_id": factory_id, "apply": apply, "thresholds": {
+            "stale_generation_orders": MIN_STALE_ORDERS,
+            "rerunnable_orders": MIN_RERUNNABLE_ORDERS,
+            "supplier_gap_parts": MIN_SUPPLIER_GAP_PARTS,
+        },
+        "counts": outcome["counts"], "findings": found, "items": outcome["items"],
+        "rule": ("这三格不是引擎算不出，是台账/主数据没跟上：齐套行登记世代、"
+                 "可重跑补齐的缺行单、外购缺口的供应商。缩到阈值以下自动关闭。"),
+    }

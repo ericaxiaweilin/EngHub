@@ -229,3 +229,52 @@ def test_last_error_ring_is_carried_into_the_task_verbatim():
                                              "error": "asyncpg.exceptions.TooManyConnectionsError"}])],
                      crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)[0]
     assert "TooManyConnectionsError" in found["description"]
+
+# ── 数据缺口：判据被台账/主数据封顶时要派活 ────────────────────────────────
+def _readings(stale=0, in_flow=0, rerun=0, no_sup=0):
+    from api.services.engine_watchdog import gap_readings
+
+    return gap_readings(gen={"stale_gen": stale, "in_flow": in_flow, "no_lines": 0},
+                        sup={"no_supplier": no_sup},
+                        ready={"fixable_by_rerun_orders": rerun, "models_with_orders": 9})
+
+
+def test_small_gaps_do_not_take_up_the_inbox():
+    """十几张以内重跑一次就完了，不值得挂待办；阈值写在判据里，不靠人记。"""
+    assert _readings(stale=9, in_flow=70) == []
+    assert _readings(rerun=9) == []
+    assert _readings(no_sup=19) == []
+
+
+def test_stale_kit_generation_raises_a_data_task_that_names_the_fix_and_the_catch():
+    got = _readings(stale=64, in_flow=205)
+    assert [f["kind"] for f in got] == ["stale_generation"]
+    f = got[0]
+    assert "64/205" in f["title"]
+    assert "登记世代" in f["block_reason"] or "登记世代" in f["description"]
+    # 这条催办必须把"刷台账会同时改小采购缺口"写在脸上，不然等于让人盲刷生产数据
+    assert "毛需求" in f["description"] and "低层码" in f["description"]
+    assert "/api/v1/pmc/sim-readiness" in f["description"]
+    assert f["category"] == "engine_data_gap" and f["agent_key"] == "pmc_agent"
+
+
+def test_rerunnable_and_supplier_gaps_route_to_the_right_owner():
+    got = _readings(rerun=17, no_sup=57)
+    kinds = {f["kind"]: f for f in got}
+    assert set(kinds) == {"rerunnable_gap", "missing_supplier"}
+    assert kinds["rerunnable_gap"]["agent_key"] == "pmc_agent"
+    assert kinds["missing_supplier"]["agent_key"] == "procurement_agent"
+    assert "default_supplier" in kinds["missing_supplier"]["description"]
+
+
+def test_gap_signature_moves_by_ten_not_by_one():
+    """补掉一张不刷新待办；补掉十张才算有进展 —— 不然收件箱那条每天改标题却没实际变化。"""
+    a = _readings(stale=64, in_flow=205)[0]["sig"]
+    b = _readings(stale=61, in_flow=205)[0]["sig"]
+    c = _readings(stale=54, in_flow=205)[0]["sig"]
+    assert a == b and a != c
+
+
+def test_closed_gap_explains_why_it_closed():
+    f = _readings(stale=64, in_flow=205)[0]
+    assert "缩到判据线以下" in f["recovered_note"]

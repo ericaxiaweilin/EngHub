@@ -576,6 +576,7 @@ async def get_sim_readiness(
 async def get_engine_watchdog(
     factory_id: str = Query(..., description="催办挂在哪个厂区的收件箱"),
     apply: bool = Query(False, description="false=只出判定不动库；true 才真的挂/刷新/关闭"),
+    include_data: bool = Query(False, description="true 时连数据缺口（台账世代/缺供应商）一起巡检"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -586,9 +587,12 @@ async def get_engine_watchdog(
     签名没变不动库；台账恢复后自动关闭并写明恢复。一次性任务跑完退出不算故障。
     """
     del current_user
-    from api.services.engine_watchdog import scan
+    from api.services.engine_watchdog import scan, scan_data
 
-    return await scan(db, factory_id, apply=apply)
+    out = await scan(db, factory_id, apply=apply)
+    if include_data:
+        out["data"] = await scan_data(db, factory_id, apply=apply)
+    return out
 
 
 @router.get("/engine-contract", summary="引擎对外契约：三个接口的签名与业务词表（与模型内部无关）")
