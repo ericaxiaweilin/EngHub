@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import text
 
 from core.mes.route_resolution import route_ops_for_product
+from core.mes.data_evidence import lead_flags
 from sqlalchemy.ext.asyncio import AsyncSession
 
 DEFAULT_LABOR_COST_PER_PERSON_DAY = float(os.getenv("SIM_LABOR_COST_PER_PERSON_DAY", "30"))
@@ -117,6 +118,9 @@ async def sim_bom_lines(db: AsyncSession, factory_id: str, model: str,
         codes = [str(r["material_code"]) for r in lines]
         attrs = {str(r["material_code"]): dict(r) for r in
                  (await db.execute(BOM_ATTR_SQL, {"fid": factory_id, "codes": codes})).mappings().all()}
+        # 提前期是引擎点瓶颈件时吃的唯一数字。它要是按类别铺出来的默认值，推演就得自己说清楚，
+        # 不能让"延 6 天"这种结论顶着一条没有任何实测的 12 天出场（实测：全厂外购料号只有 10 个取值）。
+        flags = await lead_flags(db, factory_id, codes)
         rows = []
         for r in lines:
             code = str(r["material_code"])
@@ -131,13 +135,19 @@ async def sim_bom_lines(db: AsyncSession, factory_id: str, model: str,
                          "lead_time_days": a.get("lead_time_days"),
                          "default_supplier": a.get("default_supplier"),
                          "unit_price": (r.get("unit_price") if r.get("unit_price") is not None
-                                        else a.get("unit_price"))})
+                                        else a.get("unit_price")),
+                         "lead_evidence": flags.get(code)})
         return {"rows": rows, "source": source, "problems": problems,
+                "lead_evidence_counts": {k: sum(1 for x in rows if x.get("lead_evidence") == k)
+                                         for k in set(x.get("lead_evidence") for x in rows) - {None}},
                 "levels": (exp or {}).get("max_level"), "parts": (exp or {}).get("parts"),
                 "buy_parts": (exp or {}).get("buy_parts"), "make_parts": (exp or {}).get("make_parts")}
 
     rows = [dict(r) for r in (await db.execute(
         BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
+    fb_flags = await lead_flags(db, factory_id, [str(r.get("material_code")) for r in rows])
+    for r in rows:
+        r["lead_evidence"] = fb_flags.get(str(r.get("material_code")))
     return {"rows": rows, "source": ("mes_bom_items" if rows else "none"),
             "problems": (["engflow 镜像与本地 bom_items 都没有这个型号的物料清单"] if not rows else []),
             "levels": None, "parts": len(rows), "buy_parts": None, "make_parts": None}
@@ -371,6 +381,7 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
             "short": round(short, 3), "make_or_buy": kind,
             "supplier": row["default_supplier"] or None,
             "lead_time_days": lead,
+            "lead_evidence": row.get("lead_evidence"),
         }
         if unit_cost is not None:
             cost += unit_cost * need
@@ -381,6 +392,8 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
             if lead_days >= (kit_lead_max[0] or -1):
                 kit_lead_max[0] = lead_days
                 kit_bottleneck[0] = {"material_code": code, "lead_time_days": lead_days,
+                                     "ledger_lead_time_days": lead,
+                                     "lead_evidence": row.get("lead_evidence"),
                                      "short": round(short, 3),
                                      "supplier": row["default_supplier"] or None,
                                      "unit_price": (float(price) if price not in (None, "") else None)}

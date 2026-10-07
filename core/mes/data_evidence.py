@@ -105,6 +105,50 @@ def _f(v: Any) -> Optional[float]:
         return None
 
 
+FLAG_SQL = text("""
+    WITH g AS (
+        SELECT make_or_buy, material_type, count(*) AS n,
+               count(DISTINCT lead_time_days) AS distinct_values,
+               mode() WITHIN GROUP (ORDER BY lead_time_days) AS modal_days
+        FROM materials WHERE factory_id = :fid AND lead_time_days IS NOT NULL
+        GROUP BY 1,2)
+    SELECT m.material_code,
+           CASE WHEN g.n >= :min_parts AND g.distinct_values <= :max_distinct
+                     AND m.lead_time_days = g.modal_days
+                THEN 'unverified_default' ELSE 'ledger_declared' END AS lead_evidence,
+           m.lead_time_days
+    FROM materials m
+    JOIN g ON g.make_or_buy = m.make_or_buy AND g.material_type = m.material_type
+    WHERE m.factory_id = :fid AND m.material_code = ANY(:codes)
+""")
+
+FLAG_MEASURED_SQL = text("""
+    SELECT DISTINCT material_code FROM purchase_orders
+    WHERE factory_id = :fid AND material_code = ANY(:codes)
+      AND order_date IS NOT NULL AND actual_date IS NOT NULL AND actual_date >= order_date
+""")
+
+
+async def lead_flags(db: AsyncSession, factory_id: str, codes: List[str]) -> Dict[str, str]:
+    """给一批料号各打一个提前期出处标签 —— 单表两条查询，供推演/接口逐行贴标，不做逐件查询。
+
+    值：`unverified_default`（同组几十~几千个件共用同一个众数取值）/ `ledger_declared`（台账给了个不一样的值）/
+    `measured`（这个号在本厂采购历史里真有下单→到货）/ `no_ledger_row`（台账压根没有这个号）。
+    """
+    codes = [str(c) for c in codes if c]
+    if not codes:
+        return {}
+    rows = (await db.execute(FLAG_SQL, {"fid": factory_id, "codes": codes,
+                                        "min_parts": DEFAULT_SUSPECT_MIN_PARTS,
+                                        "max_distinct": DEFAULT_SUSPECT_MAX_DISTINCT})).mappings().all()
+    out = {str(r["material_code"]): str(r["lead_evidence"]) for r in rows}
+    for r in (await db.execute(FLAG_MEASURED_SQL, {"fid": factory_id, "codes": codes})).mappings().all():
+        out[str(r["material_code"])] = "measured"
+    for c in codes:
+        out.setdefault(str(c), "no_ledger_row")
+    return out
+
+
 def _group_stats(rows: List[Any]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:

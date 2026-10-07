@@ -150,6 +150,20 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_lead_time_evidence",
+            "description": "提前期证据普查（只读）：回答『这个料号的提前期是量出来的还是台账铺的默认值』『台账说 12 天能不能信』『哪批件的提前期最该去实测』。并列四个出处：materials 台账、采购下单→实际到货实测（条数/中位/P90/最长）、仓收实测、供应商声明；每件给 verdict（measured / ledger_default_conflicts_with_measured / unverified_default / ledger_declared_only / no_lead_time_at_all），并摊开台账与实测的冲突。建议值只在 suggested_days，不回填台账。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "material_codes": {"type": "string", "description": "逗号分隔的料号；不填就按厂区抽样普查"},
+                    "limit": {"type": "integer", "description": "返回行数上限，默认 30", "default": 30},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_pmc_rush_impact",
             "description": "PMC插单影响沙盘：根据现有待排主工单和插单数量，返回VIP/急单预计加工时间、受影响订单、原交期、新预计完工时间和延迟小时。只读不落库。",
             "parameters": {
@@ -3085,6 +3099,46 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _tool_query_lead_time_evidence(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """提前期证据普查（只读）：判据只写在 core/mes/data_evidence 一处，这里只转述读数。
+
+    为什么要单独立一个工具：交期、排产、加急建议都吃 `materials.lead_time_days`，
+    而这个数在本厂是按类别铺出来的默认值（3 万个外购料号只有 10 个取值）。
+    助手回答"12 天能到"之前必须能说清这句有没有实测支撑。
+    """
+    from core.mes.data_evidence import lead_time_evidence
+
+    fid = factory_id or "FAC_MECH_001"
+    codes = [c.strip() for c in str(args.get("material_codes") or "").replace("，", ",").split(",")
+             if c.strip()]
+    limit = max(1, min(int(args.get("limit") or 30), 200))
+    out = await lead_time_evidence(db, fid, codes=codes or None, limit=limit)
+    return {
+        "type": "lead_time_evidence",
+        "factory_id": fid,
+        "queried_codes": codes,
+        "checked": out["checked"],
+        "coverage": out["coverage"],
+        "verdict_counts": out["verdict_counts"],
+        "lead_time_shape_by_group": out["lead_time_shape_by_group"],
+        "make_or_buy_contradiction": out["make_or_buy_contradiction"],
+        "items": [{"material_code": r["material_code"], "material_name": r["material_name"],
+                   "make_or_buy": r["make_or_buy"], "ledger_days": r["ledger_days"],
+                   "verdict": r["verdict"], "evidence": r["evidence"],
+                   "group_shape": r["group_shape"], "measured": r["measured"],
+                   "receipt_measured": r["receipt_measured"], "supplier": r["supplier"],
+                   "suggested_days": r["suggested_days"]} for r in out["rows"][:limit]],
+        "conflicts": out["conflict_examples"][:5],
+        "name_bridge": out["name_bridge"],
+        "basis": out["basis"],
+        "reading_hint": ("unverified_default = 同组几十~几千个料号共用同一个众数取值，这个数没被量过；"
+                         "ledger_default_conflicts_with_measured = 台账值比实测中位小一半以上，"
+                         "拿它算交期会系统性偏乐观；suggested_days 是「要去核对的数」，不是事实。"),
+    }
+
+
 async def _tool_query_pmc_material_supply(
     db: AsyncSession,
     args: Dict[str, Any],
@@ -3316,6 +3370,7 @@ _TOOL_EXECUTORS = {
     "get_work_order_detail": _tool_get_work_order_detail,
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
+    "query_lead_time_evidence": _tool_query_lead_time_evidence,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
     "query_defects": _tool_query_defects,
@@ -3709,6 +3764,7 @@ TOOL_LABELS = {
     "get_work_order_detail": "工单详情",
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
+    "query_lead_time_evidence": "提前期证据普查",
     "query_pmc_material_supply": "PMC物料供应证据",
     "query_pmc_rush_impact": "PMC插单影响",
     "query_pmc_control_tower": "PMC控制塔",
@@ -3846,6 +3902,15 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "PMC工作矩阵", "PMC矩阵", "工作矩阵", "预排程沙盘", "时间锤", "物料锤",
             "生产锤", "出货锤", "紧急锤", "重算ETA", "ETA推迟", "ETA延迟", "UHN",
             "可加工时间", "库存齐套", "齐套率",
+        ],
+    },
+    {
+        # 「提前期准不准/是不是量出来的」是证据问题，不能被只报台账值的供应查询抢走
+        "tool": "query_lead_time_evidence",
+        "keywords": [
+            "提前期准", "提前期可信", "提前期是不是", "提前期怎么来", "提前期多少天", "提前期几天",
+            "是不是量出来", "量出来的", "铺的默认", "默认提前期", "台账默认值", "实测到货",
+            "到货天数", "到货要多久", "供应商几天到", "交期靠得住",
         ],
     },
     {
