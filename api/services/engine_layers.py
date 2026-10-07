@@ -32,7 +32,9 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
             "direction_hit_rate": 1.0,      # 符号错就是模型坏，不是精度问题
             "ci_width_steps": 1.5,           # 90% 置信区间宽过 1.5 个档距就等于没测出来
             "elastic_ci_usable": 0.5},      # 至少一半杠杆的弹性是"测得出来的"，才算这一层成立
-    "L2B": {"bottleneck_min_orders": 20,   # 按单算命中率：20 张才有对错可言（1 张不算命中率）
+    "L2B": {"kit_line_coverage": 0.60,    # 台账缺口行至少覆盖引擎展开的六成，否则一致率没有意义
+            "top5_overlap": 0.50,         # 两边前 5 名要有一半以上重合
+            "bottleneck_min_orders": 20,   # 按单算命中率：20 张才有对错可言（1 张不算命中率）
             "backtest_mape": 0.20,        # 预测与实际工期之比，偏差 20% 以内才算能用
             "backtest_min_pairs": 10,      # 少于 10 张成对样本不判线（3 张能算出数但说明不了精度）
             "bottleneck_hit_rate": 0.70},
@@ -473,6 +475,21 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
         _metric("BOM 取数来源", (agree.get("bom_sources") or [None])[0], None, "lte", "",
                 f"这批可比单的仿真取数来自 {agree.get('bom_sources')}；"
                 "镜像没有行的机种会如实回落本地 bom_items 并在每台单的读数里标注（见 sim-readiness）"),
+        _metric("台账缺口行覆盖率", (round(agree.get("median_ledger_parts") / max(1, agree.get("median_shortage_parts") or 1), 3)
+                  if agree.get("median_ledger_parts") is not None else None),
+                THRESHOLDS["L2B"]["kit_line_coverage"], "gte", "比例",
+                f"每张单台账里记录的缺口件数中位 {agree.get('median_ledger_parts')} 件 vs 引擎按真源 BOM "
+                f"展开的缺口件数中位 {agree.get('median_shortage_parts')} 件 —— "
+                "一致率与 top-5 重叠都被这个覆盖率封顶：台账只看得到 1/4 的缺料行，"
+                "引擎再怎么算也对不上剩下那 3/4（根因是镜像里没有组件级子 BOM，见 #46）",
+                missing=(None if agree.get("median_shortage_parts") else
+                         "引擎没展开出缺口件，覆盖率无从计算")),
+        _metric("瓶颈件 top-5 重叠率", agree.get("top5_overlap_rate"),
+                THRESHOLDS["L2B"]["top5_overlap"], "gte", "",
+                f"两边各取前 5 名的交集比例；台账第一件落进引擎前 5 的有 "
+                f"{(agree.get('ledger_first_found_in_engine_top5') or {}).get('rate')}，"
+                f"倒数排名 MRR {agree.get('engine_reciprocal_rank_on_ledger')} —— "
+                "比只看第一名更贴近「是不是在盯同一批料」"),
         _metric("可比机种数（只报数）", len(both), None, "gte", "个",
                 f"仿真给出瓶颈件且台账有缺口行的机种 {len(both)} 个："
                 + "、".join(f"{k} {v} 行" for k, v in

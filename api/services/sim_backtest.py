@@ -100,6 +100,7 @@ ORDER_SHORT_SQL = """
                (ARRAY_AGG(w.material_code ORDER BY w.shortage_qty DESC))[1] AS most_missing,
                (ARRAY_AGG(w.material_code ORDER BY COALESCE(m.lead_time_days, -1) DESC,
                                                     w.shortage_qty DESC))[1] AS longest_lead,
+               ARRAY_AGG(w.material_code ORDER BY w.shortage_qty DESC) AS qty_rank,
                MAX(w.shortage_qty) AS top_short_qty
         FROM work_order_materials w
         JOIN work_orders o ON o.id = w.work_order_id
@@ -113,21 +114,20 @@ ORDER_SHORT_SQL = """
           AND COALESCE(w.shortage_qty, 0) > 0
           AND o.status NOT IN ('completed', 'cancelled') AND o.id NOT LIKE 'wo-vf-%'
         GROUP BY 1, 2, 3)
-    SELECT model, qty, most_missing, longest_lead, top_short_qty, work_order_id
+    SELECT model, qty, most_missing, longest_lead, top_short_qty, work_order_id, qty_rank
     FROM per_order ORDER BY top_short_qty DESC
 """
 
 
 async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int = 120) -> Dict[str, Any]:
-    """引擎选的那件料 vs 台账同一张单选的那件 —— 两种定义各算一次。
+    """引擎选的那件料 vs 台账同一张单选的那件 —— 两种定义 + 排名重叠度一起算。
 
-    为什么必须分开算：仿真的「瓶颈件」是决定到货日的那件（外购缺料里提前期最长的），
-    台账上最直觉的「缺最多那件」是数量口径。原来我拿前者比后者，得到 0/40 ——
-    那个 0 是**指标定义错了**，不是引擎判错（实测样单里 `1000108191` 两边都是「缺最多那件」，
-    但引擎按提前期选的是另一件）。
+    为什么不能只比第一名：仿真的「瓶颈件」是外购缺料里提前期最长的那件（决定到货日），
+    台账最直觉的「缺最多那件」是数量口径；两边就算都判对，第一名也可能不同。
+    所以这里同时报：精确一致率（两种定义）、top-5 重叠率、台账第一件在引擎榜里的名次与 MRR。
 
     已知偏差：引擎用今天的库存与在途重算净需求，台账那行是当时算的；对下达很久的单
-    两边不一致是预期内的。这一格读的是「有没有对错题」，不是模型达标与否。
+    名次漂移是预期内的。这一格读的是「引擎与台账看的是不是同一批料」，不是达标与否。
     """
     from api.services import virtual_run as vr
 
@@ -155,44 +155,80 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
             cache[key] = {
                 "lead_top": by_lead[0]["material_code"] if by_lead else None,
                 "qty_top": by_qty[0]["material_code"] if by_qty else None,
+                "qty_rank": [str(l["material_code"]) for l in by_qty],
+                "lead_rank": [str(l["material_code"]) for l in by_lead],
                 "short_parts": len(short_buy), "source": got["source"]}
         got = cache[key]
+        led_rank = list(dict.fromkeys(str(x) for x in (r["qty_rank"] or [])))
+        eng_rank = list(got["qty_rank"])
+        eng_lead = list(got["lead_rank"])
+
+        def _rank(needle: Optional[str], pool: List[str]) -> Optional[int]:
+            return (pool.index(needle) + 1) if needle and needle in pool else None
+
+        k = 5
+        inter = len(set(eng_rank[:k]) & set(led_rank[:k]))
         per_order.append({
             "work_order_id": str(r["work_order_id"]), "model": model, "units": qty,
             "engine_lead_top": got["lead_top"], "engine_qty_top": got["qty_top"],
-            "ledger_longest_lead": str(r["longest_lead"]),
-            "ledger_most_missing": str(r["most_missing"]),
+            "ledger_longest_lead": str(r["longest_lead"]), "ledger_most_missing": str(r["most_missing"]),
             "lead_agrees": bool(got["lead_top"]) and got["lead_top"] == str(r["longest_lead"]),
             "qty_agrees": bool(got["qty_top"]) and got["qty_top"] == str(r["most_missing"]),
-            "engine_shortage_parts": got["short_parts"], "bom_source": got["source"]})
+            "ledger_first_in_engine_top5": (k and str(r["most_missing"]) in eng_rank[:k]) or False,
+            "engine_first_in_ledger_top5": (bool(got["qty_top"]) and got["qty_top"] in led_rank[:k]) or False,
+            "top5_overlap": round(inter / max(1, min(k, len(eng_rank), len(led_rank) or k)), 3),
+            "ledger_first_engine_rank": _rank(str(r["most_missing"]), eng_rank),
+            "engine_first_ledger_rank": _rank(got["qty_top"], led_rank),
+            "engine_shortage_parts": got["short_parts"],
+            "ledger_shortage_parts": len(led_rank), "bom_source": got["source"]})
     n = len(per_order)
     lead_hits = sum(1 for x in per_order if x["lead_agrees"])
     qty_hits = sum(1 for x in per_order if x["qty_agrees"])
     models = sorted({x["model"] for x in per_order})
 
-    def _by_model(flag):
+    def _rate(flag):
+        c = sum(1 for x in per_order if x.get(flag))
+        return {"agree": c, "rate": round(c / n, 3) if n else None}
+
+    def _mrr(flag):
+        vals = []
+        for x in per_order:
+            rk = x.get(flag)
+            vals.append(1.0 / rk if rk else 0.0)
+        return round(sum(vals) / max(1, len(vals)), 3)
+
+    overlaps = [x["top5_overlap"] for x in per_order if x["top5_overlap"] is not None]
+
+    def _by_model(key_name):
         out = []
         for m in models:
             sub = [x for x in per_order if x["model"] == m]
-            hits = sum(1 for x in sub if x[flag])
+            hits = sum(1 for x in sub if x.get(key_name))
             out.append({"model": m, "orders": len(sub), "agree": hits,
                         "rate": round(hits / max(1, len(sub)), 3)})
         return sorted(out, key=lambda v: -v["orders"])
 
     return {
         "orders_compared": n,
-        "lead_based": {"agree": lead_hits, "rate": round(lead_hits / n, 3) if n else None,
+        "lead_based": {**_rate("lead_agrees"),
                        "definition": "外购缺料里提前期最长的那件（决定到货日的那件）"},
-        "quantity_based": {"agree": qty_hits, "rate": round(qty_hits / n, 3) if n else None,
+        "quantity_based": {**_rate("qty_agrees"),
                            "definition": "外购缺料里净缺口最大的那件"},
+        "top5_overlap_rate": round(sum(overlaps) / max(1, len(overlaps)), 3) if overlaps else None,
+        "ledger_first_found_in_engine_top5": _rate("ledger_first_in_engine_top5"),
+        "engine_first_found_in_ledger_top5": _rate("engine_first_in_ledger_top5"),
+        "engine_reciprocal_rank_on_ledger": _mrr("ledger_first_engine_rank"),
         "models_compared": len(models), "model_list": models,
         "per_model": _by_model("lead_agrees"),
         "per_model_by_quantity": _by_model("qty_agrees"),
+        "median_shortage_parts": (sorted(x["engine_shortage_parts"] for x in per_order)[n // 2]
+                                 if n else None),
+        "median_ledger_parts": (sorted(x["ledger_shortage_parts"] for x in per_order)[n // 2]
+                                if n else None),
         "bom_sources": sorted({str(x["bom_source"]) for x in per_order}),
-        "disagreements": [x for x in per_order if not x["lead_agrees"]][:8],
-        "meaning": ("这一格读的是「引擎与台账在同一张单上会不会选中同一件料」，两种定义都要看："
-                    "只看数量会漏掉「缺得多但不卡日期」的件，只看提前期会漏掉「量大到必须现在下单」的件。"
-                    "库存取今天而非当时快照，所以对老单不一致是预期内的。"),
+        "disagreements": [x for x in per_order if not x["qty_agrees"]][:8],
+        "meaning": ("第一名一致率之外再看 top-5 重叠与倒数排名：前者说明两边是不是在盯同一批料，"
+                    "后者说明差多远。库存取今天而非当时快照，所以对老单名次漂移是预期内的。"),
     }
 
 
