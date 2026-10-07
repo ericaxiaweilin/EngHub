@@ -494,6 +494,49 @@ async def get_sim_tradeoffs(
     return await record_tradeoffs(db, factory_id, apply=apply)
 
 
+@router.post("/execution-events", summary="记一件现场真做过的事：加班几小时、从哪个组调几个人、开几条线")
+async def post_execution_event(
+    body: Dict[str, Any] = Body(..., description="action, line_code/section, people, hours, units, note"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """这张表是给"验证不了"准备的：加班、调人、开并联线以前在系统里没有任何落点，
+
+    所以厂规写了「OT 上限 2h」「跨线调人要技能匹配」也没法核对，挖掘也拿不到结果。
+    记一笔会立刻对着已声明的规则校一遍（超上限当场报，不等下一轮推演）。
+    """
+    from core.mes.factory_rules import record_execution
+
+    return await record_execution(
+        db, str(body.get("factory_id") or ""), action=str(body.get("action") or ""),
+        line_code=body.get("line_code"), section=body.get("section"),
+        model_code=body.get("model_code"), people=body.get("people"),
+        hours=body.get("hours"), units=body.get("units"),
+        note=str(body.get("note") or ""),
+        actor=str(getattr(current_user, "username", None) or body.get("actor") or "unknown"),
+        source=str(body.get("source") or "manual"))
+
+
+@router.get("/execution-events", summary="最近记过的现场执行（含系统回查用的原始凭据）")
+async def get_execution_events(
+    factory_id: str = Query(..., description="厂区"),
+    action: str = Query("", description="动作名，可选"),
+    days: int = Query(30, description="回看天数"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """给助手、给巡检、也给计划员自己核对"我们到底做过什么"。"""
+    del current_user
+    from datetime import datetime, timedelta
+
+    from core.mes.factory_rules import recent_executions
+
+    return {"factory_id": factory_id, "action": action or None, "days": days,
+            "events": await recent_executions(
+                db, factory_id, action=(action or None),
+                since=datetime.now() - timedelta(days=max(1, int(days))), limit=100)}
+
+
 @router.get("/action-constraints", summary="动作约束层：这个厂现在哪些动作根本不存在、哪些没规则支撑")
 async def get_action_constraints(
     factory_id: str = Query(..., description="厂区"),

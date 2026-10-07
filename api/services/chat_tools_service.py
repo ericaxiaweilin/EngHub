@@ -163,6 +163,26 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "record_execution",
+            "description": "记一件现场真做过的事：加了几天班（几小时）、从哪个组调了几个人顶什么岗、开了几条并联线、先交了几台。这些动作以前没有落库地方，所以「加班上限 2 小时」「跨线调人要技能匹配」这类厂规没法核对、系统也永远算不出某个动作的成功率。记完会立刻对着已声明的厂规校一遍，超上限当场报。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "add_overtime / cross_line_transfer / parallel_line / extra_crew / partial_delivery / reprioritize"},
+                    "line_code": {"type": "string", "description": "线编码，可选（LINE-TREAD-01 等）"},
+                    "section": {"type": "string", "description": "工段名，可选（组立/焊接/加工…）"},
+                    "people": {"type": "integer", "description": "调了/加了几个人"},
+                    "hours": {"type": "number", "description": "加班小时数（按人日合计或每人小时要写清，note 里说明）"},
+                    "units": {"type": "number", "description": "影响台数，可选"},
+                    "note": {"type": "string", "description": "现场原话，含数字与条件"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "adopt_recommendation",
             "description": "把「引擎上次推荐的那件事我们真做了」记回决策台账：例如下单把某个件压到 10 天、先开了第一批 18 台、调了 2 名检测员。这是达成率与规则挖掘的唯一真燃料来源，不记就永远只有预测。系统每 6 小时会自动回查有痕迹的动作（下单记录、工单推进），但加班/开并联线/跨线调人这类没有落库通道的动作只能靠这里确认。",
             "parameters": {
@@ -3162,6 +3182,30 @@ async def _tool_list_open_rule_questions(
     return out
 
 
+async def _tool_record_execution(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant",
+    factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """现场执行入表 + 当场按厂规校验。actor 用登录用户，机器写的只算 agent 证据。"""
+    from core.mes.factory_rules import record_execution
+
+    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    res = await record_execution(
+        db, fid, action=str(args.get("action") or ""), line_code=args.get("line_code"),
+        section=args.get("section"), model_code=args.get("model_code"),
+        people=args.get("people"), hours=args.get("hours"), units=args.get("units"),
+        note=str(args.get("note") or ""), actor=str(operator or "unknown"))
+    if res.get("error"):
+        return {"error": res["error"]}
+    rc = res.get("rule_check") or {}
+    res["rule_check_note"] = {"violates_forbidden": "厂规禁止这个动作，但这次做了 —— 要么规则要改，要么这是例外，得留痕",
+                              "over_cap": "超出厂规上限（规则写的是上限，不是建议值）",
+                              "within_cap": "在厂规上限之内",
+                              "no_rule": "这个动作还没有声明过的规则，做了也没法判对错"}.get(
+                                  str(rc.get("verdict")), "")
+    return res
+
+
 async def _tool_adopt_recommendation(
     db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant",
     factory_id: Optional[str] = None
@@ -3504,6 +3548,7 @@ _TOOL_EXECUTORS = {
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
     "list_open_rule_questions": _tool_list_open_rule_questions,
+    "record_execution": _tool_record_execution,
     "adopt_recommendation": _tool_adopt_recommendation,
     "record_factory_rule": _tool_record_factory_rule,
     "query_lead_time_evidence": _tool_query_lead_time_evidence,
@@ -3885,6 +3930,7 @@ WRITE_TOOLS = {
     "create_followup_task",
     "record_factory_rule",
     "adopt_recommendation",
+    "record_execution",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
@@ -3903,6 +3949,7 @@ TOOL_LABELS = {
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
     "list_open_rule_questions": "现场规则缺口提问",
+    "record_execution": "记一件现场执行",
     "adopt_recommendation": "确认推荐已执行",
     "record_factory_rule": "落一条厂规",
     "query_lead_time_evidence": "提前期证据普查",
@@ -4046,10 +4093,21 @@ INTENT_RULES: List[Dict[str, Any]] = [
         ],
     },
     {
+        # 带数字的具体执行（加了几个钟、调了几个人、开了几条线）先走执行台账：
+        # 这些是验证厂规与算成功率的原料，不能只当"采纳确认"记掉
+        "tool": "record_execution",
+        "keywords": [
+            "加了班", "加了 3 小时", "加了3小时", "加班 3", "排了加班", "几点下班",
+            "调了 2 人", "调了2人", "调了 2 个人", "调人顶岗", "顶了检测", "顶检测岗",
+            "开了第二条线", "开并联线", "先交了", "部分交付了",
+        ],
+    },
+    {
         # "我们照做了/已经下单了"是执行反馈，必须早于规则登记与提问，否则会被读工具抢走
         "tool": "adopt_recommendation",
         "keywords": [
-            "已经下单", "已下单", "按你说的下单", "采纳了", "照做了", "做了", "执行了",
+            "采纳了", "照做了", "按你说的做", "就按这个", "按建议下单", "执行了",
+            "已经下单", "已下单", "按你说的下单", "没做", "没采纳",
             "排了加班", "加班排了", "调了人", "人已调到", "开了第二条线", "先开工了", "已经开工",
             "没做", "没采纳", "先开第一批", "先开第", "开第一批", "不等齐套", "第一批已经",
             "已经先开", "压到", "已经催", "下单了", "已经安排",
@@ -4624,7 +4682,8 @@ async def execute_tool(
     if not executor:
         return {"error": f"未知工具：{tool_name}"}
     try:
-        if tool_name in {"create_followup_task", "record_factory_rule", "adopt_recommendation"}:
+        if tool_name in {"create_followup_task", "record_factory_rule",
+                         "adopt_recommendation", "record_execution"}:
             # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "edit_online_workbook":

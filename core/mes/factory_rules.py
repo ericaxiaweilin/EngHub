@@ -39,6 +39,9 @@ MACHINE_ACTORS = {
 NO_CHANNEL_ACTIONS = {"parallel_line", "add_overtime", "extra_crew", "cross_line_transfer",
                       "partial_delivery", "reprioritize"}
 
+# 仿真时钟造出来的人（vf_mec_0001 这种）写在工单上看着像"有人做过"，其实是系统在给自己盖章
+SIM_ACTOR_PREFIXES = ("vf_", "sim_")
+
 DDL = [
     """
     CREATE TABLE IF NOT EXISTS factory_rules (
@@ -79,6 +82,28 @@ DDL = [
     """
     CREATE INDEX IF NOT EXISTS ix_decision_records_lookup
         ON decision_records (factory_id, occurred_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS execution_events (
+        id TEXT PRIMARY KEY,
+        factory_id TEXT NOT NULL,
+        occurred_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        action TEXT NOT NULL,
+        line_code TEXT,
+        section TEXT,
+        model_code TEXT,
+        people INT,
+        hours NUMERIC,
+        units NUMERIC,
+        note TEXT,
+        actor TEXT,
+        source TEXT NOT NULL DEFAULT 'manual',
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_execution_events_lookup
+        ON execution_events (factory_id, action, occurred_at DESC)
     """,
 ]
 
@@ -141,6 +166,20 @@ ORDER_OUTCOME_SQL = text("""
     FROM work_orders w
     WHERE w.factory_id = :fid AND w.product_id = ANY(:products)
 """)
+
+
+async def actor_class(db: AsyncSession, actor: Any) -> str:
+    """human / agent / simulation / unknown —— 决定这条证据能不能算现场事实。"""
+    name = str(actor or "").strip()
+    if not name:
+        return "unknown"
+    if name in MACHINE_ACTORS:
+        return "agent"
+    if name.startswith(SIM_ACTOR_PREFIXES):
+        return "simulation"
+    hit = (await db.execute(text("SELECT 1 FROM users WHERE username = :u LIMIT 1"),
+                            {"u": name})).scalar()
+    return "human" if hit else "unknown"
 
 
 async def ensure_schema(db: AsyncSession) -> List[str]:
@@ -393,11 +432,13 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
             # 结果质量必须分级：这些工单的计划量/交期是厂里的，但 good_qty 是自家仿真时钟报的工
             # 质量分级看三件事：有没有连到工单、工单里那笔量是谁写的、动作本身有没有执行通道
             actors = {str(c.get("updated_by") or c.get("created_by") or "") for c in linked} - {""}
-            human = bool(actors - MACHINE_ACTORS)
+            classes = {await actor_class(db, x) for x in actors}
+            human = "human" in classes
             started = any(c.get("actual_start") for c in linked)
             quality = ("no_execution_channel" if str(a.get("type") or "") in NO_CHANNEL_ACTIONS else
                        "verified_human" if (linked and human and started) else
-                       "verified_agent" if (linked and started) else
+                       "verified_agent" if (linked and started and classes & {"agent", "unknown"}) else
+                       "verified_simulation" if (linked and started) else
                        "mixed_simulation" if linked else "no_linked_order")
             rows.append({
                 "id": f"dec-{t['id']}-{i}", "factory_id": factory_id, "occurred_at": t["created_at"],
@@ -444,8 +485,9 @@ async def backfill_decision_ledger(db: AsyncSession, factory_id: str, *, limit: 
             "minable_samples": real,
             "outcome_quality_counts": {k: sum(1 for r in rows
                                               if r["outcome"]["outcome_quality"] == k)
-                                       for k in ("verified_human", "verified_agent", "mixed_simulation",
-                                                 "no_execution_channel", "no_linked_order")},
+                                       for k in ("verified_human", "verified_agent", "verified_simulation",
+                                                 "mixed_simulation", "no_execution_channel",
+                                                 "no_linked_order")},
             "note": ("只有 outcome_source=work_order_actuals 的行能用来算成功率；"
                      "没有执行通道的动作（加班/并联/调人/部分交付）一律不算采纳 —— "
                      "厂里做了也没地方查，那就得靠 record_adoption 人肉确认，机器写的只算 verified_agent。"
@@ -494,9 +536,14 @@ async def record_adoption(db: AsyncSession, factory_id: str, *, decision_id: Opt
                              ensure_ascii=False, default=str),
            "src": "adoption", "link": decision_id})
     await db.commit()
+    klass = await actor_class(db, actor)
+    quality = {"human": "verified_human", "agent": "verified_agent",
+               "simulation": "verified_simulation"}.get(klass, "unattributed")
     return {"record_id": rid, "action_type": atype, "adopted": bool(adopted), "actor": actor,
-            "outcome_quality": "verified_human" if actor not in MACHINE_ACTORS else "verified_agent",
-            "note": "机器/仿真操作人写的确认只算 verified_agent；真人确认才进 human 档"}
+            "actor_class": klass, "outcome_quality": quality,
+            "note": ("只有真人账号写的算 verified_human；vf_* 这类仿真身份写的算 verified_simulation，"
+                     "程序写的是 verified_agent，认不出的账号是 unattributed —— 后三类都不进挖掘分母"
+                     if quality != "verified_human" else "真人确认，进挖掘分母")}
 
 
 async def sweep_adoption(db: AsyncSession, factory_id: str, *, limit: int = 40,
@@ -541,16 +588,102 @@ async def sweep_adoption(db: AsyncSession, factory_id: str, *, limit: int = 40,
         elif status == "no_evidence":
             tally["no_evidence"] += 1
         elif status == "adopted" and apply:
-            actors = [a for a in (d.get("human_actors") or d.get("actors") or []) if a]
+            actors = [a for a in (d.get("human_actors") or []) if a] or \
+                     [a for a in (d.get("actors") or []) if a]
             res = await record_adoption(db, factory_id, decision_id=r["id"], action_type=atype,
                                         adopted=True, actor=(actors[0] if actors else "unknown"),
-                                        note=f"巡检自动回查认定采纳：{json.dumps({k: v for k, v in d.items() if k != 'status'}, ensure_ascii=False)[:280]}",
+                                        note=f"巡检自动回查认定采纳：{json.dumps({k: v for k, v in d.items() if k != 'status'}, ensure_ascii=False, default=str)[:280]}",
                                         evidence=d)
             if not res.get("error"):
                 tally["adopted_written"] += 1
     return {**tally, "distinct_actions_checked": len(seen),
             "note": "自动回查只认库里有痕迹的（下单记录、工单状态推进）；没痕迹不等于没做，"
                     "那种要靠人确认（POST /adopt-recommendation 或助手的 adopt_recommendation）"}
+
+
+async def record_execution(db: AsyncSession, factory_id: str, *, action: str,
+                           line_code: Optional[str] = None, section: Optional[str] = None,
+                           model_code: Optional[str] = None, people: Optional[int] = None,
+                           hours: Optional[float] = None, units: Optional[float] = None,
+                           note: str = "", actor: str = "unknown",
+                           source: str = "manual") -> Dict[str, Any]:
+    """记一件"现场真做过的事"：加了几小时班、从哪个组调了几个人、开了几条线、先交了几台。
+
+    这张表存在的理由很单纯：加班、调人、开并联这些动作以前没有任何落点，
+    所以规则（OT 上限 2h、调人要技能匹配）永远无法验证，挖掘也永远拿不到结果。
+    """
+    import hashlib
+    from datetime import datetime
+
+    action = str(action or "").split(":", 1)[0]
+    if not action:
+        return {"error": "action 不能为空"}
+    stamp = datetime.now()
+    rid = "exe-" + hashlib.sha1(f"{factory_id}|{action}|{line_code}|{section}|{stamp.isoformat()}".encode()).hexdigest()[:20]
+    await db.execute(text("""
+        INSERT INTO execution_events (id, factory_id, occurred_at, action, line_code, section,
+                                      model_code, people, hours, units, note, actor, source)
+        VALUES (:id, :fid, :at, :action, :line, :section, :model, :people, :hours, :units,
+                :note, :actor, :source)
+    """), {"id": rid, "fid": factory_id, "at": stamp, "action": action,
+           "line": line_code, "section": section, "model": model_code,
+           "people": int(people) if people is not None else None,
+           "hours": float(hours) if hours is not None else None,
+           "units": float(units) if units is not None else None,
+           "note": str(note or "")[:600], "actor": str(actor or "unknown"), "source": source})
+    await db.commit()
+    return {"event_id": rid, "action": action, "occurred_at": stamp.isoformat(),
+            "people": people, "hours": hours, "actor": actor,
+            "rule_check": await check_rule_respect(db, factory_id, action,
+                                                   line_code=line_code, section=section,
+                                                   hours=hours, people=people)}
+
+
+async def recent_executions(db: AsyncSession, factory_id: str, *, action: Optional[str] = None,
+                             since: Any = None, line_code: Optional[str] = None,
+                             section: Optional[str] = None, limit: int = 40) -> List[Dict[str, Any]]:
+    clauses = ["factory_id = :fid"]
+    params: Dict[str, Any] = {"fid": factory_id, "lim": int(limit)}
+    if action:
+        clauses.append("action = :action")
+        params["action"] = action
+    if since:
+        clauses.append("occurred_at >= :since")
+        params["since"] = since
+    if line_code:
+        clauses.append("(line_code IS NULL OR line_code = :line)")
+        params["line"] = line_code
+    if section:
+        clauses.append("(section IS NULL OR section = :section)")
+        params["section"] = section
+    rows = (await db.execute(text(f"""
+        SELECT id, occurred_at::text AS at, action, line_code, section, model_code,
+               people, hours, units, note, actor, source
+        FROM execution_events WHERE {" AND ".join(clauses)}
+        ORDER BY occurred_at DESC LIMIT :lim
+    """), params)).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def check_rule_respect(db: AsyncSession, factory_id: str, action: str, *,
+                             line_code: Optional[str] = None, section: Optional[str] = None,
+                             hours: Optional[float] = None,
+                             people: Optional[int] = None) -> Dict[str, Any]:
+    """把刚记的事对着已声明的厂规量一遍：超上限就当场报，不等下一轮推演。"""
+    declared = await binding_rules(db, factory_id)
+    rule = declared.get(str(action)) or {}
+    params = rule.get("params") or {}
+    if isinstance(params, str):
+        params = _json(params)
+    out: Dict[str, Any] = {"rule": bool(rule), "verdict": "no_rule"}
+    cap = params.get("max_hours_per_day")
+    if rule and str(rule.get("verdict")) == "forbidden":
+        out.update(verdict="violates_forbidden",
+                   why=f"厂规声明 {action} 不允许做，但记了一次执行（{hours}h/{people}人）")
+    elif cap and hours is not None:
+        out.update(verdict="over_cap" if float(hours) > float(cap) else "within_cap",
+                   cap=float(cap), recorded_hours=float(hours))
+    return out
 
 
 async def ledger_rows(db: AsyncSession, factory_id: str, *, limit: int = 60) -> List[Dict[str, Any]]:
@@ -571,8 +704,16 @@ async def detect_adoption(db: AsyncSession, factory_id: str, *, action_type: str
     更不能因为推演推荐里有这个动作就算成已执行。
     """
     if str(action_type) in NO_CHANNEL_ACTIONS:
+        # 这些动作原来连地方记都没有；现在查 execution_events，查到就是采纳，查不到才说没通道/没痕迹
+        ev = await recent_executions(db, factory_id, action=str(action_type), since=since, limit=5)
+        if ev:
+            actors = sorted({str(e.get("actor") or "") for e in ev} - {""})
+            return {"status": "adopted", "executions": len(ev),
+                    "actors": actors, "human_actors": sorted(set(actors) - MACHINE_ACTORS),
+                    "detail": ev[0]}
         return {"status": "no_channel",
-                "why": f"{action_type} 在这个系统里没有落库执行通道（没排班/加班/调人/并联动账）"}
+                "why": f"{action_type} 还没有执行记录（execution_events 里 0 行）—— "
+                       "做了就用 /execution-events 或助手记一笔，否则规则永远验证不了"}
     if action_type == "expedite_purchase" and material_code:
         params = {"fid": factory_id, "codes": [str(material_code)], "since": since or "2000-01-01"}
         pos = [dict(r) for r in (await db.execute(PO_AFTER_SQL, params)).mappings().all()]
@@ -610,7 +751,8 @@ async def mine_patterns(db: AsyncSession, factory_id: str, *, min_samples: int =
     for r in rows:
         outcome = _json(r["outcome"])
         # 只有真实现场结果才进统计：引擎自己的预测、仿真时钟报的工都不算
-        if not str(outcome.get("outcome_quality") or "").startswith("verified_"):
+        # 只认 verified_human：程序回查与仿真身份写的都算自证，不能进成功率分母
+        if str(outcome.get("outcome_quality") or "") != "verified_human":
             continue
         act = _json(r["act"])
         if not act.get("type"):
