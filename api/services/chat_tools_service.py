@@ -150,6 +150,37 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_open_rule_questions",
+            "description": "列出引擎想知道、但厂里还没写成规则的现场约束（外发允不允许、加班上限几小时、缺人时能从哪些组调人、能不能部分交付、并联线的合并产能上限）。每条问题带「为什么现在要问」和已经挖到的证据（例如册上能顶检测岗只剩 2 人），要问现场时优先用这个，而不是把空表甩给人填。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "line": {"type": "string", "description": "线编码，可选；给了就按这条线问，问题更具体"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_factory_rule",
+            "description": "把现场口头说的厂规落成规则（写库，只写 factory_rules 这一张表）。用于「组立暴雨也不许外发」「加班上限 2 小时」「检测岗只能由有检验技能的人顶」「这个客户可以部分交付」这类经验。subject 必须落在封闭动作词表里；status=declared 表示现场明确声明（立刻有约束力），candidate 只是记下发现不拦引擎。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "description": "动作名：reroute_line / parallel_line / cross_line_transfer / add_overtime / extra_crew / expedite_purchase / split_release / reprioritize / partial_delivery / subcontract"},
+                    "verdict": {"type": "string", "enum": ["allowed", "forbidden", "bounded"], "description": "允许 / 禁止 / 有条件允许"},
+                    "statement": {"type": "string", "description": "人怎么说就怎么记，包含条件（例如：组立线暴雨也不允许外发；加班上限每天 2 小时）"},
+                    "status": {"type": "string", "enum": ["declared", "validated", "candidate", "rejected"], "description": "现场明确声明用 declared；系统自己发现的用 candidate（不拦引擎）", "default": "declared"},
+                    "params": {"type": "object", "description": "上限类参数，例如 {max_hours_per_day: 2} 或 {from_sections: [焊接, 加工]}，可选"},
+                },
+                "required": ["subject", "verdict", "statement"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_lead_time_evidence",
             "description": "提前期证据普查（只读）。凡问某个料号/物料的提前期『能不能信、够不够、安不安全、能不能按它承诺交期、会不会太乐观、和实际差多少』，先调这个工具再回答：台账 lead_time_days 很可能是按类别铺出来的默认值（本厂 31,452 个外购料号只有 10 个不同取值），也可能与采购实测冲突（见过台账 7 天、实测中位 110 天）。"
             "原话问『是量出来的还是铺的默认值』『哪批件最该去实测』也用它。并列四个出处：materials 台账、" "采购下单→实际到货实测（条数/中位/P90/最长）、仓收实测、供应商声明；每件给 verdict（measured / " "ledger_default_conflicts_with_measured / unverified_default / ledger_declared_only / no_lead_time_at_all），" "并摊开台账与实测的冲突。建议值只在 suggested_days，不回填台账。",
@@ -3100,6 +3131,68 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _tool_list_open_rule_questions(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """现场规则缺口 → 可回答的问题（只读）。判据与问题模板只在 core/mes/factory_rules 一处。"""
+    from core.mes.factory_rules import open_questions
+
+    fid = factory_id or "FAC_MECH_001"
+    out = await open_questions(db, fid, line_code=(args.get("line") or None))
+    out["how_to_answer"] = ("现场回答后用 record_factory_rule 落成规则；"
+                            "declared 立刻进约束判定，candidate 只记不拦。")
+    return out
+
+
+async def _tool_record_factory_rule(
+    db: AsyncSession, args: Dict[str, Any], operator: str = "ai_assistant",
+    factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """把现场口述的厂规写进 factory_rules（只这一张表，不动任何事实表）。"""
+    from core.mes.factory_rules import upsert_rule
+
+    # 规则属于哪个厂必须跟着当前会话的厂区走：写错厂相当于给另一家工厂立规矩
+    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    fid = str(args.get("factory_id") or factory_id or "FAC_MECH_001")
+    # 现场说的是"不许外发"还是"不许加班"决定这条规则拦哪个动作 —— 动作选错，
+    # 引擎就会按错的边界过滤候选（实测模型把"暴雨不许外发"记到了 reroute_line 上）。
+    # 所以先从话术里找线索：只有一个动作被提到却和传进来的 subject 不一致时，结构化拒绝，
+    # 让模型带着正确 subject 再调一次；一个都没提到或提到多个，才按传入值写并标注歧义。
+    statement = str(args.get("statement") or "")
+    hints = {
+        "subcontract": ["外发", "外协", "外包", "subcontract"],
+        "add_overtime": ["加班", "上限", "OT"],
+        "cross_line_transfer": ["调人", "跨线", "顶岗", "借人", "检测岗", "技能"],
+        "parallel_line": ["并联", "第二条线", "开两条线"],
+        "reroute_line": ["改派", "换线", "改线", "移线", "挪到别的线"],
+        "expedite_purchase": ["加急", "催料", "催货", "提前期压"],
+        "partial_delivery": ["部分交付", "分批交付", "先交一部分"],
+        "split_release": ["分批开工", "先开", "不等齐套"],
+        "reprioritize": ["优先级", "插单", "先后顺序"],
+        "extra_crew": ["加人", "补人", "增加人手", "外部补人"],
+    }
+    hit = sorted(k for k, words in hints.items() if any(w in statement for w in words))
+    ambiguity = None
+    if len(hit) == 1 and hit[0] != args.get("subject"):
+        return {"error": f"话术里指向的动作是 {hit[0]}（{statement[:40]}），但 subject 传的是 "
+                         f"{args.get('subject')}。请用 subject={hit[0]} 重新记录 —— "
+                         "动作记错会让引擎按错的边界过滤候选动作。"}
+    if not hit:
+        ambiguity = "话术里没出现任何动作线索词，按传入 subject 记录，建议人工复核"
+    res = await upsert_rule(
+        db, fid, subject=str(args.get("subject") or ""), verdict=str(args.get("verdict") or ""),
+        statement=str(args.get("statement") or ""), status=str(args.get("status") or "declared"),
+        source="chat", params=args.get("params") or {},
+        evidence={"channel": "chatbot", "asked_by": str(operator or "")},
+        asked_by=str(operator or ""), confirmed_by=str(operator or ""))
+    if res.get("error"):
+        return {"error": res["error"]}
+    res["next"] = ("这条规则现在参与约束判定（verdict=%s, status=%s）；"
+                   "引擎下一轮推演就会按它过滤候选动作" % (res["verdict"], res["status"])
+                   if res.get("binding") else "已记录为候选，等人确认后才拦引擎")
+    return res
+
+
 async def _tool_query_lead_time_evidence(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3373,6 +3466,8 @@ _TOOL_EXECUTORS = {
     "get_work_order_detail": _tool_get_work_order_detail,
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
+    "list_open_rule_questions": _tool_list_open_rule_questions,
+    "record_factory_rule": _tool_record_factory_rule,
     "query_lead_time_evidence": _tool_query_lead_time_evidence,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
@@ -3750,6 +3845,7 @@ WRITE_TOOLS = {
     "reload_online_workbook",
     "acknowledge_alert", "run_alert_patrol",
     "create_followup_task",
+    "record_factory_rule",
 }
 
 # 仿真类工具（前端展示用「仿真」色标，区别于写绿/查蓝）
@@ -3767,6 +3863,8 @@ TOOL_LABELS = {
     "get_work_order_detail": "工单详情",
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
+    "list_open_rule_questions": "现场规则缺口提问",
+    "record_factory_rule": "落一条厂规",
     "query_lead_time_evidence": "提前期证据普查",
     "query_pmc_material_supply": "PMC物料供应证据",
     "query_pmc_rush_impact": "PMC插单影响",
@@ -3905,6 +4003,23 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "PMC工作矩阵", "PMC矩阵", "工作矩阵", "预排程沙盘", "时间锤", "物料锤",
             "生产锤", "出货锤", "紧急锤", "重算ETA", "ETA推迟", "ETA延迟", "UHN",
             "可加工时间", "库存齐套", "齐套率",
+        ],
+    },
+    {
+        # "记一条厂规/以后不许"是写动作，必须排在提问类规则之前，否则会被读工具抢走
+        "tool": "record_factory_rule",
+        "keywords": [
+            "记一条", "记下", "记住", "写进规则", "定条规矩", "立规矩", "以后都",
+            "不允许外发", "禁止外发", "可以外发", "加班上限", "不许外发", "规定：",
+            "组立不允许", "检测岗只能", "只能由", "算违约", "允许部分交付",
+        ],
+    },
+    {
+        # 现场规则与"能不能这么做"是约束问题：要问出来也要能记下来
+        "tool": "list_open_rule_questions",
+        "keywords": [
+            "哪些规则", "还没写规则", "规则缺口", "允许外发", "能不能外发", "加班上限",
+            "能不能加班", "顶检测", "调人", "跨线调人", "部分交付", "厂规", "现场规则",
         ],
     },
     {
@@ -4459,7 +4574,7 @@ async def execute_tool(
     if not executor:
         return {"error": f"未知工具：{tool_name}"}
     try:
-        if tool_name == "create_followup_task":
+        if tool_name in {"create_followup_task", "record_factory_rule"}:
             # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "edit_online_workbook":

@@ -1496,6 +1496,26 @@ def _blocked_note(blocked: List[Dict[str, Any]]) -> str:
     return "本轮不产出解：" + "；".join(label.get(k, k) for k in kinds)
 
 
+async def declared_forbidden_policies(db: AsyncSession, factory_id: str,
+                                      lines: List[Dict[str, Any]],
+                                      policies: List[Dict[str, Any]]) -> List[str]:
+    """返回被厂里声明"不许做"的政策名。只有 declared/validated 的 forbidden 才拦，candidate 不拦。"""
+    from core.mes.action_constraints import ACTIONS, policy_actions
+    from core.mes.factory_rules import binding_rules
+
+    declared = await binding_rules(db, factory_id)
+    hard = {k for k, v in declared.items()
+            if str(v.get("verdict")) == "forbidden" and k.split(":")[0] in ACTIONS}
+    if not hard:
+        return []
+    out: List[str] = []
+    for pol in policies:
+        acts = set(policy_actions(pol))
+        if acts & hard:
+            out.append(str(pol.get("name") or ""))
+    return out
+
+
 async def constraint_overlay(db: AsyncSession, factory_id: str,
                              targets: List[Dict[str, Any]],
                              policies: List[Dict[str, Any]],
@@ -1515,19 +1535,28 @@ async def constraint_overlay(db: AsyncSession, factory_id: str,
         c = await action_constraints(db, factory_id, model=model,
                                      line_code=(line or {}).get("line_code"))
         per_model.append({"model": model, "line": (line or {}).get("line_code"),
+                          "declared": {a["action"]: (a.get("binding_rule") or {})
+                                       for a in c["actions"] if a.get("binding_rule")},
                           "verdicts": {a["action"]: a["verdict"] for a in c["actions"]},
                           "why": {a["action"]: a["why"] for a in c["actions"]
                                   if a["verdict"] not in ("allowed_bounded",)},
                           "constraint_gaps": c["constraint_gaps"]})
     per_policy: List[Dict[str, Any]] = []
+    blocked: List[str] = []
     for pol in policies:
         acts = policy_actions(pol)
         unsupported = {m["model"]: [a for a in acts
                                     if str((m["verdicts"] or {}).get(a) or "").startswith(("undeclared", "forbidden"))]
                        for m in per_model}
-        per_policy.append({"policy": str(pol.get("name") or ""), "actions": acts,
+        # forbidden 且来自人声明的规则 → 这个政策不再进候选集（"不能胡来"由规则负责）
+        hard = [a for a in acts if any(str(v["verdicts"].get(a) or "") == "forbidden"
+                                       and (v.get("declared") or {}).get(a) for v in per_model)]
+        name = str(pol.get("name") or "")
+        if hard:
+            blocked.append(name)
+        per_policy.append({"policy": name, "actions": acts, "blocked_by_rule": hard,
                            "unsupported": {k: v for k, v in unsupported.items() if v}})
-    return {"enforced": False,
+    return {"enforced": bool(blocked), "blocked_policies": blocked,
             "rule": ("只报不删：政策照跑，但每个动作有没有厂里的规则支撑要跟着结论出门。"
                      "要真拦下来得由 IE 先把规则填实，再由用户点一次开关。"),
             "per_model": per_model, "per_policy": per_policy}
@@ -1539,7 +1568,8 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         scenarios: Optional[List[Dict[str, Any]]] = None,
                         targets_by_scenario: Optional[Dict[str, List[Dict[str, Any]]]] = None,
                         perturb: Optional[Dict[str, float]] = None,
-                        with_constraints: bool = False) -> Dict[str, Any]:
+                        with_constraints: bool = False,
+                        enforce_constraints: bool = True) -> Dict[str, Any]:
     """让引擎自己扫政策组合：同一批目标在多种产能/出勤/采购/分批政策下的多目标结果。
 
     这里刻意不给"唯一总分"。每个政策产出一个目标向量，交给 pareto_eval 判前沿与平衡解 ——
@@ -1577,6 +1607,11 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
         # 本轮模拟出来的单也要排队：同一条线组的产能是它们一起占的。以前每台单只吃
         # "真实已承诺量"，于是三台跑步机机种各占 GROUP-TREAD 十几天却互不遮挡，
         # 交期普遍算得偏乐观 —— 而"谁先做"本来是引擎要做的决定，不是背景假设。
+        # 人声明过禁止的动作所在的政策先挡掉，再进推演与择优 —— 规则负责"不能胡来"
+        if enforce_constraints:
+            _blocked = await declared_forbidden_policies(db, factory_id, lines, [pol])
+            if _blocked:
+                continue
         allocated: Dict[str, float] = {} if pol.get("ignore_backlog") else dict(group_busy)
         # 按线到岗是"这一轮政策"的属性：改派之后占用的是**改派后那条线**的队列，
         # 所以排队口径必须与 run_target 用同一个解析函数，不能在这里另算一遍。
@@ -1699,6 +1734,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
     return {"factory_id": factory_id, "today": str(today), "demand_units": demand_units,
             "demand_by_scenario": demand_by_scenario,
             "policies_tried": total, "scenarios": list(grouped),
+            "by_scenario": grouped,
             "constraints": overlay,
             "note": ("前沿在每个天气场景内部各算一次：天气不是可选政策。"
                      "跨场景的推荐按'各场景推荐解里后悔向量最稳的那个'给。")}

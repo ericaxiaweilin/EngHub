@@ -518,6 +518,71 @@ async def get_action_constraints(
                                     state=({"weather": weather} if weather else None))
 
 
+@router.get("/open-rule-questions", summary="引擎想知道但厂里没写的规则：转成现场能一句话回答的问题")
+async def get_open_rule_questions(
+    factory_id: str = Query(..., description="厂区"),
+    line: str = Query("", description="线编码，可选（给了就按这条线问）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """数据不完整是常态，所以缺口不能只摊成清单等别人填 —— 这里直接生成可回答的问题。
+
+    每个问题都带上"为什么现在要问"和已经挖到的证据（例如册上能顶检测岗的只剩 2 人），
+    现场回答后用 POST /factory-rules 或助手工具 record_factory_rule 落成规则。
+    """
+    del current_user
+    from core.mes.factory_rules import open_questions
+
+    return await open_questions(db, factory_id, line_code=(line or None))
+
+
+@router.post("/factory-rules", summary="把一条厂规落库（声明/确认/派生候选都走这里）")
+async def post_factory_rule(
+    body: Dict[str, Any] = Body(..., description="subject, verdict, statement, status, source, params, evidence"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """subject 必须落在封闭动作词表里（reroute_line / subcontract / add_overtime / …），
+    否则结构化拒绝 —— 不许有"随手编一条规则"这条路。
+
+    `status` 决定它有没有约束力：只有 `declared`（人明说）与 `validated`（人确认过挖掘结果）
+    会进约束判定；`candidate`（系统从数据里发现的）只报数、不拦引擎。
+    """
+    from core.mes.factory_rules import upsert_rule
+
+    return await upsert_rule(
+        db, str(body.get("factory_id") or ""),
+        subject=str(body.get("subject") or ""), verdict=str(body.get("verdict") or ""),
+        kind=str(body.get("kind") or "constraint"), statement=str(body.get("statement") or ""),
+        status=str(body.get("status") or "declared"), source=str(body.get("source") or "human_ui"),
+        params=body.get("params") or {}, evidence=body.get("evidence") or {},
+        asked_by=body.get("asked_by"), confirmed_by=getattr(current_user, "username", None)
+        or str(body.get("confirmed_by") or ""))
+
+
+@router.get("/decision-ledger", summary="决策台账：推荐过的动作与后来的实绩连成一行（默认只读预演）")
+async def get_decision_ledger(
+    factory_id: str = Query(..., description="厂区"),
+    limit: int = Query(100, description="读多少条历史推荐"),
+    apply: bool = Query(False, description="true=写台账表（只写 decision_records，不动事实表）"),
+    mine: bool = Query(False, description="true=顺带挖一次模式（只产 candidate）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把 followup_tasks 里的推演推荐与工单实绩连起来 —— 这是"以后能挖成功率"的唯一前提。
+
+    读数会明确分级结果质量：`verified_field`（现场真做过）/ `mixed_simulation`
+    （计划是厂里的、产出是自家仿真时钟报的）/ `no_linked_order`。只有第一类能算成功率。
+    """
+    del current_user
+    from core.mes.factory_rules import backfill_decision_ledger, mine_patterns
+
+    out = await backfill_decision_ledger(db, factory_id, limit=limit, apply=apply)
+    if mine:
+        out["patterns"] = await mine_patterns(db, factory_id, apply=apply)
+    return out
+
+
 @router.get("/data-evidence", summary="料号提前期的证据普查：台账值是不是量出来的，一调就知道")
 async def get_data_evidence(
     factory_id: str = Query(..., description="厂区"),

@@ -144,6 +144,14 @@ async def action_constraints(db: AsyncSession, factory_id: str,
     lead = dict(((await db.execute(LEAD_FLAGS_SQL, {"fid": factory_id})).mappings().first() or {}))
 
     line = next((l for l in lines if str(l["line_code"]) == str(line_code)), None) if line_code else None
+    # 已经落库的厂规优先于"这列没数据"：人只要声明过（declared/validated），
+    # 动作就按声明变成 forbidden / allowed_bounded，不再算 undeclared。
+    try:
+        from core.mes.factory_rules import binding_rules
+
+        declared = await binding_rules(db, factory_id)
+    except Exception:  # noqa: BLE001  规则表查不动时退回 undeclared，不能把"没读到"当成"没规则"
+        declared = {}
     out: List[Dict[str, Any]] = []
     gaps: Dict[str, Dict[str, Any]] = {}
 
@@ -269,6 +277,23 @@ async def action_constraints(db: AsyncSession, factory_id: str,
                         checked={"delivery_policy_rows": 0}, gap="delivery_policy.partial_shipment_allowed"))
     add_gap("delivery_policy.partial_shipment_allowed", ["partial_delivery"], {"delivery_policy_rows": 0})
 
+    override = {"forbidden": "forbidden", "allowed": "allowed_bounded", "bounded": "allowed_bounded"}
+    for o in out:
+        name = str(o["action"])
+        rule = declared.get(name) or next((v for k, v in declared.items()
+                                           if str(k).startswith(name + ":")), None)
+        if not rule:
+            continue
+        o["verdict_before_rule"] = o["verdict"]
+        o["verdict"] = override.get(str(rule.get("verdict")), o["verdict"])
+        o["why"] = (f"按厂里声明的规则判定：{rule.get('statement') or ''}"
+                    f"（来源 {rule.get('source')}，状态 {rule.get('status')}）")
+        o["binding_rule"] = {k: rule.get(k) for k in ("subject", "verdict", "status", "source", "params")}
+        for gap in list(gaps.values()):
+            if name in gap["actions"]:
+                gap["actions"].discard(name)
+                gap["resolved_by_rule"] = rule.get("subject")
+
     counts: Dict[str, int] = {}
     for o in out:
         counts[o["verdict"]] = counts.get(o["verdict"], 0) + 1
@@ -277,9 +302,12 @@ async def action_constraints(db: AsyncSession, factory_id: str,
         "generated": len(out), "of_candidate_actions": len(ACTIONS),
         "verdict_counts": counts,
         "actions": out,
+        "declared_rules_applied": sorted(str(v.get("subject")) for v in declared.values()),
         "constraint_gaps": sorted(
             [{"column": g["column"], "owner": g["owner"], "actions": sorted(g["actions"]),
-              "evidence": g["evidence"]} for g in gaps.values()],
+              "evidence": g["evidence"],
+              **({"resolved_by_rule": g["resolved_by_rule"]} if g.get("resolved_by_rule") else {})}
+             for g in gaps.values() if g["actions"]],
             key=lambda x: x["column"]),
         "rule": ("forbidden=有声明说不行；allowed_bounded=能做但上限来自落库数据；"
                  "undeclared=厂里没人写过这条规则 —— 一律不进候选推荐，并点名要填哪一列。"
