@@ -157,6 +157,25 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "properties": {
                     "models": {"type": "string", "description": "逗号分隔机种；不给就取 BOM 最完整的几个"},
                     "units": {"type": "number", "description": "每张单台数，默认 1200"},
+                    "factory_id": {"type": "string",
+                                   "description": ("问的是哪个厂：厂名（机械厂、电子厂）或厂区 id；"
+                                                   "不写用当前会话厂区，答复要按返回体的厂区说")},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_attendance_reality",
+            "description": "回答「这座厂实际怎么出勤」：从打卡表量出标称班时、加班人次与最长额外小时、两班倒用了多少人次（按段点名）、段级缺勤率和最坏的「段-日」极值。用于判断加班/双班/借人这些动作有没有现场先例、上限该按几小时，而不是按声明或想象。窗口内没有换段记录时会明说「跨线调人在打卡里观测不到」，不许把看不到当成没发生。厂区没打卡行时返回空原因，不会把缺勤率算成 0。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "factory_id": {"type": "string",
+                                   "description": ("问的是哪个厂：可写厂名（机械厂、电子厂）或厂区 id（FAC_MECH_001）。"
+                                                   "不写就用当前会话厂区；返回体里的 answer_must_name_factory "
+                                                   "是这份数真正出自哪个厂，答复必须按它说")},
                 },
             },
         },
@@ -3199,19 +3218,83 @@ async def _tool_query_stagnant(db: AsyncSession, args: Dict[str, Any], factory_i
     }
 
 
+async def _factory_scoped_id(db: AsyncSession, args: Dict[str, Any],
+                             session_factory_id: Optional[str],
+                             default: str = "FAC_MECH_001") -> Dict[str, Any]:
+    """把"机械厂/电子厂"这种点名的厂区落到真实 id，并返回用的是哪个厂。
+
+    为什么要单独一层：会话厂区是登录用户的厂，用户问"机械厂"时若直接用会话厂区，
+    答复会把 A 厂的数说成 B 厂的 —— 数字是真的，厂是错的。解析不到时不猜，
+    退回会话厂区但把退回原因一起带回去，让答复必须点名实际用的厂区。
+    """
+    raw = str(args.get("factory_id") or args.get("factory") or "").strip()
+    fallback = str(session_factory_id or default)
+    if not raw:
+        return {"factory_id": fallback, "asked": None, "resolved_from": "session"}
+    if raw.upper().startswith("FAC_"):
+        hit = (await db.execute(text("SELECT id, name FROM factories WHERE id = :i"),
+                                {"i": raw})).mappings().first()
+        return {"factory_id": raw, "asked": raw, "resolved_from": "id",
+                "name": str(hit["name"]) if hit else None,
+                "warning": None if hit else f"厂区 id {raw} 在 factories 里没有行"}
+    hit = (await db.execute(text("""
+        SELECT id, name FROM factories
+        WHERE name = :n OR short_name = :n OR name LIKE :p OR id LIKE :p
+        ORDER BY (name = :n) DESC LIMIT 1
+    """), {"n": raw, "p": f"%{raw}%"})).mappings().first()
+    if hit:
+        return {"factory_id": str(hit["id"]), "asked": raw, "name": str(hit["name"]),
+                "resolved_from": "name"}
+    return {"factory_id": fallback, "asked": raw, "resolved_from": "unmatched",
+            "warning": (f"没有叫「{raw}」的厂区，下面这些数来自 {fallback}；"
+                        "答复要按这个厂说，不许把它当成用户问的那个厂")}
+
+
+def _stamp_factory(out: Dict[str, Any], scope: Dict[str, Any]) -> Dict[str, Any]:
+    """把"这份数出自哪个厂"写进返回体，答复里就没法悄悄换厂。"""
+    label = (f"{scope['factory_id']}" if not scope.get("name")
+             else f"{scope['name']}（{scope['factory_id']}）")
+    out["factory"] = {"id": scope["factory_id"], "name": scope.get("name"),
+                      "asked": scope.get("asked"), "resolved_from": scope.get("resolved_from")}
+    out["answer_must_name_factory"] = label
+    if scope.get("warning"):
+        out["factory_warning"] = scope["warning"]
+    return out
+
+
 async def _tool_list_measurement_priority(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """该先量哪些件（只读）。口径只在 core/mes/measurement_priority 一处，这里只转述。"""
     from core.mes.measurement_priority import measurement_priority
 
-    fid = factory_id or "FAC_MECH_001"
+    scope = await _factory_scoped_id(db, args, factory_id)
+    fid = scope["factory_id"]
     codes = [m.strip() for m in str(args.get("models") or "").replace("，", ",").split(",") if m.strip()]
     out = await measurement_priority(db, fid, models=codes or None,
                                      units=(float(args["units"]) if args.get("units") else None))
     out["reading_hint"] = ("swing_days_if_measured 是把这一档提前期换成实测量级后完工日差几天；"
                            "critical_part_count 很大时要整批量，单量一个件交期不动。"
                            "校准比 n_materials=0 时结论只是量级演示，不能拿去承诺交期")
+    return _stamp_factory(out, scope)
+
+
+async def _tool_query_attendance_reality(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """这座厂实际怎么出勤（只读）。口径只在 core/mes/data_evidence 一处，这里只转述。"""
+    from core.mes.data_evidence import attendance_evidence
+
+    scope = await _factory_scoped_id(db, args, factory_id)
+    out = await attendance_evidence(db, scope["factory_id"])
+    out = _stamp_factory(out, scope)
+    if not out.get("available"):
+        out["reading_hint"] = "这个厂区没有打卡行 —— 缺勤率/加班都无从观测，引擎不许按 0 或缺省值推"
+        return out
+    out["reading_hint"] = ("标称班时是打卡中位，不是声明值；加班看 max_observed_extra_hours（现场最多额外几小时），"
+                           "双班看 double_shift.observed_person_days（真用过的产能动作）。"
+                           "缺勤要按段-日极值配人，全厂平均会把风险摊平。"
+                           "observability.people_changed_section=0 只表示这张表看不出换段，不表示从没调过人")
     return out
 
 
@@ -3612,6 +3695,7 @@ _TOOL_EXECUTORS = {
     "get_production_summary": _tool_get_production_summary,
     "query_inventory": _tool_query_inventory,
     "list_measurement_priority": _tool_list_measurement_priority,
+    "query_attendance_reality": _tool_query_attendance_reality,
     "list_open_rule_questions": _tool_list_open_rule_questions,
     "confirm_rule": _tool_confirm_rule,
     "record_execution": _tool_record_execution,
@@ -4016,6 +4100,7 @@ TOOL_LABELS = {
     "get_production_summary": "生产统计",
     "query_inventory": "查询库存",
     "list_measurement_priority": "该先量哪些件",
+    "query_attendance_reality": "到岗与加班实测",
     "list_open_rule_questions": "现场规则缺口提问",
     "confirm_rule": "确认或驳回候选规则",
     "record_execution": "记一件现场执行",
@@ -4205,6 +4290,15 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": [
             "先量哪些", "该量哪些", "先量哪", "要量哪些", "哪些件要量", "哪些料号要实测",
             "值得量", "补哪个件", "先补哪些数", "量了能提前几天", "该补哪些料号",
+        ],
+    },
+    {
+        # 「现场到底怎么出勤/加过班没有」只能从打卡表读，不能被声明或默认值代替
+        "tool": "query_attendance_reality",
+        "keywords": [
+            "加班", "加了多长", "实际加班", "两班倒", "双班", "倒班", "出勤", "到岗",
+            "缺勤", "请假", "请假率", "没人来", "标称班时", "几个班", "班次", "班时几小时",
+            "借人", "顶班", "有多少人干活",
         ],
     },
     {
