@@ -479,6 +479,34 @@ SUPPLIER_GAP_SQL = """
 MIN_STALE_ORDERS = 10
 MIN_RERUNNABLE_ORDERS = 10
 MIN_SUPPLIER_GAP_PARTS = 20
+# 提前期普查的两格阈值：整组只有一个取值 = 这一类件压根没分供应商/分规格量过；
+# 自制/外购在两列上互相矛盾的行数，决定"同一个件会不会被两头做出不同动作"。
+MIN_UNVERIFIED_LEAD_PARTS = 1000
+MIN_MOB_CONTRADICTION_ROWS = 500
+
+LEAD_DEFAULT_SQL = """
+    WITH g AS (
+        SELECT make_or_buy, material_type, count(*) AS n,
+               count(DISTINCT lead_time_days) AS distinct_values,
+               mode() WITHIN GROUP (ORDER BY lead_time_days) AS modal_days
+        FROM materials WHERE factory_id = :fid AND lead_time_days IS NOT NULL
+        GROUP BY 1,2)
+    SELECT count(*) FILTER (WHERE g.n >= 50 AND g.distinct_values <= 15
+                              AND m.lead_time_days = g.modal_days) AS unverified,
+           count(*) AS buy_rows,
+           count(DISTINCT m.lead_time_days) AS ledger_distinct_values
+    FROM materials m
+    JOIN g ON g.make_or_buy = m.make_or_buy AND g.material_type = m.material_type
+    WHERE m.factory_id = :fid AND m.make_or_buy = '外购'
+"""
+
+MOB_CONTRADICTION_SQL = """
+    SELECT count(*) AS rows_conflict
+    FROM materials
+    WHERE factory_id = :fid
+      AND ((make_or_buy = '外购' AND material_type = 'make')
+        OR (make_or_buy = '自制' AND material_type IN ('purchased', 'raw')))
+"""
 
 
 def _gap(loop: str, kind: str, sig: str, title: str, description: str, block: str,
@@ -495,16 +523,20 @@ def _gap(loop: str, kind: str, sig: str, title: str, description: str, block: st
 async def data_findings(db: AsyncSession, factory_id: str, *,
                         readiness_out: Optional[Dict[str, Any]] = None
                         ) -> List[Dict[str, Any]]:
-    """把三条查数收齐交给 gap_readings()：查询与判据分开，判据才单测得到。"""
+    """把五格查数收齐交给 gap_readings()：查询与判据分开，判据才单测得到。"""
     gen = (await db.execute(text(KIT_GENERATION_SQL), {"fid": factory_id})).mappings().first()
     sup = (await db.execute(text(SUPPLIER_GAP_SQL), {"fid": factory_id})).mappings().first()
+    lead = (await db.execute(text(LEAD_DEFAULT_SQL), {"fid": factory_id})).mappings().first()
+    mob = (await db.execute(text(MOB_CONTRADICTION_SQL), {"fid": factory_id})).mappings().first()
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
-    return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {})
+    return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
+                        lead=dict(lead or {}), mob=dict(mob or {}))
 
 
 def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
-                 ready: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """三条"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
+                 ready: Dict[str, Any], lead: Optional[Dict[str, Any]] = None,
+                 mob: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
     阈值写成张数/料号数而不是比例：少于十几张时重跑一次的成本比挂一条待办更划算，
     不值得占收件箱。签名按 10 张/10 个一档，补掉一档就刷新、缩到线下就自动关。
@@ -542,6 +574,41 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             "pmc_agent", "重跑齐套登记前先看这批单是不是已经停工，停工单不用补。",
             {"rerunnable_orders": rerun}))
 
+    lt = int((lead or {}).get("unverified") or 0)
+    if lt >= MIN_UNVERIFIED_LEAD_PARTS:
+        out.append(_gap(
+            "lead_time_evidence", "unverified_default", f"lt|{lt // 10}",
+            f"补数据｜{lt} 个外购料号的提前期是按类别铺的默认值，交期吃的就是这个数",
+            "判据：同组（采购属性×物料类别）≥50 个料号、该组提前期只有 ≤15 个取值、本件取值==该组众数。"
+            f"实测机械厂：{lt} 行命中，全厂外购行的提前期只有 "
+            f"{(lead or {}).get('ledger_distinct_values')} 个不同取值。\n"
+            "而本厂 65 单真采购的下单→到货实测中位 54 天、最长 123 天 —— 台账均值只有 9.9 天；"
+            "引擎点名的瓶颈件（见 /virtual-run 的 bottleneck_part.lead_evidence）目前 0 个有实测支撑。"
+            "把提前期从默认量级推到实测量级，机械厂两台机的最晚延误从 6 天变 75 天。\n"
+            "这不是算法能补的：要么按料号量出实际到货天数（先量决定交期的那几十个），"
+            "要么把承诺口径改成不依赖未量的提前期。\n"
+            "复核：GET /api/v1/pmc/data-evidence?factory_id=<厂区>、"
+            "POST /api/v1/pmc/virtual-run 看 bottleneck_part.lead_evidence。",
+            f"{lt} 个外购料号的提前期没有实测证据，交期结论建在铺出来的默认值上",
+            "procurement_agent", "按料号量到货天数，先量引擎点名的瓶颈件，别铺全厂默认值。",
+            {"unverified_buy_rows": lt, "buy_rows": int((lead or {}).get("buy_rows") or 0),
+             "ledger_distinct_values": (lead or {}).get("ledger_distinct_values")}))
+
+    mob = int((mob or {}).get("rows_conflict") or 0)
+    if mob >= MIN_MOB_CONTRADICTION_ROWS:
+        out.append(_gap(
+            "material_make_or_buy_conflict", "self_make_contradiction", f"mob|{mob // 10}",
+            f"补数据｜{mob} 个料号的自制/外购在两列上说法相反，同一个件有两种动作",
+            "materials.make_or_buy 说外购、material_type 却是 make（或反之，raw/purchased 标成自制）。"
+            f"实测 {mob} 行。\n排产与齐套按 make_or_buy 判要不要买，另一些读料路径按 material_type "
+            "判要不要自制 —— 同一个件会得出「等 4 天到货」和「线上自己做」两种动作，两边都觉得自己有依据。"
+            "而且矛盾组里 7,007 行的提前期全是同一个 4 天，说明这一列是整批铺出来的。\n"
+            "这是主数据决定（哪一列作准），不是算法能替厂里填的；定了之后另一列要么删要么改成派生值。\n"
+            "复核：GET /api/v1/pmc/data-evidence 的 make_or_buy_contradiction。",
+            f"{mob} 个料号的自制/外购两列互相矛盾",
+            "pmc_agent", "先定哪一列作准（排产/齐套已吃 make_or_buy），再批量对齐另一列。",
+            {"rows_conflict": mob}))
+
     no_sup = int((sup or {}).get("no_supplier") or 0)
     if no_sup >= MIN_SUPPLIER_GAP_PARTS:
         out.append(_gap(
@@ -577,8 +644,10 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
             "stale_generation_orders": MIN_STALE_ORDERS,
             "rerunnable_orders": MIN_RERUNNABLE_ORDERS,
             "supplier_gap_parts": MIN_SUPPLIER_GAP_PARTS,
+            "unverified_lead_parts": MIN_UNVERIFIED_LEAD_PARTS,
+            "mob_contradiction_rows": MIN_MOB_CONTRADICTION_ROWS,
         },
         "counts": outcome["counts"], "findings": found, "items": outcome["items"],
-        "rule": ("这三格不是引擎算不出，是台账/主数据没跟上：齐套行登记世代、"
-                 "可重跑补齐的缺行单、外购缺口的供应商。缩到阈值以下自动关闭。"),
+        "rule": ("这几格不是引擎算不出，是台账/主数据没跟上：齐套行登记世代、可重跑补齐的缺行单、"
+                 "外购缺口的供应商、没量过的提前期、自制/外购两列矛盾。缩到阈值以下自动关闭。"),
     }
