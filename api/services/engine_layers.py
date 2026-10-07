@@ -32,7 +32,9 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
             "direction_hit_rate": 1.0,      # 符号错就是模型坏，不是精度问题
             "ci_width_steps": 1.5,           # 90% 置信区间宽过 1.5 个档距就等于没测出来
             "elastic_ci_usable": 0.5},      # 至少一半杠杆的弹性是"测得出来的"，才算这一层成立
-    "L2B": {"backtest_mape": 0.20, "bottleneck_hit_rate": 0.70},
+    "L2B": {"backtest_mape": 0.20,        # 预测与实际工期之比，偏差 20% 以内才算能用
+            "backtest_min_pairs": 10,      # 少于 10 张成对样本不判线（3 张能算出数但说明不了精度）
+            "bottleneck_hit_rate": 0.70},
     "L3": {"retest_improvement_days": 0.5,  # 推荐相对基线至少要值半天，否则别推荐
            "adoption_rate": 0.30,           # 人真采纳过；全被引擎自己取代 = 没人看
            "flip_rate": 0.20},              # 推荐反复翻转说明结论不稳
@@ -333,20 +335,30 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
     from api.services.sim_sensitivity import mapping_accuracy
     acc = await mapping_accuracy(db, factory_id, models)
     # 瓶颈命中率：仿真点名的瓶颈件 vs 台账里该机型缺口最大的外购料号
+    # 台账瓶颈必须归到**整机机种**再比：工单有下级自制件子单（实测机械厂 791 张有父单），
+    # 子单上的 product_id 是 SAP 组件号（1000461205 这类），直接按它分组的话
+    # 17 个"机种"里有 16 个根本不是机种，和仿真的整机瓶颈永远对不上（实测滚一层就够：16/17 落回 A-50-04-F）
     hit_rows = (await db.execute(text("""
-        -- product_id 有两种存法（UUID 或机种编码），两种都要归到机种编码上，
-        -- 否则"台账瓶颈"与"仿真瓶颈"永远对不到一起（n=1 那种假命中率就是这么来的）
-        SELECT COALESCE(p.product_code, o.product_id) AS model,
-               (ARRAY_AGG(w.material_code ORDER BY w.shortage_qty DESC))[1] AS top_short_code
-        FROM work_order_materials w
-        JOIN work_orders o ON o.id = w.work_order_id
-        LEFT JOIN products p ON p.factory_id = o.factory_id
-             AND (p.id::text = o.product_id OR p.product_code = o.product_id)
-        WHERE o.factory_id = :fid AND w.item_type = 'buy' AND COALESCE(w.shortage_qty,0) > 0
-          AND o.status NOT IN ('completed','cancelled')
-        GROUP BY 1
+        WITH led AS (
+            SELECT w.material_code, w.shortage_qty,
+                   COALESCE(pp.product_code, p.product_code, o.product_id) AS model
+            FROM work_order_materials w
+            JOIN work_orders o ON o.id = w.work_order_id
+            LEFT JOIN products p ON p.factory_id = o.factory_id
+                 AND (p.id::text = o.product_id OR p.product_code = o.product_id)
+            LEFT JOIN work_orders par ON par.id = o.parent_work_order_id
+            LEFT JOIN products pp ON pp.factory_id = par.factory_id
+                 AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+            WHERE o.factory_id = :fid AND w.item_type = 'buy'
+              AND COALESCE(w.shortage_qty,0) > 0
+              AND o.status NOT IN ('completed','cancelled'))
+        SELECT model,
+               (ARRAY_AGG(material_code ORDER BY shortage_qty DESC))[1] AS top_short_code,
+               COUNT(*) AS short_lines
+        FROM led GROUP BY 1
     """), {"fid": factory_id})).mappings().all()
     ledger = {str(r["model"]): str(r["top_short_code"]) for r in hit_rows}
+    ledger_lines = {str(r["model"]): int(r["short_lines"] or 0) for r in hit_rows}
     from api.services.virtual_run import derive_targets, scan_policies
     targets = await derive_targets(db, factory_id, models, days_of_output=6.0, lead_margin=1.15)
     scan = await scan_policies(db, factory_id, targets,
@@ -357,30 +369,98 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
            for d in detail if d.get("bottleneck_part")}
     both = [m for m in sim if m in ledger]
     hits = sum(1 for m in both if sim[m] == ledger[m])
-    mape = (await db.execute(text("""
-        SELECT COUNT(*) FROM work_orders w
-        WHERE w.factory_id = :fid AND w.actual_complete IS NOT NULL
-          AND EXISTS (SELECT 1 FROM aps_schedule_tasks t WHERE t.work_order_id = w.id)
-    """), {"fid": factory_id})).scalar()
+    # 回测不靠 aps_schedule_tasks（实测已完工 28 张里 0 张留有排程任务行，等于永远回测不了）：
+    # 用"计划开工日为今天、按现主数据重跑一次"得到预测完工日，与实际完工日成对比。
+    # 局限必须一起报：重跑用的是**现在**的 BOM/工时/提前期，不是当时的主数据快照。
+    from datetime import date as _date, timedelta as _td
+    from api.services.virtual_run import scan_policies as _scan
+
+    pairs, skipped = [], {"no_planned_start": 0, "model_not_in_bom": 0}
+    done_rows = (await db.execute(text("""
+        SELECT o.id, o.planned_start, o.planned_due, o.actual_complete,
+               o.planned_qty AS qty,
+               COALESCE(pp.product_code, p.product_code, o.product_id) AS model
+        FROM work_orders o
+        LEFT JOIN products p ON p.factory_id = o.factory_id
+             AND (p.id::text = o.product_id OR p.product_code = o.product_id)
+        LEFT JOIN work_orders par ON par.id = o.parent_work_order_id
+        LEFT JOIN products pp ON pp.factory_id = par.factory_id
+             AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+        WHERE o.factory_id = :fid AND o.status = 'completed'
+          AND o.actual_complete IS NOT NULL
+        ORDER BY o.actual_complete DESC LIMIT 60
+    """), {"fid": factory_id})).mappings().all()
+    for r in done_rows:
+        model = str(r["model"] or "")
+        start, due, actual = r["planned_start"], r["planned_due"], r["actual_complete"]
+        if start is None or due is None:
+            skipped["no_planned_start"] += 1
+            continue
+        has_bom = (await db.execute(text(
+            "SELECT 1 FROM bom_items WHERE factory_id=:fid AND product_id=:m LIMIT 1"
+        ), {"fid": factory_id, "m": model})).first()
+        if not has_bom:
+            skipped["model_not_in_bom"] += 1
+            continue
+        start_d = start.date() if hasattr(start, "date") else _date.fromisoformat(str(start)[:10])
+        due_d = due.date() if hasattr(due, "date") else _date.fromisoformat(str(due)[:10])
+        actual_d = actual.date() if hasattr(actual, "date") else _date.fromisoformat(str(actual)[:10])
+        units = float(r["qty"] or 0) or 1.0
+        scan = await _scan(db, factory_id,
+                           [{"model_code": model, "units": units,
+                             "due_in_days": max(1, (due_d - start_d).days)}],
+                           today=start_d,
+                           policies=[{"name": "基准", "allow_partial": True}],
+                           scenarios=[{"name": "基准", "attendance": 0.97}])
+        sols = (((scan.get("by_scenario") or {}).get("基准") or {}).get("solutions") or [{}])
+        det = sols[0].get("detail") or []
+        pred = det[0].get("finish_date") if det else None
+        if not pred:
+            continue
+        pred_d = _date.fromisoformat(str(pred)[:10])
+        err = abs((pred_d - actual_d).days)
+        span = max(1, (actual_d - start_d).days)
+        pairs.append({"work_order_id": str(r["id"]), "model": model, "units": units,
+                      "planned_start": str(start_d), "planned_due": str(due_d),
+                      "actual_complete": str(actual_d), "sim_predicted_finish": str(pred_d),
+                      "error_days": err, "actual_span_days": span})
+    mape_value = (round(sum(p["error_days"] for p in pairs)
+                        / max(1, sum(p["actual_span_days"] for p in pairs)), 4)
+                  if pairs else None)
+    mape = len(pairs)
     priced = float(acc.get("overall_accuracy") or 0)
     return {"metrics": [
         _metric(
             "瓶颈位置命中率", round(hits / len(both), 3) if both else None,
             THRESHOLDS["L2B"]["bottleneck_hit_rate"], "gte", "",
             f"可比 {len(both)} 台：仿真点名的瓶颈件 == 台账缺口最大的外购料号",
-            n=len(both), min_n=3,
-            missing=(f"可比台数 {len(both)}：仿真按 BOM 机种编码（如 A-50-04-F），"
-                     f"台账工单的 product_id 存的是 SAP 产品号（如 1000461205），"
-                     f"两边产品键没对齐 —— 对不上不是命中率低，是根本没在同一口径上比；"
-                     f"属 #55 家底清单里的键/单位对齐项"),
+            n=len(both), min_n=5,
+            missing=(f"可比机种只有 {len(both)} 个（判线要 ≥5）：产品键本身能归一"
+                     f"（products.product_code 对上 159/160 个工单键，子单滚一层再并进来），"
+                     f"卡住的是**外购缺口行的覆盖面** —— 工单键能归一，但缺口行只落在 "
+                     f"{len(ledger_lines)} 个机种上："
+                     + "、".join(f"{k} {v} 行" for k, v in
+                                 sorted(ledger_lines.items(), key=lambda x: -x[1])[:4])
+                     + f"；仿真这轮给出瓶颈件的机种有 {len(sim)} 个，交集只有 {len(both)} 个。"
+                       "这是齐套行没生成，不是算法命中率低"),
         ),
-        _metric("回测 MAPE", None, THRESHOLDS["L2B"]["backtest_mape"], "lte", "",
-                "需要「同一张单的预测完工日 + 实际完工日」成对样本",
-                missing=("已完工单里没有留存对应排程任务行（可回测样本 0 张）；"
-                         "要能算，下达时要把预测完工日落到工单上（新约定），否则永远回测不了")),
+        _metric("回测 MAPE", mape_value, THRESHOLDS["L2B"]["backtest_mape"], "lte", "",
+                "已完工单按计划开工日重跑一次沙箱（政策=现况、好天），比预测完工日与实际完工日；"
+                "误差按实际工期归一。**已知偏差方向**：重跑用的是**今天**的库存与提前期，"
+                "历史单当时'料还没到'今天已不成立 → 沙箱会判得偏早（实测 3 张样本全部偏早，"
+                "偏差等于整段实际工期）。所以这一格即使样本够也只能当下限看，"
+                "真要精度回测需要当时的齐套/库存快照（见 #54）",
+                n=mape, min_n=THRESHOLDS["L2B"]["backtest_min_pairs"],
+                missing=(f"成对样本 {mape} 张（判线要 ≥{THRESHOLDS['L2B']['backtest_min_pairs']} 张）："
+                         f"已完成且有实际完工日 {len(done_rows)} 张，其中"
+                         f" {skipped['no_planned_start']} 张没留计划开工日、"
+                         f" {skipped['model_not_in_bom']} 张的机种在 BOM 里没有行。"
+                         "要补的是下达/完工时把计划开工日与预测完工日一起落到工单上（#54）")),
         _metric("输入映射精度", round(priced / 100.0, 3), None, "gte", "0~1",
                 "六项输入的加权覆盖率（工时/提前期/供应商/库存/自制外购/单价），只作分母透明化"),
     ], "sim_bottleneck": sim, "ledger_top_short": ledger,
+        "ledger_short_lines": ledger_lines,
+        "backtest_pairs": pairs[:12], "backtest_skipped": skipped,
         "backtest_pairs_available": int(mape or 0)}
 
 
