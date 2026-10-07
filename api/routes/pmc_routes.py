@@ -666,6 +666,27 @@ async def get_decision_ledger(
     return out
 
 
+@router.get("/measurement-priority", summary="该先量哪些件：决定开工日那一档、几个件、量出来值几天")
+async def get_measurement_priority(
+    factory_id: str = Query(..., description="厂区"),
+    models: str = Query("", description="逗号分隔机种；留空取 BOM 最完整的几个"),
+    units: float = Query(0, description="每台单数量，0=按 1200 台"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把"数据不全"换成一张能干的活：先量哪一档、要不要一起量、量出来交期差几天。
+
+    只量其中一个没用 —— 并列最长档有 349 个件时，交期由那一档整体决定。
+    校准比（实测÷台账）来自本厂采购实测；一个都没有时会明确写"只是量级演示"，不拿去承诺。
+    """
+    del current_user
+    from core.mes.measurement_priority import measurement_priority
+
+    codes = [m.strip() for m in str(models or "").split(",") if m.strip()]
+    return await measurement_priority(db, factory_id, models=codes or None,
+                                      units=(float(units) if units else None))
+
+
 @router.get("/data-evidence", summary="料号提前期的证据普查：台账值是不是量出来的，一调就知道")
 async def get_data_evidence(
     factory_id: str = Query(..., description="厂区"),
