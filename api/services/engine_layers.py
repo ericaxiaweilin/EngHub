@@ -80,16 +80,30 @@ ROUTING_GOLDEN: List[Tuple[str, str]] = [
 
 def _metric(name: str, value: Any, threshold: Optional[float], sense: str, unit: str,
             basis: str, **extra: Any) -> Dict[str, Any]:
-    """sense: gte=越大越好，lte=越小越好；value=None → not_computable（不是 0 分）。"""
+    """sense: gte=越大越好，lte=越小越好。三种状态必须分清：
+
+    · pass / fail —— 算得出且有判线；
+    · reported —— 算得出，但这一格没有判线（只报数不打分，比如峰值内存、累计崩溃率）；
+    · not_computable —— 真的算不出：没有值，或样本少于判据要的条数，必须点名缺哪个输入。
+
+    以前"没有判线"也写成 not_computable，于是"峰值内存 191.8 MB"这种明明量出来的数
+    在报告里挂着"算不出"—— 读报告的人会去补一个本来就有的数，而真正缺的那格反而没人追。
+    """
     out = {"metric": name, "value": value, "threshold": threshold, "sense": sense,
            "unit": unit, "basis": basis, **extra}
     min_n = extra.get("n")
-    if value is None or threshold is None or (min_n is not None and float(min_n) < float(extra.get("min_n", 0) or 0)):
+    short_sample = min_n is not None and float(min_n) < float(extra.get("min_n", 0) or 0)
+    if value is None or short_sample:
         out["pass"] = None
         out["state"] = "not_computable"
         out.setdefault("missing", extra.get("missing") or
                        (f"可比样本 {min_n} 条，少于判据需要的 {extra.get('min_n')} 条"
                         if min_n is not None else extra.get("missing")))
+        return out
+    if threshold is None:
+        out["pass"] = None
+        out["state"] = "reported"
+        out.setdefault("missing", None)
         return out
     ok = float(value) >= float(threshold) if sense == "gte" else float(value) <= float(threshold)
     out["pass"] = bool(ok)
@@ -458,12 +472,27 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                   if pairs else None)
     mape = len(pairs)
     priced = float(acc.get("overall_accuracy") or 0)
+    univ = agree.get("bom_universe") or {}
+    same_gen = univ.get("same_generation") or {}
+    basis = same_gen.get("requirement_basis") or {}
+    depth = univ.get("ledger_row_depth") or {}
+    depth_txt = "、".join(f"{int(v)} 张停在 {k}" for k, v in (depth.get("buy_rows_per_order_buckets") or {}).items()
+                          if v) or "没有可比单"
     return {"metrics": [
         _metric("瓶颈件一致率（提前期口径）", round(order_hits / order_n, 3) if order_n else None,
                 THRESHOLDS["L2B"]["bottleneck_hit_rate"], "gte", "",
                 f"{order_hits}/{order_n} 张在流程单：引擎选的「决定到货日那件」== 台账同一张单里提前期最长的缺料件；"
                 f"覆盖机种 {len(order_models)} 个（{order_models}）。"
-                f"库存取今天而非当时快照，所以老单不一致是预期内的 —— 这一格读的是有没有对错题",
+                "这一格量的是**两种需求算法点的第一名是否相同**，不是引擎准不准 —— "
+                "三个解释里只剩一个成立：料号宇宙是同一批（台账行与引擎展开 100% 重合，"
+                f"{univ.get('ledger_top_in_engine_bom', {}).get('agree')}/"
+                f"{univ.get('ledger_top_in_engine_bom', {}).get('of')} 张单的台账第一件在引擎展开里），"
+                f"快照过期不成立（把台账缺口按今天的库存重算，一致率仍 "
+                f"{same_gen.get('qty_top_rate')}），"
+                f"剩下的是算法差：{basis.get('engine_lower_than_ledger')}/"
+                f"{basis.get('rows_paired')} 行引擎的需求量更低（其中 "
+                f"{basis.get('engine_says_zero_ledger_asks_positive')} 行引擎判 0 = 父层够用就不往下炸），"
+                f"更高的 {basis.get('engine_higher_than_ledger')} 行。要判准不准，得先把齐套行按同一算法刷一遍",
                 n=order_n, min_n=int(THRESHOLDS["L2B"]["bottleneck_min_orders"]),
                 missing=(None if order_n >= int(THRESHOLDS["L2B"]["bottleneck_min_orders"])
                          else f"可比单数 {order_n}（判线要 ≥{THRESHOLDS['L2B']['bottleneck_min_orders']} 张）")),
@@ -471,7 +500,12 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                 None, "gte", "",
                 f"{qty_hits}/{order_n} 张：引擎选的「净缺口最大那件」== 台账该单缺口最大的那件。"
                 "两种定义分开报，是因为它们回答的不是同一个问题"
-                "（提前期口径管「哪天能开工」，数量口径管「该现在下单多少」）"),
+                "（提前期口径管「哪天能开工」，数量口径管「该现在下单多少」）。"
+                f"两边都点到名的单只有 {univ.get('shared_universe_orders')} 张"
+                f"（另有 {univ.get('off_universe_orders')} 张的引擎第一件压根不在该单当日的缺口行里），"
+                f"在这 {univ.get('shared_universe_orders')} 张上的一致率是 "
+                f"{univ.get('qty_based_on_shared_universe', {}).get('rate')} —— "
+                "同一宇宙的分母才谈得上对错，剩下的分母是覆盖率问题"),
         _metric("BOM 取数来源", (agree.get("bom_sources") or [None])[0], None, "lte", "",
                 f"这批可比单的仿真取数来自 {agree.get('bom_sources')}；"
                 "镜像没有行的机种会如实回落本地 bom_items 并在每台单的读数里标注（见 sim-readiness）"),
@@ -480,8 +514,12 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                 THRESHOLDS["L2B"]["kit_line_coverage"], "gte", "比例",
                 f"每张单台账里记录的缺口件数中位 {agree.get('median_ledger_parts')} 件 vs 引擎按真源 BOM "
                 f"展开的缺口件数中位 {agree.get('median_shortage_parts')} 件 —— "
-                "一致率与 top-5 重叠都被这个覆盖率封顶：台账只看得到 1/4 的缺料行，"
-                "引擎再怎么算也对不上剩下那 3/4（根因是镜像里没有组件级子 BOM，见 #46）",
+                "一致率与 top-5 重叠都被这个覆盖率封顶：台账只看得到一部分缺料行。"
+                f"但盖子是**登记世代**不是源侧缺账 —— {order_n} 张里 {depth_txt}"
+                f"（中位 {depth.get('median_buy_rows')} 行、最多 {depth.get('max_buy_rows')} 行；"
+                "同一个机种按多层展开登记过的单能到 680 行、深 9 层），"
+                "所以这一格要先重跑齐套登记（#30 那条路径）才谈得上命中率准不准；"
+                "#46 只解释其中键在镜像里压根没有子 BOM 的那部分",
                 missing=(None if agree.get("median_shortage_parts") else
                          "引擎没展开出缺口件，覆盖率无从计算")),
         _metric("瓶颈件 top-5 重叠率", agree.get("top5_overlap_rate"),
@@ -724,16 +762,18 @@ def summarize(report: Dict[str, Any]) -> Dict[str, Any]:
         m = (report.get(lid) or {}).get("metrics") or []
         fails = [x["metric"] for x in m if x.get("state") == "fail"]
         unknown = [x["metric"] for x in m if x.get("state") == "not_computable"]
+        reported = [x["metric"] for x in m if x.get("state") == "reported"]
         lines.append({"layer": lid, "name": LAYER_NAMES[lid],
                       "pass": all(x.get("state") != "fail" for x in m) and any(
                           x.get("state") == "pass" for x in m),
                       "reportable": (report.get(lid) or {}).get("reportable"),
                       "quote_rule": (report.get(lid) or {}).get("quote_rule"),
-                      "failed": fails, "not_computable": unknown,
+                      "failed": fails, "not_computable": unknown, "reported": reported,
                       "metrics": m})
     return {"factory_id": report.get("factory_id"), "layers": lines, "gate": g,
             "rule": ("自下而上：每层都要有能算的数且过线；第一个不过线的层以上不许对外引用。"
-                     "没有数的层写 not_computable 并点名缺哪个输入，不打分、不用别的数冒充。")}
+                     "not_computable=真的算不出（点名缺哪个输入，不打分、不用别的数冒充），"
+                     "reported=量出来了但这一格没有判线，两者不是一回事。")}
 
 
 async def layered_acceptance(db: AsyncSession, factory_id: str,

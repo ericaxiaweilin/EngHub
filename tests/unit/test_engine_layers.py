@@ -19,6 +19,24 @@ def test_metric_without_source_is_not_computable():
     assert m["state"] == "not_computable" and "没有排程行" in m["missing"]
 
 
+def test_a_measured_number_without_a_threshold_is_reported_not_missing():
+    """量出来了但没有判线 → reported。以前这格写 not_computable，"峰值内存 191.8 MB"
+    明明有数却在报告里说算不出，读的人会去补一个本来就有的数。"""
+    m = el._metric("峰值内存", 191.8, None, "lte", "MB", "只报数不判线")
+    assert m["state"] == "reported" and m["pass"] is None and m["value"] == 191.8
+    assert m["missing"] is None
+
+
+def test_reported_metrics_keep_the_layer_computable():
+    """只有 reported + pass 的层不能因为"没判线"就被当成整层没数。"""
+    def layer(*states):
+        return {"metrics": [{"metric": f"m{i}", "state": st} for i, st in enumerate(states)]}
+    report = {"L1": layer("pass", "reported"), "L2A": layer("pass"), "L2B": layer("pass"),
+              "L3": layer("pass"), "L4": layer("pass")}
+    out = el.gate(report)
+    assert out["first_unmet_layer"] is None and len(out["reportable_through"]) == 5
+
+
 def test_gate_blocks_everything_above_the_first_failing_layer():
     """L1 崩了，上面四层再漂亮都不许引用 —— 这是这份验收唯一的目的。"""
     def layer(*states):

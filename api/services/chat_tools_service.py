@@ -2683,7 +2683,8 @@ async def _tool_query_engine_capability_layers(
     return {"status": "ok", "factory_id": fid, "has_data": True, "models": models,
             "gate": out.get("gate"), "rule": out.get("rule"),
             "layers": [{k: line.get(k) for k in ("layer", "name", "pass", "reportable",
-                                                  "quote_rule", "failed", "not_computable", "metrics")}
+                                                  "quote_rule", "failed", "not_computable",
+                                                  "reported", "metrics")}
                        for line in out.get("layers") or []],
             "note": ("任何 reportable=false 的层，它的数只能内部看；"
                      "not_computable 的项要连缺哪个输入一起说，不许折算成 0 分或别的数")}

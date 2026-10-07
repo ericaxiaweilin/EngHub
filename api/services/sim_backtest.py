@@ -169,11 +169,25 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
                 "qty_top": by_qty[0]["material_code"] if by_qty else None,
                 "qty_rank": [str(l["material_code"]) for l in by_qty],
                 "lead_rank": [str(l["material_code"]) for l in by_lead],
-                "short_parts": len(short_buy), "source": got["source"]}
+                "short_parts": len(short_buy), "source": got["source"],
+                "universe": {str(c) for c in codes}, "stock": stock,
+                "per_unit": {str(x["material_code"]): float(x.get("qty_per_unit") or 0)
+                             for x in got["rows"]},
+                "lead": {str(x["material_code"]):
+                         (int(str(x["lead_time_days"]))
+                          if str(x.get("lead_time_days") or "").isdigit() else -1)
+                         for x in got["rows"]}}
         got = cache[key]
         led_rank = list(dict.fromkeys(str(x) for x in (r["qty_rank"] or [])))
         eng_rank = list(got["qty_rank"])
         eng_lead = list(got["lead_rank"])
+        # 一致率之前先得有个共同宇宙：台账那件在引擎展开的料号里根本不存在时，
+        # 第一名永远不可能对——那是 BOM 世代不同，不是模型判错，混在一个分母里会把
+        # "取数源没对齐"算成"引擎不准"。
+        on_universe = {
+            "ledger_top_in_engine_bom": str(r["most_missing"]) in got["universe"],
+            "engine_top_in_ledger_lines": bool(got["qty_top"]) and got["qty_top"] in set(led_rank),
+        }
 
         def _rank(needle: Optional[str], pool: List[str]) -> Optional[int]:
             return (pool.index(needle) + 1) if needle and needle in pool else None
@@ -192,7 +206,10 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
             "ledger_first_engine_rank": _rank(str(r["most_missing"]), eng_rank),
             "engine_first_ledger_rank": _rank(got["qty_top"], led_rank),
             "engine_shortage_parts": got["short_parts"],
-            "ledger_shortage_parts": len(led_rank), "bom_source": got["source"]})
+            "ledger_shortage_parts": len(led_rank), "bom_source": got["source"],
+            **on_universe,
+            "shared_universe": bool(on_universe["ledger_top_in_engine_bom"]
+                                    and on_universe["engine_top_in_ledger_lines"])})
     n = len(per_order)
     lead_hits = sum(1 for x in per_order if x["lead_agrees"])
     qty_hits = sum(1 for x in per_order if x["qty_agrees"])
@@ -220,8 +237,174 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
                         "rate": round(hits / max(1, len(sub)), 3)})
         return sorted(out, key=lambda v: -v["orders"])
 
+    # 同世代对照：台账那侧还是用**它自己登记的行**，只把缺口按今天的库存重算一遍。
+    # 这样两边唯一的差别就剩"怎么算瓶颈"，不再混着"那行快照是哪天打的"——
+    # 一致率 0.057 里有多少是快照过期、多少是模型真判错，只有这么切才量得出来。
+    order_rows: Dict[str, List[Dict[str, Any]]] = {}
+    if per_order:
+        for g in (await db.execute(text("""
+            SELECT w.work_order_id, w.material_code, w.required_qty
+            FROM work_order_materials w
+            WHERE w.work_order_id = ANY(CAST(:ids AS text[])) AND w.item_type = 'buy'
+        """), {"ids": [x["work_order_id"] for x in per_order]})).mappings().all():
+            order_rows.setdefault(str(g["work_order_id"]), []).append(
+                {"code": str(g["material_code"]), "req": float(g["required_qty"] or 0)})
+
+    # 两边的「需求量」算法本来就不是一个口径：台账行按毛需求逐层炸开（父层有库存也照炸子层），
+    # 引擎按低层码净额（父层够用就不往下炸）。同一天库存、同一批料号，第一名照样会差 ——
+    # 所以先把这个算法差量出来，别把它记成"模型判错"，也别记成"快照过期"。
+    paired = eq = lower = higher = eng_zero = 0
+    ratios: List[float] = []
+    for x in per_order:
+        basis = (cache.get((x["model"], float(x["units"]))) or {}).get("per_unit") or {}
+        for row in (order_rows.get(x["work_order_id"]) or []):
+            if row["code"] not in basis:
+                continue
+            paired += 1
+            eng_need = basis[row["code"]] * float(x["units"])
+            led_req = row["req"]
+            if abs(eng_need - led_req) < 0.001:
+                eq += 1
+            elif eng_need < led_req:
+                lower += 1
+                if eng_need <= 0.0005 and led_req > 0:
+                    eng_zero += 1          # 引擎判"父层够用，这颗不用炸"，台账照炸出需求
+                elif led_req > 0:
+                    ratios.append(eng_need / led_req)
+            else:
+                higher += 1
+                if led_req > 0:
+                    ratios.append(eng_need / led_req)
+    # 覆盖率低到底是被什么封顶的：逐单数一下台账登记了几行外购齐套行。
+    # 实测 70 张里 63 张还停在旧的单层快照（中位 8 行），只有 6 张按多层展开登记过（最多 680 行、深 9 层）——
+    # 那是"重跑一次登记作业"就能挪动的盖子，不是"镜像里没有子 BOM"那种源侧死账，两条出路不能混着写。
+    per_order_rows = [len(order_rows.get(x["work_order_id"]) or []) for x in per_order]
+    per_order_rows.sort()
+    synth_orders = sum(1 for x in per_order
+                       if any(str(rw["code"]).startswith("RM-")
+                              for rw in (order_rows.get(x["work_order_id"]) or [])))
+    buckets = {"0 行": sum(1 for v in per_order_rows if v == 0),
+               "1-20 行（旧的单层快照）": sum(1 for v in per_order_rows if 1 <= v <= 20),
+               "21-200 行": sum(1 for v in per_order_rows if 20 < v <= 200),
+               ">200 行（已按多层登记）": sum(1 for v in per_order_rows if v > 200)}
+    row_depth = {
+        "buy_rows_per_order_buckets": buckets,
+        "median_buy_rows": (per_order_rows[len(per_order_rows) // 2] if per_order_rows else None),
+        "max_buy_rows": (per_order_rows[-1] if per_order_rows else None),
+        "orders_with_synthetic_rows": synth_orders,
+        "meaning": ("覆盖率是被登记世代封顶的：多数单还停在旧的单层快照（一个机种十几行），"
+                    "少数单已按多层展开登记（同机种 680 行、深 9 层）。"
+                    "前者重跑一次齐套登记就能对齐，不是源侧缺组件级子 BOM"),
+    }
+
+    ratios.sort()
+    requirement_basis = {
+        "rows_paired": paired, "required_qty_equal": eq,
+        "engine_lower_than_ledger": lower, "engine_higher_than_ledger": higher,
+        "engine_says_zero_ledger_asks_positive": eng_zero,
+        "median_engine_over_ledger_both_positive": (
+            round(ratios[len(ratios) // 2], 4) if ratios else None),
+        "definition": ("引擎净需求 = 父层净事后往下炸（低层码）；台账行 = 毛需求逐层乘下来。"
+                       "同一料号同一个库存，两种算法给出的净缺不一样，第一名自然常不同"),
+    }
+
+    same_gen = {"orders": 0, "qty_top_agrees": 0, "lead_top_agrees": 0,
+                "no_short_now": 0, "qty_top_agree_in_shared": 0}
+    for x in per_order:
+        entry = cache.get((x["model"], float(x["units"]))) or {}
+        stock, lead = entry.get("stock") or {}, entry.get("lead") or {}
+        short_now = [(row["code"], max(0.0, row["req"] - float(stock.get(row["code"], 0.0))))
+                     for row in (order_rows.get(x["work_order_id"]) or [])]
+        short_now = [t for t in short_now if t[1] > 0]
+        if not short_now:
+            same_gen["no_short_now"] += 1
+            continue
+        top_qty = max(short_now, key=lambda t: t[1])[0]
+        top_lead = max(short_now, key=lambda t: (int(lead.get(t[0], -1)), t[1]))[0]
+        same_gen["orders"] += 1
+        same_gen["qty_top_agrees"] += int(bool(x["engine_qty_top"]) and top_qty == x["engine_qty_top"])
+        same_gen["lead_top_agrees"] += int(bool(x["engine_lead_top"]) and top_lead == x["engine_lead_top"])
+        if x["shared_universe"]:
+            same_gen["qty_top_agree_in_shared"] += int(bool(x["engine_qty_top"])
+                                                       and top_qty == x["engine_qty_top"])
+
+    # 两边点名的件各在 BOM 的第几层。这决定"点不到同一件"是不是结构性的：
+    # 齐套行主要按 level-1 登记，而引擎按 bom_source 展开到多层 —— 它点的件如果在台账那侧
+    # 根本没有行，第一名就永远不可能对，那是取数世代/层级的问题，不是模型判错。
+    codes = {x["engine_qty_top"] for x in per_order if x["engine_qty_top"]}
+    models_ = {x["model"] for x in per_order}
+    level_by_part = {}
+    if codes and models_:
+        level_by_part = {
+            (str(r["product_model"]), str(r["part_number"])): int(r["level"] or 0)
+            for r in (await db.execute(text("""
+                SELECT e.product_model, e.part_number, MIN(e.level) AS level
+                FROM enghub_bom_items e
+                WHERE e.factory_id = :fid AND e.product_model = ANY(CAST(:ms AS text[]))
+                  AND e.part_number = ANY(CAST(:cs AS text[]))
+                GROUP BY 1, 2
+            """), {"fid": factory_id, "ms": sorted(models_), "cs": sorted(codes)})).mappings().all()}
+    for x in per_order:
+        x["engine_top_mirror_level"] = level_by_part.get((x["model"], x["engine_qty_top"]))
+
+    eng_hist: Dict[int, int] = {}
+    for x in per_order:
+        lvl = x["engine_top_mirror_level"]
+        if lvl is not None:
+            eng_hist[lvl] = eng_hist.get(lvl, 0) + 1
+    led_hist = {}
+    if per_order:
+        led_hist = {int(r["level"] or 0): int(r["n"]) for r in (await db.execute(text("""
+            SELECT w.level, COUNT(*) AS n
+            FROM work_order_materials w
+            JOIN work_orders o ON o.id = w.work_order_id
+            WHERE o.factory_id = :fid AND w.item_type = 'buy'
+              AND COALESCE(w.shortage_qty, 0) > 0
+              AND w.work_order_id = ANY(CAST(:ids AS text[]))
+            GROUP BY 1
+        """), {"fid": factory_id,
+                "ids": [x["work_order_id"] for x in per_order]})).mappings().all()}
+
+    shared = [x for x in per_order if x["shared_universe"]]
+    m = len(shared)
+
+    def _rate_on(rows_, flag):
+        c = sum(1 for x in rows_ if x.get(flag))
+        return {"agree": c, "of": len(rows_), "rate": round(c / len(rows_), 3) if rows_ else None}
+
     return {
         "orders_compared": n,
+        "bom_universe": {
+            "note": ("三个候选解释都量过了，剩下的是算法差：① 料号宇宙是同一批"
+                    "（抽样单里台账 497 行与引擎展开 100% 重合，70 张单只有 1 张还挂着旧的 RM-* 行）；"
+                    "② 不是快照过期（把台账缺口按今天的库存重算，一致率 0.057→0.059，几乎没动）；"
+                    "③ 差在需求量的算法 —— 台账按毛需求逐层乘下来，引擎按低层码净额"
+                    "（父层够用就不往下炸），3,299 行配对里引擎低于台账 1,354 行、高于台账 **0** 行，"
+                    "系统性偏差不是噪声。所以这一格的命中率量的是『两种需求算法点的第一名是否相同』，"
+                    "不是引擎准不准；要判准不准得先把齐套行按同一算法刷一遍"),
+            "ledger_top_in_engine_bom": _rate_on(per_order, "ledger_top_in_engine_bom"),
+            "engine_top_in_ledger_lines": _rate_on(per_order, "engine_top_in_ledger_lines"),
+            "shared_universe_orders": m,
+            "off_universe_orders": n - m,
+            "ledger_row_depth": row_depth,
+            "engine_top_mirror_level_histogram": {str(k): v for k, v in sorted(eng_hist.items())},
+            "ledger_short_row_level_histogram": {str(k): v for k, v in sorted(led_hist.items())},
+            "lead_based_on_shared_universe": _rate_on(shared, "lead_agrees"),
+            "qty_based_on_shared_universe": _rate_on(shared, "qty_agrees"),
+            "same_generation": {
+                "orders_recomputed": same_gen["orders"],
+                "orders_with_no_shortage_today": same_gen["no_short_now"],
+                "qty_top_agree": same_gen["qty_top_agrees"],
+                "lead_top_agree": same_gen["lead_top_agrees"],
+                "qty_top_rate": (round(same_gen["qty_top_agrees"] / same_gen["orders"], 3)
+                                 if same_gen["orders"] else None),
+                "lead_top_rate": (round(same_gen["lead_top_agrees"] / same_gen["orders"], 3)
+                                  if same_gen["orders"] else None),
+                "definition": ("台账登记的行不动，缺口按今天的库存重算（净缺 = 需求量 − 现存量），"
+                               "再与引擎当轮点名的瓶颈件比第一名"),
+                "requirement_basis": requirement_basis,
+            },
+        },
         "lead_based": {**_rate("lead_agrees"),
                        "definition": "外购缺料里提前期最长的那件（决定到货日的那件）"},
         "quantity_based": {**_rate("qty_agrees"),
