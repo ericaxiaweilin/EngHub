@@ -151,7 +151,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_lead_time_evidence",
-            "description": "提前期证据普查（只读）：回答『这个料号的提前期是量出来的还是台账铺的默认值』『台账说 12 天能不能信』『哪批件的提前期最该去实测』。并列四个出处：materials 台账、采购下单→实际到货实测（条数/中位/P90/最长）、仓收实测、供应商声明；每件给 verdict（measured / ledger_default_conflicts_with_measured / unverified_default / ledger_declared_only / no_lead_time_at_all），并摊开台账与实测的冲突。建议值只在 suggested_days，不回填台账。",
+            "description": "提前期证据普查（只读）。凡问某个料号/物料的提前期『能不能信、够不够、安不安全、能不能按它承诺交期、会不会太乐观、和实际差多少』，先调这个工具再回答：台账 lead_time_days 很可能是按类别铺出来的默认值（本厂 31,452 个外购料号只有 10 个不同取值），也可能与采购实测冲突（见过台账 7 天、实测中位 110 天）。"
+            "原话问『是量出来的还是铺的默认值』『哪批件最该去实测』也用它。并列四个出处：materials 台账、" "采购下单→实际到货实测（条数/中位/P90/最长）、仓收实测、供应商声明；每件给 verdict（measured / " "ledger_default_conflicts_with_measured / unverified_default / ledger_declared_only / no_lead_time_at_all），" "并摊开台账与实测的冲突。建议值只在 suggested_days，不回填台账。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3909,6 +3910,8 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "tool": "query_lead_time_evidence",
         "keywords": [
             "提前期准", "提前期可信", "提前期是不是", "提前期怎么来", "提前期多少天", "提前期几天",
+            "提前期够不够", "提前期安全", "提前期能不能", "提前期会不会", "提前期可靠", "台账提前期",
+            "提前期差多少", "实测到货",
             "是不是量出来", "量出来的", "铺的默认", "默认提前期", "台账默认值", "实测到货",
             "到货天数", "到货要多久", "供应商几天到", "交期靠得住",
         ],
