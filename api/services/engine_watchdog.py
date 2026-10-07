@@ -47,7 +47,7 @@ CHECK_HINT = ("复核：GET /api/v1/pmc/engine-layers（L1 那格用的就是这
               "docker logs enghub-engine --tail 50")
 
 OPEN_SQL = text("""
-    SELECT id, title, status, payload, created_at
+    SELECT id, title, description, status, payload, created_at
     FROM followup_tasks
     WHERE factory_id = :fid AND status NOT IN ('done', 'cancelled')
       AND payload->>'category' = :cat
@@ -296,7 +296,11 @@ def plan_actions(open_tasks: List[Dict[str, Any]],
         for duplicate in rows[1:]:
             actions.append({"action": "close_duplicate", "task_id": duplicate.get("id"),
                             "task": duplicate, "finding": finding})
-        if str(current["watchdog"].get("sig") or "") != finding["sig"]:
+        # 只看 sig 会漏掉一件事：sig 按 10/100 分档，档没跨过时把催办文案改准（补数据的人
+        # 靠描述知道该量哪一批）永远不会写回库里，收件箱留着的是旧说法。
+        if (str(current["watchdog"].get("sig") or "") != finding["sig"]
+                or str(current.get("title") or "") != str(finding.get("title") or "")
+                or str(current.get("description") or "") != str(finding.get("description") or "")):
             actions.append({"action": "refresh", "task_id": current.get("id"),
                             "task": current, "finding": finding})
         else:
