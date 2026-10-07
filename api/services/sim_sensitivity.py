@@ -290,8 +290,7 @@ async def mapping_accuracy(db: AsyncSession, factory_id: str,
     lines = [dict(r) for r in (await db.execute(vr.LINES_SQL, {"fid": factory_id})).mappings().all()]
     per_model: List[Dict[str, Any]] = []
     for model in models:
-        bom = [dict(r) for r in (await db.execute(
-            vr.BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
+        bom = (await vr.sim_bom_lines(db, factory_id, model, 1.0))["rows"]
         codes = [str(r["material_code"]) for r in bom]
         stock_rows = (await db.execute(vr.STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all() \
             if codes else []

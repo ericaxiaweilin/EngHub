@@ -77,6 +77,78 @@ BOM_SQL = text("""
     WHERE b.factory_id = :fid AND b.product_id = :model
 """)
 
+BOM_ATTR_SQL = text("""
+    SELECT x.code AS material_code, m.material_name, m.unit, m.make_or_buy,
+           m.lead_time_days, m.default_supplier, p.unit_price
+    FROM unnest(CAST(:codes AS text[])) AS x(code)
+    LEFT JOIN materials m ON m.material_code = x.code AND m.factory_id = :fid
+    LEFT JOIN (SELECT part_number, MAX(unit_price) AS unit_price
+                 FROM enghub_bom_items WHERE factory_id = :fid GROUP BY 1) p
+           ON p.part_number = x.code
+""")
+
+_ITEM_TYPE_CN = {"buy": "外购", "make": "自制"}
+
+
+async def sim_bom_lines(db: AsyncSession, factory_id: str, model: str,
+                        units: float) -> Dict[str, Any]:
+    """BOM 取数一律经 bom_source：镜像多层 → 镜像 level-1 → 本地 bom_items。
+
+    以前这里直接查 `bom_items`，而本厂的 `bom_items` 是 1,055 行 RM-* 合成料号
+    （SAP 料号 0 行），真结构 861 行在 engflow 镜像里 —— 仿真于是拿着演示 BOM 推真实工厂，
+    点名的瓶颈件永远对不上台账。回落不是错误，但必须说清用的是哪一头、镜像展开有哪些行接不上父级。
+    """
+    from api.services import bom_source as bs
+
+    units = max(1e-6, float(units or 0))
+    exp = await bs.explode_requirement(db, factory_id, model, units)
+    lines = [r for r in ((exp or {}).get("lines") or []) if r.get("material_code")]
+    source = "engflow_mirror_multi_level" if lines else None
+    problems = list((exp or {}).get("problems") or [])
+    if not lines:
+        mirror_rows, src = await bs.latest_bom_lines(db, factory_id, model)
+        if src == "engflow_mirror" and mirror_rows:
+            lines = [{"material_code": r["material_code"],
+                      "material_name": r.get("material_name"), "unit": r.get("unit"),
+                      "required_qty": float(r.get("qty_per_unit") or 0) * units,
+                      "item_type": None} for r in mirror_rows]
+            source = "engflow_mirror_level1"
+    if lines:
+        codes = [str(r["material_code"]) for r in lines]
+        attrs = {str(r["material_code"]): dict(r) for r in
+                 (await db.execute(BOM_ATTR_SQL, {"fid": factory_id, "codes": codes})).mappings().all()}
+        rows = []
+        for r in lines:
+            code = str(r["material_code"])
+            a = attrs.get(code) or {}
+            kind = (_ITEM_TYPE_CN.get(str(r.get("item_type") or ""), None)
+                    or str(a.get("make_or_buy") or "unknown"))
+            rows.append({"material_code": code,
+                         "material_name": r.get("material_name") or a.get("material_name") or code,
+                         "unit": r.get("unit") or a.get("unit") or "pcs",
+                         "qty_per_unit": round(float(r.get("required_qty") or 0) / units, 6),
+                         "make_or_buy": kind,
+                         "lead_time_days": a.get("lead_time_days"),
+                         "default_supplier": a.get("default_supplier"),
+                         "unit_price": (r.get("unit_price") if r.get("unit_price") is not None
+                                        else a.get("unit_price"))})
+        return {"rows": rows, "source": source, "problems": problems,
+                "levels": (exp or {}).get("max_level"), "parts": (exp or {}).get("parts"),
+                "buy_parts": (exp or {}).get("buy_parts"), "make_parts": (exp or {}).get("make_parts")}
+
+    rows = [dict(r) for r in (await db.execute(
+        BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
+    return {"rows": rows, "source": ("mes_bom_items" if rows else "none"),
+            "problems": (["engflow 镜像与本地 bom_items 都没有这个型号的物料清单"] if not rows else []),
+            "levels": None, "parts": len(rows), "buy_parts": None, "make_parts": None}
+
+
+async def sim_part_lead_days(db: AsyncSession, factory_id: str, part: str) -> List[int]:
+    """自制子件的到货/产出前置：同样经 bom_source，不再直查本地合成表。"""
+    got = await sim_bom_lines(db, factory_id, part, 1.0)
+    return [int(r["lead_time_days"]) for r in got["rows"]
+            if str(r.get("lead_time_days") or "").isdigit()]
+
 STOCK_SQL = text("""
     SELECT i.material_code, SUM(GREATEST(COALESCE(i.available_qty, 0), 0)) AS available
     FROM inventory i
@@ -335,17 +407,23 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     """把一个目标跑成一条演变时间线。"""
     cache = (cached or {}).get(model)
     if not cache:
-        bom = [dict(r) for r in (await db.execute(
-            BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
+        got = await sim_bom_lines(db, factory_id, model, units)
+        bom = got["rows"]
         codes = [str(r["material_code"]) for r in bom]
         stock_rows = (await db.execute(STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all() if codes else []
         stock = {str(r["material_code"]): float(r["available"] or 0) for r in stock_rows}
         route_own = await route_ops_for_product(db, factory_id, model)
         family_rows = [] if route_own else await load_family_route(db, factory_id, model)
         cache = {"bom": bom, "stock": stock,
-                 "route_own": [dict(o) for o in route_own], "family_rows": family_rows}
+                 "route_own": [dict(o) for o in route_own], "family_rows": family_rows,
+                 "bom_source": got["source"], "bom_problems": got["problems"],
+                 "bom_levels": got["levels"], "bom_parts": got["parts"]}
     bom, stock = cache["bom"], cache["stock"]
     route_own, family_rows = cache["route_own"], cache["family_rows"]
+    bom_source_label = cache.get("bom_source")
+    bom_problems = cache.get("bom_problems") or []
+    bom_parts = cache.get("bom_parts")
+    bom_levels = cache.get("bom_levels")
     route, route_basis = resolve_route(list(route_own), family_rows)
     line, line_basis = pick_line(model, lines)
     hours_per_unit, hours_basis = hours_per_unit_from(route, line)
@@ -363,10 +441,7 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     # 自制件要先做出来：按同一条线排队，占的是同一段时间（递归一层，深度有上限）
     child_days = 0
     for child in self_made_children[:MAX_MAKE_DEPTH]:
-        child_bom = [dict(r) for r in (await db.execute(
-            PART_BOM_SQL, {"fid": factory_id, "part": child["material_code"]})).mappings().all()]
-        leads = [int(r["lead_time_days"]) for r in child_bom
-                 if str(r["lead_time_days"] or "").isdigit()]
+        leads = await sim_part_lead_days(db, factory_id, str(child["material_code"]))
         child_days = max(child_days, (max(leads) + 1) if leads else 0)
 
     # 开工要排在三件事之后：料齐、子件做完、这条线手上已承诺的活干完
@@ -435,6 +510,8 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     return {
         "model_code": model, "units": units, "status": "simulated",
         "binding_terms": binding_terms,
+        "bom_source": bom_source_label, "bom_parts": bom_parts, "bom_levels": bom_levels,
+        "bom_problems": bom_problems,
         "route_steps": len(route), "route_basis": route_basis,
         "line": (line or {}).get("line_code"), "line_basis": line_basis,
         "hours_per_unit": hours_per_unit, "hours_basis": hours_basis,
@@ -1037,8 +1114,8 @@ async def build_policy_grid(db: AsyncSession, factory_id: str,
                                   {"name": "等齐套才开工（不分批）", "allow_partial": False}]
     leads = set()
     for t in targets:
-        bom = [dict(r) for r in (await db.execute(
-            BOM_SQL, {"fid": factory_id, "model": str(t["model_code"])})).mappings().all()]
+        bom = (await sim_bom_lines(db, factory_id, str(t["model_code"]),
+                                   float(t.get("units") or 1) or 1.0))["rows"]
         for r in bom:
             lead = str(r.get("lead_time_days") or "")
             if lead.isdigit() and int(lead) > 2:
@@ -1131,8 +1208,7 @@ async def derive_targets(db: AsyncSession, factory_id: str, models: List[str],
     for model in models:
         line, line_basis = pick_line(model, lines)
         per_day = float((line or {}).get("units_per_day") or 0)
-        bom = [dict(r) for r in (await db.execute(
-            BOM_SQL, {"fid": factory_id, "model": model})).mappings().all()]
+        bom = (await sim_bom_lines(db, factory_id, model, 1.0))["rows"]
         codes = [str(r["material_code"]) for r in bom]
         lead_rows = (await db.execute(text("""
             SELECT MAX(COALESCE(m.lead_time_days, 0)) AS max_lead
@@ -1323,6 +1399,10 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         "status": x["run"].get("status"), "line": x["run"].get("line"),
                         "why": x["run"].get("why"),
                         "binding_terms": x["run"].get("binding_terms"),
+                        "bom_source": x["run"].get("bom_source"),
+                        "bom_parts": x["run"].get("bom_parts"),
+                        "bom_levels": x["run"].get("bom_levels"),
+                        "bom_problems": (x["run"].get("bom_problems") or [])[:3],
                         "batches_released": x["run"].get("batches_released"),
                         "changeover_days_added": x["run"].get("changeover_days_added"),
                         "queue_days_before_this_order": x["run"].get("line_busy_days_before_order"),
