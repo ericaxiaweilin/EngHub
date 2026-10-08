@@ -1111,6 +1111,27 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_data_flow_profile",
+            "description": (
+                "仿真引擎的数据流节点剖面（只读，三层全部实测）：台账层——这座厂 18 类节点各有多少行、"
+                "合计多少行、最大一块是谁；图结构层——public 表数、有数据的表数、外键边数；"
+                "展开层——一台机一次推演真展开多少 BOM 行/料号/层级/工序/工作中心（镜像没有多层结构时"
+                "点名回落本地 bom_items，不装作展开了）；推演层——真跑一次经过多少齐套行、缺口行、"
+                "按天动作事件、班次日推进。给 headcount 时附规模层：人头类节点随规模动，"
+                "volume 类按吞吐等比外推『这座规模要多少台账行才推得动』（需求估算，不回填事实表），"
+                "主档/线/工位/日历属结构类，等比放大等于编数据。"
+                "用于『百人工厂有多少数据流节点』『千人工厂流经多少节点』『五千人厂要多少行台账』"
+                "『引擎一次推演到底读多少东西』类问题。不写任何系统。"),
+            "parameters": {"type": "object", "properties": {
+                "headcount": {"type": "number", "description": "目标人数规模（100/1000/5000），给了才出规模层"},
+                "sample_models": {"type": "integer", "description": "展开层抽样几台机，默认 2（1~4）"},
+                "with_run": {"type": "boolean", "description": "是否真跑一次推演层，默认 true"},
+            }},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_engine_attribution",
             "description": (
                 "引擎的因果归因（只读，走对外契约接口 attribution）：现在这个完工日被哪一项卡住"
@@ -3302,6 +3323,20 @@ async def _tool_query_simulation_sensitivity(
     }
 
 
+async def _tool_query_data_flow_profile(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """数据流节点剖面：三层都实测；缩放那一格只是需求外推，不回填任何事实表。"""
+    from core.mes.data_flow import data_flow_profile
+
+    fid = factory_id or "FAC_MECH_001"
+    hc = args.get("headcount")
+    return await data_flow_profile(
+        db, fid, headcount=(float(hc) if hc else None),
+        sample_models=int(args.get("sample_models") or 2),
+        run_sample=bool(args.get("with_run", True)))
+
+
 async def _tool_query_engine_attribution(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -4362,7 +4397,8 @@ _TOOL_EXECUTORS = {
     "query_sim_evidence_readiness": _tool_query_sim_evidence_readiness,
     "query_engine_capability_profile": _tool_query_engine_capability_profile,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
-    "query_simulation_sensitivity": _tool_query_simulation_sensitivity,    "query_engine_attribution": _tool_query_engine_attribution,
+    "query_simulation_sensitivity": _tool_query_simulation_sensitivity,
+    "query_data_flow_profile": _tool_query_data_flow_profile,    "query_engine_attribution": _tool_query_engine_attribution,
     "query_chain_convergence": _tool_query_chain_convergence,
     "query_plan_commit_gate": _tool_query_plan_commit_gate,
     "query_shortage_alerts": _tool_query_shortage_alerts,
@@ -4775,7 +4811,8 @@ TOOL_LABELS = {
     "query_engine_capability_layers": "引擎分层验收",
     "query_sim_evidence_readiness": "精度判据就绪度",
     "query_engine_capability_profile": "能力三格画像（总结/分析/推演）",
-    "query_simulation_sensitivity": "建模精度与敏感度",    "query_engine_attribution": "交期为什么是这个数（归因）",
+    "query_simulation_sensitivity": "建模精度与敏感度",
+    "query_data_flow_profile": "数据流节点剖面（台账/展开/推演/规模）",    "query_engine_attribution": "交期为什么是这个数（归因）",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
     "query_spc_anomalies": "SPC失控",
@@ -4852,6 +4889,13 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "supplier delay怎么处理", "供应商 delay 怎么处理", "供应商延迟怎么处理", "供应商延期怎么处理", "供应延迟怎么处理",
             "需要补齐什么数据", "需要补什么数据", "缺什么数据", "数据缺口", "数据完整性", "补齐数据", "补数清单",
         ],
+    },
+    {
+        # 节点剖面必须排在规模模型之前："千人工厂有多少数据流节点"两格关键词都有，
+        # 但它问的是台账/推演的节点计数，等比结构模型答不了这个 —— 具体问法先命中。
+        "tool": "query_data_flow_profile",
+        "keywords": ["数据流节点", "数据节点", "多少节点", "节点数", "节点剖面", "数据流",
+                     "台账有多少", "多少行台账", "流经多少", "data flow"],
     },
     {
         # "百人/千人/几千人厂"这类规模问题必须走引擎：让模型自己描述一座厂，
@@ -5586,6 +5630,11 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message)
         if due_match:
             args["rush_due_date"] = due_match.group(1)
+    elif tool == "query_data_flow_profile":
+        # "千人工厂有多少数据流节点"里的规模要传进去：规模层外推才是这问法要的答案
+        scale = _architecture_intent_args(message)
+        if scale.get("headcount"):
+            args["headcount"] = scale["headcount"]
     elif tool == "generate_plant_architecture":
         args.update(_architecture_intent_args(message))
         # 规模问题常带工况（"五千人的厂 40度90% 还能干吗"）：温度/湿度/工序沿用同一套抽取，
@@ -5700,6 +5749,8 @@ DETERMINISTIC_INTENT_TOOLS = frozenset({
     # "有几成概率准点/交期分布/哪个杠杆值钱"必须是抽过样、跑过档位的答案，
     # 模型会被要求给一个它没有的数字 —— 它没有分布，只有印象
     "query_simulation_sensitivity",
+    # "百人/千人工厂有多少数据流节点"：节点数在台账与真推演里，模型数不出来也不该猜
+    "query_data_flow_profile",
     "query_pmc_control_tower",
     "query_order_work_order_status",
     "query_manufacturing_intelligence",

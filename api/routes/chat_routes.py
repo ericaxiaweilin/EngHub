@@ -1309,11 +1309,34 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         return "\n".join(lines)
     if tool_name == "query_simulation_sensitivity":
         return _format_sensitivity_reply(result)
+    if tool_name == "query_data_flow_profile":
+        return _format_data_flow_reply(result)
     if tool_name == "generate_plant_architecture":
         return _format_architecture_reply(result)
     if tool_name == "query_pmc_rush_impact":
         return _format_rush_impact(result)
     return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
+
+
+def _format_data_flow_reply(result: Dict[str, Any]) -> str:
+    """数据流节点剖面的答复：数都在三层实测里，缩放那一格是需求估算、不是厂里的事实。"""
+    scale_word = {"heads": "随人头缩放", "volume": "随订单/产量体积缩放", "fixed": "结构与人数无关"}
+    if result.get("error"):
+        return f"数据流节点剖面没生成：{result['error']}"
+    lines = [f"数据流节点剖面（工厂 {result.get('factory_id')}，只读）："]
+    for r in (result.get("reading") or []):
+        lines.append(f"- {r}")
+    for row in ((result.get("ledger") or {}).get("nodes") or []):
+        if row.get("status") != "ok":
+            lines.append(f"- 节点 {row.get('node')}：读不到 —— {str(row.get('why'))[:80]}")
+            continue
+        lines.append(f"- {row.get('node')}：{int(row.get('rows') or 0):,} 行"
+                     f"｜{scale_word.get(str(row.get('scales')), '未分类')}")
+    sc = result.get("scale") or {}
+    if sc:
+        lines.append(f"- 缩放依据：目标 {sc.get('headcount')} 人 ÷ 参照厂实测 "
+                     f"{sc.get('reference_people')} 人 ＝ 等比 {sc.get('factor')}｜{sc.get('note')}")
+    return "\n".join(lines)
 
 
 def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
