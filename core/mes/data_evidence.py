@@ -687,29 +687,43 @@ async def workforce_presence_under_conditions(
 # 开放母单里的机种有没有被某条线的档案认领（can_make_models）：
 # 没认领的单在沙箱里 line=null，人力类动作全都乘不上（唯一口径放在这里，别处只调用）
 LINE_CLAIM_SQL = text("""
-    SELECT count(DISTINCT p.product_code) AS unclaimed_models,
+    WITH open_master AS (
+        SELECT o.work_order_code, o.planned_qty, COALESCE(p.product_code, o.product_id) AS model_code,
+               (p.id IS NULL) AS product_row_missing
+        FROM work_orders o
+        LEFT JOIN products p ON p.id = o.product_id
+        WHERE o.factory_id = :fid AND o.wo_type = 'master'
+          AND o.status IN ('pending', 'released', 'in_progress')
+    ), dangling AS (
+        SELECT DISTINCT o.created_by
+        FROM work_orders o
+        WHERE o.factory_id = :fid AND o.wo_type = 'master'
+          AND o.status IN ('pending', 'released', 'in_progress')
+          AND NOT EXISTS (SELECT 1 FROM products p WHERE p.id = o.product_id)
+    )
+    SELECT count(DISTINCT m.model_code) AS unclaimed_models,
            count(*) AS orders,
-           COALESCE(SUM(o.planned_qty), 0) AS units,
-           array_agg(DISTINCT p.product_code) AS codes
-    FROM work_orders o
-    JOIN products p ON p.id = o.product_id
-    WHERE o.factory_id = :fid AND o.wo_type = 'master'
-      AND o.status IN ('pending', 'released', 'in_progress')
-      AND NOT EXISTS (SELECT 1 FROM line_profiles lp
-                      WHERE lp.factory_id = o.factory_id
-                        AND COALESCE(lp.can_make_models::text, '') LIKE '%' || p.product_code || '%')
+           COALESCE(SUM(m.planned_qty), 0) AS units,
+           array_agg(DISTINCT m.model_code) AS codes,
+           count(*) FILTER (WHERE m.product_row_missing) AS orders_without_product_row,
+           count(DISTINCT m.model_code) FILTER (WHERE m.product_row_missing) AS missing_product_models,
+           (SELECT array_agg(created_by) FROM dangling) AS dangling_created_by
+    FROM open_master m
+    WHERE NOT EXISTS (SELECT 1 FROM line_profiles lp
+                      WHERE lp.factory_id = :fid
+                        AND COALESCE(lp.can_make_models::text, '') LIKE '%' || m.model_code || '%')
 """)
 
 # 没被线认领的那些单，工单自己登记的工位是什么（assigned_station_id）——
 # 这决定补哪一侧：真有线就做线认领，本来按工位做就缺工位产能口径
 UNCLAIMED_STATION_EVIDENCE_SQL = text("""
-    SELECT p.product_code AS model_code,
+    SELECT COALESCE(p.product_code, o.product_id) AS model_code,
            string_agg(DISTINCT s.station_code, ', ' ORDER BY s.station_code) AS stations,
            count(*) FILTER (WHERE COALESCE(o.assigned_station_id, '') <> '') AS orders_with_station,
            count(*) AS orders,
            COALESCE(SUM(o.planned_qty), 0) AS units
     FROM work_orders o
-    JOIN products p ON p.id = o.product_id
+    LEFT JOIN products p ON p.id = o.product_id
     LEFT JOIN stations s ON s.id = o.assigned_station_id
     WHERE o.factory_id = :fid AND o.wo_type = 'master'
       AND o.status IN ('pending', 'released', 'in_progress')
@@ -749,6 +763,9 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
         "unclaimed_orders": int(row.get("orders") or 0),
         "unclaimed_units": int(float(row.get("units") or 0)),
         "unclaimed_codes": [str(c) for c in (row.get("codes") or [])][:12],
+        "orders_without_product_row": int(row.get("orders_without_product_row") or 0),
+        "missing_product_models": int(row.get("missing_product_models") or 0),
+        "dangling_created_by": [str(x) for x in (row.get("dangling_created_by") or [])],
         "stations": sum(int(r.get("stations") or 0) for r in shapes),
         "station_capacity_rows": sum(int(r.get("with_capacity_row") or 0) for r in shapes),
         "stations_with_per_hour": sum(int(r.get("with_per_hour") or 0) for r in shapes),
@@ -761,6 +778,10 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
              f"{int(float(row.get('units') or 0))} 台）→ 这些单在沙箱里 line=null，"
              "产能只按路线工时推，人力动作乘不上"
              if unclaimed else "在流程单都各有线档案认领（没有 line=null 的单）")
+            + (f"；其中 {int(row.get('orders_without_product_row') or 0)} 张母单指向的机种在 products 里没有行"
+               f"（product_id 悬空，创建者是 {'、'.join(row.get('dangling_created_by') or []) or '未知'}）"
+               " → 这些单没有 BOM、没有路线，任何推演都算不出它们"
+               if int(row.get("orders_without_product_row") or 0) else "")
             + f"；工位侧 {sum(int(r.get('stations') or 0) for r in shapes)} 个站里 "
             f"station_capacity 填了 {sum(int(r.get('with_capacity_row') or 0) for r in shapes)} 个"
             + ("，且 capacity 单位在站间不一致（" + "、".join(units_mix) + "）"
