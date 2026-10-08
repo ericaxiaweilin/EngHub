@@ -200,6 +200,13 @@ def slope_per_step(rows: List[Dict[str, Any]], lever: Dict[str, Any],
                            if nonlinear else "局部与拟合一致，可按线性引用"),
             "measured_between": [base, float(pick["level"])],
             "direction": "把该输入加大一档",
+            # 倍数与政策是两件事：lead_multiplier 改的是"台账提前期有多准"（数据带宽，不花钱），
+            # expedite_lead_days 才是"掏钱把到货往前拽"。共享受约束项时把前者报成 $0/天，
+            # 会被读成"压提前期免费" —— 那是把数据问题说成了采购决策。
+            "cost_note": ("这一档改的是台账依据的带宽（数据准不准），不是花钱加急；"
+                          "要价签看加急政策那一档"
+                          if lever.get("key") in ("lead_multiplier", "hours_multiplier", "stock_multiplier")
+                          and cost_per_step == 0 and abs(per_step_days) > 1e-9 else None),
             "money_per_day_saved": (round(cost_per_step / abs(per_step_days), 2)
                                     if per_step_days else None)}
 

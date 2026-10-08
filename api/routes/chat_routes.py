@@ -1337,7 +1337,8 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
             f"＝人工 {sl.get('labor_usd_per_step') or 0:,.0f}+加急 {sl.get('expedite_usd_per_step') or 0:,.0f}"
             f"+开线 {sl.get('activation_usd_per_step') or 0:,.0f}）、准点 {sl.get('on_time_models_per_step')} 台/档"
             + (f"｜台阶型：最陡 {sl.get('steepest_days_per_step')} 天/档（在 {sl.get('steepest_at_level')} 那档）"
-               if sl.get("nonlinear") else ""))
+               if sl.get("nonlinear") else "")
+            + (f"｜{sl['cost_note']}" if sl.get("cost_note") else ""))
     if step_like:
         lines.append("- 动不了的输入：" + "、".join([x for x in step_like if x])
                      + " —— 不是它不重要，是它现在不进约束（看基准那行的『卡在』）")

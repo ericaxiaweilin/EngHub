@@ -340,3 +340,26 @@ def test_cost_per_day_counts_expedite_and_activation_not_labor_only():
     assert out["labor_usd_per_step"] == 0.0
     assert out["cost_usd_per_step"] == 600.0
     assert out["money_per_day_saved"] == 300.0     # 每提前一天花 $300，而不是 $0
+
+
+def test_free_data_band_step_is_not_reported_as_a_free_purchase():
+    """提前期倍数那一档买到天数但不花钱 —— 因为它改的是数据带宽，不是加急单。"""
+    lever = {"label": "外购提前期", "key": "lead_multiplier", "step": 0.1, "base": 1.0}
+    rows = [
+        {"level": 1.0, "finish_date": "2026-01-11", "days_vs_base": 0, "labor_delta_usd": 0.0,
+         "expedite_delta_usd": 0.0, "activation_delta_usd": 0.0, "on_time_models": 3},
+        {"level": 0.9, "finish_date": "2026-01-09", "days_vs_base": -2, "labor_delta_usd": 0.0,
+         "expedite_delta_usd": 0.0, "activation_delta_usd": 0.0, "on_time_models": 5},
+    ]
+    out = ss.slope_per_step(rows, lever, 1.0)
+    assert out["cost_usd_per_step"] == 0.0
+    assert "数据" in out["cost_note"] and "加急" in out["cost_note"]
+    # 真掏钱的那一档（并联开线）不能被这条注释洗白
+    paid = {"label": "并联开线", "key": "parallel_lines", "step": 1.0, "base": 1.0}
+    rows2 = [
+        {"level": 1.0, "finish_date": "2026-01-11", "days_vs_base": 0, "labor_delta_usd": 0.0,
+         "expedite_delta_usd": 0.0, "activation_delta_usd": 0.0, "on_time_models": 3},
+        {"level": 2.0, "finish_date": "2026-01-06", "days_vs_base": -5, "labor_delta_usd": 0.0,
+         "expedite_delta_usd": 0.0, "activation_delta_usd": 8730.0, "on_time_models": 4},
+    ]
+    assert ss.slope_per_step(rows2, paid, 1.0)["cost_note"] is None
