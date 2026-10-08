@@ -261,3 +261,38 @@ def test_as_dict_treats_json_null_as_empty_not_as_a_crash():
     assert pf._as_dict('{"a": 1}') == {"a": 1}
     assert pf._as_dict({"a": 1}) == {"a": 1}
     assert pf._as_dict("坏 json") == {}
+
+def test_late_delta_table_reports_what_the_money_actually_buys():
+    """推荐文案必须自己说清"花多少买到几天、还剩几天不准"。
+    10-07 实测：加急到 10 天花 $12,240，最坏那台只从 35 天买到 34 天 ——
+    只写"延误最小 + 代价"会被读成加急解决了交期。"""
+    from api.services.portfolio_flywheel import late_delta_table
+
+    def sol(name, model, late, scen):
+        return {"name": name, "scenario": scen,
+                "detail": [{"model_code": model, "days_late": late}]}
+    scan = {"by_scenario": {
+        "好天（到岗 0.97）": {"solutions": [
+            sol("现况（分批开工）", "FG-TREAD-003", 21, "好天"),
+            sol("瓶颈件提前期 20 天 → 10 天（减半）", "FG-TREAD-003", 21, "好天"),
+            sol("现况（分批开工）", "A-50-04-F", 6, "好天"),
+            sol("瓶颈件提前期 20 天 → 10 天（减半）", "A-50-04-F", 5, "好天")]},
+        "暴雨（到岗 0.70）": {"solutions": [
+            sol("现况（分批开工）", "FG-TREAD-003", 35, "暴雨"),
+            sol("瓶颈件提前期 20 天 → 10 天（减半）", "FG-TREAD-003", 34, "暴雨"),
+            sol("现况（分批开工）", "A-50-04-F", 9, "暴雨"),
+            sol("瓶颈件提前期 20 天 → 10 天（减半）", "A-50-04-F", 8, "暴雨")]}}}
+    out = late_delta_table(scan, "瓶颈件提前期 20 天 → 10 天（减半）")
+    per = {x["model_code"]: x for x in out["per_model"]}
+    # 每台取各场景里最紧的那一档：暴雨 35→34，不是好天 21→21
+    assert per["FG-TREAD-003"]["days_late_base"] == 35
+    assert per["FG-TREAD-003"]["days_late_recommended"] == 34
+    assert out["days_bought_total"] == 2 and out["worst_still_late_days"] == 34
+    assert out["models_not_on_time"] == 2 and out["models_compared"] == 2
+
+
+def test_late_delta_table_is_empty_safe_when_the_base_policy_is_absent():
+    from api.services.portfolio_flywheel import late_delta_table
+
+    out = late_delta_table({"by_scenario": {}}, "随便什么")
+    assert out["per_model"] == [] and out["days_bought_total"] == 0

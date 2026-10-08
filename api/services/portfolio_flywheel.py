@@ -300,6 +300,40 @@ async def record_cycle(db: AsyncSession, sim: Dict[str, Any], *, factory_id: str
     return receipt
 
 
+def late_delta_table(scan: Dict[str, Any], recommended: Optional[str],
+                     base: str = "现况（分批开工）") -> Dict[str, Any]:
+    """逐台算清"这个政策花多少钱、买到几天、还剩几天不准"。
+
+    取每台在**各场景里最紧的那一档**（按好天的数下单、暴雨天就失约），所以数字比
+    记分卡上的 days_late_worst 更保守，也更接近计划员真正要答的那道题。
+    这一步存在的原因：推荐文案以前只写"代价 $12,420、延误最小"，
+    读起来像加急解决了交期 —— 实测加急到 10 天只把最坏那台从 35 天买到 34 天。
+    """
+    worst: Dict[str, Dict[str, int]] = {}
+    for block in (scan.get("by_scenario") or {}).values():
+        for sol in (block.get("solutions") or []):
+            name = str(sol.get("name") or "")
+            which = "recommended" if name == str(recommended) else ("base" if name == base else None)
+            if not which:
+                continue
+            for d in (sol.get("detail") or []):
+                m = str(d.get("model_code"))
+                day = int(d.get("days_late") or 0)
+                slot = worst.setdefault(m, {"base": -10**6, "recommended": -10**6})
+                slot[which] = max(slot[which], day)
+    rows, bought, still_late = [], 0, 0
+    for m, v in sorted(worst.items()):
+        b, r = max(v["base"], 0), max(v["recommended"], 0)
+        rows.append({"model_code": m, "days_late_base": b, "days_late_recommended": r,
+                     "days_bought": max(0, b - r)})
+        bought += max(0, b - r)
+        still_late = max(still_late, r)
+    return {"per_model": rows, "days_bought_total": bought,
+            "worst_still_late_days": still_late,
+            "models_not_on_time": sum(1 for x in rows if x["days_late_recommended"] > 0),
+            "models_compared": len(rows)}
+
+
 async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = True,
                             models: Optional[List[str]] = None) -> Dict[str, Any]:
     """扫一遍政策×天气，把权衡矩阵与稳健推荐写进记分卡；推荐变了才动待办。"""
@@ -457,6 +491,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         "levers": json.dumps(robust, ensure_ascii=False),
         "detail": json.dumps({"actions": actions[:20],
                               "action_coverage": _action_coverage(tuned.get("final_scan") or {}),
+                              "late_delta": late_delta_table(tuned.get("final_scan") or {},
+                                                             str(robust.get("policy") or "")),
                               "lever_economics": (levers.get("ranked") or [])[:8],
                               "mapping_accuracy": levers.get("overall_accuracy"),
                               "by_scenario": per_scenario,
@@ -554,13 +590,27 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
             elif t in ("master_data_gap", "model_data_gap"):
                 act_lines.append(f"· {'机种推演不了' if t == 'model_data_gap' else '主数据缺口'}："
                                  f"{a.get('detail')}")
+        delta = late_delta_table(tuned.get("final_scan") or {}, str(rec))
+        money = float(objs.get("expedite_cost_usd") or 0) + float(objs.get("line_activation_cost_usd") or 0)
+        per_model_txt = "、".join(
+            f"{x['model_code']} {x['days_late_base']}→{x['days_late_recommended']} 天"
+            for x in (delta.get("per_model") or [])[:8])
+        honest_line = (
+            f"逐台账（各台取最紧的那个天气档）：{per_model_txt or '没有可比台'}。\n"
+            f"这单政策一共买到 {delta.get('days_bought_total')} 天，"
+            f"最坏那台仍延 {delta.get('worst_still_late_days')} 天"
+            + (f"，${money:,.0f} 买的是 {delta.get('days_bought_total')} 天里的一部分 —— "
+               "**加急不解决交期**，要自洽得改承诺口径或补产能路径（#72）。"
+               if delta.get("worst_still_late_days") else "（已能准点）。")
+            + "\n")
         created = await create_task(
             db, factory_id, "virtual_factory",
             f"推演推荐｜{rec}（{claim}，代价 ${float(objs.get('expedite_cost_usd') or 0) + float(objs.get('line_activation_cost_usd') or 0):,.0f}）"[:200],
             description=(
                 f"政策×天气扫描（{len(per)} 个天气场景 × {scan['policies_tried']} 个政策）的稳健推荐：{rec}。\n"
                 f"各场景推荐：" + "；".join(f"{k}→{v}" for k, v in per.items()) + "\n"
-                f"代价：加急 ${float(objs.get('expedite_cost_usd') or 0):,.0f}"
+                + honest_line
+                + f"代价：加急 ${float(objs.get('expedite_cost_usd') or 0):,.0f}"
                 f" + 开并联线 ${float(objs.get('line_activation_cost_usd') or 0):,.0f}"
                 f" + 人工 ${float(objs.get('labor_cost_usd') or 0):,.0f}；"
                 f"等料空档 {float(objs.get('standby_person_days') or 0):,.0f} 人日。\n"
