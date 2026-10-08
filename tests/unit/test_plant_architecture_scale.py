@@ -207,12 +207,17 @@ def test_chat_answer_prints_the_scaled_timeline_and_that_nothing_was_written():
                                            "line_basis": "line_declared_home",
                                            "units_per_day": 287.36, "crew": 287.4},
                            "due": {"days": 25, "note": "交期天数由提问给出"},
+                           "min_scale": {"status": "found", "min_headcount": 2280,
+                                         "reading": "赶上 25 天交期至少要 2280 人（参照厂实测 1044 人的 "
+                                                    "2.18 倍；载体 LINE-TREAD-01 声明 300 台/天、班组 300 人 "
+                                                    "→ 等效 8 个这样的班组），届时完工 25 天；试了 13 个规模"},
                            "reading": "1000 人规模（载体 LINE-TREAD-01 声明 300 台/天 → 287.36 台/天）："
                                       "8000 台 A-50-04-F 预计 57 天完工，比交期晚 32 天；用工 9626.8 人日"}}
     text = _format_architecture_reply(result)
     assert "预计 57 天完工" in text and "9626.8 人日" in text
     assert "LINE-TREAD-01" in text and "line_declared_home" in text
     assert "line_profiles 未改动" in text, "缩放线只活在内存里，界面必须这么说"
+    assert "赶得上这个交期至少要：赶上 25 天交期至少要 2280 人" in text, "延了就要顺手给出要多少人"
     # 缺数量那条出口也要在答复里出现，不能整个 delivery 段静默消失
     refused = _format_architecture_reply({
         "status": "ok", "reference_factory_id": "F", "readings": [], "scaled": {"warnings": []},
@@ -241,11 +246,97 @@ def test_scaled_line_does_not_carry_a_decimal_into_the_chat_payload():
 
     实测过：答复文本已经生成好，落库时 `Object of type Decimal is not JSON serializable`
     把整条 /chat 打成 500 —— 生成侧成功不等于交付成功，所以这里钉住显式转换。
+    按模块源码判：缩放读数在 _run_at_scale 里组装，函数拆了也不该让这条约束跟着漏。
     """
     import inspect
 
-    from core.mes.plant_architecture import scaled_delivery_run
+    import core.mes.plant_architecture as pa
 
-    src = inspect.getsource(scaled_delivery_run)
+    src = inspect.getsource(pa)
     assert 'float(base_line["hours_per_day"])' in src
     assert '"hours_per_day": scaled_line.get("hours_per_day")' not in src
+
+
+def test_min_scale_finds_the_smallest_headcount_that_meets_the_due_date():
+    """搜索本身要能单测：探针给一个单调的完工天数函数，看它收敛到几个人。
+
+    finish(hc)=⌈57000/hc⌉：1000 人 57 天（与真实沙箱同一形状），25 天交期→最少 2280 人。
+    """
+    import asyncio
+    from math import ceil
+
+    from core.mes.plant_architecture import min_scale_for_delivery
+
+    def finish(hc: float) -> float:
+        return ceil(57000.0 / hc)
+
+    async def probe(hc: float):
+        return {"finish_day": finish(hc), "wait_days_for_material": 10, "person_days": hc * finish(hc)}
+
+    out = asyncio.run(min_scale_for_delivery(probe, reference_headcount=1044, units=8000, due_days=25))
+    assert out["status"] == "found" and out["min_headcount"] == 2280
+    assert finish(out["min_headcount"]) <= 25 and finish(out["min_headcount"] - 1) > 25
+    # 报出去的那个人数自己就得赶得上，完工天数也必须挂在它身上（不是挂在 2280.7 人身上）
+    assert out["finish_day"] == 25 and out["infeasible_one_person_less"] == 26
+    assert out["search_tolerance_headcount"] == 1 and out["probes"] < 20
+
+
+def test_min_scale_says_when_adding_people_stops_helping():
+    """完工天数有地板（等料/提前期）时不许回"再加人就快了"。"""
+    import asyncio
+
+    from core.mes.plant_architecture import min_scale_for_delivery
+
+    async def probe(hc: float):
+        return {"finish_day": max(40.0, 57000.0 / hc), "wait_days_for_material": 40}
+
+    out = asyncio.run(min_scale_for_delivery(probe, reference_headcount=1044, units=8000, due_days=25))
+    assert out["status"] == "lead_time_bound"
+    assert out["finish_day_at_max"] == 40 and out["finish_day_at_max_div_8"] == 40
+    assert "卡的是等料" in out["note"] and "200000" in out["why"]
+
+
+def test_min_scale_reports_a_ceiling_instead_of_a_number_when_people_still_bind():
+    import asyncio
+
+    from core.mes.plant_architecture import min_scale_for_delivery
+
+    async def probe(hc: float):
+        return {"finish_day": 6_000_000.0 / hc, "wait_days_for_material": 10}
+
+    out = asyncio.run(min_scale_for_delivery(probe, reference_headcount=1044, units=8000, due_days=25))
+    assert out["status"] == "beyond_ceiling" and out["finish_day_at_max"] == 30
+    assert out["finish_day_at_max_div_8"] == 240     # 规模差 8 倍天数还在动 → 人仍是瓶颈
+    assert "并行多条线" in out["note"]
+
+
+def test_min_scale_is_computed_only_when_that_scale_misses_the_date(monkeypatch):
+    """赶上了就不必再花十几轮沙箱；赶不上就必须把"要多少人"一起给出，不等追问。"""
+    import asyncio
+
+    import core.mes.plant_architecture as pa
+
+    calls = []
+
+    async def late_run(db, ref, **kw):
+        return {"status": "simulated", "finish_day": 57, "days_late": 32, "due": {"days": 25}}
+
+    async def on_time_run(db, ref, **kw):
+        return {"status": "ok", "finish_day": 20, "days_late": -5, "due": {"days": 25}}
+
+    async def fake_min(db, ref, **kw):
+        calls.append(kw)
+        return {"status": "found", "min_headcount": 2280}
+
+    args = {"delivery_model": "A-50-04-F", "delivery_units": 8000, "delivery_due_days": 25}
+    base = {"reference_factory_id": "FAC_MECH_001", "scaled": {"target_people": 1000}}
+    monkeypatch.setattr(pa, "scaled_delivery_run", late_run)
+    monkeypatch.setattr(pa, "min_headcount_for_delivery", fake_min)
+    out = asyncio.run(pa.attach_delivery(None, dict(base), dict(args)))
+    assert out["delivery"]["min_scale"]["min_headcount"] == 2280
+    assert calls[0]["model"] == "A-50-04-F" and calls[0]["due_in_days"] == 25
+
+    calls.clear()
+    monkeypatch.setattr(pa, "scaled_delivery_run", on_time_run)
+    out2 = asyncio.run(pa.attach_delivery(None, dict(base), dict(args)))
+    assert not calls and "min_scale" not in out2["delivery"]

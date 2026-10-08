@@ -437,49 +437,35 @@ async def capacity_cross_check(db: AsyncSession, factory_id: str, *, max_models:
     }
 
 
-async def scaled_delivery_run(db: AsyncSession, reference_factory_id: str, *, headcount: float,
-                              model: str, units: float, due_in_days: Optional[int] = None,
-                              temperature_c: Optional[float] = None,
-                              humidity_percent: Optional[float] = None,
-                              task_type: str = "assembly") -> Dict[str, Any]:
-    """把缩放后的产线送进真正的沙箱：出一条时间线，而不是一句"能做 N 台/天"。
+async def _delivery_basis(db: AsyncSession, reference_factory_id: str, model: str, *,
+                          temperature_c: Optional[float] = None,
+                          humidity_percent: Optional[float] = None,
+                          task_type: str = "assembly") -> Dict[str, Any]:
+    """一次取齐"按规模算交期"要用到的全部依据：基数人头、机种、载体线、日历、到岗、设备。
 
-    缩放只作用在**人**与**该线声明的台/天**上（两者都是参照厂台账值）；
-    来料齐套、提前期、班次日历、设备可用率仍走真表 —— 换规模不换依据。
-    生成的线是内存对象，绝不写 line_profiles（那是事实表）。
+    单独成一层是因为"要多少人才赶得上"要在同一批依据上试很多个规模 —— 每试一次重取一遍，
+    两次读到的到岗率可能已经不是同一天的了，比较就失去意义。
     """
-    from datetime import date, timedelta
+    from datetime import date
 
     from api.services.virtual_run import (CALENDAR_SQL, LINES_SQL, equipment_rate,
-                                          measured_attendance, pick_line, resolve_product,
-                                          run_target)
+                                          measured_attendance, pick_line, resolve_product)
 
     shape = await plant_shape(db, reference_factory_id)
     base_people = float(shape.get("people_per_day") or 0)
-    if base_people <= 0 or not headcount:
+    if base_people <= 0:
         return {"status": "no_scale_basis",
-                "why": "参照厂没有逐日人头或没给目标规模 → 不缩放"}
-    factor = float(headcount) / base_people
+                "why": "参照厂在 attendance 里没有逐日人头 → 缩放没有基数，不凭空长一座厂"}
     resolved = await resolve_product(db, reference_factory_id, model)
     if resolved.get("status") != "ok":
         return {"status": f"product_{resolved.get('status')}", "model_code": model,
-                "factor": round(factor, 4), "candidates": resolved.get("candidates") or [],
+                "candidates": resolved.get("candidates") or [],
                 "why": resolved.get("why") or "机种在参照厂产品台账里对不上 → 没有载体机种"}
-    model = resolved["product_id"]
     lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": reference_factory_id})).mappings().all()]
-    base_line, line_basis = pick_line(model, lines)
+    base_line, line_basis = pick_line(resolved["product_id"], lines)
     if base_line is None:
-        return {"status": "no_line", "model_code": model, "factor": round(factor, 4),
-                "why": f"{len(lines)} 条在册线里没有一条声明能做 {model} → 缩放没有载体"}
-    declared = float(base_line.get("units_per_day") or 0)
-    crew = float(base_line.get("crew_size") or 0)
-    scaled_code = f"{base_line['line_code']}@{int(headcount)}人(等比 {factor:g})"
-    scaled_line = {**base_line, "line_code": scaled_code, "line_group": None,
-                   "units_per_day": round(declared * factor, 2) if declared else declared,
-                   "group_units_per_day": None, "crew_size": round(crew * factor, 1) if crew else crew}
-    shift_days = {int(r["weekday"]) + 1 for r in
-                  (await db.execute(CALENDAR_SQL, {"fid": reference_factory_id})).mappings().all()} or {1, 2, 3, 4, 5, 6}
-    today = date.today()
+        return {"status": "no_line", "model_code": resolved["product_id"], "factor": None,
+                "why": f"{len(lines)} 条在册线里没有一条声明能做 {resolved['product_id']} → 缩放没有载体"}
     if temperature_c is not None:
         from core.mes.data_evidence import workforce_presence_under_conditions
 
@@ -489,22 +475,59 @@ async def scaled_delivery_run(db: AsyncSession, reference_factory_id: str, *, he
             step_count=3000)
         ratio, att_basis = pres.get("present_ratio"), pres.get("basis")
         if ratio is None:
-            return {"status": "no_attendance_baseline", "why": pres.get("why"), "factor": round(factor, 4)}
+            return {"status": "no_attendance_baseline", "why": pres.get("why")}
     else:
         att = await measured_attendance(db, reference_factory_id)
         ratio, att_basis = float(att["present_ratio"]), att.get("basis")
     equip = await equipment_rate(db, reference_factory_id)
-    due_days = int(due_in_days) if due_in_days else 25
-    due_days_basis = "user" if due_in_days else "default_25"
-    run = await run_target(db, reference_factory_id, model, float(units),
-                           today + timedelta(days=max(1, due_days)), today,
-                           {d: float(ratio) for d in range(0, 400)}, [scaled_line], shift_days,
-                           line_busy_days=0.0, equip_rate=float(equip.get("rate") or 1.0))
+    shift_days = {int(r["weekday"]) + 1 for r in
+                  (await db.execute(CALENDAR_SQL, {"fid": reference_factory_id})).mappings().all()} or set(range(1, 7))
+    return {
+        "status": "ok", "factory_id": reference_factory_id, "model_code": resolved["product_id"],
+        "product_resolution": resolved.get("how"), "base_people": base_people,
+        "base_line": base_line, "line_basis": line_basis, "present_ratio": float(ratio),
+        "attendance_basis": att_basis, "equipment_rate": equip, "shift_days": shift_days,
+        "today": date.today(),
+        "conditions": (None if temperature_c is None else
+                       {"temperature_c": float(temperature_c),
+                        "humidity_percent": float(humidity_percent or 60.0)}),
+    }
+
+
+def _scaled_line_at(ctx: Dict[str, Any], headcount: float) -> tuple:
+    """把参照厂那条线等比到目标人头，返回 (缩放线, 系数)。只动人数与该线声明的台/天。"""
+    base_line = ctx["base_line"]
+    factor = float(headcount) / float(ctx["base_people"])
+    declared = float(base_line.get("units_per_day") or 0)
+    crew = float(base_line.get("crew_size") or 0)
+    scaled = {**base_line, "line_code": f"{base_line['line_code']}@{int(headcount)}人(等比 {factor:g})",
+              "line_group": None,
+              "units_per_day": round(declared * factor, 2) if declared else declared,
+              "group_units_per_day": None,
+              "crew_size": round(crew * factor, 1) if crew else crew}
+    return scaled, factor
+
+
+async def _run_at_scale(db: AsyncSession, ctx: Dict[str, Any], *, headcount: float,
+                        units: float, due_days: int, due_days_basis: str = "user") -> Dict[str, Any]:
+    """在一个目标规模上真跑一遍沙箱：出完工天数、比交期早晚、用工，而不是一句台/天。"""
+    from datetime import timedelta
+
+    from api.services.virtual_run import run_target
+
+    base_line = ctx["base_line"]
+    scaled, factor = _scaled_line_at(ctx, headcount)
+    ratio = ctx["present_ratio"]
+    run = await run_target(db, ctx["factory_id"], ctx["model_code"], float(units),
+                           ctx["today"] + timedelta(days=max(1, int(due_days))), ctx["today"],
+                           {d: ratio for d in range(0, 400)}, [scaled], ctx["shift_days"],
+                           line_busy_days=0.0, equip_rate=float(ctx["equipment_rate"].get("rate") or 1.0))
     conflict = run.get("line_vs_station") or {}
     finish, late = run.get("finish_day"), run.get("days_late")
+    declared = float(base_line.get("units_per_day") or 0)
     head = (f"{int(headcount)} 人规模（等比 {factor:g}，载体 {base_line['line_code']} 声明 "
-            f"{declared:g} 台/天 → {scaled_line['units_per_day']:g} 台/天、班组 "
-            f"{scaled_line['crew_size']:g} 人、到岗 {ratio:g}）：{units:g} 台 {model}"
+            f"{declared:g} 台/天 → {scaled['units_per_day']:g} 台/天、班组 "
+            f"{scaled['crew_size']:g} 人、到岗 {ratio:g}）：{units:g} 台 {ctx['model_code']}"
             f"（交期按 {due_days} 天{'' if due_days_basis == 'user' else '，是默认假设'}）")
     if finish is not None:
         verdict = f"预计 {finish} 天完工"
@@ -512,7 +535,7 @@ async def scaled_delivery_run(db: AsyncSession, reference_factory_id: str, *, he
             verdict += f"，比交期晚 {late:g} 天" if late > 0 else f"，比交期早 {-late:g} 天"
     elif run.get("status") == "simulated":
         verdict = ("在这台机剩余可排的 400 天窗口内做不完"
-                   f"（已按 {run.get('capacity_after_equipment') or scaled_line['units_per_day']} 台/天推进）")
+                   f"（已按 {run.get('capacity_after_equipment') or scaled['units_per_day']} 台/天推进）")
     else:
         verdict = f"排不出时间线：{run.get('why') or run.get('status')}"
     tails = [head + verdict]
@@ -524,28 +547,158 @@ async def scaled_delivery_run(db: AsyncSession, reference_factory_id: str, *, he
         tails.append(f"工位侧自述只有 {conflict.get('station_bound_units_per_day')} 台/天"
                      f"（差 {conflict.get('ratio_line_over_station')} 倍）")
     return {
-        "status": run.get("status") or "ok", "model_code": model, "units": float(units),
-        "product_resolution": resolved.get("how"),
-        "reference_factory_id": reference_factory_id, "headcount": int(headcount),
+        "status": run.get("status") or "ok", "model_code": ctx["model_code"], "units": float(units),
+        "product_resolution": ctx["product_resolution"],
+        "reference_factory_id": ctx["factory_id"], "headcount": int(headcount),
         "factor": round(factor, 4), "scaled_line": {
-            "line_code": scaled_code, "from_line": str(base_line["line_code"]),
-            "line_basis": line_basis, "units_per_day": scaled_line["units_per_day"],
-            "crew": scaled_line["crew_size"],
+            "line_code": scaled["line_code"], "from_line": str(base_line["line_code"]),
+            "line_basis": ctx["line_basis"], "units_per_day": scaled["units_per_day"],
+            "crew": scaled["crew_size"],
             # line_profiles.hours_per_day 是 numeric：不转 float 就把 Decimal 塞进 chat_messages
             # 的 jsonb，落库时 TypeError，整条 /chat 直接 500（答复文本已经生成好了也白搭）
             "hours_per_day": (float(base_line["hours_per_day"])
                               if base_line.get("hours_per_day") is not None else None),
             "written_to_db": False},
-        "due": {"days": due_days, "basis": due_days_basis,
+        "due": {"days": int(due_days), "basis": due_days_basis,
                 "note": ("交期天数由提问给出" if due_days_basis == "user"
                          else "没给交期 → 按 25 天比对；这个 25 是提问要改的假设，不是台账值")},
-        "attendance": {"present_ratio": ratio, "basis": att_basis,
-                       "conditions": (None if temperature_c is None else
-                                      {"temperature_c": float(temperature_c),
-                                       "humidity_percent": float(humidity_percent or 60.0)})},
-        "equipment_rate": equip, "line_vs_station": conflict, "run": run,
+        "attendance": {"present_ratio": ratio, "basis": ctx["attendance_basis"],
+                       "conditions": ctx["conditions"]},
+        "equipment_rate": ctx["equipment_rate"], "line_vs_station": conflict, "run": run,
+        "finish_day": finish, "days_late": late,
         "reading": "；".join(tails),
     }
+
+
+async def scaled_delivery_run(db: AsyncSession, reference_factory_id: str, *, headcount: float,
+                              model: str, units: float, due_in_days: Optional[int] = None,
+                              temperature_c: Optional[float] = None,
+                              humidity_percent: Optional[float] = None,
+                              task_type: str = "assembly") -> Dict[str, Any]:
+    """把缩放后的产线送进真正的沙箱：出一条时间线，而不是一句"能做 N 台/天"。
+
+    缩放只作用在**人**与**该线声明的台/天**上（两者都是参照厂台账值）；
+    来料齐套、提前期、班次日历、设备可用率仍走真表 —— 换规模不换依据。
+    生成的线是内存对象，绝不写 line_profiles（那是事实表）。
+    """
+    ctx = await _delivery_basis(db, reference_factory_id, model, temperature_c=temperature_c,
+                                humidity_percent=humidity_percent, task_type=task_type)
+    if ctx.get("status") != "ok":
+        return ctx
+    return await _run_at_scale(db, ctx, headcount=headcount, units=units,
+                               due_days=int(due_in_days) if due_in_days else 25,
+                               due_days_basis=("user" if due_in_days else "default_25"))
+
+
+async def min_scale_for_delivery(probe, *, reference_headcount: float, units: float,
+                                 due_days: int, max_headcount: float = 200000.0,
+                                 tolerance: int = 1) -> Dict[str, Any]:
+    """二分出"赶上这个交期至少要多少人"。probe(hc) → run_target 那一条读数，不另立口径。
+
+    完工天数对规模单调（这条线的台/天按人头等比），所以区间收缩成立。三种结论分开给：
+    找到最小规模 / 加到上限仍赶不上 / **加人无效** —— 规模差 8 倍而完工天数几乎不动，
+    说明剩下来卡的是等料与提前期，不是人力，这时候报"至少要多少人"就是误导。
+    """
+    seen: Dict[float, tuple] = {}
+
+    async def at(hc: float) -> tuple:
+        if hc not in seen:
+            r = await probe(hc)
+            fin = r.get("finish_day")
+            seen[hc] = (fin is not None and float(fin) <= due_days,
+                        (float(fin) if fin is not None else None), r)
+        return seen[hc]
+
+    ceiling = max(float(reference_headcount) * 2.0, 2.0)
+    hi = None
+    while ceiling <= max_headcount:
+        if (await at(ceiling))[0]:
+            hi = ceiling
+            break
+        ceiling *= 2.0
+    if hi is None:
+        _fmax, fin_max, r_max = await at(max_headcount)
+        _f8, fin_8, _r8 = await at(max_headcount / 8.0)
+        stalled = (fin_max is not None and fin_8 is not None and abs(fin_8 - fin_max) < 1.0)
+        return {"status": "lead_time_bound" if stalled else "beyond_ceiling",
+                "due_days": due_days, "units": float(units),
+                "max_headcount_tested": int(max_headcount),
+                "finish_day_at_max": fin_max, "finish_day_at_max_div_8": fin_8,
+                "wait_days_for_material": (r_max or {}).get("wait_days_for_material"),
+                "probes": len(seen),
+                "why": (f"加到 {int(max_headcount)} 人（参照厂实测 {reference_headcount:g} 人的 "
+                        f"{max_headcount / reference_headcount:g} 倍）仍在 {due_days} 天内做不完"
+                        + (f"；届时等料占 {(r_max or {}).get('wait_days_for_material')} 天"
+                           if (r_max or {}).get("wait_days_for_material") else "")),
+                "note": ("规模再翻 8 倍完工天数几乎不动 → 卡的是等料/提前期，不是人力，"
+                         "报『至少要多少人』在这里是误导" if stalled else
+                         "上限内还没试到可行规模 → 需要放宽交期或并行多条线")}
+    lo = hi / 2.0
+    while lo > 1.0 and (await at(lo))[0]:
+        lo /= 2.0
+    while hi - lo > tolerance:
+        mid = (hi + lo) / 2.0
+        if (await at(mid))[0]:
+            hi = mid
+        else:
+            lo = mid
+    # 二分到的是小数规模，报出去必须是整数人头：向上取整后再往回退，直到"少一个人就赶不上"。
+    # 实测踩过：把 2888.5 人截断成 2888 人，还顺手把 2888.5 人的完工天数（25 天）挂在 2888 人
+    # 名下 —— 而 2888 人真实是 26 天。报出来的那个人数必须自己就能赶上。
+    k = int(-(-hi // 1))
+    while k > 1 and (await at(float(k - 1)))[0]:
+        k -= 1
+    _f, fin, r = await at(float(k))
+    return {"status": "found", "due_days": due_days, "min_headcount": k,
+            "search_tolerance_headcount": tolerance, "finish_day": fin, "units": float(units),
+            "infeasible_one_person_less": (None if k <= 1 else (await at(float(k - 1)))[1]),
+            "person_days": (r or {}).get("person_days"), "probes": len(seen),
+            "note": (f"最小可行规模按 ±{tolerance} 人分辨率二分得到，判据是缩放线进沙箱的完工天数"
+                     "（不是拿平均产能除一个数）")}
+
+
+async def min_headcount_for_delivery(db: AsyncSession, reference_factory_id: str, *, model: str,
+                                     units: float, due_in_days: int,
+                                     temperature_c: Optional[float] = None,
+                                     humidity_percent: Optional[float] = None,
+                                     task_type: str = "assembly") -> Dict[str, Any]:
+    """"要多少人才能赶上这个交期"：与 scaled_delivery_run 共用同一批依据与同一条沙箱。"""
+    from datetime import timedelta
+
+    from api.services.virtual_run import run_target
+
+    ctx = await _delivery_basis(db, reference_factory_id, model, temperature_c=temperature_c,
+                                humidity_percent=humidity_percent, task_type=task_type)
+    if ctx.get("status") != "ok":
+        return ctx
+
+    async def probe(hc: float) -> Dict[str, Any]:
+        scaled, _ = _scaled_line_at(ctx, hc)
+        run = await run_target(db, ctx["factory_id"], ctx["model_code"], float(units),
+                               ctx["today"] + timedelta(days=int(due_in_days)), ctx["today"],
+                               {d: ctx["present_ratio"] for d in range(0, 400)}, [scaled],
+                               ctx["shift_days"], line_busy_days=0.0,
+                               equip_rate=float(ctx["equipment_rate"].get("rate") or 1.0))
+        return {"finish_day": run.get("finish_day"),
+                "wait_days_for_material": run.get("wait_days_for_material"),
+                "person_days": run.get("person_days"), "status": run.get("status")}
+
+    out = await min_scale_for_delivery(probe, reference_headcount=float(ctx["base_people"]),
+                                       units=float(units), due_days=int(due_in_days))
+    crew = float(ctx["base_line"].get("crew_size") or 0)
+    out["carrier_line"] = str(ctx["base_line"]["line_code"])
+    out["carrier_crew"] = crew
+    out["reference_headcount"] = ctx["base_people"]
+    if out.get("status") == "found":
+        out["equivalent_crews"] = (int(-(-out["min_headcount"] // crew)) if crew else None)
+        out["reading"] = (f"赶上 {due_in_days} 天交期至少要 {out['min_headcount']} 人"
+                          f"（参照厂实测 {ctx['base_people']:g} 人的 "
+                          f"{out['min_headcount'] / ctx['base_people']:g} 倍；载体 "
+                          f"{out['carrier_line']} 声明 "
+                          f"{float(ctx['base_line'].get('units_per_day') or 0):g} 台/天、班组 {crew:g} 人 "
+                          f"→ 等效 {out['equivalent_crews']} 个这样的班组），届时完工 {out['finish_day']:g} 天"
+                          f"；试了 {out['probes']} 个规模")
+    return out
 
 
 async def attach_delivery(db: AsyncSession, result: Dict[str, Any],
@@ -574,10 +727,21 @@ async def attach_delivery(db: AsyncSession, result: Dict[str, Any],
                               "hint": "改给 headcount（如 1000）再问一次"}
         return result
     temp = args.get("temperature_c")
-    result["delivery"] = await scaled_delivery_run(
+    hum = (float(args["humidity_percent"]) if args.get("humidity_percent") else None)
+    task = str(args.get("task_type") or "assembly")
+    due_days = int(args["delivery_due_days"]) if args.get("delivery_due_days") else 25
+    delivery = await scaled_delivery_run(
         db, ref, headcount=float(target_hc), model=target, units=float(units),
-        due_in_days=(int(args["delivery_due_days"]) if args.get("delivery_due_days") else None),
-        temperature_c=(float(temp) if temp is not None else None),
-        humidity_percent=(float(args["humidity_percent"]) if args.get("humidity_percent") else None),
-        task_type=str(args.get("task_type") or "assembly"))
+        due_in_days=due_days, temperature_c=(float(temp) if temp is not None else None),
+        humidity_percent=hum, task_type=task)
+    result["delivery"] = delivery
+    # 答复里既然说"赶不上"，就把"那要多少人才赶得上"一起算出来 —— 这是同一批依据、同一条沙箱，
+    # 不是另起一个口径。规模够用时不算（它不是一个被问到的问题，也算了会把 8 秒白加上去）。
+    late = delivery.get("days_late")
+    if (delivery.get("finish_day") is not None or delivery.get("status") == "simulated") and (
+            delivery.get("finish_day") is None or (isinstance(late, (int, float)) and late > 0)):
+        delivery["min_scale"] = await min_headcount_for_delivery(
+            db, ref, model=target, units=float(units), due_in_days=due_days,
+            temperature_c=(float(temp) if temp is not None else None),
+            humidity_percent=hum, task_type=task)
     return result

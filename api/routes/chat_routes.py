@@ -967,6 +967,15 @@ def _format_architecture_reply(result: Dict[str, Any]) -> str:
                 f"- 缩放载体：{sl.get('from_line')}（{sl.get('line_basis')}）声明 "
                 f"{dlv.get('factor', 1):g} 倍 → {sl.get('units_per_day')} 台/天、班组 {sl.get('crew')} 人"
                 f"｜写在内存，line_profiles 未改动｜交期假设：{due.get('days')} 天（{due.get('note') or ''}）")
+        ms = dlv.get("min_scale") or {}
+        if ms.get("reading"):
+            lines.append(f"- 赶得上这个交期至少要：{ms['reading']}")
+        elif ms.get("status") in ("lead_time_bound", "beyond_ceiling"):
+            lines.append(
+                f"- 加人解决不了：{ms.get('why') or ''}｜{ms.get('note') or ''}"
+                + (f"｜规模差 8 倍时完工 {ms.get('finish_day_at_max_div_8')} 天 vs "
+                   f"{ms.get('finish_day_at_max')} 天"
+                   if ms.get("finish_day_at_max") is not None else ""))
     return "\n".join(lines)
 
 
