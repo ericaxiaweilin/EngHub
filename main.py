@@ -170,6 +170,7 @@ async def _periodic_scheduler():
         "warehouse_replenish": "_last_warehouse_check",
         "engine_watchdog": "_last_engine_watchdog",
         "engine_data_gap": "_last_engine_data_gap",
+        "engine_kit_backfill": "_last_engine_kit_backfill",
     }
     while True:
         did = {}
@@ -500,6 +501,37 @@ async def _periodic_scheduler():
                     }
         except Exception as e:
             _logger.warning(f"[scheduler] 引擎数据缺口巡检异常: {e}")
+
+        # 齐套行覆盖补齐 —— 每 2 小时补 15 张最薄的单（只加不改不删，每张 ≤400 行）。
+        # 为什么要自动：10-08 配对实测把因由量死了 —— 补登过的 8 张一致率 0.25，
+        # 台账 100-399 行的 94 张 0.0，旧登记世代的 18 张 0.0；封顶的是登记深度，不是引擎判错。
+        # 手动点一次不算跑通（候选=齐套行 ≤80 行且镜像里有 >1 层结构的单，队列消空后这格自然静默）。
+        try:
+            import time as _t_kb
+            if not hasattr(_periodic_scheduler, "_last_engine_kit_backfill"):
+                _periodic_scheduler._last_engine_kit_backfill = 0
+            if _t_kb.time() - _periodic_scheduler._last_engine_kit_backfill > 7200:  # 2h
+                _periodic_scheduler._last_engine_kit_backfill = _t_kb.time()
+                from api.services.component_orders import reupgrade_stale_kit_lines
+                from api.services.engine_watchdog import DEFAULT_FACTORY_ID as _KB_FID
+                async with db_config.session_factory() as db:
+                    res = await reupgrade_stale_kit_lines(
+                        db, _KB_FID,
+                        apply=os.getenv("ENGINE_KIT_BACKFILL_APPLY", "true").lower()
+                            not in {"0", "false", "no", "off"},
+                        limit=max(1, int(os.getenv("ENGINE_KIT_BACKFILL_PER_ROUND", "15"))),
+                        max_lines=max(1, int(os.getenv("ENGINE_KIT_BACKFILL_MAX_LINES", "80"))))
+                    did["engine_kit_backfill"] = {
+                        "applied": res["apply"], "candidates": res["orders_stale"],
+                        "orders_upgraded": res["orders_upgraded"],
+                        "lines_added": res["lines_added"],
+                        "skipped_existing": res["lines_skipped_existing"],
+                        "skipped_zero_requirement": res["lines_skipped_zero"],
+                        "no_structure": res["orders_no_structure"]}
+                    if res["lines_added"]:
+                        _logger.info(f"[kit-backfill] {did['engine_kit_backfill']}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 齐套行补登异常: {e}")
 
         from api.services.engine_heartbeat import record as _heartbeat
         import time as _gt
