@@ -31,15 +31,16 @@ TERRAIN_MULTIPLIERS = {"flat": 1.0, "slope": 1.15, "stairs": 1.3, "uneven": 1.1}
 # 这些输入被接口接受、也照原样存进快照与审计，但不进上面任何一项计算。
 # 明写出来是因为"传了参数却没反应"必须看得见，不能让人以为参数已经生效。
 INERT_INPUTS = (
+    # distance_meters 现在进强度反推了（给了实测距离就不再用步数×步幅估），不再属于没反应的字段
     "environment.noise_db", "environment.dust_mg_m3",
-    "distance_meters", "time_step_minutes", "x_position_m", "y_position_m",
+    "time_step_minutes", "x_position_m", "y_position_m",
     "work_context.action_type", "work_context.skill_level",
     "work_context.ppe_status", "work_context.machine_risk_level",
 )
 
 
 class PhysicsCore:
-    VERSION = "3.1.4"
+    VERSION = "3.1.5"
 
     def simulate_step(self, physical_input: PhysicalInput, *,
                       heat_threshold_c: Optional[float] = None,
@@ -80,6 +81,7 @@ class PhysicsCore:
             tlv_wbgt_c=th.get("tlv_wbgt_c"),
             thermal_exceedance_c=th.get("exceedance_c"),
             metabolic_level=th.get("metabolic_level"),
+            intensity_basis=dict(th.get("intensity") or {}),
             required_rest_fraction=th.get("required_rest_fraction"),
             max_allowable_work_minutes_per_hour=th.get("max_allowable_work_minutes_per_hour"),
             thermal_basis=dict(th.get("basis") or {}),
@@ -162,6 +164,14 @@ class PhysicsCore:
             "comfort_basis": th.get("comfort_basis"),
             "method": "metabolic_rate_x_time",
             "metabolic_kcal_per_hour": rate,
+            # 代谢率是怎么来的要能拆开看：工序名义档 + 步行净增项 + 姿势增项
+            "intensity_route": (th.get("intensity") or {}).get("route"),
+            "task_baseline_kcal_per_hour": ((th.get("intensity") or {}).get("components") or {})
+            .get("task_baseline_kcal_per_hour"),
+            "gait_increment_kcal_per_hour": ((th.get("intensity") or {}).get("components") or {})
+            .get("gait_increment_kcal_per_hour"),
+            "posture_adder_kcal_per_hour": ((th.get("intensity") or {}).get("components") or {})
+            .get("posture_adder_kcal_per_hour"),
             "metabolic_level": th.get("metabolic_level"),
             "rest_metabolic_kcal_per_hour": rest_rate,
             "exposure_hours": round(hours, 4),
@@ -207,7 +217,8 @@ class PhysicsCore:
             "energy_kcal": {
                 "formula": ("代谢率(强度档 kcal/h，来自 JSOH 同表) × 实际作业小时"
                             " + 休息段代谢率 × 休息小时"),
-                "driven_by": ["work_context.task_type（强度档→代谢率）", "continuous_work_minutes",
+                "driven_by": ["work_context.task_type（名义档）", "step_count / distance_meters（步行净增项）",
+                              "load_weight_kg", "posture_angle_deg", "continuous_work_minutes",
                               "WBGT 超限→required_rest_fraction"],
                 "thermal_route": ("温度与湿度通过 WBGT 超限逼出工休、折减实际作业小时来改变能耗；"
                                   "标准没有「同样外功的 kcal 按温度放大」的系数，所以不直接乘"),
@@ -253,10 +264,21 @@ class PhysicsCore:
                 "sensitivity_status": ("热侧斜率与冷侧 0 都是**本厂声明值**（写在包里可改可追）；"
                                         "台账窗口只有 9 天且全在热季、没有逐日车间温度实测，所以没跟数据对撞过"),
             },
+            "metabolic_intensity": {
+                "formula": ("强度档 = 工序名义档(非步行时间) + 步行净增项(ACSM 0.1·S·(1+负重/体重) + 1.7·S·坡度)"
+                            " × 步行占比 + 姿势增项；再按 RMR=(kcal/h−70)/60 回到 JSOH 的强度档取 WBGT 限值"),
+                "driven_by": ["step_count", "distance_meters", "continuous_work_minutes",
+                              "load_weight_kg", "posture_angle_deg", "environment.terrain",
+                              "environment.floor_incline_percent", "work_context.task_type"],
+                "why_not_task_lookup": ("只按工序名查表时，3000 步与 12000 步落在同一档、同一个 WBGT 限值上；"
+                                        "步数与负重是台账里真有的过程量，工序名是人填的"),
+                "fallback": "没有步数/距离或作业时长时退回工序名义档，并在 intensity_basis.route=task_map_only 里写明",
+                "declared_parameters": "步幅、步速、体重、楼梯系数、姿势系数都在包里声明（本厂值，不是实测）",
+            },
             "thermal_outputs": ["wbgt_c", "wet_bulb_c", "tlv_wbgt_c", "thermal_exceedance_c",
                                  "required_rest_fraction", "max_allowable_work_minutes_per_hour",
                                  "comfort_center_c", "comfort_band_c", "work_efficiency",
-                                 "energy_cost_multiplier", "attendance_impact"],
+                                 "energy_cost_multiplier", "attendance_impact", "intensity_basis"],
             "inert_inputs": list(INERT_INPUTS),
             "inert_note": ("这些字段接口收、快照存、审计里查得到，但不进疲劳、不进能耗、也不触发规则；"
                            "改了它们读数不变不是「参数没生效」，是模型里就没有这一段"),

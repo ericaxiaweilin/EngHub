@@ -884,6 +884,18 @@ def _format_orchestration_reply(orch_result) -> str:
     return "\n".join(parts)
 
 
+_SIM_DEFAULT_LABELS = {"temperature_c": "温度", "humidity_percent": "湿度",
+                       "continuous_work_minutes": "连续时长", "task_type": "工序",
+                       "step_count": "步数", "load_weight_kg": "负重",
+                       "posture_angle_deg": "姿势", "terrain": "地形"}
+
+
+def _sim_default_labels(keys) -> str:
+    """答复里必须点名哪些参数是填的默认值：不然"12000 步"的问题会被当成 3000 步的答案读。"""
+    skip = {"action_type"}
+    return "、".join(_SIM_DEFAULT_LABELS.get(str(k), str(k)) for k in (keys or []) if str(k) not in skip)
+
+
 def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
     """Deterministic fallback reply for clear business intents."""
     label = TOOL_LABELS.get(tool_name, tool_name)
@@ -976,7 +988,12 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             + ("（超职业接触限值，需改工作-恢复制度）" if result.get("legal_blocked") else ""),
             f"- 场景：{sc.get('task_type')}、{sc.get('temperature_c')}℃、湿度 "
             f"{sc.get('humidity_percent')}%、连续 {sc.get('continuous_work_minutes')} 分钟、"
-            f"{sc.get('step_count')} 步（出勤基线厂区：{result.get('answer_must_name_factory') or '未取'}）",
+            f"{sc.get('step_count')} 步、负重 {sc.get('load_weight_kg')}kg、姿势 {sc.get('posture_angle_deg')}°、"
+            f"地形 {sc.get('terrain') or 'flat'}（出勤基线厂区：{result.get('answer_must_name_factory') or '未取'}）"
+            + (f"；⚠ 原话里没给、按默认填的：{_sim_default_labels(result.get('defaults_applied'))}"
+               if result.get('defaults_applied') else ""),
+            f"- 强度档：{(result.get('intensity') or {}).get('reading') or '未反推'}"
+            + f"（档位来源：{(result.get('intensity') or {}).get('route') or 'none'}）",
             f"- WBGT {th.get('wbgt_c')}℃（自然湿球 {th.get('wet_bulb_c')}℃）对比 "
             f"{th.get('metabolic_level')} 强度档限值 {th.get('tlv_wbgt_c')}℃："
             + (f"超 {over:g}℃ → 需约 {rest}% 工休，每 60 分钟最多连续作业 "

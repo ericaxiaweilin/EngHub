@@ -202,9 +202,17 @@ class ISO7243HeatPlugin(SimulationPlugin):
 
         if not (legislation_pack or {}).get("metabolic_levels"):
             return []
+        # 强度档要按同一套过程量反推，否则物理层与判定层会各拿一个档（快照 moderate、规则 heavy）
         th = assess(temperature_c=snapshot.environment.temperature_c,
                     humidity_percent=snapshot.environment.humidity_percent,
-                    task_type=snapshot.task_type, pack=legislation_pack)
+                    task_type=snapshot.task_type, pack=legislation_pack,
+                    workload={"step_count": snapshot.step_count,
+                              "distance_meters": snapshot.distance_meters,
+                              "continuous_work_minutes": snapshot.continuous_work_minutes,
+                              "load_weight_kg": snapshot.load_weight_kg,
+                              "posture_angle_deg": snapshot.posture_angle_deg,
+                              "terrain": snapshot.environment.terrain,
+                              "floor_incline_percent": snapshot.environment.floor_incline_percent})
         if not th.get("available"):
             return []
         exceed = float(th.get("exceedance_c") or 0.0)

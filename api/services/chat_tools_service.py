@@ -37,7 +37,7 @@ from api.services.employee_skill_service import EmployeeSkillService
 from api.services.sim_erp_audit_service import SimERPAuditService
 from core.sim_erp.engine import SimERPEngine
 from core.sim_erp.models import (
-    ActionType, EnvironmentSnapshot, PhysicalInput, WorkContext,
+    ActionType, EnvironmentSnapshot, PhysicalInput, TerrainType, WorkContext,
 )
 from core.sim_erp.plugins.registry import build_default_registry
 from api.services.workbook_service import (
@@ -401,7 +401,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "humidity_percent": {"type": "number", "description": "湿度百分比，默认60"},
                     "load_weight_kg": {"type": "number", "description": "负重（公斤），默认0"},
                     "posture_angle_deg": {"type": "number", "description": "姿势角度（0-180），默认0"},
-                    "step_count": {"type": "integer", "description": "步数，默认3000"},
+                    "step_count": {"type": "integer", "description": "步数，默认3000（步数与负重会反推强度档，不是只进疲劳）"},
+                    "terrain": {"type": "string", "enum": ["flat", "slope", "stairs", "uneven"],
+                                "description": "地形：平地/斜坡/楼梯/不平整，默认flat。楼梯按包里系数抬高步行成本"},
                     "action_type": {"type": "string", "enum": ["walk", "lift", "push", "pull", "assemble", "inspect", "idle"], "description": "动作类型，默认walk"},
                     "factory_id": {"type": "string",
                                    "description": ("出勤基线用哪个厂：可写厂名（机械厂、电子厂）或厂区 id。"
@@ -1741,9 +1743,12 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     action_raw = (args.get("action_type") or "walk").lower()
     action = action_raw if action_raw in [a.value for a in ActionType] else "walk"
     try:
+        terrain_raw = (args.get("terrain") or "flat").lower()
+        terrain = terrain_raw if terrain_raw in [t.value for t in TerrainType] else "flat"
         env = EnvironmentSnapshot(
             temperature_c=float(args.get("temperature_c", 30.0)),
             humidity_percent=float(args.get("humidity_percent", 60.0)),
+            terrain=TerrainType(terrain),
         )
         wc = WorkContext(
             task_type=task_type,
@@ -1824,6 +1829,26 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
                                                     ["heat_allowance_triggers_above_c"])
            else f"不高于 {drivers['rule_thresholds']['heat_allowance_triggers_above_c']:g}℃ → "
                 "温度这一项对疲劳与判定都没有反应"))
+    it = snap.intensity_basis or {}
+    eb = snap.energy_basis or {}
+    if it.get("route") == "workload_derived":
+        g = it.get("gait") or {}
+        c = it.get("components") or {}
+        intensity_reading = (
+            f"{snap.metabolic_level} 档 {eb.get('metabolic_kcal_per_hour')} kcal/h = "
+            f"工序名义 {c.get('task_baseline_kcal_per_hour')} + 步行净增 {c.get('gait_increment_kcal_per_hour')}"
+            f"（{snap.step_count} 步≈{g.get('distance_m')}m，按 {g.get('speed_m_per_min')} m/min 走了 "
+            f"{g.get('walk_minutes')} 分钟，占窗口 {round((c.get('walking_duty_cycle') or 0) * 100, 1)}%，"
+            f"负重 {snap.load_weight_kg}kg、地形 {g.get('terrain')}×{g.get('terrain_multiplier')}）"
+            f" + 姿势 {c.get('posture_adder_kcal_per_hour')}"
+            + (f"；比工序名义档「{it.get('task_map_level')}」高一档 → WBGT 限值按 "
+               f"{snap.tlv_wbgt_c}℃ 判" if it.get("band_shifted_from_task_map") else ""))
+    elif it.get("route"):
+        intensity_reading = (f"{snap.metabolic_level} 档 {eb.get('metabolic_kcal_per_hour')} kcal/h："
+                             f"{it.get('why') or '未按工作量反推'}")
+    else:
+        intensity_reading = ("强度档没反推过（没有热应力规则包 → 能耗退回外功代理口径），"
+                             "不代表这个岗位的负荷就是这么轻")
     att_effect = ""
     ai = snap.attendance_impact or {}
     if ai.get("predicted_absence_rate") is not None:
@@ -1870,6 +1895,13 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
             "read_pitfall": ("强超限时窗口内总能耗可能反而低于轻超时温度（工休把作业小时换成了休息档）—— "
                              "不代表高温更省力，而是那段时间不允许连续干；要看效率与所需工休"),
             "basis": (snap.energy_basis or {}).get("comfort_basis"),
+        },
+        # 强度档是 WBGT 限值与代谢率的共同入口：说清它是反推的还是查表的
+        "intensity": {
+            **(snap.intensity_basis or {}),
+            "metabolic_level": snap.metabolic_level,
+            "wbgt_limit_c": snap.tlv_wbgt_c,
+            "reading": intensity_reading
         },
         # 工况的核心后果之一在出勤：热到没人来，产能就不是效率问题了而是人数问题
         "attendance_impact": {
@@ -1920,6 +1952,12 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
         },
         "model_drivers": drivers,
         "inputs_supplied_but_inert": supplied_inert,
+        # 用户没说出口的数要用默认值填空 —— 哪些是填的要单独列出来，
+        # 否则"12000 步"被当成"3000 步"回答，答复看着像按原话算的
+        "defaults_applied": [k for k in ("temperature_c", "humidity_percent", "continuous_work_minutes",
+                                         "task_type", "step_count", "load_weight_kg",
+                                         "posture_angle_deg", "terrain", "action_type")
+                             if args.get(k) is None],
         "scenario": {
             "task_type": task_type,
             "continuous_work_minutes": snap.continuous_work_minutes,
@@ -1928,6 +1966,7 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
             "load_weight_kg": snap.load_weight_kg,
             "posture_angle_deg": snap.posture_angle_deg,
             "step_count": snap.step_count,
+            "terrain": getattr(snap.environment.terrain, "value", str(snap.environment.terrain)),
             "attendance_baseline": (ledger.get("basis") if ledger.get("available")
                                     else ledger.get("why")),
         },
@@ -4759,6 +4798,33 @@ _HEAT_TASK_WORDS = {
 _FACTORY_NAME_WORDS = ("机械厂", "电子厂")
 
 
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+           "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _cn_hours(raw: str) -> Optional[float]:
+    """"一小时/两个半小时/3.5小时" 都要能变成分钟数，只认阿拉伯数字会把原话读成默认场景。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw == "半":
+        return 0.5
+    if raw.isdigit() or re.match(r"^\d+(?:\.\d+)?$", raw):
+        return float(raw)
+    if "半" in raw:
+        head = _cn_hours(raw.replace("半", "").strip().rstrip("个"))
+        return (head or 0) + 0.5
+    if raw.startswith("十") and len(raw) == 2 and raw[1] in _CN_NUM:
+        return 10 + _CN_NUM[raw[1]]
+    if raw in _CN_NUM:
+        return float(_CN_NUM[raw])
+    if len(raw) == 2 and raw[1] == "十" and raw[0] in _CN_NUM:
+        return float(_CN_NUM[raw[0]] * 10)
+    if len(raw) == 3 and raw[1] == "十":
+        return float(_CN_NUM.get(raw[0], 0) * 10 + _CN_NUM.get(raw[2], 0))
+    return None
+
+
 def extract_heat_scenario(message: str) -> Dict[str, Any]:
     """从原话里抽温度/湿度/连续时长/工序 —— 高温问题必须有真实数字进引擎。
 
@@ -4766,7 +4832,15 @@ def extract_heat_scenario(message: str) -> Dict[str, Any]:
     """
     args: Dict[str, Any] = {}
     text = (message or "").replace("℃", "度").replace("°C", "度").replace("º", "度")
-    t = re.search(r"(-?\d+(?:\.\d+)?)\s*度", text)
+    # 先按"车间/室温/温度 + N度"认温度，认不到才退回裸 N度（但跳过"弯腰N度"这种姿势说法）
+    t = re.search(r"(?:车间|厂房|室温|室内|环境温度|温度|气温)[^0-9\-]{0,4}(-?\d+(?:\.\d+)?)\s*度", text)
+    if not t:
+        for cand in re.finditer(r"(-?\d+(?:\.\d+)?)\s*度", text):
+            head = text[max(0, cand.start() - 4):cand.start()]
+            if any(w in head for w in ("弯腰", "俯身", "蹲", "跪", "低头", "姿态", "姿势")):
+                continue
+            t = cand
+            break
     if t:
         args["temperature_c"] = float(t.group(1))
     h = re.search(r"(?:湿度|相对湿度)[^0-9]{0,6}(\d{1,3})\s*%?", text)
@@ -4782,6 +4856,30 @@ def extract_heat_scenario(message: str) -> Dict[str, Any]:
     m2 = re.search(r"(\d{2,4})\s*分钟", text)
     if m2:
         args["continuous_work_minutes"] = int(m2.group(1))
+    # 步数/负重/姿势/地形是强度档的输入，抽不到就会拿默认场景回答用户点名的活
+    st = re.search(r"(\d+(?:\.\d+)?)\s*(?:万)?\s*步", text)
+    if st:
+        n = float(st.group(1)) * (10000 if "万" in text[st.start():st.end()] else 1)
+        args["step_count"] = int(round(n))
+    ld = re.search(r"(?:背|搬|提|扛|负重|载荷|拿)[^0-9]{0,4}(\d+(?:\.\d+)?)\s*(?:公斤|kg|KG|千克)", text)
+    if ld:
+        args["load_weight_kg"] = float(ld.group(1))
+    ps = re.search(r"(?:弯腰|俯身|蹲|跪|低头)[^0-9]{0,4}(\d{1,3})\s*度", text)
+    if ps:
+        args["posture_angle_deg"] = float(ps.group(1))
+    if re.search(r"楼梯|阶梯|爬楼", text):
+        args["terrain"] = "stairs"
+    elif re.search(r"斜坡|坡道|上坡", text):
+        args["terrain"] = "slope"
+    if "不平整" in text or "泥泞" in text:
+        args["terrain"] = "uneven"
+    # 只说"一小时/8小时"也算作业窗口：抽不到就把窗口填成默认 4 小时，等于替用户改题
+    if "continuous_work_minutes" not in args:
+        bare = re.search(r"(\d+(?:\.\d+)?|半|[一两二三四五六七八九十]{1,3})\s*(?:个)?小时", text)
+        if bare:
+            hrs = _cn_hours(bare.group(1))
+            if hrs:
+                args["continuous_work_minutes"] = int(round(hrs * 60))
     for cn, en in _HEAT_TASK_WORDS.items():
         if cn in text:
             args["task_type"] = en

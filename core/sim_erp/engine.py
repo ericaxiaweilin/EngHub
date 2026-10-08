@@ -20,6 +20,20 @@ from .plugins.executor import PluginExecutor
 HEAT_PACK_NAME = "iso7243_jsoh_heat"
 
 
+def _workload(physical_input: PhysicalInput) -> dict:
+    """反推强度档要的过程量：步数/距离/时长/负重/姿势/地形/坡度，全来自输入本身。"""
+    env = physical_input.environment
+    return {
+        "step_count": physical_input.step_count,
+        "distance_meters": physical_input.distance_meters,
+        "continuous_work_minutes": physical_input.continuous_work_minutes,
+        "load_weight_kg": physical_input.load_weight_kg,
+        "posture_angle_deg": physical_input.posture_angle_deg,
+        "terrain": getattr(env.terrain, "value", str(env.terrain)),
+        "floor_incline_percent": env.floor_incline_percent,
+    }
+
+
 class SimERPEngine:
     def __init__(
         self,
@@ -69,7 +83,8 @@ class SimERPEngine:
             thermal = assess(temperature_c=physical_input.environment.temperature_c,
                              humidity_percent=physical_input.environment.humidity_percent,
                              task_type=physical_input.work_context.task_type, pack=heat_pack,
-                             absence_baseline=attendance_baseline)
+                             absence_baseline=attendance_baseline,
+                             workload=_workload(physical_input))
             if not thermal.get("available"):
                 thermal = None
             else:

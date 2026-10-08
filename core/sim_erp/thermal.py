@@ -61,6 +61,99 @@ def resolve_metabolic_level(task_type: str, pack: Dict[str, Any],
             "wbgt_limit_c": row.get("wbgt_limit_c")}
 
 
+def derive_intensity(*, pack: Dict[str, Any], task_meta: Dict[str, Any],
+                     workload: Optional[Dict[str, Any]],
+                     explicit_level: Optional[str] = None) -> Dict[str, Any]:
+    """强度档由工作量反推：工序名义档代表非步行时间，步数/坡度/负重/姿势各自加项。
+
+    为什么要反推而不是按工序名查表：步数与负重是台账里真有的过程量，工序名是人填的；
+    查表的话 3000 步和 12000 步会落在同一个强度档、同一个 WBGT 限值上。
+    """
+    levels = pack.get("metabolic_levels") or {}
+    if explicit_level and explicit_level in levels:
+        row = levels[explicit_level]
+        return {**task_meta, "route": "explicit_level",
+                "why": f"调用方点名了强度档 {explicit_level} → 不反推",
+                "components": {}, "gait": {}, "assumptions": []}
+    wf = pack.get("metabolic_from_workload") or {}
+    base = float(task_meta.get("kcal_per_hour") or 0.0)
+    out: Dict[str, Any] = {"route": "task_map_only", "components": {"task_baseline_kcal_per_hour": base},
+                           "gait": {}, "assumptions": [],
+                           "why": "没有步数/距离或作业时长（或包里没开反推）→ 强度档只能按工序名义值取"}
+    if not wf:
+        return {**task_meta, **out}
+    wl = workload or {}
+    minutes = float(wl.get("continuous_work_minutes") or 0.0)
+    steps = int(wl.get("step_count") or 0)
+    distance = float(wl.get("distance_meters") or 0.0)
+    stride = float(wf.get("stride_m", 0.65))
+    pace = float(wf.get("pace_m_per_min", 60.0))
+    bw = float(wf.get("body_mass_kg", 60.0))
+    if minutes <= 0 or (steps <= 0 and distance <= 0):
+        return {**task_meta, **out}
+    distance_m = distance if distance > 0 else steps * stride
+    walk_min = distance_m / pace if pace > 0 else 0.0
+    speed = pace
+    assumptions = []
+    if walk_min > minutes:            # 窗口全在走：隐含速度比声明步速快，按实际速度算
+        speed = distance_m / minutes
+        walk_min = minutes
+        assumptions.append(f"隐含步行速度 {round(speed, 1)} m/min 高于声明步速 {pace:g} m/min → 整段按步行计")
+    duty = walk_min / minutes
+    grade = max(0.0, float(wl.get("floor_incline_percent") or 0.0)) / 100.0
+    terrain = str(wl.get("terrain") or "flat")
+    terr_mult = float((wf.get("terrain_gait_multiplier") or {}).get(terrain, 1.0))
+    load = max(0.0, float(wl.get("load_weight_kg") or 0.0))
+    # ACSM 净项按搬动的总质量计：这是对该式的算术扩展，不是原文（包里写明）
+    vo2_net = (float(wf.get("acsm_horizontal", 0.1)) * speed * (1.0 + load / bw)
+               + float(wf.get("acsm_vertical", 1.7)) * speed * grade) * terr_mult
+    gait_kcal_h = vo2_net * bw * 0.3
+    start = float(wf.get("posture_adder_start_deg", 30.0))
+    deg = float(wl.get("posture_angle_deg") or 0.0)
+    posture_met = float(wf.get("posture_adder_met_at_90deg", 0.0)) * max(0.0, (deg - start) / (90.0 - start))
+    posture_kcal_h = posture_met * float(wf.get("kcal_per_met_kg_h", 1.05)) * bw
+    total = base + gait_kcal_h * duty + posture_kcal_h
+    rmr = int(round((total - 70.0) / 60.0))
+    rmr = min(5, max(1, rmr))
+    key = next((k for k, v in levels.items() if v.get("rmr") == rmr), task_meta.get("level"))
+    row = levels.get(key) or {}
+    assumptions.append("工序名义档只算非步行时间的负荷，步行加的是净增项 —— 两者不重复计")
+    return {
+        "level": key,
+        "rmr": row.get("rmr", rmr),
+        "kcal_per_hour": round(total, 1),
+        "wbgt_limit_c": row.get("wbgt_limit_c"),
+        "route": "workload_derived",
+        "components": {
+            "task_baseline_kcal_per_hour": round(base, 1),
+            "gait_kcal_per_hour_while_walking": round(gait_kcal_h, 1),
+            "gait_increment_kcal_per_hour": round(gait_kcal_h * duty, 1),
+            "walking_duty_cycle": round(duty, 4),
+            "posture_adder_kcal_per_hour": round(posture_kcal_h, 1),
+            "load_weight_kg": load,
+            "body_mass_kg": bw,
+        },
+        "gait": {
+            "step_count": steps,
+            "distance_m": round(distance_m, 1),
+            "stride_m": stride,
+            "walk_minutes": round(walk_min, 1),
+            "speed_m_per_min": round(speed, 1),
+            "terrain": terrain,
+            "terrain_multiplier": terr_mult,
+            "grade_fraction": round(grade, 4),
+            "vo2_net_ml_per_kg_min": round(vo2_net, 2),
+        },
+        "task_map_level": task_meta.get("level"),
+        "task_map_kcal_per_hour": base,
+        "band_shifted_from_task_map": key != task_meta.get("level"),
+        "assumptions": assumptions,
+        "basis": wf.get("basis"),
+        "formula": wf.get("formula"),
+        "sources": wf.get("sources"),
+    }
+
+
 def attendance_impact(*, wbgt_over_pre_limit_c: float, cold_deg: float, pack: Dict[str, Any],
                       absence_baseline: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把工况折算成出勤率影响：热侧按 WBGT 相对「限值−本厂余量」的偏差加增量，冷侧按声明值（默认 0）。
@@ -112,14 +205,16 @@ def attendance_impact(*, wbgt_over_pre_limit_c: float, cold_deg: float, pack: Di
 def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
            pack: Dict[str, Any], globe_temperature_c: Optional[float] = None,
            metabolic_level: Optional[str] = None,
-           absence_baseline: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           absence_baseline: Optional[Dict[str, Any]] = None,
+           workload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把环境 + 作业强度折成 WBGT、限值、超限幅度、所需工休、应变系数与出勤率影响。"""
     if not pack:
         return {"available": False, "why": "没有热应力规则包（iso7243_jsoh_heat）→ 不折算，也不冒充算过"}
     env = wbgt_c(temperature_c=temperature_c, humidity_percent=humidity_percent,
                  globe_temperature_c=globe_temperature_c,
                  weights=(pack.get("wbgt") or {}).get("indoor_weights"))
-    meta = resolve_metabolic_level(task_type, pack, metabolic_level)
+    meta = derive_intensity(pack=pack, task_meta=resolve_metabolic_level(task_type, pack, metabolic_level),
+                            workload=workload, explicit_level=metabolic_level)
     limit = meta.get("wbgt_limit_c")
     strain = pack.get("strain") or {}
     rest = pack.get("work_rest") or {}
@@ -130,8 +225,10 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
                         float(rest.get("rest_fraction_per_exceedance_c", 0.0)) * over)
     cf = pack.get("comfort") or {}
     kcal = float(meta.get("kcal_per_hour") or 0.0)
-    center = float(cf.get("optimal_c", 21.0)) + float(
-        cf.get("optimal_shift_per_100kcal_above_130", 0.0)) * max(0.0, (kcal - 130.0) / 100.0)
+    shift = float(cf.get("optimal_shift_per_100kcal_above_130", 0.0)) * max(0.0, (kcal - 130.0) / 100.0)
+    # 舒适中心随强度下移要封顶：不封顶时 686 kcal/h 会外推出 9.9℃ 的"舒适中心"，那是假数
+    cap = abs(float(cf.get("optimal_shift_cap_c", 5.0)))
+    center = float(cf.get("optimal_c", 21.0)) + max(-cap, min(cap, shift))
     band = float(cf.get("band_c", 2.0))
     upper, lower = center + band, center - band
     pre = float(cf.get("wbgt_pre_limit_c", 0.0))
@@ -157,6 +254,7 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
     return {
         "available": True,
         "comfort_center_c": round(center, 2),
+        "comfort_shift_capped": bool(abs(shift) > cap),
         "comfort_band_c": [round(lower, 2), round(upper, 2)],
         "apparent_cold_c": apparent_cold_c,
         "cold_wet_penalty_c": wet_cold_penalty,
@@ -177,6 +275,7 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
         "wbgt_c": env["wbgt_c"],
         "assumptions": env["assumptions"],
         "metabolic_level": meta["level"],
+        "intensity": meta,
         "metabolic_rmr": meta["rmr"],
         "metabolic_kcal_per_hour": meta["kcal_per_hour"],
         "tlv_wbgt_c": limit,

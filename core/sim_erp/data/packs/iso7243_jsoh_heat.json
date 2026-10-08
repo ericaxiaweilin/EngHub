@@ -70,6 +70,33 @@
     "office": "very_light",
     "planning": "very_light"
   },
+  "metabolic_from_workload": {
+    "formula": "强度 = 工序名义档 + 步行净增项 + 姿势增项；步行净增项按 ACSM 步行代谢式反推",
+    "gait_formula": "VO2(ml/kg/min) = 3.5 + 0.1·S·(1+负重/体重) + 1.7·S·坡度小数；净增项 = (VO2 − 3.5) × 体重 × 0.3 kcal/h（0.3 = 5 kcal/L × 60 min / 1000 mL）",
+    "walk_minutes": "步行分钟 = min(作业分钟, 距离 / 步速)；距离 = 步数 × 步幅（给了实测距离就用实测距离）",
+    "task_baseline_note": "工序名义档代表**非步行时间**的手工/站立负荷；步行只加净增项，不按「整段时间都在走路」折算，避免把工序档与走路重复计算",
+    "acsm_horizontal": 0.1,
+    "acsm_vertical": 1.7,
+    "resting_vo2_ml_per_kg_min": 3.5,
+    "kcal_per_met_kg_h": 1.05,
+    "stride_m": 0.65,
+    "pace_m_per_min": 60.0,
+    "body_mass_kg": 60.0,
+    "terrain_gait_multiplier": {
+      "flat": 1.0,
+      "slope": 1.0,
+      "stairs": 1.6,
+      "uneven": 1.15
+    },
+    "posture_adder_start_deg": 30.0,
+    "posture_adder_met_at_90deg": 0.6,
+    "rmr_from_kcal": "RMR = (kcal/h − 70) / 60，四舍五入取 1~5 档（JSOH 同表 M = 70 + 60·RMR 的反解）",
+    "sources": {
+      "acsm": "ACSM 代谢式（步行）VO2 = (0.1 × S) + (1.7 × S × G) + 3.5，S=速度 m/min、G=坡度小数、3.5=静息摄氧量（1 MET）；ACSM's Guidelines 系列与运动测试教材通用形式",
+      "met_to_kcal": "1 MET = 3.5 ml·kg⁻¹·min⁻¹；kcal/min = MET × 3.5 × 体重 / 200（即 kcal/h = MET × 体重 × 1.05）"
+    },
+    "basis": "把负重写成 0.1·S 项上的 (1+负重/体重) 是该式「净项按搬动的总质量计」的算术扩展，不是 ACSM 原文；步幅 0.65m、步速 60m/min、体重 60kg、楼梯 ×1.6、姿势 +0.6 MET@90° 都是**本厂声明值**（没有逐人工体实测，改这里就是改口径）。反推出来的档与工序名义档不一致时以反推为准，因为步数与负重是台账里真有的过程量，工序名是人填的"
+  },
   "default_metabolic_level": "moderate",
   "strain": {
     "fatigue_gain_per_exceedance_c": 0.1,
@@ -101,6 +128,8 @@
     "optimal_c": 21.0,
     "band_c": 2.0,
     "optimal_shift_per_100kcal_above_130": -2.0,
+    "optimal_shift_cap_c": 5.0,
+    "optimal_shift_cap_note": "强度越高舒适中心越低，但最多只降 5℃（重活的中性温度也就 16℃ 上下）。不封顶时 686 kcal/h 会外推出 9.9℃ 的『舒适中心』—— 那是外推出来的假数",
     "cost_per_deg_hot": 0.03,
     "cost_per_deg_cold": 0.02,
     "efficiency_loss_per_deg_hot": 0.012,
@@ -133,8 +162,20 @@
     "baseline_must_come_from_ledger": "基线缺勤率不在包里写死：由调用方从 attendance 台账按厂区取（leave 行数 / 排班人次行），换厂区就换一个实测数；取不到基线时只报增量 pp，不假装知道总缺勤率",
     "observed_ledger": {
       "window": "2026-08-08 ~ 2026-08-22（9 个日期、11567 行、2 个厂区）",
-      "FAC_MECH_001": {"rows": 7319, "leave_rate": 0.0433, "nonpresent_rate": 0.0747, "late_rate": 0.0313, "daily_leave_rate": "4.31%（各天持平）"},
-      "FAC_ELEC_DEMO_2026": {"rows": 4248, "leave_rate": 0.0005, "nonpresent_rate": 0.0365, "late_rate": 0.0358, "daily_leave_rate": "0.00%"},
+      "FAC_MECH_001": {
+        "rows": 7319,
+        "leave_rate": 0.0433,
+        "nonpresent_rate": 0.0747,
+        "late_rate": 0.0313,
+        "daily_leave_rate": "4.31%（各天持平）"
+      },
+      "FAC_ELEC_DEMO_2026": {
+        "rows": 4248,
+        "leave_rate": 0.0005,
+        "nonpresent_rate": 0.0365,
+        "late_rate": 0.0358,
+        "daily_leave_rate": "0.00%"
+      },
       "reading": "金属加工厂的请假率（4.33%）比电子厂（0.05%）高两个量级，电子厂的不到勤几乎全是迟到 —— 但金属厂这九天日级请假率一模一样（4.31%），台账里没有「热天 vs 凉天」的差异可挖，所以热侧斜率只能是声明值，不能声称已被现场证实"
     },
     "cold_side_note": "冷侧增量默认 0：厂里口径是 10℃ 左右不影响出勤（人照常来），但效率确实掉（见 comfort 的冷偏差项）—— 两条轴分开，不要把『照常上班』读成『干得一样快』"

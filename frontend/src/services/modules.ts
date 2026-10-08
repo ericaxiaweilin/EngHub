@@ -115,6 +115,7 @@ export interface SimSnapshot {
   energy_cost_multiplier?: number | null
   attendance_impact?: Record<string, any>
   thermal_basis?: Record<string, any>
+  intensity_basis?: Record<string, any>
 }
 
 export interface SimulationResult {

@@ -110,6 +110,8 @@ class PhysicalSnapshot(BaseModel):
     tlv_wbgt_c: Optional[float] = None
     thermal_exceedance_c: Optional[float] = None
     metabolic_level: Optional[str] = None
+    # 强度档是怎么来的（工序名义档 + 步行净增项 + 姿势增项的分解），None=没反推过
+    intensity_basis: Dict[str, Any] = Field(default_factory=dict)
     required_rest_fraction: Optional[float] = None
     max_allowable_work_minutes_per_hour: Optional[float] = None
     thermal_basis: Dict[str, Any] = Field(default_factory=dict)

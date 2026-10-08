@@ -568,6 +568,29 @@ const ComplianceSim: React.FC = () => {
                           ? ` · 需 ${Math.round(result.snapshot.required_rest_fraction * 100)}% 工休，每 60 分钟最多连续 ${result.snapshot.max_allowable_work_minutes_per_hour} 分钟`
                           : ''}
                       </Descriptions.Item>
+                      <Descriptions.Item label="强度档（工作量反推）">
+                        {(() => {
+                          const it: any = result.snapshot?.intensity_basis || {}
+                          const c = it.components || {}
+                          const g = it.gait || {}
+                          if (it.route === 'workload_derived') {
+                            return (
+                              <span>
+                                <Text strong>{result.snapshot?.metabolic_level}</Text>
+                                {' · 工序名义 ' + c.task_baseline_kcal_per_hour + ' + 步行净增 ' + c.gait_increment_kcal_per_hour}
+                                {'（' + g.step_count + ' 步 ≈ ' + g.distance_m + 'm，按 ' + g.speed_m_per_min}
+                                {' m/min 走了 ' + g.walk_minutes + ' 分钟，占 ' + Math.round((c.walking_duty_cycle || 0) * 1000) / 10}
+                                {'%，负重 ' + c.load_weight_kg + 'kg，地形 ' + g.terrain + '×' + g.terrain_multiplier + '）'}
+                                {' + 姿势 ' + c.posture_adder_kcal_per_hour + ' kcal/h'}
+                                {it.band_shifted_from_task_map
+                                  ? <Tag color="volcano" style={{ marginLeft: 10 }}>档位比工序名义「{it.task_map_level}」更高 → WBGT 限值按 {result.snapshot?.tlv_wbgt_c}℃ 判</Tag>
+                                  : null}
+                              </span>
+                            )
+                          }
+                          return <Text type="secondary">{it.route === 'explicit_level' ? '调用方点名强度档，未反推' : (it.why || '未按工作量反推')}</Text>
+                        })()}
+                      </Descriptions.Item>
                       <Descriptions.Item label="工况曲线">
                         {result.snapshot.work_efficiency != null
                           ? `效率 ${Math.round(result.snapshot.work_efficiency * 100)}%` : '效率 —'}

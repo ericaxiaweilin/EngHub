@@ -175,6 +175,8 @@ class SimERPSnapshotResponse(BaseModel):
     attendance_impact: Dict[str, Any] = Field(default_factory=dict)
     # 折算依据（含 rule_route：物理层折算与法规判定是不是都走了）
     thermal_basis: Dict[str, Any] = Field(default_factory=dict)
+    # 强度档反推过程（工序名义档 + 步行净增项 + 姿势增项）
+    intensity_basis: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SimERPSimulationResponse(BaseModel):
@@ -336,6 +338,7 @@ def _build_response(record: AuditRecord) -> SimERPSimulationResponse:
             energy_cost_multiplier=snap.energy_cost_multiplier,
             attendance_impact=snap.attendance_impact,
             thermal_basis=snap.thermal_basis,
+            intensity_basis=snap.intensity_basis,
         ),
         plugin_records=[
             SimERPPluginRecordResponse(
