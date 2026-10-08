@@ -771,6 +771,26 @@ async def _engine_contract_call(iface: str, db: AsyncSession, factory_id: str,
         raise HTTPException(status_code=422, detail=exc.as_dict())
 
 
+@router.get("/kit-lines-reupgrade", summary="把停在旧登记世代的齐套表补到多层结构（默认只预演，只加不改不删）")
+async def get_kit_lines_reupgrade(
+    factory_id: str = Query(..., description="厂区"),
+    apply: bool = Query(False, description="false=只出预演不动库；true 才真的补行"),
+    limit: int = Query(20, ge=1, le=200, description="本轮最多看多少张单"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """L2B 的覆盖率与瓶颈件一致率被台账的**登记世代**压着：同机种按多层展开登记过的单能到 680 行，
+    而这些单只有十几行 —— 这一格给的是把结构补齐的那条路，不是再推演一遍。
+
+    只加不改不删：表里已有的料号一律跳过，所以缺料只会因为看见更多行而变多，
+    齐套门不会因为补登而放松；数量口径沿用 `_from_explosion` 那一条。
+    """
+    del current_user
+    from api.services.component_orders import reupgrade_stale_kit_lines
+
+    return await reupgrade_stale_kit_lines(db, factory_id, apply=apply, limit=limit)
+
+
 @router.get("/sim-readiness", summary="精度判据就绪度：L2B 那两个数为什么算不出，缺的是哪一类数据")
 async def get_sim_readiness(
     factory_id: str = Query(..., description="厂区"),

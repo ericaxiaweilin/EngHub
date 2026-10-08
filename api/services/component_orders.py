@@ -556,3 +556,125 @@ async def rebuild_missing_component_kits(
         f"{receipt['kits_from_parent_snapshot']} 张来自父单快照）；"
         f"{receipt['still_no_evidence']} 张厂里根本没有它的下层结构，按 BOM 缺失报出")
     return receipt
+
+STALE_KIT_SQL = """
+WITH o AS (
+    SELECT w.id, w.work_order_code, w.product_id, w.planned_qty,
+           COALESCE(pp.product_code, p.product_code, w.product_id) AS model,
+           COUNT(wm.id) AS kit_lines,
+           COALESCE(SUM(wm.shortage_qty) FILTER (WHERE COALESCE(wm.shortage_qty,0) > 0), 0) AS shortage_now
+    FROM work_orders w
+    LEFT JOIN work_order_materials wm ON wm.work_order_id = w.id
+    LEFT JOIN products p ON p.factory_id = w.factory_id
+         AND (p.id::text = w.product_id OR p.product_code = w.product_id)
+    LEFT JOIN work_orders par ON par.id = w.parent_work_order_id
+    LEFT JOIN products pp ON pp.factory_id = par.factory_id
+         AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+    WHERE w.factory_id = :fid AND w.status IN ('pending', 'released', 'in_progress')
+      AND w.id NOT LIKE 'wo-vf-%'
+    GROUP BY 1, 2, 3, 4, 5
+)
+SELECT o.id, o.work_order_code, o.model, o.planned_qty, o.kit_lines, o.shortage_now
+FROM o
+WHERE o.kit_lines BETWEEN 1 AND :max_lines
+  AND EXISTS (SELECT 1 FROM enghub_bom_items e
+               WHERE e.factory_id = :fid AND e.product_model = o.model AND e.level > 1)
+ORDER BY o.kit_lines ASC
+LIMIT :limit
+"""
+
+EXISTING_CODES_SQL = """
+    SELECT DISTINCT material_code FROM work_order_materials WHERE work_order_id = :wid
+"""
+
+KIT_REUPGRADE_APPLY = os.getenv("ENGINE_KIT_REUPGRADE_APPLY", "false").strip().lower() in ("1", "true", "yes", "on")
+KIT_REUPGRADE_MAX_LINES = 400
+
+
+async def reupgrade_stale_kit_lines(
+    db: AsyncSession, factory_id: str, *, apply: Optional[bool] = None, limit: int = 20,
+) -> Dict[str, Any]:
+    """把还停在旧登记世代的工单齐套表**补到多层结构**，一行老的都不动。
+
+    为什么要补：70 张可比单里 64 张的领料行还停在 1-20 行（同机种按多层展开登记过的能到 680 行、
+    深 9 层）。齐套表只看得到一小截结构，`台账缺口行覆盖率` 与瓶颈件一致率就被封顶 —— 判据读起来像
+    "引擎不准"，实际是台账没跟上。
+
+    三条硬规矩：
+    ① **只加不改不删**：已有的料号一律跳过（不重写 required/shortage），所以缺料只会因为看见更多行
+       而变多、不会因为这次补登而变少 —— 齐套门不会因为这次写入而放松；
+    ② 数量口径沿用 `_from_explosion` 那一条（required=毛需求、shortage=低层码净需求），
+       不在这里另发明一套；毛/净之争要改的是原口径，不是这次补登；
+    ③ 每张单最多补 `KIT_REUPGRADE_MAX_LINES` 行（磁盘寿命），默认只预演，
+       落库要显式开 ENGINE_KIT_REUPGRADE_APPLY=true 或调用时传 apply=True。
+    """
+    if apply is None:
+        apply = KIT_REUPGRADE_APPLY
+    rows = (await db.execute(text(STALE_KIT_SQL), {
+        "fid": factory_id, "limit": max(1, int(limit)), "max_lines": 20})).mappings().all()
+    receipt: Dict[str, Any] = {
+        "factory_id": factory_id, "apply": apply, "dry_run": not apply,
+        "orders_stale": len(rows), "orders_upgraded": 0, "lines_added": 0,
+        "lines_skipped_existing": 0, "lines_skipped_zero": 0, "orders_no_structure": 0,
+        "codes_before_total": 0, "codes_after_total": 0, "parts": [],
+    }
+    for row in rows:
+        wid = str(row["id"])
+        model = str(row["model"] or "")
+        units = int(row["planned_qty"] or 0) or 1
+        have = {str(c["material_code"]) for c in (await db.execute(
+            text(EXISTING_CODES_SQL), {"wid": wid})).mappings().all()}
+        codes_before = len(have)
+        receipt["codes_before_total"] += codes_before
+        try:
+            own = await explode_requirement(db, factory_id, model, units)
+        except Exception:  # noqa: BLE001 - 展开失败就报缺依据，不落半行数据
+            own = None
+        new_lines: List[Dict[str, Any]] = []
+        for line in ((own or {}).get("lines") or []):
+            code = str(line.get("material_code") or "")
+            if not code or code == model:
+                continue
+            if float(line.get("required_qty") or 0) <= 0:
+                receipt["lines_skipped_zero"] += 1
+                continue
+            if code in have:
+                receipt["lines_skipped_existing"] += 1
+                continue
+            have.add(code)
+            new_lines.append({
+                "material_code": code,
+                "material_name": line.get("material_name") or code,
+                "unit": line.get("unit"),
+                "required_qty": float(line.get("required_qty") or 0),
+                "available_qty": float(line.get("on_hand_qty") or 0),
+                "allocated_qty": float(line.get("allocated_qty") or 0),
+                "shortage_qty": float(line.get("net_qty") or 0),
+                "level": max(1, int(line.get("level") or 1)),
+                "item_type": line.get("item_type"),
+            })
+            if len(new_lines) >= KIT_REUPGRADE_MAX_LINES:
+                break
+        if not new_lines:
+            receipt["orders_no_structure"] += 1
+            continue
+        written = await _write_kit_lines(db, child_id=wid, kit_lines=new_lines,
+                                        apply=apply, receipt=receipt)
+        receipt["lines_added"] += written
+        receipt["orders_upgraded"] += 1
+        receipt["codes_after_total"] += codes_before + written
+        if len(receipt["parts"]) < 8:
+            receipt["parts"].append({"work_order_code": str(row["work_order_code"]),
+                                     "model": model, "lines_before": len(have) - written,
+                                     "lines_added": written})
+    if apply:
+        await db.commit()
+    else:
+        await db.rollback()
+    receipt["status"] = "ok"
+    receipt["message"] = (
+        f"{'补登' if apply else '预演补登'} {receipt['orders_upgraded']}/{receipt['orders_stale']} 张"
+        f"停在旧登记世代的工单，新增 {receipt['lines_added']} 行"
+        f"（跳过已在表里的 {receipt['lines_skipped_existing']} 行、需求为 0 的 {receipt['lines_skipped_zero']} 行）；"
+        "只加不改不删 —— 齐套门不会因为补登而放松")
+    return receipt
