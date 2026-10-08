@@ -1167,6 +1167,29 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_engine_capability_profile",
+            "description": (
+                "能力三格画像（只读）：把「人办一件事的三种能力」各量成一个判定 —— "
+                "推演=给结果（同输入可复现率、方向命中率、瓶颈件一致率，引用 L1..L4 的同名实测值）；"
+                "分析=给原因（每台单点名被哪一项卡住、反事实里方向可信的比例、"
+                "是否拒绝把测出 0 效果的项写成动作）；"
+                "总结=把前两者说成一段不编的话（正文数字有出处率、引擎报了缺口的轮次里答复点名缺口的比例）。"
+                "每格给 pass / fail / not_computable 三态之一，算不出就点名缺什么，不给 0 分。"
+                "用于「你们引擎会不会总结/分析/推演」「这三样各量化到什么程度」「哪一格是短板」"
+                "「这版结论能不能对外说」类问题。口径约束：300+ 张积压单不在比对范围（它们属于另一台机种"
+                "和另一套承诺政策），一致率只报当前最好的一次读数，不得据此宣称引擎算得准。"),
+            "parameters": {"type": "object", "properties": {
+                "days": {"type": "integer",
+                         "description": "总结格回查对话的天数窗口，默认 30"},
+                "n_models": {"type": "integer",
+                             "description": "取 BOM 最完整的 n 个机种参与推演/分析格，默认 3"},
+                "refresh": {"type": "boolean",
+                            "description": "true=现跑一遍分层验收（分钟级）；默认用缓存读数"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_plan_commit_gate",
             "description": "计划逐单下达就绪门（只读）：这一版排程里哪些工单真的能开工、哪些被哪条门压住（没排进本版本/工序没排齐/物料没齐套/首道工位映射不到），以及已经下达过的张数。用于'这版计划能开工几张''还有哪些单卡着''为什么没下达''计划生效了没'类问题。只报判定，不改工单状态、不下达。",
             "parameters": {"type": "object", "properties": {}},
@@ -3330,6 +3353,40 @@ async def _tool_query_engine_capability_layers(
                      "not_computable 的项要连缺哪个输入一起说，不许折算成 0 分或别的数")}
 
 
+async def _tool_query_engine_capability_profile(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """能力三格画像（只读）：三格的定义与判线都在 engine_capability 一处，这里只转述。"""
+    from api.services.engine_capability import capability_profile
+    from api.services.virtual_run import default_models
+
+    fid = factory_id or "FAC_MECH_001"
+    try:
+        days = max(1, min(180, int(args.get("days") or 30)))
+    except (TypeError, ValueError):
+        days = 30
+    try:
+        n = max(1, min(8, int(args.get("n_models") or 3)))
+    except (TypeError, ValueError):
+        n = 3
+    models = await default_models(db, fid, n=n)
+    if not models:
+        return {"status": "ok", "has_data": False, "factory_id": fid,
+                "note": "厂区里没有可推演的机种（BOM 镜像为空？），三格都无从算起"}
+    out = await capability_profile(db, fid, models, days=days,
+                                   use_cache=not bool(args.get("refresh")))
+    v = out.get("verdict") or {}
+    return {"status": "ok", "has_data": True, "factory_id": fid,
+            "models": out.get("models"), "window_days": out.get("window_days"),
+            "verdict": v, "推演": out.get("forecast"), "分析": out.get("analysis"),
+            "总结": out.get("summary"), "rule": out.get("rule"),
+            "answer_how": ("三格分别答：会不会推演（给结果）、会不会分析（给原因）、会不会总结（给一段不编的话）。"
+                           "有一格 fail 就说那格是短板并念出那个数；not_computable 要念「缺什么」而不是「0 分」。"
+                           "瓶颈件一致率现在是 0.0 这一读法下的数（台账按毛需求、引擎按低层码净额），"
+                           "报的时候必须带上这句因果，不许说成引擎不准"),
+            "caveat": out.get("summary", {}).get("meaning")}
+
+
 async def _tool_query_sim_evidence_readiness(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -4303,6 +4360,7 @@ _TOOL_EXECUTORS = {
     "query_bom_data_quality": _tool_query_bom_data_quality,
     "query_engine_capability_layers": _tool_query_engine_capability_layers,
     "query_sim_evidence_readiness": _tool_query_sim_evidence_readiness,
+    "query_engine_capability_profile": _tool_query_engine_capability_profile,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
     "query_simulation_sensitivity": _tool_query_simulation_sensitivity,    "query_engine_attribution": _tool_query_engine_attribution,
     "query_chain_convergence": _tool_query_chain_convergence,
@@ -4716,6 +4774,7 @@ TOOL_LABELS = {
     "query_simulation_recommendation": "推演建议与落地复查",
     "query_engine_capability_layers": "引擎分层验收",
     "query_sim_evidence_readiness": "精度判据就绪度",
+    "query_engine_capability_profile": "能力三格画像（总结/分析/推演）",
     "query_simulation_sensitivity": "建模精度与敏感度",    "query_engine_attribution": "交期为什么是这个数（归因）",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",

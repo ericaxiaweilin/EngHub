@@ -19,14 +19,27 @@ def test_every_public_input_declares_units_range_step_and_basis():
         assert spec["units"], name
         assert spec["default_unit"] in spec["units"], name
         assert spec["range"][0] <= spec["range"][1], name
-        assert spec["step"] > 0, name
+        if not spec.get("text"):
+            # 文本型入参（"哪条线整班没来"传的是线编码）没有步长这件事；
+            # 但单位、区间、依据、动了什么都必须照旧声明齐全。
+            assert spec["step"] > 0, name
         assert spec["basis"] and spec["moves"], name
         assert spec["translate"][0] in ("perturb", "policy", "scope", "scenario"), name
 
 
+def test_passthrough_input_names_are_the_exception_not_the_rule():
+    """绝大多数业务名翻译到引擎内部名；只有 absent_line/absent_share 是契约自己吃掉的。
+
+    这两个是"接口侧合成键"（_translate 把它们折成 line_staffing），不会以内部名出现在响应里，
+    所以下一条禁泄漏检查要跳过它们 —— 但这类例外得钉死在这一格，不许悄悄再多。
+    """
+    passthrough = sorted(k for k, v in ec.INPUTS.items() if v["translate"][1] == k)
+    assert passthrough == ["absent_line", "absent_share"], passthrough
+
+
 def test_internal_names_are_all_forbidden_on_the_contract_face():
     # 词表翻译到的内部名，一个都不许出现在响应里 —— 否则 agent 会照内部名传参
-    internals = {v["translate"][1] for v in ec.INPUTS.values()}
+    internals = {v["translate"][1] for k, v in ec.INPUTS.items() if v["translate"][1] != k}
     internals |= {"changeover_hours", "attendance"}
     missing = sorted(k for k in internals if k not in ec.INTERNAL_ONLY_KEYS)
     assert missing == [], f"内部名没进禁泄漏清单：{missing}"

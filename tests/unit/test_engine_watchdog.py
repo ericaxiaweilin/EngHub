@@ -173,7 +173,10 @@ def test_crash_signature_buckets_the_rate():
 
 # ── 对账动作 ────────────────────────────────────────────────────────────────
 def _open_task(finding, task_id="t-1", sig=None):
-    return {"id": task_id, "title": finding["title"], "status": "open",
+    # 字段要和 OPEN_SQL 真查出来的那几列一致：对账比的是 title+description+sig 三样，
+    # 夹具少给 description 就会把"签名没变别动库"测成"每轮都刷新"（线上不会，OPEN_SQL 选了这列）。
+    return {"id": task_id, "title": finding["title"],
+            "description": finding.get("description"), "status": "open",
             "payload": {"category": CATEGORY, "loop": finding["loop"],
                         "kind": finding["kind"], "sig": sig or finding["sig"]}}
 
