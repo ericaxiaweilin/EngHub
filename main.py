@@ -172,6 +172,7 @@ async def _periodic_scheduler():
         "engine_data_gap": "_last_engine_data_gap",
         "engine_kit_backfill": "_last_engine_kit_backfill",
         "delivery_prediction_ledger": "_last_delivery_ledger",
+        "blocked_followup_recheck": "_last_blocked_recheck",
     }
     while True:
         did = {}
@@ -559,6 +560,30 @@ async def _periodic_scheduler():
                     _logger.info(f"[delivery-ledger] {did['delivery_prediction_ledger']}")
         except Exception as e:
             _logger.warning(f"[scheduler] 交期留痕账本异常: {e}")
+
+        # blocked 催办的台账复判 —— 每 30 分钟。升级出去的单不会自己消失：
+        # 106 条从 8 月挂到现在，其中相当一部分的缺口早补平了，只是没人再去看台账。
+        # 复判只朝一个方向动：台账说补平了才关；还缺着的原样留着等人工裁决。
+        try:
+            import time as _t_br
+            if not hasattr(_periodic_scheduler, "_last_blocked_recheck"):
+                _periodic_scheduler._last_blocked_recheck = 0
+            if _t_br.time() - _periodic_scheduler._last_blocked_recheck > 1800:  # 30min
+                _periodic_scheduler._last_blocked_recheck = _t_br.time()
+                from api.services.followup_lifecycle import sweep_blocked
+                from api.services.engine_watchdog import DEFAULT_FACTORY_ID as _BR_FID
+                async with db_config.session_factory() as db:
+                    sw = await sweep_blocked(
+                        db, _BR_FID, limit=80,
+                        apply=os.getenv("BLOCKED_FOLLOWUP_RECHECK_APPLY", "true").lower()
+                            not in {"0", "false", "no", "off"})
+                    did["blocked_followup_recheck"] = {
+                        "applied": sw["apply"], "examined": sw["examined"],
+                        "actions": sw["action_counts"]}
+                    if sw["action_counts"].get("close_kit_complete"):
+                        _logger.info(f"[blocked-recheck] {sw['action_counts']}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] blocked 催办复判异常: {e}")
 
         from api.services.engine_heartbeat import record as _heartbeat
         import time as _gt

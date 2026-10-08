@@ -140,6 +140,56 @@ def veto_model_closure(new_status: str, conclusion: Dict[str, Any],
     return "open"
 
 
+async def blocked_shortage_tasks(db: AsyncSession, factory_id: str,
+                                 *, limit: int = 80) -> list:
+    """升级后停在 blocked 的缺料催办：它们不进跟进扫描（跟进是给 open 的），
+    但台账可能早就补平了 —— 不复判就会永远挂在收件箱里，像"已经有人处理过"。
+    """
+    rows = (await db.execute(text("""
+        SELECT id, factory_id, created_by, title, description, agent_key, status,
+               block_reason, follow_count, max_follows, progress_pct, assigned_to, payload
+        FROM followup_tasks
+        WHERE factory_id = :fid AND status = 'blocked'
+          AND payload->>'category' = :cat
+        ORDER BY last_follow_at NULLS FIRST, created_at ASC
+        LIMIT :lim
+    """), {"fid": factory_id, "cat": CATEGORY, "lim": max(1, int(limit))})).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def sweep_blocked(db: AsyncSession, factory_id: str, *,
+                        limit: int = 80, apply: bool = True) -> Dict[str, Any]:
+    """按台账复判 blocked：缺口归零就关闭，还缺着就原样留着等人工裁决（不自动退回 open，
+    否则升级单会被反复重开，催办量在读数上像自己在动）。"""
+    out: Dict[str, Any] = {"factory_id": factory_id, "apply": apply, "examined": 0}
+    counts: Dict[str, int] = {}
+    closed: list = []
+    for task in await blocked_shortage_tasks(db, factory_id, limit=limit):
+        try:
+            # 先只问台账：blocked 的唯一自动出路是"缺口补平了→关闭"。
+            # 其余判定（还缺多少、要不要再升级）照样报出来，但不写库 ——
+            # 这些单已经在等人工裁决，巡检再动它就变成机器和人对着改。
+            probe = await sync_shortage_task(db, task, apply=False)
+            may_apply = str(probe.get("action")) == "close_kit_complete" and apply
+            item = await sync_shortage_task(db, task, apply=may_apply)
+        except Exception as exc:  # noqa: BLE001 - 一张单查崩不拖垮整轮，但要留在回报里
+            await db.rollback()
+            item = {"task_id": str(task.get("id")), "action": "error",
+                    "note": f"{type(exc).__name__}: {exc}"}
+        action = str(item.get("action"))
+        counts[action] = counts.get(action, 0) + 1
+        if action == "close_kit_complete":
+            closed.append({"task_id": item.get("task_id"),
+                           "work_order_code": item.get("work_order_code"),
+                           "note": (item.get("note") or "")[:160]})
+        out["examined"] += 1
+    out["action_counts"] = counts
+    out["closed"] = closed[:10]
+    out["rule"] = ("blocked=已升级待人工裁决，复判只做「缺口确实补平了→关闭」这一向；"
+                   "还缺着的不动，避免升级单被反复重开")
+    return out
+
+
 async def kit_state(db: AsyncSession, factory_id: str, work_order_id: str) -> Dict[str, Any]:
     """这一单的齐套台账现状：有几行依据、几行还缺、合计缺多少。"""
     row = (await db.execute(KIT_STATE_SQL,
