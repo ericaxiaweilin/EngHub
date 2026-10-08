@@ -163,6 +163,7 @@ class SimERPSnapshotResponse(BaseModel):
     metabolic_level: Optional[str] = None
     required_rest_fraction: Optional[float] = None
     max_allowable_work_minutes_per_hour: Optional[float] = None
+    energy_mechanical_kcal: Optional[float] = None
 
 
 class SimERPSimulationResponse(BaseModel):
@@ -317,6 +318,7 @@ def _build_response(record: AuditRecord) -> SimERPSimulationResponse:
             metabolic_level=snap.metabolic_level,
             required_rest_fraction=snap.required_rest_fraction,
             max_allowable_work_minutes_per_hour=snap.max_allowable_work_minutes_per_hour,
+            energy_mechanical_kcal=snap.energy_mechanical_kcal,
         ),
         plugin_records=[
             SimERPPluginRecordResponse(

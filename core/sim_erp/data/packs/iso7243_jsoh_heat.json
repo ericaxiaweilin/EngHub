@@ -19,16 +19,42 @@
     },
     "globe_equals_dry_bulb_when_no_radiant_load": true,
     "validity": {
-      "temperature_c": [-20.0, 50.0],
-      "humidity_percent": [5.0, 99.0]
+      "temperature_c": [
+        -20.0,
+        50.0
+      ],
+      "humidity_percent": [
+        5.0,
+        99.0
+      ]
     }
   },
   "metabolic_levels": {
-    "very_light": {"rmr": 1, "kcal_per_hour": 130, "wbgt_limit_c": 32.5},
-    "light": {"rmr": 2, "kcal_per_hour": 190, "wbgt_limit_c": 30.5},
-    "moderate": {"rmr": 3, "kcal_per_hour": 250, "wbgt_limit_c": 29.0},
-    "moderately_heavy": {"rmr": 4, "kcal_per_hour": 310, "wbgt_limit_c": 27.5},
-    "heavy": {"rmr": 5, "kcal_per_hour": 370, "wbgt_limit_c": 26.5}
+    "very_light": {
+      "rmr": 1,
+      "kcal_per_hour": 130,
+      "wbgt_limit_c": 32.5
+    },
+    "light": {
+      "rmr": 2,
+      "kcal_per_hour": 190,
+      "wbgt_limit_c": 30.5
+    },
+    "moderate": {
+      "rmr": 3,
+      "kcal_per_hour": 250,
+      "wbgt_limit_c": 29.0
+    },
+    "moderately_heavy": {
+      "rmr": 4,
+      "kcal_per_hour": 310,
+      "wbgt_limit_c": 27.5
+    },
+    "heavy": {
+      "rmr": 5,
+      "kcal_per_hour": 370,
+      "wbgt_limit_c": 26.5
+    }
   },
   "task_metabolic_map": {
     "assembly": "moderate",
@@ -56,5 +82,12 @@
     "max_rest_fraction": 0.75,
     "basis": "ACGIH/JSOH 的表达方式是'超限就要换成带休息的工作-恢复制度'（离散档），本厂先按每超 1℃ 需 8% 休息线性折算给出连续读数，上限 75%；要改成按档取值需要拿到标准原表的确切矩阵再改这里"
   },
-  "notes": "能耗（kcal）不含热代价：ISO 7933/8996 用代谢率与热应变（出汗、心率、可承受工时）表达高温影响，没有把同样外功的 kcal 按温度放大的系数，所以这里也不编。高温的代价体现在 wbgt_c / exceedance_c / required_rest_fraction / max_allowable_work_minutes_per_hour。"
+  "notes": "energy_kcal 已改为按代谢率 x 时长（含高温导致的工休折减）；旧的外功代理值仍在 energy_mechanical_kcal 里可核对。",
+  "energy": {
+    "formula": "energy_kcal = 代谢率(kcal/h) x 实际作业小时 + 休息段代谢率(kcal/h) x 休息小时",
+    "rest_metabolic_kcal_per_hour": 130.0,
+    "basis": "代谢率取 JSOH 2025-2026 表 VIII-1 同表的 RMR 档（moderate=250 kcal/h 等），休息段按该表 very_light 档 130 kcal/h 计 —— 都是包里已有的引用值，不是新造的系数。标准不把高温写成 kcal 放大系数，所以温度是通过 WBGT 超限、所需工休、实际作业时长这条链影响能耗的",
+    "mechanical_proxy_kept_as": "energy_mechanical_kcal",
+    "scope_note": "这个数是「这段暴露窗口内的能量消耗」。同一件工作在高温下要花更长时间才能做完，所以做完它的总消耗是升的；本引擎没有任务工作量输入（只有步数这类过程量），不做那句结论，也不拿它当完成工时用"
+  }
 }

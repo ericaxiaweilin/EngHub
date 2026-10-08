@@ -391,7 +391,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_compliance_simulation",
-            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/湿度/连续作业时长/负重/姿势/步数/作业类型），返回合规判定、违规规则、疲劳分、能耗、WBGT 与所需工休等。所有参数可选，默认一个标准装配场景。**读数口径**：温度与湿度按 ISO 7243 室内形式折算 WBGT（0.7×自然湿球+0.3×干球，湿球用 Stull 2011 由温湿度估算），与该作业强度档的职业接触限值（JSOH 2025-2026）比较，超限会给出所需工休比例并可判定阻断；能耗仍是步数/负重/坡度/地形的机械功代理，**温度与湿度不进这一项**（标准没有把同样外功的 kcal 按温度放大的系数，模型就不编）。答复必须按返回体的 thermal / model_drivers 说，不要猜原因。",
+            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/湿度/连续作业时长/负重/姿势/步数/作业类型），返回合规判定、违规规则、疲劳分、能耗、WBGT 与所需工休等。所有参数可选，默认一个标准装配场景。**读数口径**：温度与湿度按 ISO 7243 室内形式折算 WBGT（0.7×自然湿球+0.3×干球，湿球用 Stull 2011 由温湿度估算），与该作业强度档的职业接触限值（JSOH 2025-2026）比较，超限会给出所需工休比例并可判定阻断；能耗 = 强度档代谢率(kcal/h，JSOH 同表) × 实际作业小时 + 休息档 × 工休小时，所以高温通过 WBGT→工休改变能耗，而**不是**把同样外功的 kcal 按温度放大（标准没有这个系数，模型就不编）；旧的外功代理值在 energy_mechanical_kcal 里仍可核对。答复必须按返回体的 thermal / energy_basis / model_drivers 说，不要猜原因。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1817,13 +1817,22 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     return {
         "success": True,
         "message": (f"合规仿真完成：疲劳 {round(snap.fatigue_score, 1)}、能耗 {round(snap.energy_kcal, 1)} kcal。"
-                    f"{thermal_effect or heat_effect}。能耗只由步数/负重/坡度/地形决定，"
-                    f"温度与湿度不进这一项；它们的作用体现在 WBGT 与所需工休上。"),
+                    f"{thermal_effect or heat_effect}。"
+                    + (f"能耗 {round(snap.energy_kcal, 1)} kcal = {(snap.energy_basis or {}).get('metabolic_level')} 档 "
+                       f"{(snap.energy_basis or {}).get('metabolic_kcal_per_hour')} kcal/h × "
+                       f"{(snap.energy_basis or {}).get('exposure_hours')} 小时，"
+                       f"其中工休 {round(float((snap.energy_basis or {}).get('rest_fraction') or 0) * 100)}% "
+                       f"按休息档计（旧外功代理值 {snap.energy_mechanical_kcal} kcal 仍可比对）"
+                       if (snap.energy_basis or {}).get("method") == "metabolic_rate_x_time"
+                       else f"能耗 {round(snap.energy_kcal, 1)} kcal 用的是外功代理口径"
+                            "（没有强度档代谢率可查，与温度/湿度/时长都无关）")),
         "simulation_id": record.simulation_id,
         "final_status": arb.final_status,
         "legal_blocked": arb.legal_blocked,
         "fatigue_score": round(snap.fatigue_score, 1),
         "energy_kcal": round(snap.energy_kcal, 1),
+        "energy_mechanical_kcal": snap.energy_mechanical_kcal,
+        "energy_basis": snap.energy_basis,
         "max_required_break_minutes": arb.max_required_break_minutes,
         "total_penalty_score": arb.total_penalty_score,
         "total_cost_delta": arb.total_cost_delta,

@@ -97,6 +97,9 @@ class PhysicalSnapshot(BaseModel):
     continuous_work_minutes: int
     fatigue_score: float = Field(..., ge=0.0)
     energy_kcal: float = Field(..., ge=0.0)
+    # 旧的外功代理值（按步数与负重折算）：留着是为了能和历史读数对齐核对，不是另一套真相
+    energy_mechanical_kcal: Optional[float] = None
+    energy_basis: Dict[str, Any] = Field(default_factory=dict)
     environment: EnvironmentSnapshot
     skill_level: Optional[str] = None
     ppe_status: Optional[str] = None

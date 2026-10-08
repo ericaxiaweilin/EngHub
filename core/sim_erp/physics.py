@@ -39,7 +39,7 @@ INERT_INPUTS = (
 
 
 class PhysicsCore:
-    VERSION = "2.2.0"
+    VERSION = "3.0.0"
 
     def simulate_step(self, physical_input: PhysicalInput, *,
                       heat_threshold_c: Optional[float] = None,
@@ -48,7 +48,8 @@ class PhysicsCore:
                      else float(heat_threshold_c))
         fatigue_score = self._calculate_fatigue(physical_input, heat_threshold_c=threshold,
                                                 thermal=thermal)
-        energy_kcal = self._calculate_energy(physical_input)
+        energy_kcal, energy_mech, energy_basis = self._calculate_energy(physical_input,
+                                                                        thermal=thermal)
         context = physical_input.work_context
         th = thermal or {}
 
@@ -68,6 +69,8 @@ class PhysicsCore:
             continuous_work_minutes=physical_input.continuous_work_minutes,
             fatigue_score=round(fatigue_score, 4),
             energy_kcal=round(energy_kcal, 2),
+            energy_mechanical_kcal=round(energy_mech, 2),
+            energy_basis=energy_basis,
             environment=physical_input.environment,
             skill_level=context.skill_level,
             ppe_status=context.ppe_status,
@@ -105,15 +108,48 @@ class PhysicsCore:
 
         return fatigue + posture_penalty + continuous_penalty
 
-    def _calculate_energy(self, physical_input: PhysicalInput) -> float:
+    @staticmethod
+    def _mechanical_energy(physical_input: PhysicalInput) -> float:
+        """旧口径：每步外功代理。留着只为和历史读数对得上，不再当能耗真相。"""
         terrain_multiplier = TERRAIN_MULTIPLIERS[physical_input.environment.terrain.value]
-
         step_energy = physical_input.step_count * STEP_ENERGY_KCAL
         load_energy = physical_input.load_weight_kg * LOAD_ENERGY_KCAL_PER_KG
         incline_energy = (physical_input.environment.floor_incline_percent
                           * INCLINE_ENERGY_KCAL_PER_PERCENT)
-
         return (step_energy + load_energy + incline_energy) * terrain_multiplier
+
+    def _calculate_energy(self, physical_input: PhysicalInput, *,
+                          thermal: Optional[Dict[str, Any]] = None):
+        """能耗 = 代谢率 x 实际作业时长 + 休息段代谢率 x 休息时长。
+
+        高温不是把 kcal 按温度放大（标准没有这个系数），而是通过 WBGT 超限逼出工休：
+        作业小时被折掉的那部分换成休息档代谢率，所以 40℃ 与 30℃ 的能耗必然不同。
+        拿不到强度档（没有热应力规则包）时退回外功代理，并说明用的是哪套口径。
+        """
+        mech = self._mechanical_energy(physical_input)
+        th = thermal or {}
+        rate = th.get("metabolic_kcal_per_hour")
+        hours = physical_input.continuous_work_minutes / 60.0
+        if not th.get("available") or not rate or hours <= 0:
+            return mech, mech, {"method": "mechanical_proxy",
+                                "why": ("没有热应力规则包（拿不到强度档代谢率）→ 能耗退回外功代理值，"
+                                        "这个值与温度、湿度、时长都无关")}
+        rest_rate = th.get("rest_metabolic_kcal_per_hour") or rate
+        rest_fraction = min(1.0, max(0.0, float(th.get("required_rest_fraction") or 0.0)))
+        worked = rate * (1.0 - rest_fraction) * hours
+        rested = rest_rate * rest_fraction * hours
+        return (worked + rested), mech, {
+            "method": "metabolic_rate_x_time",
+            "metabolic_kcal_per_hour": rate,
+            "metabolic_level": th.get("metabolic_level"),
+            "rest_metabolic_kcal_per_hour": rest_rate,
+            "exposure_hours": round(hours, 4),
+            "rest_fraction": round(rest_fraction, 4),
+            "worked_kcal": round(worked, 2),
+            "rested_kcal": round(rested, 2),
+            "basis": th.get("energy_basis"),
+            "mechanical_proxy_kcal": round(mech, 2),
+        }
 
     @staticmethod
     def describe_model(*, heat_threshold_c: Optional[float] = None,
@@ -148,15 +184,23 @@ class PhysicsCore:
                 "tlv_by_metabolic_level": tlv_by_level or {},
             },
             "energy_kcal": {
-                "formula": (f"(步数×{STEP_ENERGY_KCAL} + 负重×{LOAD_ENERGY_KCAL_PER_KG} + "
-                            f"坡度%×{INCLINE_ENERGY_KCAL_PER_PERCENT}) × 地形系数"
-                            f"（{', '.join(f'{k}={v}' for k, v in TERRAIN_MULTIPLIERS.items())}）"),
-                "driven_by": ["step_count", "load_weight_kg", "environment.floor_incline_percent",
-                              "environment.terrain"],
-                "temperature_changes_it": False,
-                "humidity_changes_it": False,
-                "why": ("高温的代价在标准里体现为热应变与所需工休（ISO 7933/8996 一系的口径），"
-                        "不是「同样外功的 kcal 按温度放大」——没有这个系数，所以不编"),
+                "formula": ("代谢率(强度档 kcal/h，来自 JSOH 同表) × 实际作业小时"
+                            " + 休息段代谢率 × 休息小时"),
+                "driven_by": ["work_context.task_type（强度档→代谢率）", "continuous_work_minutes",
+                              "WBGT 超限→required_rest_fraction"],
+                "thermal_route": ("温度与湿度通过 WBGT 超限逼出工休、折减实际作业小时来改变能耗；"
+                                  "标准没有「同样外功的 kcal 按温度放大」的系数，所以不直接乘"),
+                "fallback": "没有热应力规则包时退回外功代理值（与温度/湿度/时长都无关）",
+                "scope": ("算的是这段暴露窗口内的消耗：超限被逼出工休后作业小时减少，读数就下降；"
+                          "同一件工作在高温下要花更长时间完成，做完它的总消耗是升的 —— "
+                          "引擎没有任务工作量输入（只有步数这类过程量），所以不下那句结论"),
+                "mechanical_proxy": {
+                    "field": "energy_mechanical_kcal",
+                    "formula": (f"(步数×{STEP_ENERGY_KCAL} + 负重×{LOAD_ENERGY_KCAL_PER_KG} + "
+                                f"坡度%×{INCLINE_ENERGY_KCAL_PER_PERCENT}) × 地形系数"
+                                f"（{', '.join(f'{k}={v}' for k, v in TERRAIN_MULTIPLIERS.items())}）"),
+                    "kept_because": "历史读数与回归核对要能对齐，不代表这是能耗的真相",
+                },
             },
             "thermal_outputs": ["wbgt_c", "wet_bulb_c", "tlv_wbgt_c", "thermal_exceedance_c",
                                  "required_rest_fraction", "max_allowable_work_minutes_per_hour"],

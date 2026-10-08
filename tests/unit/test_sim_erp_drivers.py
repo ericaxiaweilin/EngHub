@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from core.sim_erp.arbiter import DecisionArbiter  # noqa: F401  (保持与原测试同层可导入)
 from core.sim_erp.engine import SimERPEngine
 from core.sim_erp.models import (
@@ -119,12 +121,32 @@ def test_heavier_work_has_tighter_limit_at_the_same_temperature():
     assert heavy.snapshot.tlv_wbgt_c < light.snapshot.tlv_wbgt_c
 
 
-def test_energy_still_has_no_thermal_term():
+def test_energy_is_metabolic_rate_times_worked_and_rest_hours():
+    """30℃ 不超限 → 满负荷 4 小时；40℃ 被逼出工休 → 同样 4 小时能耗更低。"""
     cool = _evaluate(_input(temp=30.0))
     hot = _evaluate(_input(temp=40.0))
-    assert cool.snapshot.energy_kcal == hot.snapshot.energy_kcal == 120.0
-    assert PhysicsCore.describe_model(thermal_available=True)["energy_kcal"][
-        "temperature_changes_it"] is False
+    assert cool.snapshot.energy_basis["method"] == "metabolic_rate_x_time"
+    assert cool.snapshot.energy_kcal == 1000.0          # 250 kcal/h × 4h，无工休
+    assert hot.snapshot.energy_kcal < cool.snapshot.energy_kcal
+    assert hot.snapshot.energy_basis["rest_fraction"] > 0.4
+    assert (hot.snapshot.energy_basis["worked_kcal"]
+            + hot.snapshot.energy_basis["rested_kcal"]) == pytest.approx(hot.snapshot.energy_kcal)
+    # 旧外功代理值留着可核对，且它确实与温度无关（那正是它不能当能耗真相的原因）
+    assert cool.snapshot.energy_mechanical_kcal == hot.snapshot.energy_mechanical_kcal == 120.0
+
+
+def test_energy_scales_with_exposure_duration():
+    short = _evaluate(_input(temp=30.0, minutes=60))
+    long = _evaluate(_input(temp=30.0, minutes=240))
+    assert short.snapshot.energy_kcal == 250.0
+    assert long.snapshot.energy_kcal == 1000.0
+
+
+def test_heavier_intensity_costs_more_energy():
+    light = _evaluate(_input(temp=30.0, task="inspect"))     # light 190 kcal/h
+    heavy = _evaluate(_input(temp=30.0, task="casting"))     # heavy 370 kcal/h
+    assert light.snapshot.energy_kcal == 760.0
+    assert heavy.snapshot.energy_kcal > light.snapshot.energy_kcal
 
 
 def test_missing_thermal_pack_falls_back_to_the_legacy_step_and_says_so():
@@ -134,6 +156,8 @@ def test_missing_thermal_pack_falls_back_to_the_legacy_step_and_says_so():
     assert rec.snapshot.fatigue_score == 4.4          # 老阶跃：×1.3
     d = PhysicsCore.describe_model(thermal_available=False)
     assert d["fatigue_score"]["heat_is_a_step_not_a_curve"] is True
+    assert rec.snapshot.energy_mechanical_kcal == rec.snapshot.energy_kcal == 120.0
+    assert rec.snapshot.energy_basis["method"] == "mechanical_proxy"
 
 
 def test_describe_model_moves_humidity_into_fatigue_drivers():

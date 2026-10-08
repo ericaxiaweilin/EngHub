@@ -964,6 +964,7 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         th = result.get("thermal") or {}
         sc = result.get("scenario") or {}
         basis = th.get("basis") or {}
+        eb = result.get("energy_basis") or {}
         over = float(th.get("exceedance_c") or 0.0)
         rest = round(float(th.get("required_rest_fraction") or 0.0) * 100)
         hit = "、".join(result.get("hit_rules") or []) or "、".join(
@@ -979,8 +980,13 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             + (f"超 {over:g}℃ → 需约 {rest}% 工休，每 60 分钟最多连续作业 "
                f"{th.get('max_allowable_work_minutes_per_hour')} 分钟"
                if over > 0 else f"未超（余 {-over:g}℃）"),
-            f"- 疲劳 {result.get('fatigue_score')}、能耗 {result.get('energy_kcal')} kcal；"
-            "能耗是步数/负重/坡度/地形的机械功代理，温度与湿度不进这一项",
+            f"- 疲劳 {result.get('fatigue_score')}、能耗 {result.get('energy_kcal')} kcal"
+            + (f"（{eb.get('metabolic_level')} 档 {eb.get('metabolic_kcal_per_hour')} kcal/h × "
+               f"{eb.get('exposure_hours')} 小时，其中 {round(float(eb.get('rest_fraction') or 0) * 100)}% "
+               f"按休息档 {eb.get('rest_metabolic_kcal_per_hour')} kcal/h 计；"
+               f"旧外功代理值 {result.get('energy_mechanical_kcal')} kcal 仍可核对）"
+               if eb.get("method") == "metabolic_rate_x_time" else
+               "（外功代理口径：与温度、湿度、时长都无关）"),
             f"- 高温补贴 {result.get('total_cost_delta')} VND、罚分 "
             f"{result.get('total_penalty_score')}、强制休息 "
             f"{result.get('max_required_break_minutes')} 分钟",
