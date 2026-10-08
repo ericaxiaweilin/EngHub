@@ -372,18 +372,38 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
         c = sum(1 for x in rows_ if x.get(flag))
         return {"agree": c, "of": len(rows_), "rate": round(c / len(rows_), 3) if rows_ else None}
 
+    u_top = _rate_on(per_order, "ledger_top_in_engine_bom")
+    e_top = _rate_on(per_order, "engine_top_in_ledger_lines")
+    qty_rate = (round(same_gen["qty_top_agrees"] / same_gen["orders"], 3)
+                if same_gen["orders"] else None)
+    lead_rate = (round(same_gen["lead_top_agrees"] / same_gen["orders"], 3)
+                 if same_gen["orders"] else None)
+    # 这三句解释必须跟着本轮实测走。上一版把"台账 497 行与引擎展开 100% 重合"
+    # "高于台账 0 行"写死在文案里；下一轮实测 engine_higher_than_ledger 变成 2,292 行时，
+    # 那句"系统性偏差不是噪声"就成了报告里的假话 —— 结论只能由当轮数据拼出来。
+    one_sided = requirement_basis["engine_higher_than_ledger"] == 0
+    basis_wording = ("单边低 = 需求算法差（毛需求 vs 低层码净额），不是噪声"
+                     if one_sided else
+                     "高低两边都有 = 毛净之差之外还有别的来源（层级/登记世代/在途口径），别只归一条")
+
+    univ_note = (
+        f"三条候选解释各给一个当轮读数：① 料号宇宙 —— 台账点的第一件有 "
+        f"{u_top['agree']}/{u_top['of']}（{u_top['rate']}）也在引擎本轮展开里；"
+        f"② 快照过期 —— 台账行不动、缺口按今天的库存重算，第一名一致率 "
+        f"{qty_rate}（数量口径）/ {lead_rate}（提前期口径）；"
+        f"③ 需求算法 —— {requirement_basis['engine_lower_than_ledger']}/"
+        f"{requirement_basis['rows_paired']} 行引擎更低（其中 "
+        f"{requirement_basis['engine_says_zero_ledger_asks_positive']} 行引擎判 0 = 父层够用就不往下炸），"
+        f"更高的 {requirement_basis['engine_higher_than_ledger']} 行：{basis_wording}。"
+        "所以这一格读的是『两种需求算法点的第一名是否相同』，不是引擎准不准；"
+        "要判准不准，得先把齐套行按同一算法刷一遍")
+
     return {
         "orders_compared": n,
         "bom_universe": {
-            "note": ("三个候选解释都量过了，剩下的是算法差：① 料号宇宙是同一批"
-                    "（抽样单里台账 497 行与引擎展开 100% 重合，70 张单只有 1 张还挂着旧的 RM-* 行）；"
-                    "② 不是快照过期（把台账缺口按今天的库存重算，一致率 0.057→0.059，几乎没动）；"
-                    "③ 差在需求量的算法 —— 台账按毛需求逐层乘下来，引擎按低层码净额"
-                    "（父层够用就不往下炸），3,299 行配对里引擎低于台账 1,354 行、高于台账 **0** 行，"
-                    "系统性偏差不是噪声。所以这一格的命中率量的是『两种需求算法点的第一名是否相同』，"
-                    "不是引擎准不准；要判准不准得先把齐套行按同一算法刷一遍"),
-            "ledger_top_in_engine_bom": _rate_on(per_order, "ledger_top_in_engine_bom"),
-            "engine_top_in_ledger_lines": _rate_on(per_order, "engine_top_in_ledger_lines"),
+            "note": univ_note,
+            "ledger_top_in_engine_bom": u_top,
+            "engine_top_in_ledger_lines": e_top,
             "shared_universe_orders": m,
             "off_universe_orders": n - m,
             "ledger_row_depth": row_depth,
@@ -396,10 +416,8 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
                 "orders_with_no_shortage_today": same_gen["no_short_now"],
                 "qty_top_agree": same_gen["qty_top_agrees"],
                 "lead_top_agree": same_gen["lead_top_agrees"],
-                "qty_top_rate": (round(same_gen["qty_top_agrees"] / same_gen["orders"], 3)
-                                 if same_gen["orders"] else None),
-                "lead_top_rate": (round(same_gen["lead_top_agrees"] / same_gen["orders"], 3)
-                                  if same_gen["orders"] else None),
+                "qty_top_rate": qty_rate,
+                "lead_top_rate": lead_rate,
                 "definition": ("台账登记的行不动，缺口按今天的库存重算（净缺 = 需求量 − 现存量），"
                                "再与引擎当轮点名的瓶颈件比第一名"),
                 "requirement_basis": requirement_basis,

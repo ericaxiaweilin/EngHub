@@ -514,16 +514,7 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                 THRESHOLDS["L2B"]["bottleneck_hit_rate"], "gte", "",
                 f"{order_hits}/{order_n} 张在流程单：引擎选的「决定到货日那件」== 台账同一张单里提前期最长的缺料件；"
                 f"覆盖机种 {len(order_models)} 个（{order_models}）。"
-                "这一格量的是**两种需求算法点的第一名是否相同**，不是引擎准不准 —— "
-                "三个解释里只剩一个成立：料号宇宙是同一批（台账行与引擎展开 100% 重合，"
-                f"{univ.get('ledger_top_in_engine_bom', {}).get('agree')}/"
-                f"{univ.get('ledger_top_in_engine_bom', {}).get('of')} 张单的台账第一件在引擎展开里），"
-                f"快照过期不成立（把台账缺口按今天的库存重算，一致率仍 "
-                f"{same_gen.get('qty_top_rate')}），"
-                f"剩下的是算法差：{basis.get('engine_lower_than_ledger')}/"
-                f"{basis.get('rows_paired')} 行引擎的需求量更低（其中 "
-                f"{basis.get('engine_says_zero_ledger_asks_positive')} 行引擎判 0 = 父层够用就不往下炸），"
-                f"更高的 {basis.get('engine_higher_than_ledger')} 行。要判准不准，得先把齐套行按同一算法刷一遍",
+                + str(univ.get("note") or ""),
                 n=order_n, min_n=int(THRESHOLDS["L2B"]["bottleneck_min_orders"]),
                 missing=(None if order_n >= int(THRESHOLDS["L2B"]["bottleneck_min_orders"])
                          else f"可比单数 {order_n}（判线要 ≥{THRESHOLDS['L2B']['bottleneck_min_orders']} 张）")),
