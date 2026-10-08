@@ -108,6 +108,7 @@ def test_plugin_registry_exposes_default_plugins():
 
     assert [manifest["plugin_name"] for manifest in manifests] == [
         "Factory_Policy_Default",
+        "ISO7243_Heat_TLV",
         "Johnson_Global_Standard",
         "VN_Legal_2024",
     ]

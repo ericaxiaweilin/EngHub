@@ -155,6 +155,14 @@ class SimERPSnapshotResponse(BaseModel):
     skill_level: Optional[str] = None
     ppe_status: Optional[str] = None
     machine_risk_level: Optional[str] = None
+    # 热应力读数：None 表示没有规则包、没折算过，不是「没有热风险」
+    wbgt_c: Optional[float] = None
+    wet_bulb_c: Optional[float] = None
+    tlv_wbgt_c: Optional[float] = None
+    thermal_exceedance_c: Optional[float] = None
+    metabolic_level: Optional[str] = None
+    required_rest_fraction: Optional[float] = None
+    max_allowable_work_minutes_per_hour: Optional[float] = None
 
 
 class SimERPSimulationResponse(BaseModel):
@@ -302,6 +310,13 @@ def _build_response(record: AuditRecord) -> SimERPSimulationResponse:
             skill_level=snap.skill_level,
             ppe_status=snap.ppe_status,
             machine_risk_level=snap.machine_risk_level,
+            wbgt_c=snap.wbgt_c,
+            wet_bulb_c=snap.wet_bulb_c,
+            tlv_wbgt_c=snap.tlv_wbgt_c,
+            thermal_exceedance_c=snap.thermal_exceedance_c,
+            metabolic_level=snap.metabolic_level,
+            required_rest_fraction=snap.required_rest_fraction,
+            max_allowable_work_minutes_per_hour=snap.max_allowable_work_minutes_per_hour,
         ),
         plugin_records=[
             SimERPPluginRecordResponse(

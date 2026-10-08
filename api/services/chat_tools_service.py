@@ -55,7 +55,8 @@ from api.services.workbook_service import (
 # ==================== Sim-ERP 仿真引擎（模块级单例，直连引擎不走 HTTP） ====================
 _sim_engine = SimERPEngine()
 _sim_registry = build_default_registry()
-DEFAULT_SIM_PLUGINS = ["VN_Legal_2024", "Johnson_Global_Standard", "Factory_Policy_Default"]
+DEFAULT_SIM_PLUGINS = ["VN_Legal_2024", "Johnson_Global_Standard", "Factory_Policy_Default",
+                       "ISO7243_Heat_TLV"]
 
 
 # ==================== 工具定义（OpenAI function-calling 格式） ====================
@@ -390,7 +391,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_compliance_simulation",
-            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/连续作业时长/负重/姿势等），返回合规判定、违规规则、疲劳分、所需休息等。所有参数可选，默认一个标准装配场景。**注意模型的边界**：能耗只由步数/负重/坡度/地形决定，温度与湿度都不进能耗；温度仅在超过法规高温阈值时放大疲劳并触发高温补贴；humidity_percent 目前不进任何计算（返回体的 model_drivers / inputs_supplied_but_inert 会点名）。所以两个温度给出相同能耗不是「参数没生效」，是公式里没有这一项 —— 答复要按返回体说，不要猜原因。",
+            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/湿度/连续作业时长/负重/姿势/步数/作业类型），返回合规判定、违规规则、疲劳分、能耗、WBGT 与所需工休等。所有参数可选，默认一个标准装配场景。**读数口径**：温度与湿度按 ISO 7243 室内形式折算 WBGT（0.7×自然湿球+0.3×干球，湿球用 Stull 2011 由温湿度估算），与该作业强度档的职业接触限值（JSOH 2025-2026）比较，超限会给出所需工休比例并可判定阻断；能耗仍是步数/负重/坡度/地形的机械功代理，**温度与湿度不进这一项**（标准没有把同样外功的 kcal 按温度放大的系数，模型就不编）。答复必须按返回体的 thermal / model_drivers 说，不要猜原因。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1764,15 +1765,23 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     # 阈值从法规包读一次：答复里说的"高温线/连续工时线"必须和判据用的是同一个数
     from core.sim_erp.physics import PhysicsCore
 
-    heat_gt, cont_limit = None, None
+    heat_gt, cont_limit, heat_pack = None, None, None
     try:
         for pack_name in {p.manifest.legislation_pack for p in plugins if p.manifest.legislation_pack}:
             pack = _sim_engine.legislation_catalog.load_pack(pack_name)
             heat_gt = (pack.get("heat_allowance") or {}).get("temperature_c_gt", heat_gt)
             cont_limit = (pack.get("continuous_work_limit") or {}).get("max_minutes", cont_limit)
+            if pack.get("metabolic_levels"):
+                heat_pack = pack
     except Exception:  # noqa: BLE001  包读不到时照样出数，只是不编阈值
         pass
-    drivers = PhysicsCore.describe_model(heat_threshold_c=heat_gt, continuous_limit_minutes=cont_limit)
+    drivers = PhysicsCore.describe_model(
+        heat_threshold_c=heat_gt, continuous_limit_minutes=cont_limit,
+        thermal_available=bool(heat_pack),
+        strain_gain_per_exceedance_c=((heat_pack or {}).get("strain") or {})
+        .get("fatigue_gain_per_exceedance_c"),
+        tlv_by_level={k: v.get("wbgt_limit_c")
+                      for k, v in ((heat_pack or {}).get("metabolic_levels") or {}).items()})
 
     # 落审计记录（独立事务，失败不影响返回仿真结果）
     try:
@@ -1789,6 +1798,14 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
                  "time_step_minutes": "time_step_minutes", "action_type": "work_context.action_type"}
     supplied_inert = sorted(k for k, path in inert_map.items()
                             if args.get(k) is not None and path in drivers["inert_inputs"])
+    thermal_effect = ""
+    if snap.wbgt_c is not None and snap.tlv_wbgt_c is not None:
+        over = float(snap.thermal_exceedance_c or 0.0)
+        thermal_effect = (
+            f"WBGT {snap.wbgt_c:g}℃ 对 {snap.metabolic_level} 档限值 {snap.tlv_wbgt_c:g}℃："
+            + (f"超 {over:g}℃ → 需约 {round(float(snap.required_rest_fraction or 0) * 100)}% 工休，"
+               f"每 60 分钟最多连续 {snap.max_allowable_work_minutes_per_hour:g} 分钟"
+               if over > 0 else f"未超（余 {-over:g}℃）"))
     heat_effect = (
         f"温度 {snap.environment.temperature_c:g}℃ "
         + (f"高于 {drivers['rule_thresholds']['heat_allowance_triggers_above_c']:g}℃ → "
@@ -1800,7 +1817,8 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     return {
         "success": True,
         "message": (f"合规仿真完成：疲劳 {round(snap.fatigue_score, 1)}、能耗 {round(snap.energy_kcal, 1)} kcal。"
-                    f"{heat_effect}。能耗只由步数/负重/坡度/地形决定，**温度与湿度都不进这一项**。"),
+                    f"{thermal_effect or heat_effect}。能耗只由步数/负重/坡度/地形决定，"
+                    f"温度与湿度不进这一项；它们的作用体现在 WBGT 与所需工休上。"),
         "simulation_id": record.simulation_id,
         "final_status": arb.final_status,
         "legal_blocked": arb.legal_blocked,
@@ -1812,11 +1830,27 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
         "cost_currency": "VND",
         "blocking_rules": [d.rule_code for d in arb.blocking_decisions],
         "warnings": [d.rule_code for d in arb.warnings],
+        # 只列阻断与警告会让"成本类判定"看不见（高温补贴就是 COST_MODIFIER），
+        # 用户问"命中了什么规则"时要能一次数全
+        "hit_rules": [d.rule_code for d in arb.decisions],
         "applied_actions": [
             {"action_code": a.action_code, "description": a.description, "break_minutes": a.break_minutes}
             for a in arb.applied_actions
         ],
         "decision_count": len(arb.decisions),
+        "thermal": {
+            "standard": "ISO 7243 型 WBGT × JSOH 2025-2026 职业接触限值（见 basis 里的出处）",
+            "wbgt_c": snap.wbgt_c,
+            "wet_bulb_c": snap.wet_bulb_c,
+            "tlv_wbgt_c": snap.tlv_wbgt_c,
+            "exceedance_c": snap.thermal_exceedance_c,
+            "metabolic_level": snap.metabolic_level,
+            "required_rest_fraction": snap.required_rest_fraction,
+            "max_allowable_work_minutes_per_hour": snap.max_allowable_work_minutes_per_hour,
+            "basis": snap.thermal_basis,
+            "note": (snap.wbgt_c is None
+                     and "没有热应力规则包 → 未折算，不代表没有热风险"),
+        },
         "model_drivers": drivers,
         "inputs_supplied_but_inert": supplied_inert,
         "scenario": {
@@ -4395,6 +4429,15 @@ INTENT_RULES: List[Dict[str, Any]] = [
         ],
     },
     {
+        # 温度/湿度能不能干、要休多久 —— 必须让引擎算，不能让模型背标准
+        "tool": "run_compliance_simulation",
+        "keywords": [
+            "度能干", "度可以干", "度作业", "度高温", "高温作业", "闷热", "中暑", "热射病",
+            "WBGT", "湿球", "黑球", "热应激", "热应力", "连续作业", "连续干", "连续工作",
+            "要休多久", "休息多久", "要休息", "需要休息", "合规吗", "符不符合", "湿度",
+        ],
+    },
+    {
         # 「先去量哪些件」是补数据的行动问题，必须有清单而不是回"数据不全"
         "tool": "list_measurement_priority",
         "keywords": [
@@ -4636,6 +4679,43 @@ def _is_explicit_workflow_diagram_request(message: str) -> bool:
     )
 
 
+_HEAT_TASK_WORDS = {
+    "装配": "assembly", "组装": "assembly", "检验": "inspect", "质检": "inspect",
+    "焊接": "welding", "注塑": "injection", "喷涂": "painting", "涂装": "painting",
+    "包装": "packing", "搬运": "material_handling", "机加": "machining",
+}
+
+
+def extract_heat_scenario(message: str) -> Dict[str, Any]:
+    """从原话里抽温度/湿度/连续时长/工序 —— 高温问题必须有真实数字进引擎。
+
+    没有明说温度就返回空：宁可不跑，也不拿默认 30℃ 的场景去回答"40 度能不能干"。
+    """
+    args: Dict[str, Any] = {}
+    text = (message or "").replace("℃", "度").replace("°C", "度").replace("º", "度")
+    t = re.search(r"(-?\d+(?:\.\d+)?)\s*度", text)
+    if t:
+        args["temperature_c"] = float(t.group(1))
+    h = re.search(r"(?:湿度|相对湿度)[^0-9]{0,6}(\d{1,3})\s*%?", text)
+    if h:
+        args["humidity_percent"] = float(h.group(1))
+    elif re.search(r"(\d{1,3})\s*%\s*(?:湿度|相对湿度)", text):
+        args["humidity_percent"] = float(re.search(r"(\d{1,3})\s*%\s*(?:湿度|相对湿度)", text).group(1))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:个?小时|h|H)\s*(?:[^。]{0,4})?(?:连续|干|作业|工作)?"
+                  r"|(?:连续|干|作业|工作)[^0-9]{0,6}(\d+(?:\.\d+)?)\s*(?:个?小时|h|H)", text)
+    if m:
+        hours = float(m.group(1) or m.group(2))
+        args["continuous_work_minutes"] = int(round(hours * 60))
+    m2 = re.search(r"(\d{2,4})\s*分钟", text)
+    if m2:
+        args["continuous_work_minutes"] = int(m2.group(1))
+    for cn, en in _HEAT_TASK_WORDS.items():
+        if cn in text:
+            args["task_type"] = en
+            break
+    return args
+
+
 def detect_intent_tool(message: str) -> Optional[str]:
     """确定性意图识别：命中业务关键词则返回应强制调用的工具名，否则返回 None（交给模型 auto 决策）。"""
     if not message:
@@ -4672,7 +4752,14 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
     from api.services.workflow_service import match_workflow  # 懒加载，避免循环导入
     wf_name = match_workflow(message)
     if wf_name:
-        return {"tool": "run_workflow", "args": {"workflow_name": wf_name, "params": {}}}
+        # 合规检查工作流现在透传参数：句子里点了温度/湿度/时长的必须带上，
+        # 否则又会回到"用户说 40 度、引擎跑默认 30 度"那个坑
+        params = {}
+        if wf_name == "full_compliance_check":
+            params = {k: v for k, v in extract_heat_scenario(message).items()
+                      if k in ("temperature_c", "humidity_percent", "continuous_work_minutes",
+                               "task_type")}
+        return {"tool": "run_workflow", "args": {"workflow_name": wf_name, "params": params}}
 
     tool = detect_intent_tool(message)
     if not tool:
@@ -4682,7 +4769,12 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
     if tool == "query_workflow_diagram" and not _is_explicit_workflow_diagram_request(message):
         return None
     args: Dict[str, Any] = {}
-    if tool == "query_order_work_order_status":
+    if tool == "run_compliance_simulation":
+        args = extract_heat_scenario(message)
+        # 没抽到温度就别抢模型的活：拿默认 30℃ 回答"40 度能不能干"是假话
+        if "temperature_c" not in args:
+            return None
+    elif tool == "query_order_work_order_status":
         match = re.search(r"\bSO-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)
         if match:
             args["order_code"] = match.group(0)
@@ -4885,6 +4977,8 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
 # chat_routes 的 deterministic_handler / route_not_required 直接引用本集合，
 # 不要再在别处内联一份，否则会漂移。
 DETERMINISTIC_INTENT_TOOLS = frozenset({
+    # 高温/湿度能不能干、要休多久：必须引擎算，不能让模型背标准条款
+    "run_compliance_simulation",
     "query_pmc_control_tower",
     "query_order_work_order_status",
     "query_manufacturing_intelligence",

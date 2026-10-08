@@ -7,7 +7,8 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Type
 
 from .base import SimulationPlugin
-from .builtin import FactoryBreakPolicyPlugin, JohnsonGlobalStandardPlugin, VNLabor2024Plugin
+from .builtin import (FactoryBreakPolicyPlugin, ISO7243HeatPlugin, JohnsonGlobalStandardPlugin,
+                      VNLabor2024Plugin)
 
 
 class PluginRegistry:
@@ -35,4 +36,5 @@ def build_default_registry() -> PluginRegistry:
     registry.register(VNLabor2024Plugin)
     registry.register(JohnsonGlobalStandardPlugin)
     registry.register(FactoryBreakPolicyPlugin)
+    registry.register(ISO7243HeatPlugin)
     return registry

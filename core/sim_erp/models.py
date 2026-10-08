@@ -101,6 +101,15 @@ class PhysicalSnapshot(BaseModel):
     skill_level: Optional[str] = None
     ppe_status: Optional[str] = None
     machine_risk_level: Optional[str] = None
+    # 热应力读数：有规则包才填。None 的意思是"没折算过"，不是"没有热风险"。
+    wbgt_c: Optional[float] = None
+    wet_bulb_c: Optional[float] = None
+    tlv_wbgt_c: Optional[float] = None
+    thermal_exceedance_c: Optional[float] = None
+    metabolic_level: Optional[str] = None
+    required_rest_fraction: Optional[float] = None
+    max_allowable_work_minutes_per_hour: Optional[float] = None
+    thermal_basis: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RuleEvidence(BaseModel):

@@ -1,12 +1,16 @@
-"""Compliance engine input-effect contracts (温度/湿度/能耗的真实口径).
+"""热应力与输入口径的契约测试（ISO 7243 型 WBGT × JSOH 2025-2026 限值）。
 
-这些断言是在记录"模型现在到底让什么影响结果"，不是愿望：
-能耗不含热代价、湿度完全不进链、高温是 >35℃ 的一次阶跃、连续工时用的是严格大于。
-要改这些行为必须同时改规则包与这里，别靠答复里的猜测。
+这些断言记录的是"引擎现在真的按什么算"：
+- 温度与湿度按 WBGT 折算进入疲劳与判定；30℃/60% 与 40℃/60% 必须不同；
+- 能耗仍是外功代理，不含热代价（标准没给 kcal 的热放大系数，就不编）；
+- 没有热应力规则包时退回旧阶跃，并在读数里明说没按标准折算。
 """
 
 from __future__ import annotations
 
+import math
+
+from core.sim_erp.arbiter import DecisionArbiter  # noqa: F401  (保持与原测试同层可导入)
 from core.sim_erp.engine import SimERPEngine
 from core.sim_erp.models import (
     ActionType,
@@ -17,13 +21,16 @@ from core.sim_erp.models import (
 from core.sim_erp.physics import PhysicsCore
 from core.sim_erp.plugins.builtin import (
     FactoryBreakPolicyPlugin,
+    ISO7243HeatPlugin,
     JohnsonGlobalStandardPlugin,
     VNLabor2024Plugin,
 )
+from core.sim_erp.thermal import assess, resolve_metabolic_level, wbgt_c, wet_bulb_c
 
 
 def _input(*, temp: float = 30.0, hum: float = 60.0, minutes: int = 240,
-           steps: int = 3000, load: float = 0.0, posture: float = 0.0) -> PhysicalInput:
+           steps: int = 3000, load: float = 0.0, posture: float = 0.0,
+           task: str = "assembly") -> PhysicalInput:
     return PhysicalInput(
         time_step_minutes=30.0,
         step_count=steps,
@@ -31,77 +38,125 @@ def _input(*, temp: float = 30.0, hum: float = 60.0, minutes: int = 240,
         posture_angle_deg=posture,
         continuous_work_minutes=minutes,
         environment=EnvironmentSnapshot(temperature_c=temp, humidity_percent=hum),
-        work_context=WorkContext(task_type="assembly", zone_id="line-a", shift_id="shift-day",
+        work_context=WorkContext(task_type=task, zone_id="line-a", shift_id="shift-day",
                                  worker_ref="worker-001", action_type=ActionType.WALK),
     )
 
 
-def _evaluate(phys: PhysicalInput):
+def _evaluate(phys: PhysicalInput, *, with_heat: bool = True):
     engine = SimERPEngine()
     engine.audit_trail = type(engine.audit_trail)(storage_path=None)
-    return engine.evaluate(phys, [VNLabor2024Plugin(), JohnsonGlobalStandardPlugin(),
-                                  FactoryBreakPolicyPlugin()])
+    plugins = [VNLabor2024Plugin(), JohnsonGlobalStandardPlugin(), FactoryBreakPolicyPlugin()]
+    if with_heat:
+        plugins.append(ISO7243HeatPlugin())
+    return engine.evaluate(phys, plugins)
 
 
-def test_heat_threshold_comes_from_the_pack_not_the_physics_constant():
-    """35℃ 以下温度不改变任何读数；35.1℃ 一次阶跃（疲劳 ×1.3 + 高温补贴）。"""
-    below = _evaluate(_input(temp=35.0))
-    above = _evaluate(_input(temp=35.1))
-    assert below.snapshot.fatigue_score == 3.5
-    assert [d.rule_code for d in below.arbiter_result.decisions] == []
-    assert above.snapshot.fatigue_score == 4.4          # 3.0 * 1.3 + 0.5
-    assert "VN.HEAT.ALLOWANCE" in [d.rule_code for d in above.arbiter_result.decisions]
-    assert above.arbiter_result.total_cost_delta == 30000
+def _codes(rec):
+    return [d.rule_code for d in rec.arbiter_result.decisions]
 
 
-def test_energy_has_no_thermal_term_at_all():
-    """30℃ 与 40℃ 能耗相同不是 bug，是公式里就没有温度。"""
+def test_wet_bulb_agrees_with_iterative_psychrometric_solution():
+    """Stull 经验式必须贴着心理测量方程的迭代解，否则 WBGT 是从错的湿球算出来的。"""
+    def es(t):
+        return 6.1094 * math.exp(17.625 * t / (t + 243.04))
+
+    def iterative(t_db, rh):
+        gamma = 0.00066 * 1013.25
+        tw = wet_bulb_c(t_db, rh)
+        for _ in range(60):
+            e = rh / 100.0 * es(t_db)
+            f = es(tw) - gamma * (t_db - tw) - e
+            d = (es(tw + 0.01) - es(tw)) / 0.01 + gamma
+            nxt = tw - f / d
+            if abs(nxt - tw) < 1e-7:
+                return nxt
+            tw = nxt
+        return tw
+
+    for t, rh in [(20, 40), (30, 60), (35, 80), (40, 40), (45, 60)]:
+        assert abs(wet_bulb_c(t, rh) - iterative(t, rh)) < 1.0
+
+
+def test_indoor_wbgt_weights_and_globe_assumption_are_stated():
+    out = wbgt_c(temperature_c=30.0, humidity_percent=60.0)
+    assert out["wet_bulb_c"] == round(wet_bulb_c(30.0, 60.0), 2)
+    assert out["globe_used_c"] == 30.0
+    assert any("Tg≈Td" in a for a in out["assumptions"])
+    assert abs(out["wbgt_c"] - (0.7 * wet_bulb_c(30, 60) + 0.3 * 30)) < 0.02
+
+
+def test_moderate_work_at_30c_is_within_the_limit_but_40c_is_not():
+    cool = _evaluate(_input(temp=30.0, hum=60.0))
+    hot = _evaluate(_input(temp=40.0, hum=60.0))
+    assert cool.snapshot.wbgt_c < cool.snapshot.tlv_wbgt_c
+    assert cool.arbiter_result.final_status == "accepted"
+    assert "ISO7243.WBGT.TLV" not in _codes(cool)
+    assert hot.snapshot.thermal_exceedance_c > 3.0
+    assert hot.arbiter_result.final_status == "rejected"
+    assert hot.snapshot.fatigue_score > cool.snapshot.fatigue_score
+
+
+def test_same_temperature_different_humidity_now_reads_different():
+    dry = _evaluate(_input(temp=35.0, hum=40.0))
+    humid = _evaluate(_input(temp=35.0, hum=90.0))
+    assert humid.snapshot.wbgt_c > dry.snapshot.wbgt_c + 3.0
+    assert humid.snapshot.fatigue_score > dry.snapshot.fatigue_score
+    assert humid.arbiter_result.final_status == "rejected"
+
+
+def test_required_rest_scales_with_exceedance():
+    slight = _evaluate(_input(temp=36.0, hum=60.0))
+    severe = _evaluate(_input(temp=45.0, hum=80.0))
+    assert (slight.snapshot.required_rest_fraction or 0) < (severe.snapshot.required_rest_fraction or 0)
+    assert severe.snapshot.max_allowable_work_minutes_per_hour < 60 * 0.5
+
+
+def test_heavier_work_has_tighter_limit_at_the_same_temperature():
+    light = _evaluate(_input(temp=33.0, task="inspect"))        # light → 30.5
+    heavy = _evaluate(_input(temp=33.0, task="casting"))        # heavy → 26.5
+    assert "ISO7243.WBGT.TLV" in _codes(heavy)
+    assert heavy.snapshot.tlv_wbgt_c < light.snapshot.tlv_wbgt_c
+
+
+def test_energy_still_has_no_thermal_term():
     cool = _evaluate(_input(temp=30.0))
     hot = _evaluate(_input(temp=40.0))
     assert cool.snapshot.energy_kcal == hot.snapshot.energy_kcal == 120.0
-    assert PhysicsCore.describe_model()["energy_kcal"]["temperature_changes_it"] is False
+    assert PhysicsCore.describe_model(thermal_available=True)["energy_kcal"][
+        "temperature_changes_it"] is False
 
 
-def test_humidity_is_accepted_but_inert_everywhere():
-    for hum in (30.0, 60.0, 95.0):
-        rec = _evaluate(_input(temp=30.0, hum=hum))
-        assert rec.snapshot.fatigue_score == 3.5
-        assert rec.snapshot.energy_kcal == 120.0
-        assert rec.arbiter_result.decisions == []
-    assert "environment.humidity_percent" in PhysicsCore.describe_model()["inert_inputs"]
-
-
-def test_continuous_work_limit_uses_strict_greater_than():
-    """240 分钟恰好等于法律上限不违规；241 分钟才阻断并要求 30 分钟休息。"""
-    at_limit = _evaluate(_input(temp=40.0, minutes=240))
-    over = _evaluate(_input(temp=40.0, minutes=241))
-    assert at_limit.arbiter_result.final_status == "accepted"
-    assert over.arbiter_result.final_status == "rejected"
-    assert over.arbiter_result.total_penalty_score == 100
-    assert over.arbiter_result.max_required_break_minutes == 30
-
-
-def test_customer_warning_is_penalty_not_blocking():
-    rec = _evaluate(_input(steps=12000))
-    codes = [d.rule_code for d in rec.arbiter_result.decisions]
-    assert "JOHNSON.FATIGUE.WARNING" in codes
-    assert rec.arbiter_result.final_status == "accepted"
-    assert rec.arbiter_result.total_penalty_score == 20
-
-
-def test_factory_break_rule_fires_at_its_own_threshold():
-    rec = _evaluate(_input(minutes=300))
-    assert "FACTORY.REQUIRED.BREAK" in [d.rule_code for d in rec.arbiter_result.decisions]
-    assert rec.arbiter_result.max_required_break_minutes == 30  # 法律 30 > 厂规 15
-
-
-def test_describe_model_publishes_the_drivers_and_inert_inputs():
-    d = PhysicsCore.describe_model(heat_threshold_c=35, continuous_limit_minutes=240)
-    assert "step_count" in d["energy_kcal"]["driven_by"]
-    assert "environment.temperature_c" in d["fatigue_score"]["driven_by"]
+def test_missing_thermal_pack_falls_back_to_the_legacy_step_and_says_so():
+    """没有规则包时不许假装按标准折算过。"""
+    rec = _evaluate(_input(temp=35.1), with_heat=False)
+    assert rec.snapshot.wbgt_c is None
+    assert rec.snapshot.fatigue_score == 4.4          # 老阶跃：×1.3
+    d = PhysicsCore.describe_model(thermal_available=False)
     assert d["fatigue_score"]["heat_is_a_step_not_a_curve"] is True
-    assert d["rule_thresholds"]["heat_allowance_triggers_above_c"] == 35.0
-    assert d["rule_thresholds"]["continuous_work_limit_minutes"] == 240
-    assert d["energy_kcal"]["driven_by"] == ["step_count", "load_weight_kg",
-                                             "environment.floor_incline_percent",
-                                             "environment.terrain"]
+
+
+def test_describe_model_moves_humidity_into_fatigue_drivers():
+    pack = SimERPEngine().legislation_catalog.load_pack("iso7243_jsoh_heat")
+    d = PhysicsCore.describe_model(
+        thermal_available=True,
+        strain_gain_per_exceedance_c=pack["strain"]["fatigue_gain_per_exceedance_c"],
+        tlv_by_level={k: v["wbgt_limit_c"] for k, v in pack["metabolic_levels"].items()},
+    )
+    assert "environment.humidity_percent" in d["fatigue_score"]["driven_by"]
+    assert "environment.humidity_percent" not in d["inert_inputs"]
+    assert d["fatigue_score"]["heat_is_a_step_not_a_curve"] is False
+    assert d["thermal_outputs"] and "wbgt_c" in d["thermal_outputs"]
+    assert d["fatigue_score"]["tlv_by_metabolic_level"]["moderate"] == 29.0
+
+
+def test_metabolic_lookup_uses_pack_mapping_and_default():
+    pack = SimERPEngine().legislation_catalog.load_pack("iso7243_jsoh_heat")
+    assert resolve_metabolic_level("assembly", pack)["wbgt_limit_c"] == 29.0
+    assert resolve_metabolic_level("没见过的工序", pack)["level"] == pack["default_metabolic_level"]
+    assert resolve_metabolic_level("assembly", pack, "heavy")["wbgt_limit_c"] == 26.5
+
+
+def test_assess_without_pack_refuses_to_convert():
+    out = assess(temperature_c=40.0, humidity_percent=60.0, task_type="assembly", pack={})
+    assert out["available"] is False and "iso7243_jsoh_heat" in out["why"]

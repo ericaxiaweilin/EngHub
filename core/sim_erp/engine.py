@@ -42,7 +42,23 @@ class SimERPEngine:
             (pack.get("heat_allowance", {}).get("temperature_c_gt")
              for pack in legislation_catalog.values()
              if isinstance(pack.get("heat_allowance"), dict)), None)
-        snapshot = self.physics_core.simulate_step(physical_input, heat_threshold_c=heat_gt)
+        heat_pack = next((pack for pack in legislation_catalog.values()
+                          if isinstance(pack, dict) and pack.get("metabolic_levels")), None)
+        thermal = None
+        if heat_pack:
+            from .thermal import assess
+
+            thermal = assess(temperature_c=physical_input.environment.temperature_c,
+                             humidity_percent=physical_input.environment.humidity_percent,
+                             task_type=physical_input.work_context.task_type, pack=heat_pack)
+            if not thermal.get("available"):
+                thermal = None
+            else:
+                # 假设跟着数走：Tg≈Td 这类简化必须在读数里看得见
+                thermal["basis"] = {**(thermal.get("basis") or {}),
+                                    "assumptions": thermal.get("assumptions") or []}
+        snapshot = self.physics_core.simulate_step(physical_input, heat_threshold_c=heat_gt,
+                                                   thermal=thermal)
         plugin_records = self.plugin_executor.execute_plugins(snapshot, plugin_list, legislation_catalog)
         arbiter_result = self.arbiter.resolve(plugin_records)
         plugin_manifest_hash = self.plugin_executor.hash_manifests(plugin_list)

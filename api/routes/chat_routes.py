@@ -958,6 +958,38 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- {'点击任一步可查看输入、判断标准、输出、交付物、下一步与异常回流' if is_business else '图中保留审批角色、会签/或签、审批条件和异常路径'}\n"
             f"- {diagram.get('engine_note', '节点与连线均来自流程引擎定义。')}"
         )
+    if tool_name == "run_compliance_simulation":
+        if result.get("error"):
+            return f"合规仿真没跑成：{result['error']}"
+        th = result.get("thermal") or {}
+        sc = result.get("scenario") or {}
+        basis = th.get("basis") or {}
+        over = float(th.get("exceedance_c") or 0.0)
+        rest = round(float(th.get("required_rest_fraction") or 0.0) * 100)
+        hit = "、".join(result.get("hit_rules") or []) or "、".join(
+            (result.get("blocking_rules") or []) + (result.get("warnings") or []))
+        lines = [
+            f"合规仿真结论：{result.get('final_status')}"
+            + ("（超职业接触限值，需改工作-恢复制度）" if result.get("legal_blocked") else ""),
+            f"- 场景：{sc.get('task_type')}、{sc.get('temperature_c')}℃、湿度 "
+            f"{sc.get('humidity_percent')}%、连续 {sc.get('continuous_work_minutes')} 分钟、"
+            f"{sc.get('step_count')} 步",
+            f"- WBGT {th.get('wbgt_c')}℃（自然湿球 {th.get('wet_bulb_c')}℃）对比 "
+            f"{th.get('metabolic_level')} 强度档限值 {th.get('tlv_wbgt_c')}℃："
+            + (f"超 {over:g}℃ → 需约 {rest}% 工休，每 60 分钟最多连续作业 "
+               f"{th.get('max_allowable_work_minutes_per_hour')} 分钟"
+               if over > 0 else f"未超（余 {-over:g}℃）"),
+            f"- 疲劳 {result.get('fatigue_score')}、能耗 {result.get('energy_kcal')} kcal；"
+            "能耗是步数/负重/坡度/地形的机械功代理，温度与湿度不进这一项",
+            f"- 高温补贴 {result.get('total_cost_delta')} VND、罚分 "
+            f"{result.get('total_penalty_score')}、强制休息 "
+            f"{result.get('max_required_break_minutes')} 分钟",
+            f"- 命中规则：{hit or '无'}",
+            f"- 依据：{basis.get('wbgt') or '无'}",
+            f"- 限值出处：{basis.get('limit') or '无'}",
+            f"- 假设：{'；'.join(str(x) for x in (basis.get('assumptions') or [])) or '无'}",
+        ]
+        return "\n".join(lines)
     if tool_name == "query_pmc_work_matrix":
         if result.get("error"):
             return f"PMC 工作矩阵暂时无法生成：{result['error']}\n{result.get('hint', '')}"
@@ -2391,6 +2423,7 @@ async def _handle_kernel_chat(
                 "query_manufacturing_intelligence": "manufacturing-intelligence",
                 "query_order_work_order_status": "order-work-order-status",
                 "query_workflow_diagram": "workflow-diagram-engine",
+                "run_compliance_simulation": "sim-erp-compliance-engine",
             }[tool_name],
             degraded="error" in result,
             actions=[action] if action is not None else [],
@@ -3267,6 +3300,35 @@ async def _legacy_stream_disabled(
             if request.enable_tools and not image_records and not has_spreadsheet_attachment
             else None
         )
+        if direct_intent and direct_intent.get("tool") == "run_compliance_simulation":
+            # 高温/湿度类问题在流式主链路上也必须由引擎出数：模型自己背标准条款会编出
+            # "不超过2小时"这种没入库的口径，这里直接执行仿真并把结论回给用户。
+            arguments = direct_intent.get("args") or {}
+            result = await execute_tool(db, "run_compliance_simulation", arguments,
+                                        operator=operator, factory_id=factory_id)
+            action = ToolAction(
+                tool="run_compliance_simulation",
+                label=TOOL_LABELS["run_compliance_simulation"],
+                arguments=arguments,
+                result=result,
+                is_write=False,
+                is_sim=True,
+                success="error" not in result,
+            )
+            actions.append(action)
+            acc_reply = _direct_tool_reply("run_compliance_simulation", result)
+            yield _sse("action", action.model_dump())
+            yield _sse("delta", {"content": acc_reply})
+            yield _sse("done", {
+                "model": "sim-erp-compliance-engine",
+                "degraded": "error" in result,
+                "session_id": session_id,
+                "stream_request_id": stream_request_id,
+                "request_id": stream_request_id,
+            })
+            await persist_stream_round("sim-erp-compliance-engine")
+            return
+
         if direct_intent and direct_intent.get("tool") == "query_pmc_control_tower":
             arguments = direct_intent.get("args") or {}
             result = await execute_tool(db, "query_pmc_control_tower", arguments, operator=operator, factory_id=factory_id)

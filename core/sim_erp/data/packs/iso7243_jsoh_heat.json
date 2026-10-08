@@ -1,0 +1,60 @@
+{
+  "standard": "WBGT 评价按 ISO 7243 型公式（室内无太阳辐射形式），作业接触限值按 JSOH《职业接触限值建议（2025-2026）》表 VIII-1 的相对代谢率档",
+  "version": "2025.01",
+  "sources": {
+    "wbgt_indoor": "室内（无太阳辐射）WBGT = 0.7·Tnwb + 0.3·Tg；有太阳辐射时为 0.7·Tnwb + 0.2·Tg + 0.1·Td（加拿大就业及社会发展部职业安全报告引用 ACGIH 形式）",
+    "wet_bulb": "Stull, R., 2011: An Empirical Formula to Calculate Wet-Bulb Temperature from Relative Humidity and Air Temperature, J. Appl. Meteor. Climatol.；适用 RH 5~99%、T −20~50℃",
+    "tlv": "Japan Society for Occupational Health, Recommendation of Occupational Exposure Limits (2025-2026), Table VIII-1 高温作业 WBGT 限值，DOI 10.1539/eohp.ROEL2025"
+  },
+  "wbgt": {
+    "indoor_weights": {
+      "wet_bulb": 0.7,
+      "globe": 0.0,
+      "dry_bulb": 0.3
+    },
+    "solar_weights": {
+      "wet_bulb": 0.7,
+      "globe": 0.2,
+      "dry_bulb": 0.1
+    },
+    "globe_equals_dry_bulb_when_no_radiant_load": true,
+    "validity": {
+      "temperature_c": [-20.0, 50.0],
+      "humidity_percent": [5.0, 99.0]
+    }
+  },
+  "metabolic_levels": {
+    "very_light": {"rmr": 1, "kcal_per_hour": 130, "wbgt_limit_c": 32.5},
+    "light": {"rmr": 2, "kcal_per_hour": 190, "wbgt_limit_c": 30.5},
+    "moderate": {"rmr": 3, "kcal_per_hour": 250, "wbgt_limit_c": 29.0},
+    "moderately_heavy": {"rmr": 4, "kcal_per_hour": 310, "wbgt_limit_c": 27.5},
+    "heavy": {"rmr": 5, "kcal_per_hour": 370, "wbgt_limit_c": 26.5}
+  },
+  "task_metabolic_map": {
+    "assembly": "moderate",
+    "inspect": "light",
+    "inspection": "light",
+    "packing": "moderate",
+    "machining": "moderate",
+    "welding": "moderately_heavy",
+    "painting": "moderately_heavy",
+    "casting": "heavy",
+    "injection": "heavy",
+    "material_handling": "moderately_heavy",
+    "office": "very_light",
+    "planning": "very_light"
+  },
+  "default_metabolic_level": "moderate",
+  "strain": {
+    "fatigue_gain_per_exceedance_c": 0.1,
+    "blocking_above_exceedance_c": 3.0,
+    "treat_exceedance_as_binding": true,
+    "basis": "标准只给 WBGT 限值，不给疲劳系数：每超 1℃ 给疲劳加 10%、超 3℃ 视为不可接受，是**本厂把限值转成引擎应变的换算**，写在这里就是让人能改、能追责，不是从标准里抄来的"
+  },
+  "work_rest": {
+    "rest_fraction_per_exceedance_c": 0.08,
+    "max_rest_fraction": 0.75,
+    "basis": "ACGIH/JSOH 的表达方式是'超限就要换成带休息的工作-恢复制度'（离散档），本厂先按每超 1℃ 需 8% 休息线性折算给出连续读数，上限 75%；要改成按档取值需要拿到标准原表的确切矩阵再改这里"
+  },
+  "notes": "能耗（kcal）不含热代价：ISO 7933/8996 用代谢率与热应变（出汗、心率、可承受工时）表达高温影响，没有把同样外功的 kcal 按温度放大的系数，所以这里也不编。高温的代价体现在 wbgt_c / exceedance_c / required_rest_fraction / max_allowable_work_minutes_per_hour。"
+}
