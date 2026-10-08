@@ -733,10 +733,38 @@ async def get_engine_layers(
     return await layered_acceptance(db, factory_id, models, use_cache=not refresh)
 
 
+@router.get("/sim-schedule-risk", summary="交期分布：按已声明的误差带抽样，给 P50/P90 与准点概率")
+async def get_sim_schedule_risk(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
+    samples: int = Query(48, description="抽样次数（6~200；每抽一次真跑一遍沙箱）"),
+    seed: int = Query(20261008, description="固定种子：同一批数据要能重算出同一条分布"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把"可信到几成"换成一条日期分布 —— 承诺要的是概率，不是一个 ±天 的标量。
+
+    抽样不加新假设：提前期按 lead_error_band(覆盖率)、工时按每台机自己依据的允许误差
+    （借同族路线 40%、自家路线 5%），一批机型共用乘子所以取最差那条；到岗按天气标定
+    三档（0.97/0.92/0.70）离散抽而不是正态；设备可用率=台账实测 ±2pp。
+    引用规矩：P50、P90 与准点概率三件一起报 —— 只报 P50 等于把毛边藏起来。
+    只读：不写业务表、不改排产。
+    """
+    del current_user
+    from api.services.sim_sensitivity import schedule_risk
+    from api.services.virtual_run import default_models
+
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await schedule_risk(db, factory_id, models, samples=samples, seed=seed)
+
+
 @router.get("/sim-sensitivity", summary="建模精度×敏感度：每个输入动一档，交期/准点/钱各变多少")
 async def get_sim_sensitivity(
     factory_id: str = Query(..., description="厂区"),
     n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
+    include_risk: bool = Query(False, description="true 时顺带给交期分布（多花几十秒）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -753,7 +781,7 @@ async def get_sim_sensitivity(
     models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
     if not models:
         raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
-    return await report(db, factory_id, models)
+    return await report(db, factory_id, models, include_risk=include_risk)
 
 
 
@@ -789,6 +817,31 @@ async def get_kit_lines_reupgrade(
     from api.services.component_orders import reupgrade_stale_kit_lines
 
     return await reupgrade_stale_kit_lines(db, factory_id, apply=apply, limit=limit)
+
+
+@router.get("/engine-capability-profile",
+            summary="能力三格画像：推演=给结果、分析=给原因、总结=给一段不编的话，各给实测值与判定")
+async def get_engine_capability_profile(
+    db: AsyncSession = Depends(get_db),
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(3, description="取 BOM 最完整的 n 个机种（与分层验收同一取数）"),
+    days: int = Query(default=30, ge=1, le=180),
+    refresh: bool = Query(False, description="推演格现算一遍分层验收（默认用缓存读数）"),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """人办一件事走 总结→分析→推演，引擎反过来走 推演→分析→总结，三格各自有尺。
+
+    推演格引用分层验收（L1..L4）的同名实测值，不另算一套尺；refresh=true 时现算（分钟级）。
+    任何一格算不出就写算不出并点名缺什么，不给 0 分。
+    """
+    from api.services.engine_capability import capability_profile
+    from api.services.virtual_run import default_models
+
+    del current_user
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await capability_profile(db, factory_id, models, days=days, use_cache=not refresh)
 
 
 @router.get("/sim-readiness", summary="精度判据就绪度：L2B 那两个数为什么算不出，缺的是哪一类数据")

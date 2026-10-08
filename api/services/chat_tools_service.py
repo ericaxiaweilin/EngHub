@@ -1097,9 +1097,15 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "到岗率±0.05、设备可用率±0.05、批量±1天产量、并联开线、加班加人、承诺交期系数），"
                 "换算成'值几天、每天值多少钱、救回几台准点'；映射精度（每项输入有多少真依据、"
                 "允许误差多大）；以及误差传导 —— 现在这个交期可信到几成、把哪项数据补到可信能压掉几天。"
+                "误差传导之外还有两格：杠杆交互（两把钥匙是不是开同一把锁 —— 一起上减去各自上之和，"
+                "分可加/替代/互补），以及 with_schedule_risk=true 时的交期分布"
+                "（按已声明误差带抽 48 轮真跑，给 P50/P90 与准点概率）。"
                 "用于'补 IE 工时值多少''加急值几天''该不该开第二条线''加班划不划算'"
                 "'这个交期有多可信''哪个杠杆最值钱''数据补齐能改善多少'类问题。不写任何系统。"),
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {"type": "object", "properties": {
+                "with_schedule_risk": {"type": "boolean",
+                                       "description": "要交期分布/准点概率时置 true（多花几十秒真跑 48 轮）"},
+            }},
         },
     },
     {
@@ -3231,7 +3237,7 @@ async def _tool_query_simulation_sensitivity(
     if not models:
         return {"status": "ok", "factory_id": fid, "has_data": False,
                 "message": "厂区里没有可推演的机种（BOM 镜像为空？）"}
-    out = await report(db, fid, models)
+    out = await report(db, fid, models, include_risk=bool(args.get("with_schedule_risk")))
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3255,6 +3261,18 @@ async def _tool_query_simulation_sensitivity(
                                 "drags": m["drags"]} for m in acc.get("models") or []],
         "uncertainty": (out.get("uncertainty") or {}).get("per_model"),
         "value_of_repair": (out.get("uncertainty") or {}).get("value_of_repair"),
+        "lever_interactions": [
+            {"pair": p.get("pair"), "solo_days_saved": (p.get("solo_days_saved") or {}).get("a"),
+             "solo_days_saved_other": (p.get("solo_days_saved") or {}).get("b"),
+             "joint_days_saved": p.get("joint_days_saved"),
+             "interaction_days": p.get("interaction_days"), "relation": p.get("relation"),
+             "extra_cost_usd": (p.get("cost_usd") or {}).get("joint"),
+             "reading": p.get("reading")}
+            for p in ((out.get("interactions") or {}).get("pairs") or [])
+            if p.get("status") == "ok"],
+        "schedule_risk": (out.get("risk") or {}),
+        "risk_not_sampled_because": (None if out.get("risk") else
+                                     "没点要分布（with_schedule_risk=true 才抽样，一次 48 轮真跑）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
                    "不确定天数 = |斜率| × (允许误差 ÷ 档位步长)，多项线性相加是保守口径；"
                    "所有档位都走同一条 scan_policies 推演路径，不另建第二套算法。"),
@@ -4784,6 +4802,14 @@ INTENT_RULES: List[Dict[str, Any]] = [
                      "按规模", "放大到", "缩小到", "千人规模", "万人规模", "人工厂"],
     },
     {
+        # 敏感交互与交期分布这类数必须由引擎给：模型会背一个"大概有七成把握"，
+        # 而那句话背后没有任何抽样。只认 distinctive 的说法，别抢"加急/延几天"那些既有路由。
+        "tool": "query_simulation_sensitivity",
+        "keywords": ["敏感度", "哪个杠杆", "杠杆交互", "组合拳", "可信到几成", "有多可信",
+                     "准点概率", "几成概率", "交期分布", "分布", "P90", "P50", "毛边",
+                     "sensitivity", "斜率"],
+    },
+    {
         # PMC 专项规则必须早于普通“库存”，否则“库存齐套率/在途库存”会被截成普通库存查询。
         "tool": "query_pmc_rush_impact",
         # 带机种/数量的插单问法必须走引擎（工时、日产能、到岗都在台账里），不能让模型背一个
@@ -5430,6 +5456,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         else:
             args["report_type"] = "production_summary"
         args["format"] = "csv" if any(k in message for k in ["csv", "CSV", "表格"]) else "json"
+    elif tool == "query_simulation_sensitivity":
+        # 问"几成概率/分布/毛边"要的是抽样之后的日期分布；点估那一格答不了这种问法
+        if any(k in message for k in ("概率", "几成", "分布", "P90", "P50", "毛边")):
+            args["with_schedule_risk"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
         flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)
@@ -5608,6 +5638,9 @@ DETERMINISTIC_INTENT_TOOLS = frozenset({
     "query_pmc_rush_impact",
     # "千人厂什么样"必须由引擎按参照厂实测比例生成，不能让模型即兴描述一座厂
     "generate_plant_architecture",
+    # "有几成概率准点/交期分布/哪个杠杆值钱"必须是抽过样、跑过档位的答案，
+    # 模型会被要求给一个它没有的数字 —— 它没有分布，只有印象
+    "query_simulation_sensitivity",
     "query_pmc_control_tower",
     "query_order_work_order_status",
     "query_manufacturing_intelligence",

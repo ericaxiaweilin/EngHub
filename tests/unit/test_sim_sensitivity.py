@@ -205,3 +205,138 @@ def test_interaction_rows_carry_internal_keys_for_the_public_mapping(monkeypatch
     known = {str(l["key"]) for l in ss.INTERACTION_LEVERS}
     for p in out["pairs"]:
         assert p["status"] == "ok" and set(p["keys"]) <= known and len(p["keys"]) == 2
+
+
+def test_schedule_risk_is_reproducible_and_reports_percentiles_not_a_point(monkeypatch):
+    """同一个种子必须重算出同一条分布，否则这条 P90 不可核对。"""
+    import asyncio
+
+    dates = ["2026-11-21", "2026-11-24", "2026-11-18", "2026-11-30"]
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    calls = {"n": 0}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        calls["n"] += 1
+        idx = calls["n"] % len(dates)
+        late = 0.0 if idx == 2 else float(idx * 3)
+        return {"finish_date": dates[idx], "days_late_worst": late,
+                "on_time_rate": 1.0 if late <= 0 else 0.0, "labor_cost_usd": 1000.0,
+                "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                "binding": "material_arrival", "first_batch_units": 10, "queued_units": 0}
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 73.0, "hours_error_band": 0.30,
+                            "components": {"lead_time": {"score": 1.0}, "hours": {"score": 0.35}}}]}
+
+    monkeypatch.setattr(ss.vr, "derive_targets", fake_targets)
+    monkeypatch.setattr(ss.vr, "equipment_rate", fake_equip)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+    calls["n"] = 0
+    first = asyncio.run(ss.schedule_risk(None, "FAC", ["M-1"], samples=12, seed=7))
+    calls["n"] = 0
+    again = asyncio.run(ss.schedule_risk(None, "FAC", ["M-1"], samples=12, seed=7))
+    assert first["status"] == "ok" and first["with_date"] == 12
+    assert [p["finish_date"] for p in first["percentiles"]] == [p["finish_date"] for p in again["percentiles"]]
+    assert first["p_on_time"] == again["p_on_time"]
+    pcs = {p["percentile"]: p["finish_date"] for p in first["percentiles"]}
+    assert pcs[10] <= pcs[50] <= pcs[90]
+    assert first["promise_date"] <= pcs[50] or first["p_on_time"] == 0
+    assert first["bands_used"]["purchase_lead_time"] == 0.2 and first["bands_used"]["unit_work_hours"] == 0.3
+    assert "只报 P50" in first["how_to_quote"]
+    assert first["reading"] and "P90" in first["reading"]
+
+
+def test_schedule_risk_says_no_dates_instead_of_inventing_a_distribution(monkeypatch):
+    import asyncio
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        return {"finish_date": None, "binding": "no_time_basis", "days_late_worst": None,
+                "labor_cost_usd": 0.0, "on_time_rate": None}
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "hours_error_band": 0.3,
+                            "components": {"lead_time": {"score": 1.0}}}]}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+    out = asyncio.run(ss.schedule_risk(None, "FAC", ["M-1"], samples=6))
+    assert out["status"] == "no_dates" and "给不出分布" in out["why"]
+    assert out["bindings_seen"] == ["no_time_basis"]
+
+
+def test_lead_error_band_is_one_source_for_sampling_and_for_propagation():
+    """抽样带宽与误差传导必须同一个出处，不然两处各说一个 ±%。"""
+    assert ss.lead_error_band(1.0) == 0.20
+    assert ss.lead_error_band(0.8) == 0.20
+    assert ss.lead_error_band(0.5) == 0.50
+    assert ss.lead_error_band(0.0) == 1.0
+
+
+def test_sensitivity_chat_answer_carries_interactions_and_the_distribution():
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    result = {"status": "ok", "has_data": True, "factory_id": "FAC_MECH_001",
+              "models": ["A-50-04-F", "FG-BIKE-003"],
+              "base": {"finish_date": "2026-11-21", "days_late_worst": 21.0, "on_time_rate": 0.0,
+                       "labor_cost_usd": 314280.0, "expedite_cost_usd": 0.0,
+                       "line_activation_cost_usd": 0.0, "binding": "line_declared"},
+              "levers": [{"lever": "外购提前期", "slope": {"computable": True, "days_per_step": 0.8,
+                                                          "money_per_day_saved": 2070.0,
+                                                          "on_time_models_per_step": -0.4,
+                                                          "nonlinear": True, "steepest_days_per_step": 2.2,
+                                                          "steepest_at_level": 1.5}},
+                         {"lever": "单件工时", "slope": {"computable": True, "days_per_step": 0.0}}],
+              "lever_interactions": [{"pair": "压瓶颈件提前期 × 加班加人 30%", "solo_days_saved": 4.0,
+                                      "solo_days_saved_other": 0.0, "joint_days_saved": 4.0,
+                                      "interaction_days": 0.0, "relation": "additive",
+                                      "extra_cost_usd": 110844.0,
+                                      "reading": "两个杠杆各解各的，钱可以分开算"}],
+              "schedule_risk": {"status": "ok", "reading": "48 抽 48 次有完工日：P50=2026-11-21、P90=2026-11-27",
+                                "percentiles": [{"percentile": 10, "finish_date": "2026-11-19"},
+                                                {"percentile": 50, "finish_date": "2026-11-21"},
+                                                {"percentile": 90, "finish_date": "2026-11-27"}],
+                                "bands_used": {"purchase_lead_time": 0.2, "unit_work_hours": 0.3}},
+              "risk_not_sampled_because": None,
+              "accuracy_overall": 71.6, "method": "斜率只取基准两侧最近两档",
+              "uncertainty": [{"model_code": "M-1", "uncertainty_days_sum": 1.6,
+                               "uncertainty_days_after_repair": 0.4}]}
+    text = _format_sensitivity_reply(result)
+    assert "组合完工 2026-11-21" in text and "卡在 line_declared" in text
+    assert "每档 0.8 天" in text and "台阶型" in text
+    assert "动不了的输入：单件工时" in text
+    assert "交互 0.0 天" in text and "各解各的" in text
+    assert "交期分布" in text and "2026-11-27" in text and "这段就是毛边" in text
+    assert "映射精度：71.6" in text
+    assert "没抽" not in text
+
+
+def test_cost_per_day_counts_expedite_and_activation_not_labor_only():
+    """只按人工折算会把加急费说成 $0/天 —— 贵的东西被读成免费的。"""
+    lever = {"label": "外购提前期", "step": 0.1, "base": 1.0}
+    rows = [
+        {"level": 1.0, "finish_date": "2026-01-11", "days_vs_base": 0, "labor_delta_usd": 0.0,
+         "expedite_delta_usd": 0.0, "activation_delta_usd": 0.0, "on_time_models": 3},
+        {"level": 0.9, "finish_date": "2026-01-09", "days_vs_base": -2, "labor_delta_usd": 0.0,
+         "expedite_delta_usd": -600.0, "activation_delta_usd": 0.0, "on_time_models": 5},
+    ]
+    out = ss.slope_per_step(rows, lever, 1.0)
+    assert out["days_per_step"] == 2.0
+    assert out["labor_usd_per_step"] == 0.0
+    assert out["cost_usd_per_step"] == 600.0
+    assert out["money_per_day_saved"] == 300.0     # 每提前一天花 $300，而不是 $0

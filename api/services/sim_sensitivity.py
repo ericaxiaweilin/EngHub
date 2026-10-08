@@ -181,9 +181,16 @@ def slope_per_step(rows: List[Dict[str, Any]], lever: Dict[str, Any],
     hi_mag = magnitudes[-1] if magnitudes else 0.0
     nonlinear = bool(len(magnitudes) >= 2 and (any(m <= 1e-9 for m in magnitudes)
                                                or (lo_mag > 0 and hi_mag > 2.0 * lo_mag)))
+    # 每档的代价不能只算人工：加急与开线也是这一档花出去的钱。只按人工折算时
+    # "外购提前期 每天值 $0" 这种话会把 $6,030 的加急费抹平 —— 那是把贵的说成免费的。
+    per_step_expedite = round((pick.get("expedite_delta_usd") or 0) * (step / span) * sign, 2)
+    per_step_activation = round((pick.get("activation_delta_usd") or 0) * (step / span) * sign, 2)
+    cost_per_step = round(abs(per_step_labor) + abs(per_step_expedite) + abs(per_step_activation), 2)
     return {"computable": True, "base_level": round(base, 4),
             "unit": f"每 {lever['label']} ±{format(step, 'g')}",
             "days_per_step": per_step_days, "labor_usd_per_step": per_step_labor,
+            "expedite_usd_per_step": per_step_expedite,
+            "activation_usd_per_step": per_step_activation, "cost_usd_per_step": cost_per_step,
             "on_time_models_per_step": round(on_time_delta, 3),
             "days_per_step_fit": fit_days, "on_time_models_per_step_fit": fit_on_time,
             "steepest_days_per_step": steepest_days, "steepest_at_level": steepest[1],
@@ -193,7 +200,7 @@ def slope_per_step(rows: List[Dict[str, Any]], lever: Dict[str, Any],
                            if nonlinear else "局部与拟合一致，可按线性引用"),
             "measured_between": [base, float(pick["level"])],
             "direction": "把该输入加大一档",
-            "money_per_day_saved": (round(abs(per_step_labor) / abs(per_step_days), 2)
+            "money_per_day_saved": (round(cost_per_step / abs(per_step_days), 2)
                                     if per_step_days else None)}
 
 
@@ -347,6 +354,11 @@ async def mapping_accuracy(db: AsyncSession, factory_id: str,
                      "要改口径得改这一处。")}
 
 
+def lead_error_band(coverage: float) -> float:
+    """外购提前期的允许误差：覆盖率够就把 ±20% 当底线，覆盖不足按缺口放大（单一出处）。"""
+    return 0.20 if float(coverage) >= 0.8 else max(0.20, 1.0 - float(coverage))
+
+
 def propagate_uncertainty(sens: Dict[str, Any], acc: Dict[str, Any],
                           *, repaired: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     """把映射误差按敏感度斜率折算成天数：这台机器现在能给出几天宽的区间，补完数据能压到几天。"""
@@ -373,7 +385,7 @@ def propagate_uncertainty(sens: Dict[str, Any], acc: Dict[str, Any],
                           "uncertainty_days_after": round(abs(hours_slope) * (hours_err_after / 0.10), 2)})
         if lead_slope:
             lead_cov = float(comps.get("lead_time", {}).get("score") or 0)
-            lead_err = 0.20 if lead_cov >= 0.8 else max(0.20, 1.0 - lead_cov)
+            lead_err = lead_error_band(lead_cov)
             lead_after = min(lead_err, repaired.get("lead_multiplier", lead_err))
             parts.append({"input": "外购提前期", "days_per_step": lead_slope, "error_band": lead_err,
                           "uncertainty_days_now": round(abs(lead_slope) * (lead_err / 0.10), 2),
@@ -465,7 +477,8 @@ async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -
                      "power=|天/档|+|准点台/档|，只用于排序不改判")}
 
 
-async def report(db: AsyncSession, factory_id: str, models: List[str], **kw: Any) -> Dict[str, Any]:
+async def report(db: AsyncSession, factory_id: str, models: List[str], *,
+                 include_risk: bool = False, **kw: Any) -> Dict[str, Any]:
     acc = await mapping_accuracy(db, factory_id, models)
     sens = await sensitivity(db, factory_id, models, **kw)
     inter = await interactions(db, factory_id, models, **kw)
@@ -482,12 +495,16 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], **kw: Any
         "claim_guard": ("任何写成「省 $X / 值 $Y」的结论都必须同时写"
                         "「收益侧未建模，这只是成本差值」"),
     }
-    return {"factory_id": factory_id, "models": models, "economic_readiness": economy,
-            "accuracy": acc, "sensitivity": sens, "uncertainty": unc, "interactions": inter,
-            "how_to_read": ("要交期就给交期：base.finish_date 是这批的组合完工日，"
-                            "curves 给每个输入动一档之后的完工日/人工/加急差值，"
-                            "uncertainty 给这些数现在可信到几成、补哪项数据能压掉几天，"
-                            "interactions 给两个杠杆一起上时多出来（或白花）的那部分。")}
+    out = {"factory_id": factory_id, "models": models, "economic_readiness": economy,
+           "accuracy": acc, "sensitivity": sens, "uncertainty": unc, "interactions": inter,
+           "how_to_read": ("要交期就给交期：base.finish_date 是这批的组合完工日，"
+                           "curves 给每个输入动一档之后的完工日/人工/加急差值，"
+                           "uncertainty 给这些数现在可信到几成、补哪项数据能压掉几天，"
+                           "interactions 给两个杠杆一起上时多出来（或白花）的那部分，"
+                           "risk（include_risk=true 时）给按已声明误差带抽出来的完工日分布。")}
+    if include_risk:
+        out["risk"] = await schedule_risk(db, factory_id, models, **kw)
+    return out
 
 
 # 两个杠杆一起上才看得出来的东西：各自的边际是"在别的都卡着"的前提下测的，
@@ -588,3 +605,107 @@ async def interactions(db: AsyncSession, factory_id: str, models: List[str], *,
                      "这一格测的是把两个杠杆一起打开之后多出来（或少掉）的那部分 —— "
                      "替代关系为负意味着第二个的钱白花，互补为正意味着有一个是另一个的前提。"
                      "钱的口径=人工+加急+开线，收益侧未建模，所以只是成本差值。")}
+
+
+# 蒙特卡洛抽的四个因子。误差带一律复用上面已声明的出处（ERROR_BAND / lead_error_band /
+# 天气标定），这里不另立一套分布假设。
+RISK_ATTENDANCE_LEVELS = (0.97, 0.92, 0.70)
+
+RISK_FACTORS: List[Dict[str, Any]] = [
+    {"input": "purchase_lead_time", "label": "外购提前期", "perturb": "lead_multiplier",
+     "band_from": "lead_error_band(覆盖率)"},
+    {"input": "unit_work_hours", "label": "单件工时", "perturb": "hours_multiplier",
+     "band_from": "每台机自己的 hours_error_band"},
+    {"input": "crew_attendance", "label": "到岗比例", "levels": list(RISK_ATTENDANCE_LEVELS),
+     "band_from": "天气标定（用户 10-06 给的三档）"},
+    {"input": "equipment_availability", "label": "设备可用率", "perturb": "equip_rate",
+     "band_from": "台账实测 ±2pp"},
+]
+
+
+async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
+                        days_of_output: float = 6.0, lead_margin: Optional[float] = None,
+                        policy: Optional[Dict[str, Any]] = None, samples: int = 48,
+                        seed: int = 20261008) -> Dict[str, Any]:
+    """把"可信到几成"换成一条日期分布：按已声明的误差带抽样，给 P50/P90 与准点概率。
+
+    不确定度传导只有一个标量（±1.6 天），而决策要问的是"这版完工日有几成概率赶上承诺"。
+    抽样不加新假设：提前期与工时按**每台机自己那条依据**允许的误差均匀抽（借同族路线允许 40%、
+    自家路线 5%，取这批里最差的那个带宽），到岗按天气三档离散抽（不是正态），
+    设备可用率按台账实测 ±2pp。种子固定 —— 这条分布必须能被重算核对。
+    """
+    import random
+    from datetime import date, timedelta
+
+    margin = lead_margin if lead_margin is not None else vr.PROMISE_LEAD_MARGIN
+    pol = policy or {"name": "基准政策（分批开工）", "allow_partial": True}
+    n = max(6, min(200, int(samples)))
+    targets = await vr.derive_targets(db, factory_id, models,
+                                      days_of_output=days_of_output, lead_margin=margin)
+    base_eq = float((await vr.equipment_rate(db, factory_id)).get("rate") or 1.0)
+    acc = await mapping_accuracy(db, factory_id, models)
+    per_model = acc.get("models") or []
+    # 一批机型共用一个乘子，所以带宽取这批里最差的那条依据（保守；取平均会假装我们更准）
+    hours_band = max([float(m.get("hours_error_band") or 0.0) for m in per_model] or [0.0])
+    lead_band = max([lead_error_band(float((m.get("components") or {}).get("lead_time", {})
+                                           .get("score") or 0)) for m in per_model] or [0.20])
+    rng = random.Random(seed)
+
+    outcomes: List[Dict[str, Any]] = []
+    for _ in range(n):
+        att = rng.choice(RISK_ATTENDANCE_LEVELS)
+        perturb = {"lead_multiplier": round(1.0 + rng.uniform(-lead_band, lead_band), 4),
+                   "hours_multiplier": round(1.0 + rng.uniform(-hours_band, hours_band), 4),
+                   "equip_rate": round(max(0.05, min(1.0, base_eq + rng.uniform(-0.02, 0.02))), 4)}
+        m = await _run_one(db, factory_id, targets, pol, attendance=att, perturb=perturb)
+        outcomes.append({"attendance": att, **perturb, "binding": m.get("binding"),
+                         "finish_date": m.get("finish_date"),
+                         "days_late_worst": (float(m["days_late_worst"])
+                                             if m.get("days_late_worst") is not None else None),
+                         "labor_cost_usd": m.get("labor_cost_usd")})
+
+    dated = [o for o in outcomes if o.get("finish_date")]
+    if not dated:
+        return {"status": "no_dates", "samples": n, "seed": seed,
+                "why": "抽到的每一轮都推不出完工日（机种没有可推演的 BOM/依据）→ 给不出分布",
+                "bindings_seen": sorted({str(o.get("binding")) for o in outcomes})}
+    ordered = sorted(dated, key=lambda o: str(o["finish_date"]))
+    lates = [float(o["days_late_worst"] or 0) for o in ordered]
+    # 承诺日 = 每抽的（完工日 − 该抽延误）取最早：这台机被承诺到哪天才叫"准点"
+    due = min(date.fromisoformat(str(o["finish_date"])) - timedelta(days=int(o["days_late_worst"] or 0))
+              for o in dated)
+
+    def pct(frac: float) -> Dict[str, Any]:
+        idx = min(len(ordered) - 1, max(0, int(round(frac * (len(ordered) - 1)))))
+        return {"percentile": int(frac * 100), "finish_date": str(ordered[idx]["finish_date"]),
+                "days_late_worst": ordered[idx]["days_late_worst"]}
+
+    p_on_time = round(sum(1 for x in lates if x <= 0) / len(lates), 3)
+    p_late7 = round(sum(1 for x in lates if x > 7) / len(lates), 3)
+    by_att: Dict[float, List[float]] = {}
+    for o in dated:
+        by_att.setdefault(float(o["attendance"]), []).append(float(o["days_late_worst"] or 0))
+    return {
+        "status": "ok", "factory_id": factory_id, "models": models,
+        "samples": n, "seed": seed, "with_date": len(dated), "no_date": n - len(dated),
+        "policy": pol["name"], "promise_date": str(due),
+        "percentiles": [pct(0.10), pct(0.50), pct(0.90)],
+        "p_on_time": p_on_time, "p_late_gt_7_days": p_late7,
+        "days_late_min": min(lates), "days_late_max": max(lates),
+        "worst_seen": {"finish_date": str(ordered[-1]["finish_date"]),
+                       "days_late_worst": ordered[-1]["days_late_worst"]},
+        "by_attendance": [{"attendance": k, "samples": len(v),
+                           "mean_days_late": round(sum(v) / len(v), 2),
+                           "share_of_samples": round(len(v) / len(dated), 3)}
+                          for k, v in sorted(by_att.items())],
+        "bands_used": {"purchase_lead_time": round(lead_band, 3), "unit_work_hours": round(hours_band, 3),
+                       "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS), "equipment_plus_minus": 0.02},
+        "basis": ("提前期按 lead_error_band(覆盖率)、工时按每台机自己的 hours_error_band，"
+                  "两者都取这批里最差的那条；到岗按天气标定三档离散抽；设备可用率=台账实测 ±2pp。"
+                  "没有引入新的分布假设，种子固定可重算。"),
+        "how_to_quote": ("引用时给 P50、P90 与准点概率三件；P90 与 P50 差几天就是这条交期的毛边，"
+                         "只报 P50 等于把毛边藏起来"),
+        "reading": (f"{n} 抽 {len(dated)} 次有完工日：P50={pct(0.50)['finish_date']}、"
+                    f"P90={pct(0.90)['finish_date']}（承诺 {due}）；准点概率 {p_on_time:.0%}，"
+                    f"延超过 7 天概率 {p_late7:.0%}；延误跨度 {min(lates):g}~{max(lates):g} 天"),
+    }

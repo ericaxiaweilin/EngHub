@@ -264,7 +264,10 @@ _TOOL_SELECTION_ACTION_HINTS: Dict[str, tuple[str, ...]] = {
     "query_simulation_sensitivity": ("值多少", "值几天", "最值钱", "哪个杠杆", "划不划算",
                                     "敏感度", "补 IE 工时", "补工时", "IE 工时值", "可信到几成", "有多可信", "可信度",
                                     "误差", "精度", "加急值", "开第二条线划不", "加班划不划",
-                                    "压到", "改善多少", "提升多少", "sensitivity"),
+                                    "压到", "改善多少", "提升多少", "sensitivity",
+                                    # 问"几成概率/分布/毛边"要的是抽样后的日期分布，不是一个点估
+                                    "几成概率", "准点概率", "概率", "分布", "P50", "P90", "毛边",
+                                    "一起上", "组合拳", "两个一起", "交互"),
     "query_simulation_recommendation": ("引擎在建议", "推演建议", "政策推演", "机种推演",
                                        "沙箱推演", "沙盘", "推演交期", "推演", "政策扫描",
                                        "建议什么", "要不要加急", "加急", "该催哪个料",
@@ -1300,11 +1303,63 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         if len(items) > 20:
             lines.append(f"- 其余 {len(items) - 20} 种物料已保留在结构化结果中。")
         return "\n".join(lines)
+    if tool_name == "query_simulation_sensitivity":
+        return _format_sensitivity_reply(result)
     if tool_name == "generate_plant_architecture":
         return _format_architecture_reply(result)
     if tool_name == "query_pmc_rush_impact":
         return _format_rush_impact(result)
     return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
+
+
+def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
+    """敏感度答复：基准交期 + 杠杆斜率 + 组合交互 + 交期分布，全在 sim_sensitivity 一处算出来。"""
+    if not result.get("has_data"):
+        return f"敏感度读数没生成：{result.get('message') or result.get('status') or '没有可推演的机种'}"
+    base = result.get("base") or {}
+    lines = [f"仿真引擎量化读数（工厂 {result.get('factory_id')}，{len(result.get('models') or [])} 台机，只读）："]
+    lines.append(
+        f"- 基准：组合完工 {base.get('finish_date') or '算不出'}｜最晚延 {base.get('days_late_worst')} 天｜"
+        f"准点 {base.get('on_time_rate')}｜人工 ${base.get('labor_cost_usd') or 0:,.0f}｜"
+        f"加急 ${base.get('expedite_cost_usd') or 0:,.0f}｜开线 ${base.get('line_activation_cost_usd') or 0:,.0f}"
+        f"｜卡在 {base.get('binding') or '未明'}")
+    step_like = []
+    for lever in (result.get("levers") or [])[:12]:
+        sl = lever.get("slope") or {}
+        if not sl.get("computable"):
+            continue
+        if float(sl.get("days_per_step") or 0) == 0:
+            step_like.append(lever.get("lever"))
+            continue
+        lines.append(
+            f"- {lever.get('lever')}：每档 {sl.get('days_per_step')} 天"
+            f"（每提前一天要多花 ${sl.get('money_per_day_saved') or 0:,.0f}"
+            f"＝人工 {sl.get('labor_usd_per_step') or 0:,.0f}+加急 {sl.get('expedite_usd_per_step') or 0:,.0f}"
+            f"+开线 {sl.get('activation_usd_per_step') or 0:,.0f}）、准点 {sl.get('on_time_models_per_step')} 台/档"
+            + (f"｜台阶型：最陡 {sl.get('steepest_days_per_step')} 天/档（在 {sl.get('steepest_at_level')} 那档）"
+               if sl.get("nonlinear") else ""))
+    if step_like:
+        lines.append("- 动不了的输入：" + "、".join([x for x in step_like if x])
+                     + " —— 不是它不重要，是它现在不进约束（看基准那行的『卡在』）")
+    for p in (result.get("lever_interactions") or [])[:4]:
+        lines.append(f"- 组合：{p.get('pair')} 一起上 {p.get('joint_days_saved')} 天"
+                     f"（各自 {p.get('solo_days_saved')}+{p.get('solo_days_saved_other')}）"
+                     f"｜交互 {p.get('interaction_days')} 天｜{p.get('relation')}｜{p.get('reading')}")
+    risk = result.get("schedule_risk") or {}
+    if risk.get("status") == "ok":
+        pcs = {int(x.get("percentile")): x.get("finish_date") for x in (risk.get("percentiles") or [])}
+        lines.append(
+            f"- 交期分布：{risk.get('reading')}｜带宽：提前期 ±{risk.get('bands_used', {}).get('purchase_lead_time')}、"
+            f"工时 ±{risk.get('bands_used', {}).get('unit_work_hours')}、到岗三档、设备 ±2pp｜"
+            f"P50→P90 = {pcs.get(50)} → {pcs.get(90)}（这段就是毛边）")
+    elif result.get("risk_not_sampled_because"):
+        lines.append(f"- 交期分布：没抽样 —— {result['risk_not_sampled_because']}")
+    lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
+    for u in (result.get("uncertainty") or [])[:2]:
+        lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"
+                     f" → 补齐后 {u.get('uncertainty_days_after_repair')} 天")
+    lines.append(f"- 引用规矩：{result.get('method') or ''}")
+    return "\n".join(lines)
 
 
 def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
