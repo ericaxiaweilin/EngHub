@@ -898,6 +898,72 @@ def _sim_default_labels(keys) -> str:
     return "、".join(_SIM_DEFAULT_LABELS.get(str(k), str(k)) for k in (keys or []) if str(k) not in skip)
 
 
+def _format_rush_impact(result: Dict[str, Any]) -> str:
+    """插单影响的答复：数字全来自 virtual_run.rush_impact()，缺依据时把缺哪一环说清楚。"""
+    if result.get("error"):
+        return f"插单影响评估失败：{result['error']}"
+    if result.get("status") != "ok":
+        parts = [
+            "插单影响评估：这次不给天数（只读，未修改排程）。",
+            f"- 状态：{result.get('status')}",
+            f"- 原因：{result.get('why') or '取不到产能依据'}",
+        ]
+        if result.get("hint"):
+            parts.append(f"- 怎么补：{result['hint']}")
+        if result.get("candidates"):
+            parts.append(f"- 台账里的候选机种：{'、'.join(str(c) for c in result['candidates'])}")
+        return "\n".join(parts)
+
+    rush = result.get("rush_order") or {}
+    impact = result.get("impact") or {}
+    basis = result.get("basis") or {}
+    att = basis.get("attendance") or {}
+    binding = {"line_declared": "线台账声明的台/天", "ie_hours": "IE 工时×班组人数算出的台/天"}.get(
+        str(basis.get("capacity_binding")), str(basis.get("capacity_binding") or ""))
+    hours_basis = {"route_standard_hours": "路线标准工时（routing_template_steps）",
+                   "takt_from_line_capacity": "线节拍=班时÷日产量（line_profiles）",
+                   "takt_from_line_capacity@measured_hours": "线节拍=实测班时÷日产量"}.get(
+        str(basis.get("hours_basis")), str(basis.get("hours_basis") or ""))
+
+    lines = [
+        "PMC插单影响沙盘完成（只读）：",
+        (f"- 急单：{rush.get('product_id')} × {rush.get('quantity')} 台，"
+         f"占用 {rush.get('line_code')}，{rush.get('own_production_days')} 个班次日做完"
+         f"（自然日 {rush.get('calendar_days')} 天，完工 {rush.get('estimated_end')}）"),
+        (f"- 产能占用比例：{float(rush.get('capacity_share') or 1) * 100:g}%"
+         "（这个比例只拉长急单自己的完工时间，同线其他单被拿走的产出不随它变）"),
+    ]
+    if rush.get("due_date"):
+        feas = rush.get("due_feasible")
+        lines.append(f"- 急单交期 {rush.get('due_date')}：{'赶得上' if feas else '赶不上' if feas is False else '未知'}")
+    lines.append(
+        f"- 依据：单件 {basis.get('hours_per_unit')} 小时，出处={hours_basis}"
+        f"（路线 {basis.get('route_operations')} 道工序、合计 {basis.get('route_hours_sum')} 小时/台）")
+    lines.append(
+        (f"- 日产能 {basis.get('units_per_day')} 台/天 = min(线声明 {basis.get('declared_units_per_day')}, "
+         f"IE 工时 implied {basis.get('ie_hours_implied_units_per_day')}) 取{binding}，"
+         f"再扣到岗 {basis.get('present_ratio')}（{att.get('source') or '未取'}）"))
+    lines.append(
+        f"- 同线未完工单 {impact.get('affected_order_count')} 张被拿走 "
+        f"{impact.get('queue_displacement_days')} 个班次日的产出；"
+        f"别的线上的 {len(impact.get('orders_on_other_lines') or [])} 张不受这条线影响"
+        f"（本次台账未完工主工单共 {impact.get('open_master_order_count')} 张）")
+    lines.append(
+        f"- 其中因这次插单才赶不上的 {impact.get('newly_late_count')} 张；"
+        f"插单前就已经过交期/赶不上的 {impact.get('late_before_insert_count')} 张不算插单的责任")
+    for item in (impact.get("delayed_orders") or [])[:20]:
+        own = item.get("own_production_days")
+        lines.append(
+            f"- {item.get('work_order_code')}（{item.get('product_id')}，{item.get('planned_qty'):g} 台）："
+            f"原交期 {item.get('original_due')} → 新 {item.get('new_estimated_end')}，"
+            f"推后 {item.get('delay_days')} 个自然日 / {item.get('delay_production_days')} 个班次日；"
+            f"自己要干 {own if own is not None else '算不出'} 天 → {item.get('risk')}")
+    for a in (result.get("assumptions") or [])[:4]:
+        lines.append(f"- 口径：{a}")
+    lines.append(result.get("note", ""))
+    return "\n".join(line for line in lines if line)
+
+
 def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
     """Deterministic fallback reply for clear business intents."""
     label = TOOL_LABELS.get(tool_name, tool_name)
@@ -1134,19 +1200,7 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             lines.append(f"- 其余 {len(items) - 20} 种物料已保留在结构化结果中。")
         return "\n".join(lines)
     if tool_name == "query_pmc_rush_impact":
-        rush = result.get("rush_order") or {}
-        impact = result.get("impact") or {}
-        lines = [
-            "PMC插单影响沙盘完成（只读）：",
-            f"- 急单：{rush.get('product_id') or '未指定产品'} × {rush.get('quantity', 0)}，预计加工 {rush.get('process_hours', 0)} 小时，产能占用 {rush.get('capacity_share', 0.5) * 100:g}%",
-            f"- 受影响订单：{impact.get('affected_order_count', 0)} 张；按当前模型每张延迟约 {impact.get('impact_hours_per_order', 0)} 小时",
-        ]
-        for item in (impact.get("delayed_orders") or [])[:20]:
-            lines.append(
-                f"- {item.get('work_order_code')}: 原交期 {item.get('original_due')} → 新预计 {item.get('new_estimated_end')}，延迟 {item.get('delay_days')} 天"
-            )
-        lines.append(result.get("note", ""))
-        return "\n".join(line for line in lines if line)
+        return _format_rush_impact(result)
     return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
 
 
@@ -1294,7 +1348,9 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
         ])
         simulation = rush.get("simulation") or {}
         if simulation:
-            lines.append(f"- 本次急单沙盘：数量 {n(simulation.get('quantity'))}，预计加工 {n(simulation.get('estimated_process_hours'))} 小时，交期可行：{simulation.get('due_feasible')}")
+            lines.append("- 本次急单沙盘（工时/产能现查台账）：")
+            for one in _format_rush_impact(simulation).splitlines():
+                lines.append(f"  {one}")
 
     engineering = facts.get("engineering_change")
     if engineering is not None:
@@ -2517,11 +2573,12 @@ async def _handle_kernel_chat(
             reply=reply,
             model={
                 "query_pmc_control_tower": "pmc-control-tower",
+                "query_pmc_rush_impact": "pmc-rush-impact-engine",
                 "query_manufacturing_intelligence": "manufacturing-intelligence",
                 "query_order_work_order_status": "order-work-order-status",
                 "query_workflow_diagram": "workflow-diagram-engine",
                 "run_compliance_simulation": "sim-erp-compliance-engine",
-            }[tool_name],
+            }.get(tool_name, f"deterministic-{tool_name}"),
             degraded="error" in result,
             actions=[a for a in ([action] + extra_actions) if a is not None],
             tables=tables,
@@ -2862,10 +2919,14 @@ _TABLE_COLUMNS: Dict[str, List[Dict[str, str]]] = {
     "query_pmc_rush_impact": [
         {"key": "work_order_code", "label": "受影响工单"},
         {"key": "product_id", "label": "产品"},
+        {"key": "line_code", "label": "占用哪条线"},
+        {"key": "planned_qty", "label": "数量"},
         {"key": "original_due", "label": "原交期"},
         {"key": "new_estimated_end", "label": "新预计完工"},
-        {"key": "delay_hours", "label": "延迟小时"},
-        {"key": "delay_days", "label": "延迟天数"},
+        {"key": "delay_days", "label": "推后自然日"},
+        {"key": "delay_production_days", "label": "被拿走班次日"},
+        {"key": "own_production_days", "label": "自己要干几天"},
+        {"key": "risk", "label": "判定"},
     ],
     "query_defects": [
         {"key": "record_code", "label": "记录编号"},

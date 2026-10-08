@@ -173,6 +173,7 @@ class PmcControlTowerService:
         days: int = 180,
         rush_quantity: Optional[int] = None,
         rush_due_date: Optional[str] = None,
+        rush_product_id: Optional[str] = None,
         limit: int = 20,
     ) -> Dict[str, Any]:
         await self._load_tables()
@@ -192,7 +193,7 @@ class PmcControlTowerService:
                 "shortage": "优先使用工单物料齐套记录的 shortage_qty；在途和PO只有供应表存在时才计入预计齐套。",
                 "otd": "已完工且 actual_complete 不晚于 planned_due 的订单 / 已完工订单；无销售订单时明确标记为工单口径。",
                 "capacity": "优先使用APS任务负荷；没有APS任务时使用工艺路线UHN与工位CPH估算，并标记partial。",
-                "rush": "插单先做只读影响评估，再走审批，审批执行后生成新的APS版本；本查询不修改排程。",
+                "rush": "插单先做只读影响评估（工时取路线标准工时或线节拍、产能取线台账并扣台账到岗），再走审批，审批执行后生成新的APS版本；本查询不修改排程。",
                 "engineering_change": "ECN记录、受影响工单标记和BOM版本分别核对；没有变更历史不推断已完成传播。",
                 "supplier_delay": "以PO expected_date与actual_date/status判断逾期；没有PO表或记录时明确为missing/zero。",
             },
@@ -206,6 +207,7 @@ class PmcControlTowerService:
                 days=days,
                 rush_quantity=rush_quantity,
                 rush_due_date=rush_due_date,
+                rush_product_id=rush_product_id,
                 limit=limit,
             )
         result["data_quality"] = self._quality(result["facts"])
@@ -794,7 +796,7 @@ class PmcControlTowerService:
             ],
         }
 
-    async def _rush(self, factory_id: str, *, rush_quantity: Optional[int] = None, rush_due_date: Optional[str] = None, **_: Any) -> Dict[str, Any]:
+    async def _rush(self, factory_id: str, *, rush_quantity: Optional[int] = None, rush_due_date: Optional[str] = None, rush_product_id: Optional[str] = None, **_: Any) -> Dict[str, Any]:
         approval_count = await self._count("rush_order_approvals", "WHERE factory_id = :fid", {"fid": factory_id})
         approval_rows = await self._rows("""
             SELECT approval_code, product_id, quantity, due_date, status, affected_orders,
@@ -803,13 +805,15 @@ class PmcControlTowerService:
         """, {"fid": factory_id}) if self._has("rush_order_approvals") else []
         simulation: Dict[str, Any] = {}
         if rush_quantity and rush_quantity > 0:
-            process_hours = rush_quantity * 0.5 / 0.85
+            # 这里原来写的是 `rush_quantity × 0.5 ÷ 0.85` —— 0.5 小时/件与 0.85 效率都没有出处。
+            # 现在与聊天工具、沙箱走同一个 rush_impact()：工时来自路线标准工时或线节拍，
+            # 产能来自线台账并扣掉台账实测到岗率；缺依据就返回 status，由这里如实呈现。
+            from api.services.virtual_run import rush_impact
+
             due = _date(rush_due_date)
-            simulation = {
-                "quantity": int(rush_quantity), "estimated_process_hours": round(process_hours, 1),
-                "due_date": _iso(due), "due_feasible": (datetime.utcnow() + timedelta(hours=process_hours)).date() <= due if due else None,
-                "note": "这是保守沙盘，不会修改APS；正式插单仍需调用影响评估并审批。",
-            }
+            simulation = await rush_impact(
+                self.db, factory_id, product_id=rush_product_id,
+                quantity=int(rush_quantity), capacity_share=1.0, due_date=due)
         return {
             "data_status": "ready" if self._has("rush_order_approvals") else "missing",
             "source": "rush_order_approvals + rush_order_approval_logs + APS重排接口",

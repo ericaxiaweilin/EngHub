@@ -285,16 +285,16 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_pmc_rush_impact",
-            "description": "PMC插单影响沙盘：根据现有待排主工单和插单数量，返回VIP/急单预计加工时间、受影响订单、原交期、新预计完工时间和延迟小时。只读不落库。",
+            "description": "PMC插单影响沙盘：按机种现查路线标准工时（查不到就用该线节拍=班时/日产量）、现查能接这条线的产线与线台账声明产能，扣掉考勤台账实测到岗率后给出：急单自己几个班次日做完、同线哪些工单被拿走多少产出。缺机种/没有线声明能做它/没有工时依据时明确拒绝并说明缺哪一环，不填默认工时。只读不落库。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "product_id": {"type": "string", "description": "急单产品编码"},
+                    "product_id": {"type": "string", "description": "急单机种编码或名称（如 A-50-04-F、跑步机3号）；机种名会在产品台账里找回编码，多义会列候选"},
                     "quantity": {"type": "integer", "description": "急单数量"},
                     "due_date": {"type": "string", "description": "急单交期，ISO日期，可选"},
-                    "capacity_share": {"type": "number", "description": "急单占用产能比例，默认0.5", "default": 0.5},
+                    "capacity_share": {"type": "number", "description": "急单占用该线日产能的比例，默认1.0=整线做这单。只拉长急单自己的完工时间，不改变同线其他单被拿走的产出量", "default": 1.0},
                 },
-                "required": ["quantity"],
+                "required": ["quantity", "product_id"],
             },
         },
     },
@@ -944,6 +944,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "work_order_code": {"type": "string", "description": "主工单号，可选"},
                     "days": {"type": "integer", "description": "呆滞判定天数，默认180天", "default": 180},
                     "rush_quantity": {"type": "integer", "description": "若询问具体急单，可提供插单数量，触发只读沙盘"},
+                    "rush_product_id": {"type": "string", "description": "急单机种编码或名称（跑步机3号/A-50-04-F）；沙盘的单件工时与能接的线都按机种现查，没给机种就不出天数"},
                     "rush_due_date": {"type": "string", "description": "急单交期，YYYY-MM-DD，可选"},
                     "limit": {"type": "integer", "description": "明细条数上限，默认20", "default": 20},
                 },
@@ -3972,74 +3973,30 @@ async def _tool_query_pmc_rush_impact(
     args: Dict[str, Any],
     factory_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Read-only rush-order impact calculation for the PMC chatbot."""
+    """Read-only rush-order impact for the PMC chatbot — 工时/产能一律现查台账。
+
+    这里原来是 `数量 × 0.5 ÷ 0.85`：单件 0.5 小时和效率 0.85 都没出处，而路线标准工时、
+    线台账台/天、实测班时与到岗率都在库里。取数口径统一走 virtual_run.rush_impact()，
+    与沙箱交期、PMC 控制塔同一个答案；缺哪一环就明说缺哪一环，不补默认值。
+    """
+    from api.services.virtual_run import rush_impact
+
     fid = factory_id or "FAC_ELEC_DEMO_2026"
     quantity = int(args.get("quantity") or 0)
     if quantity <= 0:
         return {"error": "缺少急单数量，无法计算插单影响"}
     try:
-        capacity_share = float(args.get("capacity_share", 0.5))
+        share = float(args.get("capacity_share", 1.0))
     except (TypeError, ValueError):
-        capacity_share = 0.5
-    capacity_share = max(0.01, min(1.0, capacity_share))
-
-    efficiency = 0.85
-    hours_per_unit = 0.5 / efficiency
-    rush_hours = quantity * hours_per_unit
-    # This uses the same conservative one-bottleneck approximation as the APS rush endpoint.
-    impact_hours = rush_hours
-
-    stmt = select(WorkOrder).where(
-        WorkOrder.factory_id == fid,
-        WorkOrder.status.in_(["released", "pending"]),
-        WorkOrder.wo_type == "master",
-    ).order_by(WorkOrder.planned_due.asc())
-    existing_result = await db.execute(stmt)
-    existing_orders = list(existing_result.scalars().all())
-
-    delayed_orders: List[Dict[str, Any]] = []
-    for work_order in existing_orders:
-        if not work_order.planned_due:
-            continue
-        original_due = work_order.planned_due
-        new_end = original_due + timedelta(hours=impact_hours)
-        delayed_orders.append({
-            "work_order_code": work_order.work_order_code,
-            "product_id": work_order.product_id,
-            "planned_qty": work_order.planned_qty,
-            "original_due": original_due.isoformat(),
-            "new_estimated_end": new_end.isoformat(),
-            "delay_hours": round(impact_hours, 1),
-            "delay_days": round(impact_hours / 24, 1),
-            "priority": work_order.priority,
-        })
-
-    rush_end = datetime.utcnow() + timedelta(hours=rush_hours)
-    due_date = None
+        share = 1.0
+    due = None
     if args.get("due_date"):
         try:
-            due_date = date.fromisoformat(str(args["due_date"])[:10])
+            due = date.fromisoformat(str(args["due_date"])[:10])
         except ValueError:
-            due_date = None
-    return {
-        "type": "pmc_rush_impact",
-        "factory_id": fid,
-        "rush_order": {
-            "product_id": args.get("product_id"),
-            "quantity": quantity,
-            "capacity_share": capacity_share,
-            "process_hours": round(rush_hours, 1),
-            "estimated_end": rush_end.isoformat(),
-            "due_date": due_date.isoformat() if due_date else None,
-            "due_feasible": rush_end.date() <= due_date if due_date else None,
-        },
-        "impact": {
-            "affected_order_count": len(delayed_orders),
-            "impact_hours_per_order": round(impact_hours, 1),
-            "delayed_orders": delayed_orders,
-        },
-        "note": "插单影响为只读沙盘估算，未修改APS排程；正式承诺前仍需执行APS重排并确认物料齐套。",
-    }
+            due = None
+    return await rush_impact(db, fid, product_id=args.get("product_id"), quantity=quantity,
+                             capacity_share=share, due_date=due)
 
 
 async def _tool_query_spc_anomalies(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -4380,6 +4337,7 @@ async def _tool_query_pmc_control_tower(
         days=int(args.get("days") or 180),
         rush_quantity=int(args["rush_quantity"]) if args.get("rush_quantity") is not None else None,
         rush_due_date=args.get("rush_due_date"),
+        rush_product_id=args.get("rush_product_id"),
         limit=int(args.get("limit") or 20),
     )
 
@@ -4724,7 +4682,10 @@ INTENT_RULES: List[Dict[str, Any]] = [
     {
         # PMC 专项规则必须早于普通“库存”，否则“库存齐套率/在途库存”会被截成普通库存查询。
         "tool": "query_pmc_rush_impact",
-        "keywords": ["插单影响", "原有订单会晚多久", "VIP急单", "占50%产能", "占用50%产能"],
+        # 带机种/数量的插单问法必须走引擎（工时、日产能、到岗都在台账里），不能让模型背一个
+        # "通常 0.5 小时/台"。抽不到数量或机种时本工具返回 None，交回模型追问 —— 见下方守卫。
+        "keywords": ["插单影响", "原有订单会晚多久", "VIP急单", "占50%产能", "占用50%产能",
+                     "插单", "急单", "插进去", "会不会延", "会延几"],
     },
     {
         # PMC 专项规则必须早于普通“库存”，否则“库存齐套率/在途库存”会被截成普通库存查询。
@@ -5179,6 +5140,27 @@ def _extract_wo_code(message: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+_MODEL_CODE_RE = re.compile(r"\b([A-Z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+){1,})\b")
+_MODEL_NAME_RE = re.compile(r"(跑步机|动感单车|单车|健身车|哑铃|自行车|bike|treadmill)", re.IGNORECASE)
+
+
+def _extract_model_keyword(message: str) -> Optional[str]:
+    """抽机种：先认编码形态（A-50-04-F / HTM1481-00 / FG-TREAD-001），再认中文机种类名。
+
+    只给 keyword，不猜编码 —— 能不能对上由产品台账解析（rush_impact 里 resolve_product），
+    对不上或有多义就明说，比在这里替厂里选一个机种诚实。
+    """
+    if not message:
+        return None
+    for m in _MODEL_CODE_RE.finditer(message):
+        token = m.group(1)
+        if token.upper().startswith(("WO", "MO", "PO")):   # 工单/领料/采购单号不是机种
+            continue
+        return token
+    name = _MODEL_NAME_RE.search(message)
+    return name.group(1) if name else None
+
+
 def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
     """确定性意图解析：命中业务关键词返回 {"tool", "args"}，否则 None。
 
@@ -5313,6 +5295,9 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         quantity_match = re.search(r"(?:插单|急单).{0,12}?(\d+)\s*(?:台|件|pcs|个|数量)?", message, flags=re.IGNORECASE)
         if quantity_match:
             args["rush_quantity"] = int(quantity_match.group(1))
+        keyword = _extract_model_keyword(message)
+        if keyword:
+            args["rush_product_id"] = keyword
         due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message)
         if due_match:
             args["rush_due_date"] = due_match.group(1)
@@ -5321,13 +5306,14 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if quantity_match:
             args["quantity"] = int(quantity_match.group(1))
         product_match = re.search(r"(?:产品|product(?:_id)?)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{2,})", message, flags=re.IGNORECASE)
-        if product_match:
-            args["product_id"] = product_match.group(1)
+        keyword = product_match.group(1) if product_match else _extract_model_keyword(message)
+        if keyword:
+            args["product_id"] = keyword
         due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message)
         if due_match:
             args["due_date"] = due_match.group(1)
         share_match = re.search(r"(?:占|占用)\s*(\d+(?:\.\d+)?)\s*%\s*(?:产能)?", message)
-        args["capacity_share"] = float(share_match.group(1)) / 100 if share_match else 0.5
+        args["capacity_share"] = float(share_match.group(1)) / 100 if share_match else 1.0
     elif tool == "query_pmc_work_matrix":
         wo_code = _extract_wo_code(message)
         if not wo_code:
@@ -5409,6 +5395,11 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
                 if stage_kw in message:
                     args["keyword"] = stage_kw
                     break
+    if tool == "query_pmc_rush_impact":
+        # 与高温那条同一规矩：数量或机种抽不到就**不**确定性执行 —— 让模型去问是哪个机种，
+        # 也别拿"全厂平均"或 0.5 小时/件替厂里编一个交期出来。
+        if not args.get("quantity") or not args.get("product_id"):
+            return None
     return {"tool": tool, "args": args}
 
 
@@ -5418,6 +5409,8 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
 DETERMINISTIC_INTENT_TOOLS = frozenset({
     # 高温/湿度能不能干、要休多久：必须引擎算，不能让模型背标准条款
     "run_compliance_simulation",
+    # 插单延几天同理：这些数字必须出自线台账+路线工时，不是模型背一个"通常0.5小时/件"
+    "query_pmc_rush_impact",
     "query_pmc_control_tower",
     "query_order_work_order_status",
     "query_manufacturing_intelligence",

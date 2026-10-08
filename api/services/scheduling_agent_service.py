@@ -20,7 +20,7 @@
 - SchedulingAgent: 智能体壳（事件感知+自动触发+闭环验证+进度上报）
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Dict, Any, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -670,6 +670,41 @@ class SchedulingAgent:
     # 内部方法
     # ═══════════════════════════════════════════════════════════
 
+    async def _resolve_append_station(self, factory_id: str, wo_map: Dict[str, Any]) -> tuple:
+        """工单挂哪个工位：返回 stations.station_code（aps_schedule_tasks 用的是编码）。
+
+        两处都得改：
+        1. 原来工单没派工位就兜一个台账里根本不存在的工位编码，写进去的是一条挂在没登记
+           工位上的任务，后面所有负荷统计都跟着假；
+        2. `work_orders.assigned_station_id` 实测存的是 `stations.id`（63/69 行是 UUID，0 行是编码），
+           而 `aps_schedule_tasks.station_id` 存的是编码 —— 直接抄过去，「找该工位最晚结束时间」
+           永远查不到行，追加的单于是每次都从"现在"开始排。这里按 id 或编码两种形状查台账，
+           统一换成编码；查不到或属于别的厂区就拒绝，不无声借用。
+        """
+        from core.mes.route_resolution import route_ops_for_product
+
+        sql = text("""
+            SELECT station_code, factory_id FROM stations
+            WHERE id::text = :s OR station_code = :s
+            LIMIT 2
+        """)
+        sid = str(wo_map.get("assigned_station_id") or "").strip()
+        source = "work_order_assigned"
+        if not sid:
+            ops = await route_ops_for_product(self.db, factory_id, str(wo_map.get("product_id") or ""))
+            sid = next((str(o["work_center"]) for o in ops if o.get("work_center")), "")
+            source = "route_first_operation"
+        if not sid:
+            return None, "no_station", "工单没派工位，工艺路线里也没有带工作中心的工序"
+        rows = (await self.db.execute(sql, {"s": sid})).mappings().all()
+        if not rows:
+            return None, "station_not_in_ledger", f"工位 {sid} 在 stations 台账里查不到（既不是 id 也不是编码）"
+        mine = [r for r in rows if str(r["factory_id"]) == str(factory_id)]
+        if not mine:
+            got = "、".join(sorted({str(r["factory_id"]) for r in rows}))
+            return None, "station_other_factory", f"工位 {sid} 登记在厂区 {got}，不属于 {factory_id} → 不跨厂借用"
+        return str(mine[0]["station_code"]), source, ""
+
     async def _append_to_schedule(self, factory_id: str, wo_id: str) -> Dict[str, Any]:
         """追加到当前排程末尾"""
         # 获取最新排程
@@ -683,16 +718,25 @@ class SchedulingAgent:
 
         schedule_id = row[0]
 
-        # 获取工单信息
+        # 获取工单信息（机种、数量、工位都要真的）
         wo_result = await self.db.execute(text(
-            "SELECT work_order_code, planned_qty, assigned_station_id FROM work_orders WHERE id = :id"
+            "SELECT work_order_code, product_id, planned_qty, assigned_station_id FROM work_orders WHERE id = :id"
         ), {"id": wo_id})
         wo = wo_result.first()
         if not wo:
             return {"success": False, "error": "工单不存在"}
 
         wo_map = dict(wo._mapping)
-        station_id = wo_map.get("assigned_station_id") or "ST-01"
+        qty = float(wo_map.get("planned_qty") or 0)
+        if qty <= 0:
+            return {"success": False,
+                    "error": f"工单 {wo_map['work_order_code']} 没有数量 → 不写入排程（原来这里当成 100 台）"}
+
+        station_id, station_basis, station_why = await self._resolve_append_station(factory_id, wo_map)
+        if not station_id:
+            return {"success": False, "station_status": station_basis,
+                    "error": (f"工单 {wo_map['work_order_code']} 找不到可登记的工位（{station_why}）→ "
+                              "不写排程任务（原来这里会兜一个台账里没有的工位编码）")}
 
         # 找该工位最晚结束时间
         last_end = await self.db.execute(text("""
@@ -702,8 +746,18 @@ class SchedulingAgent:
         end_row = last_end.first()
         start_time = end_row[0] if end_row and end_row[0] else datetime.utcnow()
 
-        process_hours = (wo_map["planned_qty"] or 100) * 0.5 / 0.85
-        end_time = start_time + timedelta(hours=process_hours)
+        # 占用多久：与沙箱/插单同一口径（路线标准工时或线节拍 → 线台账日产能 → 实测到岗）
+        from api.services.virtual_run import order_capacity, production_finish_day
+
+        cap = await order_capacity(self.db, factory_id, str(wo_map.get("product_id") or ""))
+        if cap.get("status") != "ok":
+            return {"success": False, "capacity_status": cap.get("status"),
+                    "error": (f"工单 {wo_map['work_order_code']}（{wo_map.get('product_id')}）"
+                              f"没有产能依据：{cap.get('why')} → 不写入编造的完工时间"
+                              "（原来是 数量×0.5÷0.85，两个数都没出处）")}
+        days = qty / float(cap["units_per_day"])
+        finish = production_finish_day(start_time.date(), days, set(cap["shift_days"]))
+        end_time = datetime.combine(finish["end"], time.min) + timedelta(hours=float(cap["hours_per_day"]))
 
         import uuid
         task_id = str(uuid.uuid4())
@@ -721,8 +775,20 @@ class SchedulingAgent:
             "success": True,
             "work_order": wo_map["work_order_code"],
             "station": station_id,
+            "station_basis": station_basis,
             "planned_start": start_time.isoformat(),
             "planned_end": end_time.isoformat(),
+            "basis": {
+                "quantity": qty,
+                "production_days": round(days, 2),
+                "line_code": cap["line_code"],
+                "units_per_day": cap["units_per_day"],
+                "hours_per_unit": cap["hours_per_unit"],
+                "hours_basis": cap["hours_basis"],
+                "hours_per_day": cap["hours_per_day"],
+                "present_ratio": cap["present_ratio"],
+                "capacity_binding": cap["capacity_binding"],
+            },
         }
 
     async def _start_task(self, factory_id: str, task_type: str, desc: str) -> Optional[str]:

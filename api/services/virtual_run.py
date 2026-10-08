@@ -1452,6 +1452,362 @@ async def measured_attendance(db: AsyncSession, factory_id: str) -> Dict[str, An
             "reading": (f"到岗 {round((1.0 - rate) * 100, 2)}%（台账实测缺勤 {round(rate * 100, 2)}%）")}
 
 
+# ── 插单/追加单影响的唯一取数口径 ────────────────────────────────────────────
+# 「数量 × 0.5 ÷ 0.85」这个式子在三个地方各写了一遍（聊天工具、PMC 控制塔、排程 agent 追加排程）：
+# 单件 0.5 小时和效率 0.85 都没有出处，而库里既有路线标准工时、线台账声明的台/天，也有实测班时
+# 与到岗率。三个调用点现在都走 `order_capacity()` / `rush_impact()`：哪一环取不到依据就返回 status，
+# 由调用方明确拒绝，不许再自己补一个默认小时数。
+
+OPEN_MASTER_ORDERS_SQL = text("""
+    SELECT w.work_order_code, w.product_id, w.planned_qty, w.planned_due, w.priority, w.status
+    FROM work_orders w
+    WHERE w.factory_id = :fid AND w.wo_type = 'master'
+      AND w.status IN ('pending', 'released', 'in_progress')
+    ORDER BY w.planned_due NULLS LAST, w.created_at
+""")
+
+PRODUCT_LOOKUP_SQL = text("""
+    SELECT DISTINCT product_code FROM products
+    WHERE factory_id = :fid
+      AND (lower(product_code) = lower(:kw) OR product_code ILIKE :like OR product_name ILIKE :like)
+    ORDER BY product_code
+    LIMIT 8
+""")
+
+
+def _n_pro_days(production_days: float) -> int:
+    """占用的班次日向上取整 —— 半天也算占了一天线。"""
+    import math
+
+    return max(0, int(math.ceil(float(production_days) - 1e-9)))
+
+
+def production_finish_day(start: date, production_days: float, shift_days: set) -> Dict[str, Any]:
+    """从 start 起占 N 个班次日（开工日算第 1 天）：落在哪天、跨了几个自然日。"""
+    n = _n_pro_days(production_days)
+    if n <= 0:
+        return {"end": start, "calendar_days": 0, "production_days": 0}
+    day, guard = start, 0
+    while day.isoweekday() not in shift_days and guard < 400:
+        day += timedelta(days=1)
+        guard += 1
+    used = 1
+    while used < n and guard < 4000:
+        day += timedelta(days=1)
+        guard += 1
+        if day.isoweekday() in shift_days:
+            used += 1
+    return {"end": day, "calendar_days": (day - start).days, "production_days": n}
+
+
+def shift_forward(day: date, production_days: float, shift_days: set) -> date:
+    """把一个交期往后推 N 个班次日（停工日不占产能，所以不能按自然日加）。"""
+    n = _n_pro_days(production_days)
+    out, moved, guard = day, 0, 0
+    while moved < n and guard < 4000:
+        out += timedelta(days=1)
+        guard += 1
+        if out.isoweekday() in shift_days:
+            moved += 1
+    return out
+
+
+def production_days_between(start: date, end: date, shift_days: set) -> int:
+    """start 到 end（含头不含尾）之间有几个班次日 —— 拿它比对『还剩的时间够不够干』。"""
+    if end <= start:
+        return 0
+    n, day = 0, start
+    while day < end:
+        if day.isoweekday() in shift_days:
+            n += 1
+        day += timedelta(days=1)
+    return n
+
+
+def _clamp_share(capacity_share: Any) -> float:
+    """占用比例夹在 5%~100%：0 或没给按整线算，0.0001 那种输入等于说这条线不干别的了。"""
+    if capacity_share is None:
+        return 1.0
+    try:
+        value = float(capacity_share)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.05, min(1.0, value)) if value > 0 else 1.0
+
+
+def rush_durations(quantity: float, units_per_day: float,
+                   capacity_share: float = 1.0) -> Dict[str, float]:
+    """急单自己占几个班次日 vs 从同线队列里拿走几个班次日。
+
+    占用比例只拉长前者（慢慢插也是从这条线拿走同样多的台数），所以延迟不乘 share ——
+    这条恒等式单独拆出来，是为了能被测住：以前 share 解析完根本没用过。
+    """
+    per_day = float(units_per_day or 0)
+    if per_day <= 0 or float(quantity or 0) <= 0:
+        return {"own_production_days": 0.0, "queue_displacement_days": 0.0}
+    share = _clamp_share(capacity_share)
+    queue_days = float(quantity) / per_day
+    return {"own_production_days": round(queue_days / share, 4),
+            "queue_displacement_days": round(queue_days, 4)}
+
+
+async def resolve_product(db: AsyncSession, factory_id: str, keyword: str) -> Dict[str, Any]:
+    """机种给得不准（小写、只说"跑步机3号"）先在产品台账里找回来；多个候选就列出来，不猜一个。"""
+    kw = str(keyword or "").strip()
+    if not kw:
+        return {"status": "no_keyword"}
+    like = f"%{kw}%"
+    rows = [str(r[0]) for r in (await db.execute(
+        PRODUCT_LOOKUP_SQL, {"fid": factory_id, "kw": kw, "like": like})).all()]
+    exact = [r for r in rows if r.lower() == kw.lower()]
+    if exact:
+        return {"status": "ok", "product_id": exact[0], "how": "exact_code"}
+    if len(rows) == 1:
+        return {"status": "ok", "product_id": rows[0], "how": "ledger_name_match"}
+    if rows:
+        return {"status": "ambiguous", "candidates": rows,
+                "why": f"台账里 {kw} 对上 {len(rows)} 个机种（{('、'.join(rows))}）→ 要点名一个"}
+    return {"status": "not_found",
+            "why": f"产品台账里没有 {kw}（厂区 {factory_id}）→ 没有机种就没有工时依据"}
+
+
+async def order_capacity(db: AsyncSession, factory_id: str, model: str, *,
+                         lines: Optional[List[Dict[str, Any]]] = None,
+                         shift_days: Optional[set] = None,
+                         cached: Optional[Dict[str, Any]] = None,
+                         with_attendance: bool = True) -> Dict[str, Any]:
+    """一个机种在这家厂的产能依据：哪条线接、单件占多少工时、一天出几台、扣掉实测到岗。
+
+    口径与 `run_target` 一致（同一套 pick_line / group_capacity / hours_per_unit_from /
+    capacity_limits），这样"插单影响"和"沙箱交期"不会给出两个答案。任何一环取不到就带
+    status+why 返回，调用方必须拒绝给天数，而不是退回 0.5 小时/件。
+    """
+    cache = cached if cached is not None else {}
+    if lines is None:
+        if "_lines" not in cache:
+            cache["_lines"] = [dict(r) for r in
+                               (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
+        lines = cache["_lines"]
+    if shift_days is None:
+        if "_shift_days" not in cache:
+            cache["_shift_days"] = {int(r["weekday"]) + 1 for r in
+                                    (await db.execute(CALENDAR_SQL, {"fid": factory_id})).mappings().all()}
+        shift_days = cache["_shift_days"] or {1, 2, 3, 4, 5, 6}
+
+    line, line_basis = pick_line(model, lines)
+    if line is None:
+        return {"product_id": model, "status": "no_line", "line_code": None,
+                "why": (f"{len(lines)} 条在册产线里没有任何一条声明能做 {model}"
+                        + ("" if lines else "（这个厂区一条线档案都没有）")
+                        + " → 不给日产能，也不给插单天数")}
+
+    group = str(line.get("line_group") or "")
+    members = [l for l in lines if group and str(l.get("line_group") or "") == group] or [line]
+    parallel = max(1, len([l for l in members if model in declared_models(l)]))
+    cap = group_capacity(lines, line, parallel)
+    census = await load_station_capacity(db, factory_id, cache)
+    measured_hours = (census.get("shift_hours") or {}).get("hours")
+
+    route_key = f"_route:{model}"
+    if route_key not in cache:
+        cache[route_key] = [dict(o) for o in await route_ops_for_product(db, factory_id, model)]
+    route = cache[route_key]
+    hours_per_unit, hours_basis = hours_per_unit_from(route, line, measured_hours)
+    if hours_basis == "no_time_basis":
+        return {"product_id": model, "status": "no_time_basis",
+                "line_code": str(line["line_code"]), "line_basis": line_basis,
+                "why": (f"路线没有标准工时（工单上挂的模板解析出 {len(route)} 道工序、"
+                        f"合计 0 小时），线台账也没给 units_per_day → 单件占多久无从得知"
+                        "（不拿 0.5 小时/件代替）"),
+                "route_ops": len(route)}
+
+    hours_per_day = float(line.get("hours_per_day") or 0) or float(measured_hours or 0)
+    limits = capacity_limits(crew=float(cap["crew"]), hours_per_day=hours_per_day,
+                             hours_per_unit=hours_per_unit, line_declared=float(cap["units_per_day"]))
+    att = None
+    if with_attendance:
+        if "_att" not in cache:
+            cache["_att"] = await measured_attendance(db, factory_id)
+        att = cache["_att"]
+    present = float(att["present_ratio"]) if att else 1.0
+    per_day = round(float(limits["units_per_day"]) * min(1.0, max(0.0, present)), 2)
+    if per_day <= 0:
+        return {"product_id": model, "status": "no_capacity_basis",
+                "line_code": str(line["line_code"]), "hours_per_unit": hours_per_unit,
+                "hours_basis": hours_basis,
+                "why": (f"线 {line['line_code']} 声明 {cap['units_per_day']:g} 台/天、"
+                        f"按 IE 工时可完成 {limits['hours_implied']:g} 台/天、到岗 {present:g} → "
+                        "合起来给不出大于 0 的日产能")}
+    return {
+        "product_id": model, "status": "ok",
+        "line_code": str(line["line_code"]), "line_basis": line_basis,
+        "line_group": group or None, "parallel_lines": parallel,
+        "crew": float(cap["crew"]), "capacity_basis": cap["capacity_basis"],
+        "hours_per_day": round(hours_per_day, 2),
+        "hours_per_day_source": ("line_profiles" if float(line.get("hours_per_day") or 0) > 0
+                                 else "attendance_measured_median"),
+        "hours_per_unit": round(hours_per_unit, 4), "hours_basis": hours_basis,
+        "route_operations": len(route),
+        "route_hours_sum": round(sum(float(o.get("standard_hours") or 0) for o in route), 4),
+        "declared_units_per_day": float(limits["line_declared"]),
+        "ie_hours_implied_units_per_day": float(limits["hours_implied"]),
+        "capacity_binding": limits["binding"],
+        "units_per_day": per_day,
+        "present_ratio": present,
+        "attendance": ({"present_ratio": present, "source": att.get("source"),
+                        "basis": att.get("basis") or att.get("reading")} if att else None),
+        "other_capable_lines": [str(l["line_code"]) for l, _ in capable_lines(model, lines)[1:]],
+        "shift_days": sorted(shift_days),
+    }
+
+
+async def rush_impact(db: AsyncSession, factory_id: str, *, product_id: Optional[str],
+                      quantity: float, capacity_share: float = 1.0,
+                      due_date: Optional[date] = None,
+                      today: Optional[date] = None) -> Dict[str, Any]:
+    """插这单会顶掉谁的产能：急单占用的线，与同线未完工工单被推后的天数。
+
+    两条读数分开算，都来自台账：
+    * **急单自己多久做完** = 数量 ÷（该线日产能 × 占用比例）——占用比例只影响这一段；
+    * **同线其他单被推后多久** = 数量 ÷ 该线日产能 —— 插单从这条线的产出里拿走了这么多台，
+      与占用比例无关（慢慢插也是拿走这么多），所以延迟不乘 share。
+    不在同一线上的单不受这条线影响，以前是"所有单一起延同一个小时数"。
+    """
+    today = today or date.today()
+    qty = float(quantity or 0)
+    if qty <= 0:
+        return {"type": "pmc_rush_impact", "factory_id": factory_id, "status": "no_quantity",
+                "why": "没给急单数量 → 没有可算的占用量"}
+    fid = str(factory_id or "FAC_ELEC_DEMO_2026")
+    share = _clamp_share(capacity_share)
+
+    model = str(product_id or "").strip()
+    if not model:
+        return {"type": "pmc_rush_impact", "factory_id": fid, "status": "no_product", "quantity": int(qty),
+                "why": "没点名机种 → 单件工时、能接的线、被顶掉的同线工单都不知道是哪些，"
+                       "插单影响算不出（不拿全厂平均产能摊一个数）",
+                "hint": "给 product_id 或机种名，例如『插单 500 台 A-50-04-F』"}
+    resolved = await resolve_product(db, fid, model)
+    if resolved.get("status") != "ok":
+        return {"type": "pmc_rush_impact", "factory_id": fid, "status": f"product_{resolved.get('status')}",
+                "quantity": int(qty), "product_id": model,
+                "candidates": resolved.get("candidates") or [],
+                "why": resolved.get("why") or "机种在产品台账里对不上"}
+    model = resolved["product_id"]
+
+    cache: Dict[str, Any] = {}
+    cap = await order_capacity(db, fid, model, cached=cache)
+    if cap.get("status") != "ok":
+        return {"type": "pmc_rush_impact", "factory_id": fid, "status": cap["status"], "quantity": int(qty),
+                "product_id": model, "capacity": cap, "why": cap.get("why"),
+                "basis": {"hours_per_unit": cap.get("hours_per_unit"),
+                          "hours_basis": cap.get("hours_basis")}}
+
+    shift_days = set(cap["shift_days"])
+    durations = rush_durations(qty, float(cap["units_per_day"]), share)
+    own_days = durations["own_production_days"]
+    queue_days = durations["queue_displacement_days"]
+    finish = production_finish_day(today, own_days, shift_days)
+
+    rows = (await db.execute(OPEN_MASTER_ORDERS_SQL, {"fid": fid})).mappings().all()
+    delayed, on_other_line, no_due = [], [], []
+    for r in rows:
+        code = str(r["product_id"] or "")
+        oline, _ = pick_line(code, cache["_lines"])
+        entry = {"work_order_code": str(r["work_order_code"]), "product_id": code,
+                 "planned_qty": float(r["planned_qty"] or 0), "priority": r["priority"],
+                 "status": r["status"], "line_code": (str(oline["line_code"]) if oline else None)}
+        if oline is None or str(oline["line_code"]) != cap["line_code"]:
+            entry["why"] = ("这台机排在别的线（或没有线接）→ 不占这条线的产出"
+                            if oline else "没有线声明能做它 → 不知道它占哪条线，不计入影响")
+            (on_other_line if oline else no_due).append(entry)
+            continue
+        if r["planned_due"] is None:
+            entry["why"] = "同线但没挂交期 → 推后多少无法比对"
+            no_due.append(entry)
+            continue
+        original = r["planned_due"].date() if isinstance(r["planned_due"], datetime) else r["planned_due"]
+        new_due = shift_forward(original, queue_days, shift_days)
+        own = await order_capacity(db, fid, code, lines=cache["_lines"],
+                                   shift_days=shift_days, cached=cache)
+        need_days = (float(entry["planned_qty"]) / float(own["units_per_day"])
+                     if own.get("status") == "ok" and own.get("units_per_day") else None)
+        available = production_days_between(today, original, shift_days)
+        entry.update({
+            "original_due": str(original), "new_estimated_end": str(new_due),
+            "delay_days": (new_due - original).days,
+            "delay_production_days": round(queue_days, 2),
+            "own_production_days": (round(need_days, 2) if need_days is not None else None),
+            "production_days_left_before_insert": available,
+            "late_before_insert": (need_days is not None and need_days > available),
+            "late_after_insert": (need_days is not None and need_days + queue_days > available),
+            "risk": ("依据不足" if need_days is None else
+                     ("本来就赶不上" if need_days > available else
+                      ("插单后赶不上" if need_days + queue_days > available else "仍有富余"))),
+            "order_basis": ({"line_code": own.get("line_code"), "units_per_day": own.get("units_per_day"),
+                             "hours_per_unit": own.get("hours_per_unit"),
+                             "hours_basis": own.get("hours_basis")} if need_days is not None else None),
+            "slack_note": ("这张单自己有 IE 工时/线产能依据：按『自己要干几天 vs 距原交期几个班次日』比对"
+                           if need_days is not None else
+                           f"这张单自己没有可算的工时依据（{own.get('status')}）→ 只报被推后的天数"),
+        })
+        delayed.append(entry)
+
+    delayed.sort(key=lambda x: (-float(x["delay_days"] or 0), str(x["original_due"])))
+    rush_end_ok = (finish["end"] <= due_date) if due_date else None
+    return {
+        "type": "pmc_rush_impact", "factory_id": fid, "status": "ok",
+        "rush_order": {
+            "product_id": model, "product_resolution": resolved.get("how"),
+            "quantity": int(qty), "capacity_share": share,
+            "process_hours": round(qty * float(cap["hours_per_unit"]), 1),
+            "process_hours_meaning": "这是单件 IE 工时 × 数量的**人工工时合计**，不是这条线要占几个班次日（后者见 own_production_days）",
+            "line_code": cap["line_code"], "units_per_day": cap["units_per_day"],
+            "own_production_days": round(own_days, 2), "production_days_used": finish["production_days"],
+            "estimated_end": str(finish["end"]), "calendar_days": finish["calendar_days"],
+            "due_date": str(due_date) if due_date else None,
+            "due_feasible": rush_end_ok,
+        },
+        "impact": {
+            "affected_order_count": len(delayed),
+            "open_master_order_count": len(rows),
+            "queue_displacement_days": round(queue_days, 2),
+            "late_before_insert_count": sum(1 for x in delayed if x.get("late_before_insert")),
+            "late_after_insert_count": sum(1 for x in delayed if x.get("late_after_insert")),
+            "newly_late_count": sum(1 for x in delayed
+                                    if x.get("late_after_insert") and not x.get("late_before_insert")),
+            "delayed_orders": delayed[:20],
+            "orders_on_other_lines": on_other_line[:10],
+            "orders_without_line_or_due": no_due[:10],
+        },
+        "basis": {
+            "hours_per_unit": cap["hours_per_unit"], "hours_basis": cap["hours_basis"],
+            "route_operations": cap["route_operations"], "route_hours_sum": cap["route_hours_sum"],
+            "line_code": cap["line_code"], "line_basis": cap["line_basis"],
+            "parallel_lines": cap["parallel_lines"], "crew": cap["crew"],
+            "units_per_day": cap["units_per_day"],
+            "capacity_binding": cap["capacity_binding"],
+            "declared_units_per_day": cap["declared_units_per_day"],
+            "ie_hours_implied_units_per_day": cap["ie_hours_implied_units_per_day"],
+            "hours_per_day": cap["hours_per_day"],
+            "hours_per_day_source": cap["hours_per_day_source"],
+            "present_ratio": cap["present_ratio"], "attendance": cap["attendance"],
+            "capacity_basis": cap["capacity_basis"],
+            "shift_days": cap["shift_days"],
+            "other_capable_lines": cap["other_capable_lines"],
+        },
+        "assumptions": [
+            "急单插在同线队列最前，占的是这条线的产出；不同线的单不受影响",
+            "同线工单之间的先后顺序台账里没有，所以给同线每张单同一个『被拿走的天数』（按产出守恒，不按顺序猜）",
+            f"到岗 {cap['present_ratio']:g} 来自台账缺勤率，已折进日产能（不是另加一条效率折扣）",
+            "只算产能，没有算物料齐套：等料的天数另算（沙箱 run_target 才带 BOM/提前期）",
+        ],
+        "note": ("全部数字出自线台账(line_profiles)、路线标准工时(routing_template_steps)、"
+                 "实测班时与到岗(attendance)；只读沙盘，未修改 APS 排程。"
+                 "承诺前仍需跑物料齐套与 APS 重排。"),
+    }
+
+
 async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                       *, today: Optional[date] = None,
                       attendance_curve: Optional[Dict[int, float]] = None,
