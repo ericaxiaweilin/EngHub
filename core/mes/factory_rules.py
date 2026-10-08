@@ -4,11 +4,11 @@
 账上的样本长出 candidate rule → 人确认后变成正式规则。缺任何一环都会退化成"等 IE 填表"。
 这个模块补的是平时没人做的三件事：
 
-1. **自己挖**：`operators.skills` / `hr_employees` 里已经有人写的技能与等级，把它算成
+1. 「自己挖」：`operators.skills` / `hr_employees` 里已经有人写的技能与等级，把它算成
    "这个厂有几个能干这件事的人" —— 0 个和"没声明"是两件事，0 个就是物理上不能做（只能等）；
-2. **自己问**：`open_questions()` 把约束层摊出来的空白变成一条条**可回答的闭合问题**，
+2. 「自己问」：`open_questions()` 把约束层摊出来的空白变成一条条「可回答的闭合问题」，
    交给 chatbot 在当班对话里问现场的人，回答用 `record_rule()` 落成规则（source=chat，带消息证据）；
-3. **自己记账**：`backfill_decision_ledger()` 把已经存在但从未被连起来的三张表
+3. 「自己记账」：`backfill_decision_ledger()` 把已经存在但从未被连起来的三张表
    （推演推荐 = 当时的状态与动作、工单实绩 = 结果、约束判定 = 候选集）连成决策台账，
    `mine_patterns()` 再从台账里按"同状态同动作"算成功率，产出 `status=candidate` 的模式 ——
    candidate 不参与约束判定，只有人确认成 validated/declared 才会拦住引擎。
@@ -468,7 +468,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                                  if st_lines else "工单也没登记工位，只有路线工序")
                                 + (f"；路线点名的工位 {'、'.join(missing_st)} 在 stations 里没有行，"
                                    f"同类站有 {'、'.join(cands)}" if missing_st else ""),
-            "already_computed": ("这几台机已经能按工位路线算产能（两读法取下界），"
+            "already_computed": ("这几台机已经能按工位路线算产能（两读法取下界 × 实测班时），"
                                   "不必先有人回答「归哪条线」"),
             "why_it_matters": ("这些单在推演里 line=null：日产能没有被线约束，时间线只是路线工时 + 来料日；"
                                "加班、借人、双班、闷热天扣人这些人力动作在这张单上乘不上，"
@@ -490,13 +490,16 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                          f"还缺的是每站效率与可用工时（{cov.get('stations')} 个站里 "
                          f"station_capacity 填了 {cov.get('station_capacity_rows')} 个）"),
             "why_it_matters": ("单位口径没定的时候，引擎不敢把 per_hour 乘班时当产能：那要么把「人」当「件」乘，"
-                               "要么把 6 成效率当 10 成。按工位走的机种（比如上面那几台）因此只能用路线工时推，"
-                               "算不出'这条工位最多一天出多少'"),
+                               "要么把 6 成效率当 10 成。现在引擎取下界（两读法里小的那个）× 实测班时，"
+                               "宁可少算也不替厂里把口径拍板；要算准就得定这列含义 + 把占位的班次效率填实）"),
             "expected_answer": ("① capacity_per_hour 到底是整站还是每人；"
                                 "② 每站可用工时与效率（或直接说按站点声明那列算，另一列只当理论上限）"),
-            "prefilled_evidence": (f"capacity 单位在站间混用：{'、'.join(cov.get('capacity_unit_mix') or [])}"
-                                   if cov.get("capacity_unit_ambiguous") else
-                                   "capacity 单位一致，但 station_capacity 表没填每站工时与效率"),
+            "prefilled_evidence": (
+                "station_capacity 每个站都有行，但 source 全是 derived_station_master（系统自己导出的占位），"
+                f"每站可用工时从 {cov.get('station_capacity_hours_min')} 到 "
+                f"{cov.get('station_capacity_hours_max')} 小时 —— 0.07 与 54.5 都不可能是班时，"
+                "所以这张表有行不等于有数据；capacity 单位还在站间混用："
+                + "、".join(cov.get("capacity_unit_mix") or [])),
             "record_as": {"subject": "station_capacity_basis", "verdict": "declared",
                           "status": "declared", "source": "chat"},
         })

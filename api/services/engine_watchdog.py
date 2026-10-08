@@ -71,7 +71,7 @@ def stall_deadline_seconds(row: Dict[str, Any]) -> float:
 def is_down(row: Dict[str, Any]) -> bool:
     """这个循环现在能不能被算成"没在跑"。
 
-    分两种死法：台账**自己报出来的**（failed / exited）是事实，立刻成立；
+    分两种死法：台账「自己报出来的」（failed / exited）是事实，立刻成立；
     靠"没动静"推断出来的（只记到 spawned 或状态不认识）要给宽限 ——
     read_states 把"活着"定义成"逐轮心跳新鲜"，刚起来的进程那一笔是 spawned，
     没有宽限就会在引擎重启后的头 1-2 分钟挂出 N 条"从未在跑"的假警报。
@@ -454,7 +454,7 @@ async def _apply(db: AsyncSession, factory_id: str, act: Dict[str, Any]) -> Dict
 
 
 # ── 数据缺口：判据被主数据封顶时，把"补哪个数据"挂成催办 ────────────────────
-# 机种归属沿用齐套判据那条规则（ORDER_SHORT_SQL）：子工单算到**父工单的机种**头上。
+# 机种归属沿用齐套判据那条规则（ORDER_SHORT_SQL）：子工单算到「父工单的机种」头上。
 # 不这么写的话，A-50-04-F 那批半成品子单的键是组件编码，在镜像里查不到行，
 # 登记世代这一格就永远不响 —— 同一个厂里两套"这台单属于哪个机种"的口径是量不准的根源。
 KIT_GENERATION_SQL = """
@@ -657,7 +657,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  "（`query_working_condition_impact`：闷热天扣的是可用人头，不是效率折扣）。"
                  f"但 attendance 有 {int(wc.get('attendance_days') or 0)} 个出勤日、"
                  f"equipment_readings 里温度 0 行（总读数 {int(wc.get('reading_rows') or 0)} 行）—— "
-                 "缺勤序列与温度序列没有可对撞的那一维，所以包里 1.0pp/℃ 这条斜率只能是**本厂声明值**。"
+                 "缺勤序列与温度序列没有可对撞的那一维，所以包里 1.0pp/℃ 这条斜率只能是「本厂声明值」。"
                  "\n补法不讲究精度：工位传感器、每天定点抄表、巡检拍照都行，"
                  "按 factory_id+date 记 ℃ 与 RH，攒到 20 天上下就能回归出本厂斜率替换声明值；"
                  "那之前对外只能说「按标准折算的情景值」，不能说「本厂实测」。"),
@@ -715,7 +715,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             "L2B 的「台账缺口行覆盖率」被这一格压着（当前读数见 /engine-layers），"
             "一致率与 top-5 重叠都到不了顶：这些单的机种"
             f"在 engflow 镜像里有行，可台账只登记了十几行外购件（同机种按多层展开登记过的单能到 "
-            f"680 行、深 9 层）。\n这是**登记世代**差，不是源侧没结构 —— 修法是把这 {stale} 张单的"
+            f"680 行、深 9 层）。\n这是「登记世代」差，不是源侧没结构 —— 修法是把这 {stale} 张单的"
             "齐套行按 bom_source 重登记一次（component_orders 那条路径）。\n"
             "动手前必须先定一件事：重登记会把台账的毛需求换成引擎用的低层码净额，"
             "采购缺口会变小（实测 3,299 行配对里 861 行引擎判 0），直接影响催办量与齐套放行门。\n"
@@ -790,7 +790,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
         out.append(_gap(
             "candidate_rules", "awaiting_confirmation", f"cand|{len(pending)}",
             f"补数据｜{len(pending)} 条系统自己发现的规则等着人确认（来源 {'、'.join(kinds)}）",
-            "这些不是空白，是**从数据里挖出来的候选规律**：人手能顶哪个工位（从技能台账推）、"
+            "这些不是空白，是「从数据里挖出来的候选规律」：人手能顶哪个工位（从技能台账推）、"
             "某种状态下哪个动作历史上达成率高（从决策台账推）。它们现在只是 candidate，不拦引擎；"
             "确认过的才升成 declared/validated 并开始过滤候选动作。\n"
             f"待确认清单：{json.dumps(pending[:8], ensure_ascii=False)[:1200]}\n"

@@ -5,7 +5,7 @@
 铺出来的默认值，不是量出来的。而同期 65 单真采购的下单→到货实测均值 54 天、最长 123 天。
 仿真引擎点瓶颈件、算最早开工日吃的就是这个字段；它要是默认值，推演再精细也是在替假数字背书。
 
-这个模块**只读**：不回填 `materials`，不改任何事实表。它做三件事 ——
+这个模块「只读」：不回填 `materials`，不改任何事实表。它做三件事 ——
 1. 逐字段说清出处（台账默认 / 采购实测 / 收货实测 / 供应商声明），并给出证据条数；
 2. 冲突要摊开：台账 12 天、实测中位 78 天 → 报 `conflict`，而不是取其中一个当真相；
 3. 普查必须自报"到底查了多少对象"，否则空结果分不清是"没问题"还是"没检查"。
@@ -734,7 +734,8 @@ UNCLAIMED_STATION_EVIDENCE_SQL = text("""
 """)
 
 
-# 路线点名的工位在 stations 里没有行的那些：整条路线就这一档算不出产能，
+# 路线点名的工位在「本厂」 stations 里没有行的那些：这一档算不出产能；
+# 顺带查出它是不是登记在别的厂（跨厂引用不能借）
 # 顺带把同类站列出来给人认 —— 是路线写错了别名，还是档案少了一行
 ROUTE_STATION_GAP_SQL = text("""
     WITH used AS (
@@ -748,9 +749,17 @@ ROUTE_STATION_GAP_SQL = text("""
         SELECT u.wc FROM used u
         WHERE NOT EXISTS (SELECT 1 FROM stations st
                           WHERE st.factory_id = :fid AND st.station_code = u.wc)
+    ), elsewhere AS (
+        SELECT m.wc,
+               (SELECT string_agg(DISTINCT st.factory_id, ',') FROM stations st
+                WHERE st.station_code = m.wc) AS other_factory
+        FROM miss m
+        WHERE EXISTS (SELECT 1 FROM stations st WHERE st.station_code = m.wc)
     )
     SELECT (SELECT array_agg(wc) FROM miss) AS missing_stations,
            (SELECT count(*) FROM used) AS route_stations_used,
+           COALESCE((SELECT json_agg(json_build_object('station_code', wc, 'registered_in', other_factory))
+                     FROM elsewhere), '[]'::json) AS cross_factory_stations,
            COALESCE((SELECT json_agg(json_build_object('code', st.station_code, 'name', st.station_name,
                                                        'type', st.station_type,
                                                        'per_hour', st.capacity_per_hour,
@@ -765,8 +774,12 @@ ROUTE_STATION_GAP_SQL = text("""
 STATION_CAPACITY_SHAPE_SQL = text("""
     SELECT s.capacity_unit AS unit, count(*) AS stations,
            count(*) FILTER (WHERE COALESCE(s.capacity_per_hour, 0) > 0) AS with_per_hour,
-           count(*) FILTER (WHERE sc.station_id IS NOT NULL) AS with_capacity_row
-    FROM stations s LEFT JOIN station_capacity sc ON sc.station_id = s.id
+           count(*) FILTER (WHERE sc.id IS NOT NULL) AS with_capacity_row,
+           count(*) FILTER (WHERE sc.source = 'derived_station_master') AS with_derived_placeholder,
+           min(sc.available_hours_per_day) FILTER (WHERE sc.id IS NOT NULL) AS hours_min,
+           max(sc.available_hours_per_day) FILTER (WHERE sc.id IS NOT NULL) AS hours_max
+    FROM stations s
+    LEFT JOIN station_capacity sc ON sc.station_id = s.station_code AND sc.factory_id = s.factory_id
     WHERE s.factory_id = :fid
     GROUP BY 1 ORDER BY 2 DESC
 """)
@@ -801,26 +814,42 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
         "stations_with_per_hour": sum(int(r.get("with_per_hour") or 0) for r in shapes),
         "route_stations_missing": missing_route,
         "route_stations_used": int(gap.get("route_stations_used") or 0),
+        "cross_factory_stations": [x for x in (gap.get("cross_factory_stations") or [])
+                                   if isinstance(x, dict)],
         "route_station_candidates": [c for c in (gap.get("candidates") or []) if isinstance(c, dict)][:6],
+        "station_capacity_hours_min": (min([x.get("hours_min") for x in shapes
+                                            if x.get("hours_min") is not None] or [None])),
+        "station_capacity_hours_max": (max([x.get("hours_max") for x in shapes
+                                            if x.get("hours_max") is not None] or [None])),
         "capacity_units": shapes,
         "capacity_unit_mix": units_mix,
         "capacity_unit_ambiguous": len(units_mix) > 1,
         "unclaimed_detail": per_model,
         "reading": (
             (f"{unclaimed} 个在流程单没有线档案认领（{int(row.get('orders') or 0)} 张母单、"
-             f"{int(float(row.get('units') or 0))} 台）→ 这些单在沙箱里 line=null，"
-             "产能只按路线工时推，人力动作乘不上"
-             if unclaimed else "在流程单都各有线档案认领（没有 line=null 的单）")
+             f"{int(float(row.get('units') or 0))} 台）→ 没有线档案认领，"
+             "推演已改按工位路线的产能下界算（人力动作与工况扣人乘得上）"
+             if unclaimed else "在流程单都各有线档案认领")
             + (f"；其中 {int(row.get('orders_without_product_row') or 0)} 张母单指向的机种在 products 里没有行"
                f"（product_id 悬空，创建者是 {'、'.join(row.get('dangling_created_by') or []) or '未知'}）"
                " → 这些单没有 BOM、没有路线，任何推演都算不出它们"
                if int(row.get("orders_without_product_row") or 0) else "")
-            + (f"；路线点名的工位有 {len(missing_route)} 个在 stations 里没有行（{'、'.join(missing_route)}）"
-               " → 整条路线只有这一档算不出产能，其余工序已经按工位下界算了"
+            + (f"；路线点名的工位 {'、'.join(missing_route)} 在本厂 stations 里没有行"
+               " → 这一档没有产能读数（其余工序已按工位下界算）"
                if missing_route else "")
             + f"；工位侧 {sum(int(r.get('stations') or 0) for r in shapes)} 个站里 "
-            f"station_capacity 填了 {sum(int(r.get('with_capacity_row') or 0) for r in shapes)} 个"
+            f"station_capacity 有 {sum(int(r.get('with_capacity_row') or 0) for r in shapes)} 个的行，"
+            f"其中 {sum(int(r.get('with_derived_placeholder') or 0) for r in shapes)} 行是系统自动导出的占位值"
+            "（每站可用工时落在 "
+            + str(min([x.get("hours_min") for x in shapes if x.get("hours_min") is not None] or [0]))
+            + "~"
+            + str(max([x.get("hours_max") for x in shapes if x.get("hours_max") is not None] or [0]))
+            + " 小时、efficiency_rate 全为 1）→ 有行不等于有数据，这些值不能当班时用"
+            + (f"；路线还跨厂引用了 "
+               + "、".join(f"{x.get('station_code')}（登记在 {x.get('registered_in')}）"
+                           for x in (gap.get("cross_factory_stations") or []))
+               if gap.get("cross_factory_stations") else "")
             + ("，且 capacity 单位在站间不一致（" + "、".join(units_mix) + "）"
-               "→ 口径没统一，所以推演按两读法的**下界**折（不取大的那个）" if len(units_mix) > 1
+               "→ 口径没统一，所以推演按两读法的「下界」折（不取大的那个）" if len(units_mix) > 1
                else "；单位口径一致，缺的是每站可用工时与效率（这张表没填）")),
     }
