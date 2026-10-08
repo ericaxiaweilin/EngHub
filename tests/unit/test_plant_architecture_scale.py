@@ -379,3 +379,40 @@ def test_cross_check_and_sandbox_share_one_station_basis():
     assert "8.0" not in s, "名义 8h 不许回来"
     assert "load_station_capacity" in s and "shift_hours" in s
     assert "不回落" in s and "取不到" in s, "没有实测班时要直说，不硬给日产能"
+
+
+def test_station_side_leg_does_not_scale_with_people():
+    """线口径说"加到 2889 人就赶得上"，工位口径不吃这一套 —— 两个都要摆出来。"""
+    from datetime import date
+
+    from core.mes.plant_architecture import station_side_verdict
+
+    conflict = {"station_bound_units_per_day": 40.0, "tight_station": "ST-JG-01",
+                "line_declared_units_per_day": 300.0, "ratio_line_over_station": 7.5, "agrees": False}
+    got = station_side_verdict(8000.0, conflict, today=date(2026, 10, 8),
+                               shift_days={1, 2, 3, 4, 5, 6}, due_days=25, material_wait_days=10.0)
+    assert got["status"] == "ok" and got["production_days"] == 200.0
+    assert got["scales_with_headcount"] is False
+    assert got["earliest_finish_day"] > 200 and got["meets_due"] is False
+    assert "不随人数缩放" in got["note"] and "ST-JG-01" == got["tight_station"]
+    # 同一行里已经念过 40 件/天了，缩略版不许再念一遍（读数重复两遍会被读成两个不同的数）
+    assert "不随人数缩放" in got["short_note"] and "件/天" not in got["short_note"]
+    # 工位侧没有读数就明说没法比对，不拿线档案那一侧冒充
+    none_ = station_side_verdict(8000.0, {"station_bound_units_per_day": None}, today=date(2026, 10, 8),
+                                shift_days={1, 2, 3, 4, 5, 6}, due_days=25)
+    assert none_["status"] == "no_station_basis" and "没法比对" in none_["why"]
+
+
+def test_reported_minimum_is_re_run_before_it_is_printed():
+    """二分路径上的缓存不能当证据：报出的那个人数要单独再跑一次，判据在它自己身上成立才算数。
+
+    这条是 2888/2889 那次教训的固化 —— 那次天数挂在 2888.5 人上、人头截断成 2888，
+    两个数分属两个规模，看着完全可信但是假的。
+    """
+    import inspect
+
+    from core.mes.plant_architecture import min_headcount_for_delivery
+
+    src = inspect.getsource(min_headcount_for_delivery)
+    assert "_run_at_scale" in src and "verified_feasible" in src
+    assert "station_side" in src, "『要多少人』必须带上工位那条腿，否则会被当成可承诺"

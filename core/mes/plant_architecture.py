@@ -511,6 +511,41 @@ def _scaled_line_at(ctx: Dict[str, Any], headcount: float) -> tuple:
     return scaled, factor
 
 
+def station_side_verdict(units: float, conflict: Optional[Dict[str, Any]], *, today,
+                         shift_days: set, due_days: int,
+                         material_wait_days: float = 0.0) -> Dict[str, Any]:
+    """同一批数量换成「工位自己声明的台/天」要几天 —— 这一侧不随人数缩放。
+
+    线档案那条腿按人数等比缩放，所以"加到 2889 人就赶得上"在**线口径**下成立；但路线最紧的那个
+    工位（这座厂是加工车间 ST-JG-01）自己只报 4 件/小时=40 件/天，那是台账里的另一条声明，
+    与这座厂有多少人无关。两个数必须一起摆出来，否则"要多少人"会被读成一句可承诺的话。
+    """
+    from api.services.virtual_run import production_finish_day
+
+    bound = (conflict or {}).get("station_bound_units_per_day")
+    if not bound or float(bound) <= 0:
+        return {"status": "no_station_basis", "scales_with_headcount": None,
+                "why": "工位侧没有读数（路线点名的工位没有档案，或这台机没有可解析路线）→ 这条腿没法比对"}
+    bound = float(bound)
+    pro_days = float(units) / bound
+    wait = max(0.0, float(material_wait_days or 0))
+    finish = production_finish_day(today, pro_days + wait, shift_days)
+    earliest = int(finish["calendar_days"]) + 1
+    return {
+        "status": "ok", "station_bound_units_per_day": bound,
+        "tight_station": (conflict or {}).get("tight_station"),
+        "production_days": round(pro_days, 1), "wait_days_for_material": wait,
+        "earliest_finish_day": earliest, "meets_due": earliest <= int(due_days),
+        "scales_with_headcount": False,
+        "short_note": (f"工位那条腿要 {round(pro_days, 1):g} 个班次日"
+                       + (f"（另加等料 {wait:g} 天）" if wait else "")
+                       + f"，最早第 {earliest} 天交 —— 不随人数缩放"),
+        "note": (f"按工位自述 {bound:g} 件/天，{units:g} 台要 {round(pro_days, 1):g} 个班次日"
+                 + (f"（另加等料 {wait:g} 天）" if wait else "")
+                 + f" → 最早第 {earliest} 天交，这一侧**不随人数缩放**（站点声明与在册人数无关）"),
+    }
+
+
 async def _run_at_scale(db: AsyncSession, ctx: Dict[str, Any], *, headcount: float,
                         units: float, due_days: int, due_days_basis: str = "user") -> Dict[str, Any]:
     """在一个目标规模上真跑一遍沙箱：出完工天数、比交期早晚、用工，而不是一句台/天。"""
@@ -549,6 +584,11 @@ async def _run_at_scale(db: AsyncSession, ctx: Dict[str, Any], *, headcount: flo
     if conflict.get("agrees") is False:
         tails.append(f"工位侧自述只有 {conflict.get('station_bound_units_per_day')} 台/天"
                      f"（差 {conflict.get('ratio_line_over_station')} 倍）")
+    station_side = station_side_verdict(float(units), conflict, today=ctx["today"],
+                                        shift_days=ctx["shift_days"], due_days=due_days,
+                                        material_wait_days=run.get("wait_days_for_material") or 0)
+    if station_side.get("status") == "ok" and not station_side["meets_due"]:
+        tails.append(station_side["short_note"])
     return {
         "status": run.get("status") or "ok", "model_code": ctx["model_code"], "units": float(units),
         "product_resolution": ctx["product_resolution"],
@@ -568,7 +608,7 @@ async def _run_at_scale(db: AsyncSession, ctx: Dict[str, Any], *, headcount: flo
         "attendance": {"present_ratio": ratio, "basis": ctx["attendance_basis"],
                        "conditions": ctx["conditions"]},
         "equipment_rate": ctx["equipment_rate"], "line_vs_station": conflict, "run": run,
-        "finish_day": finish, "days_late": late,
+        "station_side": station_side, "finish_day": finish, "days_late": late,
         "reading": "；".join(tails),
     }
 
@@ -693,6 +733,14 @@ async def min_headcount_for_delivery(db: AsyncSession, reference_factory_id: str
     out["carrier_crew"] = crew
     out["reference_headcount"] = ctx["base_people"]
     if out.get("status") == "found":
+        # 报出的那个人数单独再跑一次：搜索结果不能只信二分路径上的缓存，判据要在它自己身上成立
+        verify = await _run_at_scale(db, ctx, headcount=float(out["min_headcount"]),
+                                     units=float(units), due_days=int(due_in_days))
+        out["verified_finish_day"] = verify.get("finish_day")
+        out["verified_days_late"] = verify.get("days_late")
+        out["verified_feasible"] = (verify.get("finish_day") is not None
+                                    and float(verify["finish_day"]) <= int(due_in_days))
+        out["station_side"] = verify["station_side"]
         out["equivalent_crews"] = (int(-(-out["min_headcount"] // crew)) if crew else None)
         out["reading"] = (f"赶上 {due_in_days} 天交期至少要 {out['min_headcount']} 人"
                           f"（参照厂实测 {ctx['base_people']:g} 人的 "
@@ -701,6 +749,8 @@ async def min_headcount_for_delivery(db: AsyncSession, reference_factory_id: str
                           f"{float(ctx['base_line'].get('units_per_day') or 0):g} 台/天、班组 {crew:g} 人 "
                           f"→ 等效 {out['equivalent_crews']} 个这样的班组），届时完工 {out['finish_day']:g} 天"
                           f"；试了 {out['probes']} 个规模")
+        if out["station_side"].get("status") == "ok" and not out["station_side"]["meets_due"]:
+            out["reading"] += f"；但{out['station_side']['note']}"
     return out
 
 
