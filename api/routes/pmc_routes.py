@@ -345,6 +345,9 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/sim-sensitivity", "mode": "read_only"},
             {"key": "sim_schedule_risk", "name": "交期分布（按已声明误差带抽样：P50/P90、准点概率、毛边）",
              "path": "/api/v1/pmc/sim-schedule-risk", "mode": "read_only"},
+            {"key": "sim_data_repair",
+             "name": "数据修复报价（每条误差带修到已声明下限后毛边窄几天、先修哪条、几天修不掉）",
+             "path": "/api/v1/pmc/sim-data-repair", "mode": "read_only"},
             {"key": "data_flow_profile",
              "name": "数据流节点剖面（台账/展开/推演三层各多少节点，按规模外推需要多少行）",
              "path": "/api/v1/pmc/data-flow-profile", "mode": "read_only"},
@@ -813,6 +816,7 @@ async def get_sim_sensitivity(
     factory_id: str = Query(..., description="厂区"),
     n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
     include_risk: bool = Query(False, description="true 时顺带给交期分布（多花几十秒）"),
+    include_repair: bool = Query(False, description="true 时顺带给数据修复报价（每条带宽一趟抽样，更慢）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -829,7 +833,35 @@ async def get_sim_sensitivity(
     models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
     if not models:
         raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
-    return await report(db, factory_id, models, include_risk=include_risk)
+    return await report(db, factory_id, models, include_risk=include_risk,
+                       include_repair=include_repair)
+
+
+@router.get("/sim-data-repair", summary="数据修复报价：每条误差带修到已声明下限，毛边窄几天、先修哪条")
+async def get_sim_data_repair(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(3, description="取 BOM 最完整的 n 个机种"),
+    samples: int = Query(24, description="每条带宽抽几轮（6~60；一条带宽一趟）"),
+    seed: int = Query(20261008, description="固定种子：与交期分布同一串抽样，差值才配得上对"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把毛边拆开定价：逐条把误差带压到**已声明的下限**（±20% / IE 的 ±5%），重跑同一串抽样。
+
+    同一串抽样是关键：重抽的话两次分布的差里混着抽样噪声，看着就像"修数据买到了几天"。
+    读法有三件：①先修哪条（按窄下来的天数排序，0 的排不进）②毛边里几天修得掉几天修不掉
+    ③修不动的那些是"已在下限"还是"这条输入不 binding"，两者是完全不同的现场动作。
+    它不承诺交期提前 —— 修数据只让同一条交期的毛边变窄。只读，不写任何表。
+    """
+    del current_user
+    from api.services.sim_sensitivity import data_repair_experiment
+    from api.services.virtual_run import default_models
+
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await data_repair_experiment(db, factory_id, models,
+                                        samples=max(6, min(60, int(samples))), seed=seed)
 
 
 
@@ -853,8 +885,9 @@ async def get_kit_lines_reupgrade(
     factory_id: str = Query(..., description="厂区"),
     apply: bool = Query(False, description="false=只预演；true 才写库（也受 ENGINE_KIT_REUPGRADE_APPLY 控制）"),
     limit: int = Query(20, ge=1, le=200, description="本轮最多补几张单"),
-    max_lines: int = Query(20, ge=1, le=200,
-                           description="选单闸：台账现有齐套行数少于这个数的单才补（20=旧世代档，80=覆盖不足档）"),
+    max_lines: int = Query(400, ge=1, le=800,
+                           description="选单闸：台账现有齐套行数少于这个数的单才补"
+                                       "（400=登记到位那一档的上限，实测该档一致率 0.967）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:

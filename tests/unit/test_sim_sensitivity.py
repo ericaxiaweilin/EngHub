@@ -462,3 +462,185 @@ def test_schedule_risk_rejects_a_malformed_against_list(monkeypatch):
     assert ok["status"] == "ok" and len(ok["against"]) == 1
     empty = asyncio.run(call(""))
     assert empty["status"] == "ok" and empty["against"] == []
+
+
+def test_rescale_draws_narrows_only_the_named_band_around_its_own_center():
+    """配对的前提：改一条带宽时，另外几条必须逐抽一字不动，中心也不能漂。"""
+    draws = ss._risk_draws(8, 99, lead_band=0.6, hours_band=0.4, base_equip=0.8)
+    out = ss._rescale_draws(draws, 0.8, narrowed={"purchase_lead_time": 0.5})
+    assert len(out) == len(draws)
+    for a, b in zip(draws, out):
+        assert b["hours_multiplier"] == a["hours_multiplier"], "工时那一维不能跟着动"
+        assert b["equip_rate"] == a["equip_rate"] and b["attendance"] == a["attendance"]
+        assert b["lead_multiplier"] == round(1.0 + 0.5 * (a["lead_multiplier"] - 1.0), 4), \
+            "偏移要按精确比例收窄到代码那 4 位小数，中心不许漂"
+    assert out != draws, "没改动就说明 narrowed 没接上"
+
+
+def test_rescale_draws_anchors_equipment_at_the_measured_rate_and_attendance_at_the_median():
+    draws = ss._risk_draws(9, 7, lead_band=0.2, hours_band=0.2, base_equip=0.8)
+    eq = ss._rescale_draws(draws, 0.8, narrowed={"equipment_availability": 0.0})
+    assert all(d["equip_rate"] == 0.8 for d in eq), "归零必须回到台账实测率，不是回到 1.0"
+    at = ss._rescale_draws(draws, 0.8, narrowed={"crew_attendance": 0.0})
+    assert len({d["attendance"] for d in at}) == 1
+    assert list({d["attendance"] for d in at})[0] == 0.92, "三档的中位是 0.92，不是均值"
+
+
+def test_repair_floors_come_from_the_same_declared_sources_as_the_sampling_bands():
+    """下限不许另立一套：提前期用 lead_error_band 的底线、工时用 IE 声明工时那条带。"""
+    floors = {t["input"]: t["floor_band"] for t in ss.DATA_REPAIR_TARGETS}
+    assert floors["purchase_lead_time"] == ss.lead_error_band(1.0)
+    assert floors["unit_work_hours"] == ss.ERROR_BAND["route_standard_hours"]
+    assert floors["crew_attendance"] == 0.0
+    assert not [t for t in ss.DATA_REPAIR_TARGETS if t["repairable"]
+                and t["input"] not in ss.BAND_KEY], "可修的因子必须抽得到"
+
+
+def _fake_env(monkeypatch, *, lead_score=0.3, hours_band=0.30):
+    """造一个只有提前期真的卡住工时的世界：修提前期该窄，修工时该白花。"""
+    from datetime import date, timedelta
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 60.0,
+                            "hours_error_band": hours_band,
+                            "components": {"lead_time": {"score": lead_score},
+                                           "hours": {"score": 0.5, "basis": "route_standard_hours"}}}]}
+
+    seen = {"draws": []}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        p = perturb or {}
+        seen["draws"].append(dict(p))
+        days = round(60.0 * float(p.get("lead_multiplier", 1.0)), 1)
+        return {"finish_date": str(date(2026, 11, 1) + timedelta(days=int(days))),
+                "days_late_worst": days - 45.0, "labor_cost_usd": 1000.0,
+                "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                "binding": "material_arrival"}
+
+    monkeypatch.setattr(ss.vr, "derive_targets", fake_targets)
+    monkeypatch.setattr(ss.vr, "equipment_rate", fake_equip)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+    return seen
+
+
+def test_data_repair_experiment_prices_each_band_in_narrowed_days(monkeypatch):
+    import asyncio
+
+    _fake_env(monkeypatch, lead_score=0.3)      # 覆盖率 30% → 提前期带宽 ±0.70，远高于 ±0.20 下限
+    out = asyncio.run(ss.data_repair_experiment(None, "FAC", ["M-1"], samples=16, seed=11))
+    assert out["status"] == "ok"
+    by = {r["input"]: r for r in out["repairs"]}
+    assert by["purchase_lead_time"]["band_now"] == 0.7
+    assert by["purchase_lead_time"]["band_after"] == ss.lead_error_band(1.0)
+    assert by["purchase_lead_time"]["gap_days_narrowed"] > 0, "提前期修准必须真把毛边窄下来"
+    assert by["unit_work_hours"]["status"] == "ok"
+    assert by["unit_work_hours"]["gap_days_narrowed"] == 0.0, "工时不 binding 就不能报成值钱"
+    assert by["crew_attendance"]["status"] == "not_repairable"
+    assert out["first_fix"]["input"] == "purchase_lead_time"
+    dec = out["decomposition"]
+    assert 0 < dec["repairable_gap_days"] <= dec["gap_days_now"]
+    assert dec["not_repairable_gap_days"] == out["all_repaired"]["p90_p50_gap_days"]
+    assert any("先修哪条（按窄下来的天数排序）" in x for x in out["reading"])
+    assert any("毛边构成" in x for x in out["reading"])
+    assert "修数据只把毛边变窄" in out["claim_guard"]
+
+
+def test_data_repair_experiment_is_paired_on_one_draw_stream_not_rerolled_dice(monkeypatch):
+    import asyncio
+
+    seen = _fake_env(monkeypatch, lead_score=0.3)
+    out = asyncio.run(ss.data_repair_experiment(None, "FAC", ["M-1"], samples=12, seed=5))
+    n = out["samples"]
+    base_block = seen["draws"][:n]
+    lead_block = seen["draws"][n:2 * n]
+    assert [d["hours_multiplier"] for d in base_block] == [d["hours_multiplier"] for d in lead_block]
+    assert all(abs(l["lead_multiplier"] - 1.0) <= ss.lead_error_band(1.0) + 1e-9 for l in lead_block), \
+        "修过的那一档必须整串落在下限带宽里"
+    again = asyncio.run(ss.data_repair_experiment(None, "FAC", ["M-1"], samples=12, seed=5))
+    assert again["reading"] == out["reading"], "同种子必须能重算核对"
+
+
+def test_data_repair_experiment_refuses_to_rank_when_no_repair_narrows_anything(monkeypatch):
+    """空集合不许报成"先修哪条：修完了"：测过但没用要说清是约束不 binding，不是数据已齐。"""
+    import asyncio
+
+    _fake_env(monkeypatch, lead_score=1.0, hours_band=0.05)
+    out = asyncio.run(ss.data_repair_experiment(None, "FAC", ["M-1"], samples=10, seed=3))
+    by = {r["input"]: r for r in out["repairs"]}
+    assert by["purchase_lead_time"]["status"] == "already_at_floor"
+    assert by["unit_work_hours"]["status"] == "already_at_floor"
+    assert out["first_fix"] is None
+    line = [x for x in out["reading"] if "先修哪条" in x][0]
+    assert "没有一条数据能压掉毛边" in line and "已经在下限的" in line
+    dec = out["decomposition"]
+    assert dec["gap_change_if_all_repaired"] == 0.0, "只有设备能动而设备不 binding → 一天也压不出"
+    assert dec["repairable_gap_days"] == 0.0 and dec["wider_by_days_if_all_repaired"] == 0.0
+    assert dec["not_repairable_gap_days"] == dec["gap_days_now"]
+    assert any("一天没窄" in x for x in out["reading"]), "合修那格要如实报没窄，不许给比例"
+    assert any("这些带宽各自量的是什么" in x and "铺进去的默认值也算有数" in x for x in out["reading"]), \
+        "覆盖率 100% 不等于量过 —— 这句口径必须随读数一起出去"
+
+
+def test_data_repair_experiment_says_no_repair_instead_of_inventing_one(monkeypatch):
+    import asyncio
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 0.0, "hours_error_band": 0.4,
+                            "components": {"lead_time": {"score": 0.0}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        return {"finish_date": None, "days_late_worst": None, "binding": "no_material"}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+    out = asyncio.run(ss.data_repair_experiment(None, "FAC", ["M-1"], samples=8, seed=1))
+    assert out["status"] == "no_dates" and out["repairs"] == [] and out["first_fix"] is None
+    assert any("没跑成" in x for x in out["reading"])
+
+
+def test_data_repair_chat_answer_names_the_first_fix():
+    """聊天那一屏必须把"先修哪条"渲染出来，否则引擎算了但没人看得见。"""
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    res = {"factory_id": "FAC", "models": ["M-1"], "has_data": True,
+           "base": {"finish_date": "2026-11-27", "days_late_worst": 9.0, "on_time_rate": 0.0,
+                    "binding": "material_arrival"}, "data_repair": {
+        "status": "ok", "samples": 16, "seed": 11,
+        "reading": ["毛边构成：16 抽 P50=2026-11-26、P90=2026-12-05 → 毛边 9 天（跨度 14 天）、准点概率 0%",
+                    "可修/不可修：三条可修数据同时到下限 → 毛边 9 天收窄到 3 天，其中 6.0 天是数据能修的（占 67%），"
+                    "剩下 3 天修台账不动它（到岗真实波动+约束本身）",
+                    "先修哪条（按窄下来的天数排序）：外购提前期逐料号实测（带宽 ±0.70→±0.20，毛边窄 6 天、"
+                    "准点 +12.5pp）",
+                    "这一条的依据：把请购→到货的实测提前期按料号回填，替掉铺进去的默认值｜"
+                    "覆盖率≥80% 时 lead_error_band 的底线就是 ±20%"],
+        "first_fix": {"label": "外购提前期逐料号实测", "gap_days_narrowed": 6.0,
+                      "on_time_uplift_pp": 12.5, "band_now": 0.7, "band_after": 0.2,
+                      "how": "把请购→到货的实测提前期按料号回填", "p_on_time_after": 0.125},
+        "decomposition": {"gap_days_now": 9, "not_repairable_gap_days": 3,
+                          "repairable_gap_days": 6.0, "meaning": "剩下的 3 天不是数据"}}}
+    text = _format_sensitivity_reply(res)
+    assert "先修哪条（按窄下来的天数排序）：外购提前期逐料号实测" in text
+    assert "毛边窄 6 天" in text and "毛边构成" in text and "把请购→到货的实测提前期" in text
+
+    no_repair = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+                 "data_repair": {"status": "no_dates", "why": "抽到的每一轮都推不出完工日", "reading": []}}
+    refuse = _format_sensitivity_reply(no_repair)
+    assert "没跑成 —— 抽到的每一轮都推不出完工日" in refuse
+    assert "先修哪条" not in refuse, "没跑成就不许摆出一张优先级"
+

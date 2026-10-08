@@ -1340,7 +1340,7 @@ def _format_data_flow_reply(result: Dict[str, Any]) -> str:
 
 
 def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
-    """敏感度答复：基准交期 + 杠杆斜率 + 组合交互 + 交期分布，全在 sim_sensitivity 一处算出来。"""
+    """敏感度答复：基准交期 + 杠杆斜率 + 组合交互 + 交期分布 + 数据修复报价，全在 sim_sensitivity 一处算出来。"""
     if not result.get("has_data"):
         return f"敏感度读数没生成：{result.get('message') or result.get('status') or '没有可推演的机种'}"
     base = result.get("base") or {}
@@ -1379,9 +1379,17 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
         lines.append(
             f"- 交期分布：{risk.get('reading')}｜带宽：提前期 ±{risk.get('bands_used', {}).get('purchase_lead_time')}、"
             f"工时 ±{risk.get('bands_used', {}).get('unit_work_hours')}、到岗三档、设备 ±2pp｜"
-            f"P50→P90 = {pcs.get(50)} → {pcs.get(90)}（这段就是毛边）")
+            f"P50→P90 = {pcs.get(50)} → {pcs.get(90)}（这段就是毛边，{risk.get('p90_p50_gap_days')} 天）")
     elif result.get("risk_not_sampled_because"):
         lines.append(f"- 交期分布：没抽样 —— {result['risk_not_sampled_because']}")
+    rep = result.get("data_repair") or {}
+    if rep.get("status") == "ok":
+        for x in (rep.get("reading") or []):
+            lines.append(f"- {x}")
+        if rep.get("method"):
+            lines.append(f"- 报价口径：{rep['method']}")
+    elif rep:
+        lines.append(f"- 数据修复报价：没跑成 —— {rep.get('why') or rep.get('status')}")
     lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
     for u in (result.get("uncertainty") or [])[:2]:
         lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"

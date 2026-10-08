@@ -485,7 +485,8 @@ async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -
 
 
 async def report(db: AsyncSession, factory_id: str, models: List[str], *,
-                 include_risk: bool = False, **kw: Any) -> Dict[str, Any]:
+                 include_risk: bool = False, include_repair: bool = False,
+                 **kw: Any) -> Dict[str, Any]:
     acc = await mapping_accuracy(db, factory_id, models)
     sens = await sensitivity(db, factory_id, models, **kw)
     inter = await interactions(db, factory_id, models, **kw)
@@ -508,9 +509,12 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], *,
                            "curves 给每个输入动一档之后的完工日/人工/加急差值，"
                            "uncertainty 给这些数现在可信到几成、补哪项数据能压掉几天，"
                            "interactions 给两个杠杆一起上时多出来（或白花）的那部分，"
-                           "risk（include_risk=true 时）给按已声明误差带抽出来的完工日分布。")}
+                           "risk（include_risk=true 时）给按已声明误差带抽出来的完工日分布，"
+                           "data_repair（include_repair=true 时）给每条误差带修到下限之后毛边窄几天。")}
     if include_risk:
         out["risk"] = await schedule_risk(db, factory_id, models, **kw)
+    if include_repair:
+        out["data_repair"] = await data_repair_experiment(db, factory_id, models, **kw)
     return out
 
 
@@ -654,13 +658,21 @@ def _risk_summary(rows: List[Dict[str, Any]], *, factory_id: str, models: List[s
 
     p_on_time = round(sum(1 for x in lates if x <= 0) / len(lates), 3)
     p_late7 = round(sum(1 for x in lates if x > 7) / len(lates), 3)
+    p10, p50, p90 = pct(0.10), pct(0.50), pct(0.90)
+
+    def _gap_days(earlier: Dict[str, Any], later: Dict[str, Any]) -> int:
+        return (date.fromisoformat(str(later["finish_date"]))
+                - date.fromisoformat(str(earlier["finish_date"]))).days
+    p90_p50 = _gap_days(p50, p90)
+    p50_p10 = _gap_days(p10, p50)
     by_att: Dict[float, List[float]] = {}
     for r in dated:
         by_att.setdefault(float(r["attendance"]), []).append(float(r["days_late_worst"] or 0))
     return {
         "status": "ok", "factory_id": factory_id, "models": models, "policy": policy_name,
         "samples": samples, "seed": seed, "with_date": len(dated), "no_date": len(rows) - len(dated),
-        "promise_date": str(due), "percentiles": [pct(0.10), pct(0.50), pct(0.90)],
+        "promise_date": str(due), "percentiles": [p10, p50, p90],
+        "p90_p50_gap_days": p90_p50, "p50_p10_gap_days": p50_p10,
         "p_on_time": p_on_time, "p_late_gt_7_days": p_late7,
         "days_late_min": min(lates), "days_late_max": max(lates),
         "rough_days": round(max(lates) - min(lates), 1),
@@ -673,9 +685,10 @@ def _risk_summary(rows: List[Dict[str, Any]], *, factory_id: str, models: List[s
         "bands_used": bands, "basis": with_date_note,
         "how_to_quote": ("引用时给 P50、P90 与准点概率三件；P90 与 P50 差几天就是这条交期的毛边，"
                          "只报 P50 等于把毛边藏起来"),
-        "reading": (f"{samples} 抽 {len(dated)} 次有完工日：P50={pct(0.50)['finish_date']}、"
-                    f"P90={pct(0.90)['finish_date']}（承诺 {due}）；准点概率 {p_on_time:.0%}，"
-                    f"延超过 7 天概率 {p_late7:.0%}；延误跨度 {min(lates):g}~{max(lates):g} 天"),
+        "reading": (f"{samples} 抽 {len(dated)} 次有完工日：P50={p50['finish_date']}、"
+                    f"P90={p90['finish_date']}（承诺 {due}）；毛边 P90−P50 = {p90_p50} 天；"
+                    f"准点概率 {p_on_time:.0%}，延超过 7 天概率 {p_late7:.0%}；"
+                    f"延误跨度 {min(lates):g}~{max(lates):g} 天"),
     }
 
 
@@ -725,6 +738,58 @@ def _paired_delta(base_rows: List[Dict[str, Any]], other_rows: List[Dict[str, An
                      "只看两个分布的分位数相减会把这两种情况抹平")}
 
 
+async def _risk_setup(db: AsyncSession, factory_id: str, models: List[str], *,
+                      days_of_output: float = 6.0, lead_margin: Optional[float] = None,
+                      samples: int = 48, seed: int = 20261008) -> Dict[str, Any]:
+    """抽样前的全部依据：目标单、每台机自己的带宽、设备实测率、固定抽次序列。
+
+    交期分布和数据修复实验必须共用这一份，否则两边的毛边不是同一条抽样序列，
+    差值就掺了抽样噪声。
+    """
+    margin = lead_margin if lead_margin is not None else vr.PROMISE_LEAD_MARGIN
+    n = max(6, min(200, int(samples)))
+    targets = await vr.derive_targets(db, factory_id, models,
+                                      days_of_output=days_of_output, lead_margin=margin)
+    base_eq = float((await vr.equipment_rate(db, factory_id)).get("rate") or 1.0)
+    acc = await mapping_accuracy(db, factory_id, models)
+    per_model = acc.get("models") or []
+    worst_hours = max(per_model, key=lambda m: float(m.get("hours_error_band") or 0.0),
+                      default=None) if per_model else None
+    hours_band = float((worst_hours or {}).get("hours_error_band") or 0.0) if worst_hours else 0.0
+    lead_covs = [float(((m.get("components") or {}).get("lead_time") or {}).get("score") or 0)
+                 for m in per_model]
+    lead_cov = min(lead_covs) if lead_covs else 0.0
+    lead_band = lead_error_band(lead_cov) if lead_covs else 0.20
+    return {"targets": targets, "base_equip": base_eq, "n": n, "seed": seed,
+            "lead_band": round(lead_band, 3), "hours_band": round(hours_band, 3),
+            "lead_coverage": round(lead_cov, 3),
+            "hours_basis": str((((worst_hours or {}).get("components") or {}).get("hours") or {})
+                               .get("basis") or "—"),
+            "bands": {"purchase_lead_time": round(lead_band, 3), "unit_work_hours": round(hours_band, 3),
+                      "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS),
+                      "equipment_plus_minus": 0.02},
+            "draws": _risk_draws(n, seed, lead_band=lead_band, hours_band=hours_band,
+                                 base_equip=base_eq)}
+
+
+async def _sample_rows(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
+                       one_policy: Dict[str, Any], draws: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按给定抽次序列逐抽推演一次（同序，所以两条政策/两种带宽的行能逐抽相减）。"""
+    rows: List[Dict[str, Any]] = []
+    for d in draws:
+        perturb = {k: v for k, v in d.items() if k != "attendance"}
+        m = await _run_one(db, factory_id, targets, one_policy,
+                           attendance=d["attendance"], perturb=perturb)
+        rows.append({"attendance": d["attendance"], **perturb, "binding": m.get("binding"),
+                     "finish_date": m.get("finish_date"),
+                     "days_late_worst": (float(m["days_late_worst"])
+                                         if m.get("days_late_worst") is not None else None),
+                     "labor_cost_usd": m.get("labor_cost_usd"),
+                     "expedite_cost_usd": m.get("expedite_cost_usd"),
+                     "line_activation_cost_usd": m.get("line_activation_cost_usd")})
+    return rows
+
+
 async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
                         days_of_output: float = 6.0, lead_margin: Optional[float] = None,
                         policy: Optional[Dict[str, Any]] = None, samples: int = 48,
@@ -741,38 +806,16 @@ async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
     它们与基准共用同一串抽样，返回里给出同序配对的"每天数收窄"与中位多花的钱 ——
     这才是"这笔加急费买到的毛边收窄几天"。
     """
-    margin = lead_margin if lead_margin is not None else vr.PROMISE_LEAD_MARGIN
     pol = policy or {"name": "基准政策（分批开工）", "allow_partial": True}
-    n = max(6, min(200, int(samples)))
-    targets = await vr.derive_targets(db, factory_id, models,
-                                      days_of_output=days_of_output, lead_margin=margin)
-    base_eq = float((await vr.equipment_rate(db, factory_id)).get("rate") or 1.0)
-    acc = await mapping_accuracy(db, factory_id, models)
-    per_model = acc.get("models") or []
-    hours_band = max([float(m.get("hours_error_band") or 0.0) for m in per_model] or [0.0])
-    lead_band = max([lead_error_band(float((m.get("components") or {}).get("lead_time", {})
-                                         .get("score") or 0)) for m in per_model] or [0.20])
-    bands = {"purchase_lead_time": round(lead_band, 3), "unit_work_hours": round(hours_band, 3),
-             "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS), "equipment_plus_minus": 0.02}
+    setup = await _risk_setup(db, factory_id, models, days_of_output=days_of_output,
+                              lead_margin=lead_margin, samples=samples, seed=seed)
+    n, bands = setup["n"], setup["bands"]
     basis_note = ("提前期按 lead_error_band(覆盖率)、工时按每台机自己的 hours_error_band，"
                   "两者都取这批里最差的那条；到岗按天气标定三档离散抽；设备可用率=台账实测 ±2pp。"
                   "没有引入新的分布假设，种子固定可重算。")
-    draws = _risk_draws(n, seed, lead_band=lead_band, hours_band=hours_band, base_equip=base_eq)
 
     async def sample(one_policy: Dict[str, Any]) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        for d in draws:
-            perturb = {k: v for k, v in d.items() if k != "attendance"}
-            m = await _run_one(db, factory_id, targets, one_policy,
-                               attendance=d["attendance"], perturb=perturb)
-            rows.append({"attendance": d["attendance"], **perturb, "binding": m.get("binding"),
-                         "finish_date": m.get("finish_date"),
-                         "days_late_worst": (float(m["days_late_worst"])
-                                             if m.get("days_late_worst") is not None else None),
-                         "labor_cost_usd": m.get("labor_cost_usd"),
-                         "expedite_cost_usd": m.get("expedite_cost_usd"),
-                         "line_activation_cost_usd": m.get("line_activation_cost_usd")})
-        return rows
+        return await _sample_rows(db, factory_id, setup["targets"], one_policy, setup["draws"])
 
     base_rows = await sample(pol)
     out = _risk_summary(base_rows, factory_id=factory_id, models=models, policy_name=pol["name"],
@@ -813,3 +856,221 @@ async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
         comparisons.append(entry)
     out["against"] = comparisons
     return out
+
+
+# 数据修复实验：毛边不是只能"接受"，它由几条已声明的误差带撑着。
+# 把其中一条按现场能做到的下限收窄，同一串抽样重跑一次 —— 窄下来的天数就是这张数据的报价。
+BAND_KEY = {"purchase_lead_time": "lead_multiplier", "unit_work_hours": "hours_multiplier",
+            "equipment_availability": "equip_rate", "crew_attendance": "attendance"}
+
+DATA_REPAIR_TARGETS: List[Dict[str, Any]] = [
+    {"input": "purchase_lead_time", "label": "外购提前期逐料号实测", "repairable": True,
+     "floor_band": 0.20, "floor_note": "覆盖率≥80% 时 lead_error_band 的底线就是 ±20%",
+     "evidence_meaning": "覆盖率统计的是外购料号有没有提前期那个数（铺进去的默认值也算有数），"
+                         "不是这一单量过没量过",
+     "how": "把请购→到货的实测提前期按料号回填，替掉铺进去的默认值"},
+    {"input": "unit_work_hours", "label": "单件工时按 IE 实测填实", "repairable": True,
+     "floor_band": ERROR_BAND["route_standard_hours"], "floor_note": "IE 声明工时的已声明误差 ±5%",
+     "evidence_meaning": "这条带宽取的是这批机型最差的那条工时依据"
+                         "（IE 声明 ±5%／借同族路线 ±40%／线节拍反推 ±30%）",
+     "how": "借同族路线（±40%）或线节拍反推（±30%）的那批工序，换成自家路线的实测工时"},
+    {"input": "equipment_availability", "label": "设备可用率逐台按日打点", "repairable": True,
+     "floor_band": 0.0, "floor_note": "±2pp 之外厂里没有声明下限，所以这一档按归零算=乐观上界",
+     "evidence_meaning": "±2pp 是台账批量快照之间的抖动，不是逐台逐日量出来的",
+     "how": "台账里那 ±2pp 是批量快照的抖动，逐台按日打点后不再是估计"},
+    {"input": "crew_attendance", "label": "到岗波动（三档天气标定）", "repairable": False,
+     "floor_band": 0.0, "floor_note": "这不是数据：是天气/节假日的真实波动，修台账不动它",
+     "evidence_meaning": "三档是天气/季节标定的到岗档（0.97/0.92/0.70），不是某项数据的精度",
+     "how": "放进来只为了把毛边分成可修/不可修两半，不进修复优先级"},
+]
+
+
+def _rescale_draws(draws: List[Dict[str, Any]], base_equip: float,
+                   *, narrowed: Dict[str, float]) -> List[Dict[str, Any]]:
+    """把某些因子的抽样偏移按比例收窄，其余因子逐抽原样保留。
+
+    必须用**同一条随机序列**再乘比例，而不是重抽：重抽的话两次分布的差里混着抽样噪声，
+    看着就像"修数据买到了几天"。
+    """
+    out: List[Dict[str, Any]] = []
+    levels = sorted({d["attendance"] for d in draws})
+    median_level = levels[len(levels) // 2] if levels else 0.92
+    for d in draws:
+        e = dict(d)
+        for inp, keep in (narrowed or {}).items():
+            keep = float(keep)
+            if inp == "crew_attendance":
+                e["attendance"] = median_level
+            elif inp == "equipment_availability":
+                e["equip_rate"] = round(max(0.05, min(1.0,
+                                       base_equip + (float(d["equip_rate"]) - base_equip) * keep)), 4)
+            else:
+                key = BAND_KEY[inp]
+                e[key] = round(1.0 + (float(d[key]) - 1.0) * keep, 4)
+        out.append(e)
+    return out
+
+
+async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List[str], *,
+                                 samples: int = 24, seed: int = 20261008,
+                                 days_of_output: float = 6.0,
+                                 lead_margin: Optional[float] = None,
+                                 policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """逐条把误差带修到已声明的下限，重跑同一串抽样，报"这条数据值几天毛边"。
+
+    与 propagate_uncertainty 的区别要写清：那边是 |斜率|×带宽 的线性折算（只单条杠杆、
+    不含约束切换）；这里是真的把带宽改了再推演一遍，所以包含非线性，但只到"分布收窄"
+    这一层 —— 它不承诺修完数据交期就提前，只承诺同一条交期可信度变高。
+    """
+    pol = policy or {"name": "基准政策（分批开工）", "allow_partial": True}
+    setup = await _risk_setup(db, factory_id, models, days_of_output=days_of_output,
+                              lead_margin=lead_margin, samples=samples, seed=seed)
+    n, bands = setup["n"], setup["bands"]
+    basis_note = ("抽样序列与交期分布同一串（同 seed）；每条修复只改自己那条带宽，"
+                  "其余因子逐抽原样 —— 所以差值是这条数据的，不是抽样的。")
+
+    async def run(draws: List[Dict[str, Any]], name: str) -> Dict[str, Any]:
+        rows = await _sample_rows(db, factory_id, setup["targets"], pol, draws)
+        return _risk_summary(rows, factory_id=factory_id, models=models, policy_name=name,
+                             samples=n, seed=seed, bands=bands, with_date_note=basis_note)
+
+    base = await run(setup["draws"], pol["name"])
+    if base.get("status") != "ok":
+        return {**base, "repairs": [], "first_fix": None,
+                "reading": [f"数据修复实验没跑成：{base.get('why')} —— 抽不出完工日就无从比较带宽"]}
+
+    band_now = {"purchase_lead_time": setup["lead_band"], "unit_work_hours": setup["hours_band"],
+                "equipment_availability": bands["equipment_plus_minus"],
+                "crew_attendance": None}
+    cov_now = {"purchase_lead_time": setup["lead_coverage"], "unit_work_hours": setup["hours_basis"],
+               "equipment_availability": setup["base_equip"], "crew_attendance": None}
+
+    repairs: List[Dict[str, Any]] = []
+    for t in DATA_REPAIR_TARGETS:
+        inp = t["input"]
+        cur = band_now[inp]
+        entry = {"input": inp, "label": t["label"], "repairable": t["repairable"],
+                 "how": t["how"], "band_now": cur, "band_after": None,
+                 "current_evidence": cov_now[inp], "evidence_meaning": t["evidence_meaning"],
+                 "floor_note": t["floor_note"]}
+        if not t["repairable"]:
+            entry.update({"status": "not_repairable", "days_narrowed": None,
+                          "why": ("这一档不是数据带宽：到岗三档是天气/节假日的真实波动，"
+                                  "修台账不会让它变窄 —— 它只进可修/不可修那两半的账")})
+            repairs.append(entry)
+            continue
+        if cur is None or float(cur) <= float(t["floor_band"]):
+            entry.update({"status": "already_at_floor",
+                          "why": (f"这条带宽现在 ±{cur}，已经不在下限 ±{t['floor_band']} 之上 —— "
+                                  f"修它不会让毛边变窄，先去修别的那条（{t['evidence_meaning']}）"),
+                          "days_narrowed": 0.0})
+            repairs.append(entry)
+            continue
+        keep = float(t["floor_band"]) / float(cur)
+        after = await run(_rescale_draws(setup["draws"], setup["base_equip"], narrowed={inp: keep}),
+                          t["label"])
+        if after.get("status") != "ok":
+            entry.update({"status": "no_dates", "why": after.get("why"), "days_narrowed": None})
+            repairs.append(entry)
+            continue
+        entry.update({
+            "status": "ok", "band_after": t["floor_band"], "narrow_factor": round(keep, 3),
+            "rough_days_now": base["rough_days"], "rough_days_after": after["rough_days"],
+            "days_narrowed": round(float(base["rough_days"]) - float(after["rough_days"]), 1),
+            "gap_days_now": base["p90_p50_gap_days"], "gap_days_after": after["p90_p50_gap_days"],
+            "gap_days_narrowed": round(float(base["p90_p50_gap_days"])
+                                       - float(after["p90_p50_gap_days"]), 1),
+            "p_on_time_now": base["p_on_time"], "p_on_time_after": after["p_on_time"],
+            "on_time_uplift_pp": round(100.0 * (float(after["p_on_time"]) - float(base["p_on_time"])), 1),
+            "reading": after["reading"],
+        })
+        repairs.append(entry)
+
+    measurable = [t for t in DATA_REPAIR_TARGETS if t["repairable"]]
+    narrowed: Dict[str, float] = {}
+    for t in measurable:
+        cur = band_now[t["input"]]
+        if cur and float(cur) > float(t["floor_band"]):
+            narrowed[t["input"]] = float(t["floor_band"]) / float(cur)
+    floor = (await run(_rescale_draws(setup["draws"], setup["base_equip"], narrowed=narrowed),
+                       "三条可修数据同时到下限") if narrowed else None)
+    floor_ok = bool(floor and floor.get("status") == "ok")
+    gap_now = float(base["p90_p50_gap_days"])
+    gap_change = (round(gap_now - float(floor["p90_p50_gap_days"]), 1) if floor_ok else None)
+    decomposition = {
+        "rough_days_now": base["rough_days"], "gap_days_now": gap_now,
+        "gap_days_if_all_repaired": (float(floor["p90_p50_gap_days"]) if floor_ok else None),
+        "gap_change_if_all_repaired": gap_change,
+        "repairable_gap_days": (max(0.0, gap_change) if floor_ok else None),
+        "wider_by_days_if_all_repaired": (max(0.0, -gap_change) if floor_ok else None),
+        "not_repairable_gap_days": (float(floor["p90_p50_gap_days"]) if floor_ok else None),
+        "meaning": ("把可修的几条带宽一起压到已声明下限之后剩下的那几天，就是这套台账修不掉的毛边 —— "
+                    "它来自到岗真实波动与约束本身，不是数据质量问题。合修反而变宽时（这条不为负），"
+                    "说明带宽不是加性的：收窄一条会让约束换到另一条上"),
+    }
+    ranked = sorted([r for r in repairs if r.get("status") == "ok"],
+                    key=lambda r: -(r["gap_days_narrowed"] or 0))
+    pays = [r for r in ranked if (r["gap_days_narrowed"] or 0) > 0]
+    first = pays[0] if pays else None
+    lines = [
+        f"毛边构成：{n} 抽 P50={base['percentiles'][1]['finish_date']}、"
+        f"P90={base['percentiles'][2]['finish_date']} → 毛边 {base['p90_p50_gap_days']} 天"
+        f"（跨度 {base['rough_days']} 天）、准点概率 {base['p_on_time']:.0%}",
+    ]
+    if floor_ok and gap_change > 0:
+        lines.append(
+            f"可修/不可修：三条可修数据同时到下限 → 毛边 {gap_now:g} 天收窄到 "
+            f"{floor['p90_p50_gap_days']} 天，其中 {gap_change:g} 天是数据能修的"
+            f"（占 {gap_change / max(1.0, gap_now):.0%}），"
+            f"剩下 {floor['p90_p50_gap_days']} 天修台账不动它（到岗真实波动+约束本身）")
+    elif floor_ok and gap_change < 0:
+        lines.append(f"可修/不可修：三条同时到下限之后毛边反而宽了 {-gap_change:g} 天"
+                     f"（{gap_now:g}→{floor['p90_p50_gap_days']}）—— 带宽不是加性的，"
+                     f"收窄一条就有别的约束顶上来。这几天毛边不是这三条带宽造成的，"
+                     f"报'数据能修掉 X 天'在这份数据上就是假话")
+    elif floor_ok:
+        lines.append(f"可修/不可修：三条同时到下限，毛边 {gap_now:g} 天一天没窄 —— "
+                     f"这条毛边全在到岗真实波动与约束本身那一侧，不是测量误差")
+    elif not narrowed:
+        lines.append("可修/不可修：没有一条带宽在已声明下限之上，合修那一档就等于现在这条分布 —— "
+                     "这一层分不出可修/不可修，不给比例")
+    else:
+        lines.append("可修/不可修：合修那一档抽不出完工日 —— 单独每条的数在下面，合起来的数不给")
+    if pays:
+        lines.append("先修哪条（按窄下来的天数排序）：" + " ＞ ".join(
+            f"{r['label']}（带宽 ±{r['band_now']:.2f}→±{r['band_after']:.2f}，毛边窄 "
+            f"{r['gap_days_narrowed']:g} 天、准点 {r['on_time_uplift_pp']:+g}pp）" for r in pays))
+    else:
+        at_floor = [f"{r['label']} 带宽 ±{r['band_now']} 已经等于下限 ±{r['band_after'] or r['band_now']}"
+                    for r in repairs if r.get("status") == "already_at_floor"]
+        measured = [f"{r['label']} ±{r['band_now']:.2f}→±{r['band_after']:.2f} "
+                    + ("毛边没变" if not r["gap_days_narrowed"]
+                       else (f"反而宽 {-r['gap_days_narrowed']:g} 天" if r["gap_days_narrowed"] < 0
+                             else f"窄 {r['gap_days_narrowed']:g} 天"))
+                    for r in ranked]
+        parts = []
+        if at_floor:
+            parts.append("已经在下限的：" + "、".join(at_floor))
+        if measured:
+            parts.append("重跑过但压不动毛边的：" + "、".join(measured))
+        lines.append("先修哪条：没有一条数据能压掉毛边" + (" —— " + "；".join(parts) if parts else "")
+                     + "。要动的是约束口径，不是台账")
+    if first:
+        lines.append(f"这一条的依据：{first['how']}｜{first['floor_note']}")
+    zeroed = [r for r in repairs if r.get("status") == "ok" and (r["gap_days_narrowed"] or 0) < 0]
+    if zeroed:
+        lines.append("反向：" + "、".join(
+            f"{r['label']} 修到下限反而把毛边撑开 {-r['gap_days_narrowed']:g} 天（约束切换所致，"
+            f"不是算错）" for r in zeroed))
+    lines.append("这些带宽各自量的是什么：" + "；".join(
+        f"{r['label']}＝{r['evidence_meaning']}" for r in repairs if r.get("evidence_meaning")))
+    return {
+        "status": "ok", "factory_id": factory_id, "models": models, "policy": pol["name"],
+        "samples": n, "seed": seed, "bands_now": band_now, "evidence_now": cov_now,
+        "baseline": base, "repairs": repairs, "all_repaired": floor,
+        "decomposition": decomposition, "first_fix": first, "reading": lines,
+        "method": ("带宽改了再重跑同一串抽样，取 P90−P50 的差 = 这条数据的报价；"
+                   "与 propagate_uncertainty 的 |斜率|×带宽 线性折算不是同一个数（那个不含约束切换）"),
+        "claim_guard": ("修数据只把毛边变窄，不会把完工日提前 —— 报'省几天'之前要分清说的是毛边还是交期；"
+                        "下限之外厂里没有声明更准的数，所以归零那一档（设备）是乐观上界"),
+    }

@@ -1098,13 +1098,19 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "换算成'值几天、每天值多少钱、救回几台准点'；映射精度（每项输入有多少真依据、"
                 "允许误差多大）；以及误差传导 —— 现在这个交期可信到几成、把哪项数据补到可信能压掉几天。"
                 "误差传导之外还有两格：杠杆交互（两把钥匙是不是开同一把锁 —— 一起上减去各自上之和，"
-                "分可加/替代/互补），以及 with_schedule_risk=true 时的交期分布"
-                "（按已声明误差带抽 48 轮真跑，给 P50/P90 与准点概率）。"
+                "分可加/替代/互补），with_schedule_risk=true 时的交期分布"
+                "（按已声明误差带抽 48 轮真跑，给 P50/P90 与准点概率），以及 with_data_repair=true 时的"
+                "数据修复报价（把每条误差带单独修到已声明下限再重跑同一串抽样，报'这条数据值几天毛边'、"
+                "毛边里几天修得掉几天修不掉）。"
                 "用于'补 IE 工时值多少''加急值几天''该不该开第二条线''加班划不划算'"
-                "'这个交期有多可信''哪个杠杆最值钱''数据补齐能改善多少'类问题。不写任何系统。"),
+                "'这个交期有多可信''哪个杠杆最值钱''数据补齐能改善多少'"
+                "'先修哪条数据''修数据能把毛边压掉几天'类问题。不写任何系统。"),
             "parameters": {"type": "object", "properties": {
                 "with_schedule_risk": {"type": "boolean",
                                        "description": "要交期分布/准点概率时置 true（多花几十秒真跑 48 轮）"},
+                "with_data_repair": {"type": "boolean",
+                                     "description": ("要'先修哪条数据、修到下限能窄几天毛边'时置 true"
+                                                     "（每条带宽一趟抽样，比只出分布更慢）")},
             }},
         },
     },
@@ -3269,6 +3275,27 @@ async def _tool_query_bom_data_quality(
     }
 
 
+def _compact_data_repair(rep: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """聊天载荷只留报价本身：逐抽明细与 baseline 分布留给 /pmc 那一格，别把 jsonb 撑爆。"""
+    if not rep:
+        return None
+    if rep.get("status") != "ok":
+        return {"status": rep.get("status"), "why": rep.get("why"), "reading": rep.get("reading") or []}
+    first = rep.get("first_fix") or {}
+    return {
+        "status": "ok", "samples": rep.get("samples"), "seed": rep.get("seed"),
+        "bands_now": rep.get("bands_now"), "reading": rep.get("reading") or [],
+        "decomposition": rep.get("decomposition"),
+        "first_fix": {k: first.get(k) for k in ("label", "band_now", "band_after", "gap_days_narrowed",
+                                                "on_time_uplift_pp", "p_on_time_after", "how", "floor_note")},
+        "repairs": [{k: r.get(k) for k in ("input", "label", "status", "repairable", "band_now",
+                                           "band_after", "gap_days_narrowed", "on_time_uplift_pp",
+                                           "current_evidence", "evidence_meaning", "how", "why")}
+                    for r in rep.get("repairs") or []],
+        "method": rep.get("method"), "claim_guard": rep.get("claim_guard"),
+    }
+
+
 async def _tool_query_simulation_sensitivity(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3281,7 +3308,8 @@ async def _tool_query_simulation_sensitivity(
     if not models:
         return {"status": "ok", "factory_id": fid, "has_data": False,
                 "message": "厂区里没有可推演的机种（BOM 镜像为空？）"}
-    out = await report(db, fid, models, include_risk=bool(args.get("with_schedule_risk")))
+    out = await report(db, fid, models, include_risk=bool(args.get("with_schedule_risk")),
+                       include_repair=bool(args.get("with_data_repair")))
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3317,6 +3345,10 @@ async def _tool_query_simulation_sensitivity(
         "schedule_risk": (out.get("risk") or {}),
         "risk_not_sampled_because": (None if out.get("risk") else
                                      "没点要分布（with_schedule_risk=true 才抽样，一次 48 轮真跑）"),
+        "data_repair": _compact_data_repair(out.get("data_repair")),
+        "repair_not_sampled_because": (None if out.get("data_repair") else
+                                       "没点要修复报价（with_data_repair=true 才逐条带宽重跑，"
+                                       "一条带宽一趟抽样）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
                    "不确定天数 = |斜率| × (允许误差 ÷ 档位步长)，多项线性相加是保守口径；"
                    "所有档位都走同一条 scan_policies 推演路径，不另建第二套算法。"),
@@ -4398,7 +4430,8 @@ _TOOL_EXECUTORS = {
     "query_engine_capability_profile": _tool_query_engine_capability_profile,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
     "query_simulation_sensitivity": _tool_query_simulation_sensitivity,
-    "query_data_flow_profile": _tool_query_data_flow_profile,    "query_engine_attribution": _tool_query_engine_attribution,
+    "query_data_flow_profile": _tool_query_data_flow_profile,
+    "query_engine_attribution": _tool_query_engine_attribution,
     "query_chain_convergence": _tool_query_chain_convergence,
     "query_plan_commit_gate": _tool_query_plan_commit_gate,
     "query_shortage_alerts": _tool_query_shortage_alerts,
@@ -4910,6 +4943,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "tool": "query_simulation_sensitivity",
         "keywords": ["敏感度", "哪个杠杆", "杠杆交互", "组合拳", "可信到几成", "有多可信",
                      "准点概率", "几成概率", "交期分布", "分布", "P90", "P50", "毛边",
+                     "先修哪条", "修哪条数据", "数据修复", "修数据", "压毛边",
                      "sensitivity", "斜率"],
     },
     {
@@ -5562,6 +5596,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
     elif tool == "query_simulation_sensitivity":
         # 问"几成概率/分布/毛边"要的是抽样之后的日期分布；点估那一格答不了这种问法
         if any(k in message for k in ("概率", "几成", "分布", "P90", "P50", "毛边")):
+            args["with_schedule_risk"] = True
+        # "先修哪条数据"要的是逐条带宽重跑的报价，斜率/线性传导都给不出这个排序
+        if any(k in message for k in ("先修哪条", "修哪条", "数据修复", "修数据", "压毛边", "窄几天")):
+            args["with_data_repair"] = True
             args["with_schedule_risk"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
