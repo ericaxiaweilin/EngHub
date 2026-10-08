@@ -76,7 +76,8 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
     if not sols:
         return {"dated_models": 0, "finish_date": None, "blocked_models": [],
                 "labor_cost_usd": 0.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
-                "first_batch_units": 0.0, "waiting_for_material_units": 0.0}
+                "first_batch_units": 0.0, "waiting_for_material_units": 0.0,
+                "crew_before_staffing_sum": 0.0, "crew_effective_sum": 0.0}
     sol = sols[0]
     objs = sol.get("objectives") or {}
     detail = sol.get("detail") or []
@@ -101,6 +102,11 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
             "waiting_for_material_units": round(sum(float(d.get("batch_b_units") or 0) for d in detail), 2),
             "capacity_line_declared_max": max([float(d.get("capacity_line_declared") or 0) for d in detail] or [0.0]),
             "capacity_basis": sorted({str(d.get("capacity_basis")) for d in detail if d.get("capacity_basis")}),
+            # 人头按"每台机占用的班组"加总：同一条线被两台机共用会各算一次，口径是占用不是编外新增
+            "crew_before_staffing_sum": round(sum(
+                float((d.get("staffing") or {}).get("crew_before_staffing") or 0) for d in detail), 1),
+            "crew_effective_sum": round(sum(
+                float((d.get("staffing") or {}).get("crew_effective") or 0) for d in detail), 1),
             "blocked_models": blocked}
 
 
@@ -486,6 +492,7 @@ async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -
 
 async def report(db: AsyncSession, factory_id: str, models: List[str], *,
                  include_risk: bool = False, include_repair: bool = False,
+                 include_crew_margin: bool = False,
                  **kw: Any) -> Dict[str, Any]:
     acc = await mapping_accuracy(db, factory_id, models)
     sens = await sensitivity(db, factory_id, models, **kw)
@@ -510,11 +517,14 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], *,
                            "uncertainty 给这些数现在可信到几成、补哪项数据能压掉几天，"
                            "interactions 给两个杠杆一起上时多出来（或白花）的那部分，"
                            "risk（include_risk=true 时）给按已声明误差带抽出来的完工日分布，"
-                           "data_repair（include_repair=true 时）给每条误差带修到下限之后毛边窄几天。")}
+                           "data_repair（include_repair=true 时）给每条误差带修到下限之后毛边窄几天，"
+                           "crew_margin（include_crew_margin=true 时）给要加多少人才让 P90 也赶上承诺。")}
     if include_risk:
         out["risk"] = await schedule_risk(db, factory_id, models, **kw)
     if include_repair:
         out["data_repair"] = await data_repair_experiment(db, factory_id, models, **kw)
+    if include_crew_margin:
+        out["crew_margin"] = await crew_margin_for_p90(db, factory_id, models, **kw)
     return out
 
 
@@ -785,6 +795,8 @@ async def _sample_rows(db: AsyncSession, factory_id: str, targets: List[Dict[str
                      "days_late_worst": (float(m["days_late_worst"])
                                          if m.get("days_late_worst") is not None else None),
                      "labor_cost_usd": m.get("labor_cost_usd"),
+                     "crew_before_staffing_sum": m.get("crew_before_staffing_sum"),
+                     "crew_effective_sum": m.get("crew_effective_sum"),
                      "expedite_cost_usd": m.get("expedite_cost_usd"),
                      "line_activation_cost_usd": m.get("line_activation_cost_usd")})
     return rows
@@ -1074,3 +1086,194 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
         "claim_guard": ("修数据只把毛边变窄，不会把完工日提前 —— 报'省几天'之前要分清说的是毛边还是交期；"
                         "下限之外厂里没有声明更准的数，所以归零那一档（设备）是乐观上界"),
     }
+
+
+# 加多少人赶得上承诺 —— 这格必须逐档真跑：斜率那一格在好天档测出"加班 0 天"，
+# 而毛边几乎全来自暴雨档，所以"要不要加人"只能在抽过样的分布上判。
+CREW_LADDER = (0.10, 0.20, 0.30, 0.50, 0.75, 1.00)
+
+
+def _median(values: List[Any]) -> Optional[float]:
+    from statistics import median
+
+    vals = [float(v) for v in values if v is not None]
+    return round(float(median(vals)), 2) if vals else None
+
+
+def _paired_median_delta(base_rows: List[Dict[str, Any]], alt_rows: List[Dict[str, Any]],
+                         key: str) -> Optional[float]:
+    """同序配对的逐抽中位差（钱：alt−base，正数=多花；人头同理）。"""
+    from statistics import median
+
+    pairs = [(float(a.get(key) or 0), float(b.get(key) or 0)) for a, b in zip(base_rows, alt_rows)]
+    return round(float(median([b - a for a, b in pairs])), 2) if pairs else None
+
+
+def _p90(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return next((p for p in (summary.get("percentiles") or [])
+                 if int(p.get("percentile") or 0) == 90), {})
+
+
+async def crew_margin_for_p90(db: AsyncSession, factory_id: str, models: List[str], *,
+                              samples: int = 16, seed: int = 20261008,
+                              on_time_required: float = 0.90,
+                              ladder: Tuple[float, ...] = CREW_LADDER,
+                              days_of_output: float = 6.0,
+                              lead_margin: Optional[float] = None,
+                              policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """逐档加人（crew_bonus）在**同一串抽样**上真跑，找出第一个准点概率达标的档位。
+
+    报出来的档位必须自己就成立：给 k_min，同时给低一档 k_below 实测到达的准点概率，
+    这样"加 30% 人手"不是插值猜出来的。人头按向上取整报（人是整数，向下取整就少人了）。
+    加人买到的时间集中在暴雨档 —— 好天/雨季那两档卡的是线声明产能上限，这格把它分开报。
+    """
+    pol = policy or {"name": "基准政策（分批开工）", "allow_partial": True}
+    req = max(0.50, min(0.99, float(on_time_required)))
+    setup = await _risk_setup(db, factory_id, models, days_of_output=days_of_output,
+                              lead_margin=lead_margin, samples=samples, seed=seed)
+    n, bands = setup["n"], setup["bands"]
+    note = ("抽样与交期分布同一串（同 seed）；每档只改 crew_bonus，"
+            "到岗/提前期/工时/设备逐抽原样 —— 所以档位之间的差是人手的功劳。")
+
+    async def one(k: float) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        rows = await _sample_rows(db, factory_id, setup["targets"], {**pol, "crew_bonus": float(k)},
+                                  setup["draws"])
+        return rows, _risk_summary(rows, factory_id=factory_id, models=models,
+                                   policy_name=f"{pol['name']}＋加人 {k:.0%}", samples=n, seed=seed,
+                                   bands=bands, with_date_note=note)
+
+    base_rows, base = await one(0.0)
+    if base.get("status") != "ok":
+        return {**base, "ladder_tried": [], "verdict": "no_dates", "on_time_required": req,
+                "reading": [f"加人档位实验没跑成：{base.get('why')} —— 抽不出完工日就谈不上赶不赶得上"]}
+    base_heads = _median([r.get("crew_before_staffing_sum") for r in base_rows])
+    out: Dict[str, Any] = {"status": "ok", "factory_id": factory_id, "models": models,
+                           "samples": n, "seed": seed, "on_time_required": req,
+                           "promise_date": base["promise_date"],
+                           "baseline": {"p_on_time": base["p_on_time"],
+                                        "p90": _p90(base), "rough_days": base["rough_days"],
+                                        "crew_per_day": base_heads,
+                                        "by_attendance": base["by_attendance"]},
+                           "bands_used": bands, "ladder_tried": [], "verdict": None, "reading": []}
+
+    if float(base["p_on_time"]) >= req:
+        out["verdict"] = {"kind": "already_ok", "crew_bonus": 0.0,
+                          "note": f"不加人也已经 {base['p_on_time']:.0%} 准点（≥{req:.0%}）"}
+        out["reading"] = [f"准点概率已经 {base['p_on_time']:.0%} ≥ 要求的 {req:.0%} —— 不用加人；"
+                          f"要动的是别的（看毛边构成那一格）"]
+        return out
+
+    attempts: List[Dict[str, Any]] = []
+    reach_rows: Optional[List[Dict[str, Any]]] = None
+    reach_sum: Optional[Dict[str, Any]] = None
+    reach_k: Optional[float] = None
+    for k in ladder:
+        rows, s = await one(k)
+        if s.get("status") != "ok":
+            attempts.append({"crew_bonus": k, "status": s.get("status"), "why": s.get("why")})
+            continue
+        p90 = _p90(s)
+        rec = {"crew_bonus": k, "p_on_time": s["p_on_time"],
+               "p90_days_late": p90.get("days_late_worst"), "p90_finish_date": p90.get("finish_date"),
+               "rough_days": s["rough_days"],
+               "crew_per_day": _median([r.get("crew_before_staffing_sum") for r in rows]),
+               "median_extra_heads": _paired_median_delta(base_rows, rows, "crew_before_staffing_sum"),
+               "median_extra_labor_cost_usd": _paired_median_delta(base_rows, rows, "labor_cost_usd"),
+               "binding_seen": sorted({str(r.get("binding")) for r in rows if r.get("binding")}),
+               "by_attendance": s["by_attendance"], "reading": s["reading"]}
+        attempts.append(rec)
+        if float(s["p_on_time"]) >= req:
+            reach_rows, reach_sum, reach_k = rows, s, k
+            break
+
+    below = next((a for a in reversed(attempts[:-1]) if "p_on_time" in a), None)
+    if below is None:
+        below = {"crew_bonus": 0.0, "p_on_time": base["p_on_time"]}
+    def attendance_effect(rows_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        before = {float(x["attendance"]): float(x["mean_days_late"]) for x in base["by_attendance"]}
+        after = {float(x["attendance"]): float(x["mean_days_late"])
+                 for x in (rows_summary or {}).get("by_attendance") or []}
+        return [{"attendance": a, "days_late_before": before.get(a), "days_late_after": after.get(a),
+                 "days_bought": (round(before[a] - after[a], 2) if a in before and a in after else None)}
+                for a in sorted(set(before) | set(after))]
+
+    out["ladder_tried"] = attempts
+    if reach_sum is None:
+        rungs = [a for a in attempts if "p_on_time" in a]
+        top = rungs[-1] if rungs else None          # 最高那一档，不是"最不差"的那一档
+        binding = sorted({b for a in attempts for b in (a.get("binding_seen") or [])})
+        out["verdict"] = {
+            "kind": "not_crew_bound", "top_crew_bonus": (top or {}).get("crew_bonus", max(ladder)),
+            "best_p_on_time": max((float(a["p_on_time"]) for a in rungs), default=0.0),
+            "top_p_on_time": (top or {}).get("p_on_time"),
+            "top_p90_days_late": (top or {}).get("p90_days_late"),
+            "top_extra_heads_per_day": (top or {}).get("median_extra_heads"),
+            "top_median_extra_labor_cost_usd": (top or {}).get("median_extra_labor_cost_usd"),
+            "by_attendance_effect": attendance_effect(top or {}),
+            "binding_seen": binding,
+            "note": (f"加到 {(top or {}).get('crew_bonus', max(ladder)):.0%} 也只到 "
+                     f"{(top or {}).get('p_on_time', 0):.0%} 准点（要求 {req:.0%}）—— "
+                     f"这串抽样里卡的一直是 {'、'.join(binding) or '未明'}，不是人手不够")}
+        ladder_text = "、".join(
+            f"{float(a['crew_bonus']):.0%}→{float(a['p_on_time']):.0%}"
+            for a in attempts if "p_on_time" in a)
+        moved = [h for h in out["verdict"]["by_attendance_effect"] if (h["days_bought"] or 0) > 0]
+        spread = (max(h["days_late_before"] for h in out["verdict"]["by_attendance_effect"]
+                      if h.get("days_late_before") is not None)
+                  - min(h["days_late_before"] for h in out["verdict"]["by_attendance_effect"]
+                        if h.get("days_late_before") is not None)
+                  if out["verdict"]["by_attendance_effect"] else 0.0)
+        out["reading"] = [
+            f"加人解不到：加到 {(top or {}).get('crew_bonus', max(ladder)):.0%}"
+            f"（每天多 {(top or {}).get('median_extra_heads') or 0:g} 人、中位人工多 "
+            f"${(top or {}).get('median_extra_labor_cost_usd') or 0:,.0f}/批）"
+            f"仍然只 {(top or {}).get('p_on_time', 0):.0%} 准点，P90 还延 "
+            f"{(top or {}).get('p90_days_late')} 天｜这串抽样里卡的一直是 "
+            f"{'、'.join(binding) or '未明'} —— 是料与线声明产能的上限，不是班组人数",
+            f"准点概率随加人：{ladder_text or '没有一档出得了完工日'}",
+            "加人买到的时间在哪儿：" + ("、".join(
+                f"{h['attendance']:.2f} 档 延 {h['days_late_before']}→{h['days_late_after']} 天"
+                f"（买到 {h['days_bought']:g} 天）" for h in moved)
+                if moved else (
+                    f"哪一档都没买到 —— 各档延误在加人前后一模一样。补一句：到岗本身确实改延误"
+                    f"（这批里最紧档与最松档差 {spread:g} 天），但加人换不回来 —— "
+                    f"到岗影响交期走的不是『班组人数×单件工时』这条通道，具体哪一条还得再核")),
+        ]
+        return out
+
+    reach_heads = _median([r.get("crew_before_staffing_sum") for r in reach_rows or []])
+    from math import ceil
+
+    extra_heads = int(ceil(max(0.0, float(reach_heads or 0) - float(base_heads or 0))))
+    extra_cost = _paired_median_delta(base_rows, reach_rows or [], "labor_cost_usd")
+    below_txt = f"低一档 {below['crew_bonus']:.0%} 实测只到 {below['p_on_time']:.0%} 准点"
+    helps = attendance_effect(reach_sum)
+    out["verdict"] = {
+        "kind": "found", "crew_bonus": reach_k, "below_crew_bonus": (below or {}).get("crew_bonus"),
+        "below_p_on_time": (below or {}).get("p_on_time"),
+        "p_on_time_at_level": reach_sum["p_on_time"],
+        "p90_days_late_at_level": _p90(reach_sum).get("days_late_worst"),
+        "p90_finish_date_at_level": _p90(reach_sum).get("finish_date"),
+        "crew_per_day_at_level": reach_heads, "extra_heads_per_day": extra_heads,
+        "median_extra_labor_cost_usd": extra_cost, "by_attendance_effect": helps,
+        "note": (f"加 {reach_k:.0%} 人手把准点概率抬到 {reach_sum['p_on_time']:.0%}（要求 {req:.0%}）；"
+                 f"{below_txt} —— 报 {reach_k:.0%} 是因为它自己就成立")}
+    out["reading"] = [
+        f"现状：{n} 抽准点概率 {base['p_on_time']:.0%}（要求 ≥{req:.0%}），P90 完工 "
+        f"{_p90(base).get('finish_date')}（延 {_p90(base).get('days_late_worst')} 天，承诺 "
+        f"{base['promise_date']}），班组每天到站中位 {base_heads:g} 人",
+        f"赶得上要加：人手 +{reach_k:.0%} ＝ 每天多 {extra_heads} 人（{base_heads:g}→{reach_heads:g} 人），"
+        f"准点概率到 {reach_sum['p_on_time']:.0%}；{below_txt}",
+        f"这档的钱：人工中位多花 ${extra_cost or 0:,.0f}/批｜口径：收益侧未建模，只有成本差值"
+        f"（$30/人日·标定），不构成投资回报",
+        "加人买到的时间在哪儿：" + "、".join(
+            f"{h['attendance']:.2f} 档 延 {h['days_late_before']}→{h['days_late_after']} 天"
+            + (f"（买到 {h['days_bought']:g} 天）" if (h['days_bought'] or 0) > 0 else "（买不到）")
+            for h in helps) + " —— 到岗高的那档买不到，是因为它卡在线声明产能上限",
+    ]
+    out["method"] = ("逐档真跑同一串抽样的 crew_bonus，报第一个达标档位并附低一档的实测读数；"
+                     "人头按占用班组加总（同线被两台机共用会各算一次），向上取整")
+    out["claim_guard"] = ("这是'要让 P90 也赶上承诺'的人手余量，不是'加人就能提前'——"
+                          "好天档加人不换时间；钱只是人工成本差值，收益侧未建模")
+    return out
+

@@ -1101,16 +1101,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "分可加/替代/互补），with_schedule_risk=true 时的交期分布"
                 "（按已声明误差带抽 48 轮真跑，给 P50/P90 与准点概率），以及 with_data_repair=true 时的"
                 "数据修复报价（把每条误差带单独修到已声明下限再重跑同一串抽样，报'这条数据值几天毛边'、"
-                "毛边里几天修得掉几天修不掉）。"
+                "毛边里几天修得掉几天修不掉），以及 with_crew_margin=true 时的"
+                "人手余量（逐档加人在同一串抽样上真跑，报'要加百分之几人手、每天多几个人，"
+                "才让 P90 也赶上承诺'，并给低一档实测到达的准点概率）。"
                 "用于'补 IE 工时值多少''加急值几天''该不该开第二条线''加班划不划算'"
                 "'这个交期有多可信''哪个杠杆最值钱''数据补齐能改善多少'"
-                "'先修哪条数据''修数据能把毛边压掉几天'类问题。不写任何系统。"),
+                "'先修哪条数据''修数据能把毛边压掉几天''赶得上这单要加多少人''加人行不行'类问题。"
+                "不写任何系统。"),
             "parameters": {"type": "object", "properties": {
                 "with_schedule_risk": {"type": "boolean",
                                        "description": "要交期分布/准点概率时置 true（多花几十秒真跑 48 轮）"},
                 "with_data_repair": {"type": "boolean",
                                      "description": ("要'先修哪条数据、修到下限能窄几天毛边'时置 true"
                                                      "（每条带宽一趟抽样，比只出分布更慢）")},
+                "with_crew_margin": {"type": "boolean",
+                                     "description": ("要'赶得上要加多少人手'时置 true"
+                                                     "（最多 6 档 × 16 抽逐档真跑）")},
             }},
         },
     },
@@ -3296,6 +3302,19 @@ def _compact_data_repair(rep: Optional[Dict[str, Any]]) -> Optional[Dict[str, An
     }
 
 
+def _compact_crew_margin(margin: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """加人档位那一格只留结论与逐档读数，逐抽明细不进聊天载荷。"""
+    if not margin:
+        return None
+    if margin.get("status") != "ok":
+        return {"verdict": margin.get("verdict"), "why": margin.get("why"),
+                "reading": margin.get("reading") or [], "samples": margin.get("samples")}
+    return {k: margin.get(k) for k in ("status", "factory_id", "models", "samples", "seed",
+                                       "on_time_required", "promise_date", "baseline",
+                                       "ladder_tried", "verdict", "reading", "method",
+                                       "claim_guard")}
+
+
 async def _tool_query_simulation_sensitivity(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3309,7 +3328,8 @@ async def _tool_query_simulation_sensitivity(
         return {"status": "ok", "factory_id": fid, "has_data": False,
                 "message": "厂区里没有可推演的机种（BOM 镜像为空？）"}
     out = await report(db, fid, models, include_risk=bool(args.get("with_schedule_risk")),
-                       include_repair=bool(args.get("with_data_repair")))
+                       include_repair=bool(args.get("with_data_repair")),
+                       include_crew_margin=bool(args.get("with_crew_margin")))
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3349,6 +3369,9 @@ async def _tool_query_simulation_sensitivity(
         "repair_not_sampled_because": (None if out.get("data_repair") else
                                        "没点要修复报价（with_data_repair=true 才逐条带宽重跑，"
                                        "一条带宽一趟抽样）"),
+        "crew_margin": _compact_crew_margin(out.get("crew_margin")),
+        "margin_not_sampled_because": (None if out.get("crew_margin") else
+                                       "没点要人手余量（with_crew_margin=true 才逐档加人真跑）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
                    "不确定天数 = |斜率| × (允许误差 ÷ 档位步长)，多项线性相加是保守口径；"
                    "所有档位都走同一条 scan_policies 推演路径，不另建第二套算法。"),
@@ -4944,6 +4967,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "keywords": ["敏感度", "哪个杠杆", "杠杆交互", "组合拳", "可信到几成", "有多可信",
                      "准点概率", "几成概率", "交期分布", "分布", "P90", "P50", "毛边",
                      "先修哪条", "修哪条数据", "数据修复", "修数据", "压毛边",
+                     "加多少人", "要加几个人", "加人行不行", "人手余量", "排班余量", "赶得上要",
                      "sensitivity", "斜率"],
     },
     {
@@ -5601,6 +5625,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if any(k in message for k in ("先修哪条", "修哪条", "数据修复", "修数据", "压毛边", "窄几天")):
             args["with_data_repair"] = True
             args["with_schedule_risk"] = True
+        # "赶得上要加多少人"是分布上的问题：单杠杆斜率在好天档测出"加班 0 天"，答不了这一格
+        if any(k in message for k in ("加多少人", "要加几个人", "加人行不行", "人手余量",
+                                      "排班余量", "赶得上要", "几人赶得上")):
+            args["with_crew_margin"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
         flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)

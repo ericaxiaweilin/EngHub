@@ -644,3 +644,126 @@ def test_data_repair_chat_answer_names_the_first_fix():
     assert "没跑成 —— 抽到的每一轮都推不出完工日" in refuse
     assert "先修哪条" not in refuse, "没跑成就不许摆出一张优先级"
 
+
+
+def test_metrics_exposes_the_crew_it_actually_used():
+    """人头要出自推演结果里那台机占用的班组，不是台账上写的在册数。"""
+    detail = [{"model_code": "M-1", "finish_date": "2026-11-05",
+               "staffing": {"crew_before_staffing": 120.0, "crew_effective": 100.0}},
+              {"model_code": "M-2", "finish_date": "2026-11-06",
+               "staffing": {"crew_before_staffing": 80.0, "crew_effective": 60.0}}]
+    sol = {"objectives": {"days_late_worst": 4.0, "on_time_rate": 0.0, "labor_cost_usd": 1000.0,
+                          "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0},
+           "detail": detail}
+    scan = {"by_scenario": {"基准": {"solutions": [sol]}}}
+    m = ss._metrics(scan)
+    assert m["crew_before_staffing_sum"] == 200.0 and m["crew_effective_sum"] == 160.0
+    assert ss._metrics({"by_scenario": {"基准": {"solutions": []}}})["crew_before_staffing_sum"] == 0.0
+
+
+def _crew_env(monkeypatch, *, effect=3.0, floor_shift=18.0):
+    from datetime import date, timedelta
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 60.0, "hours_error_band": 0.05,
+                            "components": {"lead_time": {"score": 1.0},
+                                           "hours": {"score": 1.0, "basis": "route_standard_hours"}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        k = float((policy or {}).get("crew_bonus") or 0)
+        p = perturb or {}
+        late = round(20.0 * float(p.get("lead_multiplier", 1.0)) * (2.0 - float(attendance))
+                     / (1.0 + effect * k) - floor_shift, 1)
+        return {"finish_date": str(date(2026, 12, 1) + timedelta(days=int(late))),
+                "days_late_worst": late, "labor_cost_usd": round(1000.0 + 800.0 * k, 2),
+                "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                "binding": "material_arrival",
+                "crew_before_staffing_sum": round(100.0 * (1.0 + k), 1),
+                "crew_effective_sum": round(100.0 * (1.0 + k) * float(attendance), 1)}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+
+def test_crew_margin_reports_the_rung_that_actually_holds(monkeypatch):
+    import asyncio
+
+    _crew_env(monkeypatch)
+    out = asyncio.run(ss.crew_margin_for_p90(None, "FAC", ["M-1"], samples=24, seed=9))
+    assert out["status"] == "ok" and out["verdict"]["kind"] == "found"
+    v = out["verdict"]
+    assert v["p_on_time_at_level"] >= out["on_time_required"], "报出的档位必须自己就达标"
+    assert (v["below_p_on_time"] or 0) < out["on_time_required"], "低一档要真的不达标，否则报高了"
+    assert v["crew_bonus"] == max(a["crew_bonus"] for a in out["ladder_tried"])
+    assert v["extra_heads_per_day"] == int(v["crew_per_day_at_level"] - out["baseline"]["crew_per_day"])
+    assert v["median_extra_labor_cost_usd"] > 0
+    assert any("赶得上要加" in x for x in out["reading"]) and any("低一档" in x for x in out["reading"])
+    assert any("加人买到的时间在哪儿" in x for x in out["reading"])
+    assert "这是'要让 P90 也赶上承诺'" in out["claim_guard"]
+
+
+def test_crew_margin_says_so_when_people_are_not_the_binding_thing(monkeypatch):
+    """加满也达不到 → 不许报'再加点'，要报名字：这串抽样里卡的是什么。"""
+    import asyncio
+
+    _crew_env(monkeypatch, effect=0.0)
+    out = asyncio.run(ss.crew_margin_for_p90(None, "FAC", ["M-1"], samples=16, seed=4))
+    v = out["verdict"]
+    assert v["kind"] == "not_crew_bound" and v["top_crew_bonus"] == max(ss.CREW_LADDER)
+    assert v["binding_seen"] == ["material_arrival"]
+    assert len(out["ladder_tried"]) == len(ss.CREW_LADDER)
+    # "每天多几人"要说最高那一档的人头，不是第一个并列档位（这里 100% → 100 人）
+    assert v["top_extra_heads_per_day"] == 100.0
+    assert v["top_median_extra_labor_cost_usd"] > 0
+    assert any("加人解不到" in x and "100 人" in x for x in out["reading"])
+    assert any("加人买到的时间在哪儿" in x and "哪一档都没买到" in x for x in out["reading"])
+    flat = [x for x in out["reading"] if "加人买到的时间在哪儿" in x][0]
+    assert "到岗本身确实改延误" in flat and "还得再核" in flat, "不许把'加人没用'说成'到岗没用'"
+    assert "→" in [x for x in out["reading"] if "准点概率随加人" in x][0]
+
+
+def test_crew_margin_does_not_ask_for_people_it_does_not_need(monkeypatch):
+    import asyncio
+
+    _crew_env(monkeypatch, effect=3.0, floor_shift=60.0)   # 现况就已经全部准点
+    out = asyncio.run(ss.crew_margin_for_p90(None, "FAC", ["M-1"], samples=10, seed=2))
+    assert out["verdict"]["kind"] == "already_ok" and out["ladder_tried"] == []
+    assert any("不用加人" in x for x in out["reading"])
+
+
+def test_crew_margin_chat_answer_names_heads_and_the_refusal(monkeypatch):
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    found = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+             "crew_margin": {"status": "ok", "on_time_required": 0.9, "samples": 24,
+                             "baseline": {"p_on_time": 0.12, "crew_per_day": 412.0},
+                             "verdict": {"kind": "found", "crew_bonus": 0.2,
+                                         "extra_heads_per_day": 83, "crew_per_day_at_level": 494.4,
+                                         "p_on_time_at_level": 0.92, "below_crew_bonus": 0.1,
+                                         "below_p_on_time": 0.54}}}
+    text = _format_sensitivity_reply(found)
+    assert "赶得上要加：人手 +20%＝每天多 83 人" in text and "12%→92%" in text
+    assert "低一档 10% 实测只到 54%" in text
+
+    refused = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+               "crew_margin": {"status": "ok", "on_time_required": 0.9,
+                               "baseline": {"p_on_time": 0.0, "crew_per_day": 412.0},
+                               "verdict": {"kind": "not_crew_bound", "top_crew_bonus": 1.0,
+                                           "top_p_on_time": 0.0, "top_p90_days_late": 31.0,
+                                           "top_extra_heads_per_day": 412,
+                                           "binding_seen": ["line_declared"]}}}
+    t2 = _format_sensitivity_reply(refused)
+    assert "加人解不到：加到 100%（每天多 412 人）仍只 0% 准点" in t2 and "line_declared" in t2
+    assert "赶得上要加" not in t2
+
+    not_run = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+               "margin_not_sampled_because": "没点要人手余量（with_crew_margin=true 才逐档加人真跑）"}
+    assert "没算 —— 没点要人手余量" in _format_sensitivity_reply(not_run)

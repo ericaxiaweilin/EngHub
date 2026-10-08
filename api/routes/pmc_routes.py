@@ -348,6 +348,9 @@ async def get_pmc_capabilities(
             {"key": "sim_data_repair",
              "name": "数据修复报价（每条误差带修到已声明下限后毛边窄几天、先修哪条、几天修不掉）",
              "path": "/api/v1/pmc/sim-data-repair", "mode": "read_only"},
+            {"key": "sim_crew_margin",
+             "name": "人手余量（要加百分之几人手、每天多几个人，才让 P90 赶上承诺；附低一档实测）",
+             "path": "/api/v1/pmc/sim-crew-margin", "mode": "read_only"},
             {"key": "data_flow_profile",
              "name": "数据流节点剖面（台账/展开/推演三层各多少节点，按规模外推需要多少行）",
              "path": "/api/v1/pmc/data-flow-profile", "mode": "read_only"},
@@ -817,6 +820,7 @@ async def get_sim_sensitivity(
     n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
     include_risk: bool = Query(False, description="true 时顺带给交期分布（多花几十秒）"),
     include_repair: bool = Query(False, description="true 时顺带给数据修复报价（每条带宽一趟抽样，更慢）"),
+    include_crew_margin: bool = Query(False, description="true 时顺带给人手余量（逐档加人真跑，最多 6 档）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -834,7 +838,7 @@ async def get_sim_sensitivity(
     if not models:
         raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
     return await report(db, factory_id, models, include_risk=include_risk,
-                       include_repair=include_repair)
+                       include_repair=include_repair, include_crew_margin=include_crew_margin)
 
 
 @router.get("/sim-data-repair", summary="数据修复报价：每条误差带修到已声明下限，毛边窄几天、先修哪条")
@@ -862,6 +866,36 @@ async def get_sim_data_repair(
         raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
     return await data_repair_experiment(db, factory_id, models,
                                         samples=max(6, min(60, int(samples))), seed=seed)
+
+
+@router.get("/sim-crew-margin", summary="人手余量：要加百分之几人手、每天多几个人，P90 才赶上承诺")
+async def get_sim_crew_margin(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(3, description="取 BOM 最完整的 n 个机种"),
+    samples: int = Query(16, description="每档抽几轮（6~40；最多 6 档，逐档真跑）"),
+    seed: int = Query(20261008, description="与交期分布同一串抽样的种子"),
+    on_time_required: float = Query(0.90, ge=0.5, le=0.99,
+                                    description="要求的准点概率（默认 P90 也赶上承诺）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把"要不要加班加人"换成分布上的档位：逐档加人在**同一串抽样**上真跑到第一个达标档位。
+
+    为什么不能看斜率那一格：单杠杆斜率是在好天档测的，那里产能被线声明的台/天卡住，
+    加人测出 0 天；而毛边几乎全来自暴雨档。所以这一格逐档真跑抽过样的分布。
+    报出的档位自己就成立（同时给低一档实测到达的准点概率）；人头按占用班组加总、向上取整。
+    加满仍达不到 → 明说卡的是料/线上限，不是人手。只读，不写任何表。
+    """
+    del current_user
+    from api.services.sim_sensitivity import crew_margin_for_p90
+    from api.services.virtual_run import default_models
+
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await crew_margin_for_p90(db, factory_id, models,
+                                     samples=max(6, min(40, int(samples))), seed=seed,
+                                     on_time_required=on_time_required)
 
 
 

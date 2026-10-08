@@ -1390,6 +1390,30 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
             lines.append(f"- 报价口径：{rep['method']}")
     elif rep:
         lines.append(f"- 数据修复报价：没跑成 —— {rep.get('why') or rep.get('status')}")
+    if result.get("margin_not_sampled_because"):
+        lines.append(f"- 人手余量：没算 —— {result['margin_not_sampled_because']}")
+    else:
+        margin = result.get("crew_margin") or {}
+        verdict = margin.get("verdict") or {}
+        if verdict.get("kind") == "found":
+            lines.append(
+                f"- 赶得上要加：人手 +{verdict.get('crew_bonus'):.0%}＝每天多 "
+                f"{verdict.get('extra_heads_per_day') or 0:g} 人（班组 "
+                f"{(margin.get('baseline') or {}).get('crew_per_day') or 0:g}→"
+                f"{verdict.get('crew_per_day_at_level') or 0:g} 人），准点概率 "
+                f"{margin.get('baseline', {}).get('p_on_time'):.0%}→{verdict.get('p_on_time_at_level'):.0%}"
+                f"（要求 {margin.get('on_time_required'):.0%}）；低一档 "
+                f"{verdict.get('below_crew_bonus'):.0%} 实测只到 {verdict.get('below_p_on_time'):.0%}")
+        elif verdict.get("kind") == "not_crew_bound":
+            lines.append(
+                f"- 加人解不到：加到 {verdict.get('top_crew_bonus'):.0%}（每天多 "
+                f"{verdict.get('top_extra_heads_per_day') or 0:g} 人）仍只 "
+                f"{verdict.get('top_p_on_time', 0):.0%} 准点（P90 仍延 {verdict.get('top_p90_days_late')} 天）"
+                f"｜卡的始终是 {'、'.join(verdict.get('binding_seen') or []) or '未明'}，不是班组人数")
+        elif verdict.get("kind") == "already_ok":
+            lines.append(f"- 人手余量：不用加 —— 已经 {margin.get('baseline', {}).get('p_on_time'):.0%} 准点")
+        elif margin:
+            lines.append(f"- 人手余量：没算成 —— {margin.get('why') or verdict.get('kind')}")
     lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
     for u in (result.get("uncertainty") or [])[:2]:
         lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"
