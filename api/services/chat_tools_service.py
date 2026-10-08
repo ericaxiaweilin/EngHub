@@ -3256,8 +3256,19 @@ async def _tool_query_simulation_recommendation(
 
     fid = factory_id or "FAC_MECH_001"
     out = await latest_tradeoff_state(db, fid)
+    from api.services.virtual_run import WEATHER_SCENARIOS, measured_attendance
+
+    att = await measured_attendance(db, fid)
+    # 记分卡的场景档是"声明的天气压力值"，台账量出来的常态到岗是另一个数；不写清楚就会被读成实测
+    scenario_attendance = [
+        {"scenario": sc["name"], "declared_attendance": float(sc.get("attendance", 0.97)),
+         "measured_normal": (att.get("present_ratio") if att.get("source") == "attendance_ledger" else None),
+         "gap_pp": (round((att["present_ratio"] - float(sc.get("attendance", 0.97))) * 100, 2)
+                    if att.get("source") == "attendance_ledger" else None)}
+        for sc in WEATHER_SCENARIOS]
     if out.get("status") == "no_card":
-        return {"status": "ok", "factory_id": fid, "has_card": False, **out}
+        return {"status": "ok", "factory_id": fid, "has_card": False,
+                "scenario_attendance": scenario_attendance, **out}
     ft = out.get("followthrough") or {}
     return {
         "status": "ok", "factory_id": fid, "has_card": True,
@@ -3270,6 +3281,13 @@ async def _tool_query_simulation_recommendation(
         "followthrough": ft,
         "followthrough_verdict": ft.get("verdict") or ft.get("note"),
         "by_scenario": out.get("by_scenario"),
+        "scenario_attendance": scenario_attendance,
+        "scenario_attendance_note": (
+            "场景里的到岗比例（好天/雨/暴雨）是「声明的压力测试档」，不是量出来的常态到岗；"
+            f"台账实测常态是 {att.get('present_ratio')}（{att.get('basis') or att.get('why') or '常数'}）。"
+            "两套数各管各的：档位用来比政策在不同天气下的排序，常态到岗才是这厂平时的可用人头。"
+            if att.get("source") == "attendance_ledger" else
+            f"场景到岗比例是声明档；这座厂没有台账缺勤率可对照（{att.get('basis')}）"),
         "scenario_divergence": out.get("scenario_divergence"),
         "promise_conclusion": out.get("promise_conclusion"),
         "robust_pool": out.get("robust_pool"),

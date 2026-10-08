@@ -1718,8 +1718,12 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                               float(busy_by_line[l["line_code"]]["busy_days"]))
     cache: Dict[str, Any] = {}
     grouped: Dict[str, Any] = {}
+    # 天气档的比例是**声明的压力测试值**；台账量出来的常态到岗是另一个数。
+    # 不重标定任何一档（标定是围绕可行率做的），但要把两者的差写进读数，
+    # 否则"好天 0.97"会被当成实测到岗读走。
+    measured = await measured_attendance(db, factory_id)
     for scen in scenarios:
-      curve = {d: float(scen.get("attendance", 0.97)) for d in range(0, 400)}
+      curve = {d: float(scen.get("attendance", DEFAULT_ATTENDANCE_RATE)) for d in range(0, 400)}
       # 每个天气场景可以用自己标定的目标（批量/交期系数），全局值兜底
       scen_targets = (targets_by_scenario or {}).get(scen["name"]) or targets
       demand_by_scenario[scen["name"]] = 0.0   # 逐政策算，只算"能推演的那部分需求"
@@ -1848,8 +1852,19 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         "po_lines": x["run"].get("po_lines"),
                         "bottleneck_part": x["run"].get("bottleneck_part")} for x in per_run],
         })
-      grouped[scen["name"]] = {"attendance": float(scen.get("attendance", 0.97)),
-                               "solutions": solutions}
+      ratio = float(scen.get("attendance", DEFAULT_ATTENDANCE_RATE))
+      grouped[scen["name"]] = {"attendance": ratio, "solutions": solutions,
+                               "attendance_kind": "declared_weather_stress",
+                               "measured_attendance": (measured.get("present_ratio")
+                                                       if measured.get("source") == "attendance_ledger"
+                                                       else None),
+                               "attendance_note": (
+                                   f"这一档 {ratio:g} 是声明的天气压力值，不是量出来的常态到岗；"
+                                   f"台账实测常态 {measured['present_ratio']:g}"
+                                   f"（差 {round((measured['present_ratio'] - ratio) * 100, 2)} 个百分点）"
+                                   if measured.get("source") == "attendance_ledger" else
+                                   f"这一档 {ratio:g} 是声明值；这座厂没有台账缺勤率可对照"
+                                   f"（退回常数 {DEFAULT_ATTENDANCE_RATE:g}）")}
     total = sum(len(v["solutions"]) for v in grouped.values())
     overlay = (await constraint_overlay(db, factory_id, targets, policies, lines)
                if with_constraints else None)
