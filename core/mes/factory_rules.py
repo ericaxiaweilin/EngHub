@@ -445,10 +445,33 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     我拿 capacity_per_hour 乘班时能出一个数，但那个数是我猜的单位口径，
     排产吃了它就是把猜测当事实。
     """
+    from core.mes.capacity_math import efficiency_basis_census
     from core.mes.data_evidence import line_claim_coverage
 
     cov = await line_claim_coverage(db, factory_id)
+    eff = await efficiency_basis_census(db, factory_id)
     out: List[Dict[str, Any]] = []
+    total_st = int(eff.get("active_stations") or 0)
+    if total_st and eff.get("all_unverified"):
+        out.append({
+            "topic": "station_efficiency_basis",
+            "question": ("排程用的工位效率是量过的，还是档案自动带的默认值？"
+                         f"（现在 {total_st} 个在册工位全是没验证的：占位 {eff.get('placeholder')}、"
+                         f"没填按 1.0 计 {eff.get('unset')}）"),
+            "what_records_say": (f"{eff.get('reading')}；涉及的工位："
+                                 + ('、'.join(str(x) for x in (eff.get('placeholder_stations') or [])) or '—')),
+            "already_computed": ("负荷、利用率、交期承诺都已经把 efficiency_rate 乘进分母"
+                                 "（core/mes/capacity_math.resolve_oee 一个口径：填了用填报值、"
+                                 "没填按不打折并标明是上界；以前 aps_service 另有两个分支各兜 0.85 与 0.9）"),
+            "why_it_matters": eff.get("consequence"),
+            "expected_answer": ("IE 逐工位量一次效率（或确认档案默认值就按它），写进 "
+                                "station_capacity.efficiency_rate 并填 verified_at —— 有 verified_at "
+                                "才算量过，这条会自动缩掉；不要用报工台账的 cycle_time_sec 反推，"
+                                "那批 production_reports 是仿真自写的行"),
+            "prefilled_evidence": {"used_values": eff.get("used_values") or [],
+                                   "verified": eff.get("verified"), "declared": eff.get("declared"),
+                                   "placeholder": eff.get("placeholder"), "unset": eff.get("unset")},
+        })
     if int(cov.get("unclaimed_models") or 0) > 0:
         codes = cov.get("unclaimed_codes") or []
         detail = cov.get("unclaimed_detail") or []

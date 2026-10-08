@@ -192,7 +192,8 @@ class PmcControlTowerService:
                 "materials": "BOM、工单物料和库存SKU分别计数；库存流水物料数用于判断历史控制证据。",
                 "shortage": "优先使用工单物料齐套记录的 shortage_qty；在途和PO只有供应表存在时才计入预计齐套。",
                 "otd": "已完工且 actual_complete 不晚于 planned_due 的订单 / 已完工订单；无销售订单时明确标记为工单口径。",
-                "capacity": "优先使用APS任务负荷；没有APS任务时使用工艺路线UHN与工位CPH估算，并标记partial。",
+                "capacity": ("优先使用APS任务负荷；没有APS任务时使用工艺路线UHN与工位CPH估算，并标记partial。"
+                             "负荷分母用的效率按 station_capacity 行分四类（验证过/填报/占位/没填），见 efficiency_basis"),
                 "rush": "插单先做只读影响评估（工时取路线标准工时或线节拍、产能取线台账并扣台账到岗），再走审批，审批执行后生成新的APS版本；本查询不修改排程。",
                 "engineering_change": "ECN记录、受影响工单标记和BOM版本分别核对；没有变更历史不推断已完成传播。",
                 "supplier_delay": "以PO expected_date与actual_date/status判断逾期；没有PO表或记录时明确为missing/zero。",
@@ -677,7 +678,7 @@ class PmcControlTowerService:
         """, {"fid": factory_id})
         capacity_rows = await self._rows("""
             SELECT station_id, available_hours_per_day, efficiency_rate,
-                   setup_time_minutes, max_concurrent_orders, source
+                   setup_time_minutes, max_concurrent_orders, source, verified_at, created_at
             FROM station_capacity
             WHERE factory_id = :fid AND is_active = TRUE
         """, {"fid": factory_id}) if self._has("station_capacity") else []
@@ -715,7 +716,7 @@ class PmcControlTowerService:
 
         # 分子用"落在班次里的实际工时"，不是 planned_end - planned_start 的墙钟跨度：
         # 跨班次连续排产之后墙钟含夜间与周末，是实际工时的 3~5 倍。
-        from core.mes.capacity_math import load_station_models
+        from core.mes.capacity_math import efficiency_basis_buckets, load_station_models
 
         station_codes = sorted({str(row.get("station_code")) for row in stations if row.get("station_code")})
         horizon_end = max((_date(row.get("planned_due")) for row in wo_rows if _date(row.get("planned_due"))),
@@ -788,6 +789,7 @@ class PmcControlTowerService:
             + ([] if calendar_count else ["aps_work_calendars:no_rows"]),
             "data_note": "有APS任务时使用实际任务负荷；没有APS任务时使用工艺UHN与已配置工位产能做理论评估，不代表已完成实际排程。未配置工作日历时，APS只使用兼容默认班次，不能作为正式承诺依据。",
             "load_source": "aps_schedule_tasks" if aps_rows else "routing_UHN_and_station_capacity" if capacity_rows else "routing_UHN_and_station_CPH",
+            "efficiency_basis": efficiency_basis_buckets(capacity_rows),
             "bottlenecks": bottlenecks, "stations": station_items,
             "balance_method": [
                 "按瓶颈工位利用率从高到低排序",

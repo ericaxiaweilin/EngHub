@@ -169,8 +169,12 @@ async def test_reschedule_delegates_to_generate_schedule(mock_aps_db):
 
 
 class _Model:
+    """StationModel 的替身：字段要跟真数据类一起走（漏字段就是假绿，读数的形状对不上）。"""
+
     daily_pieces = 10.0
     oee = 0.9
+    oee_kind = "declared"
+    oee_source = "station_capacity 填报 0.9（没有验证标记）"
     max_concurrent = 1
     calendar_source = "aps_work_calendars"
 

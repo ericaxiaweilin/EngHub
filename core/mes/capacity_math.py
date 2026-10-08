@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +31,119 @@ from sqlalchemy.exc import SQLAlchemyError
 from database.models import ApsHoliday, ApsSchedule, ApsWorkCalendar, Station
 
 Slot = Tuple[datetime.time, datetime.time]
+
+# 工位效率只有一个口径：台账填了就用填的值；没填按"不打折"(1.0) 计并把这是占位读法写进出处。
+# 以前同一个"没填"在一条排程链上被兜了三个数 —— aps_service 的两个分支各兜 0.85 与 0.9，
+# 本模块兜 1.0 —— 于是可用工时看代码走到哪个分支而定，界面只显示算出来的利用率。
+# 本厂没有实测效率（要 IE 量），所以这里不猜一个数代替：占位就是占位，读数里说清楚。
+NEUTRAL_OEE = 1.0
+PLACEHOLDER_SOURCES = frozenset({"derived_station_master", "auto", "system", "seed"})
+
+
+def _is_verified_later(row: Dict[str, Any]) -> bool:
+    """verified_at 只有在**晚于建行时间**时才算验证过。
+
+    实测：station_capacity 38 行的 verified_at 与 created_at 逐行相等（38/38），
+    source 全是 derived_station_master、note 写着"由 stations.capacity 推导；需业务确认" ——
+    那个时间戳是建行时一起写的。要是只看"verified_at 非空"，占位值会被读成"量过的"，
+    催办整格消失，这比不分类更糟。
+    """
+    stamp, created = row.get("verified_at"), row.get("created_at")
+    if not stamp:
+        return False
+    if created and stamp == created:
+        return False
+    return True
+
+
+def classify_oee(row: Optional[Dict[str, Any]]) -> str:
+    """这一行的效率是哪一类：verified / declared / placeholder / unset。分桶与读数都从这里取，
+    不在别处用字符串猜 —— 字符串一变分类就静默变错，那种错没人看得见。"""
+    data = row or {}
+    raw = data.get("efficiency_rate")
+    try:
+        value = float(raw) if raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        value = 0.0
+    if value <= 0:
+        return "unset"
+    if _is_verified_later(data):
+        return "verified"
+    if str(data.get("source") or "").strip() in PLACEHOLDER_SOURCES:
+        return "placeholder"
+    return "declared"
+
+
+def resolve_oee(row: Optional[Dict[str, Any]]) -> Tuple[float, str]:
+    """(效率, 出处)。出处要能被界面念出来：占位值不等于实测值。"""
+    data = row or {}
+    raw = data.get("efficiency_rate")
+    try:
+        value = float(raw) if raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        value = 0.0
+    kind = classify_oee(data)
+    if kind == "unset":
+        return NEUTRAL_OEE, "efficiency_rate 未填 → 按不打折 1.0 计（这是产能上界，不是量出来的效率）"
+    if kind == "verified":
+        return value, (f"station_capacity 填报 {value:g}，"
+                       f"{str(data.get('verified_at'))[:10]} 事后确认过（晚于建行时间）")
+    if kind == "placeholder":
+        return value, (f"station_capacity 的 {value:g} 是工位档案自动带出来的"
+                       f"（source={str(data.get('source') or '').strip()}）、未验证 → 只能当上界读")
+    return value, f"station_capacity 填报 {value:g}（没有验证标记）"
+
+
+def efficiency_basis_buckets(rows: Optional[Iterable[Dict[str, Any]]]) -> Dict[str, Any]:
+    """把 station_capacity 的行按"这个效率是怎么来的"分四类 —— 分桶口径只有这一处。
+
+    负荷与利用率的分母都来自这些数，所以"1.0"到底是量过的还是自动带的必须分得开：
+    排程按 100% 效率跑本身不算错，错在界面上没人知道那个 100% 是谁定的。
+    """
+    listed = [dict(r) for r in (rows or [])]
+    buckets: Dict[str, List[str]] = {"verified": [], "declared": [], "placeholder": [], "unset": []}
+    used: List[float] = []
+    for row in listed:
+        value, _ = resolve_oee(row)
+        key = classify_oee(row)
+        buckets[key].append(str(row.get("station_id") or "?"))
+        used.append(round(value, 4))
+    total = len(listed)
+    unverified = len(buckets["placeholder"]) + len(buckets["unset"])
+    return {
+        "active_stations": total,
+        "verified": len(buckets["verified"]),
+        "declared": len(buckets["declared"]),
+        "placeholder": len(buckets["placeholder"]),
+        "unset": len(buckets["unset"]),
+        "all_unverified": bool(total) and unverified == total,
+        "used_values": sorted(set(used)),
+        "placeholder_stations": sorted(buckets["placeholder"])[:12],
+        "reading": (f"{unverified}/{total} 个在册工位的排程效率不是量过的"
+                    f"（档案自动带的占位 {len(buckets['placeholder'])}、没填按不打折 1.0 计 {len(buckets['unset'])}）"
+                    f"；负荷分母实际用到的效率值只有 {sorted(set(used))}" if total
+                    else "station_capacity 里没有这个厂区的活跃行 → 负荷分母没有效率依据"),
+        "consequence": ("占位与未填都等于按 100% 效率排产：那是产能上界，不是可达产能 —— "
+                        "利用率因此偏低（看着还有余量）、交期因此偏乐观。"
+                        "本厂没有实测效率，引擎不猜一个数代替"),
+        "basis": ("resolve_oee()：efficiency_rate 填了用填报值；"
+                  "verified_at 要**晚于 created_at** 才算事后确认过（建行时一起写的时间戳不算验证）；"
+                  f"source 在 {sorted(PLACEHOLDER_SOURCES)} 里算档案自动生成的占位；"
+                  "没填按 1.0 并标明是上界"),
+    }
+
+
+async def efficiency_basis_census(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """按厂区读 station_capacity 再分桶（口径见 efficiency_basis_buckets）。"""
+    try:
+        rows = [dict(r) for r in (await db.execute(text(
+            "SELECT station_id, efficiency_rate, source, verified_at, created_at "
+            "FROM station_capacity "
+            "WHERE factory_id = :fid AND is_active = TRUE"
+        ), {"fid": factory_id})).mappings().all()]
+    except SQLAlchemyError:
+        rows = []
+    return efficiency_basis_buckets(rows)
 
 
 def _slot(start: datetime.time, end: datetime.time) -> Slot:
@@ -50,7 +163,9 @@ class StationModel:
     slots_by_weekday: Dict[int, List[Slot]] = field(default_factory=dict)
     blocked_dates: Set[datetime.date] = field(default_factory=set)
     working_dates: Set[datetime.date] = field(default_factory=set)
-    oee: float = 1.0
+    oee: float = NEUTRAL_OEE
+    oee_kind: str = "unset"
+    oee_source: str = "没有 station_capacity 行 → 按不打折 1.0 计（上界，不是实测）"
     max_concurrent: int = 1
     daily_pieces: Optional[float] = None
     calendar_source: str = 'aps_work_calendars'
@@ -194,8 +309,9 @@ async def load_station_models(
         # station_capacity 表没有 ORM 模型，各处一直用裸 SQL —— 各写一遍也正是
         # 负荷口径分叉的起点，这里统一读一次。
         capacity_rows = [row for row in (await db.execute(text(
-            "SELECT station_id, available_hours_per_day, efficiency_rate, max_concurrent_orders "
-            "FROM station_capacity WHERE factory_id = :fid AND is_active = TRUE"
+            "SELECT station_id, available_hours_per_day, efficiency_rate, max_concurrent_orders, "
+            "source, verified_at, created_at FROM station_capacity "
+            "WHERE factory_id = :fid AND is_active = TRUE"
         ), {"fid": factory_id})).mappings().all() if str(row['station_id']) in set(wanted)]
     except SQLAlchemyError:
         capacity_rows = []
@@ -203,7 +319,8 @@ async def load_station_models(
         model = models.get(str(row['station_id']))
         if not model:
             continue
-        model.oee = float(row['efficiency_rate'] or 1.0)
+        model.oee, model.oee_source = resolve_oee(dict(row))
+        model.oee_kind = classify_oee(dict(row))
         model.max_concurrent = int(row['max_concurrent_orders'] or 1)
         # 这列的名字写着 hours_per_day，用户确认它实际维护的是"一天可完成几件产品"，
         # 所以只能作为产量口径展示，不能当小时参与利用率计算。
@@ -254,3 +371,34 @@ def summarize_load(
         bucket['work_hours'] = round(bucket['work_hours'], 2)
         bucket['wall_hours'] = round(bucket['wall_hours'], 2)
     return per_station
+
+
+def efficiency_basis_from_models(models: Optional[Dict[str, StationModel]]) -> Dict[str, Any]:
+    """已经算好产能口径的那批工位，按效率出处分桶（排程/负荷路径上不必再回表查一次）。
+
+    直接读 StationModel.oee_kind —— 不在这里伪造 source/verified_at 再让 classify_oee 猜一遍，
+    那种往返会把口径的真相藏进自己的字符串里。
+    """
+    buckets: Dict[str, List[str]] = {"verified": [], "declared": [], "placeholder": [], "unset": []}
+    used: List[float] = []
+    for sid, model in (models or {}).items():
+        kind = str(getattr(model, "oee_kind", "unset") or "unset")
+        buckets.setdefault(kind, []).append(str(sid))
+        used.append(round(float(getattr(model, "oee", NEUTRAL_OEE) or NEUTRAL_OEE), 4))
+    total = sum(len(v) for v in buckets.values())
+    unverified = len(buckets["placeholder"]) + len(buckets["unset"])
+    return {
+        "active_stations": total,
+        "verified": len(buckets["verified"]), "declared": len(buckets["declared"]),
+        "placeholder": len(buckets["placeholder"]), "unset": len(buckets["unset"]),
+        "all_unverified": bool(total) and unverified == total,
+        "used_values": sorted(set(used)),
+        "placeholder_stations": sorted(buckets["placeholder"])[:12],
+        "reading": (f"{unverified}/{total} 个工位的排程效率不是量过的"
+                    f"（档案自动带的占位 {len(buckets['placeholder'])}、没填按不打折 1.0 计 {len(buckets['unset'])}）"
+                    f"；负荷分母实际用到的效率值只有 {sorted(set(used))}" if total
+                    else "这一版排程没有拿到任何工位产能口径 → 负荷分母没有效率依据"),
+        "consequence": ("占位与未填都等于按 100% 效率排产：那是产能上界，不是可达产能 —— "
+                        "利用率因此偏低（看着还有余量）、交期因此偏乐观"),
+        "basis": "StationModel.oee_kind（load_station_models 里由 classify_oee 判定），与 resolve_oee 同一口径",
+    }

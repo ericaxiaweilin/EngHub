@@ -1344,6 +1344,9 @@ def _format_pmc_control_tower_reply(result: Dict[str, Any]) -> str:
         lines.append(f"- 当前负荷来源：{capacity.get('load_source')}；瓶颈按利用率排序：")
         for item in (capacity.get("bottlenecks") or [])[:3]:
             lines.append(f"- {item.get('station_code') or item.get('station_name')}: 利用率 {n(item.get('utilization_pct'))}%、负荷 {n(item.get('load_hours_used'))}/{n(item.get('available_hours'))} 小时，{item.get('status')}")
+        eff = capacity.get("efficiency_basis") or {}
+        if eff.get("active_stations"):
+            lines.append(f"- 负荷分母的效率：{eff.get('reading')}。{eff.get('consequence')}")
         lines.append("- 平衡方法：先重排未开工工单和换型顺序，再评估加班/换线/外协/分批交付，重排后复核物料、交期和工序重叠。")
 
     rush = facts.get("rush")

@@ -27,7 +27,10 @@ from database.models import (
 
 )
 
-from core.mes.capacity_math import load_station_models, summarize_load  # 工位日历与负荷的唯一口径
+from core.mes.capacity_math import (efficiency_basis_buckets, efficiency_basis_from_models,
+                               load_station_models, resolve_oee, summarize_load)
+# 工位日历、效率出处与负荷的唯一算法：resolve_oee 给值与出处，
+# efficiency_basis_* 负责"这版的分母到底是量过的还是占位"这一层读数
 
 from api.services.attendance_model import attendance_factor
 from api.services.idle_capacity import crew_by_station as crew_by_station_map
@@ -640,11 +643,12 @@ class ApsService:
 
         capacity_result = await self.db.execute(text("""
             SELECT station_id, available_hours_per_day, efficiency_rate,
-                   setup_time_minutes, max_concurrent_orders
+                   setup_time_minutes, max_concurrent_orders, source, verified_at
             FROM station_capacity
             WHERE factory_id = :factory_id AND is_active = TRUE
         """), {"factory_id": factory_id})
-        capacity_map = {row["station_id"]: dict(row) for row in capacity_result.mappings().all()}
+        capacity_result_rows = list(capacity_result.mappings().all())
+        capacity_map = {row["station_id"]: dict(row) for row in capacity_result_rows}
 
         eq_stmt = select(Equipment).where(
 
@@ -751,7 +755,7 @@ class ApsService:
 
                     capacity=int(capacity.get("max_concurrent_orders") or 1),
 
-                    oee=float(capacity.get("efficiency_rate") or 0.85),
+                    oee=resolve_oee(capacity)[0],
 
                     calendar_by_weekday=calendar["calendar_by_weekday"],
 
@@ -789,7 +793,7 @@ class ApsService:
 
                     capacity=int(capacity.get("max_concurrent_orders") or 1),
 
-                    oee=float(capacity.get("efficiency_rate") or 0.9),
+                    oee=resolve_oee(capacity)[0],
 
                     calendar_by_weekday=calendar["calendar_by_weekday"],
 
@@ -839,7 +843,7 @@ class ApsService:
 
                         capacity=int(capacity.get("max_concurrent_orders") or 1),
 
-                        oee=float(capacity.get("efficiency_rate") or 0.9),
+                        oee=resolve_oee(capacity)[0],
 
                         calendar_by_weekday=calendar["calendar_by_weekday"],
 
@@ -1329,6 +1333,10 @@ class ApsService:
                 "unscheduled": unscheduled_details,
                 "constraint_violations": violation_details,
                 "data_integrity": data_integrity_warnings,
+                # 这一版排程用的效率到底是量过的还是档案自动带的占位 —— 版本可追溯，
+                # 不然过两周没人说得清当时那条 92% 的利用率是按什么分母算的
+                "efficiency_basis": efficiency_basis_buckets(
+                    [dict(r) for r in capacity_result_rows]),
             },
 
             "station_loads": station_loads,
@@ -2172,6 +2180,8 @@ class ApsService:
                 "wall_clock_hours_in_window": round(float(bucket["wall_hours"]), 2),
                 "capacity_hours_in_window": round(capacity_window, 2),
                 "oee": round(model.oee, 3) if model else None,
+                "oee_kind": model.oee_kind if model else "unset",
+                "oee_source": model.oee_source if model else "没有产能口径行 → 按不打折 1.0 计",
                 "max_concurrent_orders": model.max_concurrent if model else None,
                 "daily_capacity_pieces": model.daily_pieces if model else None,
                 "calendar_source": model.calendar_source if model else "unconfigured",
@@ -2224,4 +2234,7 @@ class ApsService:
                 else "工厂没有已下达(is_current)的方案，负荷按 0 显示"
             ),
             "load_hours_basis": "任务窗口与班次求交得到的实际工时，不含夜间与休息日",
+            # 利用率低不一定是真有余量：分母里的效率若是档案自动带的占位 1.0，
+            # 那这张表说的是"理论上限还空着"，不是"还能再排活"
+            "efficiency_basis": efficiency_basis_from_models(models),
         }

@@ -580,14 +580,16 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     lead = (await db.execute(text(LEAD_DEFAULT_SQL), {"fid": factory_id})).mappings().first()
     mob = (await db.execute(text(MOB_CONTRADICTION_SQL), {"fid": factory_id})).mappings().first()
     wc = (await db.execute(text(TEMPERATURE_OBSERVATION_SQL), {"fid": factory_id})).mappings().first()
+    from core.mes.capacity_math import efficiency_basis_census
     from core.mes.data_evidence import line_claim_coverage
 
     claim = await line_claim_coverage(db, factory_id)
+    eff = await efficiency_basis_census(db, factory_id)
     if evaluated_out is not None:
         evaluated_out.update({"kit_line_generation", "supplier_master",
                               "lead_time_evidence", "material_make_or_buy_conflict",
                               "candidate_rules", "working_conditions_evidence",
-                              "line_profile_coverage"})
+                              "line_profile_coverage", "station_efficiency_basis"})
     try:
         from core.mes.action_constraints import action_constraints
 
@@ -621,14 +623,18 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
-                        wc=dict(wc or {}), claim=claim or {}, rejected=rejected,
+                        wc=dict(wc or {}), claim=claim or {}, eff=eff or {}, rejected=rejected,
                         pending=list(pending or []), mp=dict(mp or {}),
                         evaluated_out=evaluated_out)
+
+
+MIN_STATIONS_FOR_EFFICIENCY_GAP = 5
 
 
 def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  ready: Dict[str, Any], lead: Optional[Dict[str, Any]] = None,
                  mob: Optional[Dict[str, Any]] = None,
+                 eff: Optional[Dict[str, Any]] = None,
                  cons: Optional[Dict[str, Any]] = None,
                  pending: Optional[List[Dict[str, Any]]] = None,
                  mp: Optional[Dict[str, Any]] = None,
@@ -672,6 +678,34 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  "reading_rows": int(wc.get("reading_rows") or 0),
                  "attendance_days": int(wc.get("attendance_days") or 0),
                  "declared_slope_pp_per_c": 1.0},
+            ))
+
+    if eff is not None:
+        # 排程分母的效率是哪来的：占位与未填都等于按 100% 效率排产，
+        # 于是利用率看着有余量、交期看着宽裕，其实是没人量过这条线的效率
+        ev.add("station_efficiency_basis")
+        total = int(eff.get("active_stations") or 0)
+        if total >= MIN_STATIONS_FOR_EFFICIENCY_GAP and eff.get("all_unverified"):
+            out.append(_gap(
+                "station_efficiency_basis", "efficiency_all_placeholder",
+                f"eff|{total // 5}",
+                f"补数据｜{total} 个工位的排程效率全是没验证的（负荷与交期按 100% 效率算）",
+                ("station_capacity 是负荷与交期承诺的分母来源。"
+                 f"{eff.get('reading')}。"
+                 f"\n涉及的工位：{('、'.join(str(x) for x in (eff.get('placeholder_stations') or [])))}"
+                 "\n后果要说准：这不是算错，是把上界当成了可达 —— 利用率因此偏低（界面看着还有余量）、"
+                 "交期因此偏乐观；同一版排程复用判断（input_fingerprint）也把 efficiency_rate 算进去了，"
+                 "所以一旦 IE 填了实测值，历史方案会自动重算而不是继续复用。"
+                 "\n补法：IE 逐工位量一次（或确认档案默认值），写进 station_capacity.efficiency_rate "
+                 "并填 verified_at —— 有 verified_at 才算量过，读数会把它从占位挪到已验证。"
+                 "注意不要用报工台账的 cycle_time_sec 反推：`production_reports` 这批行是仿真自写的，"
+                 "拿它当实测等于把自己的输出当现场事实。"),
+                "不影响出数（照排），影响的是这版负荷与交期能不能对外当承诺",
+                "get_capacity_load",
+                "IE 填 station_capacity.efficiency_rate 并标 verified_at 后，这一格自动缩到线下",
+                {"active_stations": total, "placeholder": int(eff.get("placeholder") or 0),
+                 "unset": int(eff.get("unset") or 0), "verified": int(eff.get("verified") or 0),
+                 "used_values": eff.get("used_values") or []},
             ))
 
     if rejected is not None:
