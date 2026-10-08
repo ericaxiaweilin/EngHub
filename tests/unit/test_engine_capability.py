@@ -5,6 +5,7 @@
 """
 from api.services.engine_capability import (
     GAP_WORDS,
+    HEADLINE_TOOLS,
     MIN_SUMMARY_REPLIES,
     THRESHOLDS,
     _surface,
@@ -173,3 +174,17 @@ def test_thresholds_are_named_per_grid_and_judgable():
                 "analysis_relief_trustworthy", "analysis_explainable_orders",
                 "summary_number_backing", "summary_gap_disclosure"):
         assert isinstance(THRESHOLDS[key], float) or THRESHOLDS[key] == 1.0
+
+
+def test_headline_tools_are_all_registered_chat_tools():
+    """名单里每个名字都必须是 chat 真注册的工具：写错一个，那类答复就永远进不了分母。
+
+    10-08 实测就是这么发现的 —— 名单里的 `virtual_factory_simulate` 从来没存在过，
+    60 天窗口只攒到 6 条样本，看着像"用得少"，实际是名字对不上。
+    """
+    from api.services.chat_tools_service import TOOL_DEFINITIONS
+
+    registered = {d["function"]["name"] for d in TOOL_DEFINITIONS}
+    unknown = sorted(set(HEADLINE_TOOLS) - registered)
+    assert unknown == [], f"这些引擎工具名不存在：{unknown}"
+    assert len(HEADLINE_TOOLS) >= 8, "只剩三五个名字通常意味着名单错拼，不是引擎面变少了"

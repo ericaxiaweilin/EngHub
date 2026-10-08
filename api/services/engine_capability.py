@@ -22,10 +22,18 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# 回答里"引用了引擎给的要点"要能核对：这些工具的返回带结构化要点，才谈得上覆盖率
-HEADLINE_TOOLS = ("query_engine_attribution", "query_simulation_sensitivity",
-                  "query_simulation_recommendation", "query_engine_capability_layers",
-                  "query_sim_evidence_readiness", "virtual_factory_simulate")
+# 总结格的分母只算"引擎族"工具：仿真/推演/合规/工况/规模/证据/剖面这些是引擎给出的数，
+# 转述失真最贵。纯 MES 读数工具（query_inventory 那一类）不在此列 —— 它们的忠实度
+# 由 L4 的数字可回溯率管，两格各管一段，别在同一件事上放两把尺。
+# 名单必须与 chat 里真注册的工具同名：写错一个名字，那一类答复就永远进不了分母（读起来像"样本不足"）。
+HEADLINE_TOOLS = (
+    "query_engine_attribution", "query_engine_capability_layers",
+    "query_engine_capability_profile", "query_sim_evidence_readiness",
+    "query_simulation_sensitivity", "query_simulation_recommendation",
+    "query_simulation_audits", "query_lead_time_evidence", "query_pmc_rush_impact",
+    "run_compliance_simulation", "query_working_condition_impact",
+    "generate_plant_architecture", "query_data_flow_profile",
+)
 
 # 判线：三格各自的门槛。定在这里、写清为什么，别散在文案里
 THRESHOLDS = {
