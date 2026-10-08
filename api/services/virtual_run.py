@@ -641,6 +641,12 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
 
     hours_per_day = float((line or {}).get("hours_per_day") or 11)
     group_cap = group_capacity(lines, line or {}, parallel_lines)
+    if line is None:
+        # 没有线档案时不许把读数写成"single_line"：那会让人以为产能算过
+        group_cap = {**group_cap, "capacity_basis": "no_line_profile",
+                     "note": ("这台机种没有任何线档案认领（line_profiles 里没有能做它的线）→ "
+                              "日产能没有被线或工位约束，时间线只由路线工时 + 来料日推出来；"
+                              "加班/借人/双班/工况扣人这些人力动作在这张单上乘不上")}
     present, present_by_line = staffing_crew_factor(lines, line or {}, parallel_lines, staffing)
     crew = round(group_cap["crew"] * (1.0 + crew_bonus) * present, 1)
     cap_line = round(group_cap["units_per_day"] * max(0.1, min(1.0, equip_rate)), 2)  # 设备可用率折进日产能

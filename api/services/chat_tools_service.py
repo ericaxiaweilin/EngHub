@@ -2099,7 +2099,8 @@ async def _tool_query_working_condition_impact(
     if comparable and sum(abs(int(d or 0)) for d in delta_days) == 0:
         binds = sorted({str(o.get("capacity_binding")) for o in per_order if o.get("capacity_binding")})
         # 到底是"没人可扣"还是"根本没有线档案认领这台机种"，看的是 run 里的 line，不是我猜的
-        unclaimed = [str(o.get("model_code")) for o in per_order if not o.get("line")]
+        unclaimed = [str(o.get("model_code")) for o in per_order
+                     if not o.get("line") or o.get("capacity_basis") == "no_line_profile"]
         parts = []
         if binds:
             parts.append("卡点写着 " + "、".join(binds))

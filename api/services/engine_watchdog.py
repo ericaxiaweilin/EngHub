@@ -699,9 +699,14 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  "工况缺勤也算不出交期影响（读数会写 line=null）。"
                  f"\n涉及的机种：{('、'.join(codes))}；开放母单 {int(claim.get('orders') or 0)} 张、"
                  f"{int(float(claim.get('units') or 0))} 台。"
-                 "\n补法：在 line_profiles 里把这些机种加进实际做它的那条线（或新建线档案声明 "
-                 "units_per_day/crew_size/hours_per_day），补完这条待办自动关。"
-                 "在此之前，这些单的产能读数是**工时推的**，不是线能力算的，别对外说算过产能。"),
+                 "\n能补的两件事，按顺序：① 在 line_profiles 里把这些机种加进实际做它的那条线"
+                 "（或新建线档案声明 units_per_day/crew_size/hours_per_day）；"
+                 "② 若它们其实按工位走，station_capacity 表现在是 **0 行**（没有 available_hours_per_day、"
+                 "没有 efficiency_rate），要按工位算产能得先把这张表填上 —— 而在那之前还要定一件事："
+                 "stations.capacity_per_hour 到底是「每件每小时」还是「每线每小时」"
+                 "（实测 capacity/capacity_unit 在两类站里口径不一致：车间写「人」、CNC 写「sets/day」），"
+                 "口径没定之前引擎不做工位级折算。"
+                 "\n在此之前这些单的产能读数是**路线工时推的**，不是线/工位能力算的，别对外说算过产能。"),
                 "这些单的人力/工况约束在引擎里是盲区：加班、借人、闷热天扣人都算不出效果",
                 "run_sandbox",
                 "把这些机种登记进对应线档案的 can_make_models，并核对 units_per_day/crew_size",
