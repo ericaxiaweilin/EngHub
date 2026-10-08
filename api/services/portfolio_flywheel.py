@@ -300,6 +300,26 @@ async def record_cycle(db: AsyncSession, sim: Dict[str, Any], *, factory_id: str
     return receipt
 
 
+def robust_objectives(scan: Dict[str, Any], policy: str) -> Dict[str, Any]:
+    """代价向量必须取"被推荐的那一条政策"的目标值，取最紧的那个天气档。
+
+    以前这里取的是「第一个场景的 recommended_objectives」，而各场景的推荐解可以不是同一条政策 ——
+    10-07 实测：稳健推荐是"提前期 15→7 天"，正文里的加急费却读了另一条不花钱的政策，写成 $0，
+    而那条政策实测要 $16,560。价签贴错商品，比不贴更坏。
+    """
+    best: Dict[str, Any] = {}
+    best_late = -10 ** 9
+    for block in (scan.get("by_scenario") or {}).values():
+        for sol in (block.get("solutions") or []):
+            if str(sol.get("name")) != str(policy):
+                continue
+            objs = sol.get("objectives") or {}
+            late = int(objs.get("days_late_worst") or 0)
+            if late > best_late:
+                best, best_late = objs, late
+    return best
+
+
 def late_delta_table(scan: Dict[str, Any], recommended: Optional[str],
                      base: str = "现况（分批开工）") -> Dict[str, Any]:
     """逐台算清"这个政策花多少钱、买到几天、还剩几天不准"。
@@ -468,11 +488,14 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         return receipt
 
     # 先给推荐解本身算一遍代价：钱和天数值不值得，写在建议里，不让人再去问模型
-    objectives: Dict[str, Any] = {}
-    for res in (verdict.get("by_scenario") or {}).values():
-        if isinstance(res, dict) and res.get("recommended_objectives"):
-            objectives = res["recommended_objectives"]
-            break
+    # 卡的 objectives 也走同一个口径：被推荐那条政策的代价，不是"第一个场景恰好推荐的解"
+    objectives: Dict[str, Any] = robust_objectives(tuned.get("final_scan") or {},
+                                                   str(robust.get("policy") or ""))
+    if not objectives:
+        for res in (verdict.get("by_scenario") or {}).values():
+            if isinstance(res, dict) and res.get("recommended_objectives"):
+                objectives = res["recommended_objectives"]
+                break
     # 记分卡的"分数"不是总分排名，是稳健度：推荐政策在多少个天气场景下真的准点（0~100）。
     # 以前这里取 on_time_rate，但 auto_tune 不再回传 objectives，于是张张卡都是 0 分。
     on_time_scen = sum(1 for r in per_scenario.values()
@@ -591,7 +614,9 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                 act_lines.append(f"· {'机种推演不了' if t == 'model_data_gap' else '主数据缺口'}："
                                  f"{a.get('detail')}")
         delta = late_delta_table(tuned.get("final_scan") or {}, str(rec))
-        money = float(objs.get("expedite_cost_usd") or 0) + float(objs.get("line_activation_cost_usd") or 0)
+        rec_objs = robust_objectives(tuned.get("final_scan") or {}, str(rec)) or objs
+        money = float(rec_objs.get("expedite_cost_usd") or 0) \
+            + float(rec_objs.get("line_activation_cost_usd") or 0)
         per_model_txt = "、".join(
             f"{x['model_code']} {x['days_late_base']}→{x['days_late_recommended']} 天"
             for x in (delta.get("per_model") or [])[:8])

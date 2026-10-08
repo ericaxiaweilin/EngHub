@@ -296,3 +296,22 @@ def test_late_delta_table_is_empty_safe_when_the_base_policy_is_absent():
 
     out = late_delta_table({"by_scenario": {}}, "随便什么")
     assert out["per_model"] == [] and out["days_bought_total"] == 0
+
+def test_cost_vector_follows_the_recommended_policy_not_whichever_scenario_comes_first():
+    """价签不能贴错商品：待办与记分卡上的"代价"必须是**被推荐那条政策**的目标向量。
+    10-07 实测错过一次 —— 稳健推荐是"提前期 15→7 天"（实测 $16,560），
+    但正文读的是"第一个场景的推荐解"（另一条不花钱的政策），写成 $0。"""
+    from api.services.portfolio_flywheel import robust_objectives
+
+    def sol(name, late, exp):
+        return {"name": name, "objectives": {"days_late_worst": late,
+                                             "expedite_cost_usd": exp,
+                                             "line_activation_cost_usd": 0.0}}
+    scan = {"by_scenario": {
+        "好天": {"solutions": [sol("现况（分批开工）", 21, 0.0),
+                          sol("加班加人 15%", 19, 0.0)]},
+        "暴雨": {"solutions": [sol("现况（分批开工）", 35, 0.0),
+                          sol("加班加人 15%", 31, 16560.0)]}}}
+    got = robust_objectives(scan, "加班加人 15%")
+    assert got["expedite_cost_usd"] == 16560.0 and got["days_late_worst"] == 31
+    assert robust_objectives(scan, "没有这条政策") == {}
