@@ -241,7 +241,11 @@ async def line_committed_days(db: AsyncSession, factory_id: str, line: Dict[str,
     row = (await db.execute(LINE_COMMITMENT_SQL,
                             {"fid": factory_id, "models": models})).mappings().first()
     units = float((row or {}).get("committed_units") or 0)
-    per_day = float(line.get("units_per_day") or 0) or 1.0
+    per_day = float(line.get("units_per_day") or 0)
+    if per_day <= 0:
+        return {"committed_units": units, "busy_days": None,
+                "why": (f"线 {line.get('line_code')} 没声明 units_per_day → 它手上排了多久算不出"
+                        "（不拿 1 台/天代替，那会把排队天数编出来）")}
     return {"committed_units": units, "busy_days": round(units / per_day, 2)}
 
 
@@ -382,14 +386,19 @@ def resolve_route(route_own: List[Dict[str, Any]], family_rows: List[Dict[str, A
     return [], "no_route"
 
 
-def hours_per_unit_from(route: List[Dict[str, Any]], line: Optional[Dict[str, Any]]) -> tuple:
+def hours_per_unit_from(route: List[Dict[str, Any]], line: Optional[Dict[str, Any]],
+                        measured_hours_per_day: Optional[float] = None) -> tuple:
     """单件占用工时：路线给的分钟优先；没有就用线节拍（一天做多少台、一天几个班时）。"""
     declared = round(sum(float(o.get("standard_hours") or 0) for o in route), 4)
     if declared > 0:
         return declared, "route_standard_hours"
     if line and float(line["units_per_day"] or 0) > 0:
-        hpd = float(line["hours_per_day"] or 11) or 11.0
-        return round(hpd / float(line["units_per_day"]), 4), "takt_from_line_capacity"
+        declared_hpd = float(line.get("hours_per_day") or 0)
+        hpd = declared_hpd or float(measured_hours_per_day or 0)
+        if hpd <= 0:
+            return 0.0, "no_time_basis"
+        return (round(hpd / float(line["units_per_day"]), 4),
+                "takt_from_line_capacity" if declared_hpd else "takt_from_line_capacity@measured_hours")
     return 0.0, "no_time_basis"
 
 
@@ -486,6 +495,14 @@ def simulate_days(units: float, hours_per_unit: float, hours_per_day: float,
     # 不绑人力的装配线可以以后按线打标放开，现在按声明的 人数:台数 比例算。
     units_per_day = cap_per_day if cap_per_day > 0 else (   # cap_per_day 已经把工时上限取过 min
         max(1.0, hours_per_day / hours_per_unit) if hours_per_unit > 0 else 0.0)
+    if units_per_day <= 0:
+        # 线产能、工时产能、工位下界三者都给不出 → 这台单没有产能依据。
+        # 老代码在这里塞 1 台/天：3000 台会被算成 3000 天的"交期"，那是编出来的数
+        return {"started_on_day": None, "finished_on_day": None, "wait_days": 0, "work_days": 0,
+                "person_days": 0.0, "idle_person_days_before_start": 0.0, "completed": False,
+                "timeline": [], "no_capacity_basis": True,
+                "why": ("日产能、单件工时、工位下界三者都给不出 → 不排完工日"
+                        "（原先这里塞 1 台/天，等于替厂里造一个产能）")}
     remaining = float(units)
     day = 0
     started_on: Optional[int] = None
@@ -511,8 +528,6 @@ def simulate_days(units: float, hours_per_unit: float, hours_per_day: float,
             timeline.append({"day": day, "action": "开工", "units_today": 0})
         present = crew * attendance_by_day.get(day, 1.0)
         capacity_today = (units_per_day * min(1.0, present / crew)) if (crew > 0 and units_per_day) else units_per_day
-        if capacity_today <= 0:
-            capacity_today = units_per_day or 1.0
         make = min(remaining, capacity_today)
         remaining -= make
         work_days += 1
@@ -695,7 +710,10 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     staffing = normalize_staffing(line_staffing)
     choice = pick_staffed_line(model, lines, staffing)
     line, line_basis = choice["line"], choice["basis"]
-    hours_per_unit, hours_basis = hours_per_unit_from(route, line)
+    # 站点档案 + 实测标称班时：线没声明班时、或压根没有线档案时都靠它，不再用写死的 11h
+    census = await load_station_capacity(db, factory_id, cached if cached is not None else {})
+    measured_hours = (census["shift_hours"] or {}).get("hours")
+    hours_per_unit, hours_basis = hours_per_unit_from(route, line, measured_hours)
     if hours_per_unit:
         hours_per_unit = round(hours_per_unit * max(0.05, float(hours_multiplier)), 6)
 
@@ -747,7 +765,6 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     station_cap = None
     if line is None:
         # 没有线档案不等于算不出产能：路线上的工位有在册人数、有声明台/小时、班时是打卡量出来的
-        census = await load_station_capacity(db, factory_id, cache)
         shift = census["shift_hours"]
         hours = float(shift.get("hours") or 0.0)
         if hours > 0:
@@ -797,6 +814,25 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
     run_b = simulate_days(batch_b, hours_per_unit, hours_per_day, crew, attendance_curve,
                           shift_days, start_b, cap, today) if batch_b else None
     run = run_b or run_a
+    if run.get("no_capacity_basis"):
+        # 没有产能依据就不给完工日：这条与 no_time_basis/no_staffed_line 同级，
+        # 但原因是"三个来源都给不出日产能"，不是没时间
+        return {"model_code": model, "units": units, "status": "no_capacity_basis",
+                "why": (f"日产能、单件工时、工位下界三者都给不出 → 不排完工日、不报延期"
+                        f"（线档案={line_basis}，工时依据={hours_basis}，"
+                        f"工位={(station_cap or {}).get('why') or '未参与'}）"),
+                "route_basis": route_basis, "line_basis": line_basis,
+                "capacity_basis": group_cap.get("capacity_basis"),
+                "station_capacity": station_cap,
+                "staffing": {"requested": bool(staffing), "present_ratio": present,
+                             "by_line": present_by_line,
+                             "rerouted_from": None, "candidates": choice["candidates"],
+                             "checked_lines": choice["checked_lines"],
+                             "unknown_line_codes": choice["unknown_line_codes"],
+                             "clamped": [], "action": "补线档案/IE 工时，或确认这台单该按什么节拍排"},
+                "kit": {k: kit[k] for k in ("buy_arrival_days", "blockers", "material_cost",
+                                            "materials_without_price")},
+                "due": str(due)}
     finish_day = run["finished_on_day"]
     finish_date = today + timedelta(days=finish_day) if finish_day is not None else None
     late = (finish_day - (due - today).days) if finish_day is not None else None
@@ -1835,10 +1871,13 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
     group_busy: Dict[str, float] = {}
     for l in lines:
         grp = str(l.get("line_group") or l["line_code"])
-        group_busy[grp] = max(group_busy.get(grp, 0.0),
-                              float(busy_by_line[l["line_code"]]["busy_days"]))
+        bd = busy_by_line[l["line_code"]].get("busy_days")
+        group_busy[grp] = max(group_busy.get(grp, 0.0), float(bd or 0.0))
+        if bd is None:
+            group_busy_unresolved.add(grp)
     cache: Dict[str, Any] = {}
     grouped: Dict[str, Any] = {}
+    group_busy_unresolved: set = set()
     # 天气档的比例是**声明的压力测试值**；台账量出来的常态到岗是另一个数。
     # 不重标定任何一档（标定是围绕可行率做的），但要把两者的差写进读数，
     # 否则"好天 0.97"会被当成实测到岗读走。
