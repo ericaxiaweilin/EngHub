@@ -496,6 +496,9 @@ export default function PmcWorkbench() {
                     <List.Item>
                       <Space direction="vertical" size={2}>
                         <Text>{q.question}</Text>
+                        {!!q.what_records_say && (
+                          <Text style={{ fontSize: 12, color: '#7dd3fc' }}>{q.what_records_say}</Text>
+                        )}
                         <Text type="secondary" style={{ fontSize: 12 }}>{q.why_it_matters}</Text>
                         <Text type="secondary" style={{ fontSize: 12 }}>
                           已查到：{q.prefilled_evidence}　·　要回答：{q.expected_answer}

@@ -451,6 +451,10 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     out: List[Dict[str, Any]] = []
     if int(cov.get("unclaimed_models") or 0) > 0:
         codes = cov.get("unclaimed_codes") or []
+        detail = cov.get("unclaimed_detail") or []
+        st_lines = [f"{d.get('model_code')}→{(d.get('stations') or '没登记工位')}"
+                    f"（{d.get('orders_with_station')}/{d.get('orders')} 张工单登记了工位）"
+                    for d in detail[:4]]
         out.append({
             "topic": "line_claim",
             "question": (f"{'、'.join(str(c) for c in codes[:4])}"
@@ -458,10 +462,13 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                          f"（现在 {cov.get('unclaimed_models')} 个机种、"
                          f"{cov.get('unclaimed_orders')} 张母单、{cov.get('unclaimed_units')} 台，"
                          "line_profiles 里没有一条线认领它们）"),
+            "what_records_say": ("工单登记的工位：" + "；".join(st_lines)
+                                 if st_lines else "工单也没登记工位，只有路线工序"),
             "why_it_matters": ("这些单在推演里 line=null：日产能没有被线约束，时间线只是路线工时 + 来料日；"
                                "加班、借人、双班、闷热天扣人这些人力动作在这张单上乘不上，"
                                "所以现在给出的完工天数不能当线能力算过的数"),
-            "expected_answer": "机种 → 线编码（LINE-…），或说明它们本来就不走线（按工位做）",
+            "expected_answer": ("机种 → 线编码（LINE-…）；若这些确实按工位做，"
+                                "请回答「按工位」并转去定工位产能口径那条问题"),
             "prefilled_evidence": cov.get("reading"),
             "record_as": {"subject": "line_claim", "verdict": "declared", "status": "declared",
                           "source": "chat"},

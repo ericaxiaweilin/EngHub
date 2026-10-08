@@ -632,6 +632,26 @@ LINE_CLAIM_SQL = text("""
                         AND COALESCE(lp.can_make_models::text, '') LIKE '%' || p.product_code || '%')
 """)
 
+# 没被线认领的那些单，工单自己登记的工位是什么（assigned_station_id）——
+# 这决定补哪一侧：真有线就做线认领，本来按工位做就缺工位产能口径
+UNCLAIMED_STATION_EVIDENCE_SQL = text("""
+    SELECT p.product_code AS model_code,
+           string_agg(DISTINCT s.station_code, ', ' ORDER BY s.station_code) AS stations,
+           count(*) FILTER (WHERE COALESCE(o.assigned_station_id, '') <> '') AS orders_with_station,
+           count(*) AS orders,
+           COALESCE(SUM(o.planned_qty), 0) AS units
+    FROM work_orders o
+    JOIN products p ON p.id = o.product_id
+    LEFT JOIN stations s ON s.id = o.assigned_station_id
+    WHERE o.factory_id = :fid AND o.wo_type = 'master'
+      AND o.status IN ('pending', 'released', 'in_progress')
+      AND NOT EXISTS (SELECT 1 FROM line_profiles lp
+                      WHERE lp.factory_id = o.factory_id
+                        AND COALESCE(lp.can_make_models::text, '') LIKE '%' || p.product_code || '%')
+    GROUP BY 1 ORDER BY 2 DESC
+""")
+
+
 STATION_CAPACITY_SHAPE_SQL = text("""
     SELECT s.capacity_unit AS unit, count(*) AS stations,
            count(*) FILTER (WHERE COALESCE(s.capacity_per_hour, 0) > 0) AS with_per_hour,
@@ -649,6 +669,8 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
     capacity_per_hour 是每件每小时还是每线每小时没定过，口径没定就乘出来的数是我猜的。
     """
     row = dict((await db.execute(LINE_CLAIM_SQL, {"fid": factory_id})).mappings().first() or {})
+    per_model = [dict(r) for r in (await db.execute(UNCLAIMED_STATION_EVIDENCE_SQL,
+                                                   {"fid": factory_id})).mappings().all()]
     shapes = [dict(r) for r in (await db.execute(STATION_CAPACITY_SHAPE_SQL,
                                                  {"fid": factory_id})).mappings().all()]
     unclaimed = int(row.get("unclaimed_models") or 0)
@@ -665,6 +687,7 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
         "capacity_units": shapes,
         "capacity_unit_mix": units_mix,
         "capacity_unit_ambiguous": len(units_mix) > 1,
+        "unclaimed_detail": per_model,
         "reading": (
             (f"{unclaimed} 个在流程单没有线档案认领（{int(row.get('orders') or 0)} 张母单、"
              f"{int(float(row.get('units') or 0))} 台）→ 这些单在沙箱里 line=null，"
