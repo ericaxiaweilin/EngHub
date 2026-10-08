@@ -429,6 +429,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "temperature_c": {"type": "number", "description": "车间温度（摄氏度），必填"},
                     "humidity_percent": {"type": "number", "description": "相对湿度，默认60"},
                     "task_type": {"type": "string", "description": "作业类型（定强度档与限值），默认assembly"},
+                    "section": {"type": "string",
+                                "description": ("只看某个工段（焊接/涂装/组立/滚轮/仪表…）：段级缺勤率差别很大"
+                                                "（实测厂级 4.33%、最紧的段 14.29%）；问「某段还开不开得动」要传这个；"
+                                                "不传按全厂基线")},
                     "model_code": {"type": "string", "description": "机种编码，例如 7.8AT-02"},
                     "units": {"type": "number", "description": "数量（台）"},
                     "due_in_days": {"type": "integer", "description": "交期（从今天起算天数），默认25"},
@@ -2021,6 +2025,9 @@ async def _tool_query_working_condition_impact(
     """
     scope = await _factory_scoped_id(db, args, factory_id)
     fid = scope["factory_id"]
+    # 段级基线要在取 ledger 之前就定下来，否则后面全是全厂数
+    section = args.get("section") or args.get("station")
+    section = str(section) if section else None
     temp = args.get("temperature_c")
     if temp is None:
         return {"error": ("要知道车间温度才能算这条工况的交期影响（湿度可以不说，按 60% 算）。"
@@ -2033,14 +2040,28 @@ async def _tool_query_working_condition_impact(
     from api.services.virtual_run import run_sandbox
     from core.mes.data_evidence import absence_baseline, workforce_presence_under_conditions
 
-    ledger = await absence_baseline(db, fid)
+    ledger_all = await absence_baseline(db, fid)
+    # 原话里的"X段"未必正好是台账的段名（"厂涂装" vs "涂装"）→ 用真实段名反查，认不到就报段名清单
+    resolved = None
+    if section:
+        names = [x["section"] for x in (ledger_all.get("sections") or [])]
+        hint = str(section)
+        resolved = next((n for n in names if n and (n == hint or n in hint or hint in n)), None)
+    ledger = await absence_baseline(db, fid, section=resolved)
     if not ledger.get("available"):
-        return _stamp_factory({"error": (f"这座厂在 attendance 里 0 行，没有缺勤基线 → "
-                                         f"算不出「工况比平时少来多少人」：{ledger.get('why')}")}, scope)
+        return _stamp_factory({"error": (
+            f"段「{section}」这座厂台账里查不出缺勤率 → 算不出这条工况少来多少人"
+            if section else f"{ledger.get('why') or '这座厂在 attendance 里 0 行'} → "
+                            "算不出这条工况少来多少人"),
+            "sections_seen": ledger.get("sections_seen") or [],
+            "hint": ("想看全厂就别传 section；想看某一段就用上面列出的段名"
+                     if ledger.get("sections_seen") else
+                     "这个厂区没有打卡行，缺勤基线无从观测")}, scope)
     under = await workforce_presence_under_conditions(
         db, fid, temperature_c=float(temp), humidity_percent=hum,
         task_type=str(args.get("task_type") or "assembly"),
-        step_count=int(args.get("step_count") or 3000))
+        step_count=int(args.get("step_count") or 3000),
+        section=resolved)
     if under.get("present_ratio") is None:
         return _stamp_factory({"error": under.get("why") or "工况算不出到岗比例"}, scope)
 
@@ -2079,6 +2100,12 @@ async def _tool_query_working_condition_impact(
                 "standby_person_days_total": rec.get("standby_person_days_total"),
                 "waiting_for_manpower": rec.get("waiting_for_manpower")}
 
+    inc = float(under.get("increment_pp") or 0.0) / 100.0
+    by_section = [{
+        "section": x["section"], "scheduled_rows": x["rows"],
+        "normal_presence": round(1.0 - x["absence_rate"], 4),
+        "under_conditions_presence": round(max(0.0, 1.0 - x["absence_rate"] - inc), 4),
+    } for x in (ledger.get("sections") or [])][:8]
     b, h = _pick(base), _pick(hot)
     delta_days = [None if (x is None or y is None) else int(y) - int(x)
                   for x, y in zip(b["finish_days"], h["finish_days"])]
@@ -2137,6 +2164,17 @@ async def _tool_query_working_condition_impact(
                        "targets": targets, "targets_source": targets_source},
         "attendance": {"normal": round(1.0 - float(ledger["rate"]), 4),
                        "under_conditions": under["present_ratio"],
+                       "scope": ledger.get("scope"), "section": ledger.get("section"),
+                       "section_asked_as": (str(section) if section else None),
+                       "section_resolved_from": (f"原话「{section}」→ 台账段名「{resolved}」"
+                                                 if section and resolved and resolved != str(section)
+                                                 else None),
+                       "by_section": by_section,
+                       "section_note": ("沙箱到岗曲线用的是{name}基线；段级读数另列（最紧的是 {worst}）。"
+                                        "线档案与工位没有对应关系，所以不拿段级缺勤率去乘线班组 —— "
+                                        "那是我自己编的映射"
+                                        ).format(name=("该段" if ledger.get("scope") == "section" else "全厂"),
+                                                 worst=(ledger.get("worst_section") or {}).get("section") or "—"),
                        "baseline_basis": ledger["basis"],
                        "wbgt_c": under["wbgt_c"], "tlv_wbgt_c": under["tlv_wbgt_c"],
                        "metabolic_level": under["metabolic_level"],
@@ -5089,6 +5127,11 @@ def extract_heat_scenario(message: str) -> Dict[str, Any]:
         args["terrain"] = "slope"
     if "不平整" in text or "泥泞" in text:
         args["terrain"] = "uneven"
+    sec = re.search(r"([\u4e00-\u9fa5A-Za-z]{1,4}?)(?:段|工段)(?![\u4e00-\u9fa5]*度)", text)
+    if sec:
+        # 这里只抽"X段"这个说法（可能带上前缀字，如"机械厂涂装段"抓到"厂涂装"）；
+        # 真正的段名由工具拿台账里的段名反查，抓错也不影响判定
+        args["section"] = sec.group(1)
     # 只说"一小时/8小时"也算作业窗口：抽不到就把窗口填成默认 4 小时，等于替用户改题
     if "continuous_work_minutes" not in args:
         bare = re.search(r"(\d+(?:\.\d+)?|半|[一两二三四五六七八九十]{1,3})\s*(?:个)?小时", text)

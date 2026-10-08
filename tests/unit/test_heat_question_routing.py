@@ -43,3 +43,11 @@ def test_delivery_questions_pull_in_the_capacity_run():
     assert asks_delivery_impact("闷热天到岗会掉多少") is True
     # 只问能不能干时不该多跑一遍沙箱（成本翻倍，答案也没问交期）
     assert asks_delivery_impact("车间38度、湿度70%，装配岗连续干3小时合规吗") is False
+
+
+def test_section_word_is_carried_to_the_engine():
+    """"涂装段"要带走：段级缺勤率与全厂平均差好几倍，按全厂回答等于把风险摊平。"""
+    # 抓到的可能是带前缀的短语（"厂涂装"），段名由工具拿台账反查，这里只保证"X段"被带走
+    assert "涂装" in extract_heat_scenario("机械厂涂装段车间38度、湿度70%，还开得起吗")["section"]
+    # 但"连续干3小时"里的"小时"不是段
+    assert "section" not in extract_heat_scenario("车间38度、装配岗连续干3小时合规吗")

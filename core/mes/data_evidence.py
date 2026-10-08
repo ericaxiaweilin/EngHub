@@ -303,6 +303,34 @@ OT_FLOOR_HOURS = 10.2      # 超过标称班时 0.2h 以上才算加了班（打
 DOUBLE_SHIFT_FLOOR_HOURS = 19.0
 
 
+# 段级缺勤率：归属路径与 ATT_SECTIONS_SQL 一致（attendance→operators→hr_employees.station）
+ATT_ABSENCE_BY_SECTION_SQL = text("""
+    WITH j AS (
+        SELECT h.station, a.date, a.status
+        FROM attendance a
+        JOIN operators o ON o.id = a.operator_id
+        JOIN hr_employees h ON h.factory_id = o.factory_id
+             AND (h.employee_code = o.employee_id OR h.id::text = o.employee_id)
+        WHERE a.factory_id = :fid
+    ), d AS (
+        SELECT station, date, count(*) AS n,
+               count(*) FILTER (WHERE status = 'leave') AS lv
+        FROM j GROUP BY 1,2 HAVING count(*) >= :min_rows
+    )
+    SELECT j.station, count(*) AS rows,
+           count(*) FILTER (WHERE j.status = 'leave') AS leave_rows,
+           count(*) FILTER (WHERE j.status <> 'present') AS nonpresent_rows,
+           count(*) FILTER (WHERE j.status = 'late') AS late_rows,
+           (count(*) FILTER (WHERE j.status = 'leave'))::float / nullif(count(*), 0) AS leave_rate,
+           (SELECT min(lv::float / n) FROM d WHERE d.station = j.station) AS daily_min,
+           (SELECT max(lv::float / n) FROM d WHERE d.station = j.station) AS daily_max,
+           (SELECT count(*) FROM d WHERE d.station = j.station) AS daily_days
+    FROM j GROUP BY j.station
+    HAVING count(*) >= :min_rows
+    ORDER BY (count(*) FILTER (WHERE j.status = 'leave'))::float / nullif(count(*), 0) DESC, count(*) DESC
+""")
+
+
 ATT_ABSENCE_BASELINE_SQL = text("""
     SELECT count(*) AS scheduled_rows, count(DISTINCT date) AS days,
            min(date)::text AS from_day, max(date)::text AS to_day,
@@ -516,7 +544,8 @@ async def attendance_evidence(db: AsyncSession, factory_id: str) -> Dict[str, An
 
 
 async def absence_baseline(db: AsyncSession, factory_id: str, *,
-                           min_day_rows: int = 200) -> Dict[str, Any]:
+                           min_day_rows: int = 200, section: Optional[str] = None,
+                           min_section_rows: int = 50) -> Dict[str, Any]:
     """出勤基线：只从 attendance 台账读出来的缺勤率，供合规仿真把热工况折成"多几个人不来"。
 
     单独一个轻查询而不复用 attendance_evidence：仿真只缺这一个数（基线 + 日级浮动），
@@ -532,22 +561,59 @@ async def absence_baseline(db: AsyncSession, factory_id: str, *,
                 "checked": {"attendance_rows": 0}}
     daily = dict((await db.execute(ATT_ABSENCE_DAILY_SQL,
                                    {"fid": factory_id, "min_rows": min_day_rows})).mappings().first() or {})
+    sections = [{
+        "section": str(r["station"] or ""), "rows": int(r["rows"] or 0),
+        "absent_rows": int(r["leave_rows"] or 0), "absence_rate": round(_f(r["leave_rate"]) or 0.0, 4),
+        "daily_min": (round(_f(r["daily_min"]), 4) if r.get("daily_min") is not None else None),
+        "daily_max": (round(_f(r["daily_max"]), 4) if r.get("daily_max") is not None else None),
+        "days": int(r.get("daily_days") or 0),
+        "nonpresent_rate": (round(int(r["nonpresent_rows"] or 0) / int(r["rows"] or 1), 4)
+                            if r.get("nonpresent_rows") is not None else None),
+        "late_rate": (round(int(r["late_rows"] or 0) / int(r["rows"] or 1), 4)
+                      if r.get("late_rows") is not None else None),
+    } for r in (await db.execute(ATT_ABSENCE_BY_SECTION_SQL,
+                                {"fid": factory_id, "min_rows": min_section_rows})).mappings().all()]
     leave = int(row.get("leave_rows") or 0)
+    nonpresent = int(row.get("nonpresent_rows") or 0)
+    late = int(row.get("late_rows") or 0)
     rate = round(leave / scheduled, 4)
-    dmin = _f(daily.get("daily_min"))
-    dmax = _f(daily.get("daily_max"))
+    dmin, dmax = _f(daily.get("daily_min")), _f(daily.get("daily_max"))
+    scope_rows = {"scheduled_rows": scheduled, "leave_rows": leave,
+                  "days_in_daily_band": int(daily.get("days") or 0), "min_day_rows": min_day_rows}
+    if section:
+        hit = [x for x in sections if x["section"] == str(section)]
+        if not hit:
+            return {"available": False, "rate": None, "factory_id": factory_id, "section": str(section),
+                    "why": (f"段「{section}」在 {factory_id} 的台账里查不出缺勤率"
+                            f"（够 {min_section_rows} 行以上的段有 {len(sections)} 个："
+                            f"{[x['section'] for x in sections][:6]}…）—— 不拿全厂平均替这一段回答"),
+                    "sections_seen": [x["section"] for x in sections],
+                    "checked": {"sections_computed": len(sections), "min_section_rows": min_section_rows}}
+        # 段级：全厂平均会把某一段的风险摊平（实测厂级 4.33%、最紧的段 14.29%）
+        sec = hit[0]
+        leave, nonpresent, late = sec["absent_rows"], int((sec["nonpresent_rate"] or 0) * sec["rows"]), \
+            int((sec["late_rate"] or 0) * sec["rows"])
+        scheduled, rate = sec["rows"], sec["absence_rate"]
+        dmin, dmax = sec.get("daily_min"), sec.get("daily_max")
+        scope_rows = {"scheduled_rows": scheduled, "leave_rows": leave,
+                      "days_in_daily_band": sec.get("days"), "min_section_rows": min_section_rows}
     return {
         "available": True, "factory_id": factory_id, "rate": rate,
         "daily_min": (round(dmin, 4) if dmin is not None else None),
         "daily_max": (round(dmax, 4) if dmax is not None else None),
-        "nonpresent_rate": round(int(row.get("nonpresent_rows") or 0) / scheduled, 4),
-        "late_rate": round(int(row.get("late_rows") or 0) / scheduled, 4),
+        "nonpresent_rate": round(nonpresent / scheduled, 4),
+        "late_rate": round(late / scheduled, 4),
+        "section": section,
+        "scope": ("section" if section else "factory"),
+        "sections": sections,
+        "worst_section": (sections[0] if sections else None),
+        "spread_pp": (round((sections[0]["absence_rate"] - sections[-1]["absence_rate"]) * 100, 2)
+                      if len(sections) > 1 else None),
         "window": {"from_day": row.get("from_day"), "to_day": row.get("to_day"),
                    "days": int(row.get("days") or 0), "people": int(row.get("people") or 0)},
-        "checked": {"scheduled_rows": scheduled, "leave_rows": leave,
-                    "days_in_daily_band": int(daily.get("days") or 0),
-                    "min_day_rows": min_day_rows},
-        "basis": (f"attendance 台账实测：status='leave' {leave} 行 / 排班人次 {scheduled} 行 = "
+        "checked": scope_rows,
+        "basis": (f"attendance 台账实测{'（段 ' + str(section) + '）' if section else '（全厂）'}："
+                  f"status='leave' {leave} 行 / 排班人次 {scheduled} 行 = "
                   f"{rate * 100:.2f}%（{row.get('from_day')}~{row.get('to_day')}），"
                   + (f"日级浮动 {round(dmin * 100, 2)}%~{round(dmax * 100, 2)}%"
                      if dmin is not None and dmax is not None else "日级浮动无法给出（够行的日子不足）")),
@@ -563,7 +629,7 @@ async def absence_baseline(db: AsyncSession, factory_id: str, *,
 async def workforce_presence_under_conditions(
     db: AsyncSession, factory_id: str, *, temperature_c: float, humidity_percent: float,
     task_type: str = "assembly", step_count: int = 3000,
-    continuous_work_minutes: int = 480) -> Dict[str, Any]:
+    continuous_work_minutes: int = 480, section: Optional[str] = None) -> Dict[str, Any]:
     """工况 → 到岗比例：台账基线缺勤率 + 热侧增量，折成「这条班次能来多少人」。
 
     产能侧要的是人头不是效率折扣，所以这条只用来喂到岗曲线/推演，不回填任何事实表。
@@ -572,7 +638,7 @@ async def workforce_presence_under_conditions(
     from core.sim_erp.legislation import LegislationCatalog
     from core.sim_erp.thermal import assess
 
-    ledger = await absence_baseline(db, factory_id)
+    ledger = await absence_baseline(db, factory_id, section=section)
     pack = LegislationCatalog().load_pack("iso7243_jsoh_heat")
     th = assess(temperature_c=float(temperature_c), humidity_percent=float(humidity_percent),
                 task_type=str(task_type), pack=pack,
@@ -593,6 +659,8 @@ async def workforce_presence_under_conditions(
         "metabolic_level": th.get("metabolic_level"),
         "work_efficiency": th.get("work_efficiency"),
         "required_rest_fraction": th.get("required_rest_fraction"),
+        "scope": ledger.get("scope"), "section": ledger.get("section"),
+        "worst_section": ledger.get("worst_section"), "spread_pp": ledger.get("spread_pp"),
         "baseline_absence_rate": ai.get("baseline_absence_rate"),
         "increment_pp": ai.get("increment_pp"),
         "predicted_absence_rate": rate,

@@ -984,13 +984,24 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         extra = int(result.get("extra_total_days_late") or 0)
         headline = (f"多延 {extra} 天" if extra > 0
                     else ("没有延期变化" if result.get("no_change_reason") else "无变化"))
+        secs = att.get("by_section") or []
+        att_line = (f"- 到岗：{round(float(att.get('normal') or 0) * 100, 2)}%"
+                    f"（{'段 ' + str(att.get('section')) if att.get('scope') == 'section' else '全厂'}"
+                    f"台账基线）→ {round(float(att.get('under_conditions') or 0) * 100, 2)}%"
+                    f"（这条工况）｜WBGT {att.get('wbgt_c')}℃ vs "
+                    f"{att.get('metabolic_level')} 档限值 {att.get('tlv_wbgt_c')}℃")
+        section_line = ("- 段级最紧的："
+                        + "、".join(f"{x['section']} {round(x['under_conditions_presence'] * 100, 1)}%"
+                                    for x in secs[:3])
+                        + "（工况前常态："
+                        + "、".join(f"{x['section']} {round(x['normal_presence'] * 100, 1)}%"
+                                    for x in secs[:3]) + "）") if secs else None
         lines = [
             f"工况对交期的影响：{headline}",
             f"- 工况：{cond.get('temperature_c')}℃、湿度 {cond.get('humidity_percent')}%、"
             f"{cond.get('task_type')}｜目标：{cond.get('targets_source')}",
-            f"- 到岗：{round(float(att.get('normal') or 0) * 100, 2)}%（台账基线）→ "
-            f"{round(float(att.get('under_conditions') or 0) * 100, 2)}%（这条工况）"
-            f"｜WBGT {att.get('wbgt_c')}℃ vs {att.get('metabolic_level')} 档限值 {att.get('tlv_wbgt_c')}℃",
+            att_line,
+            section_line,
             f"- 完工：{'、'.join(str(x) for x in (b.get('finish_days') or []))} 天 → "
             f"{'、'.join(str(x) for x in (h.get('finish_days') or []))} 天"
             f"｜迟交合计 {b.get('total_days_late')} → {h.get('total_days_late')} 天"
@@ -1059,7 +1070,7 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 限值出处：{basis.get('limit') or '无'}",
             f"- 假设：{'；'.join(str(x) for x in (basis.get('assumptions') or [])) or '无'}",
         ]
-        return "\n".join(lines)
+        return "\n".join([l for l in lines if l])
     if tool_name == "query_pmc_work_matrix":
         if result.get("error"):
             return f"PMC 工作矩阵暂时无法生成：{result['error']}\n{result.get('hint', '')}"
@@ -2477,7 +2488,7 @@ async def _handle_kernel_chat(
                 str(ctx.last_user_content or "")):
             # 问"这批单延几天"时只答合规就把少人这条后果藏了：按到岗比例再跑一遍产能沙箱
             impact_args = {k: arguments[k] for k in ("temperature_c", "humidity_percent",
-                                                    "task_type", "factory_id")
+                                                    "task_type", "factory_id", "section")
                            if arguments.get(k) is not None}
             impact = await execute("query_working_condition_impact", impact_args)
             if action_factory is not None:
