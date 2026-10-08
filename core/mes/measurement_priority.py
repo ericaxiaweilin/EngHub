@@ -70,7 +70,8 @@ async def measurement_priority(db: AsyncSession, factory_id: str,
     lines = [dict(r) for r in (await db.execute(vr.LINES_SQL, {"fid": factory_id})).mappings().all()]
     shift_days = {int(r["weekday"]) + 1 for r in
                   (await db.execute(vr.CALENDAR_SQL, {"fid": factory_id})).mappings().all()} or {1, 2, 3, 4, 5, 6}
-    curve = {d: 0.97 for d in range(400)}
+    att = await vr.measured_attendance(db, factory_id)
+    curve = {d: float(att["present_ratio"]) for d in range(400)}
     cache: Dict[str, Any] = {}
     for model in chosen:
         try:
@@ -108,6 +109,7 @@ async def measurement_priority(db: AsyncSession, factory_id: str,
     return {
         "factory_id": factory_id, "models": len(per_model),
         "calibration": calibration, "factor_applied": round(factor, 2),
+        "attendance_basis": att,
         "total_parts_in_critical_tiers": tiers,
         "per_model": per_model,
         "how_to_use": ("先把 critical_tier 那一档整批量出来（同一天到货的那批要一起量，"

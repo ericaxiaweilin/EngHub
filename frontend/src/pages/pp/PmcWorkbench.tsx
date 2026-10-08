@@ -160,6 +160,7 @@ export default function PmcWorkbench() {
       setPriority({ parts: pr?.total_parts_in_critical_tiers ?? null,
                     ratio: pr?.calibration?.median_ratio ?? null,
                     n: pr?.calibration?.n_materials ?? 0,
+                    attendance: pr?.attendance_basis ?? null,
                     per_model: (pr?.per_model || []).slice(0, 4) })
     } catch {
       setRuleFlow({ error: '规则与执行读数加载失败' })
@@ -560,6 +561,12 @@ export default function PmcWorkbench() {
                 <div><Text type="secondary" style={{ fontSize: 12 }}>
                   临界档合计 {priority.parts} 个料号 · 校准比 {priority.ratio ?? '—'}×
                   （{priority.n} 个料号有采购实测；没有实测时这个倍数只是量级演示）
+                </Text></div>
+                <div><Text type="secondary" style={{ fontSize: 12 }}>
+                  这些天数是在「到岗 {Math.round((priority.attendance?.present_ratio ?? 0) * 1000) / 10}%」下算的 ——{' '}
+                  {priority.attendance?.source === 'attendance_ledger'
+                    ? '来自 attendance 台账实测缺勤'
+                    : (priority.attendance?.basis || '没有台账基线，用的是声明常数')}
                 </Text></div>
                 {(priority.per_model || []).map((p: any) => (
                   <div key={p.model_code}><Text type="secondary" style={{ fontSize: 12 }}>

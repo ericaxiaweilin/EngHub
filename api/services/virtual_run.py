@@ -28,6 +28,7 @@ from core.mes.route_resolution import route_ops_for_product
 from core.mes.data_evidence import lead_flags
 from sqlalchemy.ext.asyncio import AsyncSession
 
+DEFAULT_ATTENDANCE_RATE = 0.97
 DEFAULT_LABOR_COST_PER_PERSON_DAY = float(os.getenv("SIM_LABOR_COST_PER_PERSON_DAY", "30"))
 # 加急对价：每件每天提前一天要多付的钱（库里没有运费/加急费率，这是内置标定，结果里标明 basis）
 SIM_EXPEDITE_COST_PER_UNIT_DAY = float(os.getenv("SIM_EXPEDITE_COST_PER_UNIT_DAY", "0.15"))
@@ -1271,6 +1272,29 @@ async def auto_tune(db: AsyncSession, factory_id: str, models: List[str], *, rou
 
 
 
+async def measured_attendance(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """没人给到岗曲线时用台账算出来的缺勤率，不用写死的 0.97。
+
+    0.97 是当初拍脑袋的常数；attendance 表里有真打卡记录（缺勤=status='leave' 的行/排班人次），
+    两个厂的差据还很大（机械厂 4.33%、电子厂 0.05%）。查不到台账时才退回声明值，并把退回写进读数。
+    """
+    from core.mes.data_evidence import absence_baseline
+
+    declared = {"present_ratio": DEFAULT_ATTENDANCE_RATE, "source": "declared_default",
+                "basis": f"没有台账基线 → 退回声明默认 {DEFAULT_ATTENDANCE_RATE:g}（这是常数，不是量出来的）"}
+    try:
+        ledger = await absence_baseline(db, factory_id)
+    except Exception as exc:  # noqa: BLE001  查不到不能编一个数，但要说明为什么退回常数
+        return {**declared, "lookup_error": f"{type(exc).__name__}: {exc}"[:160]}
+    if not ledger.get("available") or ledger.get("rate") is None:
+        return {**declared, "why": ledger.get("why") or "该厂区没有可引用的缺勤率"}
+    rate = float(ledger["rate"])
+    return {"present_ratio": round(1.0 - rate, 4), "source": "attendance_ledger",
+            "absence_rate": round(rate, 4), "basis": ledger.get("basis"),
+            "daily_band_flat": ledger.get("daily_band_flat"),
+            "reading": (f"到岗 {round((1.0 - rate) * 100, 2)}%（台账实测缺勤 {round(rate * 100, 2)}%）")}
+
+
 async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                       *, today: Optional[date] = None,
                       attendance_curve: Optional[Dict[int, float]] = None,
@@ -1286,7 +1310,9 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
     lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
     shift_days = {int(r["weekday"]) + 1 for r in
                   (await db.execute(CALENDAR_SQL, {"fid": factory_id})).mappings().all()} or {1, 2, 3, 4, 5, 6}
-    curve = attendance_curve or {d: 0.97 for d in range(0, 200)}
+    att = None if (attendance_curve or working_conditions) else await measured_attendance(db, factory_id)
+    curve = attendance_curve or ({d: att["present_ratio"] for d in range(0, 400)} if att
+                                 else {d: DEFAULT_ATTENDANCE_RATE for d in range(0, 200)})
     conditions_basis = None
     if working_conditions and attendance_curve is None:
         # 工况的缺勤率扣的是可用人头，不是效率折扣：产能曲线按到岗比例降，效率另算
@@ -1345,14 +1371,19 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
         "labor_cost_usd": round(sum(float(r["labor_cost_usd"] or 0) for r in ok), 2),
         "standby_cost_total_usd": round(sum(float(r["standby_cost_if_line_held_usd"] or 0) for r in ok), 2),
         "runs": runs, "constraints": constraints,
+        "attendance_basis": att,
         "working_conditions": conditions_basis,
         "assumptions": {
-            "attendance_curve": ("工况反推：WBGT " + str((conditions_basis or {}).get("wbgt_c")) + "℃ → 到岗 "
-                                 + str((conditions_basis or {}).get("present_ratio"))
-                                 + "（台账基线 + 热侧缺勤增量；斜率是"
-                                 + str((conditions_basis or {}).get("slope_status"))
-                                 + "）" if conditions_basis else
-                                 "按天到岗率（沙箱默认 0.97，可传曲线：干旱/雨/暴雨档）"),
+            "attendance_curve": (
+                f"到岗基线：{att.get('basis') or att.get('why') or att.get('source')}" if att else
+                ("工况反推：WBGT " + str((conditions_basis or {}).get("wbgt_c")) + "℃ → 到岗 "
+                 + str((conditions_basis or {}).get("present_ratio"))
+                 + "（台账基线 + 热侧缺勤增量；斜率是"
+                 + str((conditions_basis or {}).get("slope_status")) + "）")
+                if conditions_basis else
+                f"按天到岗率常数 {DEFAULT_ATTENDANCE_RATE:g}（调用方直接给了曲线）"
+                if attendance_curve else
+                f"退回声明常数 {DEFAULT_ATTENDANCE_RATE:g}：这座厂没有可引用的缺勤台账"),
             "labor_cost_per_person_day": DEFAULT_LABOR_COST_PER_PERSON_DAY,
             "labor_cost_basis": "default_calibration（库里没有薪资列，钱只到量级）",
             "material_price_source": "bom_items.unit_price（缺价就单列 materials_without_price，不折算）",
