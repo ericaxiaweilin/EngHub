@@ -175,6 +175,82 @@ def scaled_node_need(profile_rows: List[Dict[str, Any]], *, factor: float) -> Li
     return out
 
 
+# ── 节点活性：有数据的表里，引擎真读几张 ────────────────────────────────────
+# 判据是"表名有没有出现在源码里"，分三类文件：引擎（api/core）、模型与脚本（database/models.py、
+# scripts/…）、都没有。这是**代理判据**：动态拼出来的表名或字符串恰好不含表名都会漏判，
+# 所以这一格只回答"引擎没读它"，不回答"这数据没用" —— 更不构成删表的依据。
+ENGINE_DIRS = ("api/", "core/")
+SOURCE_DIRS = ("api", "core", "models", "services", "integrations", "scripts", "database")
+_SOURCE_REFS: Dict[str, List[str]] = {}
+
+
+def source_table_refs(refresh: bool = False) -> Dict[str, List[str]]:
+    """扫一遍源码，得到 {表名: [引用它的文件]}。进程内缓存一次，改代码重启即重算。"""
+    global _SOURCE_REFS
+    import re
+    from pathlib import Path
+
+    if _SOURCE_REFS and not refresh:
+        return _SOURCE_REFS
+    root = Path(__file__).resolve().parents[2]
+    refs: Dict[str, List[str]] = {}
+    for d in SOURCE_DIRS:
+        base = root / d
+        if not base.exists():
+            continue
+        for path in base.rglob("*.py"):
+            try:
+                rel = str(path.relative_to(root))
+                body = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for name in set(re.findall(r"\b([a-z][a-z0-9_]{3,})\b", body)):
+                refs.setdefault(name, []).append(rel)
+    if refresh or not _SOURCE_REFS:
+        _SOURCE_REFS = refs
+    return _SOURCE_REFS
+
+
+def classify_liveness(tables: List[tuple], refs: Dict[str, List[str]]) -> Dict[str, Any]:
+    """把有数据的表分成引擎读 / 只有模型层或脚本读 / 源码里根本不出现。"""
+    read, side, dead = [], [], []
+    for name, rows in tables:
+        hits = refs.get(str(name)) or []
+        engine_hits = [h for h in hits if h.startswith(ENGINE_DIRS)]
+        if engine_hits:
+            read.append({"table": name, "rows": int(rows), "engine_files": len(engine_hits),
+                         "example": engine_hits[0], "status": "engine_read"})
+        elif hits:
+            side.append({"table": name, "rows": int(rows), "example": sorted(hits)[0],
+                         "status": "model_or_script_only"})
+        else:
+            dead.append({"table": name, "rows": int(rows), "status": "unreferenced_in_source"})
+    total = sum(int(r) for _, r in tables)
+    dead_rows = sum(d["rows"] for d in dead)
+    return {
+        "tables_with_data": len(tables), "engine_read": len(read), "side_only": len(side),
+        "unreferenced": len(dead),
+        "engine_read_share": round(len(read) / max(1, len(tables)), 3),
+        "unreferenced_rows": dead_rows, "total_rows": total,
+        "unreferenced_row_share": round(dead_rows / max(1, total), 3),
+        "top_engine_read": sorted(read, key=lambda r: -r["rows"])[:12],
+        "top_unreferenced": sorted(dead, key=lambda r: -r["rows"])[:15],
+        "top_side_only": sorted(side, key=lambda r: -r["rows"])[:8],
+        "caveat": ("判据是表名是否出现在源码里（代理判据，动态表名会漏判）。"
+                   "这一格只说明引擎没读它，不说明数据没用，也不是删表的依据。"),
+    }
+
+
+async def node_liveness(db: AsyncSession) -> Dict[str, Any]:
+    """数"有数据的表"与"引擎读到的表"。"""
+    rows = (await db.execute(text(
+        "SELECT c.relname, c.reltuples::bigint FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname='public' AND c.relkind='r' AND c.reltuples > 0 "
+        "ORDER BY c.reltuples DESC"))).all()
+    return classify_liveness([(r[0], int(r[1])) for r in rows], source_table_refs())
+
+
 async def data_flow_profile(db: AsyncSession, factory_id: str, *, headcount: Optional[float] = None,
                              sample_models: int = 2, run_sample: bool = True) -> Dict[str, Any]:
     """这座厂的数据流节点剖面；给 headcount 时附"那个规模要多少节点"的外推。"""
@@ -182,6 +258,7 @@ async def data_flow_profile(db: AsyncSession, factory_id: str, *, headcount: Opt
 
     rows = await ledger_nodes(db, factory_id)
     graph = await graph_shape(db)
+    live = await node_liveness(db)
     shape = await plant_shape(db, factory_id)
     readable = [r for r in rows if r.get("status") == "ok"]
     unreadable = [r for r in rows if r.get("status") != "ok"]
@@ -196,7 +273,7 @@ async def data_flow_profile(db: AsyncSession, factory_id: str, *, headcount: Opt
         runs = [await run_nodes(db, factory_id, m, 1800.0) for m in models[:1]]
 
     out: Dict[str, Any] = {
-        "factory_id": factory_id, "graph": graph,
+        "factory_id": factory_id, "graph": graph, "liveness": live,
         "ledger": {"nodes": rows, "readable": len(readable), "unreadable": [r["node"] for r in unreadable],
                    "total_rows": ledger_total,
                    "biggest": sorted(readable, key=lambda r: -int(r["rows"] or 0))[:5]},
@@ -209,6 +286,11 @@ async def data_flow_profile(db: AsyncSession, factory_id: str, *, headcount: Opt
             f"（{max((int(r['rows'] or 0) for r in readable), default=0):,} 行）",
             f"图结构：public 表 {graph.get('public 表数')} 张、有数据 {graph.get('有数据的表')} 张、"
             f"外键边 {graph.get('外键边（表→表）')} 条 —— 节点之间的边就是这个数",
+            f"节点活性：有数据的 {live['tables_with_data']} 张表里，引擎（api/core）读到 "
+            f"{live['engine_read']} 张（{live['engine_read_share']:.0%}）；只有模型层或脚本碰的 "
+            f"{live['side_only']} 张；源码里根本不出现的 {live['unreferenced']} 张"
+            f"（{live['unreferenced_rows']:,} 行，占 {live['unreferenced_row_share']:.0%}）—— "
+            f"后者只代表引擎没读，不代表数据没用，更不构成删表依据",
         ],
     }
     if unreadable:

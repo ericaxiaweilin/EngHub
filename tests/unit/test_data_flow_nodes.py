@@ -74,3 +74,43 @@ def test_node_profile_wins_over_the_scale_model_when_both_match():
     assert hit["args"]["headcount"] == 1000, "规模要传进去，否则规模层外推不会出现在答复里"
     # 但纯规模问法仍是架构模型
     assert _resolve_intent_keyword("千人工厂长什么样")["tool"] == "generate_plant_architecture"
+
+
+def test_liveness_classifies_engine_reads_apart_from_script_only_and_dead():
+    from core.mes.data_flow import classify_liveness
+
+    refs = {
+        "work_orders": ["api/services/aps_service.py", "core/mes/order_flow.py"],
+        "production_alerts": ["database/models.py"],
+        "lg_stock": ["scripts/tmp.py"],
+        "archive_records": [],
+    }
+    out = classify_liveness([("work_orders", 862), ("production_alerts", 20000),
+                             ("lg_stock", 11021), ("archive_records", 4392)], refs)
+    assert out["engine_read"] == 1 and out["side_only"] == 2 and out["unreferenced"] == 1
+    assert out["top_engine_read"][0]["table"] == "work_orders"
+    assert out["top_engine_read"][0]["engine_files"] == 2
+    assert out["unreferenced_rows"] == 4392
+    # 行数占比按"有数据的表"算，不拿全库统计值冒充
+    assert out["unreferenced_row_share"] == round(4392 / (862 + 20000 + 11021 + 4392), 3)
+
+
+def test_liveness_never_becomes_a_delete_list():
+    """代理判据只能得出"引擎没读"，措辞必须挡住"所以可以删"。"""
+    from core.mes.data_flow import classify_liveness
+
+    out = classify_liveness([("x_table", 10)], {})
+    assert "数据没用" in out["caveat"] and "删表" in out["caveat"]
+    assert all(set(r) <= {"table", "rows", "status"} for r in out["top_unreferenced"]), \
+        "未引用清单只能给表名、行数与状态，多一个字段就是越权判断"
+    # 一条都没被读到时也不能编出引擎读数
+    assert out["engine_read"] == 0 and out["top_engine_read"] == []
+
+
+def test_source_refs_are_cached_and_scan_the_real_tree():
+    from core.mes.data_flow import source_table_refs
+
+    refs = source_table_refs()
+    assert refs, "源码扫描没结果：容器里的仓库根目录推导要重看"
+    assert any(f.startswith("api/") for f in refs.get("work_orders", []))
+    assert source_table_refs() is refs, "第二次调用不该重扫 399 个文件"
