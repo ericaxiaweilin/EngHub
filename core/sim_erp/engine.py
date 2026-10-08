@@ -16,6 +16,10 @@ from .plugins.base import SimulationPlugin
 from .plugins.executor import PluginExecutor
 
 
+# 热应力包的名字：物理层（WBGT/工休/出勤）与法规层（超限判定）共用同一份系数
+HEAT_PACK_NAME = "iso7243_jsoh_heat"
+
+
 class SimERPEngine:
     def __init__(
         self,
@@ -33,7 +37,8 @@ class SimERPEngine:
         )
         self.legislation_catalog = legislation_catalog or LegislationCatalog()
 
-    def evaluate(self, physical_input: PhysicalInput, plugins: Iterable[SimulationPlugin]) -> AuditRecord:
+    def evaluate(self, physical_input: PhysicalInput, plugins: Iterable[SimulationPlugin], *,
+                 attendance_baseline: dict | None = None) -> AuditRecord:
         plugin_list = list(plugins)
         legislation_catalog = self._load_legislation_packs(plugin_list)
         # 高温线只在法规包里写一次：物理层与规则层共用同一个阈值，
@@ -44,19 +49,39 @@ class SimERPEngine:
              if isinstance(pack.get("heat_allowance"), dict)), None)
         heat_pack = next((pack for pack in legislation_catalog.values()
                           if isinstance(pack, dict) and pack.get("metabolic_levels")), None)
+        physics_only = False
+        if not heat_pack:
+            # WBGT 是物理量，不是插件选项：没有插件声明热应力包时物理层照样折算，
+            # 否则取消勾选一个插件就退化成"30℃ 与 40℃ 一个能耗"那种假读数。
+            # 少了这个插件只是没人做"超限判定"，读数里必须把这两件事分开写。
+            try:
+                candidate = self.legislation_catalog.load_pack(HEAT_PACK_NAME)
+            except Exception:  # noqa: BLE001  包缺失时照样出数，走 mechanical 兜底
+                candidate = None
+            if isinstance(candidate, dict) and candidate.get("metabolic_levels"):
+                heat_pack = candidate
+                legislation_catalog[HEAT_PACK_NAME] = candidate  # 进包哈希，保证可复现
+                physics_only = True
         thermal = None
         if heat_pack:
             from .thermal import assess
 
             thermal = assess(temperature_c=physical_input.environment.temperature_c,
                              humidity_percent=physical_input.environment.humidity_percent,
-                             task_type=physical_input.work_context.task_type, pack=heat_pack)
+                             task_type=physical_input.work_context.task_type, pack=heat_pack,
+                             absence_baseline=attendance_baseline)
             if not thermal.get("available"):
                 thermal = None
             else:
                 # 假设跟着数走：Tg≈Td 这类简化必须在读数里看得见
                 thermal["basis"] = {**(thermal.get("basis") or {}),
-                                    "assumptions": thermal.get("assumptions") or []}
+                                    "assumptions": thermal.get("assumptions") or [],
+                                    "rule_route": ("physics_only" if physics_only else "plugin")}
+                if physics_only:
+                    thermal["basis"]["rule_route_note"] = (
+                        "所选插件里没有声明热应力包的插件 → WBGT、所需工休、效率与出勤率照折算（物理量），"
+                        "但**没有规则插件做超限判定**，arbiter 里不会出现 ISO7243.WBGT.TLV —— "
+                        "「没判违规」不等于「没超线」")
         snapshot = self.physics_core.simulate_step(physical_input, heat_threshold_c=heat_gt,
                                                    thermal=thermal)
         plugin_records = self.plugin_executor.execute_plugins(snapshot, plugin_list, legislation_catalog)

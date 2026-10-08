@@ -39,7 +39,7 @@ INERT_INPUTS = (
 
 
 class PhysicsCore:
-    VERSION = "3.1.3"
+    VERSION = "3.1.4"
 
     def simulate_step(self, physical_input: PhysicalInput, *,
                       heat_threshold_c: Optional[float] = None,
@@ -87,6 +87,7 @@ class PhysicsCore:
             comfort_band_c=th.get("comfort_band_c"),
             work_efficiency=th.get("work_efficiency"),
             energy_cost_multiplier=th.get("energy_cost_multiplier"),
+            attendance_impact=dict(th.get("attendance_impact") or {}),
         )
 
     def _calculate_fatigue(self, physical_input: PhysicalInput, *,
@@ -223,23 +224,39 @@ class PhysicsCore:
                 },
             },
             "comfort_curve": {
+                "environment_inputs_only": "温度与湿度两项。没有风速、服装、黑球温度的输入位——"
+                                           "室内车间无这些实测，工装是法规必须穿的（不是可调项），"
+                                           "无辐射测点时按 Tg≈Td 简化并把假设写进读数",
                 "shape": ("效率曲线两侧都连续：热侧从舒适带上沿起算（干热 + 闷热相加），"
                           "冷侧从舒适带下沿起算，且高湿度让体感更冷（apparent_cold_c）"),
-                "attendance_is_a_different_axis": ("attendance_floor_c 只回答『会不会因此不来』，"
-                                                   "不参与效率计算；10℃ 出勤影响小不等于效率不掉"),
+                "attendance_is_a_different_axis": ("出勤率影响（attendance_impact）按热侧带外偏热度数加增量、"
+                                                   "基线取 attendance 台账实测；冷侧增量本厂声明为 0（照常来上班），"
+                                                   "但效率照降 —— 「不影响出勤」不等于「效率不掉」"),
                 "cold_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency"],
                 "cold_side_note": ("冷偏差按体感温度算：10℃ 已经是冷的，湿度越高扣得越多"),
-                "hot_side_note": ("热侧两条轴分开算：舒适带偏差进疲劳/能耗/效率，"
+                "hot_side_note": ("热侧两条轴分开算：舒适带偏差进疲劳/能耗/效率与出勤率，"
                                   "WBGT 超职业接触限值那条另算（合规判定与所需工休）"),
                 "hot_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency",
-                                    "required_rest_fraction"],
+                                    "required_rest_fraction", "attendance_impact"],
                 "note": ("舒适中心随作业强度下移（重活怕热不怕冷）；带外斜率是包里的本厂曲线，"
                          "标准只给热应激限值，不给这条双侧曲线"),
+            },
+            "attendance_impact": {
+                "formula": ("预测缺勤率 = 台账基线缺勤率 + 热侧增量(pp) + 冷侧增量(pp)，"
+                            "增量按 comfort 带外偏热度数 × 包里的斜率，封顶 max_increment_pp"),
+                "driven_by": ["comfort 带外偏热度数（干热 + 闷热）",
+                              "attendance 台账基线缺勤率（按厂区实测，调用方传入）"],
+                "baseline_source": ("attendance 表 status='leave' 行数 / 有打卡行数 —— "
+                                    "基线不在规则包里写死，换厂区就是换一个实测数"),
+                "no_baseline_behavior": ("取不到基线时只报 increment_pp，predicted_absence_rate 留 None 并写 "
+                                         "no_baseline_reason，不拿一个默认缺勤率冒充现场事实"),
+                "sensitivity_status": ("热侧斜率与冷侧 0 都是**本厂声明值**（写在包里可改可追）；"
+                                        "台账窗口只有 9 天且全在热季、没有逐日车间温度实测，所以没跟数据对撞过"),
             },
             "thermal_outputs": ["wbgt_c", "wet_bulb_c", "tlv_wbgt_c", "thermal_exceedance_c",
                                  "required_rest_fraction", "max_allowable_work_minutes_per_hour",
                                  "comfort_center_c", "comfort_band_c", "work_efficiency",
-                                 "energy_cost_multiplier"],
+                                 "energy_cost_multiplier", "attendance_impact"],
             "inert_inputs": list(INERT_INPUTS),
             "inert_note": ("这些字段接口收、快照存、审计里查得到，但不进疲劳、不进能耗、也不触发规则；"
                            "改了它们读数不变不是「参数没生效」，是模型里就没有这一段"),

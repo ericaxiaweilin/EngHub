@@ -303,6 +303,28 @@ OT_FLOOR_HOURS = 10.2      # 超过标称班时 0.2h 以上才算加了班（打
 DOUBLE_SHIFT_FLOOR_HOURS = 19.0
 
 
+ATT_ABSENCE_BASELINE_SQL = text("""
+    SELECT count(*) AS scheduled_rows, count(DISTINCT date) AS days,
+           min(date)::text AS from_day, max(date)::text AS to_day,
+           count(*) FILTER (WHERE status = 'leave') AS leave_rows,
+           count(*) FILTER (WHERE status <> 'present') AS nonpresent_rows,
+           count(*) FILTER (WHERE status = 'late') AS late_rows,
+           count(DISTINCT operator_id) AS people
+    FROM attendance WHERE factory_id = :fid
+""")
+
+# 日级浮动区间只统计排班人次够多的日子：个位数行的一天算出来的比率没有意义
+ATT_ABSENCE_DAILY_SQL = text("""
+    WITH d AS (
+        SELECT date, count(*) AS rows,
+               count(*) FILTER (WHERE status = 'leave') AS leave_rows
+        FROM attendance WHERE factory_id = :fid GROUP BY 1 HAVING count(*) >= :min_rows
+    )
+    SELECT count(*) AS days, min(leave_rows::float / rows) AS daily_min,
+           max(leave_rows::float / rows) AS daily_max, array_agg(date ORDER BY date) AS days_kept
+    FROM d
+""")
+
 ATT_SUMMARY_SQL = text("""
     SELECT count(*) AS rows, count(DISTINCT operator_id) AS people, count(DISTINCT date) AS days,
            min(date)::text AS from_day, max(date)::text AS to_day,
@@ -490,4 +512,49 @@ async def attendance_evidence(db: AsyncSession, factory_id: str) -> Dict[str, An
                   f"加班=打卡 >{OT_FLOOR_HOURS}h 且 ≤{DOUBLE_SHIFT_FLOOR_HOURS:.0f}h，"
                   f"双班=打卡 >{DOUBLE_SHIFT_FLOOR_HOURS:.0f}h；缺勤=status='leave'。"
                   "本普查只读数，不写回任何表。"),
+    }
+
+
+async def absence_baseline(db: AsyncSession, factory_id: str, *,
+                           min_day_rows: int = 200) -> Dict[str, Any]:
+    """出勤基线：只从 attendance 台账读出来的缺勤率，供合规仿真把热工况折成"多几个人不来"。
+
+    单独一个轻查询而不复用 attendance_evidence：仿真只缺这一个数（基线 + 日级浮动），
+    不该为它跑一遍五张表的段归属普查。分母含没打卡的行 —— 请假本来就没卡，
+    用有卡行做分母会把缺勤率算高。
+    """
+    row = dict((await db.execute(ATT_ABSENCE_BASELINE_SQL, {"fid": factory_id})).mappings().first() or {})
+    scheduled = int(row.get("scheduled_rows") or 0)
+    if scheduled == 0:
+        return {"available": False, "rate": None, "factory_id": factory_id,
+                "why": (f"厂区 {factory_id} 在 attendance 里 0 行 —— 没有可引用的出勤基线，"
+                        "仿真只能报增量百分点，不许拿一个默认缺勤率冒充现场事实"),
+                "checked": {"attendance_rows": 0}}
+    daily = dict((await db.execute(ATT_ABSENCE_DAILY_SQL,
+                                   {"fid": factory_id, "min_rows": min_day_rows})).mappings().first() or {})
+    leave = int(row.get("leave_rows") or 0)
+    rate = round(leave / scheduled, 4)
+    dmin = _f(daily.get("daily_min"))
+    dmax = _f(daily.get("daily_max"))
+    return {
+        "available": True, "factory_id": factory_id, "rate": rate,
+        "daily_min": (round(dmin, 4) if dmin is not None else None),
+        "daily_max": (round(dmax, 4) if dmax is not None else None),
+        "nonpresent_rate": round(int(row.get("nonpresent_rows") or 0) / scheduled, 4),
+        "late_rate": round(int(row.get("late_rows") or 0) / scheduled, 4),
+        "window": {"from_day": row.get("from_day"), "to_day": row.get("to_day"),
+                   "days": int(row.get("days") or 0), "people": int(row.get("people") or 0)},
+        "checked": {"scheduled_rows": scheduled, "leave_rows": leave,
+                    "days_in_daily_band": int(daily.get("days") or 0),
+                    "min_day_rows": min_day_rows},
+        "basis": (f"attendance 台账实测：status='leave' {leave} 行 / 排班人次 {scheduled} 行 = "
+                  f"{rate * 100:.2f}%（{row.get('from_day')}~{row.get('to_day')}），"
+                  + (f"日级浮动 {round(dmin * 100, 2)}%~{round(dmax * 100, 2)}%"
+                     if dmin is not None and dmax is not None else "日级浮动无法给出（够行的日子不足）")),
+        "daily_band_flat": (dmin is not None and dmax is not None and abs(dmax - dmin) < 1e-9),
+        "daily_band_note": (("这 " + str(int(daily.get("days") or 0)) + " 天的日级请假率完全持平（"
+                             f"{round(dmin * 100, 2)}%）—— 台账里没有热天与凉天的差异，"
+                             "所以温度→缺勤的斜率拿这张表验证不了，只能当声明值")
+                            if (dmin is not None and dmax is not None and abs(dmax - dmin) < 1e-9)
+                            else "日级请假率有浮动，可用来对照温度读数（仍需逐日车间温度实测才能回归）"),
     }

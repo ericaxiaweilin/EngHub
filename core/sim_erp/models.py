@@ -118,6 +118,8 @@ class PhysicalSnapshot(BaseModel):
     comfort_band_c: Optional[list] = None
     work_efficiency: Optional[float] = None
     energy_cost_multiplier: Optional[float] = None
+    # 出勤率影响（热侧增量按台账基线叠加）：{} 的意思是"没折算过"，不是"没有出勤风险"
+    attendance_impact: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RuleEvidence(BaseModel):

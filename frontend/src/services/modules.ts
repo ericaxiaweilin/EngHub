@@ -32,6 +32,8 @@ export interface SimulationRequest {
   environment: SimEnvironment
   work_context: SimWorkContext
   plugin_names: string[]
+  // 出勤基线取哪个厂的 attendance 台账；不带就只报缺勤增量
+  factory_id?: string
 }
 
 export interface RuleEvidence {
@@ -99,6 +101,20 @@ export interface SimSnapshot {
   skill_level?: string | null
   ppe_status?: string | null
   machine_risk_level?: string | null
+  // 热应力与工况读数（没有规则包时为 null = 没折算过，不是"没有热风险"）
+  wbgt_c?: number | null
+  wet_bulb_c?: number | null
+  tlv_wbgt_c?: number | null
+  thermal_exceedance_c?: number | null
+  metabolic_level?: string | null
+  required_rest_fraction?: number | null
+  max_allowable_work_minutes_per_hour?: number | null
+  comfort_center_c?: number | null
+  comfort_band_c?: number[] | null
+  work_efficiency?: number | null
+  energy_cost_multiplier?: number | null
+  attendance_impact?: Record<string, any>
+  thermal_basis?: Record<string, any>
 }
 
 export interface SimulationResult {

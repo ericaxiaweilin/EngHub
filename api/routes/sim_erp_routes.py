@@ -47,6 +47,7 @@ class SimERPScenarioRequest(BaseModel):
     temperature_c: float = Field(..., ge=-20.0, le=80.0)
     humidity_percent: float = Field(default=60.0, ge=0.0, le=100.0)
     distance_meters: float = Field(default=0.0, ge=0.0)
+    factory_id: Optional[str] = None
 
 
 class SimERPEnvironmentRequest(BaseModel):
@@ -81,6 +82,8 @@ class SimERPSimulationRequest(BaseModel):
     timestamp: Optional[datetime] = None
     environment: SimERPEnvironmentRequest
     work_context: SimERPWorkContextRequest
+    # 出勤基线是厂级的：带厂区才去 attendance 台账取实测缺勤率，不带就只报增量
+    factory_id: Optional[str] = None
     plugin_names: List[str] = Field(
         default_factory=lambda: [
             "VN_Legal_2024",
@@ -168,6 +171,10 @@ class SimERPSnapshotResponse(BaseModel):
     comfort_band_c: Optional[list] = None
     work_efficiency: Optional[float] = None
     energy_cost_multiplier: Optional[float] = None
+    # 出勤率影响：{} 表示没折算过（没规则包），不是「没有缺勤风险」
+    attendance_impact: Dict[str, Any] = Field(default_factory=dict)
+    # 折算依据（含 rule_route：物理层折算与法规判定是不是都走了）
+    thermal_basis: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SimERPSimulationResponse(BaseModel):
@@ -327,6 +334,8 @@ def _build_response(record: AuditRecord) -> SimERPSimulationResponse:
             comfort_band_c=snap.comfort_band_c,
             work_efficiency=snap.work_efficiency,
             energy_cost_multiplier=snap.energy_cost_multiplier,
+            attendance_impact=snap.attendance_impact,
+            thermal_basis=snap.thermal_basis,
         ),
         plugin_records=[
             SimERPPluginRecordResponse(
@@ -424,6 +433,16 @@ async def get_audit(simulation_id: str, db: AsyncSession = Depends(get_db)):
     return _entity_to_detail(entity)
 
 
+async def _attendance_baseline(db: AsyncSession, factory_id: Optional[str]) -> Dict[str, Any]:
+    """出勤基线只从 attendance 台账取：没带厂区就不猜缺勤率，把原因写进读数里。"""
+    if not factory_id:
+        return {"available": False,
+                "why": "请求没带 factory_id → 不取台账基线，只报增量百分点（不拿默认缺勤率冒充现场事实）"}
+    from core.mes.data_evidence import absence_baseline
+
+    return await absence_baseline(db, factory_id)
+
+
 @router.post("/simulate", response_model=SimERPSimulationResponse)
 async def simulate(request: SimERPSimulationRequest, db: AsyncSession = Depends(get_db)):
     try:
@@ -444,7 +463,8 @@ async def simulate(request: SimERPSimulationRequest, db: AsyncSession = Depends(
         environment=EnvironmentSnapshot(**request.environment.model_dump()),
         work_context=WorkContext(**request.work_context.model_dump()),
     )
-    record = engine.evaluate(physical_input, plugins)
+    record = engine.evaluate(physical_input, plugins, attendance_baseline=await _attendance_baseline(
+        db, request.factory_id))
     await _persist_audit_record(db, record)
     return _build_response(record)
 
@@ -481,6 +501,7 @@ async def simulate_high_heat_overtime(
         plugin_registry.create_many(
             ["VN_Legal_2024", "Johnson_Global_Standard", "Factory_Policy_Default"]
         ),
+        attendance_baseline=await _attendance_baseline(db, request.factory_id),
     )
     await _persist_audit_record(db, record)
     return _build_response(record)

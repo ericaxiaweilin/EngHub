@@ -391,7 +391,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_compliance_simulation",
-            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/湿度/连续作业时长/负重/姿势/步数/作业类型），返回合规判定、违规规则、疲劳分、能耗、WBGT 与所需工休等。所有参数可选，默认一个标准装配场景。**读数口径**：温度与湿度按 ISO 7243 室内形式折算 WBGT（0.7×自然湿球+0.3×干球，湿球用 Stull 2011 由温湿度估算），与该作业强度档的职业接触限值（JSOH 2025-2026）比较，超限会给出所需工休比例并可判定阻断；能耗 = 强度档代谢率(kcal/h，JSOH 同表) × 实际作业小时 + 休息档 × 工休小时，所以高温通过 WBGT→工休改变能耗，而**不是**把同样外功的 kcal 按温度放大（标准没有这个系数，模型就不编）；旧的外功代理值在 energy_mechanical_kcal 里仍可核对。答复必须按返回体的 thermal / energy_basis / model_drivers 说，不要猜原因。",
+            "description": "运行 Sim-ERP 人机工程/劳动合规仿真。输入作业场景（温度/湿度/连续作业时长/负重/姿势/步数/作业类型），返回合规判定、违规规则、疲劳分、能耗、WBGT、所需工休与出勤率影响。所有参数可选，默认一个标准装配场景。**读数口径**：温度与湿度按 ISO 7243 室内形式折算 WBGT（0.7×自然湿球+0.3×干球，湿球用 Stull 2011 由温湿度估算），与该作业强度档的职业接触限值（JSOH 2025-2026）比较，超限会给出所需工休比例并可判定阻断；能耗 = 强度档代谢率(kcal/h，JSOH 同表) × 实际作业小时 + 休息档 × 工休小时，所以高温通过 WBGT→工休改变能耗，而**不是**把同样外功的 kcal 按温度放大（标准没有这个系数，模型就不编）；旧的外功代理值在 energy_mechanical_kcal 里仍可核对。**环境输入只有温度与湿度**：没有风速、服装、黑球温度的输入位（室内车间无这些实测，工装是法规必须穿的、不是可调项），不要建议用户「脱掉工装/加风扇」来降温。**出勤率**：attendance_impact 按舒适带外的偏热度数加增量，基线缺勤率从 attendance 台账按厂区实测（传 factory_id 才会取对厂的数）；取不到基线时只报增量百分点。答复必须按返回体的 thermal / energy_basis / model_drivers / attendance_impact 说，不要猜原因。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -403,6 +403,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "posture_angle_deg": {"type": "number", "description": "姿势角度（0-180），默认0"},
                     "step_count": {"type": "integer", "description": "步数，默认3000"},
                     "action_type": {"type": "string", "enum": ["walk", "lift", "push", "pull", "assemble", "inspect", "idle"], "description": "动作类型，默认walk"},
+                    "factory_id": {"type": "string",
+                                   "description": ("出勤基线用哪个厂：可写厂名（机械厂、电子厂）或厂区 id。"
+                                                   "不写就用当前会话厂区；返回体 answer_must_name_factory 是这份"
+                                                   "出勤基线真正出自哪个厂，答复必须按它说")},
                 },
             },
         },
@@ -1730,7 +1734,8 @@ async def _get_user_by_name(db: AsyncSession, operator: str) -> Optional[User]:
     return (await db.execute(select(User).where(User.username == operator))).scalar_one_or_none()
 
 
-async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any], operator: str) -> Dict[str, Any]:
+async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any], operator: str,
+                                          factory_id: Optional[str] = None) -> Dict[str, Any]:
     """运行 Sim-ERP 合规仿真（直连引擎），落审计记录并返回判定摘要。"""
     task_type = args.get("task_type") or "assembly"
     action_raw = (args.get("action_type") or "walk").lower()
@@ -1759,8 +1764,13 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     except Exception as exc:  # 参数越界等 pydantic 校验失败
         return {"error": f"仿真参数不合法：{exc}"}
 
+    # 出勤基线只能从台账取（规则包里不写死）：换厂区就是换一个实测数，取不到就只报增量
+    from core.mes.data_evidence import absence_baseline
+
+    scope = await _factory_scoped_id(db, args, factory_id)
+    ledger = await absence_baseline(db, scope["factory_id"])
     plugins = _sim_registry.create_many(DEFAULT_SIM_PLUGINS)
-    record = _sim_engine.evaluate(phys, plugins)
+    record = _sim_engine.evaluate(phys, plugins, attendance_baseline=ledger)
 
     # 阈值从法规包读一次：答复里说的"高温线/连续工时线"必须和判据用的是同一个数
     from core.sim_erp.physics import PhysicsCore
@@ -1814,10 +1824,19 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
                                                     ["heat_allowance_triggers_above_c"])
            else f"不高于 {drivers['rule_thresholds']['heat_allowance_triggers_above_c']:g}℃ → "
                 "温度这一项对疲劳与判定都没有反应"))
-    return {
+    att_effect = ""
+    ai = snap.attendance_impact or {}
+    if ai.get("predicted_absence_rate") is not None:
+        att_effect = (f"出勤 {round(float(ai['baseline_absence_rate']) * 100, 2)}%（台账基线）→ "
+                      f"{round(float(ai['predicted_absence_rate']) * 100, 2)}%"
+                      f"（这条工况加 {ai['increment_pp']} 个百分点，100 人里约 "
+                      f"{round(float(ai['predicted_absence_rate']) * 100, 1)} 人请不到）")
+    elif ai.get("increment_pp"):
+        att_effect = (f"缺勤增量 {ai['increment_pp']} 个百分点，但 {ai.get('no_baseline_reason') or '没有台账基线'}")
+    result = {
         "success": True,
         "message": (f"合规仿真完成：疲劳 {round(snap.fatigue_score, 1)}、能耗 {round(snap.energy_kcal, 1)} kcal。"
-                    f"{thermal_effect or heat_effect}。"
+                    f"{thermal_effect or heat_effect}。{('出勤：' + att_effect + '。') if att_effect else ''}"
                     + (f"能耗 {round(snap.energy_kcal, 1)} kcal = {(snap.energy_basis or {}).get('metabolic_level')} 档 "
                        f"{(snap.energy_basis or {}).get('metabolic_kcal_per_hour')} kcal/h × "
                        f"{(snap.energy_basis or {}).get('exposure_hours')} 小时，"
@@ -1838,17 +1857,39 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
             "band_c": snap.comfort_band_c,
             "work_efficiency": snap.work_efficiency,
             "energy_cost_multiplier": snap.energy_cost_multiplier,
-            "note": ("热湿主导的不对称工况曲线：热侧从舒适带上沿起算，冷侧要低于 "
-                     "cold_floor（默认 10℃）才起算 —— 越南 10℃ 以上偏冷不降效率，"
-                     "不按温带舒适带惩罚。中心随作业强度下移；带外斜率是本厂曲线（写在包里）"),
+            "note": ("热湿主导的双侧工况曲线：热侧从舒适带上沿起算（干热 + 闷热相加，不取大值，"
+                     "所以湿度在热天也算账）；冷侧从舒适带下沿连续起算 —— 10℃ 就是冷的，"
+                     "湿度越高体感越冷（apparent_cold_c），效率照降。中心随作业强度下移；"
+                     "带外斜率是本厂曲线（写在包里，可改可追）"),
             "apparent_cold_c": (snap.energy_basis or {}).get("apparent_cold_c"),
             "cold_wet_penalty_c": (snap.energy_basis or {}).get("cold_wet_penalty_c"),
             "attendance_floor_c": (snap.energy_basis or {}).get("attendance_floor_c"),
-            "attendance_note": ("attendance_floor_c 只回答『会不会因此不来』，不参与效率；"
-                                "10℃ 出勤影响小不等于效率不掉"),
+            "attendance_note": ("出勤率影响是独立一条读数（见 attendance_impact）：热侧按带外偏热度数加增量、"
+                                "基线取台账实测；冷侧增量按本厂声明为 0（照常来上班），但效率照降 —— "
+                                "「不影响出勤」不等于「效率不掉」"),
             "read_pitfall": ("强超限时窗口内总能耗可能反而低于轻超时温度（工休把作业小时换成了休息档）—— "
                              "不代表高温更省力，而是那段时间不允许连续干；要看效率与所需工休"),
             "basis": (snap.energy_basis or {}).get("comfort_basis"),
+        },
+        # 工况的核心后果之一在出勤：热到没人来，产能就不是效率问题了而是人数问题
+        "attendance_impact": {
+            **(snap.attendance_impact or {}),
+            "reading": ((
+                f"基线缺勤 {round(float(snap.attendance_impact['baseline_absence_rate']) * 100, 2)}%"
+                f"（台账实测）+ 热侧增量 {snap.attendance_impact['increment_pp']} 个百分点 → "
+                f"预测缺勤 {round(float(snap.attendance_impact['predicted_absence_rate']) * 100, 2)}%"
+                + (f"（日级浮动区间 "
+                   f"{round(float(snap.attendance_impact['predicted_absence_range'][0]) * 100, 2)}%~"
+                   f"{round(float(snap.attendance_impact['predicted_absence_range'][1]) * 100, 2)}%）"
+                   if snap.attendance_impact.get("predicted_absence_range") else "")
+                + f"；按 100 人算约 {round(float(snap.attendance_impact['predicted_absence_rate']) * 100, 1)} 人请不到"
+                + ("（台账各天请假率持平，给不出浮动区间）"
+                   if snap.attendance_impact.get("baseline_band_flat") else "")
+            ) if (snap.attendance_impact or {}).get("predicted_absence_rate") is not None else (
+                f"缺勤增量 {((snap.attendance_impact or {}).get('increment_pp'))} 个百分点"
+                "（没有台账基线，只给增量不给总缺勤率）")),
+            "headcount_hint": ("按 100 人折算的请不到人数；乘实际人数就是这条工况的出勤代价，"
+                               "排产要减人的那部分不是效率折扣，是可用人头"),
         },
         "max_required_break_minutes": arb.max_required_break_minutes,
         "total_penalty_score": arb.total_penalty_score,
@@ -1887,8 +1928,11 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
             "load_weight_kg": snap.load_weight_kg,
             "posture_angle_deg": snap.posture_angle_deg,
             "step_count": snap.step_count,
+            "attendance_baseline": (ledger.get("basis") if ledger.get("available")
+                                    else ledger.get("why")),
         },
     }
+    return _stamp_factory(result, scope)
 
 
 async def _tool_query_simulation_audits(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -4711,6 +4755,9 @@ _HEAT_TASK_WORDS = {
     "包装": "packing", "搬运": "material_handling", "机加": "machining",
 }
 
+# 厂名 → 厂区（_factory_scoped_id 按名字查 factories）：出勤基线要按厂取，不能默认会话厂区
+_FACTORY_NAME_WORDS = ("机械厂", "电子厂")
+
 
 def extract_heat_scenario(message: str) -> Dict[str, Any]:
     """从原话里抽温度/湿度/连续时长/工序 —— 高温问题必须有真实数字进引擎。
@@ -4738,6 +4785,11 @@ def extract_heat_scenario(message: str) -> Dict[str, Any]:
     for cn, en in _HEAT_TASK_WORDS.items():
         if cn in text:
             args["task_type"] = en
+            break
+    # 出勤基线是厂级的：句子里点了厂名就要带走，否则拿 A 厂的缺勤率答 B 厂的问题
+    for w in _FACTORY_NAME_WORDS:
+        if w in text:
+            args["factory_id"] = w
             break
     return args
 
@@ -5092,7 +5144,9 @@ async def execute_tool(
         return {"error": f"未知工具：{tool_name}"}
     try:
         if tool_name in {"create_followup_task", "record_factory_rule",
-                         "adopt_recommendation", "record_execution", "confirm_rule"}:
+                         "adopt_recommendation", "record_execution", "confirm_rule",
+                         # 合规仿真的出勤基线是厂级的：既要操作人（落审计）也要会话厂区
+                         "run_compliance_simulation"}:
             # 挂账任务同时需要操作人（created_by）和当前工厂（数据隔离）
             return await executor(db, arguments, operator=operator, factory_id=factory_id)
         if tool_name == "edit_online_workbook":

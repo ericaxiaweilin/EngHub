@@ -18,7 +18,8 @@ import {
 
 const { Text } = Typography
 
-const DEFAULT_PLUGINS = ['VN_Legal_2024', 'Johnson_Global_Standard', 'Factory_Policy_Default']
+// 热应力规则默认开着：关掉它只是没人做超限判定，WBGT 与工休读数仍由物理层折算
+const DEFAULT_PLUGINS = ['VN_Legal_2024', 'Johnson_Global_Standard', 'Factory_Policy_Default', 'ISO7243_Heat_TLV']
 
 /* ── 场景预设 ── */
 const SCENARIOS: Record<string, { label: string; icon: React.ReactNode; desc: string; values: Record<string, any> }> = {
@@ -228,6 +229,8 @@ const ComplianceSim: React.FC = () => {
         action_type: v.action_type,
       },
       plugin_names: v.plugin_names,
+      // 缺勤基线按厂取台账：不带厂区就只给增量，不拿别的厂的数冒充
+      factory_id: localStorage.getItem('active_factory_id') || undefined,
     }
     try {
       const res = await runSimulation(payload)
@@ -550,6 +553,71 @@ const ComplianceSim: React.FC = () => {
                     </Space>
                   </Col>
                 </Row>
+
+                {/* 工况与出勤：热湿工况的两条后果轴 —— 效率折扣与"人请不到" */}
+                {result.snapshot && (
+                  <Card size="small" style={{ marginBottom: 12 }}
+                    title={<span><FireOutlined style={{ color: '#fa541c' }} /> 工况与出勤</span>}>
+                    <Descriptions size="small" column={1} colon={false}>
+                      <Descriptions.Item label="WBGT / 职业接触限值">
+                        {result.snapshot.wbgt_c ?? '未折算'}℃ / {result.snapshot.tlv_wbgt_c ?? '—'}℃
+                        {(result.snapshot.thermal_exceedance_c ?? 0) > 0
+                          ? <Tag color="error" style={{ marginLeft: 6 }}>超 {result.snapshot.thermal_exceedance_c}℃</Tag>
+                          : <Tag color="success" style={{ marginLeft: 6 }}>未超</Tag>}
+                        {result.snapshot.required_rest_fraction
+                          ? ` · 需 ${Math.round(result.snapshot.required_rest_fraction * 100)}% 工休，每 60 分钟最多连续 ${result.snapshot.max_allowable_work_minutes_per_hour} 分钟`
+                          : ''}
+                      </Descriptions.Item>
+                      <Descriptions.Item label="工况曲线">
+                        {result.snapshot.work_efficiency != null
+                          ? `效率 ${Math.round(result.snapshot.work_efficiency * 100)}%` : '效率 —'}
+                        {result.snapshot.energy_cost_multiplier
+                          ? ` · 能耗代价 ×${result.snapshot.energy_cost_multiplier}` : ''}
+                        {result.snapshot.comfort_center_c != null
+                          ? ` · 舒适中心 ${result.snapshot.comfort_center_c}℃（带 ${(result.snapshot.comfort_band_c || []).join('~')}℃）` : ''}
+                      </Descriptions.Item>
+                      <Descriptions.Item label="出勤率影响">
+                        {(() => {
+                          const ai: any = result.snapshot?.attendance_impact || {}
+                          if (!ai.available) return <Text type="secondary">未折算（没有热应力规则包）</Text>
+                          return ai.predicted_absence_rate != null ? (
+                            <span>
+                              <Text strong style={{ color: ai.increment_pp > 0 ? '#f5222d' : '#52c41a' }}>
+                                预测缺勤 {(ai.predicted_absence_rate * 100).toFixed(2)}%
+                              </Text>
+                              {' = 台账基线 ' + (ai.baseline_absence_rate * 100).toFixed(2) + '% + ' + ai.increment_pp + ' 个百分点'}
+                              {ai.increment_capped ? '（已封顶）' : ''}
+                              <br />
+                              <Text type="secondary" style={{ fontSize: 11 }}>
+                                按 100 人算约 {(ai.predicted_absence_rate * 100).toFixed(1)} 人请不到 · {ai.baseline_source}
+                              </Text>
+                            </span>
+                          ) : (
+                            <span>
+                              <Text strong>缺勤增量 {ai.increment_pp} 个百分点</Text>
+                              <br />
+                              <Text type="secondary" style={{ fontSize: 11 }}>{ai.no_baseline_reason}</Text>
+                            </span>
+                          )
+                        })()}
+                      </Descriptions.Item>
+                      {(result.snapshot.attendance_impact || {}).sensitivity_status === 'declared_unverified' && (
+                        <Descriptions.Item label="判定链路">
+                          <Text type="secondary" style={{ fontSize: 11 }}>
+                            {(result.snapshot.thermal_basis || {}).rule_route === 'physics_only'
+                              ? '热应力规则插件未选中：WBGT/工休/出勤仍按标准折算（物理量），但没有插件做超限判定 —— 「没判违规」不等于「没超线」'
+                              : '热应力规则插件已选中：超限会进裁决并可阻断'}
+                          </Text>
+                        </Descriptions.Item>
+                      )}
+                      <Descriptions.Item label="斜率出处">
+                        <Text type="secondary" style={{ fontSize: 11 }}>
+                          {((result.snapshot.attendance_impact || {}).coefficient_basis || '没有出勤换算口径')}
+                        </Text>
+                      </Descriptions.Item>
+                    </Descriptions>
+                  </Card>
+                )}
 
                 {/* 阻断 & 告警 */}
                 {(result.blocking_rules.length > 0 || result.warnings.length > 0) && (

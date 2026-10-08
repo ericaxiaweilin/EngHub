@@ -966,6 +966,7 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         basis = th.get("basis") or {}
         eb = result.get("energy_basis") or {}
         cc = result.get("comfort_curve") or {}
+        ai = result.get("attendance_impact") or {}
         over = float(th.get("exceedance_c") or 0.0)
         rest = round(float(th.get("required_rest_fraction") or 0.0) * 100)
         hit = "、".join(result.get("hit_rules") or []) or "、".join(
@@ -975,7 +976,7 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             + ("（超职业接触限值，需改工作-恢复制度）" if result.get("legal_blocked") else ""),
             f"- 场景：{sc.get('task_type')}、{sc.get('temperature_c')}℃、湿度 "
             f"{sc.get('humidity_percent')}%、连续 {sc.get('continuous_work_minutes')} 分钟、"
-            f"{sc.get('step_count')} 步",
+            f"{sc.get('step_count')} 步（出勤基线厂区：{result.get('answer_must_name_factory') or '未取'}）",
             f"- WBGT {th.get('wbgt_c')}℃（自然湿球 {th.get('wet_bulb_c')}℃）对比 "
             f"{th.get('metabolic_level')} 强度档限值 {th.get('tlv_wbgt_c')}℃："
             + (f"超 {over:g}℃ → 需约 {rest}% 工休，每 60 分钟最多连续作业 "
@@ -986,11 +987,14 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"当前效率 {round(float(cc.get('work_efficiency') or 0) * 100)}%、"
             f"能耗代价 ×{cc.get('energy_cost_multiplier')}"
             + (f"（体感 {eb.get('apparent_cold_c')}℃、偏冷 {eb.get('cold_deg_outside_band')}℃；"
-               f"出勤影响线 {eb.get('attendance_floor_c')}℃ —— 低于它才算可能不来）"
+               f"湿度把体感再往下扣 {eb.get('cold_wet_penalty_c')}℃）"
                if (eb.get('cold_deg_outside_band') or 0) > 0 else
                f"（偏热 {eb.get('hot_deg_outside_band')}℃，其中 WBGT 贡献 "
                f"{eb.get('hot_deg_from_wbgt')}℃）"
                if (eb.get('hot_deg_outside_band') or 0) > 0 else "（在舒适带内）"),
+            "- 出勤：" + (ai.get("reading") or "未折算")
+            + (f"（基线出处：{ai.get('baseline_source')}）" if ai.get("baseline_source") else "")
+            + f"；斜率是{'本厂声明值、未经台账对撞（台账只有 9 天热季）' if ai.get('sensitivity_status') == 'declared_unverified' else ai.get('sensitivity_status')}",
             f"- 疲劳 {result.get('fatigue_score')}、能耗 {result.get('energy_kcal')} kcal"
             + (f"（{eb.get('metabolic_level')} 档 {eb.get('metabolic_kcal_per_hour')} kcal/h × "
                f"{eb.get('exposure_hours')} 小时，其中 {round(float(eb.get('rest_fraction') or 0) * 100)}% "
