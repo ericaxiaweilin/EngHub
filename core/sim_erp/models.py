@@ -113,6 +113,11 @@ class PhysicalSnapshot(BaseModel):
     required_rest_fraction: Optional[float] = None
     max_allowable_work_minutes_per_hour: Optional[float] = None
     thermal_basis: Dict[str, Any] = Field(default_factory=dict)
+    # 舒适带曲线（双侧）：中心、带宽、当前效率与能耗代价系数
+    comfort_center_c: Optional[float] = None
+    comfort_band_c: Optional[list] = None
+    work_efficiency: Optional[float] = None
+    energy_cost_multiplier: Optional[float] = None
 
 
 class RuleEvidence(BaseModel):

@@ -89,5 +89,19 @@
     "basis": "代谢率取 JSOH 2025-2026 表 VIII-1 同表的 RMR 档（moderate=250 kcal/h 等），休息段按该表 very_light 档 130 kcal/h 计 —— 都是包里已有的引用值，不是新造的系数。标准不把高温写成 kcal 放大系数，所以温度是通过 WBGT 超限、所需工休、实际作业时长这条链影响能耗的",
     "mechanical_proxy_kept_as": "energy_mechanical_kcal",
     "scope_note": "这个数是「这段暴露窗口内的能量消耗」。同一件工作在高温下要花更长时间才能做完，所以做完它的总消耗是升的；本引擎没有任务工作量输入（只有步数这类过程量），不做那句结论，也不拿它当完成工时用"
+  },
+  "comfort": {
+    "optimal_c": 21.0,
+    "band_c": 2.0,
+    "optimal_shift_per_100kcal_above_130": -2.0,
+    "cost_per_deg_hot": 0.03,
+    "cost_per_deg_cold": 0.02,
+    "efficiency_loss_per_deg_hot": 0.012,
+    "efficiency_loss_per_deg_cold": 0.01,
+    "cold_fatigue_gain_per_deg": 0.02,
+    "basis": "舒适作业带按人体中性温度区（约 21℃、±2℃，与 ISO 7730 / ASHRAE 55 对轻中度室内作业的中性区一致）；作业强度越高，中心往下移（人自己产热，重活觉得更凉快才舒服），移动量按 -2℃/100kcal·h⁻¹ 计。带外每偏 1℃ 的能耗与效率斜率是**本厂曲线**（标准只给热应激限值，不给这条双侧曲线），改这几个数就等于改判据",
+    "fatigue_gain_per_deg_hot": 0.02,
+    "cost_per_deg_note": "热侧与冷侧都进疲劳、能耗、效率三条读数；WBGT 超限那条法规轴仍在热侧另算一次（两者不重复：一个是产能代价，一个是合规判定）",
+    "read_pitfall": "窗口内总能耗在强超限时可能反而低于轻超时温度（40℃ 比 35℃ 低），因为法规轴强制的工休把作业小时换成了休息档代谢率 —— 这不代表高温更省力，而是那段时间根本不允许连续干；看效率与所需工休两条读数，别只看这个 kcal"
   }
 }

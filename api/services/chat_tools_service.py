@@ -1833,6 +1833,18 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
         "energy_kcal": round(snap.energy_kcal, 1),
         "energy_mechanical_kcal": snap.energy_mechanical_kcal,
         "energy_basis": snap.energy_basis,
+        "comfort_curve": {
+            "center_c": snap.comfort_center_c,
+            "band_c": snap.comfort_band_c,
+            "work_efficiency": snap.work_efficiency,
+            "energy_cost_multiplier": snap.energy_cost_multiplier,
+            "note": ("U 型工况曲线：舒适带内效率最高、能耗最低，偏冷偏热都变差；"
+                     "中心随作业强度下移。带外斜率是本厂曲线（写在包里），"
+                     "标准给的是热应激限值那条轴"),
+            "read_pitfall": ("强超限时窗口内总能耗可能反而低于轻超时温度（工休把作业小时换成了休息档）—— "
+                             "不代表高温更省力，而是那段时间不允许连续干；要看效率与所需工休"),
+            "basis": (snap.energy_basis or {}).get("comfort_basis"),
+        },
         "max_required_break_minutes": arb.max_required_break_minutes,
         "total_penalty_score": arb.total_penalty_score,
         "total_cost_delta": arb.total_cost_delta,

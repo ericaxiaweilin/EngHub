@@ -126,7 +126,9 @@ def test_energy_is_metabolic_rate_times_worked_and_rest_hours():
     cool = _evaluate(_input(temp=30.0))
     hot = _evaluate(_input(temp=40.0))
     assert cool.snapshot.energy_basis["method"] == "metabolic_rate_x_time"
-    assert cool.snapshot.energy_kcal == 1000.0          # 250 kcal/h × 4h，无工休
+    cb = cool.snapshot.energy_basis
+    assert cb["worked_kcal"] == pytest.approx(250.0 * 4.0 * float(cb["energy_cost_multiplier"]))
+    assert cb["rest_fraction"] == 0.0
     assert hot.snapshot.energy_kcal < cool.snapshot.energy_kcal
     assert hot.snapshot.energy_basis["rest_fraction"] > 0.4
     assert (hot.snapshot.energy_basis["worked_kcal"]
@@ -138,14 +140,15 @@ def test_energy_is_metabolic_rate_times_worked_and_rest_hours():
 def test_energy_scales_with_exposure_duration():
     short = _evaluate(_input(temp=30.0, minutes=60))
     long = _evaluate(_input(temp=30.0, minutes=240))
-    assert short.snapshot.energy_kcal == 250.0
-    assert long.snapshot.energy_kcal == 1000.0
+    assert short.snapshot.energy_kcal < long.snapshot.energy_kcal
+    assert long.snapshot.energy_kcal == pytest.approx(short.snapshot.energy_kcal * 4.0)
 
 
 def test_heavier_intensity_costs_more_energy():
     light = _evaluate(_input(temp=30.0, task="inspect"))     # light 190 kcal/h
     heavy = _evaluate(_input(temp=30.0, task="casting"))     # heavy 370 kcal/h
-    assert light.snapshot.energy_kcal == 760.0
+    assert heavy.snapshot.energy_basis["metabolic_kcal_per_hour"] > \
+        light.snapshot.energy_basis["metabolic_kcal_per_hour"]
     assert heavy.snapshot.energy_kcal > light.snapshot.energy_kcal
 
 
@@ -184,3 +187,32 @@ def test_metabolic_lookup_uses_pack_mapping_and_default():
 def test_assess_without_pack_refuses_to_convert():
     out = assess(temperature_c=40.0, humidity_percent=60.0, task_type="assembly", pack={})
     assert out["available"] is False and "iso7243_jsoh_heat" in out["why"]
+
+def test_comfort_curve_is_u_shaped_both_ways_from_the_center():
+    """21±2 是效率与能耗的最低点，往冷往热都要变差（只罚热不罚冷是上一版的缺陷）。"""
+    mid = _evaluate(_input(temp=21.0, hum=60.0))
+    center = mid.snapshot.comfort_center_c
+    band = mid.snapshot.comfort_band_c
+    assert center is not None and band[0] < center < band[1]
+    cold = _evaluate(_input(temp=max(-5.0, band[0] - 10.0), hum=60.0))
+    hot = _evaluate(_input(temp=band[1] + 10.0, hum=60.0))
+    assert cold.snapshot.work_efficiency < mid.snapshot.work_efficiency
+    assert hot.snapshot.work_efficiency < mid.snapshot.work_efficiency
+    assert cold.snapshot.energy_cost_multiplier > 1.0
+    assert hot.snapshot.energy_cost_multiplier > 1.0
+    assert cold.snapshot.fatigue_score > mid.snapshot.fatigue_score
+    assert hot.snapshot.fatigue_score > mid.snapshot.fatigue_score
+
+
+def test_cold_side_changes_energy_that_used_to_be_inert():
+    """12℃ 与舒适带内不是同一个能耗：旧版里低于 35℃ 全都一动不动。"""
+    cold = _evaluate(_input(temp=12.0, minutes=240))
+    comfy = _evaluate(_input(temp=19.0, minutes=240))
+    assert cold.snapshot.energy_kcal > comfy.snapshot.energy_kcal
+    assert cold.snapshot.fatigue_score > comfy.snapshot.fatigue_score
+
+
+def test_heavier_work_shifts_the_comfort_center_down():
+    light = _evaluate(_input(temp=21.0, task="inspect"))     # light 190 kcal/h
+    heavy = _evaluate(_input(temp=21.0, task="casting"))     # heavy 370 kcal/h
+    assert heavy.snapshot.comfort_center_c < light.snapshot.comfort_center_c

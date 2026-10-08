@@ -79,9 +79,32 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
     gain = float(strain.get("fatigue_gain_per_exceedance_c", 0.0))
     rest_fraction = min(float(rest.get("max_rest_fraction", 0.75)),
                         float(rest.get("rest_fraction_per_exceedance_c", 0.0)) * over)
+    cf = pack.get("comfort") or {}
+    kcal = float(meta.get("kcal_per_hour") or 0.0)
+    center = float(cf.get("optimal_c", 21.0)) + float(
+        cf.get("optimal_shift_per_100kcal_above_130", 0.0)) * max(0.0, (kcal - 130.0) / 100.0)
+    band = float(cf.get("band_c", 2.0))
+    upper, lower = center + band, center - band
+    hot_deg = max(0.0, float(temperature_c) - upper)
+    cold_deg = max(0.0, lower - float(temperature_c))
+    energy_cost_multiplier = round(1.0 + float(cf.get("cost_per_deg_hot", 0.0)) * hot_deg
+                                   + float(cf.get("cost_per_deg_cold", 0.0)) * cold_deg, 4)
+    work_efficiency = round(max(0.5, 1.0
+                                - float(cf.get("efficiency_loss_per_deg_hot", 0.0)) * hot_deg
+                                - float(cf.get("efficiency_loss_per_deg_cold", 0.0)) * cold_deg), 4)
+    comfort_fatigue_gain = round(float(cf.get("cold_fatigue_gain_per_deg", 0.0)) * cold_deg
+                                 + float(cf.get("fatigue_gain_per_deg_hot", 0.0)) * hot_deg, 4)
     return {
         "available": True,
-        "standard": pack.get("standard"),
+        "comfort_center_c": round(center, 2),
+        "comfort_band_c": [round(lower, 2), round(upper, 2)],
+        "hot_deg_outside_band": round(hot_deg, 2),
+        "cold_deg_outside_band": round(cold_deg, 2),
+        "energy_cost_multiplier": energy_cost_multiplier,
+        "work_efficiency": work_efficiency,
+        "comfort_fatigue_gain": comfort_fatigue_gain,
+        "cold_fatigue_gain": comfort_fatigue_gain,
+        "comfort_basis": cf.get("basis"),
         "pack_version": pack.get("version"),
         "wet_bulb_c": env["wet_bulb_c"],
         "globe_used_c": env["globe_used_c"],

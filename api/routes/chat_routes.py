@@ -965,6 +965,7 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         sc = result.get("scenario") or {}
         basis = th.get("basis") or {}
         eb = result.get("energy_basis") or {}
+        cc = result.get("comfort_curve") or {}
         over = float(th.get("exceedance_c") or 0.0)
         rest = round(float(th.get("required_rest_fraction") or 0.0) * 100)
         hit = "、".join(result.get("hit_rules") or []) or "、".join(
@@ -980,6 +981,14 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             + (f"超 {over:g}℃ → 需约 {rest}% 工休，每 60 分钟最多连续作业 "
                f"{th.get('max_allowable_work_minutes_per_hour')} 分钟"
                if over > 0 else f"未超（余 {-over:g}℃）"),
+            f"- 工况曲线：舒适中心 {cc.get('center_c')}℃（带 "
+            f"{(cc.get('band_c') or ['—', '—'])[0]}~{(cc.get('band_c') or ['—', '—'])[1]}℃）、"
+            f"当前效率 {round(float(cc.get('work_efficiency') or 0) * 100)}%、"
+            f"能耗代价 ×{cc.get('energy_cost_multiplier')}"
+            + (f"（偏冷 {eb.get('cold_deg_outside_band')}℃）"
+               if (eb.get('cold_deg_outside_band') or 0) > 0 else
+               f"（偏热 {eb.get('hot_deg_outside_band')}℃）"
+               if (eb.get('hot_deg_outside_band') or 0) > 0 else "（在舒适带内）"),
             f"- 疲劳 {result.get('fatigue_score')}、能耗 {result.get('energy_kcal')} kcal"
             + (f"（{eb.get('metabolic_level')} 档 {eb.get('metabolic_kcal_per_hour')} kcal/h × "
                f"{eb.get('exposure_hours')} 小时，其中 {round(float(eb.get('rest_fraction') or 0) * 100)}% "

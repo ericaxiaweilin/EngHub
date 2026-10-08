@@ -164,6 +164,10 @@ class SimERPSnapshotResponse(BaseModel):
     required_rest_fraction: Optional[float] = None
     max_allowable_work_minutes_per_hour: Optional[float] = None
     energy_mechanical_kcal: Optional[float] = None
+    comfort_center_c: Optional[float] = None
+    comfort_band_c: Optional[list] = None
+    work_efficiency: Optional[float] = None
+    energy_cost_multiplier: Optional[float] = None
 
 
 class SimERPSimulationResponse(BaseModel):
@@ -319,6 +323,10 @@ def _build_response(record: AuditRecord) -> SimERPSimulationResponse:
             required_rest_fraction=snap.required_rest_fraction,
             max_allowable_work_minutes_per_hour=snap.max_allowable_work_minutes_per_hour,
             energy_mechanical_kcal=snap.energy_mechanical_kcal,
+            comfort_center_c=snap.comfort_center_c,
+            comfort_band_c=snap.comfort_band_c,
+            work_efficiency=snap.work_efficiency,
+            energy_cost_multiplier=snap.energy_cost_multiplier,
         ),
         plugin_records=[
             SimERPPluginRecordResponse(

@@ -39,7 +39,7 @@ INERT_INPUTS = (
 
 
 class PhysicsCore:
-    VERSION = "3.0.0"
+    VERSION = "3.1.1"
 
     def simulate_step(self, physical_input: PhysicalInput, *,
                       heat_threshold_c: Optional[float] = None,
@@ -83,6 +83,10 @@ class PhysicsCore:
             required_rest_fraction=th.get("required_rest_fraction"),
             max_allowable_work_minutes_per_hour=th.get("max_allowable_work_minutes_per_hour"),
             thermal_basis=dict(th.get("basis") or {}),
+            comfort_center_c=th.get("comfort_center_c"),
+            comfort_band_c=th.get("comfort_band_c"),
+            work_efficiency=th.get("work_efficiency"),
+            energy_cost_multiplier=th.get("energy_cost_multiplier"),
         )
 
     def _calculate_fatigue(self, physical_input: PhysicalInput, *,
@@ -98,6 +102,9 @@ class PhysicsCore:
         if thermal and thermal.get("available"):
             # 有热应力折算时按 WBGT 超限幅度放大（应变系数来自规则包，可改可追）
             fatigue *= float(thermal.get("strain_multiplier") or 1.0)
+            # 舒适带两侧都进疲劳：只罚热不罚冷是半条曲线
+            fatigue *= 1.0 + float(thermal.get("comfort_fatigue_gain")
+                                   or thermal.get("cold_fatigue_gain") or 0.0)
         elif temp > heat_threshold_c:
             # 兜底：拿不到规则包时退回"温度 >35℃ 一次乘 1.3"的老阶跃，并注明没按标准折算
             fatigue *= HEAT_FATIGUE_MULTIPLIER
@@ -136,9 +143,17 @@ class PhysicsCore:
                                         "这个值与温度、湿度、时长都无关")}
         rest_rate = th.get("rest_metabolic_kcal_per_hour") or rate
         rest_fraction = min(1.0, max(0.0, float(th.get("required_rest_fraction") or 0.0)))
-        worked = rate * (1.0 - rest_fraction) * hours
-        rested = rest_rate * rest_fraction * hours
+        cost = float(th.get("energy_cost_multiplier") or 1.0)
+        worked = rate * (1.0 - rest_fraction) * hours * cost
+        rested = rest_rate * rest_fraction * hours * cost
         return (worked + rested), mech, {
+            "energy_cost_multiplier": round(cost, 4),
+            "comfort_center_c": th.get("comfort_center_c"),
+            "comfort_band_c": th.get("comfort_band_c"),
+            "hot_deg_outside_band": th.get("hot_deg_outside_band"),
+            "cold_deg_outside_band": th.get("cold_deg_outside_band"),
+            "work_efficiency": th.get("work_efficiency"),
+            "comfort_basis": th.get("comfort_basis"),
             "method": "metabolic_rate_x_time",
             "metabolic_kcal_per_hour": rate,
             "metabolic_level": th.get("metabolic_level"),
@@ -202,8 +217,20 @@ class PhysicsCore:
                     "kept_because": "历史读数与回归核对要能对齐，不代表这是能耗的真相",
                 },
             },
+            "comfort_curve": {
+                "shape": "U 型：舒适带内最低，往冷往热都变差（不是只有热的一侧）",
+                "cold_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency"],
+                "hot_side_note": ("热侧两条轴分开算：舒适带偏差进疲劳/能耗/效率，"
+                                  "WBGT 超职业接触限值那条另算（合规判定与所需工休）"),
+                "hot_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency",
+                                    "required_rest_fraction"],
+                "note": ("舒适中心随作业强度下移（重活怕热不怕冷）；带外斜率是包里的本厂曲线，"
+                         "标准只给热应激限值，不给这条双侧曲线"),
+            },
             "thermal_outputs": ["wbgt_c", "wet_bulb_c", "tlv_wbgt_c", "thermal_exceedance_c",
-                                 "required_rest_fraction", "max_allowable_work_minutes_per_hour"],
+                                 "required_rest_fraction", "max_allowable_work_minutes_per_hour",
+                                 "comfort_center_c", "comfort_band_c", "work_efficiency",
+                                 "energy_cost_multiplier"],
             "inert_inputs": list(INERT_INPUTS),
             "inert_note": ("这些字段接口收、快照存、审计里查得到，但不进疲劳、不进能耗、也不触发规则；"
                            "改了它们读数不变不是「参数没生效」，是模型里就没有这一段"),
