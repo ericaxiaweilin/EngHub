@@ -461,6 +461,172 @@ def classify_gap(row: Dict[str, Any]) -> str:
     return "flow_missing_kit"
 
 
+def coverage_summary(per_order: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """把引擎本轮算出的外购缺口件 vs 台账该单登记的缺口行汇总成可判线的数。
+
+    放行洞只算门判 ready 而引擎算出缺件的那几张；台账零缺口行是代理信号，单列不叫洞。
+    已下达(already_released)另列一档：下达发生在历史某一版，本轮判定查不到它，
+    既不能算成洞，也不能当没事。
+    """
+    eng = sum(int(x.get("engine_short_parts") or 0) for x in per_order)
+    led = sum(int(x.get("ledger_short_parts") or 0) for x in per_order)
+    missing = sum(int(x.get("missing_parts") or 0) for x in per_order)
+    dist: Dict[str, int] = {}
+    per_model: Dict[str, Dict[str, Any]] = {}
+    for x in per_order:
+        key = str(x.get("gate_verdict") or "unknown")
+        dist[key] = dist.get(key, 0) + 1
+        m = per_model.setdefault(str(x.get("model")), {"orders": 0, "engine": 0, "ledger": 0,
+                                                       "missing_rows": 0, "ledger_zero_short": 0})
+        m["orders"] += 1
+        m["engine"] += int(x.get("engine_short_parts") or 0)
+        m["ledger"] += int(x.get("ledger_short_parts") or 0)
+        m["missing_rows"] += int(x.get("missing_parts") or 0)
+        m["ledger_zero_short"] += int(not int(x.get("ledger_short_parts") or 0))
+
+    short = lambda x: int(x.get("engine_short_parts") or 0) > 0  # noqa: E731 - 三档共用一个条件
+    proven = [x for x in per_order if x.get("gate_verdict") == "ready" and short(x)]
+    acted = [x for x in per_order if x.get("gate_verdict") == "already_released" and short(x)]
+    no_basis = [x for x in per_order
+                if "no_kit_evidence" in str(x.get("gate_verdict") or "") and short(x)]
+
+    def _samples(rows_, keys):
+        return [{k: x.get(k) for k in keys} for x in rows_[:10]]
+
+    return {
+        "orders_sampled": len(per_order),
+        "models": sorted(per_model),
+        "engine_short_part_rows": eng,
+        "ledger_short_rows": led,
+        "coverage_rate": round(led / eng, 3) if eng else None,
+        "rows_to_register": missing,
+        "ledger_zero_short_orders": sum(1 for x in per_order
+                                        if not int(x.get("ledger_short_parts") or 0)),
+        "gate_verdict_distribution": dict(sorted(dist.items(), key=lambda kv: -kv[1])),
+        "gate_ready_but_engine_short": len(proven),
+        "already_released_but_engine_short": len(acted),
+        "held_no_kit_evidence_with_engine_list": len(no_basis),
+        "gate_ready_proven_samples": _samples(proven, ("work_order_code", "model",
+                                                       "engine_short_parts", "ledger_short_parts")),
+        "already_released_samples": _samples(acted, ("work_order_code", "model",
+                                                     "engine_short_parts", "ledger_short_parts")),
+        "no_basis_samples": _samples(no_basis, ("work_order_code", "model", "engine_short_parts")),
+        "per_model": sorted(per_model.values(), key=lambda v: -int(v["engine"]))[:10],
+    }
+
+
+async def kit_coverage_gap(db: AsyncSession, factory_id: str, *,
+                           per_model: int = 20, max_orders: int = 60) -> Dict[str, Any]:
+    """齐套行覆盖率（只读）：引擎按当前 BOM+库存算出的缺口件，台账登记了几件。
+
+    抽样按机种分层（每个机种取最近 per_model 张，总单数不超过 max_orders）——
+    只按时间取前 N 张会全落在同一台机种上，覆盖率就变成那一台的属性。
+    引擎侧的缺口件走 sim_bom_lines（唯一取数入口）+ build_kit，和 L2B 同一套数；
+    同一 (机种, 数量) 只展开一次，否则 60 张单会把同样的展开重算 60 遍。
+    """
+    from api.services import virtual_run as vr
+
+    rows = (await db.execute(text("""
+        WITH ranked AS (
+            SELECT o.id AS work_order_id, o.work_order_code,
+                   COALESCE(pp.product_code, p.product_code, o.product_id) AS model,
+                   o.planned_qty, o.status,
+                   COUNT(*) FILTER (WHERE w.item_type = 'buy'
+                                    AND COALESCE(w.required_qty,0) > 0) AS ledger_rows,
+                   COUNT(*) FILTER (WHERE w.item_type = 'buy'
+                                    AND COALESCE(w.shortage_qty,0) > 0) AS ledger_short_parts,
+                   ROW_NUMBER() OVER (PARTITION BY COALESCE(pp.product_code, p.product_code, o.product_id)
+                                      ORDER BY o.created_at DESC) AS model_rank
+            FROM work_orders o
+            JOIN work_order_materials w ON w.work_order_id = o.id
+            LEFT JOIN products p ON p.factory_id = o.factory_id
+                 AND (p.id::text = o.product_id OR p.product_code = o.product_id)
+            LEFT JOIN work_orders par ON par.id = o.parent_work_order_id
+            LEFT JOIN products pp ON pp.factory_id = par.factory_id
+                 AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+            WHERE o.factory_id = :fid AND o.status NOT IN ('completed','cancelled')
+            GROUP BY o.id, o.work_order_code, o.product_id, model, o.planned_qty, o.status, o.created_at
+        )
+        SELECT * FROM ranked WHERE model_rank <= :pm ORDER BY model, model_rank LIMIT :cap
+    """), {"fid": factory_id, "pm": max(1, int(per_model)), "cap": max(5, int(max_orders))})).mappings().all()
+
+    cache: Dict[tuple, Dict[str, Any]] = {}
+    per_order: List[Dict[str, Any]] = []
+    for r in rows:
+        model = str(r["model"] or "")
+        qty = float(r["planned_qty"] or 0) or 1.0
+        key = (model, qty)
+        if key not in cache:
+            got = await vr.sim_bom_lines(db, factory_id, model, qty)
+            codes = [str(x["material_code"]) for x in got["rows"]]
+            stock = {}
+            if codes:
+                stock = {str(x["material_code"]): float(x["available"] or 0) for x in (
+                    await db.execute(vr.STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all()}
+            kit = vr.build_kit(got["rows"], qty, stock, start_day=0)
+            cache[key] = {
+                "short": {str(l["material_code"]) for l in (kit.get("lines") or [])
+                          if str(l.get("make_or_buy")) == "外购" and float(l.get("short") or 0) > 0},
+                "source": got["source"]}
+        eng_short = cache[key]["short"]
+        led_short = {str(c) for (c,) in (await db.execute(text("""
+            SELECT w.material_code FROM work_order_materials w
+            WHERE w.work_order_id = :wid AND w.item_type = 'buy'
+              AND COALESCE(w.shortage_qty,0) > 0
+        """), {"wid": str(r["work_order_id"])})).all()}
+        per_order.append({
+            "gate_material_ready": None, "gate_plan_rows": None,
+            "work_order_id": str(r["work_order_id"]), "work_order_code": r["work_order_code"],
+            "model": model, "units": qty, "status": r["status"],
+            "ledger_rows": int(r["ledger_rows"] or 0),
+            "ledger_short_parts": len(led_short),
+            "engine_short_parts": len(eng_short),
+            "missing_parts": max(0, len(eng_short - led_short)),
+            "registered_rate": (round(len(eng_short & led_short) / len(eng_short), 3)
+                                if eng_short else None),
+            "bom_source": cache[key]["source"]})
+
+    # 门本轮说了什么要引用门自己的判定（evaluate_commit_gate）：只挑 material_ready 一列会
+    # 得出"24 张被判齐套"，而门实际一张都没放过 —— 它按 no_kit_evidence 挡住了同一批单。
+    # 两处读法不一致时，报告必须以门的判定为准，并分开报"洞"与"没依据"两种卡法。
+    from api.services.plan_commit_gate import evaluate_commit_gate
+
+    verdicts: Dict[str, str] = {}
+    try:
+        gate = await evaluate_commit_gate(db, factory_id, full=True)
+        verdicts = {str(k): str(v) for k, v in (gate.get("verdicts_by_order") or {}).items()}
+    except Exception as exc:  # noqa: BLE001 - 门查崩时这一格如实报"没查到"，不许猜
+        gate_error = f"{type(exc).__name__}: {exc}"
+    else:
+        gate_error = None
+    for x in per_order:
+        v = verdicts.get(x["work_order_id"])
+        x["gate_verdict"] = v or "not_in_plan"
+        x["gate_holds"] = bool(v and v != "ready")
+
+    out = coverage_summary(per_order)
+    out0 = out
+    out.update({
+        "factory_id": factory_id, "gate_error": gate_error,
+        "gate_read_from": "plan_commit_gate.evaluate_commit_gate（与任务中心下达门同一判定）",
+        "meaning": ("覆盖率 = 台账登记的缺口行 ÷ 引擎本轮算出的缺口件数。缺口件取的是"
+                    "外购且净缺>0 的料号集合，不看数量（毛/净的需求量差在另一格）"),
+        "why_it_matters": (f"门本轮判定分布 {out0['gate_verdict_distribution']}；"
+                           f"判 ready 而引擎算出缺件（可举证的放行洞）{out0['gate_ready_but_engine_short']} 张；"
+                           f"已下达而引擎算出缺件 {out0['already_released_but_engine_short']} 张 —— "
+                           f"后者不算本轮放行洞（下达发生在历史某一版），但也不能当没事；"
+                           f"另有一档：门按 no_kit_evidence 挡住、引擎却能列出缺哪些件的单 "
+                           f"{out0['held_no_kit_evidence_with_engine_list']} 张 —— 挡得对，但催办没有料号可追，"
+                           "这些单会一直卡在同一句「没有领料行」上"),
+        "write_cost": (f"补齐这些抽样单的缺口行约需新增 {out['rows_to_register']} 行"
+                       f"（{out['orders_sampled']} 张单）；按全厂在流程单数外推要先看张数上限，"
+                       "别一次写几百万行"),
+        "caveat": ("补登记会把这些单从不齐套判定变成不齐套判定（这是对的），但会同时增加催办量与"
+                   "挡住下达 —— 所以只在显式开关下做，且只加行、不改不删已有行"),
+    })
+    return out
+
+
 async def readiness(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
     rows = (await db.execute(text(READINESS_SQL), {"fid": factory_id})).mappings().all()
     per_model: Dict[str, Dict[str, Any]] = {}

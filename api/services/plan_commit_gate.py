@@ -263,6 +263,14 @@ async def evaluate_commit_gate(
     }
     if full:
         out["ready_full"] = ready
+        out["held_full"] = held
+        # 逐单判定表：别的格（齐套覆盖率、催办依据）要把"门怎么说"和自己的读数配对，
+        # 各拉一遍 ready/held/already 三个列表就会各拼出一套读法 —— 判定只在这里算一次。
+        out["verdicts_by_order"] = {
+            str(v["work_order_id"]): (
+                "already_released" if v["already_released"]
+                else ("ready" if v["ready"] else "|".join(v["hold_reasons"] or ["held"])))
+            for v in verdicts}
     return out
 
 

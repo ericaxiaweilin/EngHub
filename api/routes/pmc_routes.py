@@ -352,6 +352,9 @@ async def get_pmc_capabilities(
             {"key": "engine_capability_profile",
              "name": "能力三格画像（推演=给结果 / 分析=给原因 / 总结=给一段不编的话，各给判定）",
              "path": "/api/v1/pmc/engine-capability-profile", "mode": "read_only"},
+            {"key": "kit_coverage_gap",
+             "name": "齐套行覆盖率（引擎缺口件 vs 台账缺口行，含放行洞配对）",
+             "path": "/api/v1/pmc/kit-coverage-gap", "mode": "read_only"},
             {"key": "engine_watchdog", "name": "引擎自身故障巡检：心跳断写/崩溃越线自动挂催办，恢复自动关（默认预演）",
              "path": "/api/v1/pmc/engine-watchdog", "mode": "read_only"},
             {"key": "time_basis", "name": "预计工时出处与线/工位产能对撞（只读）",
@@ -822,6 +825,26 @@ async def get_kit_lines_reupgrade(
     from api.services.component_orders import reupgrade_stale_kit_lines
 
     return await reupgrade_stale_kit_lines(db, factory_id, apply=apply, limit=limit)
+
+
+@router.get("/kit-coverage-gap",
+            summary="齐套行覆盖率：引擎本轮算出的缺口件 vs 台账登记的缺口行（含门判定配对）")
+async def get_kit_coverage_gap(
+    factory_id: str = Query(..., description="厂区"),
+    per_model: int = Query(12, ge=1, le=40, description="每个机种抽样张数（按机种分层）"),
+    max_orders: int = Query(60, ge=5, le=200, description="参与比对的单数上限"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """只读：覆盖率 + 写入成本 + 门本轮判定分布（放行洞与没依据分开报）。
+
+    补登记会新增行、并把相关单变成不齐套，所以这里只给数与成本，不动库；
+    真要补走 /kit-lines-reupgrade（显式开关 + 行上限）。
+    """
+    del current_user
+    from api.services.sim_backtest import kit_coverage_gap
+
+    return await kit_coverage_gap(db, factory_id, per_model=per_model, max_orders=max_orders)
 
 
 @router.get("/engine-capability-profile",
