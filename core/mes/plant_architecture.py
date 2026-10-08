@@ -224,6 +224,19 @@ async def section_capacity_table(db: AsyncSession, factory_id: str) -> Dict[str,
                       "班时这里用 8h 名义值，实测标称班时另有出处（attendance 打卡中位）")}
 
 
+def _cross_check_reading(verdict: Optional[Dict[str, Any]]) -> str:
+    """线声明 vs 工位声明的倍数怎么念：min==max 时不说区间，免得念出「9.09~9.09 倍」。"""
+    if not verdict or not verdict.get("compared"):
+        return ("对撞：线声明产能与工位自述下界没有可比组 —— 要么没有线档案，"
+                "要么路线点名的工位给不出产能读数（这不是『对上了』）")
+    lo, hi = verdict.get("min"), verdict.get("max")
+    gap = f"{hi} 倍" if lo == hi else f"{lo}~{hi} 倍"
+    return (f"对撞：{verdict['compared']} 组『线声明台/天 vs 工位自述下界』差 {gap}"
+            f"（最大在 {verdict.get('worst_line')} × {verdict.get('worst_model')}，"
+            f"卡在 {verdict.get('worst_station')}）→ 沙箱/交期仍按 line_profiles 的声明出数，"
+            "但按工位自己声明的数做不出那个量；哪边是真的要厂里定，引擎不自己取小也不自己取大")
+
+
 async def architecture_model(db: AsyncSession, reference_factory_id: str, *,
                              headcount: Optional[float] = None, factor: Optional[float] = None,
                              temperature_c: Optional[float] = None,
@@ -244,6 +257,7 @@ async def architecture_model(db: AsyncSession, reference_factory_id: str, *,
         return {"status": "no_scale_basis", "why": scaled["why"], "measured_shape": shape,
                 "ratio_spread": spread}
     cap = await section_capacity_table(db, reference_factory_id)
+    cross = await capacity_cross_check(db, reference_factory_id)
     f = float(scaled["factor"])
     people_by_station = {}
     for row in cap["per_station"]:
@@ -295,6 +309,7 @@ async def architecture_model(db: AsyncSession, reference_factory_id: str, *,
         f"跨厂外推：{('可用' if spread['transferable'] else '不可用')} ——"
         f" 各厂区结构比例极差 {json.dumps(spread['spread'], ensure_ascii=False)}（>{MIN_SPREAD_TO_REFUSE_TRANSFER} 倍即拒绝）",
     ]
+    readings.append(_cross_check_reading(cross.get("verdict")))
     if conditions:
         tot = sum(float(c["absent_people_hot"] or 0) for c in conditions)
         readings.append(f"工况 {temperature_c}℃/{humidity_percent or 60}%：模型里前 8 段合计约 {round(tot)} 人这天不到岗"
@@ -308,10 +323,115 @@ async def architecture_model(db: AsyncSession, reference_factory_id: str, *,
                                  "而且 38 个工位的效率折扣都是占位 1.0 → 真实可达产能只会更低"),
         },
         "conditions": conditions, "ratio_spread": spread,
+        "cross_check": {"pairs": cross["pairs"], "verdict": cross["verdict"],
+                        "unit_open_question": cross["unit_open_question"],
+                        "rule": cross["rule"]},
         "tiers": ["厂区 → 车间/段（份额来自参照厂台账）→ 工位（stations，含路线点名的）"
                   "→ 班组人数（在册 distinct 工号 × 系数）→ 日产能上界（人数×60÷IE 工时）"],
         "not_derivable": scaled["not_scaled"] + [
             "线数：等比出 0.x 条不是物理配置（见 warnings），要的是『撑起声明产能需要几个人』"],
         "readings": readings,
         "warnings": scaled["warnings"],
+    }
+
+
+LINE_MODEL_SQL = text("""
+    SELECT lp.line_code, lp.line_group, lp.hours_per_day, lp.units_per_day, lp.crew_size,
+           lp.can_make_models::text AS can_models
+    FROM line_profiles lp WHERE lp.factory_id = :fid AND lp.is_active ORDER BY lp.line_code
+""")
+
+
+async def capacity_cross_check(db: AsyncSession, factory_id: str, *, max_models: int = 6) -> Dict[str, Any]:
+    """线声明的台/天 vs 工位路线算出的台/天 —— 两条都在台账里，差多少必须说出来。
+
+    沙箱/交期走 line_profiles 的声明产能，工位级产能走 stations.capacity_per_hour 与
+    在册人数×60÷IE 工时取下界。实测这座厂两边差 6.8~9.1 倍（线说 300~400 台/天，
+    加工车间自己说 4 件/小时=44 台/天），而 `capacity_per_hour` 的单位从没定义过：
+    4 到底是"整站每小时 4 件"还是"每人每小时 4 件"，差 164 倍。
+    所以这里只报矛盾与倍数，不替厂里把哪一条改成真相。
+    """
+    from core.mes.route_resolution import route_ops_for_product
+
+    stations = {str(r["station_code"]): dict(r) for r in (await db.execute(text("""
+        SELECT station_code, station_name, capacity, capacity_unit, capacity_per_hour
+        FROM stations WHERE factory_id = :fid AND COALESCE(status,'active')='active'
+    """), {"fid": factory_id})).mappings().all()}
+    lines = [dict(r) for r in (await db.execute(LINE_MODEL_SQL, {"fid": factory_id})).mappings().all()]
+    seen: set = set()
+    rows: List[Dict[str, Any]] = []
+    for ln in lines:
+        models = [m.strip().strip("'").strip("\\") for m in str(ln.get("can_models") or "").strip("{}").split(",") if m.strip()]
+        for model in models[:max_models]:
+            # 按 (线, 机种) 去重：同一条线组的声明各比一次，别让先出现的线把后一条线的对照吃掉
+            if (str(ln["line_code"]), model) in seen:
+                continue
+            seen.add((str(ln["line_code"]), model))
+            ops = await route_ops_for_product(db, factory_id, model)
+            if not ops:
+                rows.append({"model_code": model, "line_code": ln["line_code"], "status": "no_route",
+                             "why": "该厂这台机解析不出工艺路线 → 没有工位侧上界可对撞"})
+                continue
+            per_station, unmapped = [], []
+            for op in ops:
+                wc = str(op.get("work_center") or "").strip()
+                st = stations.get(wc)
+                hours = float(op.get("standard_hours") or 0.0)
+                if not st:
+                    if wc:
+                        unmapped.append(wc)
+                    continue
+                people = float(st.get("capacity") or 0) if str(st.get("capacity_unit") or "") == "人" else 0.0
+                headcount_bound = round(people * 60.0 / hours, 2) if (hours > 0 and people > 0) else 0.0
+                declared_rate = float(st.get("capacity_per_hour") or 0)
+                hours_per_day = float(ln.get("hours_per_day") or 0)
+                declared_bound = round(declared_rate * hours_per_day, 2) if declared_rate > 0 else 0.0
+                bounds = [b for b in (headcount_bound, declared_bound) if b > 0]
+                if not bounds:
+                    unmapped.append(wc or "(无工作中心)")
+                    continue
+                per_station.append({
+                    "station": wc, "station_name": st.get("station_name"),
+                    "operation": op.get("operation_name"), "ie_hours_per_unit": round(hours, 4),
+                    "people": int(people) if people else None,
+                    "headcount_bound_per_day": headcount_bound or None,
+                    "declared_bound_per_day": declared_bound or None,
+                    "bound_used_per_day": round(min(bounds), 2),
+                })
+            if not per_station:
+                rows.append({"model_code": model, "line_code": ln["line_code"], "status": "no_station_bounds",
+                             "why": f"路线 {len(ops)} 道工序没有一个工位给得出产能读数"
+                                    f"（缺档：{'、'.join(sorted(set(unmapped))) or '—'}）"})
+                continue
+            tight = min(per_station, key=lambda r: r["bound_used_per_day"])
+            station_bound = tight["bound_used_per_day"]
+            declared = float(ln.get("units_per_day") or 0)
+            rows.append({
+                "model_code": model, "line_code": ln["line_code"], "status": "ok",
+                "line_declared_units_per_day": declared,
+                "station_bound_units_per_day": station_bound,
+                "tight_station": tight["station"], "tight_station_name": tight["station_name"],
+                "tight_operation": tight["operation"],
+                "ratio_line_over_station": (round(declared / station_bound, 2) if station_bound and declared else None),
+                "stations_mapped": len(per_station), "route_operations": len(ops),
+                "unmapped_work_centers": sorted(set(unmapped)),
+                "per_station": sorted(per_station, key=lambda r: r["bound_used_per_day"])[:4],
+            })
+    comparable = [r for r in rows if r.get("ratio_line_over_station")]
+    ratios = [float(r["ratio_line_over_station"]) for r in comparable]
+    verdict = None
+    if ratios:
+        worst = max(comparable, key=lambda r: float(r["ratio_line_over_station"]))
+        verdict = {
+            "min": min(ratios), "max": max(ratios), "compared": len(comparable),
+            "worst_model": worst["model_code"], "worst_line": worst["line_code"],
+            "worst_station": worst.get("tight_station_name") or worst.get("tight_station"),
+        }
+    return {
+        "factory_id": factory_id, "pairs": rows, "verdict": verdict,
+        "rule": ("线声明产能与工位级下界并存时，沙箱/交期仍按 line_profiles 声明走（那是厂里给的参数），"
+                 "但读数里必须并列工位侧自己声明的数与矛盾倍数 —— 取小会把单位未定义的 "
+                 "capacity_per_hour 当真相，取大等于没对撞"),
+        "unit_open_question": ("stations.capacity_per_hour 的单位（整站/每小时 vs 每人/每小时）没定义过："
+                              "加工车间 4 配 164 人、组立一线 110 配 110 人，两种读法差 164 倍"),
     }

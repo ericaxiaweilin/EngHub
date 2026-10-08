@@ -77,3 +77,31 @@ def test_scale_question_keeps_the_working_condition_with_it():
     assert hit["args"]["headcount"] == 1000
     assert hit["args"]["temperature_c"] == 40.0 and hit["args"]["humidity_percent"] == 90.0
     assert hit["args"]["task_type"] == "assembly"
+
+
+def test_cross_check_reading_does_not_print_a_fake_range():
+    from core.mes.plant_architecture import _cross_check_reading
+
+    same = _cross_check_reading({"min": 9.09, "max": 9.09, "compared": 11,
+                                 "worst_line": "LINE-BIKE-01", "worst_model": "HTM1481-00",
+                                 "worst_station": "加工车间"})
+    assert "差 9.09 倍" in same and "~" not in same.split("组")[1]
+    span = _cross_check_reading({"min": 6.82, "max": 9.09, "compared": 11,
+                                 "worst_line": "L", "worst_model": "M", "worst_station": "S"})
+    assert "6.82~9.09 倍" in span
+    # 没有可比组时必须说"没对上过"，不能被读成"对上了"
+    none_ = _cross_check_reading(None)
+    assert "没有可比组" in none_ and "这不是『对上了』" in none_
+    assert "没有可比组" in _cross_check_reading({"compared": 0})
+
+
+def test_architecture_model_carries_the_cross_check_and_the_open_question():
+    import inspect
+
+    from core.mes.plant_architecture import architecture_model, capacity_cross_check
+
+    src = inspect.getsource(architecture_model)
+    assert "capacity_cross_check" in src, "架构模型必须带线↔工位对撞，不然只是自说自话的缩放"
+    assert "cross_check" in src
+    sig = inspect.signature(capacity_cross_check)
+    assert list(sig.parameters) == ["db", "factory_id", "max_models"]

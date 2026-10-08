@@ -451,6 +451,35 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     cov = await line_claim_coverage(db, factory_id)
     eff = await efficiency_basis_census(db, factory_id)
     out: List[Dict[str, Any]] = []
+    from core.mes.plant_architecture import capacity_cross_check
+
+    cross = await capacity_cross_check(db, factory_id)
+    cv = cross.get("verdict") or {}
+    if cv.get("compared") and float(cv.get("max") or 0) >= 2.0:
+        out.append({
+            "topic": "line_vs_station_capacity",
+            "question": (f"同一台机在线档案与工位表里差 {cv.get('max')} 倍"
+                         f"（{cv.get('worst_line')} 声明的台/天 vs {cv.get('worst_station')} "
+                         f"自述的下界，共 {cv.get('compared')} 组对照）—— 排产按哪个？"),
+            "what_records_say": json.dumps(
+                [{"model": p.get("model_code"), "line": p.get("line_code"),
+                  "line_declared": p.get("line_declared_units_per_day"),
+                  "station_bound": p.get("station_bound_units_per_day"),
+                  "ratio": p.get("ratio_line_over_station"),
+                  "tight_station": p.get("tight_station_name") or p.get("tight_station")}
+                 for p in cross["pairs"] if p.get("status") == "ok"][:6], ensure_ascii=False),
+            "already_computed": ("两条都在线上跑：沙箱/交期用 line_profiles.units_per_day，"
+                                 "工位级产能用 min(在册人数×60÷IE, capacity_per_hour×班时)；"
+                                 "系统没有把两者统一，也没有替厂里选一个"),
+            "why_it_matters": (f"同一个机种在两个出口差 {cv.get('min')}~{cv.get('max')} 倍："
+                               "按线声明排出来的量，工位侧按自己的声明根本做不出来；"
+                               "反过来按工位下界排又白白少排。交期承诺卡在中间没有依据"),
+            "expected_answer": ("一句定口径：stations.capacity_per_hour 是『整站每小时几件』还是"
+                                "『每人每小时几件』？定了之后要么改工位表、要么改线档案，"
+                                "引擎不自己取小也不自己取大"),
+            "prefilled_evidence": {"verdict": cv, "unit_open_question": cross["unit_open_question"]},
+        })
+
     total_st = int(eff.get("active_stations") or 0)
     if total_st and eff.get("all_unverified"):
         out.append({
