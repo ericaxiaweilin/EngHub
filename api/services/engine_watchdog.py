@@ -674,27 +674,32 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
         ev.add("line_profile_coverage")
         unclaimed = int(claim.get("unclaimed_models") or 0)
         if unclaimed >= MIN_UNCLAIMED_MODELS:
-            codes = [str(c) for c in (claim.get("codes") or [])][:6]
+            codes = [str(c) for c in (claim.get("unclaimed_codes") or [])][:6]
+            missing_st = [str(x) for x in (claim.get("route_stations_missing") or [])]
             out.append(_gap(
                 "line_profile_coverage", "open_orders_without_line_profile", f"models|{unclaimed // 2}",
-                f"补数据｜{unclaimed} 个在流程单没有线档案认领（沙箱里 line=null）",
-                ("这些机种有 pending/released/in_progress 的母单，但 line_profiles 里没有任何一条线的 "
-                 "can_make_models 写着它 —— 推演时 `pick_line` 找不到线，只能按路线工时推进："
-                 "**到岗曲线、班组人数、加班/双班/借人这些人力动作在这张单上乘不上**，"
-                 "工况缺勤也算不出交期影响（读数会写 line=null）。"
-                 f"\n涉及的机种：{('、'.join(codes))}；开放母单 {int(claim.get('orders') or 0)} 张、"
+                f"补数据｜{unclaimed} 个在流程单没有线档案认领"
+                + (f"（现在缺的只有工位 {'、'.join(missing_st)} 那一行）" if missing_st else ""),
+                ("这些机种有 pending/released/in_progress 的母单，line_profiles 里没有任何一条线的 "
+                 "can_make_models 写着它。原先推演因此完全不算产能（line=null，人力动作全乘不上）；"
+                 "现在改成按工位路线算产能下界 —— min(站点声明台/小时, 在册人数×60/IE工时) × "
+                 "实测标称班时（班时取该厂行数最多班次的打卡中位，实测 10.0h，不是写死的 11h）——"
+                 "所以到岗曲线、加班/双班/借人、工况扣人这几条已经乘得上了。"
+                 f"\n涉及的机种：{('、'.join(codes))}；开放母单 {int(claim.get('unclaimed_orders') or 0)} 张、"
                  f"{int(float(claim.get('unclaimed_units') or 0))} 台。"
-                 "\n能补的两件事，按顺序：① 在 line_profiles 里把这些机种加进实际做它的那条线"
-                 "（或新建线档案声明 units_per_day/crew_size/hours_per_day）；"
-                 "② 若它们其实按工位走，station_capacity 表现在是 **0 行**（没有 available_hours_per_day、"
-                 "没有 efficiency_rate），要按工位算产能得先把这张表填上 —— 而在那之前还要定一件事："
-                 "stations.capacity_per_hour 到底是「每件每小时」还是「每线每小时」"
-                 "（实测 capacity/capacity_unit 在两类站里口径不一致：车间写「人」、CNC 写「sets/day」），"
-                 "口径没定之前引擎不做工位级折算。"
-                 "\n在此之前这些单的产能读数是**路线工时推的**，不是线/工位能力算的，别对外说算过产能。"),
-                "这些单的人力/工况约束在引擎里是盲区：加班、借人、闷热天扣人都算不出效果",
+                 + (f"\n只剩一行要补：路线点名的工位 {'、'.join(missing_st)} 在 stations 里没有档案，"
+                    "这一档没有产能读数（引擎拿其余工序算，读数里标 incomplete）。"
+                    "同类站台账里有：组立一线/二线/三线这类 station_type=assembly 的行 —— "
+                    "要么路线写的是别名，要么补一行 stations 档案。" if missing_st else "")
+                 + "\n另一件要收口的（不影响能不能算，影响算得准不准）："
+                 "stations.capacity_per_hour 与「在册人数×60/IE」两读法实测差 360~6540 倍"
+                 "（组立一线两读一致=每人每件每小时；焊接车间差 6540 倍=整站读数），"
+                 "说明 capacity 那列在有的站里是车间在册总人数。引擎取两读法下界，"
+                 "所以不会把产能说大；要说准就得由厂里定这列的含义，或填 station_capacity "
+                 "的每站可用工时与效率（现在 28 个站填了 0 个）。"),
+                "工位路线产能已按下界计算；这一格剩的是路线别名/工位档案那一行与两读法收口",
                 "run_sandbox",
-                "把这些机种登记进对应线档案的 can_make_models，并核对 units_per_day/crew_size",
+                "把路线里对不上档案的工位认成已有站（或补一条 stations 行）；再定 capacity_per_hour 的口径",
                 {"unclaimed_models": unclaimed, "orders": int(claim.get("unclaimed_orders") or 0),
                  "units": int(float(claim.get("unclaimed_units") or 0)), "codes": codes,
                  "stations": claim.get("stations"), "station_capacity_rows": claim.get("station_capacity_rows"),
