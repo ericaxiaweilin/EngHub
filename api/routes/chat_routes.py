@@ -47,7 +47,7 @@ from database.models import (
 from core.auth.security import get_current_user
 from api.services.chat_tools_service import (
     TOOL_DEFINITIONS, TOOL_LABELS, WRITE_TOOLS, SIM_TOOLS, detect_intent_tool,
-    execute_tool, resolve_intent_async, DETERMINISTIC_INTENT_TOOLS,
+    execute_tool, resolve_intent_async, DETERMINISTIC_INTENT_TOOLS, asks_delivery_impact,
 )
 from api.services.quick_command_service import (
     build_agent_system_prompt, record_agent_dispatch,
@@ -227,6 +227,8 @@ _TOOL_SELECTION_ACTION_HINTS: Dict[str, tuple[str, ...]] = {
     "resume_work_order": ("恢复工单", "继续工单", "resume work order"),
     "split_work_order": ("拆分工单", "工单拆分", "split work order"),
     "run_compliance_simulation": ("合规仿真", "人机工程仿真", "劳动合规", "compliance simulation"),
+    "query_working_condition_impact": ("闷热", "高温天", "热天", "太热", "车间温度", "工况",
+                                       "到岗会掉", "请假会多", "working condition"),
     "query_alert_reviews": ("预警审查", "预警审核", "alert review"),
     "acknowledge_alert": ("确认预警", "确认告警", "驳回预警", "忽略预警", "acknowledge alert"),
     "query_ocap_tasks": ("ocap", "纠正预防措施", "待处理措施"),
@@ -970,6 +972,36 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- {'点击任一步可查看输入、判断标准、输出、交付物、下一步与异常回流' if is_business else '图中保留审批角色、会签/或签、审批条件和异常路径'}\n"
             f"- {diagram.get('engine_note', '节点与连线均来自流程引擎定义。')}"
         )
+    if tool_name == "query_working_condition_impact":
+        if result.get("error"):
+            return f"工况对交期的影响没算成：{result['error']}"
+        att = result.get("attendance") or {}
+        cond = result.get("conditions") or {}
+        b = result.get("normal") or {}
+        h = result.get("under_conditions") or {}
+        if result.get("status") == "no_run_basis":
+            return ("工况到岗率算得出，但这批单在该厂推不出时间线：" + str(result.get("why") or ""))
+        extra = int(result.get("extra_total_days_late") or 0)
+        headline = (f"多延 {extra} 天" if extra > 0
+                    else ("没有延期变化" if result.get("no_change_reason") else "无变化"))
+        lines = [
+            f"工况对交期的影响：{headline}",
+            f"- 工况：{cond.get('temperature_c')}℃、湿度 {cond.get('humidity_percent')}%、"
+            f"{cond.get('task_type')}｜目标：{cond.get('targets_source')}",
+            f"- 到岗：{round(float(att.get('normal') or 0) * 100, 2)}%（台账基线）→ "
+            f"{round(float(att.get('under_conditions') or 0) * 100, 2)}%（这条工况）"
+            f"｜WBGT {att.get('wbgt_c')}℃ vs {att.get('metabolic_level')} 档限值 {att.get('tlv_wbgt_c')}℃",
+            f"- 完工：{'、'.join(str(x) for x in (b.get('finish_days') or []))} 天 → "
+            f"{'、'.join(str(x) for x in (h.get('finish_days') or []))} 天"
+            f"｜迟交合计 {b.get('total_days_late')} → {h.get('total_days_late')} 天"
+            f"｜用工 {b.get('person_days_total')} → {h.get('person_days_total')} 人日",
+            f"- 同一批人到岗时的效率另算：{round(float(att.get('work_efficiency') or 0) * 100)}%"
+            "（这条不在天数里重复乘）",
+            f"- 依据：{att.get('baseline_basis')}",
+            f"- 口径：{(result.get('note') or '')}"
+            + (f"｜{result.get('no_change_reason')}" if result.get("no_change_reason") else ""),
+        ]
+        return "\n".join(lines)
     if tool_name == "run_compliance_simulation":
         if result.get("error"):
             return f"合规仿真没跑成：{result['error']}"
@@ -2439,6 +2471,22 @@ async def _handle_kernel_chat(
             return None
         arguments = intent.get("args") or {}
         result = await execute(tool_name, arguments)
+        reply = _direct_tool_reply(tool_name, result)
+        extra_actions = []
+        if tool_name == "run_compliance_simulation" and asks_delivery_impact(
+                str(ctx.last_user_content or "")):
+            # 问"这批单延几天"时只答合规就把少人这条后果藏了：按到岗比例再跑一遍产能沙箱
+            impact_args = {k: arguments[k] for k in ("temperature_c", "humidity_percent",
+                                                    "task_type", "factory_id")
+                           if arguments.get(k) is not None}
+            impact = await execute("query_working_condition_impact", impact_args)
+            if action_factory is not None:
+                extra_actions.append(action_factory(
+                    "query_working_condition_impact",
+                    TOOL_LABELS["query_working_condition_impact"], impact_args, impact,
+                    False, True, "error" not in impact,
+                ))
+            reply += "\n\n" + _direct_tool_reply("query_working_condition_impact", impact)
         action = None
         if action_factory is not None:
             action = action_factory(
@@ -2455,7 +2503,7 @@ async def _handle_kernel_chat(
         if table_data:
             tables.append(table_data)
         return KernelResponse(
-            reply=_direct_tool_reply(tool_name, result),
+            reply=reply,
             model={
                 "query_pmc_control_tower": "pmc-control-tower",
                 "query_manufacturing_intelligence": "manufacturing-intelligence",
@@ -2464,7 +2512,7 @@ async def _handle_kernel_chat(
                 "run_compliance_simulation": "sim-erp-compliance-engine",
             }[tool_name],
             degraded="error" in result,
-            actions=[action] if action is not None else [],
+            actions=[a for a in ([action] + extra_actions) if a is not None],
             tables=tables,
             request_id=ctx.request_id,
         )

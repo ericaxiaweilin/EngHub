@@ -558,3 +558,59 @@ async def absence_baseline(db: AsyncSession, factory_id: str, *,
                             if (dmin is not None and dmax is not None and abs(dmax - dmin) < 1e-9)
                             else "日级请假率有浮动，可用来对照温度读数（仍需逐日车间温度实测才能回归）"),
     }
+
+
+async def workforce_presence_under_conditions(
+    db: AsyncSession, factory_id: str, *, temperature_c: float, humidity_percent: float,
+    task_type: str = "assembly", step_count: int = 3000,
+    continuous_work_minutes: int = 480) -> Dict[str, Any]:
+    """工况 → 到岗比例：台账基线缺勤率 + 热侧增量，折成「这条班次能来多少人」。
+
+    产能侧要的是人头不是效率折扣，所以这条只用来喂到岗曲线/推演，不回填任何事实表。
+    没有台账基线（该厂区 0 行）时不给比例 —— 不拿一个默认缺勤率冒充现场事实。
+    """
+    from core.sim_erp.legislation import LegislationCatalog
+    from core.sim_erp.thermal import assess
+
+    ledger = await absence_baseline(db, factory_id)
+    pack = LegislationCatalog().load_pack("iso7243_jsoh_heat")
+    th = assess(temperature_c=float(temperature_c), humidity_percent=float(humidity_percent),
+                task_type=str(task_type), pack=pack,
+                absence_baseline=(ledger if ledger.get("available") else None),
+                workload={"step_count": int(step_count),
+                          "continuous_work_minutes": int(continuous_work_minutes),
+                          "load_weight_kg": 0.0, "posture_angle_deg": 0.0,
+                          "terrain": "flat", "floor_incline_percent": 0.0})
+    ai = th.get("attendance_impact") or {}
+    rate = ai.get("predicted_absence_rate")
+    present = round(1.0 - float(rate), 4) if rate is not None else None
+    out: Dict[str, Any] = {
+        "factory_id": factory_id, "available": present is not None,
+        "conditions": {"temperature_c": float(temperature_c),
+                       "humidity_percent": float(humidity_percent), "task_type": str(task_type),
+                       "step_count": int(step_count)},
+        "wbgt_c": th.get("wbgt_c"), "tlv_wbgt_c": th.get("tlv_wbgt_c"),
+        "metabolic_level": th.get("metabolic_level"),
+        "work_efficiency": th.get("work_efficiency"),
+        "required_rest_fraction": th.get("required_rest_fraction"),
+        "baseline_absence_rate": ai.get("baseline_absence_rate"),
+        "increment_pp": ai.get("increment_pp"),
+        "predicted_absence_rate": rate,
+        "present_ratio": present,
+        "absent_per_100_headcount": (round(float(rate) * 100, 1) if rate is not None else None),
+        "slope_status": ai.get("sensitivity_status"),
+        "baseline_source": ai.get("baseline_source"),
+        "reading": (f"{temperature_c:g}℃/{humidity_percent:g}% 下 WBGT {th.get('wbgt_c')}℃"
+                    f"（{th.get('metabolic_level')} 档限值 {th.get('tlv_wbgt_c')}℃）→ "
+                    f"缺勤 {round(float(rate) * 100, 2)}% = 台账基线 "
+                    f"{round(float(ai.get('baseline_absence_rate') or 0) * 100, 2)}% + "
+                    f"{ai.get('increment_pp')} 个百分点 → 到岗 {round(present * 100, 2)}%（每 100 人少 "
+                    f"{round(float(rate) * 100, 1)} 人）" if present is not None else
+                    f"{temperature_c:g}℃/{humidity_percent:g}% 只给缺勤增量 "
+                    f"{ai.get('increment_pp')} 个百分点：{ai.get('no_baseline_reason')}"),
+        "how_to_use": ("把 present_ratio 当到岗曲线喂推演（扣可用人头），"
+                       "效率另按 work_efficiency 单独计 —— 两个是不同的后果，不要乘两遍"),
+    }
+    if present is None:
+        out["why"] = ai.get("no_baseline_reason")
+    return out

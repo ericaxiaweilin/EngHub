@@ -416,6 +416,31 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_working_condition_impact",
+            "description": ("回答「车间这么热这批单还按期吗」：先按 attendance 台账算出平时的到岗率，"
+                            "再按温度+湿度折算这条工况下的到岗率（WBGT→缺勤增量），同一批目标各跑一遍沙箱，"
+                            "给出多几天完工、多几天迟交、多用多少人日。口径：缺勤扣的是**可用人头**（产能当天就矮），"
+                            "同一批人干得慢是另一条读数 work_efficiency，两者不重复乘。"
+                            "缺车间温度就返回错误不猜；缺勤增量的斜率是本厂声明值，"
+                            "全库没有车间温度实测可以验证它（读数里会写明）。"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "temperature_c": {"type": "number", "description": "车间温度（摄氏度），必填"},
+                    "humidity_percent": {"type": "number", "description": "相对湿度，默认60"},
+                    "task_type": {"type": "string", "description": "作业类型（定强度档与限值），默认assembly"},
+                    "model_code": {"type": "string", "description": "机种编码，例如 7.8AT-02"},
+                    "units": {"type": "number", "description": "数量（台）"},
+                    "due_in_days": {"type": "integer", "description": "交期（从今天起算天数），默认25"},
+                    "factory_id": {"type": "string", "description": "哪个厂（厂名或 FAC_ 开头的 id），默认会话厂区"},
+                },
+                "required": ["temperature_c"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_simulation_audits",
             "description": "查询历史合规仿真审计记录。返回仿真ID、作业场景、最终状态、是否违法阻断、所需休息、罚分、时间。",
             "parameters": {
@@ -1972,6 +1997,159 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
         },
     }
     return _stamp_factory(result, scope)
+
+
+OPEN_MASTER_TARGETS_SQL = text("""
+    SELECT p.product_code AS model_code, SUM(w.planned_qty) AS units,
+           GREATEST(1, (MIN(w.planned_due)::date - CURRENT_DATE)::int) AS due_in_days,
+           COUNT(*) AS orders
+    FROM work_orders w JOIN products p ON p.id = w.product_id
+    WHERE w.factory_id = :fid AND w.wo_type = 'master'
+      AND w.status IN ('pending', 'released', 'in_progress')
+      AND w.planned_qty > 0 AND w.planned_due IS NOT NULL
+    GROUP BY 1 ORDER BY MIN(w.planned_due) LIMIT 8
+""")
+
+
+async def _tool_query_working_condition_impact(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """工况扣人头之后这批单还按期吗：同一批目标分别按「现场基线到岗」与「工况到岗」各跑一遍沙箱。
+
+    为什么不是打一个效率折：热到没人来，少的是可用人头，产能曲线当天就矮一截；
+    效率折扣是另一件事（同一批人干得慢），两边都算就得各算各的。
+    """
+    scope = await _factory_scoped_id(db, args, factory_id)
+    fid = scope["factory_id"]
+    temp = args.get("temperature_c")
+    if temp is None:
+        return {"error": ("要知道车间温度才能算这条工况的交期影响（湿度可以不说，按 60% 算）。"
+                          "没有温度就不跑，免得拿默认 30℃ 回答点名的车间")}
+    try:
+        hum = float(args.get("humidity_percent") or 60.0)
+    except (TypeError, ValueError):
+        hum = 60.0
+
+    from api.services.virtual_run import run_sandbox
+    from core.mes.data_evidence import absence_baseline, workforce_presence_under_conditions
+
+    ledger = await absence_baseline(db, fid)
+    if not ledger.get("available"):
+        return _stamp_factory({"error": (f"这座厂在 attendance 里 0 行，没有缺勤基线 → "
+                                         f"算不出「工况比平时少来多少人」：{ledger.get('why')}")}, scope)
+    under = await workforce_presence_under_conditions(
+        db, fid, temperature_c=float(temp), humidity_percent=hum,
+        task_type=str(args.get("task_type") or "assembly"),
+        step_count=int(args.get("step_count") or 3000))
+    if under.get("present_ratio") is None:
+        return _stamp_factory({"error": under.get("why") or "工况算不出到岗比例"}, scope)
+
+    targets = args.get("targets") or ([{
+        "model_code": str(args.get("model_code") or ""),
+        "units": float(args.get("units") or 0),
+        "due_in_days": int(args.get("due_in_days") or 25),
+    }] if args.get("model_code") else [])
+    targets = [t for t in targets if str(t.get("model_code") or "").strip() and float(t.get("units") or 0) > 0]
+    targets_source = "调用方点名"
+    if not targets:
+        # 没点机种就按厂里真开着的母单算：工况影响的是整座厂的到岗，不是某一台单
+        rows = [dict(r) for r in (await db.execute(OPEN_MASTER_TARGETS_SQL, {"fid": fid})).mappings().all()]
+        targets = [{"model_code": str(r["model_code"]), "units": float(r["units"]),
+                    "due_in_days": int(r["due_in_days"])} for r in rows]
+        targets_source = (f"该厂在制/待开工的母单 {len(targets)} 个机种（按交期近的先看）"
+                          if targets else "没有可推演的机种：既没点名，也没有带交期的开放母单")
+    if not targets:
+        return _stamp_factory({"error": ("要点名的机种与数量（model_code + units），"
+                                         "或该厂要有带计划交期的开放母单")}, scope)
+
+    normal_curve = {d: round(1.0 - float(ledger["rate"]), 4) for d in range(0, 400)}
+    hot_curve = {d: float(under["present_ratio"]) for d in range(0, 400)}
+    base = await run_sandbox(db, fid, targets, attendance_curve=normal_curve)
+    hot = await run_sandbox(db, fid, targets, attendance_curve=hot_curve)
+
+    def _pick(rec):
+        return {"simulated": rec.get("simulated"), "no_basis": rec.get("no_basis"),
+                "run_status": [r.get("status") for r in (rec.get("runs") or [])],
+                "unfinished_reason": [(r.get("status") or r.get("why")) for r in (rec.get("runs") or [])
+                                      if r.get("finish_day") is None],
+                "finish_days": [r.get("finish_day") for r in (rec.get("runs") or [])],
+                "days_late": [r.get("days_late") for r in (rec.get("runs") or [])],
+                "on_time_orders": rec.get("on_time_orders"), "total_days_late": rec.get("total_days_late"),
+                "person_days_total": rec.get("person_days_total"),
+                "standby_person_days_total": rec.get("standby_person_days_total"),
+                "waiting_for_manpower": rec.get("waiting_for_manpower")}
+
+    b, h = _pick(base), _pick(hot)
+    delta_days = [None if (x is None or y is None) else int(y) - int(x)
+                  for x, y in zip(b["finish_days"], h["finish_days"])]
+    comparable = all(d is not None for d in delta_days) and bool(delta_days)
+    hot_runs = hot.get("runs") or []
+    per_order = [{
+        "model_code": r.get("model_code"), "units": r.get("units"),
+        "finish_day_normal": (base.get("runs") or [])[i].get("finish_day") if i < len(base.get("runs") or []) else None,
+        "finish_day_under_conditions": r.get("finish_day"), "delta_days": delta_days[i],
+        "capacity_binding": r.get("capacity_binding"), "binding_terms": r.get("binding_terms"),
+        "wait_days_for_material": r.get("wait_days_for_material"),
+        "bottleneck_part": (r.get("bottleneck_part") or {}).get("material_code"),
+        "people_present_avg": r.get("people_present_avg"),
+    } for i, r in enumerate(hot_runs)]
+    no_change_reason = None
+    if comparable and sum(abs(int(d or 0)) for d in delta_days) == 0:
+        binds = sorted({str(o.get("capacity_binding")) for o in per_order if o.get("capacity_binding")})
+        zero_crew = [str(o.get("model_code")) for o in per_order
+                     if float(o.get("people_present_avg") or 0.0) <= 0.0]
+        parts = []
+        if binds:
+            parts.append("卡点写着 " + "、".join(binds))
+        if zero_crew:
+            parts.append(f"其中 {len(zero_crew)} 个机种所在线**在册人数为 0**"
+                         f"（{('、'.join(zero_crew[:3]))}{'…' if len(zero_crew) > 3 else ''}）"
+                         "—— 到岗曲线乘的是在册班组，没人可扣所以改不动完工日；这是人数数据缺口，不是高温无害")
+        no_change_reason = ("完工日没变：" + ("；".join(parts) if parts else "这批单的约束不是人手")
+                            + "。少来的工时落在待命上，别把这条读成「高温没代价」")
+    if not comparable:
+        return _stamp_factory({
+            "status": "no_run_basis", "comparable": False,
+            "conditions": {"temperature_c": float(temp), "humidity_percent": hum},
+            "attendance": {"normal": round(1.0 - float(ledger["rate"]), 4),
+                           "under_conditions": under["present_ratio"],
+                           "wbgt_c": under["wbgt_c"], "tlv_wbgt_c": under["tlv_wbgt_c"],
+                           "baseline_basis": ledger["basis"],
+                           "slope_status": under["slope_status"]},
+            "normal": b, "under_conditions": h,
+            "why": (f"这批单在 {fid} 推不出时间线（沙箱返回 "
+                    f"{b.get('unfinished_reason') or b.get('run_status')}）—— "
+                    "到岗率算得出，但没有完工基线可比：换一个厂区或先补这台单的工时/路线，"
+                    "不拿一个不存在的交期差当结论"),
+            "reading": (f"{float(temp):g}℃/{hum:g}% 会让到岗从 "
+                        f"{round((1.0 - float(ledger['rate'])) * 100, 2)}% 掉到 "
+                        f"{round(float(under['present_ratio']) * 100, 2)}%，但这批单在该厂推不出时间线"
+                        "→ 交期影响没有数"),
+        }, scope)
+    return _stamp_factory({
+        "conditions": {"temperature_c": float(temp), "humidity_percent": hum,
+                       "task_type": str(args.get("task_type") or "assembly"),
+                       "targets": targets, "targets_source": targets_source},
+        "attendance": {"normal": round(1.0 - float(ledger["rate"]), 4),
+                       "under_conditions": under["present_ratio"],
+                       "baseline_basis": ledger["basis"],
+                       "wbgt_c": under["wbgt_c"], "tlv_wbgt_c": under["tlv_wbgt_c"],
+                       "metabolic_level": under["metabolic_level"],
+                       "work_efficiency": under["work_efficiency"],
+                       "slope_status": under["slope_status"]},
+        "normal": b, "under_conditions": h,
+        "per_order": per_order, "no_change_reason": no_change_reason,
+        "extra_days_per_order": delta_days,
+        "extra_total_days_late": (int(h["total_days_late"] or 0) - int(b["total_days_late"] or 0)),
+        "reading": (f"{float(temp):g}℃/{hum:g}% 到岗从 {round((1.0 - float(ledger['rate'])) * 100, 2)}% 掉到 "
+                    f"{round(float(under['present_ratio']) * 100, 2)}%（每 100 人少 "
+                    f"{round(float(under['predicted_absence_rate']) * 100 - float(ledger['rate']) * 100, 1)} 人）→ "
+                    f"这批单完工天数 {'、'.join(str(d) for d in delta_days)} 天变化，"
+                    f"迟交合计 {'+' if (h['total_days_late'] or 0) >= (b['total_days_late'] or 0) else ''}"
+                    f"{int(h['total_days_late'] or 0) - int(b['total_days_late'] or 0)} 天"),
+        "note": ("到岗比例是按台账基线与工况增量算的（增量斜率=声明值，未与温度实测对撞：全库没有车间温度数据）；"
+                 "同一批人干得慢那条走 work_efficiency，不在这里重复乘"),
+    }, scope)
 
 
 async def _tool_query_simulation_audits(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -3959,6 +4137,7 @@ _TOOL_EXECUTORS = {
     "create_production_report": _tool_create_production_report,
     "run_compliance_simulation": _tool_run_compliance_simulation,
     "query_simulation_audits": _tool_query_simulation_audits,
+    "query_working_condition_impact": _tool_query_working_condition_impact,
     "complete_work_order": _tool_complete_work_order,
     "pause_work_order": _tool_pause_work_order,
     "resume_work_order": _tool_resume_work_order,
@@ -4365,6 +4544,7 @@ TOOL_LABELS = {
     "release_work_order": "下达工单",
     "create_production_report": "生产报工",
     "run_compliance_simulation": "合规仿真",
+    "query_working_condition_impact": "工况对交期的影响",
     "query_simulation_audits": "仿真审计记录",
     "complete_work_order": "完工工单",
     "pause_work_order": "暂停工单",
@@ -4825,6 +5005,19 @@ def _cn_hours(raw: str) -> Optional[float]:
     return None
 
 
+_DELIVERY_IMPACT_WORDS = ("延", "交期", "交付", "按期", "迟", "赶得上", "来得及", "这批单", "手上的单",
+                          "到岗", "少多少人", "缺勤")
+
+
+def asks_delivery_impact(message: str) -> bool:
+    """高温问题里问的是"这批单会延几天"还是"能不能干"：前者要多跑一遍产能沙箱。
+
+    只答合规不答交期，就是把"人手不够"这条后果藏起来了 —— 工况影响产能的方式是少人，不是慢。
+    """
+    text = message or ""
+    return any(w in text for w in _DELIVERY_IMPACT_WORDS)
+
+
 def extract_heat_scenario(message: str) -> Dict[str, Any]:
     """从原话里抽温度/湿度/连续时长/工序 —— 高温问题必须有真实数字进引擎。
 
@@ -4889,6 +5082,10 @@ def extract_heat_scenario(message: str) -> Dict[str, Any]:
         if w in text:
             args["factory_id"] = w
             break
+    # 这条仿真的必要输入是温度：没抽到就整条返回空（docstring 就是这么承诺的），
+    # 否则"装配岗今天干得怎么样"会拿默认 30℃ 场景跑出一个看着像答案的数
+    if "temperature_c" not in args:
+        return {}
     return args
 
 

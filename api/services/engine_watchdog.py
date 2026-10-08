@@ -491,6 +491,15 @@ SUPPLIER_GAP_SQL = """
       AND COALESCE(m.default_supplier, '') = ''
 """
 
+TEMPERATURE_OBSERVATION_SQL = """
+    SELECT (SELECT count(*) FROM equipment_readings er
+              WHERE er.factory_id = :fid
+                AND (er.metric_type ILIKE '%temp%' OR er.unit IN ('C', '℃', 'celsius', 'Celsius'))) AS sensor_rows,
+           (SELECT count(*) FROM equipment_readings WHERE factory_id = :fid) AS reading_rows,
+           (SELECT count(DISTINCT a.date) FROM attendance a WHERE a.factory_id = :fid) AS attendance_days
+"""
+
+
 MIN_STALE_ORDERS = 10
 MIN_RERUNNABLE_ORDERS = 10
 MIN_SUPPLIER_GAP_PARTS = 20
@@ -535,10 +544,13 @@ MOB_CONTRADICTION_SQL = """
 # 判据线以下，或者那一格的查数没跑成（列没了、厂区没数据、依赖的服务抛异常被吞）。
 # 光看"没报"分不出这两种，而分不出就自动关闭会把"暂时没查"写成"已经修好"，补数据的人
 # 丢的正是那条待办。所以这一组只刷新、不关闭；要真收掉得有人明确判一次。
+MIN_ATTENDANCE_DAYS_FOR_SLOPE = 3
+
 DATA_LOOPS = frozenset({
     "kit_line_generation", "kit_line_missing", "supplier_master",
     "lead_time_evidence", "material_make_or_buy_conflict",
     "action_constraints", "action_execution_silence", "candidate_rules",
+    "working_conditions_evidence",
 })
 
 
@@ -566,10 +578,11 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     sup = (await db.execute(text(SUPPLIER_GAP_SQL), {"fid": factory_id})).mappings().first()
     lead = (await db.execute(text(LEAD_DEFAULT_SQL), {"fid": factory_id})).mappings().first()
     mob = (await db.execute(text(MOB_CONTRADICTION_SQL), {"fid": factory_id})).mappings().first()
+    wc = (await db.execute(text(TEMPERATURE_OBSERVATION_SQL), {"fid": factory_id})).mappings().first()
     if evaluated_out is not None:
         evaluated_out.update({"kit_line_generation", "supplier_master",
                               "lead_time_evidence", "material_make_or_buy_conflict",
-                              "candidate_rules"})
+                              "candidate_rules", "working_conditions_evidence"})
     try:
         from core.mes.action_constraints import action_constraints
 
@@ -600,6 +613,7 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
+                        wc=dict(wc or {}),
                         pending=list(pending or []), mp=dict(mp or {}),
                         evaluated_out=evaluated_out)
 
@@ -610,6 +624,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  cons: Optional[Dict[str, Any]] = None,
                  pending: Optional[List[Dict[str, Any]]] = None,
                  mp: Optional[Dict[str, Any]] = None,
+                 wc: Optional[Dict[str, Any]] = None,
                  evaluated_out: Optional[set] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
@@ -626,6 +641,29 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
         basis = cons.get("grid_usage_basis") or {}
         if basis.get("coverage_known"):
             ev.add("action_execution_silence")
+    if wc is not None and int(wc.get("attendance_days") or 0) >= MIN_ATTENDANCE_DAYS_FOR_SLOPE:
+        ev.add("working_conditions_evidence")
+        if int(wc.get("sensor_rows") or 0) == 0:
+            out.append(_gap(
+                "working_conditions_evidence", "no_temperature_measurement", "sensor|0",
+                "补数据｜工况缺勤率的斜率没法验证：全厂没有一条车间温度实测",
+                ("合规仿真已经把温湿度折成 WBGT→缺勤增量→到岗比例，并接进了产能"
+                 "（`query_working_condition_impact`：闷热天扣的是可用人头，不是效率折扣）。"
+                 f"但 attendance 有 {int(wc.get('attendance_days') or 0)} 个出勤日、"
+                 f"equipment_readings 里温度 0 行（总读数 {int(wc.get('reading_rows') or 0)} 行）—— "
+                 "缺勤序列与温度序列没有可对撞的那一维，所以包里 1.0pp/℃ 这条斜率只能是**本厂声明值**。"
+                 "\n补法不讲究精度：工位传感器、每天定点抄表、巡检拍照都行，"
+                 "按 factory_id+date 记 ℃ 与 RH，攒到 20 天上下就能回归出本厂斜率替换声明值；"
+                 "那之前对外只能说「按标准折算的情景值」，不能说「本厂实测」。"),
+                "不影响出数（照算），影响的是这条数能不能对外说是量过的",
+                "query_working_condition_impact",
+                "把日级车间温度与台账缺勤配起来回归斜率，斜率一改就要重跑工况影响对照",
+                {"sensor_rows": int(wc.get("sensor_rows") or 0),
+                 "reading_rows": int(wc.get("reading_rows") or 0),
+                 "attendance_days": int(wc.get("attendance_days") or 0),
+                 "declared_slope_pp_per_c": 1.0},
+            ))
+
     stale = int(gen.get("stale_gen") or 0)
     in_flow = int(gen.get("in_flow") or 0)
     if stale >= MIN_STALE_ORDERS:

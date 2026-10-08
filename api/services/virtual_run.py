@@ -1269,7 +1269,8 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
                       *, today: Optional[date] = None,
                       attendance_curve: Optional[Dict[int, float]] = None,
                       expedite_lead_days: Optional[int] = None,
-                      line_staffing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                      line_staffing: Optional[Dict[str, Any]] = None,
+                      working_conditions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """跑一批目标（每台一个时间线），并汇总组合结果。targets: [{model_code, units, due_in_days}]
 
     `line_staffing` 是 {线编码: 到岗比例}：0 = 整班没来（改派到工艺上同样能做的线，无路可改则等），
@@ -1280,6 +1281,23 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
     shift_days = {int(r["weekday"]) + 1 for r in
                   (await db.execute(CALENDAR_SQL, {"fid": factory_id})).mappings().all()} or {1, 2, 3, 4, 5, 6}
     curve = attendance_curve or {d: 0.97 for d in range(0, 200)}
+    conditions_basis = None
+    if working_conditions and attendance_curve is None:
+        # 工况的缺勤率扣的是可用人头，不是效率折扣：产能曲线按到岗比例降，效率另算
+        from core.mes.data_evidence import workforce_presence_under_conditions
+
+        conditions_basis = await workforce_presence_under_conditions(
+            db, factory_id,
+            temperature_c=float(working_conditions.get("temperature_c")),
+            humidity_percent=float(working_conditions.get("humidity_percent") or 60.0),
+            task_type=str(working_conditions.get("task_type") or "assembly"))
+        if conditions_basis.get("present_ratio") is None:
+            return {"factory_id": factory_id, "status": "no_attendance_baseline",
+                    "working_conditions": conditions_basis,
+                    "why": (f"这条工况算不出到岗比例：{conditions_basis.get('why')} —— "
+                            "不拿默认缺勤率把沙箱跑成一个看起来对的交期"),
+                    "hint": "传 factory_id 对应厂区（该厂要有 attendance 打卡行），或直接给 attendance_rate"}
+        curve = {d: float(conditions_basis["present_ratio"]) for d in range(0, 400)}
 
     runs = []
     for t in targets:
@@ -1321,8 +1339,14 @@ async def run_sandbox(db: AsyncSession, factory_id: str, targets: List[Dict[str,
         "labor_cost_usd": round(sum(float(r["labor_cost_usd"] or 0) for r in ok), 2),
         "standby_cost_total_usd": round(sum(float(r["standby_cost_if_line_held_usd"] or 0) for r in ok), 2),
         "runs": runs, "constraints": constraints,
+        "working_conditions": conditions_basis,
         "assumptions": {
-            "attendance_curve": "按天到岗率（沙箱默认 0.97，可传曲线：干旱/雨/暴雨档）",
+            "attendance_curve": ("工况反推：WBGT " + str((conditions_basis or {}).get("wbgt_c")) + "℃ → 到岗 "
+                                 + str((conditions_basis or {}).get("present_ratio"))
+                                 + "（台账基线 + 热侧缺勤增量；斜率是"
+                                 + str((conditions_basis or {}).get("slope_status"))
+                                 + "）" if conditions_basis else
+                                 "按天到岗率（沙箱默认 0.97，可传曲线：干旱/雨/暴雨档）"),
             "labor_cost_per_person_day": DEFAULT_LABOR_COST_PER_PERSON_DAY,
             "labor_cost_basis": "default_calibration（库里没有薪资列，钱只到量级）",
             "material_price_source": "bom_items.unit_price（缺价就单列 materials_without_price，不折算）",

@@ -876,7 +876,8 @@ async def get_engine_contract_check(
 @router.post("/virtual-run", summary="沙箱执行推演：引擎自己拆单/借路线/开采购/按天推进")
 async def post_virtual_run(
     body: Dict[str, Any] = Body(..., description="factory_id, targets:[{model_code,units,due_in_days}], "
-                                                "attendance_rate?, expedite_lead_days?"),
+                                                "attendance_rate?, expedite_lead_days?, "
+                                                "working_conditions?={temperature_c,humidity_percent,task_type}"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -903,9 +904,15 @@ async def post_virtual_run(
     staffing = body.get("line_staffing")
     if staffing is not None and not isinstance(staffing, dict):
         raise HTTPException(status_code=422, detail='line_staffing 要传对象，例如 {"LINE-TREAD-01": 0.5}')
+    conditions = body.get("working_conditions")
+    if conditions is not None:
+        if not isinstance(conditions, dict) or conditions.get("temperature_c") is None:
+            raise HTTPException(status_code=422,
+                                detail='working_conditions 要传 {"temperature_c":38,"humidity_percent":70}')
     return await run_sandbox(db, factory_id, targets,
                              attendance_curve=curve,
                              line_staffing=staffing,
+                             working_conditions=conditions,
                              expedite_lead_days=(int(body["expedite_lead_days"])
                                                  if body.get("expedite_lead_days") else None))
 
