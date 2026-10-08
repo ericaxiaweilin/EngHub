@@ -35,6 +35,18 @@ engine = SimERPEngine()
 plugin_registry = build_default_registry()
 
 
+class WorkingConditionImpactRequest(BaseModel):
+    """工况 → 交期：温度必填（没温度就不许拿默认场景算），其余可选。"""
+
+    temperature_c: float = Field(..., ge=-20.0, le=80.0)
+    humidity_percent: float = Field(default=60.0, ge=0.0, le=100.0)
+    task_type: str = "assembly"
+    factory_id: Optional[str] = None
+    model_code: Optional[str] = None
+    units: Optional[float] = None
+    due_in_days: Optional[int] = None
+
+
 class SimERPScenarioRequest(BaseModel):
     worker_ref: str = "worker-001"
     shift_id: str = "shift-day"
@@ -508,6 +520,20 @@ async def simulate_high_heat_overtime(
     )
     await _persist_audit_record(db, record)
     return _build_response(record)
+
+
+@router.post("/working-condition-impact")
+async def working_condition_impact(
+    request: WorkingConditionImpactRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """这条工况少来的人头值几天交期：唯一口径在 `query_working_condition_impact`，这里不再算一遍。"""
+    from api.services.chat_tools_service import execute_tool
+
+    args = request.model_dump(exclude_none=True)
+    factory_id = args.pop("factory_id", None)
+    return await execute_tool(db, "query_working_condition_impact", args,
+                              operator="sim-erp-ui", factory_id=factory_id)
 
 
 async def _persist_audit_record(db: AsyncSession, record: AuditRecord) -> None:

@@ -12,8 +12,8 @@ import {
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import {
-  runSimulation, getSimPlugins, PluginManifest, SimulationRequest, SimulationResult,
-  RuleDecision, PluginRecord,
+  runSimulation, runWorkingConditionImpact, getSimPlugins, PluginManifest,
+  SimulationRequest, SimulationResult, RuleDecision, PluginRecord,
 } from '../../services/modules'
 
 const { Text } = Typography
@@ -189,6 +189,8 @@ const ComplianceSim: React.FC = () => {
   const [plugins, setPlugins] = useState<PluginManifest[]>([])
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<SimulationResult | null>(null)
+  const [wcImpact, setWcImpact] = useState<Record<string, any> | null>(null)
+  const [wcLoading, setWcLoading] = useState(false)
   const [activeScenario, setActiveScenario] = useState<string>('high_heat')
   const { hint, check } = useRiskHint(form)
 
@@ -236,6 +238,20 @@ const ComplianceSim: React.FC = () => {
       const res = await runSimulation(payload)
       setResult(res)
       message.success('仿真完成')
+      // 工况的另一个后果是少来人，值几天交期要按产能沙箱算 —— 同一条 T/RH 直接追问一次
+      const ai: any = (res as any)?.snapshot?.attendance_impact || {}
+      setWcImpact(null)
+      if (ai.predicted_absence_rate != null) {
+        setWcLoading(true)
+        try {
+          setWcImpact(await runWorkingConditionImpact({
+            temperature_c: payload.environment.temperature_c,
+            humidity_percent: payload.environment.humidity_percent,
+            task_type: payload.work_context.task_type,
+            factory_id: localStorage.getItem('active_factory_id') || undefined,
+          }))
+        } finally { setWcLoading(false) }
+      }
     } catch { /* interceptor reports */ }
     finally { setLoading(false) }
   }
@@ -624,6 +640,20 @@ const ComplianceSim: React.FC = () => {
                           )
                         })()}
                       </Descriptions.Item>
+                      {(wcLoading || wcImpact) && (
+                        <Descriptions.Item label="对这批单的影响">
+                          {wcLoading ? <Text type="secondary">正在按到岗比例重跑产能沙箱…</Text> : (
+                            <span>
+                              <Text strong>{wcImpact?.error ? '算不出：' + wcImpact.error : wcImpact?.reading}</Text>
+                              <br />
+                              <Text type="secondary" style={{ fontSize: 11 }}>
+                                {wcImpact?.no_change_reason || wcImpact?.why ||
+                                  '按该厂在制/待开工的母单推演；同一批人干得慢那条走效率，不在天数里重复乘'}
+                              </Text>
+                            </span>
+                          )}
+                        </Descriptions.Item>
+                      )}
                       {(result.snapshot.attendance_impact || {}).sensitivity_status === 'declared_unverified' && (
                         <Descriptions.Item label="判定链路">
                           <Text type="secondary" style={{ fontSize: 11 }}>

@@ -2102,7 +2102,7 @@ async def _tool_query_working_condition_impact(
         if binds:
             parts.append("卡点写着 " + "、".join(binds))
         if zero_crew:
-            parts.append(f"其中 {len(zero_crew)} 个机种所在线**在册人数为 0**"
+            parts.append(f"其中 {len(zero_crew)} 个机种所在线「在册人数为 0」"
                          f"（{('、'.join(zero_crew[:3]))}{'…' if len(zero_crew) > 3 else ''}）"
                          "—— 到岗曲线乘的是在册班组，没人可扣所以改不动完工日；这是人数数据缺口，不是高温无害")
         no_change_reason = ("完工日没变：" + ("；".join(parts) if parts else "这批单的约束不是人手")

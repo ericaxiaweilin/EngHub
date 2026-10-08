@@ -157,6 +157,19 @@ export const getSimStatus = () =>
 export const runSimulation = (data: SimulationRequest) =>
   api.post<any, SimulationResult>(API_ENDPOINTS.SIM_ERP_SIMULATE, data)
 
+export interface WorkingConditionImpactRequest {
+  temperature_c: number
+  humidity_percent?: number
+  task_type?: string
+  factory_id?: string
+  model_code?: string
+  units?: number
+  due_in_days?: number
+}
+
+export const runWorkingConditionImpact = (data: WorkingConditionImpactRequest) =>
+  api.post<any, Record<string, any>>(API_ENDPOINTS.SIM_ERP_WC_IMPACT, data)
+
 export const runHighHeatScenario = (data: Record<string, any>) =>
   api.post<any, SimulationResult>(API_ENDPOINTS.SIM_ERP_SCENARIO_HHO, data)
 

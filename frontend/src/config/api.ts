@@ -42,6 +42,7 @@ export const API_ENDPOINTS = {
   SIM_ERP_PLUGINS: `${API_BASE_URL}/api/v1/sim-erp/plugins`,
   SIM_ERP_SIMULATE: `${API_BASE_URL}/api/v1/sim-erp/simulate`,
   SIM_ERP_SCENARIO_HHO: `${API_BASE_URL}/api/v1/sim-erp/scenarios/high-heat-overtime`,
+  SIM_ERP_WC_IMPACT: `${API_BASE_URL}/api/v1/sim-erp/working-condition-impact`,
   SIM_ERP_AUDITS: `${API_BASE_URL}/api/v1/sim-erp/audits`,
   SIM_ERP_AUDIT_LATEST: `${API_BASE_URL}/api/v1/sim-erp/audits/latest`,
   SIM_ERP_AUDIT: (simulationId: string) => `${API_BASE_URL}/api/v1/sim-erp/audits/${simulationId}`,
