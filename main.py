@@ -171,6 +171,7 @@ async def _periodic_scheduler():
         "engine_watchdog": "_last_engine_watchdog",
         "engine_data_gap": "_last_engine_data_gap",
         "engine_kit_backfill": "_last_engine_kit_backfill",
+        "delivery_prediction_ledger": "_last_delivery_ledger",
     }
     while True:
         did = {}
@@ -532,6 +533,32 @@ async def _periodic_scheduler():
                         _logger.info(f"[kit-backfill] {did['engine_kit_backfill']}")
         except Exception as e:
             _logger.warning(f"[scheduler] 齐套行补登异常: {e}")
+
+        # 交期留痕账本 —— 每天记一次、完工时配对一次。没有这一步，"引擎交期准不准"永远
+        # 只能拿今天的主数据重跑历史单来猜；攒够成对样本才谈得上回测。
+        try:
+            import time as _t_dl
+            if not hasattr(_periodic_scheduler, "_last_delivery_ledger"):
+                _periodic_scheduler._last_delivery_ledger = 0
+            if _t_dl.time() - _periodic_scheduler._last_delivery_ledger > 86400:  # 每天
+                _periodic_scheduler._last_delivery_ledger = _t_dl.time()
+                from api.services.prediction_ledger import (delivery_accuracy,
+                                                            pair_completed_predictions,
+                                                            record_predictions)
+                from api.services.engine_watchdog import DEFAULT_FACTORY_ID as _DL_FID
+                async with db_config.session_factory() as db:
+                    rec = await record_predictions(db, _DL_FID, limit=600, apply=True)
+                    par = await pair_completed_predictions(db, _DL_FID, apply=True)
+                    acc = await delivery_accuracy(db, _DL_FID)
+                    did["delivery_prediction_ledger"] = {
+                        "recorded": rec.get("recorded"),
+                        "no_line_capacity": rec.get("no_line_capacity"),
+                        "paired_now": par.get("paired"),
+                        "paired_total": acc.get("paired"),
+                        "mae_days": acc.get("mae_days"), "mape": acc.get("mape")}
+                    _logger.info(f"[delivery-ledger] {did['delivery_prediction_ledger']}")
+        except Exception as e:
+            _logger.warning(f"[scheduler] 交期留痕账本异常: {e}")
 
         from api.services.engine_heartbeat import record as _heartbeat
         import time as _gt

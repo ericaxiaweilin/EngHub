@@ -502,6 +502,13 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                         / max(1, sum(p["actual_span_days"] for p in pairs)), 4)
                   if pairs else None)
     mape = len(pairs)
+    # 留痕法那格要的是账本实况：记了几张、配了几对、误差中位数与 MAPE
+    try:
+        from api.services.prediction_ledger import delivery_accuracy as _acc
+
+        _led = await _acc(db, factory_id)
+    except Exception:  # noqa: BLE001 - 账本读不动时这一格如实 not_computable，不带崩整层
+        _led = {"mape": None, "paired": 0, "orders_recorded": 0}
     priced = float(acc.get("overall_accuracy") or 0)
     univ = agree.get("bom_universe") or {}
     same_gen = univ.get("same_generation") or {}
@@ -570,6 +577,17 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                          f" {skipped['no_planned_start']} 张没留计划开工日、"
                          f" {skipped['model_not_in_bom']} 张的机种在 BOM 里没有行。"
                          "要补的是下达/完工时把计划开工日与预测完工日一起落到工单上（#54）")),
+        _metric("交期误差（留痕法）", _led["mape"], THRESHOLDS["L2B"]["backtest_mape"], "lte", "",
+                "上一格是**追溯法**：拿今天的主数据重跑历史单，问的是「今天这套数据会不会算错」。"
+                "这一格是**留痕法**：引擎当时在工单上写下「预计几号交」，完工那天与实际对一次 —— "
+                "只有这一格才回答「客户拿到的那个日期准不准」。样本只能攒不能补："
+                "历史单当时没写过这句话，配不出对。",
+                n=_led["paired"], min_n=THRESHOLDS["L2B"]["backtest_min_pairs"],
+                missing=(None if _led["paired"] >= THRESHOLDS["L2B"]["backtest_min_pairs"] and
+                         _led["mape"] is not None else
+                         f"账本里已记 {_led['orders_recorded']} 张在流程单的当日预计，"
+                         f"成对 {_led['paired']} 对（判线要 ≥{THRESHOLDS['L2B']['backtest_min_pairs']} 对）："
+                         "每天由 delivery_prediction_ledger 那道闸门记账，完工即配对")),
         _metric("输入映射精度", round(priced / 100.0, 3), None, "gte", "0~1",
                 "六项输入的加权覆盖率（工时/提前期/供应商/库存/自制外购/单价），只作分母透明化"),
     ], "readiness": await _readiness(db, factory_id),
@@ -578,6 +596,21 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
         "ledger_short_lines": ledger_lines,
         "backtest_pairs": pairs[:12], "backtest_skipped": skipped,
         "backtest_pairs_available": int(mape or 0)}
+
+
+async def _ledger_covered(db: AsyncSession, factory_id: str) -> int:
+    """留痕账本今天记了几张单（账本没建时按 0 报，不把这格带崩）。"""
+    from sqlalchemy import text as _text
+
+    from api.services.prediction_ledger import ensure_schema
+
+    try:
+        await ensure_schema(db)
+        return int((await db.execute(_text(
+            "SELECT COUNT(DISTINCT work_order_id) FROM engine_order_predictions "
+            "WHERE factory_id = :fid"), {"fid": factory_id})).scalar() or 0)
+    except Exception:  # noqa: BLE001 - 账本查不动不影响别的格，缺席由上一格的 missing 说明
+        return 0
 
 
 async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> Dict[str, Any]:

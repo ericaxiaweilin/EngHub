@@ -357,6 +357,9 @@ async def get_pmc_capabilities(
             {"key": "engine_capability_profile",
              "name": "能力三格画像（推演=给结果 / 分析=给原因 / 总结=给一段不编的话，各给判定）",
              "path": "/api/v1/pmc/engine-capability-profile", "mode": "read_only"},
+            {"key": "delivery_accuracy_ledger",
+             "name": "交期准度账本（留痕法：当时说了哪天交 vs 实际哪天完工）",
+             "path": "/api/v1/pmc/delivery-accuracy", "mode": "read_only"},
             {"key": "kit_coverage_gap",
              "name": "齐套行覆盖率（引擎缺口件 vs 台账缺口行，含放行洞配对）",
              "path": "/api/v1/pmc/kit-coverage-gap", "mode": "read_only"},
@@ -884,6 +887,30 @@ async def get_kit_coverage_gap(
     from api.services.sim_backtest import kit_coverage_gap
 
     return await kit_coverage_gap(db, factory_id, per_model=per_model, max_orders=max_orders)
+
+
+@router.get("/delivery-accuracy",
+            summary="交期准度账本（留痕法）：引擎当时说了哪天交 vs 实际哪天完工")
+async def get_delivery_accuracy(
+    factory_id: str = Query(..., description="厂区"),
+    record: bool = Query(False, description="true=先把今天在流程单的预计完工日记一行（一天一行，不改已记的）"),
+    limit: int = Query(400, ge=1, le=1000, description="本轮最多记几张单"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """样本只能攒出来，不能补：历史单当时没说过这句话，配不出对。
+
+    record=true 时先记账再读账；配对的误差带和 MAE 都按**当时那条留痕**算，
+    与 /sim-backtest 那条"用今天主数据重跑历史单"的追溯法分开报。
+    """
+    del current_user
+    from api.services.prediction_ledger import (delivery_accuracy, pair_completed_predictions,
+                                                record_predictions)
+
+    if record:
+        await record_predictions(db, factory_id, limit=limit, apply=True)
+    await pair_completed_predictions(db, factory_id, apply=True)
+    return await delivery_accuracy(db, factory_id)
 
 
 @router.get("/engine-capability-profile",
