@@ -163,3 +163,24 @@ async def test_ie_hours_assumption_unlocks_a_date_and_is_labeled(monkeypatch):
     assert order["time_basis"] == "assumed_ie_hours"
     assert order["assumed_hours_per_step"] == 0.037
     assert order["estimated_finish"] is not None
+
+def test_unknown_policy_key_raises_instead_of_reading_as_no_effect():
+    """政策字典是封闭词表：不认识的键必须当场报错。
+    10-07 实测踩过 —— 把 run_target 的 lead_multiplier 当政策传，九档扫下来交期一点不动，
+    那条"政策"其实一直是现况，差点写成"采购提前期不是瓶颈"。"""
+    import pytest
+
+    from api.services.virtual_run import POLICY_KEYS, unknown_policy_keys
+
+    assert unknown_policy_keys({"name": "x", "expedite_lead_days": 10}) == []
+    assert unknown_policy_keys({"name": "x", "lead_multiplier": 0.5}) == ["lead_multiplier"]
+    assert "hours_multiplier" not in POLICY_KEYS and "crew_bonus" in POLICY_KEYS
+
+    async def go():
+        from api.services.virtual_run import scan_policies
+        await scan_policies(None, "FAC_MECH_001", [], policies=[{"name": "假政策", "lead_multiplier": 0.2}])
+
+    with pytest.raises(ValueError) as e:
+        import asyncio
+        asyncio.run(go())
+    assert "lead_multiplier" in str(e.value) and "perturb" in str(e.value)
