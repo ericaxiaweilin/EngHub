@@ -1144,6 +1144,28 @@ _ACTION_PRIORITY = {"expedite_purchase": 0, "supplier_master_missing": 1, "start
                     "extra_crew": 5, "model_data_gap": 6, "master_data_gap": 7}
 
 
+def evidence_flags(bp: Dict[str, Any], detail: Dict[str, Any]) -> List[str]:
+    """催购动作身上必须挂着"这几个数是几手的"。
+
+    10-07 实测：暴雨档 5 台里 3 台的瓶颈件是本地演示 BOM 的合成料号（连供应商都是演示数据）、
+    1 台是真 SAP 件但提前期是按类别铺的默认值（lead_evidence=unverified_default）、
+    而这颗件的单价是 0 —— 于是加急费算出来正好 $0，看着像"免费买到 4 天"。
+    引擎可以把这些数拿去排序，但落到"向谁下单、花多少钱"的动作上时必须把依据一起交出去。
+    """
+    flags: List[str] = []
+    evd = str(bp.get("lead_evidence") or "unknown")
+    if evd != "measured":
+        flags.append(f"提前期 {bp.get('lead_time_days')} 天的依据={evd}（不是实测交期）")
+    src = str(detail.get("bom_source") or "")
+    if src and src != "engflow_mirror_multi_level":
+        flags.append(f"BOM 取数={src}（料号与供应商可能不是厂里真件）")
+    if float(bp.get("unit_price") or 0) <= 0:
+        flags.append("该件单价缺失 → 本轮加急费按 0 计，代价被低报")
+    if not bp.get("supplier"):
+        flags.append("没有默认供应商 → 催购没有对象")
+    return flags
+
+
 def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
                            *, today: Optional[date] = None,
                            max_actions: int = 30) -> List[Dict[str, Any]]:
@@ -1219,6 +1241,10 @@ def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
                    "required_arrival_date": str(today + timedelta(days=arrival)),
                    "pulled_in_days": pull,
                    "arrival_note": f"按 {target} 天提前期推演的到货日；不催的话要到 {today + timedelta(days=arrival + pull)}"}
+            flags = evidence_flags(bp, d)
+            if flags:
+                act["evidence_flags"] = flags
+                act["note"] = (act.get("note") or "") + "；先核这几项：" + "、".join(flags)
             if bp.get("supplier"):
                 act.update({"type": "expedite_purchase", "supplier": bp["supplier"],
                             "note": f"向 {bp['supplier']} 把 {cur_lead} 天提前期压到 {target} 天；"

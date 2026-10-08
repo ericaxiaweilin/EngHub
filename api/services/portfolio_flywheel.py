@@ -516,6 +516,11 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                               "action_coverage": _action_coverage(tuned.get("final_scan") or {}),
                               "late_delta": late_delta_table(tuned.get("final_scan") or {},
                                                              str(robust.get("policy") or "")),
+                              "actions_on_unverified_input": sum(
+                                  1 for a in actions
+                                  if a.get("type") == "expedite_purchase" and a.get("evidence_flags")),
+                              "actions_total_expedite": sum(
+                                  1 for a in actions if a.get("type") == "expedite_purchase"),
                               "lever_economics": (levers.get("ranked") or [])[:8],
                               "mapping_accuracy": levers.get("overall_accuracy"),
                               "by_scenario": per_scenario,
@@ -582,10 +587,11 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
         for a in actions[:8]:
             t = a.get("type")
             if t == "expedite_purchase":
+                flags = "；先核：" + "、".join(a.get("evidence_flags") or []) if a.get("evidence_flags") else ""
                 act_lines.append(f"· 催购 {a['material_code']} {float(a['qty_short']):g} 件"
                                  f"（{a.get('supplier')}）：提前期 {a['current_lead_days']}→"
                                  f"{a['target_lead_days']} 天，{a['order_by_date']} 前下单、"
-                                 f"{a['required_arrival_date']} 前要到")
+                                 f"{a['required_arrival_date']} 前要到{flags}")
             elif t == "supplier_master_missing":
                 act_lines.append(f"· 补主数据 {a['material_code']}：没有供应商，催购没有对象"
                                  f"（卡的是数据，不是产能）")
@@ -630,7 +636,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
             + "\n")
         created = await create_task(
             db, factory_id, "virtual_factory",
-            f"推演推荐｜{rec}（{claim}，代价 ${float(objs.get('expedite_cost_usd') or 0) + float(objs.get('line_activation_cost_usd') or 0):,.0f}）"[:200],
+            f"推演推荐｜{rec}（{claim}，代价 ${money:,.0f}）"[:200],   # 价钱与正文同一口径：被推荐那条政策自己的代价
             description=(
                 f"政策×天气扫描（{len(per)} 个天气场景 × {scan['policies_tried']} 个政策）的稳健推荐：{rec}。\n"
                 f"各场景推荐：" + "；".join(f"{k}→{v}" for k, v in per.items()) + "\n"

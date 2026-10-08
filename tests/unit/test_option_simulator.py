@@ -93,3 +93,25 @@ def test_changeover_between_products_costs_capacity():
     out = _run("resequence_by_due", [dict(o) for o in [a, b]])
     assert out["changeovers"] >= 1
     assert out["setup_capacity_lost_days"] > 0
+
+def test_expedite_action_carries_the_provenance_of_every_number_it_buys_on():
+    """催购动作必须把"这几个数是几手的"交出去。
+    10-07 实测：暴雨档 5 条催购动作 5 条都至少有一项未核实依据 ——
+    4 条的料号与供应商来自本地演示 BOM、1 条的提前期是按类别铺的默认值，
+    而这些件的单价都是 0，于是加急费算成 $0，看着像"免费买到 4 天"。"""
+    from api.services.virtual_run import evidence_flags
+
+    clean = {"lead_evidence": "measured", "lead_time_days": 12, "unit_price": 3.2,
+             "supplier": "宝钢"}
+    assert evidence_flags(clean, {"bom_source": "engflow_mirror_multi_level"}) == []
+
+    demo = {"lead_evidence": "ledger_declared", "lead_time_days": 20, "unit_price": 0.0,
+            "supplier": "裕同包装(东莞)"}
+    got = evidence_flags(demo, {"bom_source": "mes_bom_items"})
+    assert any("ledger_declared" in x for x in got)
+    assert any("mes_bom_items" in x for x in got)
+    assert any("代价被低报" in x for x in got)
+
+    no_sup = {"lead_evidence": "unverified_default", "lead_time_days": 12, "unit_price": None}
+    got2 = evidence_flags(no_sup, {"bom_source": "engflow_mirror_multi_level"})
+    assert any("unverified_default" in x for x in got2) and any("没有默认供应商" in x for x in got2)

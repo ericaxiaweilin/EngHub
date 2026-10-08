@@ -43,7 +43,10 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
             "bottleneck_hit_rate": 0.70},
     "L3": {"retest_improvement_days": 0.5,  # 推荐相对基线至少要值半天，否则别推荐
            "adoption_rate": 0.30,           # 人真采纳过；全被引擎自己取代 = 没人看
-           "flip_rate": 0.20},              # 推荐反复翻转说明结论不稳
+           "flip_rate": 0.20,
+           # 催购动作可以全部建立在铺出来的提前期与演示供应商上（10-07 实测 5/5），
+           # 那不等于可以下单：这条判线把"数据没到家"从推荐文案里提到闸门上。
+           "actions_on_unverified_max": 0},
     "L4": {"routing_accuracy": 0.85, "tool_backing_rate": 0.80,
            "number_backing_rate": 0.90, "contract_leaks": 0, "envelope_violations": 0,
            "internal_names_rejected": 1.0},
@@ -630,7 +633,26 @@ async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> 
     done = sum(1 for r in mine if str(r.get("status")) == "done")
     human_closed = sum(1 for r in mine if str(r.get("status")) == "cancelled")
     adoption = round(done / (done + human_closed), 3) if (done + human_closed) else None
+    card = (await db.execute(text("""
+        SELECT detail::text AS dt FROM simulation_scorecards
+        WHERE factory_id = :fid AND source = 'virtual_run_tradeoff'
+        ORDER BY created_at DESC LIMIT 1
+    """), {"fid": factory_id})).mappings().first()
+    try:
+        cd = json.loads((card or {}).get("dt") or "{}")
+    except (TypeError, ValueError):
+        cd = {}
+    flagged = int(cd.get("actions_on_unverified_input") or 0)
+    exp_total = int(cd.get("actions_total_expedite") or 0)
+
     return {"metrics": [
+        _metric("推荐动作压在未核实依据上的条数", (flagged if exp_total else None),
+                THRESHOLDS["L3"]["actions_on_unverified_max"], "lte", "条",
+                f"最近一张权衡卡里 {exp_total} 条催购动作有 {flagged} 条至少一项依据未核实"
+                "（提前期是按类别铺的默认值 / 料号与供应商来自本地演示 BOM / 该件单价缺失所以加急费按 0 算）。"
+                "这一格不过线不是推荐算错，是**照着下单的人没有可核的对象** —— "
+                "要修的是供应商主数据（#48）与实测提前期（#55），不是再推演一遍",
+                missing=(None if exp_total else "最近这张卡没有催购动作，判不了依据质量")),
         _metric("推荐相对基线的再跑差值（暴雨档）", gain, THRESHOLDS["L3"]["retest_improvement_days"], "gte", "天",
                 "推荐政策比「现况」少延几天；0 = 推荐就是基线，决策层没有增量（差距另报 gap_to_best）"),
         _metric("人工采纳率", adoption, THRESHOLDS["L3"]["adoption_rate"], "gte", "",
