@@ -946,6 +946,27 @@ def _format_architecture_reply(result: Dict[str, Any]) -> str:
         lines.append(f"- 不外推：{n}")
     lines.append(f"- 产能依据：{cap.get('plant_bound_note') or ''}")
     lines.append(f"- 覆盖率：{cap.get('coverage') or ''}｜口径：{(cap.get('basis') or '')[:180]}")
+    dlv = result.get("delivery") or {}
+    if dlv:
+        if dlv.get("reading"):
+            lines.append(f"- 规模交期（缩放线进沙箱，只读）：{dlv['reading']}")
+        elif dlv.get("status") == "no_target_order":
+            lines.append(f"- 规模交期：没算 —— {dlv.get('why') or ''}。{dlv.get('hint') or ''}")
+        elif dlv.get("status") == "no_scale_basis":
+            lines.append(f"- 规模交期：没算 —— {dlv.get('why') or ''}。{dlv.get('hint') or ''}")
+        else:
+            lines.append(
+                f"- 规模交期：不给天数（{dlv.get('status')}）—— {dlv.get('why') or '缺依据'}"
+                + (f"；候选机种 {'、'.join(map(str, dlv['candidates']))}" if dlv.get("candidates") else "")
+                + (f"；缩放载体 {dlv.get('scaled_line', {}).get('from_line')} "
+                   f"（{dlv.get('scaled_line', {}).get('line_basis')}）"
+                   if (dlv.get("scaled_line") or {}).get("from_line") else ""))
+        sl, due = (dlv.get("scaled_line") or {}), (dlv.get("due") or {})
+        if sl.get("units_per_day"):
+            lines.append(
+                f"- 缩放载体：{sl.get('from_line')}（{sl.get('line_basis')}）声明 "
+                f"{dlv.get('factor', 1):g} 倍 → {sl.get('units_per_day')} 台/天、班组 {sl.get('crew')} 人"
+                f"｜写在内存，line_profiles 未改动｜交期假设：{due.get('days')} 天（{due.get('note') or ''}）")
     return "\n".join(lines)
 
 

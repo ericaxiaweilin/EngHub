@@ -133,3 +133,119 @@ def test_run_target_still_computes_station_bound_when_a_line_exists():
     # 分支前的初始化可以留，但"有线就不算工位侧"那条置空不许回来
     assert src.count("station_cap = None") == 1
     assert '"line_vs_station": _line_station_conflict' in src
+
+
+def test_home_line_wins_over_any_other_line_that_can_make_it():
+    """家线必须排第一：A-50-04-F 的家是 LINE-TREAD-01（11h/300 台/300 人）。
+
+    以前 capable_lines 只按 line_profiles 的行序返回，bike 线先入表 → 跑步机被派到 bike 线，
+    日产能 400、班组 150，到岗曲线乘的人力与加班上限全跟着错一条线。
+    """
+    from api.services.virtual_run import capable_lines, pick_line
+
+    lines = [
+        {"line_code": "LINE-BIKE-01", "line_group": "G-B", "hours_per_day": 11, "units_per_day": 400,
+         "group_units_per_day": 700, "crew_size": 150, "can_models": ["A-50-04-F", "HTM1481-00"],
+         "cannot_models": [], "default_model": "HTM1481-00"},
+        {"line_code": "LINE-TREAD-01", "line_group": "G-T", "hours_per_day": 11, "units_per_day": 300,
+         "group_units_per_day": 300, "crew_size": 300, "can_models": ["A-50-04-F"],
+         "cannot_models": ["HTM1481-00"], "default_model": "A-50-04-F"},
+    ]
+    order = [(l["line_code"], b) for l, b in capable_lines("A-50-04-F", lines)]
+    assert order[0] == ("LINE-TREAD-01", "line_declared_home")
+    line, basis = pick_line("A-50-04-F", lines)
+    assert line["line_code"] == "LINE-TREAD-01" and basis == "line_declared_home"
+    # 而 bike 机种的家线仍是 bike 线：家线优先不是"永远选 tread"
+    line2, basis2 = pick_line("HTM1481-00", lines)
+    assert line2["line_code"] == "LINE-BIKE-01" and basis2 == "line_declared_home"
+    # 负向声明仍然优先于任何正向声明
+    assert all(l["line_code"] != "LINE-TREAD-01" for l, _ in capable_lines("HTM1481-00", lines))
+
+
+def test_scale_question_with_an_order_also_carries_the_delivery_target():
+    """「千人的厂做 8000 台 A-50-04-F，交期 25 天」——规模之外那半句也要抽出来。
+
+    只回台/天的模型答不了"几天交"；天数得由缩放后的线进沙箱算，所以机种/数量/交期得跟
+    规模一起进工具。反过来，没给数量的问法不许被塞一个数量（那等于替厂里下了一张单）。
+    """
+    from api.services.chat_tools_service import _architecture_intent_args, _resolve_intent_keyword
+
+    assert _architecture_intent_args("千人工厂做 8000 台 A-50-04-F，交期 25 天来得及吗") == {
+        "headcount": 1000, "delivery_model": "A-50-04-F", "delivery_units": 8000.0,
+        "delivery_due_days": 25}
+    hit = _resolve_intent_keyword("千人工厂做 8000 台 A-50-04-F")
+    assert hit["tool"] == "generate_plant_architecture"
+    assert hit["args"]["delivery_model"] == "A-50-04-F" and hit["args"]["delivery_units"] == 8000.0
+    assert "delivery_units" not in _architecture_intent_args("千人工厂每天最多能做多少台")
+    assert "delivery_model" not in _architecture_intent_args("百人工厂的结构什么样")
+
+
+def test_delivery_refuses_days_without_naming_both_model_and_quantity():
+    import asyncio
+
+    from core.mes.plant_architecture import attach_delivery
+
+    base = {"reference_factory_id": "FAC_MECH_001", "scaled": {"target_people": 1000}}
+    no_model = asyncio.run(attach_delivery(None, dict(base), {"delivery_units": 8000}))
+    assert no_model["delivery"]["status"] == "no_target_order"
+    assert "机种" in no_model["delivery"]["why"] and "8000 台 A-50-04-F" in no_model["delivery"]["hint"]
+    no_units = asyncio.run(attach_delivery(None, dict(base), {"delivery_model": "A-50-04-F"}))
+    assert "数量" in no_units["delivery"]["why"] and "机种" not in no_units["delivery"]["why"]
+    # factor 路径没落成人头时也不许硬凑一个规模
+    no_base = asyncio.run(attach_delivery(None, {"reference_factory_id": "F", "scaled": {}},
+                                         {"delivery_model": "A-50-04-F", "delivery_units": 8000}))
+    assert no_base["delivery"]["status"] == "no_scale_basis"
+
+
+def test_chat_answer_prints_the_scaled_timeline_and_that_nothing_was_written():
+    from api.routes.chat_routes import _format_architecture_reply
+
+    result = {"status": "ok", "reference_factory_id": "FAC_MECH_001",
+              "readings": ["参照厂 FAC_MECH_001：实测每天 1044 人"], "scaled": {"warnings": []},
+              "delivery": {"status": "simulated", "factor": 0.9579,
+                           "scaled_line": {"from_line": "LINE-TREAD-01",
+                                           "line_basis": "line_declared_home",
+                                           "units_per_day": 287.36, "crew": 287.4},
+                           "due": {"days": 25, "note": "交期天数由提问给出"},
+                           "reading": "1000 人规模（载体 LINE-TREAD-01 声明 300 台/天 → 287.36 台/天）："
+                                      "8000 台 A-50-04-F 预计 57 天完工，比交期晚 32 天；用工 9626.8 人日"}}
+    text = _format_architecture_reply(result)
+    assert "预计 57 天完工" in text and "9626.8 人日" in text
+    assert "LINE-TREAD-01" in text and "line_declared_home" in text
+    assert "line_profiles 未改动" in text, "缩放线只活在内存里，界面必须这么说"
+    # 缺数量那条出口也要在答复里出现，不能整个 delivery 段静默消失
+    refused = _format_architecture_reply({
+        "status": "ok", "reference_factory_id": "F", "readings": [], "scaled": {"warnings": []},
+        "delivery": {"status": "no_target_order", "why": "只给了目标规模，没给数量（多少台/件） → 不出交期天数",
+                     "hint": "补一句规模+机种+数量"}})
+    assert "规模交期：没算" in refused and "没给数量" in refused
+
+
+def test_both_entries_share_one_delivery_computation():
+    """/chat 工具与 /plant-architecture 必须走同一个 attach_delivery。
+
+    两条入口各写一遍缩放口径，迟早给 PMC 两个天数 —— 与"唯一路径唯一基线"冲突。
+    """
+    import inspect
+
+    from api.routes.pmc_routes import get_plant_architecture
+    from api.services.chat_tools_service import _tool_generate_plant_architecture
+
+    assert "attach_delivery" in inspect.getsource(get_plant_architecture)
+    assert "attach_delivery" in inspect.getsource(_tool_generate_plant_architecture)
+    assert "scaled_delivery_run" not in inspect.getsource(_tool_generate_plant_architecture)
+
+
+def test_scaled_line_does_not_carry_a_decimal_into_the_chat_payload():
+    """line_profiles.hours_per_day 是 numeric：原样带出来就落不进 chat_messages 的 jsonb。
+
+    实测过：答复文本已经生成好，落库时 `Object of type Decimal is not JSON serializable`
+    把整条 /chat 打成 500 —— 生成侧成功不等于交付成功，所以这里钉住显式转换。
+    """
+    import inspect
+
+    from core.mes.plant_architecture import scaled_delivery_run
+
+    src = inspect.getsource(scaled_delivery_run)
+    assert 'float(base_line["hours_per_day"])' in src
+    assert '"hours_per_day": scaled_line.get("hours_per_day")' not in src

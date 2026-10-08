@@ -796,6 +796,9 @@ async def get_plant_architecture(
     temperature_c: Optional[float] = Query(None, description="给温度就顺带算这套架构在该工况下每段少来多少人"),
     humidity_percent: Optional[float] = Query(None),
     task_type: str = Query("assembly"),
+    delivery_model: Optional[str] = Query(None, description="给了机种+delivery_units 就把缩放后的线送进沙箱出交期天数"),
+    delivery_units: Optional[float] = Query(None, description="这一规模下要交付的数量（台/件）"),
+    delivery_due_days: Optional[int] = Query(None, description="交期按几天比对，缺省 25 天并在读数里标明是假设"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -805,11 +808,17 @@ async def get_plant_architecture(
     线数、产品族、外购结构不做等比（那些不是劳动力结构）。
     """
     del current_user
-    from core.mes.plant_architecture import architecture_model
+    from core.mes.plant_architecture import architecture_model, attach_delivery
 
-    return await architecture_model(db, factory_id, headcount=headcount, factor=factor,
-                                     temperature_c=temperature_c, humidity_percent=humidity_percent,
-                                     task_type=task_type)
+    result = await architecture_model(db, factory_id, headcount=headcount, factor=factor,
+                                       temperature_c=temperature_c, humidity_percent=humidity_percent,
+                                       task_type=task_type)
+    if result.get("status") != "ok":
+        return result
+    return await attach_delivery(db, result, {
+        "delivery_model": delivery_model, "delivery_units": delivery_units,
+        "delivery_due_days": delivery_due_days, "temperature_c": temperature_c,
+        "humidity_percent": humidity_percent, "task_type": task_type})
 
 
 @router.get("/engine-watchdog", summary="引擎自身故障巡检：心跳断写/循环退出/窗口崩溃越线会挂成哪条催办")

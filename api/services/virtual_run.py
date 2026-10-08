@@ -295,20 +295,28 @@ def capable_lines(model: str, lines: List[Dict[str, Any]]) -> List[Tuple[Dict[st
     否则会出现"首选线没人在岗、改派却挑了一条工艺上做不了这台机的线"。
     """
     lines = [l for l in lines if not line_declares_cannot(l, model)]
-    cands: List[Tuple[Dict[str, Any], str]] = []
+    cands: List[Tuple[int, Dict[str, Any], str]] = []
+    # 强弱顺序必须真的排出来：以前只是"先加 can_make 再加 default_model"，
+    # 同一条 can_make 列表里家线和新线一起出现，于是谁在 line_profiles 里排前面谁就当首选
+    # —— 结果 A-50-04-F（跑步机，家线 LINE-TREAD-01、11h/300 台/300 人）被派到 LINE-BIKE-01
+    # （400 台/天但班组只有 150 人），日产能、到岗乘的人力、加班上限全跟着错一条线。
+    rank = {"line_declared_home": 0, "line_declared_default_model": 1,
+            "line_declared_can_make": 2, "line_inferred_by_family_name": 3}
     for l in lines:
         if model in str(l["can_models"]):
-            cands.append((l, "line_declared_can_make" if l["default_model"] != model else "line_declared_home"))
+            basis = "line_declared_home" if l["default_model"] == model else "line_declared_can_make"
+            cands.append((rank[basis], l, basis))
     for l in lines:
         if str(l["default_model"] or "") == model:
-            cands.append((l, "line_declared_default_model"))
+            cands.append((rank["line_declared_default_model"], l, "line_declared_default_model"))
     stem = str(model).split("-")[1] if "-" in str(model) else ""
     for l in lines:
         if stem and stem in str(l["line_code"]):
-            cands.append((l, "line_inferred_by_family_name"))
+            cands.append((rank["line_inferred_by_family_name"], l, "line_inferred_by_family_name"))
+    cands.sort(key=lambda x: x[0])          # 稳定排序：同级仍按 line_code 行序
     seen: List[str] = []
     ordered: List[Tuple[Dict[str, Any], str]] = []
-    for l, basis in cands:
+    for _rank, l, basis in cands:
         code = str(l["line_code"])
         if code not in seen:
             seen.append(code)

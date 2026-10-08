@@ -306,15 +306,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "分层工厂架构模型：按目标规模（headcount 或 factor）把一座参照厂等比放大成 "
                 "厂区→段→工位→班组人数→日产能上界 五层，每层带出处。量化输出含段份额、工位/设备数、"
                 "瓶颈段日产能上界（人数×60÷IE 工时）、给定温湿度时每段少来多少人。"
+                "再给 delivery_model+delivery_units 时，会把缩放后的那条线（载体会是机种的家线）送进真正的"
+                "排程沙箱，返回这一规模下该批数量的完工天数、比交期早/晚几天、用工多少人日 —— 是时间线，"
+                "不是台/天。"
                 "边界：两厂实测结构比例极差 1.9~9.1 倍 → 跨厂外推默认拒绝，必须指名参照厂；"
                 "线数/产品族/外购结构不做等比；缩放后段人数跌破台账可观测下限时段级基线不可用；"
-                "日产能是上界（参照厂 38 个工位效率全是占位 1.0），不能当可达产能或对外承诺。只读。"),
+                "日产能是上界（参照厂 38 个工位效率全是占位 1.0），不能当可达产能或对外承诺；"
+                "缩放线只存在于内存，不写 line_profiles。只读。"),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "reference_factory_id": {"type": "string", "description": "参照厂区：所有比例从这座厂的台账量出来"},
                     "headcount": {"type": "number", "description": "目标每天到岗人数规模，如 100 / 1000 / 5000"},
                     "factor": {"type": "number", "description": "或给相对参照厂的倍数（与 headcount 二选一）"},
+                    "delivery_model": {"type": "string", "description": "可选：这一规模下要交付的机种编码/名称，给了才出时间线"},
+                    "delivery_units": {"type": "number", "description": "可选：该批数量（台/件），与 delivery_model 成对"},
+                    "delivery_due_days": {"type": "number", "description": "可选：交期按几天比对，缺省 25 天并在读数里标明是假设"},
                     "temperature_c": {"type": "number", "description": "可选：顺带算该规模在此工况下每段少来多少人"},
                     "humidity_percent": {"type": "number", "description": "可选，默认 60"},
                     "task_type": {"type": "string", "description": "工序类型（assembly/machining/welding/painting…）"},
@@ -4062,7 +4069,7 @@ async def _tool_generate_plant_architecture(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Read-only plant architecture scaled from a reference factory's own ledger."""
-    from core.mes.plant_architecture import architecture_model
+    from core.mes.plant_architecture import architecture_model, attach_delivery
 
     ref = str(args.get("reference_factory_id") or factory_id or "").strip()
     if not ref:
@@ -4072,11 +4079,18 @@ async def _tool_generate_plant_architecture(
         return {"error": "没给目标规模（headcount 或 factor）→ 不猜一座厂的大小",
                 "reference_factory_id": ref}
     temp = args.get("temperature_c")
-    return await architecture_model(
+    hum = (float(args["humidity_percent"]) if args.get("humidity_percent") else None)
+    task = str(args.get("task_type") or "assembly")
+    result = await architecture_model(
         db, ref, headcount=(float(hc) if hc else None), factor=(float(fac) if fac else None),
         temperature_c=(float(temp) if temp is not None else None),
-        humidity_percent=(float(args["humidity_percent"]) if args.get("humidity_percent") else None),
-        task_type=str(args.get("task_type") or "assembly"))
+        humidity_percent=hum, task_type=task)
+    if result.get("status") != "ok":
+        return result
+    # 规模模型给的是各层的台/天上界；PMC 问的是"这个规模接得住这张单吗、几天交"。
+    # 只有把缩放后的线送进沙箱才有天数，且必须指名机种+数量 —— 缺任一项就把缺的说出来，
+    # 不拿全厂上界除一个数当天数（那等于假设除瓶颈段外都不瓶颈）。
+    return await attach_delivery(db, result, args)
 
 
 async def _tool_query_spc_anomalies(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
@@ -5273,7 +5287,10 @@ _CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
 def _architecture_intent_args(message: str) -> Dict[str, Any]:
     """从"五千人的厂""百人厂""3000 人规模"里抽目标规模（中文数量词与阿拉伯数字都认）。
 
-    只抽规模，不抽参照厂 —— 参照厂由会话所在厂区给，模型与路由都不替厂里挑参照对象。
+    规模之外再抽"这一规模下要交付的那张单"（机种+数量+交期天数）：只报台/天的模型答不了
+    "千人的厂做 8000 台 A-50-04-F 要几天"，而天数必须由缩放后的线进沙箱算出来。
+    抽不到就留空 —— 缺机种/数量时工具走 no_target_order 明说缺什么，不替厂里挑一台机。
+    参照厂不在这里抽 —— 由会话所在厂区给，路由不替厂里挑参照对象。
     """
     out: Dict[str, Any] = {}
     text = message or ""
@@ -5282,16 +5299,25 @@ def _architecture_intent_args(message: str) -> Dict[str, Any]:
         raw = m.group(1)
         head = float(_CN_DIGITS[raw]) if raw in _CN_DIGITS else float(raw)
         out["headcount"] = int(head * 10000)
-        return out
-    m = re.search(r"(\d+)\s*(?:人|个人|员工)", text)
-    if m:
-        out["headcount"] = int(m.group(1))
-        return out
-    for word, unit in (("千", 1000), ("百", 100)):
-        mm = re.search(rf"([一二两三四五六七八九])?{word}\s*(?:人|人的厂|人厂|人工厂|人的工厂)", text)
-        if mm:
-            out["headcount"] = int(_CN_DIGITS.get(mm.group(1) or "", 1) * unit)
-            return out
+    else:
+        m = re.search(r"(\d+)\s*(?:人|个人|员工)", text)
+        if m:
+            out["headcount"] = int(m.group(1))
+        else:
+            for word, unit in (("千", 1000), ("百", 100)):
+                mm = re.search(rf"([一二两三四五六七八九])?{word}\s*(?:人|人的厂|人厂|人工厂|人的工厂)", text)
+                if mm:
+                    out["headcount"] = int(_CN_DIGITS.get(mm.group(1) or "", 1) * unit)
+                    break
+    model = _extract_model_keyword(text)
+    if model:
+        out["delivery_model"] = model
+    qty = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:台|件|pcs)", text, flags=re.IGNORECASE)
+    if qty:
+        out["delivery_units"] = float(qty.group(1).replace(",", ""))
+    due = re.search(r"(?:交期|交货|完工|出货).{0,6}?(\d+)\s*(?:天|日)|(\d+)\s*(?:天|日)(?:之内|内)", text)
+    if due:
+        out["delivery_due_days"] = int(due.group(1) or due.group(2))
     return out
 
 
