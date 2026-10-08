@@ -92,6 +92,45 @@ ROUTING_GOLDEN: List[Tuple[str, str]] = [
 ]
 
 
+# 引擎自己的身份：这些账号写的处置记录是系统在收尾，不是人对引擎的态度
+MACHINE_ACTORS = frozenset({
+    "virtual_factory", "virtual_factory_scenario", "system", "night-watch",
+    "plan-commit-gate", "partial_kit_advisor", "time_basis_auditor",
+    "equipment_agent", "quality_agent", "pmc_agent", "procurement_agent",
+    "scheduling_agent", "warehouse_agent", "delivery_agent", "ai_assistant",
+})
+# 少于这个条数就不判采纳率：1 条处置算出来的"0.0 采纳率"不是证据，是噪声
+MIN_ADOPTION_DISPOSITIONS = 3
+
+
+def adoption_from_dispositions(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """人工采纳率：只数**有人的账号写过处置日志**的那些单。
+
+    为什么要挑 actor：上一版只看终态 —— 24 条推演建议里 23 条是引擎换了推荐后自己关的，
+    剩下 1 条连处置日志都没有；那 1 条被算成"人拒了"，采纳率就报成 0.0。
+    没有证据的收尾不能当人对引擎的态度；有效条数不够就不判，也不给 0 分。
+    """
+    adopted = rejected = engine_churn = unlogged = 0
+    for r in rows:
+        status = str(r.get("status") or "")
+        actor = str(r.get("actor") or "").strip()
+        superseded = "已被更新的推演推荐取代" in str(r.get("block_reason") or "")
+        if superseded or (actor and actor in MACHINE_ACTORS):
+            engine_churn += 1
+            continue
+        if not actor:
+            unlogged += 1
+            continue
+        if status == "done":
+            adopted += 1
+        elif status in ("cancelled", "closed"):
+            rejected += 1
+    judged = adopted + rejected
+    return {"adopted": adopted, "rejected": rejected, "judged": judged,
+            "engine_churn": engine_churn, "unlogged": unlogged,
+            "rate": round(adopted / judged, 3) if judged >= MIN_ADOPTION_DISPOSITIONS else None}
+
+
 def _metric(name: str, value: Any, threshold: Optional[float], sense: str, unit: str,
             basis: str, **extra: Any) -> Dict[str, Any]:
     """sense: gte=越大越好，lte=越小越好。三种状态必须分清：
@@ -649,14 +688,16 @@ async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> 
     flips = sum(1 for a, b in zip(pols, pols[1:]) if a and b and a != b)
     flip_rate = round(flips / max(1, len(pols) - 1), 3) if len(pols) > 1 else None
     human = (await db.execute(text("""
-        SELECT status, block_reason FROM followup_tasks
-        WHERE factory_id = :fid AND payload->>'category' = 'simulation_recommendation'
+        SELECT t.status, t.block_reason,
+               (SELECT l.created_by FROM followup_task_logs l
+                 WHERE l.task_id = t.id AND l.status_after IN ('done','cancelled','closed')
+                 ORDER BY l.created_at DESC LIMIT 1) AS actor
+        FROM followup_tasks t
+        WHERE t.factory_id = :fid AND t.payload->>'category' = 'simulation_recommendation'
+          AND t.status IN ('done','cancelled')
     """), {"fid": factory_id})).mappings().all()
-    # 引擎自己取代的不算人的态度；只有 done（人真采纳）与人工关闭才进分母
-    mine = [r for r in human if "已被更新的推演推荐取代" not in str(r.get("block_reason") or "")]
-    done = sum(1 for r in mine if str(r.get("status")) == "done")
-    human_closed = sum(1 for r in mine if str(r.get("status")) == "cancelled")
-    adoption = round(done / (done + human_closed), 3) if (done + human_closed) else None
+    disp = adoption_from_dispositions([dict(r) for r in human])
+    adoption = disp["rate"]
     card = (await db.execute(text("""
         SELECT detail::text AS dt FROM simulation_scorecards
         WHERE factory_id = :fid AND source = 'virtual_run_tradeoff'
@@ -680,7 +721,14 @@ async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> 
         _metric("推荐相对基线的再跑差值（暴雨档）", gain, THRESHOLDS["L3"]["retest_improvement_days"], "gte", "天",
                 "推荐政策比「现况」少延几天；0 = 推荐就是基线，决策层没有增量（差距另报 gap_to_best）"),
         _metric("人工采纳率", adoption, THRESHOLDS["L3"]["adoption_rate"], "gte", "",
-                f"done {done} / (done {done} + 人工关闭 {human_closed})；引擎自己取代的 {len(human) - len(mine)} 条不计入"),
+                f"人真采纳 {disp['adopted']} / 人处置过的 {disp['judged']} 条"
+                f"（另有 {disp['engine_churn']} 条是引擎换推荐后自己关的、"
+                f"{disp['unlogged']} 条终态没有处置日志，两条都不进分母）",
+                n=disp["judged"], min_n=MIN_ADOPTION_DISPOSITIONS,
+                missing=(None if disp["judged"] >= MIN_ADOPTION_DISPOSITIONS else
+                         f"人处置过的只有 {disp['judged']} 条（判线要 ≥{MIN_ADOPTION_DISPOSITIONS} 条）："
+                         "推演建议大多被引擎自己更新的推荐关掉，没人表过态 —— "
+                         "这一格算不出，不能读成「没人采纳」")),
         _metric("推荐翻转率", flip_rate, THRESHOLDS["L3"]["flip_rate"], "lte", "",
                 "最近 12 张记分卡里稳健推荐换人的次数占比；反复翻转=结论不稳"),
     ], "base_policy": (base or {}).get("name"), "recommended_policy": rec_name or (base or {}).get("name"),

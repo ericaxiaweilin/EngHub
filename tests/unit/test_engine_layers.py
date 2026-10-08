@@ -91,3 +91,44 @@ def test_every_layer_has_thresholds_and_a_golden_question_set():
 def test_probes_cover_both_directions():
     signs = {p["sign"] for p in el.direction_expectations()}
     assert signs == {"lte", "gte"}, "只测一个方向的冲击，符号反了也测不出来"
+
+
+# ── 人工采纳率的归属：只有"人的账号写过处置日志"才算人表过态 ────────────────
+def _disp(status, actor=None, reason=""):
+    return {"status": status, "actor": actor, "block_reason": reason}
+
+
+def test_engine_superseded_closures_are_not_rejections():
+    rows = [_disp("cancelled", "virtual_factory", "已被更新的推演推荐取代") for _ in range(23)]
+    out = el.adoption_from_dispositions(rows)
+    assert out["judged"] == 0 and out["rate"] is None
+    assert out["engine_churn"] == 23
+
+
+def test_a_single_unlogged_closure_does_not_become_zero_adoption():
+    """10-08 实测的形状：23 条引擎自关 + 1 条没有日志 —— 上一版据此报采纳率 0.0。"""
+    rows = [_disp("cancelled", "virtual_factory", "已被更新的推演推荐取代") for _ in range(23)]
+    rows.append(_disp("cancelled", None))
+    out = el.adoption_from_dispositions(rows)
+    assert out["judged"] == 0 and out["rate"] is None, "没有人的处置记录就不该出一个比率"
+    assert out["unlogged"] == 1
+
+
+def test_real_human_dispositions_are_counted_in_both_directions():
+    rows = [_disp("done", "eric"), _disp("cancelled", "eric"), _disp("done", "vf_mec_pmc_01")]
+    out = el.adoption_from_dispositions(rows)
+    assert out["adopted"] == 2 and out["rejected"] == 1 and out["judged"] == 3
+    assert out["rate"] == round(2 / 3, 3)
+
+
+def test_below_three_dispositions_is_not_judged():
+    rows = [_disp("done", "eric"), _disp("cancelled", "eric")]
+    assert el.adoption_from_dispositions(rows)["rate"] is None
+    assert el.adoption_from_dispositions(rows)["judged"] == 2
+
+
+def test_machine_accounts_are_churn_even_without_the_supersede_note():
+    rows = [_disp("cancelled", "system"), _disp("cancelled", "night-watch"),
+            _disp("done", "pmc_agent")]
+    out = el.adoption_from_dispositions(rows)
+    assert out["judged"] == 0 and out["engine_churn"] == 3
