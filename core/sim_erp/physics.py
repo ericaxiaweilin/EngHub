@@ -39,7 +39,7 @@ INERT_INPUTS = (
 
 
 class PhysicsCore:
-    VERSION = "3.1.2"
+    VERSION = "3.1.3"
 
     def simulate_step(self, physical_input: PhysicalInput, *,
                       heat_threshold_c: Optional[float] = None,
@@ -153,7 +153,9 @@ class PhysicsCore:
             "hot_deg_outside_band": th.get("hot_deg_outside_band"),
             "hot_deg_from_dry_bulb": th.get("hot_deg_from_dry_bulb"),
             "hot_deg_from_wbgt": th.get("hot_deg_from_wbgt"),
-            "cold_floor_c": th.get("cold_floor_c"),
+            "apparent_cold_c": th.get("apparent_cold_c"),
+            "cold_wet_penalty_c": th.get("cold_wet_penalty_c"),
+            "attendance_floor_c": th.get("attendance_floor_c"),
             "cold_deg_outside_band": th.get("cold_deg_outside_band"),
             "work_efficiency": th.get("work_efficiency"),
             "comfort_basis": th.get("comfort_basis"),
@@ -221,11 +223,12 @@ class PhysicsCore:
                 },
             },
             "comfort_curve": {
-                "shape": ("热湿主导的不对称曲线：冷侧 10℃ 才起算（越南 10℃ 以上偏冷不降效率），"
-                          "热侧从舒适带上沿起算；中间是平台不是斜坡"),
+                "shape": ("效率曲线两侧都连续：热侧从舒适带上沿起算（干热 + 闷热相加），"
+                          "冷侧从舒适带下沿起算，且高湿度让体感更冷（apparent_cold_c）"),
+                "attendance_is_a_different_axis": ("attendance_floor_c 只回答『会不会因此不来』，"
+                                                   "不参与效率计算；10℃ 出勤影响小不等于效率不掉"),
                 "cold_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency"],
-                "cold_floor_note": ("偏冷只在低于 cold_floor_c（默认 10℃）之后才计入，"
-                                    "不再按温带舒适带下沿惩罚"),
+                "cold_side_note": ("冷偏差按体感温度算：10℃ 已经是冷的，湿度越高扣得越多"),
                 "hot_side_note": ("热侧两条轴分开算：舒适带偏差进疲劳/能耗/效率，"
                                   "WBGT 超职业接触限值那条另算（合规判定与所需工休）"),
                 "hot_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency",

@@ -194,8 +194,7 @@ def test_comfort_curve_is_u_shaped_both_ways_from_the_center():
     center = mid.snapshot.comfort_center_c
     band = mid.snapshot.comfort_band_c
     assert center is not None and band[0] < center < band[1]
-    cold = _evaluate(_input(temp=5.0, hum=60.0) if band[0] - 10.0 < 10.0
-                     else _input(temp=band[0] - 10.0, hum=60.0))
+    cold = _evaluate(_input(temp=8.0, hum=60.0))
     hot = _evaluate(_input(temp=band[1] + 10.0, hum=60.0))
     assert cold.snapshot.work_efficiency < mid.snapshot.work_efficiency
     assert hot.snapshot.work_efficiency < mid.snapshot.work_efficiency
@@ -205,18 +204,26 @@ def test_comfort_curve_is_u_shaped_both_ways_from_the_center():
     assert hot.snapshot.fatigue_score > mid.snapshot.fatigue_score
 
 
-def test_cold_side_is_a_floor_not_a_slope_in_vietnam():
-    """越南热湿主导：10℃ 以上偏冷不降效率，不能再照温带假设惩罚 12℃ 的工况。"""
-    cool = _evaluate(_input(temp=12.0, minutes=240))
+def test_cold_lowers_efficiency_even_though_attendance_is_fine():
+    """10℃ 出勤基本不受影响，但效率上 10℃ 就是冷的 —— 两条轴不能混。"""
+    cold = _evaluate(_input(temp=10.0, minutes=240))
     comfy = _evaluate(_input(temp=19.0, minutes=240))
-    assert cool.snapshot.energy_kcal == comfy.snapshot.energy_kcal
-    assert cool.snapshot.fatigue_score == comfy.snapshot.fatigue_score
-    assert cool.snapshot.work_efficiency == comfy.snapshot.work_efficiency == 1.0
-    # 真正的低温（低于地板）才计入
-    cold = _evaluate(_input(temp=5.0, minutes=240))
+    assert comfy.snapshot.work_efficiency == 1.0
     assert cold.snapshot.work_efficiency < 1.0
     assert cold.snapshot.energy_cost_multiplier > 1.0
     assert cold.snapshot.fatigue_score > comfy.snapshot.fatigue_score
+    # 出勤那条只作为独立读数存在，不参与效率
+    assert cold.snapshot.energy_basis["attendance_floor_c"] == 10.0
+
+
+def test_muggy_cold_feels_colder_than_dry_cold():
+    """同温不同湿在冷侧也要分开：湿冷比干冷更耗人。"""
+    dry = _evaluate(_input(temp=12.0, hum=40.0, minutes=240))
+    wet = _evaluate(_input(temp=12.0, hum=95.0, minutes=240))
+    assert wet.snapshot.energy_basis["cold_wet_penalty_c"] > dry.snapshot.energy_basis["cold_wet_penalty_c"]
+    assert wet.snapshot.energy_basis["apparent_cold_c"] < dry.snapshot.energy_basis["apparent_cold_c"]
+    assert wet.snapshot.work_efficiency < dry.snapshot.work_efficiency
+    assert wet.snapshot.fatigue_score > dry.snapshot.fatigue_score
 
 
 def test_heavier_work_shifts_the_comfort_center_down():

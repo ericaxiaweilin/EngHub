@@ -92,9 +92,12 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
     wbgt_hot = (max(0.0, wbgt_now - limit_for_curve) if limit_for_curve is not None else 0.0)
     # 干热与闷热相加：取大值会让湿度在热天永远被干球遮蔽（实测就是这样）
     hot_deg = min(float(cf.get("hot_deg_cap_c", 20.0)), dry_hot + wbgt_hot)
-    # 冷侧不是舒适带下沿，是一条地板线：越南 10℃ 以上偏冷不惩罚（温带假设会误伤真实工况）
-    cold_floor = float(cf.get("cold_floor_c", 10.0))
-    cold_deg = max(0.0, cold_floor - float(temperature_c))
+    # 湿冷：体感温度按湿度再往下扣，冷偏差从舒适带下沿连续起算（10℃ 就是冷的）
+    rh_ref = float(cf.get("cold_reference_rh", 60.0))
+    wet_cold_penalty = round(float(cf.get("cold_humidity_penalty_c_at_100rh", 0.0))
+                             * max(0.0, (float(humidity_percent) - rh_ref) / 100.0), 2)
+    apparent_cold_c = round(float(temperature_c) - wet_cold_penalty, 2)
+    cold_deg = min(float(cf.get("hot_deg_cap_c", 20.0)), max(0.0, lower - apparent_cold_c))
     energy_cost_multiplier = round(1.0 + float(cf.get("cost_per_deg_hot", 0.0)) * hot_deg
                                    + float(cf.get("cost_per_deg_cold", 0.0)) * cold_deg, 4)
     work_efficiency = round(max(0.5, 1.0
@@ -106,7 +109,9 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
         "available": True,
         "comfort_center_c": round(center, 2),
         "comfort_band_c": [round(lower, 2), round(upper, 2)],
-        "cold_floor_c": round(cold_floor, 2),
+        "apparent_cold_c": apparent_cold_c,
+        "cold_wet_penalty_c": wet_cold_penalty,
+        "attendance_floor_c": float(cf.get("attendance_floor_c", 10.0)),
         "hot_deg_outside_band": round(hot_deg, 2),
         "hot_deg_from_dry_bulb": round(dry_hot, 2),
         "hot_deg_from_wbgt": round(wbgt_hot, 2),

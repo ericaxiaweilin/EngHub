@@ -985,9 +985,11 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"{(cc.get('band_c') or ['—', '—'])[0]}~{(cc.get('band_c') or ['—', '—'])[1]}℃）、"
             f"当前效率 {round(float(cc.get('work_efficiency') or 0) * 100)}%、"
             f"能耗代价 ×{cc.get('energy_cost_multiplier')}"
-            + (f"（偏冷 {eb.get('cold_deg_outside_band')}℃）"
+            + (f"（体感 {eb.get('apparent_cold_c')}℃、偏冷 {eb.get('cold_deg_outside_band')}℃；"
+               f"出勤影响线 {eb.get('attendance_floor_c')}℃ —— 低于它才算可能不来）"
                if (eb.get('cold_deg_outside_band') or 0) > 0 else
-               f"（偏热 {eb.get('hot_deg_outside_band')}℃）"
+               f"（偏热 {eb.get('hot_deg_outside_band')}℃，其中 WBGT 贡献 "
+               f"{eb.get('hot_deg_from_wbgt')}℃）"
                if (eb.get('hot_deg_outside_band') or 0) > 0 else "（在舒适带内）"),
             f"- 疲劳 {result.get('fatigue_score')}、能耗 {result.get('energy_kcal')} kcal"
             + (f"（{eb.get('metabolic_level')} 档 {eb.get('metabolic_kcal_per_hour')} kcal/h × "
