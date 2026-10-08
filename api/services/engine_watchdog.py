@@ -342,6 +342,11 @@ async def scan(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
     return {
         "factory_id": factory_id, "apply": apply,
         "loops_seen": len(rows), "alive": sum(1 for r in rows if r.get("alive")),
+        # 刚重启的进程里"这轮还没跳到"不等于"挂了"：只按新鲜度报 alive 会读成 1/6，
+        # 所以同时报"没有任何一个循环自己报过死"的数，两个数一起才不被误读。
+        "self_reported_running": sum(1 for r in rows
+                                     if str(r.get("last_status") or "")
+                                     not in ("failed", "exited", "disabled")),
         "thresholds": limits, "window_hours": _window_hours(),
         "counts": outcome["counts"], "findings": found, "items": outcome["items"],
         "rule": ("心跳超过 2 个预期间隔没跳、循环退出/异常后无新心跳、窗口崩溃率越过 L1 判线 —— "

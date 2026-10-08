@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from api.services.engine_heartbeat import read_states
-from api.services.engine_runner import start_engine_loops
+from api.services.engine_runner import start_engine_loops, stop_engine_loops
 
 HEART_LOOP = "periodic-scheduler"
 # 心跳超过 4 个间隔没更新就判死（30s 一轮 -> 2 分钟），给 compose 的健康检查用
@@ -30,6 +30,13 @@ app = FastAPI(title="EngHub Engine", version="1.0")
 @app.on_event("startup")
 async def _boot() -> None:
     await start_engine_loops()
+
+
+@app.on_event("shutdown")
+async def _halt() -> None:
+    """关停要有收尾这一步：没有它，循环是被进程直接拆掉的，
+    last_error 里就留下"循环返回，引擎已停止该任务" —— 一次正常重启在读数上像一次故障。"""
+    await stop_engine_loops()
 
 
 def verdict(states) -> tuple:
