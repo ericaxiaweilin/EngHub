@@ -734,6 +734,34 @@ UNCLAIMED_STATION_EVIDENCE_SQL = text("""
 """)
 
 
+# 路线点名的工位在 stations 里没有行的那些：整条路线就这一档算不出产能，
+# 顺带把同类站列出来给人认 —— 是路线写错了别名，还是档案少了一行
+ROUTE_STATION_GAP_SQL = text("""
+    WITH used AS (
+        SELECT DISTINCT s.work_center AS wc
+        FROM work_orders o
+        JOIN routing_template_steps s ON s.template_id::text = o.routing_template_id::text
+        WHERE o.factory_id = :fid AND o.wo_type = 'master'
+          AND o.status IN ('pending', 'released', 'in_progress')
+          AND COALESCE(s.work_center, '') <> ''
+    ), miss AS (
+        SELECT u.wc FROM used u
+        WHERE NOT EXISTS (SELECT 1 FROM stations st
+                          WHERE st.factory_id = :fid AND st.station_code = u.wc)
+    )
+    SELECT (SELECT array_agg(wc) FROM miss) AS missing_stations,
+           (SELECT count(*) FROM used) AS route_stations_used,
+           COALESCE((SELECT json_agg(json_build_object('code', st.station_code, 'name', st.station_name,
+                                                       'type', st.station_type,
+                                                       'per_hour', st.capacity_per_hour,
+                                                       'headcount', st.capacity)
+                                   ORDER BY st.station_code)
+                     FROM stations st
+                     WHERE st.factory_id = :fid AND EXISTS (SELECT 1 FROM miss)
+                       AND st.station_type = 'assembly'), '[]'::json) AS candidates
+""")
+
+
 STATION_CAPACITY_SHAPE_SQL = text("""
     SELECT s.capacity_unit AS unit, count(*) AS stations,
            count(*) FILTER (WHERE COALESCE(s.capacity_per_hour, 0) > 0) AS with_per_hour,
@@ -753,6 +781,8 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
     row = dict((await db.execute(LINE_CLAIM_SQL, {"fid": factory_id})).mappings().first() or {})
     per_model = [dict(r) for r in (await db.execute(UNCLAIMED_STATION_EVIDENCE_SQL,
                                                    {"fid": factory_id})).mappings().all()]
+    gap = dict((await db.execute(ROUTE_STATION_GAP_SQL, {"fid": factory_id})).mappings().first() or {})
+    missing_route = [str(x) for x in (gap.get("missing_stations") or [])]
     shapes = [dict(r) for r in (await db.execute(STATION_CAPACITY_SHAPE_SQL,
                                                  {"fid": factory_id})).mappings().all()]
     unclaimed = int(row.get("unclaimed_models") or 0)
@@ -769,6 +799,9 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
         "stations": sum(int(r.get("stations") or 0) for r in shapes),
         "station_capacity_rows": sum(int(r.get("with_capacity_row") or 0) for r in shapes),
         "stations_with_per_hour": sum(int(r.get("with_per_hour") or 0) for r in shapes),
+        "route_stations_missing": missing_route,
+        "route_stations_used": int(gap.get("route_stations_used") or 0),
+        "route_station_candidates": [c for c in (gap.get("candidates") or []) if isinstance(c, dict)][:6],
         "capacity_units": shapes,
         "capacity_unit_mix": units_mix,
         "capacity_unit_ambiguous": len(units_mix) > 1,
@@ -782,9 +815,12 @@ async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, An
                f"（product_id 悬空，创建者是 {'、'.join(row.get('dangling_created_by') or []) or '未知'}）"
                " → 这些单没有 BOM、没有路线，任何推演都算不出它们"
                if int(row.get("orders_without_product_row") or 0) else "")
+            + (f"；路线点名的工位有 {len(missing_route)} 个在 stations 里没有行（{'、'.join(missing_route)}）"
+               " → 整条路线只有这一档算不出产能，其余工序已经按工位下界算了"
+               if missing_route else "")
             + f"；工位侧 {sum(int(r.get('stations') or 0) for r in shapes)} 个站里 "
             f"station_capacity 填了 {sum(int(r.get('with_capacity_row') or 0) for r in shapes)} 个"
             + ("，且 capacity 单位在站间不一致（" + "、".join(units_mix) + "）"
-               "→ 单位口径没定，引擎不做工位级折算" if len(units_mix) > 1
+               "→ 口径没统一，所以推演按两读法的**下界**折（不取大的那个）" if len(units_mix) > 1
                else "；单位口径一致，缺的是每站可用工时与效率（这张表没填）")),
     }

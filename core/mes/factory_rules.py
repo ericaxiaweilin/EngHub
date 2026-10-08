@@ -452,6 +452,8 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     if int(cov.get("unclaimed_models") or 0) > 0:
         codes = cov.get("unclaimed_codes") or []
         detail = cov.get("unclaimed_detail") or []
+        missing_st = [str(x) for x in (cov.get("route_stations_missing") or [])]
+        cands = [str(c.get("code")) for c in (cov.get("route_station_candidates") or [])][:6]
         st_lines = [f"{d.get('model_code')}→{(d.get('stations') or '没登记工位')}"
                     f"（{d.get('orders_with_station')}/{d.get('orders')} 张工单登记了工位）"
                     for d in detail[:4]]
@@ -463,12 +465,18 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                          f"{cov.get('unclaimed_orders')} 张母单、{cov.get('unclaimed_units')} 台，"
                          "line_profiles 里没有一条线认领它们）"),
             "what_records_say": ("工单登记的工位：" + "；".join(st_lines)
-                                 if st_lines else "工单也没登记工位，只有路线工序"),
+                                 if st_lines else "工单也没登记工位，只有路线工序")
+                                + (f"；路线点名的工位 {'、'.join(missing_st)} 在 stations 里没有行，"
+                                   f"同类站有 {'、'.join(cands)}" if missing_st else ""),
+            "already_computed": ("这几台机已经能按工位路线算产能（两读法取下界），"
+                                  "不必先有人回答「归哪条线」"),
             "why_it_matters": ("这些单在推演里 line=null：日产能没有被线约束，时间线只是路线工时 + 来料日；"
                                "加班、借人、双班、闷热天扣人这些人力动作在这张单上乘不上，"
                                "所以现在给出的完工天数不能当线能力算过的数"),
-            "expected_answer": ("机种 → 线编码（LINE-…）；若这些确实按工位做，"
-                                "请回答「按工位」并转去定工位产能口径那条问题"),
+            "expected_answer": ("只剩一行要认：路线里的 "
+                                + ('、'.join(missing_st) or "某工位")
+                                + " 是哪个已有工位（或补一条 stations 档案）；"
+                                  "线认领不再是算不出产能的前提"),
             "prefilled_evidence": cov.get("reading"),
             "record_as": {"subject": "line_claim", "verdict": "declared", "status": "declared",
                           "source": "chat"},
@@ -476,13 +484,16 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     if cov.get("capacity_unit_ambiguous") or int(cov.get("station_capacity_rows") or 0) == 0:
         out.append({
             "topic": "station_capacity_basis",
-            "question": ("工位产能怎么算：stations.capacity_per_hour 是「每件每小时」还是「每线每小时」？"
-                         f"每站每天可用几小时、按几成效率算？（现在 {cov.get('stations')} 个站里 "
+            "question": ("工位产能两读要不要收口：站点自己声明的台/小时，与「在册人数×60/IE工时」"
+                         "在实测里差 360~6540 倍（组立一线两读一致、焊接车间差 6540 倍）。"
+                         "推演现在按「下界」折，班时用打卡中位（实测 10h）代替了没填的每站工时；"
+                         f"还缺的是每站效率与可用工时（{cov.get('stations')} 个站里 "
                          f"station_capacity 填了 {cov.get('station_capacity_rows')} 个）"),
             "why_it_matters": ("单位口径没定的时候，引擎不敢把 per_hour 乘班时当产能：那要么把「人」当「件」乘，"
                                "要么把 6 成效率当 10 成。按工位走的机种（比如上面那几台）因此只能用路线工时推，"
                                "算不出'这条工位最多一天出多少'"),
-            "expected_answer": "单位含义 + 每站可用工时 + 效率（或直接说按线算、工位不单独算）",
+            "expected_answer": ("① capacity_per_hour 到底是整站还是每人；"
+                                "② 每站可用工时与效率（或直接说按站点声明那列算，另一列只当理论上限）"),
             "prefilled_evidence": (f"capacity 单位在站间混用：{'、'.join(cov.get('capacity_unit_mix') or [])}"
                                    if cov.get("capacity_unit_ambiguous") else
                                    "capacity 单位一致，但 station_capacity 表没填每站工时与效率"),
