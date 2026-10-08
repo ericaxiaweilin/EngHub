@@ -3,6 +3,8 @@
 只测纯函数（findings / plan_actions / 文案），不碰库 —— 动库那条路在预演接口里看得到。
 """
 from api.services.engine_watchdog import (
+    DATA_LOOPS,
+    gap_readings,
     CATEGORY,
     CRASH,
     EXITED,
@@ -250,3 +252,63 @@ def test_last_error_ring_is_carried_into_the_task_verbatim():
                                              "error": "asyncpg.exceptions.TooManyConnectionsError"}])],
                      crash_rate_limit=LIMIT, min_window_ticks=MIN_TICKS)[0]
     assert "TooManyConnectionsError" in found["description"]
+
+
+# ── 齐套行覆盖率：门判齐套而引擎算出缺件 = 放行洞；登记不足 = 补数据 ──────────────
+def _cov(**over):
+    base = {"orders_sampled": 24, "models": ["A-50-04-F"], "engine_short_part_rows": 967,
+            "ledger_short_rows": 290, "coverage_rate": 0.30, "rows_to_register": 750,
+            "gate_ready_but_engine_short": 0, "already_released_but_engine_short": 3,
+            "gate_ready_proven_samples": [], "per_model": []}
+    base.update(over)
+    return base
+
+
+def _titles(found):
+    return [f["title"] for f in found]
+
+
+def test_coverage_hole_is_its_own_finding_even_for_one_order():
+    """门判 ready 而引擎算出缺件：一张就要报，这张单会被直接下达开工。"""
+    cov = _cov(gate_ready_but_engine_short=1,
+               gate_ready_proven_samples=[{"work_order_code": "WO-MECH-2026-0002"}])
+    found = gap_readings(gen={}, sup={}, ready={}, cov=cov)
+    hole = [f for f in found if f["kind"] == "gate_ready_but_engine_short"]
+    assert len(hole) == 1
+    assert "WO-MECH-2026-0002" in hole[0]["title"]
+    assert hole[0]["evidence"]["coverage_rate"] == 0.30
+
+
+def test_under_registration_reports_the_write_cost_not_just_a_rate():
+    found = gap_readings(gen={}, sup={}, ready={}, cov=_cov())
+    gap = [f for f in found if f["kind"] == "under_registered"]
+    assert len(gap) == 1
+    assert "750" in gap[0]["title"]                      # 标题带写入成本
+    assert "967" in gap[0]["description"] and "290" in gap[0]["description"]  # 两侧原始计数
+    # 已下达而引擎算出缺件要一起说，但不算成放行洞（门本轮管不到它）
+    assert "3 张已下达" in gap[0]["description"]
+
+
+def test_small_coverage_gap_is_not_worth_an_inbox_row():
+    """补 30 行不值得挂待办：重跑一次就完了，收件箱不是垃圾桶。"""
+    found = gap_readings(gen={}, sup={}, ready={},
+                         cov=_cov(coverage_rate=0.55, rows_to_register=120))
+    assert [f for f in found if f["loop"] == "kit_line_coverage"] == []
+
+
+def test_coverage_at_or_above_the_line_says_nothing():
+    found = gap_readings(gen={}, sup={}, ready={},
+                         cov=_cov(coverage_rate=0.62, rows_to_register=750))
+    assert [f for f in found if f["loop"] == "kit_line_coverage"] == []
+
+
+def test_unreadable_coverage_does_not_silently_pass_the_check():
+    """cov 读不到（查崩/没跑）时既不报也不关：evaluated_out 里不能有这格。"""
+    seen = set()
+    found = gap_readings(gen={}, sup={}, ready={}, cov=None, evaluated_out=seen)
+    assert [f for f in found if f["loop"] == "kit_line_coverage"] == []
+    assert "kit_line_coverage" not in seen
+
+
+def test_coverage_loop_is_protected_when_the_check_did_not_run():
+    assert "kit_line_coverage" in DATA_LOOPS

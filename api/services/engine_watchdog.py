@@ -551,7 +551,7 @@ DATA_LOOPS = frozenset({
     "kit_line_generation", "kit_line_missing", "supplier_master",
     "lead_time_evidence", "material_make_or_buy_conflict",
     "action_constraints", "action_execution_silence", "candidate_rules",
-    "working_conditions_evidence",
+    "working_conditions_evidence", "kit_line_coverage",
 })
 
 
@@ -585,11 +585,20 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
 
     claim = await line_claim_coverage(db, factory_id)
     eff = await efficiency_basis_census(db, factory_id)
+    # 覆盖率要把引擎本轮的展开和门的判定配成对，一轮 ~1 分钟；查不动时 cov=None，
+    # 判据那侧据此不关这条催办（读不到数 ≠ 没有缺口）。
+    try:
+        from api.services.sim_backtest import kit_coverage_gap
+
+        cov = await kit_coverage_gap(db, factory_id, per_model=8, max_orders=24)
+    except Exception:  # noqa: BLE001
+        cov = None
     if evaluated_out is not None:
         evaluated_out.update({"kit_line_generation", "supplier_master",
                               "lead_time_evidence", "material_make_or_buy_conflict",
                               "candidate_rules", "working_conditions_evidence",
-                              "line_profile_coverage", "station_efficiency_basis"})
+                              "line_profile_coverage", "station_efficiency_basis",
+                              "kit_line_coverage"})
     try:
         from core.mes.action_constraints import action_constraints
 
@@ -625,8 +634,16 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
                         wc=dict(wc or {}), claim=claim or {}, eff=eff or {}, rejected=rejected,
                         pending=list(pending or []), mp=dict(mp or {}),
-                        evaluated_out=evaluated_out)
+                        cov=cov or {}, evaluated_out=evaluated_out)
 
+
+# 齐套行覆盖率：台账登记的缺口行 ÷ 引擎本轮算出的缺口件。线取 0.6 的理由是
+# L2B 那一格要有可比行才谈得上对错；低于六成时命中率读数是取数封顶，不是引擎判错。
+MIN_KIT_COVERAGE_RATE = 0.60
+# 一次催办至少值这么多行才占收件箱：补 30 行不值得挂一条待办，重跑一次就完了
+MIN_KIT_COVERAGE_ROWS = 200
+# 门判 ready 而引擎算出缺件 = 可举证的放行洞，一张就报（这张单会被直接下达开工）
+MIN_KIT_GATE_HOLE_ORDERS = 1
 
 MIN_STATIONS_FOR_EFFICIENCY_GAP = 5
 
@@ -638,6 +655,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  cons: Optional[Dict[str, Any]] = None,
                  pending: Optional[List[Dict[str, Any]]] = None,
                  mp: Optional[Dict[str, Any]] = None,
+                 cov: Optional[Dict[str, Any]] = None,
                  wc: Optional[Dict[str, Any]] = None,
                  claim: Optional[Dict[str, Any]] = None,
                  rejected: Optional[List[Dict[str, Any]]] = None,
@@ -657,6 +675,47 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
         basis = cons.get("grid_usage_basis") or {}
         if basis.get("coverage_known"):
             ev.add("action_execution_silence")
+    if cov:
+        ev.add("kit_line_coverage")
+        rate = cov.get("coverage_rate")
+        rows = int(cov.get("rows_to_register") or 0)
+        holes = int(cov.get("gate_ready_but_engine_short") or 0)
+        acted = int(cov.get("already_released_but_engine_short") or 0)
+        if holes >= MIN_KIT_GATE_HOLE_ORDERS:
+            who = ", ".join(str(s.get("work_order_code"))
+                            for s in (cov.get("gate_ready_proven_samples") or [])[:4])
+            out.append(_gap(
+                "kit_line_coverage", "gate_ready_but_engine_short", f"hole|{holes}",
+                f"放行洞｜门判齐套可下达的 {holes} 张单，引擎本轮算出外购缺件（{who}）",
+                "齐套门读的是齐套表：这些单在台账里没有对应的缺口行，门就看不见缺件。\n"
+                f"本轮抽样 {cov.get('orders_sampled')} 张，引擎缺口件 {cov.get('engine_short_part_rows')}、"
+                f"台账登记缺口行 {cov.get('ledger_short_rows')}（覆盖率 {rate}）。\n"
+                "复核：GET /api/v1/pmc/kit-coverage-gap、GET /api/v1/pmc/plan-commit-gate。",
+                f"{holes} 张单被门判成齐套但引擎算出缺件", "pmc_agent",
+                "先补这些单的齐套缺口行（只加不改不删，走 /kit-lines-reupgrade 的显式开关），"
+                "再复核门是否放行。",
+                {"orders_sampled": cov.get("orders_sampled"), "coverage_rate": rate,
+                 "gate_ready_but_engine_short": holes, "rows_to_register": rows}))
+        if rate is not None and rate < MIN_KIT_COVERAGE_RATE and rows >= MIN_KIT_COVERAGE_ROWS:
+            out.append(_gap(
+                "kit_line_coverage", "under_registered", f"cov|{int(rows // 200)}",
+                f"补数据｜台账只登记了引擎本轮缺口件的 {rate}（差 {rows} 行）",
+                "引擎按多层 BOM 加当前库存算出该缺哪些件，台账（工单齐套表）只登记了其中一部分："
+                "缺的那部分既进不了催办，也进不了 L2B 的对照 —— 命中率读数被取数封顶，"
+                "不是引擎判错。\n"
+                f"本轮抽样 {cov.get('orders_sampled')} 张（机种 {cov.get('models')}）："
+                f"引擎缺口件 {cov.get('engine_short_part_rows')} 行、台账缺口行 {cov.get('ledger_short_rows')} 行。\n"
+                f"补的写入成本约 {rows} 行；另有 {acted} 张已下达的单引擎算出缺件"
+                "（下达发生在历史某一版，本轮门判不到）。\n"
+                "复核：GET /api/v1/pmc/kit-coverage-gap、GET /api/v1/pmc/sim-readiness。",
+                f"齐套缺口行只登记了 {rate}，差 {rows} 行", "pmc_agent",
+                "补登记会新增行并把相关单变成不齐套（这是对的），所以只在显式开关下做，"
+                "且只加行、不改不删已有行。",
+                {"orders_sampled": cov.get("orders_sampled"), "coverage_rate": rate,
+                 "engine_short_part_rows": cov.get("engine_short_part_rows"),
+                 "ledger_short_rows": cov.get("ledger_short_rows"),
+                 "rows_to_register": rows,
+                 "already_released_but_engine_short": acted}))
     if wc is not None and int(wc.get("attendance_days") or 0) >= MIN_ATTENDANCE_DAYS_FOR_SLOPE:
         ev.add("working_conditions_evidence")
         if int(wc.get("sensor_rows") or 0) == 0:
@@ -958,6 +1017,9 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
             "stale_generation_orders": MIN_STALE_ORDERS,
             "rerunnable_orders": MIN_RERUNNABLE_ORDERS,
             "supplier_gap_parts": MIN_SUPPLIER_GAP_PARTS,
+            "kit_coverage_rate_min": MIN_KIT_COVERAGE_RATE,
+            "kit_coverage_rows_min": MIN_KIT_COVERAGE_ROWS,
+            "kit_gate_hole_orders_min": MIN_KIT_GATE_HOLE_ORDERS,
             "unverified_lead_parts": MIN_UNVERIFIED_LEAD_PARTS,
             "mob_contradiction_rows": MIN_MOB_CONTRADICTION_ROWS,
             "undeclared_actions": MIN_UNDECLARED_ACTIONS,
