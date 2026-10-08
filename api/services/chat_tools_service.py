@@ -1838,9 +1838,10 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
             "band_c": snap.comfort_band_c,
             "work_efficiency": snap.work_efficiency,
             "energy_cost_multiplier": snap.energy_cost_multiplier,
-            "note": ("U 型工况曲线：舒适带内效率最高、能耗最低，偏冷偏热都变差；"
-                     "中心随作业强度下移。带外斜率是本厂曲线（写在包里），"
-                     "标准给的是热应激限值那条轴"),
+            "note": ("热湿主导的不对称工况曲线：热侧从舒适带上沿起算，冷侧要低于 "
+                     "cold_floor（默认 10℃）才起算 —— 越南 10℃ 以上偏冷不降效率，"
+                     "不按温带舒适带惩罚。中心随作业强度下移；带外斜率是本厂曲线（写在包里）"),
+            "cold_floor_c": (snap.energy_basis or {}).get("cold_floor_c"),
             "read_pitfall": ("强超限时窗口内总能耗可能反而低于轻超时温度（工休把作业小时换成了休息档）—— "
                              "不代表高温更省力，而是那段时间不允许连续干；要看效率与所需工休"),
             "basis": (snap.energy_basis or {}).get("comfort_basis"),

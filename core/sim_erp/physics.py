@@ -39,7 +39,7 @@ INERT_INPUTS = (
 
 
 class PhysicsCore:
-    VERSION = "3.1.1"
+    VERSION = "3.1.2"
 
     def simulate_step(self, physical_input: PhysicalInput, *,
                       heat_threshold_c: Optional[float] = None,
@@ -151,6 +151,9 @@ class PhysicsCore:
             "comfort_center_c": th.get("comfort_center_c"),
             "comfort_band_c": th.get("comfort_band_c"),
             "hot_deg_outside_band": th.get("hot_deg_outside_band"),
+            "hot_deg_from_dry_bulb": th.get("hot_deg_from_dry_bulb"),
+            "hot_deg_from_wbgt": th.get("hot_deg_from_wbgt"),
+            "cold_floor_c": th.get("cold_floor_c"),
             "cold_deg_outside_band": th.get("cold_deg_outside_band"),
             "work_efficiency": th.get("work_efficiency"),
             "comfort_basis": th.get("comfort_basis"),
@@ -218,8 +221,11 @@ class PhysicsCore:
                 },
             },
             "comfort_curve": {
-                "shape": "U 型：舒适带内最低，往冷往热都变差（不是只有热的一侧）",
+                "shape": ("热湿主导的不对称曲线：冷侧 10℃ 才起算（越南 10℃ 以上偏冷不降效率），"
+                          "热侧从舒适带上沿起算；中间是平台不是斜坡"),
                 "cold_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency"],
+                "cold_floor_note": ("偏冷只在低于 cold_floor_c（默认 10℃）之后才计入，"
+                                    "不再按温带舒适带下沿惩罚"),
                 "hot_side_note": ("热侧两条轴分开算：舒适带偏差进疲劳/能耗/效率，"
                                   "WBGT 超职业接触限值那条另算（合规判定与所需工休）"),
                 "hot_side_enters": ["fatigue_score", "energy_kcal", "work_efficiency",

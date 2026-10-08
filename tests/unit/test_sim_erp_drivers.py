@@ -194,7 +194,8 @@ def test_comfort_curve_is_u_shaped_both_ways_from_the_center():
     center = mid.snapshot.comfort_center_c
     band = mid.snapshot.comfort_band_c
     assert center is not None and band[0] < center < band[1]
-    cold = _evaluate(_input(temp=max(-5.0, band[0] - 10.0), hum=60.0))
+    cold = _evaluate(_input(temp=5.0, hum=60.0) if band[0] - 10.0 < 10.0
+                     else _input(temp=band[0] - 10.0, hum=60.0))
     hot = _evaluate(_input(temp=band[1] + 10.0, hum=60.0))
     assert cold.snapshot.work_efficiency < mid.snapshot.work_efficiency
     assert hot.snapshot.work_efficiency < mid.snapshot.work_efficiency
@@ -204,11 +205,17 @@ def test_comfort_curve_is_u_shaped_both_ways_from_the_center():
     assert hot.snapshot.fatigue_score > mid.snapshot.fatigue_score
 
 
-def test_cold_side_changes_energy_that_used_to_be_inert():
-    """12℃ 与舒适带内不是同一个能耗：旧版里低于 35℃ 全都一动不动。"""
-    cold = _evaluate(_input(temp=12.0, minutes=240))
+def test_cold_side_is_a_floor_not_a_slope_in_vietnam():
+    """越南热湿主导：10℃ 以上偏冷不降效率，不能再照温带假设惩罚 12℃ 的工况。"""
+    cool = _evaluate(_input(temp=12.0, minutes=240))
     comfy = _evaluate(_input(temp=19.0, minutes=240))
-    assert cold.snapshot.energy_kcal > comfy.snapshot.energy_kcal
+    assert cool.snapshot.energy_kcal == comfy.snapshot.energy_kcal
+    assert cool.snapshot.fatigue_score == comfy.snapshot.fatigue_score
+    assert cool.snapshot.work_efficiency == comfy.snapshot.work_efficiency == 1.0
+    # 真正的低温（低于地板）才计入
+    cold = _evaluate(_input(temp=5.0, minutes=240))
+    assert cold.snapshot.work_efficiency < 1.0
+    assert cold.snapshot.energy_cost_multiplier > 1.0
     assert cold.snapshot.fatigue_score > comfy.snapshot.fatigue_score
 
 
@@ -216,3 +223,16 @@ def test_heavier_work_shifts_the_comfort_center_down():
     light = _evaluate(_input(temp=21.0, task="inspect"))     # light 190 kcal/h
     heavy = _evaluate(_input(temp=21.0, task="casting"))     # heavy 370 kcal/h
     assert heavy.snapshot.comfort_center_c < light.snapshot.comfort_center_c
+
+def test_mugginess_lowers_efficiency_at_the_same_dry_bulb():
+    """同温不同湿必须不等：湿度只走合规轴的话，30℃/95% 会被判成和 30℃/40% 一样舒服。"""
+    dry = _evaluate(_input(temp=30.0, hum=40.0))
+    muggy = _evaluate(_input(temp=30.0, hum=95.0))
+    assert muggy.snapshot.wbgt_c > dry.snapshot.wbgt_c + 5.0
+    assert muggy.snapshot.work_efficiency < dry.snapshot.work_efficiency
+    assert muggy.snapshot.energy_cost_multiplier > dry.snapshot.energy_cost_multiplier
+    assert muggy.snapshot.fatigue_score > dry.snapshot.fatigue_score
+    # 干热与闷热两项偏差分开可读，相加后才封顶
+    eb = muggy.snapshot.energy_basis
+    assert eb["hot_deg_from_dry_bulb"] > 0 and eb["hot_deg_from_wbgt"] > 0
+    assert eb["hot_deg_outside_band"] <= 20.0

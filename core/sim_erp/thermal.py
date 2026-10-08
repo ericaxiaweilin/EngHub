@@ -85,8 +85,16 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
         cf.get("optimal_shift_per_100kcal_above_130", 0.0)) * max(0.0, (kcal - 130.0) / 100.0)
     band = float(cf.get("band_c", 2.0))
     upper, lower = center + band, center - band
-    hot_deg = max(0.0, float(temperature_c) - upper)
-    cold_deg = max(0.0, lower - float(temperature_c))
+    pre = float(cf.get("wbgt_pre_limit_c", 0.0))
+    wbgt_now = float(env["wbgt_c"])
+    limit_for_curve = float(meta["wbgt_limit_c"]) - pre if meta.get("wbgt_limit_c") is not None else None
+    dry_hot = max(0.0, float(temperature_c) - upper)
+    wbgt_hot = (max(0.0, wbgt_now - limit_for_curve) if limit_for_curve is not None else 0.0)
+    # 干热与闷热相加：取大值会让湿度在热天永远被干球遮蔽（实测就是这样）
+    hot_deg = min(float(cf.get("hot_deg_cap_c", 20.0)), dry_hot + wbgt_hot)
+    # 冷侧不是舒适带下沿，是一条地板线：越南 10℃ 以上偏冷不惩罚（温带假设会误伤真实工况）
+    cold_floor = float(cf.get("cold_floor_c", 10.0))
+    cold_deg = max(0.0, cold_floor - float(temperature_c))
     energy_cost_multiplier = round(1.0 + float(cf.get("cost_per_deg_hot", 0.0)) * hot_deg
                                    + float(cf.get("cost_per_deg_cold", 0.0)) * cold_deg, 4)
     work_efficiency = round(max(0.5, 1.0
@@ -98,7 +106,10 @@ def assess(*, temperature_c: float, humidity_percent: float, task_type: str,
         "available": True,
         "comfort_center_c": round(center, 2),
         "comfort_band_c": [round(lower, 2), round(upper, 2)],
+        "cold_floor_c": round(cold_floor, 2),
         "hot_deg_outside_band": round(hot_deg, 2),
+        "hot_deg_from_dry_bulb": round(dry_hot, 2),
+        "hot_deg_from_wbgt": round(wbgt_hot, 2),
         "cold_deg_outside_band": round(cold_deg, 2),
         "energy_cost_multiplier": energy_cost_multiplier,
         "work_efficiency": work_efficiency,
