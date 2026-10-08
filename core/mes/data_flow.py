@@ -241,6 +241,47 @@ def classify_liveness(tables: List[tuple], refs: Dict[str, List[str]]) -> Dict[s
     }
 
 
+def node_coupling(tables: List[tuple], refs: Dict[str, List[str]]) -> Dict[str, Any]:
+    """单点节点：引擎读到一张表，靠几个文件读。只有一根线的，断一处就全断。
+
+    影响范围只到**文件级** —— 那个文件里声明了哪些端点/工具；不做函数级调用图。
+    文本判据撑不起"这张表断了具体哪个读数会掉"那种断言，说出去就是假话。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    route_re = re.compile(r'@router\.(?:get|post|put|delete)\(\s*"([^"]{2,80})"')
+    tool_re = re.compile(r'"([a-z][a-z0-9_]{3,40})":\s*_tool_')
+
+    rows: List[Dict[str, Any]] = []
+    buckets = {"single": 0, "few": 0, "many": 0}
+    for name, cnt in tables:
+        hits = sorted({h for h in (refs.get(str(name)) or []) if h.startswith(ENGINE_DIRS)})
+        if not hits:
+            continue
+        buckets["single" if len(hits) == 1 else "few" if len(hits) <= 3 else "many"] += 1
+        entry: Dict[str, Any] = {"table": str(name), "rows": int(cnt), "engine_files": len(hits),
+                                 "wired_by": hits[:4], "single_wire": len(hits) == 1,
+                                 "status": "single_wire" if len(hits) == 1 else "wired"}
+        if len(hits) == 1:
+            try:
+                body = (root / hits[0]).read_text(encoding="utf-8", errors="ignore")
+                entry["endpoints_in_that_file"] = sorted(set(route_re.findall(body)))[:8]
+                entry["tools_in_that_file"] = sorted(set(tool_re.findall(body)))[:8]
+            except OSError as exc:
+                entry["status"] = "unreadable_file"
+                entry["why"] = str(exc)[:80]
+        rows.append(entry)
+    single = [r for r in rows if r.get("single_wire")]
+    return {"single": buckets["single"], "few": buckets["few"], "many": buckets["many"],
+            "read_tables": len(rows),
+            "single_wire_share": round(len(single) / max(1, len(rows)), 3),
+            "single_wire_by_rows": sorted(single, key=lambda r: -r["rows"])[:12],
+            "note": ("判据是 api/core 里出现该表名的文件数；影响范围到文件级（那个文件声明的端点与工具），"
+                     "不是函数级调用图 —— 单点只说明脆弱，不说明该改哪张表")}
+
+
 async def node_liveness(db: AsyncSession) -> Dict[str, Any]:
     """数"有数据的表"与"引擎读到的表"。"""
     rows = (await db.execute(text(
@@ -259,6 +300,11 @@ async def data_flow_profile(db: AsyncSession, factory_id: str, *, headcount: Opt
     rows = await ledger_nodes(db, factory_id)
     graph = await graph_shape(db)
     live = await node_liveness(db)
+    coupling = node_coupling([(r[0], int(r[1])) for r in (await db.execute(text(
+        "SELECT c.relname, c.reltuples::bigint FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname='public' AND c.relkind='r' AND c.reltuples > 0"))).all()],
+        source_table_refs())
     shape = await plant_shape(db, factory_id)
     readable = [r for r in rows if r.get("status") == "ok"]
     unreadable = [r for r in rows if r.get("status") != "ok"]
@@ -273,7 +319,7 @@ async def data_flow_profile(db: AsyncSession, factory_id: str, *, headcount: Opt
         runs = [await run_nodes(db, factory_id, m, 1800.0) for m in models[:1]]
 
     out: Dict[str, Any] = {
-        "factory_id": factory_id, "graph": graph, "liveness": live,
+        "factory_id": factory_id, "graph": graph, "liveness": live, "coupling": coupling,
         "ledger": {"nodes": rows, "readable": len(readable), "unreadable": [r["node"] for r in unreadable],
                    "total_rows": ledger_total,
                    "biggest": sorted(readable, key=lambda r: -int(r["rows"] or 0))[:5]},
@@ -291,6 +337,12 @@ async def data_flow_profile(db: AsyncSession, factory_id: str, *, headcount: Opt
             f"{live['side_only']} 张；源码里根本不出现的 {live['unreferenced']} 张"
             f"（{live['unreferenced_rows']:,} 行，占 {live['unreferenced_row_share']:.0%}）—— "
             f"后者只代表引擎没读，不代表数据没用，更不构成删表依据",
+            f"节点接线：引擎读到的 {coupling['read_tables']} 张表里，"
+            f"{coupling['single']} 张只被 1 个文件读到（{coupling['single_wire_share']:.0%}）、"
+            f"{coupling['few']} 张 2~3 个、{coupling['many']} 张 4 个以上 —— "
+            f"单点表断了就是整块读数没了，最宽的几张："
+            + "、".join(f"{r['table']}({r['rows']:,} 行←{r['wired_by'][0].rsplit('/', 1)[-1]})"
+                        for r in coupling["single_wire_by_rows"][:4]),
         ],
     }
     if unreadable:

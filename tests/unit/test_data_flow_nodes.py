@@ -114,3 +114,41 @@ def test_source_refs_are_cached_and_scan_the_real_tree():
     assert refs, "源码扫描没结果：容器里的仓库根目录推导要重看"
     assert any(f.startswith("api/") for f in refs.get("work_orders", []))
     assert source_table_refs() is refs, "第二次调用不该重扫 399 个文件"
+
+
+def test_coupling_counts_single_wired_tables_and_says_so_at_file_granularity():
+    from core.mes.data_flow import node_coupling
+
+    refs = {"work_orders": ["api/services/aps_service.py", "core/mes/order_flow.py",
+                            "api/routes/pp_routes.py"],
+            "mrp_items": ["api/routes/pp_routes.py"],
+            "one_more": ["api/routes/pp_routes.py", "core/x.py", "core/y.py", "core/z.py",
+                         "api/services/q.py"],
+            "lg_stock": []}
+    out = node_coupling([("work_orders", 862), ("mrp_items", 12351), ("one_more", 5),
+                         ("lg_stock", 11021)], refs)
+    assert (out["read_tables"], out["single"], out["few"], out["many"]) == (3, 1, 1, 1)
+    assert out["single_wire_share"] == round(1 / 3, 3)
+    only = out["single_wire_by_rows"][0]
+    assert only["table"] == "mrp_items" and only["wired_by"] == ["api/routes/pp_routes.py"]
+    assert "函数级调用图" in out["note"] and "不说明该改哪张表" in out["note"]
+
+
+def test_single_wire_entry_names_the_surfaces_in_that_file():
+    """影响范围到文件级：那个路由文件里声明的端点要列出来，才有"断了会没哪几块"的概念。"""
+    from core.mes.data_flow import node_coupling
+
+    out = node_coupling([("some_table", 10)], {"some_table": ["api/routes/pp_routes.py"]})
+    entry = out["single_wire_by_rows"][0]
+    assert entry["status"] == "single_wire"
+    assert isinstance(entry.get("endpoints_in_that_file"), list)
+    assert "/mrp/calculate" in entry["endpoints_in_that_file"], "真在文件里的端点要能被抓到"
+
+
+def test_unreadable_source_file_is_reported_not_guessed():
+    from core.mes.data_flow import node_coupling
+
+    out = node_coupling([("ghost_table", 7)], {"ghost_table": ["api/routes/never_written.py"]})
+    entry = out["single_wire_by_rows"][0]
+    assert entry["status"] == "unreadable_file" and entry.get("why")
+    assert "endpoints_in_that_file" not in entry, "读不到文件就不许编端点清单"
