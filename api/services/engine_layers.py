@@ -649,7 +649,7 @@ async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> 
         _metric("推荐动作压在未核实依据上的条数", (flagged if exp_total else None),
                 THRESHOLDS["L3"]["actions_on_unverified_max"], "lte", "条",
                 f"最近一张权衡卡里 {exp_total} 条催购动作有 {flagged} 条至少一项依据未核实"
-                "（提前期是按类别铺的默认值 / 料号与供应商来自本地演示 BOM / 该件单价缺失所以加急费按 0 算）。"
+                "（提前期是按类别铺的默认值，或料号与供应商来自本地演示 BOM）。"
                 "这一格不过线不是推荐算错，是**照着下单的人没有可核的对象** —— "
                 "要修的是供应商主数据（#48）与实测提前期（#55），不是再推演一遍",
                 missing=(None if exp_total else "最近这张卡没有催购动作，判不了依据质量")),

@@ -110,7 +110,7 @@ def test_expedite_action_carries_the_provenance_of_every_number_it_buys_on():
     got = evidence_flags(demo, {"bom_source": "mes_bom_items"})
     assert any("ledger_declared" in x for x in got)
     assert any("mes_bom_items" in x for x in got)
-    assert any("代价被低报" in x for x in got)
+    assert all("单价" not in x for x in got)   # 加急费公式里没有 unit_price，误归因要挡住
 
     no_sup = {"lead_evidence": "unverified_default", "lead_time_days": 12, "unit_price": None}
     got2 = evidence_flags(no_sup, {"bom_source": "engflow_mirror_multi_level"})

@@ -1148,9 +1148,14 @@ def evidence_flags(bp: Dict[str, Any], detail: Dict[str, Any]) -> List[str]:
     """催购动作身上必须挂着"这几个数是几手的"。
 
     10-07 实测：暴雨档 5 台里 3 台的瓶颈件是本地演示 BOM 的合成料号（连供应商都是演示数据）、
-    1 台是真 SAP 件但提前期是按类别铺的默认值（lead_evidence=unverified_default）、
-    而这颗件的单价是 0 —— 于是加急费算出来正好 $0，看着像"免费买到 4 天"。
+    1 台是真 SAP 件但提前期是按类别铺的默认值（lead_evidence=unverified_default）。
     引擎可以把这些数拿去排序，但落到"向谁下单、花多少钱"的动作上时必须把依据一起交出去。
+
+    这里曾经错过一次归因：那轮 $0 的加急费我写成"因为件没单价"，配对验算是错的 ——
+    加急费公式是 台数 × 压短天数 × SIM_EXPEDITE_COST_PER_UNIT_DAY(0.15)，与 unit_price 无关
+    （1800×8×0.15 + 3×1800×13×0.15 + 2400×13×0.15 + 1800×5×0.15 = 16,560，与卡上分文不差）。
+    真正的 $0 来自代价取错了政策（已在 robust_objectives 修掉）。单价缺失影响的是库存金额与成本口径，
+    不是这一格，所以不许再挂在这里。
     """
     flags: List[str] = []
     evd = str(bp.get("lead_evidence") or "unknown")
@@ -1159,8 +1164,6 @@ def evidence_flags(bp: Dict[str, Any], detail: Dict[str, Any]) -> List[str]:
     src = str(detail.get("bom_source") or "")
     if src and src != "engflow_mirror_multi_level":
         flags.append(f"BOM 取数={src}（料号与供应商可能不是厂里真件）")
-    if float(bp.get("unit_price") or 0) <= 0:
-        flags.append("该件单价缺失 → 本轮加急费按 0 计，代价被低报")
     if not bp.get("supplier"):
         flags.append("没有默认供应商 → 催购没有对象")
     return flags
