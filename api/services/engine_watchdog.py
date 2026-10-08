@@ -614,11 +614,14 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
         derived = await record_candidates_from_census(db, factory_id, apply=True)
     except Exception:  # noqa: BLE001  挖不动就不挂这一格，绝不把没跑到说成没有候选
         mined, derived = {"error": "mining_unavailable"}, {"error": "derive_unavailable"}
+    # 候选写不进去（词表挡了、校验挡了）以前是悄悄丢返回值：这里把它变成一条催办，
+    # 否则"没落库"和"这条事实不存在"在读数上长得一模一样
+    rejected = [w for w in ((derived or {}).get("write_errors") or []) if isinstance(w, dict)]
     pending = await _pending_rules(db, factory_id)
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
-                        wc=dict(wc or {}), claim=claim or {},
+                        wc=dict(wc or {}), claim=claim or {}, rejected=rejected,
                         pending=list(pending or []), mp=dict(mp or {}),
                         evaluated_out=evaluated_out)
 
@@ -631,6 +634,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  mp: Optional[Dict[str, Any]] = None,
                  wc: Optional[Dict[str, Any]] = None,
                  claim: Optional[Dict[str, Any]] = None,
+                 rejected: Optional[List[Dict[str, Any]]] = None,
                  evaluated_out: Optional[set] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
@@ -668,6 +672,24 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  "reading_rows": int(wc.get("reading_rows") or 0),
                  "attendance_days": int(wc.get("attendance_days") or 0),
                  "declared_slope_pp_per_c": 1.0},
+            ))
+
+    if rejected is not None:
+        ev.add("rule_ledger_write")
+        if rejected:
+            out.append(_gap(
+                "rule_ledger_write", "candidate_rejected_by_guard", f"rejected|{len(rejected)}",
+                f"引擎自己挖的候选有 {len(rejected)} 条写不进台账（被词表或校验挡了）",
+                ("candidate 规则从花名册/打卡里挖出来后要落 factory_rules 才能被人确认；"
+                 "upsert_rule 按封闭动作词表与字段校验挡回来的那些，过去直接丢返回值，"
+                 "于是「没落库」和「这条事实不存在」在读数上没区别。"
+                 f"\n被挡的条目：{json.dumps(rejected, ensure_ascii=False)[:900]}"
+                 "\n要么这确实是动作之外的信息（该走工位/线档案或 capacity_questions），"
+                 "要么词表要扩 —— 但扩词表要人决定，引擎不自己放开。"),
+                "挖到的事实进不了台账，人就看不到、也确认不了",
+                "record_factory_rule",
+                "判一条：是改写载体（工位/线档案、催办问题）还是补进动作词表",
+                {"rejected": rejected[:6]},
             ))
 
     if claim is not None:

@@ -585,15 +585,39 @@ async def record_candidates_from_census(db: AsyncSession, factory_id: str, *,
                 "evidence": {"window": att.get("window"),
                              "worst_section_days": ab.get("worst_section_days"),
                              "basis": att.get("basis")}})
+    route_gaps: List[Dict[str, Any]] = []
+    try:
+        from core.mes.data_evidence import line_claim_coverage
+
+        cov = await line_claim_coverage(db, factory_id)
+    except Exception:  # noqa: BLE001  工位/线档案普查查不动时少一条缺口读数，不能带崩整段
+        cov = {}
+    # 工位别名/线认领不是"动作约束"，塞不进封闭词表（upsert_rule 会按词表挡回来）。
+    # 这类事实走 capacity_questions 与 watchdog 催办；认完要改的是 line_profiles/stations 两张表。
+    for x in [y for y in (cov.get("cross_factory_stations") or []) if isinstance(y, dict)]:
+        route_gaps.append({
+            "station_code": x.get("station_code"), "registered_in": x.get("registered_in"),
+            "candidates": [c.get("code") for c in (cov.get("route_station_candidates") or [])
+                           if isinstance(c, dict)],
+            "note": ("引擎不跨厂借工位档案，所以这一档没有产能读数；"
+                     "要人认一行：是本厂哪条装配站的别名，还是补一条 stations 档案")})
+    write_errors: List[Dict[str, Any]] = []
     for item in att_items:
         made.append(item)
         if apply:
-            await upsert_rule(db, factory_id, subject=item["subject"], verdict=item["verdict"],
-                              kind="constraint", statement=str(item["statement"])[:900],
-                              status="candidate", source="derived", params=item["params"],
-                              evidence=item["evidence"], discriminator=item["discriminator"])
+            res = await upsert_rule(db, factory_id, subject=item["subject"], verdict=item["verdict"],
+                                    kind="constraint", statement=str(item["statement"])[:900],
+                                    status="candidate", source="derived", params=item["params"],
+                                    evidence=item["evidence"], discriminator=item["discriminator"])
+            if isinstance(res, dict) and res.get("error"):
+                # 被词表或校验挡下来时必须出声：以前 error 直接丢掉，
+                # "没写进去"看着就像"这条事实不存在"
+                write_errors.append({"subject": item["subject"],
+                                     "discriminator": item.get("discriminator"),
+                                     "error": str(res["error"])[:220]})
 
     return {"factory_id": factory_id, "candidates": made, "written": bool(apply),
+            "route_station_gaps": route_gaps, "write_errors": write_errors,
             "attendance_available": bool(att.get("available")),
             "attendance_empty_reason": att.get("empty_reason"),
             "note": ("全是 candidate：从花名册与打卡表推出来的数不能当放行依据，要现场确认才升 "
