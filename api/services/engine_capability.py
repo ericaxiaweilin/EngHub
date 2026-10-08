@@ -292,6 +292,15 @@ async def _load_replies(db: AsyncSession, factory_id: str, days: int) -> List[Di
     return out
 
 
+async def grounding_report(db: AsyncSession, factory_id: str, *,
+                           days: int = 30) -> Dict[str, Any]:
+    """只看总结格：答复里的数字有没有出处、引擎报了缺口的轮次有没有点名。
+
+    单独开一个轻入口是给巡检用的 —— 巡检不该为了查转述忠实度去跑一遍分层验收。
+    """
+    return summary_score(await _load_replies(db, factory_id, days))
+
+
 async def capability_profile(db: AsyncSession, factory_id: str, models: List[str], *,
                              layers: Optional[Dict[str, Any]] = None,
                              days: int = 30, use_cache: bool = True) -> Dict[str, Any]:

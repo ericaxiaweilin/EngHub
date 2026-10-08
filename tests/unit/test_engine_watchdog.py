@@ -344,3 +344,35 @@ def test_every_gap_loop_is_protected_from_silent_closure():
     assert loops, "判据一条都没报，这条测试就失去意义了"
     unguarded = sorted(loops - DATA_LOOPS)
     assert unguarded == [], f"这些格子没进保护名单，某轮没跑成时会被自动关：{unguarded}"
+
+
+# ── 转述忠实度：够样本又低于线才报，查不动时不许被当成"已修好" ──────────────
+def test_grounding_finding_only_fires_on_a_judgable_sample():
+    thin = gap_readings(gen={}, sup={}, ready={},
+                        ground={"replies_with_claims": 4, "number_backing_rate": 0.25,
+                                "numbers_unbacked": 3, "unbacked_samples": []})
+    assert [f for f in thin if f["loop"] == "reply_grounding"] == []
+
+    bad = gap_readings(gen={}, sup={}, ready={},
+                       ground={"replies_with_claims": 39, "number_backing_rate": 0.872,
+                               "numbers_unbacked": 5,
+                               "unbacked_samples": [{"session": "3145", "numbers": ["196.6"],
+                                                     "excerpt": "合规仿真结论…"}]})
+    hits = [f for f in bad if f["loop"] == "reply_grounding"]
+    assert len(hits) == 1
+    assert "196.6" in hits[0]["description"]
+    assert hits[0]["evidence"]["replies_with_claims"] == 39
+
+    good = gap_readings(gen={}, sup={}, ready={},
+                        ground={"replies_with_claims": 39, "number_backing_rate": 0.95,
+                                "numbers_unbacked": 2, "unbacked_samples": []})
+    assert [f for f in good if f["loop"] == "reply_grounding"] == []
+
+
+def test_unreadable_grounding_is_neither_a_pass_nor_a_fix():
+    """查不动时不报缺口，也不能把这格算进"跑过判据"——否则旧催办会被自动关成已修好。"""
+    seen = set()
+    found = gap_readings(gen={}, sup={}, ready={}, ground=None, evaluated_out=seen)
+    assert [f for f in found if f["loop"] == "reply_grounding"] == []
+    assert "reply_grounding" not in seen
+    assert "reply_grounding" in DATA_LOOPS

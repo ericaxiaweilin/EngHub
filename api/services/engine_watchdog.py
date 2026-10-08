@@ -561,6 +561,7 @@ DATA_LOOPS = frozenset({
     "action_constraints", "action_execution_silence", "candidate_rules",
     "working_conditions_evidence", "kit_line_coverage",
     "line_profile_coverage", "station_efficiency_basis", "rule_ledger_write",
+    "reply_grounding",
 })
 
 
@@ -602,12 +603,19 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
         cov = await kit_coverage_gap(db, factory_id, per_model=8, max_orders=24)
     except Exception:  # noqa: BLE001
         cov = None
+    # 转述忠实度：答复里的数字在引擎返回里找不到的那些条（够样本才判，判不动时不关旧条目）
+    try:
+        from api.services.engine_capability import grounding_report
+
+        ground = await grounding_report(db, factory_id, days=30)
+    except Exception:  # noqa: BLE001 - 查不动时这一格不许被当成"通过"或"已修好"
+        ground = {}
     if evaluated_out is not None:
         evaluated_out.update({"kit_line_generation", "supplier_master",
                               "lead_time_evidence", "material_make_or_buy_conflict",
                               "candidate_rules", "working_conditions_evidence",
                               "line_profile_coverage", "station_efficiency_basis",
-                              "kit_line_coverage"})
+                              "kit_line_coverage", "reply_grounding"})
     try:
         from core.mes.action_constraints import action_constraints
 
@@ -643,7 +651,8 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
                         wc=dict(wc or {}), claim=claim or {}, eff=eff or {}, rejected=rejected,
                         pending=list(pending or []), mp=dict(mp or {}),
-                        cov=cov or {}, evaluated_out=evaluated_out)
+                        cov=cov or {}, ground=ground or {},
+                        evaluated_out=evaluated_out)
 
 
 # 齐套行覆盖率：台账登记的缺口行 ÷ 引擎本轮算出的缺口件。线取 0.6 的理由是
@@ -653,6 +662,10 @@ MIN_KIT_COVERAGE_RATE = 0.60
 MIN_KIT_COVERAGE_ROWS = 200
 # 门判 ready 而引擎算出缺件 = 可举证的放行洞，一张就报（这张单会被直接下达开工）
 MIN_KIT_GATE_HOLE_ORDERS = 1
+
+# 转述忠实度：够 10 条才判（与总结格同一条件），线跟总结格同一条 0.90。
+MIN_GROUNDING_REPLIES = 10
+MIN_GROUNDING_BACKING = 0.90
 
 MIN_STATIONS_FOR_EFFICIENCY_GAP = 5
 
@@ -665,6 +678,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  pending: Optional[List[Dict[str, Any]]] = None,
                  mp: Optional[Dict[str, Any]] = None,
                  cov: Optional[Dict[str, Any]] = None,
+                 ground: Optional[Dict[str, Any]] = None,
                  wc: Optional[Dict[str, Any]] = None,
                  claim: Optional[Dict[str, Any]] = None,
                  rejected: Optional[List[Dict[str, Any]]] = None,
@@ -725,6 +739,29 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  "ledger_short_rows": cov.get("ledger_short_rows"),
                  "rows_to_register": rows,
                  "already_released_but_engine_short": acted}))
+    if ground:
+        ev.add("reply_grounding")
+        n = int(ground.get("replies_with_claims") or 0)
+        rate = ground.get("number_backing_rate")
+        if n >= MIN_GROUNDING_REPLIES and rate is not None and rate < MIN_GROUNDING_BACKING:
+            samples = ground.get("unbacked_samples") or []
+            numbers = sorted({x for s in samples for x in (s.get("numbers") or [])})[:8]
+            out.append(_gap(
+                "reply_grounding", "unsourced_numbers", f"ground|{n}|{int(rate * 100) // 5 * 5}",
+                f"转述失真｜近 30 天 {n} 条带数字的答复里 {ground.get('numbers_unbacked')} 条"
+                f"报的数在引擎返回里找不到（有出处率 {rate}，判线 {MIN_GROUNDING_BACKING}）",
+                "这些数字既不在本会话任何引擎工具的返回里，也不是人自己报过的数 —— "
+                "要么是模型自己算的，要么是编的。无人工厂里这两种都得当场见光，"
+                "不能靠读的人凭感觉分辨。\n"
+                f"找不到的数：{numbers}；样例见 payload.unbacked_samples。\n"
+                "复核：GET /api/v1/pmc/engine-capability-profile（总结格）、"
+                "GET /api/v1/pmc/kit-coverage-gap 之外的证据链见 /api/v1/pmc/engine-layers 的 L4。",
+                f"{ground.get('numbers_unbacked')} 条答复报了没有出处的数", "pmc_agent",
+                "先在出口把这些数标出来（chat_routes 的未经核实标注目前只在「本轮没调工具」时触发，"
+                "调了工具但复述了没有的数不标 —— 那是这一格剩下的缺口）。",
+                {"replies_with_claims": n, "number_backing_rate": rate,
+                 "numbers_unbacked": ground.get("numbers_unbacked"),
+                 "unbacked_samples": samples[:6]}))
     if wc is not None and int(wc.get("attendance_days") or 0) >= MIN_ATTENDANCE_DAYS_FOR_SLOPE:
         ev.add("working_conditions_evidence")
         if int(wc.get("sensor_rows") or 0) == 0:
@@ -1029,6 +1066,8 @@ async def scan_data(db: AsyncSession, factory_id: str = DEFAULT_FACTORY_ID, *,
             "kit_coverage_rate_min": MIN_KIT_COVERAGE_RATE,
             "kit_coverage_rows_min": MIN_KIT_COVERAGE_ROWS,
             "kit_gate_hole_orders_min": MIN_KIT_GATE_HOLE_ORDERS,
+            "grounding_backing_min": MIN_GROUNDING_BACKING,
+            "grounding_min_replies": MIN_GROUNDING_REPLIES,
             "unverified_lead_parts": MIN_UNVERIFIED_LEAD_PARTS,
             "mob_contradiction_rows": MIN_MOB_CONTRADICTION_ROWS,
             "undeclared_actions": MIN_UNDECLARED_ACTIONS,
