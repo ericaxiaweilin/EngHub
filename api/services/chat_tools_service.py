@@ -301,6 +301,31 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "generate_plant_architecture",
+            "description": (
+                "分层工厂架构模型：按目标规模（headcount 或 factor）把一座参照厂等比放大成 "
+                "厂区→段→工位→班组人数→日产能上界 五层，每层带出处。量化输出含段份额、工位/设备数、"
+                "瓶颈段日产能上界（人数×60÷IE 工时）、给定温湿度时每段少来多少人。"
+                "边界：两厂实测结构比例极差 1.9~9.1 倍 → 跨厂外推默认拒绝，必须指名参照厂；"
+                "线数/产品族/外购结构不做等比；缩放后段人数跌破台账可观测下限时段级基线不可用；"
+                "日产能是上界（参照厂 38 个工位效率全是占位 1.0），不能当可达产能或对外承诺。只读。"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reference_factory_id": {"type": "string", "description": "参照厂区：所有比例从这座厂的台账量出来"},
+                    "headcount": {"type": "number", "description": "目标每天到岗人数规模，如 100 / 1000 / 5000"},
+                    "factor": {"type": "number", "description": "或给相对参照厂的倍数（与 headcount 二选一）"},
+                    "temperature_c": {"type": "number", "description": "可选：顺带算该规模在此工况下每段少来多少人"},
+                    "humidity_percent": {"type": "number", "description": "可选，默认 60"},
+                    "task_type": {"type": "string", "description": "工序类型（assembly/machining/welding/painting…）"},
+                },
+                "required": ["reference_factory_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_defects",
             "description": "查询不良品/缺陷记录。返回缺陷单号、类型、严重等级、数量、处置状态、根因分类。",
             "parameters": {
@@ -4031,6 +4056,27 @@ async def _tool_query_pmc_rush_impact(
                              capacity_share=share, due_date=due)
 
 
+async def _tool_generate_plant_architecture(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Read-only plant architecture scaled from a reference factory's own ledger."""
+    from core.mes.plant_architecture import architecture_model
+
+    ref = str(args.get("reference_factory_id") or factory_id or "").strip()
+    if not ref:
+        return {"error": "必须指名参照厂：结构比例要有台账来源，系统里没有『通用工厂比例』这种东西"}
+    hc, fac = args.get("headcount"), args.get("factor")
+    if not hc and not fac:
+        return {"error": "没给目标规模（headcount 或 factor）→ 不猜一座厂的大小",
+                "reference_factory_id": ref}
+    temp = args.get("temperature_c")
+    return await architecture_model(
+        db, ref, headcount=(float(hc) if hc else None), factor=(float(fac) if fac else None),
+        temperature_c=(float(temp) if temp is not None else None),
+        humidity_percent=(float(args["humidity_percent"]) if args.get("humidity_percent") else None),
+        task_type=str(args.get("task_type") or "assembly"))
+
+
 async def _tool_query_spc_anomalies(db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None) -> Dict[str, Any]:
     """SPC 失控点：超出 UCL/LCL 的测量"""
     from sqlalchemy import text as sa_text
@@ -4180,6 +4226,7 @@ _TOOL_EXECUTORS = {
     "query_lead_time_evidence": _tool_query_lead_time_evidence,
     "query_pmc_material_supply": _tool_query_pmc_material_supply,
     "query_pmc_rush_impact": _tool_query_pmc_rush_impact,
+    "generate_plant_architecture": _tool_generate_plant_architecture,
     "query_defects": _tool_query_defects,
     "query_equipment": _tool_query_equipment,
     "create_work_order": _tool_create_work_order,
@@ -4587,6 +4634,7 @@ TOOL_LABELS = {
     "query_lead_time_evidence": "提前期证据普查",
     "query_pmc_material_supply": "PMC物料供应证据",
     "query_pmc_rush_impact": "PMC插单影响",
+    "generate_plant_architecture": "规模架构模型（参照厂等比）",
     "query_pmc_control_tower": "PMC控制塔",
     "query_manufacturing_intelligence": "制造智能总览",
     "query_defects": "查询不良品",
@@ -4710,6 +4758,13 @@ INTENT_RULES: List[Dict[str, Any]] = [
             "supplier delay怎么处理", "供应商 delay 怎么处理", "供应商延迟怎么处理", "供应商延期怎么处理", "供应延迟怎么处理",
             "需要补齐什么数据", "需要补什么数据", "缺什么数据", "数据缺口", "数据完整性", "补齐数据", "补数清单",
         ],
+    },
+    {
+        # "百人/千人/几千人厂"这类规模问题必须走引擎：让模型自己描述一座厂，
+        # 它会编工位数与产能 —— 台账里没有任何"通用工厂比例"可依据。
+        "tool": "generate_plant_architecture",
+        "keywords": ["架构模型", "工厂架构", "百人工厂", "千人工厂", "万人工厂", "人的工厂",
+                     "按规模", "放大到", "缩小到", "千人规模", "万人规模", "人工厂"],
     },
     {
         # PMC 专项规则必须早于普通“库存”，否则“库存齐套率/在途库存”会被截成普通库存查询。
@@ -5209,6 +5264,35 @@ def _asks_working_condition(message: str) -> bool:
     return any(w in (message or "") for w in _WORK_CONDITION_WORDS)
 
 
+_CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _architecture_intent_args(message: str) -> Dict[str, Any]:
+    """从"五千人的厂""百人厂""3000 人规模"里抽目标规模（中文数量词与阿拉伯数字都认）。
+
+    只抽规模，不抽参照厂 —— 参照厂由会话所在厂区给，模型与路由都不替厂里挑参照对象。
+    """
+    out: Dict[str, Any] = {}
+    text = message or ""
+    m = re.search(r"(\d+(?:\.\d+)?|[一二两三四五六七八九])\s*万\s*(?:人|个人|员工)", text)
+    if m:
+        raw = m.group(1)
+        head = float(_CN_DIGITS[raw]) if raw in _CN_DIGITS else float(raw)
+        out["headcount"] = int(head * 10000)
+        return out
+    m = re.search(r"(\d+)\s*(?:人|个人|员工)", text)
+    if m:
+        out["headcount"] = int(m.group(1))
+        return out
+    for word, unit in (("千", 1000), ("百", 100)):
+        mm = re.search(rf"([一二两三四五六七八九])?{word}\s*(?:人|人的厂|人厂|人工厂|人的工厂)", text)
+        if mm:
+            out["headcount"] = int(_CN_DIGITS.get(mm.group(1) or "", 1) * unit)
+            return out
+    return out
+
+
 def _rush_intent_args(message: str) -> Dict[str, Any]:
     """插单影响的参数：数量、机种、交期、占用比例。
 
@@ -5384,6 +5468,14 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message)
         if due_match:
             args["rush_due_date"] = due_match.group(1)
+    elif tool == "generate_plant_architecture":
+        args.update(_architecture_intent_args(message))
+        # 规模问题常带工况（"五千人的厂 40度90% 还能干吗"）：温度/湿度/工序沿用同一套抽取，
+        # 模型里每段少来多少人这条读数才有依据
+        heat = extract_heat_scenario(message)
+        for key in ("temperature_c", "humidity_percent", "task_type"):
+            if heat.get(key) is not None:
+                args.setdefault(key, heat[key])
     elif tool == "query_pmc_rush_impact":
         args.update(_rush_intent_args(message))
     elif tool == "query_pmc_work_matrix":
@@ -5467,6 +5559,8 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
                 if stage_kw in message:
                     args["keyword"] = stage_kw
                     break
+    if tool == "generate_plant_architecture" and not args.get("headcount"):
+        return None      # 没说规模就交回模型追问，不默认一座"典型厂"
     if tool == "query_pmc_rush_impact":
         # 与高温那条同一规矩：数量或机种抽不到就**不**确定性执行 —— 让模型去问是哪个机种，
         # 也别拿"全厂平均"或 0.5 小时/件替厂里编一个交期出来。
@@ -5483,6 +5577,8 @@ DETERMINISTIC_INTENT_TOOLS = frozenset({
     "run_compliance_simulation",
     # 插单延几天同理：这些数字必须出自线台账+路线工时，不是模型背一个"通常0.5小时/件"
     "query_pmc_rush_impact",
+    # "千人厂什么样"必须由引擎按参照厂实测比例生成，不能让模型即兴描述一座厂
+    "generate_plant_architecture",
     "query_pmc_control_tower",
     "query_order_work_order_status",
     "query_manufacturing_intelligence",

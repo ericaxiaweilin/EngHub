@@ -788,6 +788,30 @@ async def get_sim_readiness(
     return await readiness(db, factory_id)
 
 
+@router.get("/plant-architecture", summary="按规模生成分层工厂架构模型（参照厂等比 + 每层产能/出勤依据）")
+async def get_plant_architecture(
+    factory_id: str = Query(..., description="参照厂：所有比例都从这座厂的台账量出来"),
+    headcount: Optional[float] = Query(None, description="目标人数；与 factor 二选一"),
+    factor: Optional[float] = Query(None, description="目标相对参照厂的倍数；与 headcount 二选一"),
+    temperature_c: Optional[float] = Query(None, description="给温度就顺带算这套架构在该工况下每段少来多少人"),
+    humidity_percent: Optional[float] = Query(None),
+    task_type: str = Query("assembly"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """百人 / 千人 / 几千人厂：能生成的层给数字，不能外推的层直说缺什么依据。
+
+    两厂实测结构比例极差 1.9~9.1 倍 → 跨厂外推默认拒绝，必须指名参照厂；
+    线数、产品族、外购结构不做等比（那些不是劳动力结构）。
+    """
+    del current_user
+    from core.mes.plant_architecture import architecture_model
+
+    return await architecture_model(db, factory_id, headcount=headcount, factor=factor,
+                                     temperature_c=temperature_c, humidity_percent=humidity_percent,
+                                     task_type=task_type)
+
+
 @router.get("/engine-watchdog", summary="引擎自身故障巡检：心跳断写/循环退出/窗口崩溃越线会挂成哪条催办")
 async def get_engine_watchdog(
     factory_id: str = Query(..., description="催办挂在哪个厂区的收件箱"),

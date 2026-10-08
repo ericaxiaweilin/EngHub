@@ -916,6 +916,39 @@ def _person_days_note(normal: Dict[str, Any], under: Dict[str, Any]) -> str:
             "没来的人不记人日 —— 要看的是完工天数与迟交天数变多）")
 
 
+def _format_architecture_reply(result: Dict[str, Any]) -> str:
+    """规模架构模型的答复：能给的层给数字，不能外推的层点名缺什么。"""
+    if result.get("error"):
+        return f"架构模型没生成：{result['error']}"
+    if result.get("status") not in ("ok",):
+        return (f"架构模型没生成（{result.get('status')}）：{result.get('why') or '缺依据'}")
+    lines = [f"规模架构模型（参照厂 {result.get('reference_factory_id')}，只读）："]
+    for r in (result.get("readings") or []):
+        lines.append(f"- {r}")
+    scaled = (result.get("scaled") or {})
+    for w in (scaled.get("warnings") or [])[:4]:
+        lines.append(f"- ⚠ {w}")
+    conds = result.get("conditions") or []
+    for c in conds[:8]:
+        flag = "（人数已低于台账可观测下限，段级基线是外推）" if c.get("extrapolated") else ""
+        lines.append(
+            f"- 段 {c.get('section')}：{c.get('people')} 人｜常态到岗 {c.get('present_normal')}"
+            f" → 工况 {c.get('present_hot')}｜约 {c.get('absent_people_hot')} 人不到岗{flag}")
+    cap = result.get("capacity") or {}
+    for row in (cap.get("per_station") or [])[:5]:
+        lines.append(
+            f"- 工位 {row.get('station_name')}（{row.get('station_code')}）：{row.get('scaled_people')} 人、"
+            f"IE {row.get('ie_hours_per_unit')} 小时/件 → 上界 {row.get('scaled_bound_per_day')} 件/天"
+            + (f"（两读法矛盾 {row.get('two_reads_conflict')}×，取小）" if row.get("two_reads_conflict") else ""))
+    for t in (result.get("tiers") or []):
+        lines.append(f"- 分层：{t}")
+    for n in (result.get("not_derivable") or []):
+        lines.append(f"- 不外推：{n}")
+    lines.append(f"- 产能依据：{cap.get('plant_bound_note') or ''}")
+    lines.append(f"- 覆盖率：{cap.get('coverage') or ''}｜口径：{(cap.get('basis') or '')[:180]}")
+    return "\n".join(lines)
+
+
 def _format_rush_impact(result: Dict[str, Any]) -> str:
     """插单影响的答复：数字全来自 virtual_run.rush_impact()，缺依据时把缺哪一环说清楚。"""
     if result.get("error"):
@@ -1224,6 +1257,8 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         if len(items) > 20:
             lines.append(f"- 其余 {len(items) - 20} 种物料已保留在结构化结果中。")
         return "\n".join(lines)
+    if tool_name == "generate_plant_architecture":
+        return _format_architecture_reply(result)
     if tool_name == "query_pmc_rush_impact":
         return _format_rush_impact(result)
     return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
@@ -2605,6 +2640,7 @@ async def _handle_kernel_chat(
                 "query_manufacturing_intelligence": "manufacturing-intelligence",
                 "query_order_work_order_status": "order-work-order-status",
                 "query_workflow_diagram": "workflow-diagram-engine",
+                "generate_plant_architecture": "plant-architecture-engine",
                 "run_compliance_simulation": "sim-erp-compliance-engine",
             }.get(tool_name, f"deterministic-{tool_name}"),
             degraded="error" in result,
