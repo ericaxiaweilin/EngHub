@@ -231,7 +231,7 @@ async def calculate_oee(
 async def oee_trend(
     factory_id: str = Query(...),
     equipment_id: Optional[str] = None,
-    days: int = Query(default=7),
+    days: int = Query(default=7, ge=1, le=366),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -243,12 +243,13 @@ async def oee_trend(
 @router.get("/oee/summary")
 async def oee_summary(
     factory_id: str = Query(...),
+    snapshot_date: Optional[str] = Query(None, description="YYYY-MM-DD；不给就取台账里最后一天"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """工厂 OEE 概览"""
+    """工厂 OEE 概览：默认那天=台账最后一天；没有行时返回 no_rows 与窗口，不给 0 平均值"""
     svc = OeeService(db)
-    return await svc.get_factory_oee_summary(factory_id)
+    return await svc.get_factory_oee_summary(factory_id, snapshot_date=snapshot_date)
 
 
 # ==================== 点检模板 + SOP + 备件请购 ====================
