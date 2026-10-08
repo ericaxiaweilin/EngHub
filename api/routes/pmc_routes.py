@@ -345,6 +345,9 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/sim-sensitivity", "mode": "read_only"},
             {"key": "sim_schedule_risk", "name": "交期分布（按已声明误差带抽样：P50/P90、准点概率、毛边）",
              "path": "/api/v1/pmc/sim-schedule-risk", "mode": "read_only"},
+            {"key": "data_flow_profile",
+             "name": "数据流节点剖面（台账/展开/推演三层各多少节点，按规模外推需要多少行）",
+             "path": "/api/v1/pmc/data-flow-profile", "mode": "read_only"},
             {"key": "engine_layers", "name": "仿真引擎分层验收（五层判据+过线闸门，下层不过线上层不引用）",
              "path": "/api/v1/pmc/engine-layers", "mode": "read_only"},
             {"key": "engine_contract", "name": "引擎对外契约（三接口签名+业务词表，与模型内部无关；自检见 /engine-contract-check）",
@@ -778,6 +781,28 @@ async def get_sim_schedule_risk(
                             detail='against 形如 [{"name":"加急到 7 天","expedite_lead_days":7}]')
     return await schedule_risk(db, factory_id, models, samples=samples, seed=seed,
                              against=alts or None)
+
+
+@router.get("/data-flow-profile", summary="数据流节点剖面：这座厂一次推演流经多少节点、按规模要多多少")
+async def get_data_flow_profile(
+    factory_id: str = Query(..., description="厂区"),
+    headcount: Optional[float] = Query(None, description="目标人数规模；给了就附『这个规模要多少节点』的外推"),
+    sample_models: int = Query(2, description="展开层抽样几台机（1~4）"),
+    with_run: bool = Query(True, description="false=不跑推演层（快，但没有按天动作/齐套行计数）"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """数引擎自己流经的节点：台账行、BOM 展开、按天动作，一层的数都不写死。
+
+    缩放那一格是**需求外推**（按吞吐系数放大 volume 类节点），回答"这座规模的厂要多少台账行才推得动"；
+    它不是厂里的事实，引擎也不会因此回填任何表。人头类节点是真会随规模动的；
+    主档/线/工位/日历这类结构与人数无关，等比放大它们等于编数据。
+    """
+    del current_user
+    from core.mes.data_flow import data_flow_profile
+
+    return await data_flow_profile(db, factory_id, headcount=headcount,
+                                   sample_models=sample_models, run_sample=with_run)
 
 
 @router.get("/sim-sensitivity", summary="建模精度×敏感度：每个输入动一档，交期/准点/钱各变多少")
