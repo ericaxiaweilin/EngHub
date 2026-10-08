@@ -396,7 +396,7 @@ def resolve_route(route_own: List[Dict[str, Any]], family_rows: List[Dict[str, A
 
 def hours_per_unit_from(route: List[Dict[str, Any]], line: Optional[Dict[str, Any]],
                         measured_hours_per_day: Optional[float] = None) -> tuple:
-    """单件占用工时：路线给的分钟优先；没有就用线节拍（一天做多少台、一天几个班时）。"""
+    """单件占用工时：路线给的单件工时（小时）优先；没有就用线节拍（一天做多少台、一天几个班时）。"""
     declared = round(sum(float(o.get("standard_hours") or 0) for o in route), 4)
     if declared > 0:
         return declared, "route_standard_hours"
@@ -624,11 +624,12 @@ async def load_station_capacity(db: AsyncSession, factory_id: str,
 
 def station_route_capacity(route_ops: List[Dict[str, Any]], stations: Dict[str, Dict[str, Any]],
                            hours_per_day: float) -> Dict[str, Any]:
-    """按工位路线算日产能：每个站取「站点声明的每小时产量」与「在册人数×60/IE工时」的下界，
+    """按工位路线算日产能：每个站取「站点声明的每小时产量」与「在册人数÷IE单件工时」的下界，
     再取整条路线最紧的那个站。
 
-    为什么是下界：capacity_per_hour 在组立一线=110（110 人 → 像每人每件每小时），
-    在焊接车间=4（218 人 → 只能是整站读数）—— 同一列在两种站里是两种口径。
+    为什么是下界（实测 14 个站的矛盾倍数 1.1~38.9×）：焊接车间 218 人、IE 1.4 小时/件 →
+    人数读法 1557 件/天，而站点自己只报 4 件/小时=40 件/天（差 38.9 倍，只能是整站读数）；
+    组立一线 110 人报 110 件/小时（差 1.9 倍，像每人每件每小时）—— 同一列在两种站里是两种口径。
     哪个是真的厂里没定过，取大的就等于替厂里把这个口径拍定了。
     """
     per_station, missing = [], []
@@ -643,7 +644,10 @@ def station_route_capacity(route_ops: List[Dict[str, Any]], stations: Dict[str, 
             continue
         declared = float(st.get("capacity_per_hour") or 0.0)
         headcount = float(st.get("headcount") or 0.0) if str(st.get("capacity_unit") or "") == "人" else 0.0
-        people_bound = (headcount * 60.0 / hours) if (hours > 0 and headcount > 0) else 0.0
+        # 人数读法是「在册人数 ÷ 单件工时」= 件/小时：standard_hours 记的是小时
+        # （成品检验 0.1 = 6 分钟，不可能是 0.1 分钟），以前写成 人×60÷小时，等于把每道工序
+        # 多算 60 倍 —— 12 人的浸塑站因此报出 450 件/小时，两读法的矛盾倍数也跟着虚高。
+        people_bound = (headcount / hours) if (hours > 0 and headcount > 0) else 0.0
         bounds = [b for b in (declared, people_bound) if b > 0]
         if not bounds:
             missing.append(wc)
@@ -673,11 +677,13 @@ def station_route_capacity(route_ops: List[Dict[str, Any]], stations: Dict[str, 
         "per_station": per_station,
         "missing_stations": sorted(set(missing)),
         "hours_per_day": hours_per_day,
-        "basis": ("工位级下界 = min(站点声明台/小时, 在册人数×60/IE工时) × 实测标称班时。"
-                  "取下界不是因为保守，是因为「人数×IE」这一读法假设全站人数都扑在这道工序上 —— "
+        "basis": ("工位级下界 = min(站点声明台/小时, 在册人数÷IE单件工时) × 实测标称班时。"
+                  "取下界不是因为保守，是因为「人数÷IE」这一读法假设全站人数都扑在这道工序上 —— "
                   "那是理论上界，不是可达产能；两读法差多少见 two_reads_conflict"),
-        "conflict_meaning": ("矛盾倍数 = 理论上界 / 站点声明。差到几千倍说明 capacity 列是车间在册总人数、"
-                             "不是这道工序的占用人数 —— 所以真正卡产能的是站点自己声明的那个数"),
+        "conflict_meaning": ("矛盾倍数 = 人数读法理论上界 / 站点声明（实测这座厂 14 个站里 1.1~38.9 倍）。"
+                             "差几十倍的站（焊接 38.9×、加工 26.9×）说明 capacity 那列读的是整站而不是每人；"
+                             "差 1~2 倍的站（组立一/二/三线 1.5~1.9×）读起来才像每人。"
+                             "同一列两种口径从没定义过 → 引擎取小的那个，不替厂里拍板"),
         "two_reads_conflict": [f"{x['station']}:{x['conflict_ratio']}×" for x in per_station
                                if (x.get("conflict_ratio") or 0) > 1.5],
     }
@@ -2235,6 +2241,18 @@ async def constraint_overlay(db: AsyncSession, factory_id: str,
             "per_model": per_model, "per_policy": per_policy}
 
 
+# 政策字典的封闭词表：只认这些键。认不了的键必须当场报错，不能静默忽略 ——
+# run_target 的参数名（lead_multiplier/hours_multiplier/stock_multiplier/batches）不在这里：
+# 它们是 perturb（敏感度扫描）的参数，不是政策。10-07 实测踩过：把 lead_multiplier 当政策传，
+# 九档提前期扫下来交期一点不动，差点写成"采购提前期不是瓶颈"的假结论。
+POLICY_KEYS = {"name", "allow_partial", "expedite_lead_days", "parallel_lines", "crew_bonus",
+               "line_staffing", "ignore_backlog", "displaces_committed_work"}
+
+
+def unknown_policy_keys(pol: Dict[str, Any]) -> List[str]:
+    return sorted(str(k) for k in (pol or {}) if str(k) not in POLICY_KEYS)
+
+
 async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                         *, today: Optional[date] = None,
                         policies: Optional[List[Dict[str, Any]]] = None,
@@ -2248,6 +2266,15 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
     这里刻意不给"唯一总分"。每个政策产出一个目标向量，交给 pareto_eval 判前沿与平衡解 ——
     工厂是取舍，不是考试。
     """
+    bad = {str(pol.get("name") or i): unknown_policy_keys(pol)
+           for i, pol in enumerate(policies or []) if unknown_policy_keys(pol)}
+    if bad:
+        raise ValueError(
+            f"政策里有不认识的键，静默忽略会把它变成\u201c现况\u201d："
+            + "; ".join(f"{name}→{keys}" for name, keys in bad.items())
+            + f"。可用键：{sorted(POLICY_KEYS)}"
+            + "（倍数类敏感度参数走 perturb，不走政策字典）")
+
     today = today or date.today()
     lines = [dict(r) for r in (await db.execute(LINES_SQL, {"fid": factory_id})).mappings().all()]
     shift_days = {int(r["weekday"]) + 1 for r in

@@ -469,7 +469,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                   "tight_station": p.get("tight_station_name") or p.get("tight_station")}
                  for p in cross["pairs"] if p.get("status") == "ok"][:6], ensure_ascii=False),
             "already_computed": ("两条都在线上跑：沙箱/交期用 line_profiles.units_per_day，"
-                                 "工位级产能用 min(在册人数×60÷IE, capacity_per_hour×班时)；"
+                                 "工位级产能用 min(在册人数÷IE单件工时, capacity_per_hour)×同一实测班时；"
                                  "系统没有把两者统一，也没有替厂里选一个"),
             "why_it_matters": (f"同一个机种在两个出口差 {cv.get('min')}~{cv.get('max')} 倍："
                                "按线声明排出来的量，工位侧按自己的声明根本做不出来；"
@@ -536,8 +536,9 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     if cov.get("capacity_unit_ambiguous") or int(cov.get("station_capacity_rows") or 0) == 0:
         out.append({
             "topic": "station_capacity_basis",
-            "question": ("工位产能两读要不要收口：站点自己声明的台/小时，与「在册人数×60/IE工时」"
-                         "在实测里差 360~6540 倍（组立一线两读一致、焊接车间差 6540 倍）。"
+            "question": ("工位产能两读要不要收口：站点自己声明的台/小时，与「在册人数÷IE单件工时」"
+                         "在实测里差 1.1~38.9 倍（成品检验两读一致 1.1×、焊接车间 38.9×、"
+                         "加工车间 26.9×；组立一/二/三线 1.5~1.9×）。"
                          "推演现在按「下界」折，班时用打卡中位（实测 10h）代替了没填的每站工时；"
                          f"还缺的是每站效率与可用工时（{cov.get('stations')} 个站里 "
                          f"station_capacity 填了 {cov.get('station_capacity_rows')} 个）"),

@@ -738,7 +738,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                 + (f"（现在缺的只有工位 {'、'.join(missing_st)} 那一行）" if missing_st else ""),
                 ("这些机种有 pending/released/in_progress 的母单，line_profiles 里没有任何一条线的 "
                  "can_make_models 写着它。原先推演因此完全不算产能（line=null，人力动作全乘不上）；"
-                 "现在改成按工位路线算产能下界 —— min(站点声明台/小时, 在册人数×60/IE工时) × "
+                 "现在改成按工位路线算产能下界 —— min(站点声明台/小时, 在册人数÷IE单件工时) × "
                  "实测标称班时（班时取该厂行数最多班次的打卡中位，实测 10.0h，不是写死的 11h）——"
                  "所以到岗曲线、加班/双班/借人、工况扣人这几条已经乘得上了。"
                  f"\n涉及的机种：{('、'.join(codes))}；开放母单 {int(claim.get('unclaimed_orders') or 0)} 张、"
@@ -748,11 +748,13 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                     "同类站台账里有：组立一线/二线/三线这类 station_type=assembly 的行 —— "
                     "要么路线写的是别名，要么补一行 stations 档案。" if missing_st else "")
                  + "\n另一件要收口的（不影响能不能算，影响算得准不准）："
-                 "stations.capacity_per_hour 与「在册人数×60/IE」两读法实测差 360~6540 倍"
-                 "（组立一线两读一致=每人每件每小时；焊接车间差 6540 倍=整站读数），"
-                 "说明 capacity 那列在有的站里是车间在册总人数。引擎取两读法下界，"
+                 "stations.capacity_per_hour 与「在册人数÷IE单件工时」两读法实测差 1.1~38.9 倍"
+                 "（成品检验 1.1×=两读一致；焊接车间 38.9×、加工车间 26.9×=整站读数；"
+                 "组立一/二/三线 1.5~1.9×=像每人每件每小时），"
+                 "说明 capacity 那列在不同站里是两种口径。引擎取两读法下界，"
                  "所以不会把产能说大；要说准就得由厂里定这列的含义，或填 station_capacity "
-                 "的每站可用工时与效率（现在 28 个站填了 0 个）。"),
+                 "的每站可用工时与效率（那台账里的效率折扣全是占位 1.0，没有一条 verified_at 晚于"
+                 " created_at 的实测）。"),
                 "工位路线产能已按下界计算；这一格剩的是路线别名/工位档案那一行与两读法收口",
                 "run_sandbox",
                 "把路线里对不上档案的工位认成已有站（或补一条 stations 行）；再定 capacity_per_hour 的口径",

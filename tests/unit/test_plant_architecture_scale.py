@@ -82,13 +82,13 @@ def test_scale_question_keeps_the_working_condition_with_it():
 def test_cross_check_reading_does_not_print_a_fake_range():
     from core.mes.plant_architecture import _cross_check_reading
 
-    same = _cross_check_reading({"min": 9.09, "max": 9.09, "compared": 11,
+    same = _cross_check_reading({"min": 10.0, "max": 10.0, "compared": 11,
                                  "worst_line": "LINE-BIKE-01", "worst_model": "HTM1481-00",
                                  "worst_station": "加工车间"})
-    assert "差 9.09 倍" in same and "~" not in same.split("组")[1]
-    span = _cross_check_reading({"min": 6.82, "max": 9.09, "compared": 11,
+    assert "差 10.0 倍" in same and "~" not in same.split("组")[1]
+    span = _cross_check_reading({"min": 7.5, "max": 10.0, "compared": 11,
                                  "worst_line": "L", "worst_model": "M", "worst_station": "S"})
-    assert "6.82~9.09 倍" in span
+    assert "7.5~10.0 倍" in span
     # 没有可比组时必须说"没对上过"，不能被读成"对上了"
     none_ = _cross_check_reading(None)
     assert "没有可比组" in none_ and "这不是『对上了』" in none_
@@ -340,3 +340,42 @@ def test_min_scale_is_computed_only_when_that_scale_misses_the_date(monkeypatch)
     monkeypatch.setattr(pa, "scaled_delivery_run", on_time_run)
     out2 = asyncio.run(pa.attach_delivery(None, dict(base), dict(args)))
     assert not calls and "min_scale" not in out2["delivery"]
+
+
+def test_station_headcount_reading_is_people_divided_by_hours_not_times_sixty():
+    """IE 的 standard_hours 记的是**小时/件**（成品检验 0.1 = 6 分钟，不可能是 0.1 分钟）。
+
+    人数读法以前写成 在册人数×60÷工时，等于把小时当分钟 —— 13 人的浸塑站因此报 487.5 件/小时，
+    与站点声明的比值虚高 60 倍，"两读法差几千倍"那条待办就是被它撑出来的（实测应为 1.1~38.9 倍）。
+    """
+    from api.services.virtual_run import station_route_capacity
+
+    stations = {"ST-JS-01": {"station_name": "浸塑车间", "capacity_per_hour": 200.0,
+                             "headcount": 13.0, "capacity_unit": "人"}}
+    ops = [{"work_center": "ST-JS-01", "operation_name": "浸塑", "standard_hours": 1.6}]
+    got = station_route_capacity(ops, stations, 10.0)
+    per = got["per_station"][0]
+    assert per["people_bound_per_hour"] == 8.12        # 13÷1.6 取整；关键是它不再等于 13×60÷1.6=487.5
+    assert per["used_bound_per_hour"] == 8.12          # 人数读法比站点声明小 → 取它
+    assert per["units_per_day"] == 81.25               # ×实测班时 10h
+    assert per["conflict_ratio"] == 24.6
+    assert got["units_per_day"] == 81.25 and "1.1~38.9" in got["conflict_meaning"]
+
+
+def test_cross_check_and_sandbox_share_one_station_basis():
+    """工位侧台/天只许有一个算法：沙箱用 station_route_capacity，对撞也必须用它。
+
+    以前对撞乘线档案 11h、段表乘写死的 8h、沙箱乘打卡实测 10h —— 同一个加工车间三个出口
+    三个数（44/32/40），报出来的矛盾倍数取决于是哪个页在念。
+    """
+    import inspect
+
+    from core.mes.plant_architecture import capacity_cross_check, section_capacity_table
+
+    x = inspect.getsource(capacity_cross_check)
+    assert "station_route_capacity(ops, stations, shift_hours)" in x
+    assert 'float(ln.get("hours_per_day")' not in x, "对撞不许再乘线档案班时"
+    s = inspect.getsource(section_capacity_table)
+    assert "8.0" not in s, "名义 8h 不许回来"
+    assert "load_station_capacity" in s and "shift_hours" in s
+    assert "不回落" in s and "取不到" in s, "没有实测班时要直说，不硬给日产能"
