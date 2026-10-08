@@ -67,3 +67,43 @@ def test_per_model_breakdown_carries_the_write_cost():
     assert sorted(per) == [4, 10]
     assert out["rows_to_register"] == 11
     assert out["models"] == ["A", "B"]
+
+
+# ── 按登记深度比"两边各看到多少缺口"：这一对数才承载毛/净那条决策 ──────────
+def test_band_labels_follow_the_backfill_gates():
+    from api.services.sim_backtest import _band_label
+
+    assert _band_label(1) == "1-99 行（没登记到结构）"
+    assert _band_label(80) == "1-99 行（没登记到结构）"
+    assert _band_label(99) == "1-99 行（没登记到结构）"
+    assert _band_label(100) == "100-399 行"
+    assert _band_label(399) == "100-399 行"
+    assert _band_label(400) == "≥400 行（登记到位）"
+
+
+def _deep(code, rows, led_lines, led_qty, eng_lines, eng_qty):
+    return {"work_order_id": code, "work_order_code": code, "model": "A",
+            "ledger_rows": rows, "ledger_short_parts": led_lines,
+            "ledger_short_qty": led_qty, "engine_short_parts": eng_lines,
+            "engine_short_qty": eng_qty, "missing_parts": max(0, eng_lines - led_lines),
+            "gate_verdict": "already_released"}
+
+
+def test_registration_bands_report_line_and_qty_ratios():
+    out = coverage_summary([
+        _deep("WO-full", 620, 1467, 141811, 1533, 160958),
+        _deep("WO-thin", 12, 49, 462, 795, 49271),
+    ])
+    bands = out["short_qty_by_registration_band"]
+    full = bands["≥400 行（登记到位）"]
+    thin = bands["1-99 行（没登记到结构）"]
+    assert full["line_ratio_engine_over_ledger"] == 1.045
+    assert full["qty_ratio_engine_over_ledger"] == 1.135
+    assert thin["line_ratio_engine_over_ledger"] == 16.224
+    # 读数要说清"差的是没登记到的行"，不能读成引擎把缺口算大了
+    assert "登记到位" in bands["reading"] and "砍半" in bands["reading"]
+
+
+def test_band_reading_admits_when_the_full_band_is_missing():
+    out = coverage_summary([_deep("WO-thin", 10, 5, 100, 200, 9000)])
+    assert "分档样本不足" in out["short_qty_by_registration_band"]["reading"]

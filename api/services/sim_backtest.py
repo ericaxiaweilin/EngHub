@@ -139,12 +139,13 @@ def agreement_by_depth(per_order: List[Dict[str, Any]],
     只有把单按登记深度切开，才知道补登记到底值不值。档位边界跟着选单闸走：
     20 行以下是"停在旧世代"那一档，400 行以上是"刚被补登过"那一档。
     """
-    bands = [("1-20 行（旧登记世代）", 1, 20), ("21-99 行", 21, 99),
-             ("100-399 行", 100, 399), ("≥400 行（补登过）", 400, 10 ** 9)]
+    # 档位标签与覆盖率那一格共用 _band_label：同一批单在两个读数里必须落在同一档，
+    # 否则"一致率 0.9 那档"和"比值 1.0 那档"不是同一组单，两条数读不出因果。
+    labels = ["1-99 行（没登记到结构）", "100-399 行", "≥400 行（登记到位）"]
     out: Dict[str, Any] = {}
-    for label, lo, hi in bands:
+    for label in labels:
         sub = [x for x in per_order
-               if lo <= int(depth_by_order.get(str(x.get("work_order_id"))) or 0) <= hi]
+               if _band_label(int(depth_by_order.get(str(x.get("work_order_id"))) or 0)) == label]
         if not sub:
             continue
         lead = sum(1 for x in sub if x.get("lead_agrees"))
@@ -152,7 +153,7 @@ def agreement_by_depth(per_order: List[Dict[str, Any]],
         n = len(sub)
         out[label] = {"orders": n, "lead_agree": lead, "qty_agree": qty,
                       "lead_rate": round(lead / n, 3), "qty_rate": round(qty / n, 3)}
-    rates = [v["lead_rate"] for v in out.values()]
+    rates = [v["lead_rate"] for v in out.values() if isinstance(v, dict)]
     out["reading"] = ("各档一致率若随登记深度上升，封顶的就是登记深度（补登记有效）；"
                       f"本轮各档提前期口径一致率 = "
                       f"{ {k: v['lead_rate'] for k, v in out.items() if isinstance(v, dict)} }；"
@@ -416,18 +417,6 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
                      if one_sided else
                      "高低两边都有 = 毛净之差之外还有别的来源（层级/登记世代/在途口径），别只归一条")
 
-    univ_note = (
-        f"三条候选解释各给一个当轮读数：① 料号宇宙 —— 台账点的第一件有 "
-        f"{u_top['agree']}/{u_top['of']}（{u_top['rate']}）也在引擎本轮展开里；"
-        f"② 快照过期 —— 台账行不动、缺口按今天的库存重算，第一名一致率 "
-        f"{qty_rate}（数量口径）/ {lead_rate}（提前期口径）；"
-        f"③ 需求算法 —— {requirement_basis['engine_lower_than_ledger']}/"
-        f"{requirement_basis['rows_paired']} 行引擎更低（其中 "
-        f"{requirement_basis['engine_says_zero_ledger_asks_positive']} 行引擎判 0 = 父层够用就不往下炸），"
-        f"更高的 {requirement_basis['engine_higher_than_ledger']} 行：{basis_wording}。"
-        "所以这一格读的是『两种需求算法点的第一名是否相同』，不是引擎准不准；"
-        "要判准不准，得先把齐套行按同一算法刷一遍")
-
     # 各档登记深度：一次 GROUP BY，不重跑展开
     depth_by_order: Dict[str, int] = {}
     if per_order:
@@ -439,9 +428,27 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
                               GROUP BY 1
                           """), {"ids": [x["work_order_id"] for x in per_order]})).mappings().all()}
 
+    depth_bands = agreement_by_depth(per_order, depth_by_order)
+    band_txt = "、".join(
+        f"{k.split('（')[0]} {v['orders']} 张 {v['lead_rate']}"
+        for k, v in depth_bands.items() if isinstance(v, dict)) or "没有可分档的单"
+    univ_note = (
+        f"三条候选解释各给一个当轮读数：① 料号宇宙 —— 台账点的第一件有 "
+        f"{u_top['agree']}/{u_top['of']}（{u_top['rate']}）也在引擎本轮展开里；"
+        f"② 快照过期 —— 台账行不动、缺口按今天的库存重算，第一名一致率 "
+        f"{qty_rate}（数量口径）/ {lead_rate}（提前期口径）；"
+        f"③ 需求算法 —— {requirement_basis['engine_lower_than_ledger']}/"
+        f"{requirement_basis['rows_paired']} 行引擎更低（其中 "
+        f"{requirement_basis['engine_says_zero_ledger_asks_positive']} 行引擎判 0 = 父层够用就不往下炸），"
+        f"更高的 {requirement_basis['engine_higher_than_ledger']} 行：{basis_wording}；"
+        f"④ 登记深度（这一条最硬）—— 把单按台账登记了多少行切开看提前期口径一致率："
+        f"{band_txt}。"
+        "读法：登记到位那一档接近 1 而薄的那档接近 0，说明整池那个数被台账登记深度封顶，"
+        "不是引擎不准；要把整池抬上去，继续补登记，而不是放宽判线。")
+
     return {
         "orders_compared": n,
-        "agreement_by_registration_depth": agreement_by_depth(per_order, depth_by_order),
+        "agreement_by_registration_depth": depth_bands,
         "bom_universe": {
             "note": univ_note,
             "ledger_top_in_engine_bom": u_top,
@@ -503,6 +510,19 @@ def classify_gap(row: Dict[str, Any]) -> str:
     return "flow_missing_kit"
 
 
+def _band_label(ledger_rows: int) -> str:
+    """按台账登记行数分三档：没登记到结构 / 登记了一半 / 登记到位。
+
+    边界跟着补登的闸口走（选单闸只捞 ≤80 行的单、每单上限 KIT_REUPGRADE_MAX_LINES=400），
+    但档位边界取 100/400：81~99 行同样是"没登记到结构"，不该被算进"登记了一半"那档。
+    """
+    if ledger_rows >= 400:
+        return "≥400 行（登记到位）"
+    if ledger_rows >= 100:
+        return "100-399 行"
+    return "1-99 行（没登记到结构）"
+
+
 def coverage_summary(per_order: List[Dict[str, Any]]) -> Dict[str, Any]:
     """把引擎本轮算出的外购缺口件 vs 台账该单登记的缺口行汇总成可判线的数。
 
@@ -535,8 +555,47 @@ def coverage_summary(per_order: List[Dict[str, Any]]) -> Dict[str, Any]:
     def _samples(rows_, keys):
         return [{k: x.get(k) for k in keys} for x in rows_[:10]]
 
+    bands: Dict[str, Dict[str, Any]] = {}
+    for x in per_order:
+        b = bands.setdefault(_band_label(int(x.get("ledger_rows") or 0)), {
+            "orders": 0, "ledger_lines": 0, "engine_lines": 0,
+            "ledger_short_qty": 0.0, "engine_short_qty": 0.0})
+        b["orders"] += 1
+        b["ledger_lines"] += int(x.get("ledger_short_parts") or 0)
+        b["engine_lines"] += int(x.get("engine_short_parts") or 0)
+        b["ledger_short_qty"] += float(x.get("ledger_short_qty") or 0)
+        b["engine_short_qty"] += float(x.get("engine_short_qty") or 0)
+    for b in bands.values():
+        b["ledger_short_qty"] = round(b["ledger_short_qty"])
+        b["engine_short_qty"] = round(b["engine_short_qty"])
+        b["line_ratio_engine_over_ledger"] = (
+            round(b["engine_lines"] / b["ledger_lines"], 3) if b["ledger_lines"] else None)
+        b["qty_ratio_engine_over_ledger"] = (
+            round(b["engine_short_qty"] / b["ledger_short_qty"], 3)
+            if b["ledger_short_qty"] else None)
+    full = bands.get("≥400 行（登记到位）") or {}
+    thin = bands.get("1-99 行（没登记到结构）") or {}
+
+    def _bands_txt() -> str:
+        return "、".join(
+            f"{k}：{v['orders']} 张，行比 {v['line_ratio_engine_over_ledger']}、"
+            f"件数比 {v['qty_ratio_engine_over_ledger']}"
+            for k, v in sorted(bands.items()) if isinstance(v, dict))
+
+    reading = (
+        "比值=引擎÷台账。登记到位那一档两个比值都接近 1，说明两边看的是同一批料、"
+        f"同一堆缺口（本轮 {full.get('orders')} 张：行比 {full.get('line_ratio_engine_over_ledger')}、"
+        f"件数比 {full.get('qty_ratio_engine_over_ledger')}）；"
+        f"薄的那档比值 {thin.get('line_ratio_engine_over_ledger')} / "
+        f"{thin.get('qty_ratio_engine_over_ledger')} —— 差的是没登记到的那几百行。"
+        "所以把齐套行刷成同一算法不会把缺口砍半，是把缺口补出来。"
+        if full and thin else "分档样本不足，比不出这一对数")
+    bands["reading"] = reading
+
     return {
         "orders_sampled": len(per_order),
+        "short_qty_by_registration_band": bands,
+        "band_summary": _bands_txt(),
         "models": sorted(per_model),
         "engine_short_part_rows": eng,
         "ledger_short_rows": led,
@@ -577,6 +636,8 @@ async def kit_coverage_gap(db: AsyncSession, factory_id: str, *,
                                     AND COALESCE(w.required_qty,0) > 0) AS ledger_rows,
                    COUNT(*) FILTER (WHERE w.item_type = 'buy'
                                     AND COALESCE(w.shortage_qty,0) > 0) AS ledger_short_parts,
+                   COALESCE(SUM(w.shortage_qty) FILTER (WHERE w.item_type = 'buy'
+                                    AND COALESCE(w.shortage_qty,0) > 0), 0) AS ledger_short_qty,
                    ROW_NUMBER() OVER (PARTITION BY COALESCE(pp.product_code, p.product_code, o.product_id)
                                       ORDER BY o.created_at DESC) AS model_rank
             FROM work_orders o
@@ -606,9 +667,12 @@ async def kit_coverage_gap(db: AsyncSession, factory_id: str, *,
                 stock = {str(x["material_code"]): float(x["available"] or 0) for x in (
                     await db.execute(vr.STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all()}
             kit = vr.build_kit(got["rows"], qty, stock, start_day=0)
+            buy_short = [l for l in (kit.get("lines") or [])
+                         if str(l.get("make_or_buy")) == "外购" and float(l.get("short") or 0) > 0]
             cache[key] = {
-                "short": {str(l["material_code"]) for l in (kit.get("lines") or [])
-                          if str(l.get("make_or_buy")) == "外购" and float(l.get("short") or 0) > 0},
+                "short": {str(l["material_code"]) for l in buy_short},
+                # 件数也留着：一致率只说"第一名对不对"，件数比才说"两边看到的缺口量差多少"
+                "short_qty": round(sum(float(l.get("short") or 0) for l in buy_short), 2),
                 "source": got["source"]}
         eng_short = cache[key]["short"]
         led_short = {str(c) for (c,) in (await db.execute(text("""
@@ -617,12 +681,13 @@ async def kit_coverage_gap(db: AsyncSession, factory_id: str, *,
               AND COALESCE(w.shortage_qty,0) > 0
         """), {"wid": str(r["work_order_id"])})).all()}
         per_order.append({
-            "gate_material_ready": None, "gate_plan_rows": None,
             "work_order_id": str(r["work_order_id"]), "work_order_code": r["work_order_code"],
             "model": model, "units": qty, "status": r["status"],
             "ledger_rows": int(r["ledger_rows"] or 0),
             "ledger_short_parts": len(led_short),
+            "ledger_short_qty": round(float(r["ledger_short_qty"] or 0), 2),
             "engine_short_parts": len(eng_short),
+            "engine_short_qty": cache[key]["short_qty"],
             "missing_parts": max(0, len(eng_short - led_short)),
             "registered_rate": (round(len(eng_short & led_short) / len(eng_short), 3)
                                 if eng_short else None),
