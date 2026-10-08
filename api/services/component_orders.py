@@ -579,9 +579,15 @@ WITH o AS (
 )
 SELECT o.id, o.work_order_code, o.model, o.planned_qty, o.kit_lines, o.shortage_now
 FROM o
-WHERE o.kit_lines BETWEEN 1 AND :max_lines
+WHERE o.kit_lines <= :max_lines
+  -- 零行的单只要有镜像行就补（哪怕只有一层）：它现在的状态是"连一行领料需求都没有"，
+  -- 门按 no_kit_evidence 挡着、催料连料号都拿不到 —— 一层结构也比没有强。
+  -- 已经有行的单才要求镜像里有 >1 层：那才是"停在旧登记世代"，补的是深度。
   AND EXISTS (SELECT 1 FROM enghub_bom_items e
-               WHERE e.factory_id = :fid AND e.product_model = o.model AND e.level > 1)
+               WHERE e.factory_id = :fid AND e.product_model = o.model)
+  AND (o.kit_lines = 0
+       OR EXISTS (SELECT 1 FROM enghub_bom_items e2
+                   WHERE e2.factory_id = :fid AND e2.product_model = o.model AND e2.level > 1))
 ORDER BY o.kit_lines ASC
 LIMIT :limit
 """
@@ -594,11 +600,22 @@ KIT_REUPGRADE_APPLY = os.getenv("ENGINE_KIT_REUPGRADE_APPLY", "false").strip().l
 KIT_REUPGRADE_MAX_LINES = 400
 
 
+def _kind_of(ledger_rows: int) -> str:
+    """这张单的补登属于哪种：一行都没有=从零登记，有但不够=补到多层。
+
+    分开的理由：一行都没有的单现在被 `no_kit_evidence` 挡在门外，催料连料号都拿不到；
+    它和"登记了一半"的单需要同步做，但读的人得知道补的是哪种。
+    """
+    return "从零登记" if int(ledger_rows or 0) == 0 else "补到多层"
+
+
 async def reupgrade_stale_kit_lines(
     db: AsyncSession, factory_id: str, *, apply: Optional[bool] = None, limit: int = 20,
     max_lines: int = 400,
 ) -> Dict[str, Any]:
-    """把还停在旧登记世代的工单齐套表**补到多层结构**，一行老的都不动。
+    """把齐套表登记不足的工单**补到多层结构**，一行老的都不动。
+
+    候选=外购需求行数 ≤ `max_lines` 的在流程单（含一行都没有的那批）。
 
     为什么要补：70 张可比单里 64 张的领料行还停在 1-20 行（同机种按多层展开登记过的能到 680 行、
     深 9 层）。齐套表只看得到一小截结构，`台账缺口行覆盖率` 与瓶颈件一致率就被封顶 —— 判据读起来像
@@ -623,7 +640,8 @@ async def reupgrade_stale_kit_lines(
         "max_lines": max(1, min(800, int(max_lines)))})).mappings().all()
     receipt: Dict[str, Any] = {
         "factory_id": factory_id, "apply": apply, "dry_run": not apply,
-        "orders_stale": len(rows), "orders_upgraded": 0, "lines_added": 0,
+        "orders_stale": len(rows), "orders_upgraded": 0, "orders_from_zero": 0,
+        "lines_added": 0,
         "lines_skipped_existing": 0, "lines_skipped_zero": 0, "orders_no_structure": 0,
         "codes_before_total": 0, "codes_after_total": 0, "parts": [],
     }
@@ -671,6 +689,7 @@ async def reupgrade_stale_kit_lines(
                                         apply=apply, receipt=receipt)
         receipt["lines_added"] += written
         receipt["orders_upgraded"] += 1
+        receipt["orders_from_zero"] += int(_kind_of(int(row["kit_lines"] or 0)) == "从零登记")
         receipt["codes_after_total"] += codes_before + written
         if len(receipt["parts"]) < 8:
             receipt["parts"].append({"work_order_code": str(row["work_order_code"]),
@@ -683,7 +702,8 @@ async def reupgrade_stale_kit_lines(
     receipt["status"] = "ok"
     receipt["message"] = (
         f"{'补登' if apply else '预演补登'} {receipt['orders_upgraded']}/{receipt['orders_stale']} 张"
-        f"停在旧登记世代的工单，新增 {receipt['lines_added']} 行"
+        f"（其中 {receipt['orders_from_zero']} 张原本一行外购需求都没有）"
+        f"，新增 {receipt['lines_added']} 行"
         f"（跳过已在表里的 {receipt['lines_skipped_existing']} 行、需求为 0 的 {receipt['lines_skipped_zero']} 行）；"
         "只加不改不删 —— 齐套门不会因为补登而放松")
     return receipt

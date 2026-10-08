@@ -880,7 +880,7 @@ async def _engine_contract_call(iface: str, db: AsyncSession, factory_id: str,
 
 
 @router.get("/kit-lines-reupgrade",
-            summary="把停在旧登记世代的工单齐套表补到多层结构（只加不改不删，默认只预演）")
+            summary="把齐套表登记不足的工单补到多层结构（含零登记单；只加不改不删，默认只预演）")
 async def get_kit_lines_reupgrade(
     factory_id: str = Query(..., description="厂区"),
     apply: bool = Query(False, description="false=只预演；true 才写库（也受 ENGINE_KIT_REUPGRADE_APPLY 控制）"),

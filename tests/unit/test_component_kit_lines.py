@@ -218,3 +218,17 @@ def test_candidate_window_is_clamped_not_trusted():
     assert db.calls[0]["params"]["max_lines"] == 800
     db2, _ = _run_reupgrade(apply=False, limit=8, max_lines=0)
     assert db2.calls[0]["params"]["max_lines"] == 1
+
+
+def test_candidate_kinds_separate_zero_from_thin():
+    """零行与"有但薄"要分开报：前者被 no_kit_evidence 挡着，催料连料号都没有。"""
+    assert co._kind_of(0) == "从零登记"
+    assert co._kind_of(1) == "补到多层"
+    assert co._kind_of(None) == "从零登记"
+
+
+def test_zero_row_orders_only_need_any_mirror_rows():
+    """零外购行的单不再要求镜像里有 >1 层：一层结构也比"没有领料依据"强。"""
+    sql = co.STALE_KIT_SQL
+    assert "AND (o.kit_lines = 0" in sql, "零行单要有另一条通道"
+    assert "level > 1" in sql, "已有行的单仍然要求镜像有多层结构，否则薄单会被反复重跑"
