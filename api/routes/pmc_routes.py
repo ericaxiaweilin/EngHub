@@ -341,6 +341,8 @@ async def get_pmc_capabilities(
              "path": "/api/v1/pmc/production-options", "mode": "read_only"},
             {"key": "sim_sensitivity", "name": "建模精度×敏感度（每个输入动一档，交期/准点/钱变多少；含补数据的量化价值）",
              "path": "/api/v1/pmc/sim-sensitivity", "mode": "read_only"},
+            {"key": "sim_schedule_risk", "name": "交期分布（按已声明误差带抽样：P50/P90、准点概率、毛边）",
+             "path": "/api/v1/pmc/sim-schedule-risk", "mode": "read_only"},
             {"key": "engine_layers", "name": "仿真引擎分层验收（五层判据+过线闸门，下层不过线上层不引用）",
              "path": "/api/v1/pmc/engine-layers", "mode": "read_only"},
             {"key": "engine_contract", "name": "引擎对外契约（三接口签名+业务词表，与模型内部无关；自检见 /engine-contract-check）",
