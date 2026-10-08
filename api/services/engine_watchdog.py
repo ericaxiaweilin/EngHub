@@ -552,11 +552,15 @@ MOB_CONTRADICTION_SQL = """
 MIN_ATTENDANCE_DAYS_FOR_SLOPE = 3
 MIN_UNCLAIMED_MODELS = 1
 
+# 每一格数据判据都要在这里登记：漏登记的那格一旦某轮没跑成判据，
+# 对账会把它当"缩到线下"自动关掉 —— 读起来就是"问题自己好了"的假绿灯。
+# 巡检读数里的 cells_without_guard 就是用来抓这种漏登记的。
 DATA_LOOPS = frozenset({
     "kit_line_generation", "kit_line_missing", "supplier_master",
     "lead_time_evidence", "material_make_or_buy_conflict",
     "action_constraints", "action_execution_silence", "candidate_rules",
     "working_conditions_evidence", "kit_line_coverage",
+    "line_profile_coverage", "station_efficiency_basis", "rule_ledger_write",
 })
 
 

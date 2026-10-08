@@ -504,10 +504,11 @@ async def _periodic_scheduler():
         except Exception as e:
             _logger.warning(f"[scheduler] 引擎数据缺口巡检异常: {e}")
 
-        # 齐套行覆盖补齐 —— 每 2 小时补 15 张最薄的单（只加不改不删，每张 ≤400 行）。
-        # 为什么要自动：10-08 配对实测把因由量死了 —— 补登过的 8 张一致率 0.25，
-        # 台账 100-399 行的 94 张 0.0，旧登记世代的 18 张 0.0；封顶的是登记深度，不是引擎判错。
-        # 手动点一次不算跑通（候选=齐套行 ≤80 行且镜像里有 >1 层结构的单，队列消空后这格自然静默）。
+        # 齐套行覆盖补齐 —— 每 2 小时补 25 张单（只加不改不删，每张 ≤400 行）。
+        # 为什么要自动、为什么闸口放到 400 行：10-08 把一致率按登记深度切开实测是
+        #   ≥400 行那档 0.967 / 100-399 行那档 0.103 / 1-99 行那档 0.0，
+        # 封顶的是台账登记深度，不是引擎判错。只捞"最薄的 ≤80 行"会永远漏掉
+        # 登记了一半的那 142 张 —— 那才是整池 0.542 上不去的大头。
         try:
             import time as _t_kb
             if not hasattr(_periodic_scheduler, "_last_engine_kit_backfill"):
@@ -521,8 +522,8 @@ async def _periodic_scheduler():
                         db, _KB_FID,
                         apply=os.getenv("ENGINE_KIT_BACKFILL_APPLY", "true").lower()
                             not in {"0", "false", "no", "off"},
-                        limit=max(1, int(os.getenv("ENGINE_KIT_BACKFILL_PER_ROUND", "15"))),
-                        max_lines=max(1, int(os.getenv("ENGINE_KIT_BACKFILL_MAX_LINES", "80"))))
+                        limit=max(1, int(os.getenv("ENGINE_KIT_BACKFILL_PER_ROUND", "25"))),
+                        max_lines=max(1, int(os.getenv("ENGINE_KIT_BACKFILL_MAX_LINES", "400"))))
                     did["engine_kit_backfill"] = {
                         "applied": res["apply"], "candidates": res["orders_stale"],
                         "orders_upgraded": res["orders_upgraded"],

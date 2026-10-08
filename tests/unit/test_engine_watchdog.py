@@ -312,3 +312,35 @@ def test_unreadable_coverage_does_not_silently_pass_the_check():
 
 def test_coverage_loop_is_protected_when_the_check_did_not_run():
     assert "kit_line_coverage" in DATA_LOOPS
+
+
+def test_every_gap_loop_is_protected_from_silent_closure():
+    """报过缺口的格子必须都在保护名单里：漏一格=那格某轮没跑成时会被自动关成"已修好"。
+
+    这一条不是形式检查：巡检读数里的 cells_without_guard 就是它要抓的事故形状。
+    """
+    found = gap_readings(
+        gen={"stale_gen": 60, "in_flow": 120},
+        sup={"no_supplier": 40},
+        ready={"fixable_by_rerun_orders": 30, "kit_gaps": {"no_lines": 5}},
+        lead={"unverified_default_parts": 20000},
+        mob={"conflict_rows": 900},
+        cons={"grid_usage_basis": {"coverage_known": True, "never_considered": ["authorize_overtime"]},
+              "undeclared_actions": 5, "considered_but_unrecorded": 20},
+        wc={"sensor_rows": 0, "attendance_days": 30},
+        claim={"unclaimed_models": 4, "unclaimed_codes": ["A"], "unclaimed_orders": 9,
+               "unclaimed_units": 400, "route_stations_missing": []},
+        eff={"stations": 28, "verified": 0, "min_verified": 1,
+             "placeholder_share": 1.0, "distinct_values": [1.0]},
+        cov={"orders_sampled": 24, "engine_short_part_rows": 967, "ledger_short_rows": 290,
+             "coverage_rate": 0.30, "rows_to_register": 750,
+             "gate_ready_but_engine_short": 2, "already_released_but_engine_short": 3,
+             "held_no_kit_evidence_with_engine_list": 1, "models": ["A-50-04-F"],
+             "gate_ready_proven_samples": [{"work_order_code": "WO-1"}],
+             "no_basis_samples": []},
+        rejected=[{"rule": "r", "why": "w"}],
+        pending=[], mp={})
+    loops = {f["loop"] for f in found}
+    assert loops, "判据一条都没报，这条测试就失去意义了"
+    unguarded = sorted(loops - DATA_LOOPS)
+    assert unguarded == [], f"这些格子没进保护名单，某轮没跑成时会被自动关：{unguarded}"

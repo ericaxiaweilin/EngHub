@@ -593,7 +593,7 @@ KIT_REUPGRADE_MAX_LINES = 400
 
 async def reupgrade_stale_kit_lines(
     db: AsyncSession, factory_id: str, *, apply: Optional[bool] = None, limit: int = 20,
-    max_lines: int = 20,
+    max_lines: int = 400,
 ) -> Dict[str, Any]:
     """把还停在旧登记世代的工单齐套表**补到多层结构**，一行老的都不动。
 
@@ -617,7 +617,7 @@ async def reupgrade_stale_kit_lines(
         apply = KIT_REUPGRADE_APPLY
     rows = (await db.execute(text(STALE_KIT_SQL), {
         "fid": factory_id, "limit": max(1, int(limit)),
-        "max_lines": max(1, min(200, int(max_lines)))})).mappings().all()
+        "max_lines": max(1, min(800, int(max_lines)))})).mappings().all()
     receipt: Dict[str, Any] = {
         "factory_id": factory_id, "apply": apply, "dry_run": not apply,
         "orders_stale": len(rows), "orders_upgraded": 0, "lines_added": 0,

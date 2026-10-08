@@ -197,16 +197,17 @@ def _run_reupgrade(**kw):
     return db, out
 
 
-def test_default_candidate_window_is_the_stale_generation_band():
+def test_default_candidate_window_covers_the_half_registered_ones():
+    """默认闸口 400：只捞 ≤80 行会把登记了一半的那批永远留在池子外面。"""
     db, out = _run_reupgrade(apply=False, limit=5)
     pick = db.calls[0]["params"]
-    assert pick["max_lines"] == 20, pick
+    assert pick["max_lines"] == 400, pick
     assert pick["limit"] == 5, pick
     assert out["dry_run"] is True and out["orders_stale"] == 0
 
 
-def test_widened_window_is_what_reaches_the_under_registered_orders():
-    """覆盖率 0.30 那档要靠 max_lines=80 才捞得到单：闸没传下去就等于没这条路径。"""
+def test_narrow_window_is_honoured_when_the_caller_asks_for_it():
+    """想只补最薄的那批就把闸收紧到 80：这个数得真的传进 SQL，不能只是文案。"""
     db, _ = _run_reupgrade(apply=False, limit=8, max_lines=80)
     assert db.calls[0]["params"]["max_lines"] == 80
 
@@ -214,6 +215,6 @@ def test_widened_window_is_what_reaches_the_under_registered_orders():
 def test_candidate_window_is_clamped_not_trusted():
     # 传 5000 行闸等于"把全厂都当成薄单"，那会把几十万次展开拉进一轮巡检
     db, _ = _run_reupgrade(apply=False, limit=8, max_lines=5000)
-    assert db.calls[0]["params"]["max_lines"] == 200
+    assert db.calls[0]["params"]["max_lines"] == 800
     db2, _ = _run_reupgrade(apply=False, limit=8, max_lines=0)
     assert db2.calls[0]["params"]["max_lines"] == 1
