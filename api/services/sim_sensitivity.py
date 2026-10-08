@@ -492,7 +492,7 @@ async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -
 
 async def report(db: AsyncSession, factory_id: str, models: List[str], *,
                  include_risk: bool = False, include_repair: bool = False,
-                 include_crew_margin: bool = False,
+                 include_crew_margin: bool = False, include_promise: bool = False,
                  **kw: Any) -> Dict[str, Any]:
     acc = await mapping_accuracy(db, factory_id, models)
     sens = await sensitivity(db, factory_id, models, **kw)
@@ -518,13 +518,16 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], *,
                            "interactions 给两个杠杆一起上时多出来（或白花）的那部分，"
                            "risk（include_risk=true 时）给按已声明误差带抽出来的完工日分布，"
                            "data_repair（include_repair=true 时）给每条误差带修到下限之后毛边窄几天，"
-                           "crew_margin（include_crew_margin=true 时）给要加多少人才让 P90 也赶上承诺。")}
+                           "crew_margin（include_crew_margin=true 时）给要加多少人才让 P90 也赶上承诺，"
+                           "promise（include_promise=true 时）给有把握能承诺的最早日期。")}
     if include_risk:
         out["risk"] = await schedule_risk(db, factory_id, models, **kw)
     if include_repair:
         out["data_repair"] = await data_repair_experiment(db, factory_id, models, **kw)
     if include_crew_margin:
         out["crew_margin"] = await crew_margin_for_p90(db, factory_id, models, **kw)
+    if include_promise:
+        out["promise"] = await promise_headroom(db, factory_id, models, **kw)
     return out
 
 
@@ -1114,6 +1117,11 @@ def _p90(summary: Dict[str, Any]) -> Dict[str, Any]:
                  if int(p.get("percentile") or 0) == 90), {})
 
 
+def _p50(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return next((p for p in (summary.get("percentiles") or [])
+                 if int(p.get("percentile") or 0) == 50), {})
+
+
 async def crew_margin_for_p90(db: AsyncSession, factory_id: str, models: List[str], *,
                               samples: int = 16, seed: int = 20261008,
                               on_time_required: float = 0.90,
@@ -1277,3 +1285,129 @@ async def crew_margin_for_p90(db: AsyncSession, factory_id: str, models: List[st
                           "好天档加人不换时间；钱只是人工成本差值，收益侧未建模")
     return out
 
+
+
+# 承诺这一格不该问"赶不赶得上"（答案已经知道：赶不上），要问"有 9 成把握的话最早能报哪天"。
+# 逐条政策在**同一串抽样**上取 P90 完工日，最早的那个就是可承诺日；多花的钱按同序配对算差值。
+PROMISE_POLICIES: List[Dict[str, Any]] = [
+    {"name": "现政策（分批开工）", "allow_partial": True},
+    {"name": "压瓶颈件提前期→7 天", "allow_partial": True, "expedite_lead_days": 7},
+    {"name": "压提前期＋并联开满 2 条线", "allow_partial": True, "expedite_lead_days": 7,
+     "parallel_lines": 2},
+    {"name": "压提前期＋并联＋加班加人 30%", "allow_partial": True, "expedite_lead_days": 7,
+     "parallel_lines": 2, "crew_bonus": 0.30},
+]
+
+
+def _earliest_then_cheapest(options: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """可承诺日取最早；同一天有几条政策做得到时取台账算出来最便宜的那条。
+
+    并列不等于随便挑 —— 实测并联开线与只加急的 P90 都是 11-28，差着 $180,630/批。
+    """
+    return min(options, key=lambda o: (str(o.get("p90_finish_date")),
+                                       float(o.get("median_total_cost_usd") or 0),
+                                       str(o.get("policy"))))
+
+
+async def promise_headroom(db: AsyncSession, factory_id: str, models: List[str], *,
+                           samples: int = 24, seed: int = 20261008,
+                           required: float = 0.90, days_of_output: float = 6.0,
+                           lead_margin: Optional[float] = None,
+                           policies: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """把"能不能赶上"换成"最早能承诺哪天"：每条政策取自己那串抽样的 P90 完工日。
+
+    P90 不是最优而是"九成情况下不会晚于这天"，所以它是可以写进承诺的那个数；
+    报出来的日期必须带着它靠哪条政策、比现承诺晚几天、多花多少钱一起出去。
+    """
+    from datetime import timedelta
+
+    req = max(0.50, min(0.99, float(required)))
+    setup = await _risk_setup(db, factory_id, models, days_of_output=days_of_output,
+                              lead_margin=lead_margin, samples=samples, seed=seed)
+    n, bands = setup["n"], setup["bands"]
+    note = ("抽样与交期分布同一串（同 seed）；每条政策只换政策字典，"
+            "到岗/带宽逐抽原样 —— 所以日期差是政策的，不是抽样的。")
+
+    base_rows: Optional[List[Dict[str, Any]]] = None
+    options: List[Dict[str, Any]] = []
+    for pol in (policies or PROMISE_POLICIES):
+        name = str(pol.get("name") or "政策")
+        rows = await _sample_rows(db, factory_id, setup["targets"], pol, setup["draws"])
+        s = _risk_summary(rows, factory_id=factory_id, models=models, policy_name=name,
+                          samples=n, seed=seed, bands=bands, with_date_note=note)
+        if base_rows is None:
+            base_rows = rows
+        if s.get("status") != "ok":
+            options.append({"policy": name, "status": s.get("status"), "why": s.get("why")})
+            continue
+        p90 = _p90(s)
+        promise = s["promise_date"]
+        later = (date.fromisoformat(str(p90["finish_date"]))
+                 - date.fromisoformat(str(promise))).days
+        money = _median([float(r.get("labor_cost_usd") or 0) + float(r.get("expedite_cost_usd") or 0)
+                         + float(r.get("line_activation_cost_usd") or 0) for r in rows])
+        options.append({
+            "policy": name, "status": "ok",
+            "settings": {k: v for k, v in pol.items() if k not in ("name",)},
+            "promise_date": promise, "p50_finish_date": _p50(s).get("finish_date"),
+            "p90_finish_date": p90.get("finish_date"), "p90_days_late": p90.get("days_late_worst"),
+            "p90_vs_promise_days": later, "p_on_time": s["p_on_time"],
+            "rough_days": s["rough_days"], "median_total_cost_usd": money,
+            "median_extra_cost_vs_now": _paired_median_delta(
+                [r for r in (base_rows or []) if r.get("labor_cost_usd") is not None],
+                rows, "labor_cost_usd"),
+            "binding_seen": sorted({str(r.get("binding")) for r in rows if r.get("binding")}),
+            "reading": s["reading"],
+        })
+
+    usable = [o for o in options if o.get("status") == "ok"]
+    if not usable:
+        return {"status": "no_dates", "factory_id": factory_id, "models": models,
+                "options": options, "verdict": None, "on_time_required": req,
+                "reading": [f"可承诺日算不出：{len(options)} 条政策没有一条抽得出完工日 —— "
+                            f"机种没有可推演的 BOM/依据时这一格不给日期"]}
+    best = _earliest_then_cheapest(usable)
+    now_opt = usable[0]
+    out: Dict[str, Any] = {
+        "status": "ok", "factory_id": factory_id, "models": models, "samples": n, "seed": seed,
+        "on_time_required": req, "current_promise": now_opt["promise_date"],
+        "bands_used": bands, "options": options,
+        "verdict": {
+            "earliest_defensible_promise": best["p90_finish_date"],
+            "policy": best["policy"], "settings": best["settings"],
+            "days_later_than_current": int(best["p90_vs_promise_days"]),
+            "p_on_time_at_current_promise": best["p_on_time"],
+            "median_total_cost_usd": best["median_total_cost_usd"],
+            "current_policy_p90": now_opt["p90_finish_date"],
+            "days_saved_by_policy": (int(now_opt["p90_vs_promise_days"])
+                                     - int(best["p90_vs_promise_days"])),
+            "binding_seen": best["binding_seen"],
+        },
+    }
+    v = out["verdict"]
+    lines = [
+        f"现承诺 {out['current_promise']}：现政策下 P90 完工 {now_opt['p90_finish_date']}"
+        f"（晚 {now_opt['p90_vs_promise_days']} 天），准点概率 {now_opt['p_on_time']:.0%} "
+        f"—— 要 {req:.0%} 把握的话这个日期报不出去",
+        f"有 {req:.0%} 把握能承诺的最早日期：{v['earliest_defensible_promise']}"
+        f"（比现承诺晚 {v['days_later_than_current']} 天），用的是『{v['policy']}』；"
+        f"这条政策自己把 P90 拉回 {v['days_saved_by_policy']} 天",
+    ]
+    cheaper = [o for o in usable if o["policy"] != now_opt["policy"]]
+    if cheaper:
+        lines.append("逐条政策的 P90：" + "、".join(
+            f"{o['policy']}→{o['p90_finish_date']}（晚 {o['p90_vs_promise_days']} 天、"
+            f"准点 {o['p_on_time']:.0%}）" for o in usable))
+    if v["days_later_than_current"] <= 0 and v["p_on_time_at_current_promise"] >= req:
+        lines.append("结论：现承诺就在这条政策的 9 成线内 —— 不用改日期，改的是排产那侧的执行")
+    else:
+        lines.append(
+            f"结论：要把 {req:.0%} 把握写进承诺，只能报 {v['earliest_defensible_promise']}；"
+            f"现承诺 {out['current_promise']} 在扫过的 {len(usable)} 条政策里都没有 9 成 —— "
+            f"该改日期或减量，不是再加杠杆")
+    out["reading"] = lines
+    out["method"] = ("可承诺日 = 各政策在同一串抽样上的 P90 完工日取最早；"
+                     "P90 是『九成情况下不会晚于这天』，所以是能写进承诺的那个数，不是最好看的数")
+    out["claim_guard"] = ("引擎只给『哪天有 9 成』，不代做承诺 —— 改承诺日要企业授权流程确认；"
+                          "钱只是台账算出的成本差值，收益侧与违约罚则未建模")
+    return out

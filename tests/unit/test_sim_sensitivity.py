@@ -767,3 +767,115 @@ def test_crew_margin_chat_answer_names_heads_and_the_refusal(monkeypatch):
     not_run = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
                "margin_not_sampled_because": "没点要人手余量（with_crew_margin=true 才逐档加人真跑）"}
     assert "没算 —— 没点要人手余量" in _format_sensitivity_reply(not_run)
+
+
+def _promise_env(monkeypatch, *, dated=True):
+    from datetime import date, timedelta
+
+    due = date(2026, 10, 31)
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 70.0, "hours_error_band": 0.05,
+                            "components": {"lead_time": {"score": 1.0},
+                                           "hours": {"score": 1.0, "basis": "route_standard_hours"}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        if not dated:
+            return {"finish_date": None, "days_late_worst": None, "binding": "no_material",
+                    "labor_cost_usd": 0.0, "expedite_cost_usd": 0.0,
+                    "line_activation_cost_usd": 0.0}
+        p = policy or {}
+        d = perturb or {}
+        cut = 13.0 if p.get("expedite_lead_days") else 0.0
+        par = 4.0 if p.get("parallel_lines") else 0.0
+        crew = 2.0 if p.get("crew_bonus") else 0.0
+        late = round(30.0 * float(d.get("lead_multiplier", 1.0)) * (2.0 - float(attendance))
+                     - 20.0 - cut - par - crew, 1)
+        return {"finish_date": str(due + timedelta(days=int(max(late, 1.0)))),
+                "days_late_worst": late,
+                "labor_cost_usd": 1000.0 + (300.0 if crew else 0.0),
+                "expedite_cost_usd": 6300.0 if cut else 0.0,
+                "line_activation_cost_usd": 45000.0 if par else 0.0,
+                "binding": "material_arrival"}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+
+def test_same_promisable_date_picks_the_cheaper_policy_not_whichever_came_first():
+    """并列 P90 时按钱排序：实测『压提前期』与『压提前期＋并联』同为 11-28，差 $180,630/批。"""
+    opts = [{"p90_finish_date": "2026-11-28", "median_total_cost_usd": 502740.0, "policy": "加并联"},
+            {"p90_finish_date": "2026-11-28", "median_total_cost_usd": 322110.0, "policy": "只加急"},
+            {"p90_finish_date": "2026-12-02", "median_total_cost_usd": 305550.0, "policy": "现政策"}]
+    assert ss._earliest_then_cheapest(opts)["policy"] == "只加急"
+    earlier = [{"p90_finish_date": "2026-11-20", "median_total_cost_usd": 999999.0, "policy": "贵但更早"},
+               {"p90_finish_date": "2026-11-28", "median_total_cost_usd": 100.0, "policy": "便宜但晚"}]
+    assert ss._earliest_then_cheapest(earlier)["policy"] == "贵但更早", "日期优先，钱只做并列裁决"
+
+
+def test_promise_headroom_reports_the_date_that_carries_nine_tenths_confidence(monkeypatch):
+    import asyncio
+
+    _promise_env(monkeypatch)
+    out = asyncio.run(ss.promise_headroom(None, "FAC", ["M-1"], samples=20, seed=6))
+    assert out["status"] == "ok" and len(out["options"]) == len(ss.PROMISE_POLICIES)
+    v = out["verdict"]
+    now = out["options"][0]
+    assert v["current_policy_p90"] == now["p90_finish_date"]
+    assert v["earliest_defensible_promise"] <= v["current_policy_p90"], "加政策不能让可承诺日更晚"
+    assert v["policy"] == ss.PROMISE_POLICIES[-1]["name"], "三条都省钱时该取最全那条"
+    assert v["days_saved_by_policy"] > 0
+    p90s = [o["p90_finish_date"] for o in out["options"]]
+    assert p90s == sorted(p90s, reverse=True), "每加一条杠杆，P90 完工日必须往早走（这台假引擎就是这么设计的）"
+    assert v["median_total_cost_usd"] > 0
+    assert any("有 90% 把握能承诺的最早日期" in x for x in out["reading"])
+    assert any("这个日期报不出去" in x for x in out["reading"])
+    assert "不代做承诺" in out["claim_guard"] and "改承诺日要企业授权流程确认" in out["claim_guard"]
+    assert "能写进承诺的那个数" in out["method"]
+
+
+def test_promise_headroom_gives_no_date_when_the_sample_has_none(monkeypatch):
+    import asyncio
+
+    _promise_env(monkeypatch, dated=False)
+    out = asyncio.run(ss.promise_headroom(None, "FAC", ["M-1"], samples=8, seed=1))
+    assert out["status"] == "no_dates" and out["verdict"] is None
+    assert any("算不出" in x for x in out["reading"])
+
+
+def test_promise_headroom_chat_answer_names_the_date_and_the_refusal():
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    res = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+           "promise_headroom": {"status": "ok", "on_time_required": 0.9,
+                                "current_promise": "2026-10-31",
+                                "verdict": {"earliest_defensible_promise": "2026-12-02",
+                                            "policy": "压提前期＋并联＋加班加人 30%",
+                                            "days_later_than_current": 32,
+                                            "days_saved_by_policy": 19,
+                                            "p_on_time_at_current_promise": 0.25,
+                                            "median_total_cost_usd": 51800.0,
+                                            "current_policy_p90": "2026-12-21"},
+                                "reading": ["现承诺 2026-10-31：现政策下 P90 完工 2026-12-21（晚 51 天），"
+                                            "准点概率 0% —— 要 90% 把握的话这个日期报不出去"]}}
+    text = _format_sensitivity_reply(res)
+    assert "有 90% 把握能承诺的最早日期：2026-12-02（比现承诺 2026-10-31 晚 32 天）" in text
+    assert "这条政策把 P90 拉回 19 天" in text and "$51,800" in text
+    assert "改日期要企业授权流程确认" in text
+
+    not_run = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+               "promise_not_sampled_because": "没点要承诺上限（with_promise_headroom=true 才逐条政策取 P90）"}
+    assert "承诺上限：没算 —— 没点要承诺上限" in _format_sensitivity_reply(not_run)
+
+    broken = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+              "promise_headroom": {"status": "no_dates", "why": "4 条政策没有一条抽得出完工日"}}
+    t3 = _format_sensitivity_reply(broken)
+    assert "没算成 —— 4 条政策没有一条抽得出完工日" in t3

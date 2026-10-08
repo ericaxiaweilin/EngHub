@@ -1117,6 +1117,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "with_crew_margin": {"type": "boolean",
                                      "description": ("要'赶得上要加多少人手'时置 true"
                                                      "（最多 6 档 × 16 抽逐档真跑）")},
+                "with_promise_headroom": {"type": "boolean",
+                                          "description": ("要'有 9 成把握最早能承诺哪天'时置 true"
+                                                          "（4 条政策 × 24 抽同一串）")},
             }},
         },
     },
@@ -3315,6 +3318,19 @@ def _compact_crew_margin(margin: Optional[Dict[str, Any]]) -> Optional[Dict[str,
                                        "claim_guard")}
 
 
+def _compact_promise_headroom(h: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """承诺上限只留结论与逐条政策的 P90，逐抽明细留给 /pmc 那一格。"""
+    if not h:
+        return None
+    if h.get("status") != "ok":
+        return {"status": h.get("status"), "why": (h.get("reading") or [None])[0],
+                "reading": h.get("reading") or []}
+    return {k: h.get(k) for k in ("status", "factory_id", "models", "samples", "seed",
+                                  "on_time_required", "current_promise", "verdict", "reading",
+                                  "method", "claim_guard",
+                                  "options")}
+
+
 async def _tool_query_simulation_sensitivity(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -3329,7 +3345,8 @@ async def _tool_query_simulation_sensitivity(
                 "message": "厂区里没有可推演的机种（BOM 镜像为空？）"}
     out = await report(db, fid, models, include_risk=bool(args.get("with_schedule_risk")),
                        include_repair=bool(args.get("with_data_repair")),
-                       include_crew_margin=bool(args.get("with_crew_margin")))
+                       include_crew_margin=bool(args.get("with_crew_margin")),
+                       include_promise=bool(args.get("with_promise_headroom")))
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3372,6 +3389,9 @@ async def _tool_query_simulation_sensitivity(
         "crew_margin": _compact_crew_margin(out.get("crew_margin")),
         "margin_not_sampled_because": (None if out.get("crew_margin") else
                                        "没点要人手余量（with_crew_margin=true 才逐档加人真跑）"),
+        "promise_headroom": _compact_promise_headroom(out.get("promise")),
+        "promise_not_sampled_because": (None if out.get("promise") else
+                                        "没点要承诺上限（with_promise_headroom=true 才逐条政策取 P90）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
                    "不确定天数 = |斜率| × (允许误差 ÷ 档位步长)，多项线性相加是保守口径；"
                    "所有档位都走同一条 scan_policies 推演路径，不另建第二套算法。"),
@@ -4968,6 +4988,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
                      "准点概率", "几成概率", "交期分布", "分布", "P90", "P50", "毛边",
                      "先修哪条", "修哪条数据", "数据修复", "修数据", "压毛边",
                      "加多少人", "要加几个人", "加人行不行", "人手余量", "排班余量", "赶得上要",
+                     "最早能承诺", "能承诺哪天", "承诺哪天", "报哪天", "改到哪天", "9 成把握", "九成把握",
                      "sensitivity", "斜率"],
     },
     {
@@ -5629,6 +5650,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if any(k in message for k in ("加多少人", "要加几个人", "加人行不行", "人手余量",
                                       "排班余量", "赶得上要", "几人赶得上")):
             args["with_crew_margin"] = True
+        # "最早能承诺哪天"问的是分布上的 P90，不是点估交期；点估那一格给不出"有九成把握的那天"
+        if any(k in message for k in ("最早能承诺", "能承诺哪天", "承诺哪天", "报哪天",
+                                      "9 成把握", "九成把握", "改到哪天")):
+            args["with_promise_headroom"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
         flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)

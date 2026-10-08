@@ -1414,6 +1414,22 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
             lines.append(f"- 人手余量：不用加 —— 已经 {margin.get('baseline', {}).get('p_on_time'):.0%} 准点")
         elif margin:
             lines.append(f"- 人手余量：没算成 —— {margin.get('why') or verdict.get('kind')}")
+    head = result.get("promise_headroom") or {}
+    if head.get("status") == "ok" and head.get("verdict"):
+        hv = head["verdict"]
+        lines.append(
+            f"- 有 {head.get('on_time_required'):.0%} 把握能承诺的最早日期："
+            f"{hv.get('earliest_defensible_promise')}（比现承诺 {head.get('current_promise')} 晚 "
+            f"{hv.get('days_later_than_current')} 天）｜靠『{hv.get('policy')}』，"
+            f"这条政策把 P90 拉回 {hv.get('days_saved_by_policy')} 天，台账算出的成本约 "
+            f"${hv.get('median_total_cost_usd') or 0:,.0f}/批")
+        lines.append(f"- 现政策的 P90：{hv.get('current_policy_p90')}"
+                     f"（准点概率 {hv.get('p_on_time_at_current_promise'):.0%}）—— "
+                     f"现承诺这个日期报不出去；改日期要企业授权流程确认，引擎不代承诺")
+    elif result.get("promise_not_sampled_because"):
+        lines.append(f"- 承诺上限：没算 —— {result['promise_not_sampled_because']}")
+    elif head:
+        lines.append(f"- 承诺上限：没算成 —— {head.get('why') or head.get('status')}")
     lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
     for u in (result.get("uncertainty") or [])[:2]:
         lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"
