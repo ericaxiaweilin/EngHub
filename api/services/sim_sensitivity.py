@@ -630,57 +630,22 @@ RISK_FACTORS: List[Dict[str, Any]] = [
 ]
 
 
-async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
-                        days_of_output: float = 6.0, lead_margin: Optional[float] = None,
-                        policy: Optional[Dict[str, Any]] = None, samples: int = 48,
-                        seed: int = 20261008) -> Dict[str, Any]:
-    """把"可信到几成"换成一条日期分布：按已声明的误差带抽样，给 P50/P90 与准点概率。
-
-    不确定度传导只有一个标量（±1.6 天），而决策要问的是"这版完工日有几成概率赶上承诺"。
-    抽样不加新假设：提前期与工时按**每台机自己那条依据**允许的误差均匀抽（借同族路线允许 40%、
-    自家路线 5%，取这批里最差的那个带宽），到岗按天气三档离散抽（不是正态），
-    设备可用率按台账实测 ±2pp。种子固定 —— 这条分布必须能被重算核对。
-    """
-    import random
+def _risk_summary(rows: List[Dict[str, Any]], *, factory_id: str, models: List[str],
+                  policy_name: str, samples: int, seed: int, bands: Dict[str, Any],
+                  with_date_note: str) -> Dict[str, Any]:
+    """把一串同序抽样读数压成分位数读数。"""
     from datetime import date, timedelta
 
-    margin = lead_margin if lead_margin is not None else vr.PROMISE_LEAD_MARGIN
-    pol = policy or {"name": "基准政策（分批开工）", "allow_partial": True}
-    n = max(6, min(200, int(samples)))
-    targets = await vr.derive_targets(db, factory_id, models,
-                                      days_of_output=days_of_output, lead_margin=margin)
-    base_eq = float((await vr.equipment_rate(db, factory_id)).get("rate") or 1.0)
-    acc = await mapping_accuracy(db, factory_id, models)
-    per_model = acc.get("models") or []
-    # 一批机型共用一个乘子，所以带宽取这批里最差的那条依据（保守；取平均会假装我们更准）
-    hours_band = max([float(m.get("hours_error_band") or 0.0) for m in per_model] or [0.0])
-    lead_band = max([lead_error_band(float((m.get("components") or {}).get("lead_time", {})
-                                           .get("score") or 0)) for m in per_model] or [0.20])
-    rng = random.Random(seed)
-
-    outcomes: List[Dict[str, Any]] = []
-    for _ in range(n):
-        att = rng.choice(RISK_ATTENDANCE_LEVELS)
-        perturb = {"lead_multiplier": round(1.0 + rng.uniform(-lead_band, lead_band), 4),
-                   "hours_multiplier": round(1.0 + rng.uniform(-hours_band, hours_band), 4),
-                   "equip_rate": round(max(0.05, min(1.0, base_eq + rng.uniform(-0.02, 0.02))), 4)}
-        m = await _run_one(db, factory_id, targets, pol, attendance=att, perturb=perturb)
-        outcomes.append({"attendance": att, **perturb, "binding": m.get("binding"),
-                         "finish_date": m.get("finish_date"),
-                         "days_late_worst": (float(m["days_late_worst"])
-                                             if m.get("days_late_worst") is not None else None),
-                         "labor_cost_usd": m.get("labor_cost_usd")})
-
-    dated = [o for o in outcomes if o.get("finish_date")]
+    dated = [r for r in rows if r.get("finish_date")]
     if not dated:
-        return {"status": "no_dates", "samples": n, "seed": seed,
+        return {"status": "no_dates", "policy": policy_name, "samples": samples,
                 "why": "抽到的每一轮都推不出完工日（机种没有可推演的 BOM/依据）→ 给不出分布",
-                "bindings_seen": sorted({str(o.get("binding")) for o in outcomes})}
-    ordered = sorted(dated, key=lambda o: str(o["finish_date"]))
-    lates = [float(o["days_late_worst"] or 0) for o in ordered]
+                "bindings_seen": sorted({str(r.get("binding")) for r in rows})}
+    ordered = sorted(dated, key=lambda r: str(r["finish_date"]))
+    lates = [float(r["days_late_worst"] or 0) for r in ordered]
     # 承诺日 = 每抽的（完工日 − 该抽延误）取最早：这台机被承诺到哪天才叫"准点"
-    due = min(date.fromisoformat(str(o["finish_date"])) - timedelta(days=int(o["days_late_worst"] or 0))
-              for o in dated)
+    due = min(date.fromisoformat(str(r["finish_date"])) - timedelta(days=int(r["days_late_worst"] or 0))
+              for r in dated)
 
     def pct(frac: float) -> Dict[str, Any]:
         idx = min(len(ordered) - 1, max(0, int(round(frac * (len(ordered) - 1)))))
@@ -690,29 +655,161 @@ async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
     p_on_time = round(sum(1 for x in lates if x <= 0) / len(lates), 3)
     p_late7 = round(sum(1 for x in lates if x > 7) / len(lates), 3)
     by_att: Dict[float, List[float]] = {}
-    for o in dated:
-        by_att.setdefault(float(o["attendance"]), []).append(float(o["days_late_worst"] or 0))
+    for r in dated:
+        by_att.setdefault(float(r["attendance"]), []).append(float(r["days_late_worst"] or 0))
     return {
-        "status": "ok", "factory_id": factory_id, "models": models,
-        "samples": n, "seed": seed, "with_date": len(dated), "no_date": n - len(dated),
-        "policy": pol["name"], "promise_date": str(due),
-        "percentiles": [pct(0.10), pct(0.50), pct(0.90)],
+        "status": "ok", "factory_id": factory_id, "models": models, "policy": policy_name,
+        "samples": samples, "seed": seed, "with_date": len(dated), "no_date": len(rows) - len(dated),
+        "promise_date": str(due), "percentiles": [pct(0.10), pct(0.50), pct(0.90)],
         "p_on_time": p_on_time, "p_late_gt_7_days": p_late7,
         "days_late_min": min(lates), "days_late_max": max(lates),
+        "rough_days": round(max(lates) - min(lates), 1),
         "worst_seen": {"finish_date": str(ordered[-1]["finish_date"]),
                        "days_late_worst": ordered[-1]["days_late_worst"]},
         "by_attendance": [{"attendance": k, "samples": len(v),
                            "mean_days_late": round(sum(v) / len(v), 2),
                            "share_of_samples": round(len(v) / len(dated), 3)}
                           for k, v in sorted(by_att.items())],
-        "bands_used": {"purchase_lead_time": round(lead_band, 3), "unit_work_hours": round(hours_band, 3),
-                       "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS), "equipment_plus_minus": 0.02},
-        "basis": ("提前期按 lead_error_band(覆盖率)、工时按每台机自己的 hours_error_band，"
-                  "两者都取这批里最差的那条；到岗按天气标定三档离散抽；设备可用率=台账实测 ±2pp。"
-                  "没有引入新的分布假设，种子固定可重算。"),
+        "bands_used": bands, "basis": with_date_note,
         "how_to_quote": ("引用时给 P50、P90 与准点概率三件；P90 与 P50 差几天就是这条交期的毛边，"
                          "只报 P50 等于把毛边藏起来"),
-        "reading": (f"{n} 抽 {len(dated)} 次有完工日：P50={pct(0.50)['finish_date']}、"
+        "reading": (f"{samples} 抽 {len(dated)} 次有完工日：P50={pct(0.50)['finish_date']}、"
                     f"P90={pct(0.90)['finish_date']}（承诺 {due}）；准点概率 {p_on_time:.0%}，"
                     f"延超过 7 天概率 {p_late7:.0%}；延误跨度 {min(lates):g}~{max(lates):g} 天"),
     }
+
+
+def _risk_draws(n: int, seed: int, *, lead_band: float, hours_band: float,
+                base_equip: float) -> List[Dict[str, Any]]:
+    """抽出一串固定的工况序列（到岗/提前期/工时/设备）。
+
+    多条政策共用**同一串**：各抽各的再相减，差里混着抽样噪声，会被读成政策的功效；
+    同序配对之后，逐抽之差才是这一档政策在那种工况下买到的天数。
+    """
+    import random
+
+    rng = random.Random(seed)
+    draws: List[Dict[str, Any]] = []
+    for _ in range(n):
+        draws.append({"attendance": rng.choice(RISK_ATTENDANCE_LEVELS),
+                      "lead_multiplier": round(1.0 + rng.uniform(-lead_band, lead_band), 4),
+                      "hours_multiplier": round(1.0 + rng.uniform(-hours_band, hours_band), 4),
+                      "equip_rate": round(max(0.05, min(1.0, base_equip + rng.uniform(-0.02, 0.02))), 4)})
+    return draws
+
+
+def _paired_delta(base_rows: List[Dict[str, Any]], other_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """同序配对后的逐抽差：正数=这一档政策把延误压掉几天。"""
+    pairs = [(a, b) for a, b in zip(base_rows, other_rows)
+             if a.get("days_late_worst") is not None and b.get("days_late_worst") is not None]
+    if not pairs:
+        return {"computable": False, "why": "两条政策没有可配对的同抽读数"}
+    saved = sorted(round(float(a["days_late_worst"]) - float(b["days_late_worst"]), 2) for a, b in pairs)
+    n = len(saved)
+    half = n // 2
+    median = saved[half] if n % 2 else round((saved[half - 1] + saved[half]) / 2.0, 2)
+    # 天数是"少延误为好"(基准−对照)，钱是"多花为负"(对照−基准)：两个方向不能套同一个减法
+    extra = sorted(round((float(b.get("expedite_cost_usd") or 0) + float(b.get("line_activation_cost_usd") or 0))
+                         - (float(a.get("expedite_cost_usd") or 0) + float(a.get("line_activation_cost_usd") or 0)), 2)
+                   for a, b in pairs)
+    cost_median = extra[half] if n % 2 else round((extra[half - 1] + extra[half]) / 2.0, 2)
+    return {"computable": True, "paired_draws": n,
+            "days_saved_min": saved[0], "days_saved_median": median,
+            "days_saved_p90": saved[min(n - 1, int(round(0.90 * (n - 1))))], "days_saved_max": saved[-1],
+            "draws_where_it_helps": sum(1 for x in saved if x > 0),
+            "draws_where_it_is_neutral": sum(1 for x in saved if x == 0),
+            "draws_where_it_is_worse": sum(1 for x in saved if x < 0),
+            "median_extra_cost_usd": cost_median,
+            "cost_per_day_saved_usd": (round(cost_median / median, 2) if median else None),
+            "note": ("逐抽同序配对：>0 是这一档真买到的时间；<0 说明某些工况下它反而拖后 —— "
+                     "只看两个分布的分位数相减会把这两种情况抹平")}
+
+
+async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
+                        days_of_output: float = 6.0, lead_margin: Optional[float] = None,
+                        policy: Optional[Dict[str, Any]] = None, samples: int = 48,
+                        seed: int = 20261008,
+                        against: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """把"可信到几成"换成一条日期分布：按已声明的误差带抽样，给 P50/P90 与准点概率。
+
+    不确定度传导只有一个标量（±1.6 天），而决策要问的是"这版完工日有几成概率赶上承诺"。
+    抽样不加新假设：提前期与工时按**每台机自己那条依据**允许的误差均匀抽（借同族路线 ±40%、
+    自家路线 ±5%，一批机型共用乘子所以取最差那条），到岗按天气标定三档离散抽（不是正态），
+    设备可用率按台账实测 ±2pp。种子固定 —— 这条分布必须能被重算核对。
+
+    `against` 给一两档政策（如 {"name":"加急到 7 天","expedite_lead_days":7}）时，
+    它们与基准共用同一串抽样，返回里给出同序配对的"每天数收窄"与中位多花的钱 ——
+    这才是"这笔加急费买到的毛边收窄几天"。
+    """
+    margin = lead_margin if lead_margin is not None else vr.PROMISE_LEAD_MARGIN
+    pol = policy or {"name": "基准政策（分批开工）", "allow_partial": True}
+    n = max(6, min(200, int(samples)))
+    targets = await vr.derive_targets(db, factory_id, models,
+                                      days_of_output=days_of_output, lead_margin=margin)
+    base_eq = float((await vr.equipment_rate(db, factory_id)).get("rate") or 1.0)
+    acc = await mapping_accuracy(db, factory_id, models)
+    per_model = acc.get("models") or []
+    hours_band = max([float(m.get("hours_error_band") or 0.0) for m in per_model] or [0.0])
+    lead_band = max([lead_error_band(float((m.get("components") or {}).get("lead_time", {})
+                                         .get("score") or 0)) for m in per_model] or [0.20])
+    bands = {"purchase_lead_time": round(lead_band, 3), "unit_work_hours": round(hours_band, 3),
+             "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS), "equipment_plus_minus": 0.02}
+    basis_note = ("提前期按 lead_error_band(覆盖率)、工时按每台机自己的 hours_error_band，"
+                  "两者都取这批里最差的那条；到岗按天气标定三档离散抽；设备可用率=台账实测 ±2pp。"
+                  "没有引入新的分布假设，种子固定可重算。")
+    draws = _risk_draws(n, seed, lead_band=lead_band, hours_band=hours_band, base_equip=base_eq)
+
+    async def sample(one_policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for d in draws:
+            perturb = {k: v for k, v in d.items() if k != "attendance"}
+            m = await _run_one(db, factory_id, targets, one_policy,
+                               attendance=d["attendance"], perturb=perturb)
+            rows.append({"attendance": d["attendance"], **perturb, "binding": m.get("binding"),
+                         "finish_date": m.get("finish_date"),
+                         "days_late_worst": (float(m["days_late_worst"])
+                                             if m.get("days_late_worst") is not None else None),
+                         "labor_cost_usd": m.get("labor_cost_usd"),
+                         "expedite_cost_usd": m.get("expedite_cost_usd"),
+                         "line_activation_cost_usd": m.get("line_activation_cost_usd")})
+        return rows
+
+    base_rows = await sample(pol)
+    out = _risk_summary(base_rows, factory_id=factory_id, models=models, policy_name=pol["name"],
+                        samples=n, seed=seed, bands=bands, with_date_note=basis_note)
+    if out.get("status") != "ok":
+        out["against"] = []
+        return out
+
+    comparisons: List[Dict[str, Any]] = []
+    for alt in (against or []):
+        one = {**pol, **alt}
+        name = str(one.get("name") or f"政策 {alt}")
+        alt_rows = await sample(one)
+        alt_sum = _risk_summary(alt_rows, factory_id=factory_id, models=models, policy_name=name,
+                               samples=n, seed=seed, bands=bands, with_date_note=basis_note)
+        paired = _paired_delta(base_rows, alt_rows)
+        entry = {"policy": name, "settings": {k: v for k, v in alt.items() if k != "name"}}
+        if alt_sum.get("status") != "ok":
+            entry["status"] = alt_sum.get("status")
+            entry["why"] = alt_sum.get("why")
+        else:
+            entry.update({
+                "status": "ok", "percentiles": alt_sum["percentiles"],
+                "p_on_time": alt_sum["p_on_time"], "p_late_gt_7_days": alt_sum["p_late_gt_7_days"],
+                "rough_days": alt_sum["rough_days"], "reading": alt_sum["reading"],
+                "paired": paired,
+                "rough_days_narrowed": (round(float(out["rough_days"]) - float(alt_sum["rough_days"]), 1)
+                                        if out.get("rough_days") is not None else None),
+            })
+            if paired.get("computable") and paired.get("days_saved_median"):
+                entry["headline"] = (f"同序配对：{paired['paired_draws']} 抽里 {paired['draws_where_it_helps']} 抽"
+                                     f"买到时间、{paired['draws_where_it_is_worse']} 抽反而拖后，"
+                                     f"中位数省 {paired['days_saved_median']:g} 天"
+                                     f"（P90 那抽省 {paired['days_saved_p90']:g} 天）；"
+                                     f"中位多花 ${paired['median_extra_cost_usd']:,.0f}"
+                                     + (f"，每省一天约 ${paired['cost_per_day_saved_usd']:,.0f}"
+                                        if paired.get("cost_per_day_saved_usd") else ""))
+        comparisons.append(entry)
+    out["against"] = comparisons
+    return out

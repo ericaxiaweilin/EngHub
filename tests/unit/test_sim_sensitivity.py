@@ -363,3 +363,102 @@ def test_free_data_band_step_is_not_reported_as_a_free_purchase():
          "expedite_delta_usd": 0.0, "activation_delta_usd": 8730.0, "on_time_models": 4},
     ]
     assert ss.slope_per_step(rows2, paid, 1.0)["cost_note"] is None
+
+
+def test_against_policies_are_sampled_on_the_same_draws_not_two_independent_runs(monkeypatch):
+    """比两条政策必须同序配对：各抽各的分位数相减，会把抽样噪声算成政策功效。"""
+    import asyncio
+    from datetime import date, timedelta
+
+    base_lates = [20.0, 23.0, 38.0, 21.0]
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "hours_error_band": 0.3,
+                            "components": {"lead_time": {"score": 1.0}}}]}
+
+    calls = []
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        calls.append((str(policy.get("name")), attendance, perturb["lead_multiplier"]))
+        late = (base_lates[calls.count(("现况", attendance, perturb["lead_multiplier"])) - 1]
+                if policy.get("name") == "现况" else base_lates[len(calls) // 2 % 4] - 5.0)
+        due = date(2026, 1, 1) + timedelta(days=23)
+        return {"finish_date": str(due + timedelta(days=int(late))), "days_late_worst": late,
+                "labor_cost_usd": 1000.0,
+                "expedite_cost_usd": (0.0 if policy.get("name") == "现况" else 6030.0),
+                "line_activation_cost_usd": 0.0, "binding": "material_arrival"}
+
+    monkeypatch.setattr(ss.vr, "derive_targets", fake_targets)
+    monkeypatch.setattr(ss.vr, "equipment_rate", fake_equip)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+    out = asyncio.run(ss.schedule_risk(
+        None, "FAC", ["M-1"], samples=8, seed=3,
+        policy={"name": "现况", "allow_partial": True},
+        against=[{"name": "加急到 7 天", "expedite_lead_days": 7}]))
+    assert out["status"] == "ok"
+    assert len(out["against"]) == 1
+    alt = out["against"][0]
+    assert alt["status"] == "ok" and alt["settings"] == {"expedite_lead_days": 7}
+    p = alt["paired"]
+    assert p["computable"] and p["paired_draws"] == 8
+    # 同序：每一抽的抽样工况一模一样，只有政策不同
+    seq_base = [c[1:] for c in calls if c[0] == "现况"]
+    seq_alt = [c[1:] for c in calls if c[0] == "加急到 7 天"]
+    assert seq_base == seq_alt, "两条政策必须共用同一串抽样"
+    assert p["days_saved_median"] > 0 and p["median_extra_cost_usd"] == 6030.0
+    assert "同序配对" in alt["headline"] and "每省一天" in alt["headline"]
+
+
+def test_schedule_risk_rejects_a_malformed_against_list(monkeypatch):
+    """against 只能按 JSON 数组传；传错了要 422 点名，不能悄悄当成"没有对照"。"""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from api.routes.pmc_routes import get_sim_schedule_risk
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "hours_error_band": 0.3,
+                            "components": {"lead_time": {"score": 1.0}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        return {"finish_date": "2026-01-20", "days_late_worst": 5.0, "labor_cost_usd": 1.0,
+                "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0, "binding": "line_declared"}
+
+    async def fake_default_models(db, fid, n=5):
+        return ["M-1"]
+
+    monkeypatch.setattr(ss.vr, "derive_targets", fake_targets)
+    monkeypatch.setattr(ss.vr, "equipment_rate", fake_equip)
+    monkeypatch.setattr(ss.vr, "default_models", fake_default_models)   # 路由里那句 import 在调用时才解析
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+    async def call(against_value):
+        return await get_sim_schedule_risk("FAC", n_models=1, samples=6, seed=1,
+                                           against=against_value, db=None, current_user=None)
+
+    for bad in ("{不是JSON}", '[1,2]', '"加急"'):
+        try:
+            asyncio.run(call(bad))
+            raise AssertionError(f"坏输入被放过了：{bad}")
+        except HTTPException as exc:
+            assert exc.status_code == 422 and "against" in str(exc.detail)
+
+    ok = asyncio.run(call('[{"name":"加急到 7 天","expedite_lead_days":7}]'))
+    assert ok["status"] == "ok" and len(ok["against"]) == 1
+    empty = asyncio.run(call(""))
+    assert empty["status"] == "ok" and empty["against"] == []
