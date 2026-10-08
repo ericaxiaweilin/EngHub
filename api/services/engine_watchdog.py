@@ -491,6 +491,23 @@ SUPPLIER_GAP_SQL = """
       AND COALESCE(m.default_supplier, '') = ''
 """
 
+# 开放母单里的机种有没有被某条线的档案认领（can_make_models）——
+# 没认领的单在沙箱里 line=null，到岗/班组/人力动作全都乘不上，产能只按路线工时走
+LINE_CLAIM_SQL = """
+    SELECT count(DISTINCT p.product_code) AS unclaimed_models,
+           count(*) AS orders,
+           COALESCE(SUM(o.planned_qty), 0) AS units,
+           array_agg(DISTINCT p.product_code) AS codes
+    FROM work_orders o
+    JOIN products p ON p.id = o.product_id
+    WHERE o.factory_id = :fid AND o.wo_type = 'master'
+      AND o.status IN ('pending', 'released', 'in_progress')
+      AND NOT EXISTS (SELECT 1 FROM line_profiles lp
+                      WHERE lp.factory_id = o.factory_id
+                        AND COALESCE(lp.can_make_models::text, '') LIKE '%' || p.product_code || '%')
+"""
+
+
 TEMPERATURE_OBSERVATION_SQL = """
     SELECT (SELECT count(*) FROM equipment_readings er
               WHERE er.factory_id = :fid
@@ -545,6 +562,7 @@ MOB_CONTRADICTION_SQL = """
 # 光看"没报"分不出这两种，而分不出就自动关闭会把"暂时没查"写成"已经修好"，补数据的人
 # 丢的正是那条待办。所以这一组只刷新、不关闭；要真收掉得有人明确判一次。
 MIN_ATTENDANCE_DAYS_FOR_SLOPE = 3
+MIN_UNCLAIMED_MODELS = 1
 
 DATA_LOOPS = frozenset({
     "kit_line_generation", "kit_line_missing", "supplier_master",
@@ -579,10 +597,12 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     lead = (await db.execute(text(LEAD_DEFAULT_SQL), {"fid": factory_id})).mappings().first()
     mob = (await db.execute(text(MOB_CONTRADICTION_SQL), {"fid": factory_id})).mappings().first()
     wc = (await db.execute(text(TEMPERATURE_OBSERVATION_SQL), {"fid": factory_id})).mappings().first()
+    claim = (await db.execute(text(LINE_CLAIM_SQL), {"fid": factory_id})).mappings().first()
     if evaluated_out is not None:
         evaluated_out.update({"kit_line_generation", "supplier_master",
                               "lead_time_evidence", "material_make_or_buy_conflict",
-                              "candidate_rules", "working_conditions_evidence"})
+                              "candidate_rules", "working_conditions_evidence",
+                              "line_profile_coverage"})
     try:
         from core.mes.action_constraints import action_constraints
 
@@ -613,7 +633,7 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
-                        wc=dict(wc or {}),
+                        wc=dict(wc or {}), claim=dict(claim or {}),
                         pending=list(pending or []), mp=dict(mp or {}),
                         evaluated_out=evaluated_out)
 
@@ -625,6 +645,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  pending: Optional[List[Dict[str, Any]]] = None,
                  mp: Optional[Dict[str, Any]] = None,
                  wc: Optional[Dict[str, Any]] = None,
+                 claim: Optional[Dict[str, Any]] = None,
                  evaluated_out: Optional[set] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
 
@@ -662,6 +683,30 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  "reading_rows": int(wc.get("reading_rows") or 0),
                  "attendance_days": int(wc.get("attendance_days") or 0),
                  "declared_slope_pp_per_c": 1.0},
+            ))
+
+    if claim is not None:
+        ev.add("line_profile_coverage")
+        unclaimed = int(claim.get("unclaimed_models") or 0)
+        if unclaimed >= MIN_UNCLAIMED_MODELS:
+            codes = [str(c) for c in (claim.get("codes") or [])][:6]
+            out.append(_gap(
+                "line_profile_coverage", "open_orders_without_line_profile", f"models|{unclaimed // 2}",
+                f"补数据｜{unclaimed} 个在流程单没有线档案认领（沙箱里 line=null）",
+                ("这些机种有 pending/released/in_progress 的母单，但 line_profiles 里没有任何一条线的 "
+                 "can_make_models 写着它 —— 推演时 `pick_line` 找不到线，只能按路线工时推进："
+                 "**到岗曲线、班组人数、加班/双班/借人这些人力动作在这张单上乘不上**，"
+                 "工况缺勤也算不出交期影响（读数会写 line=null）。"
+                 f"\n涉及的机种：{('、'.join(codes))}；开放母单 {int(claim.get('orders') or 0)} 张、"
+                 f"{int(float(claim.get('units') or 0))} 台。"
+                 "\n补法：在 line_profiles 里把这些机种加进实际做它的那条线（或新建线档案声明 "
+                 "units_per_day/crew_size/hours_per_day），补完这条待办自动关。"
+                 "在此之前，这些单的产能读数是**工时推的**，不是线能力算的，别对外说算过产能。"),
+                "这些单的人力/工况约束在引擎里是盲区：加班、借人、闷热天扣人都算不出效果",
+                "run_sandbox",
+                "把这些机种登记进对应线档案的 can_make_models，并核对 units_per_day/crew_size",
+                {"unclaimed_models": unclaimed, "orders": int(claim.get("orders") or 0),
+                 "units": int(float(claim.get("units") or 0)), "codes": codes},
             ))
 
     stale = int(gen.get("stale_gen") or 0)

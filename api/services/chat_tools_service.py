@@ -2092,19 +2092,23 @@ async def _tool_query_working_condition_impact(
         "wait_days_for_material": r.get("wait_days_for_material"),
         "bottleneck_part": (r.get("bottleneck_part") or {}).get("material_code"),
         "people_present_avg": r.get("people_present_avg"),
+        "line": r.get("line") if isinstance(r.get("line"), str) else None,
+        "capacity_basis": r.get("capacity_basis"),
     } for i, r in enumerate(hot_runs)]
     no_change_reason = None
     if comparable and sum(abs(int(d or 0)) for d in delta_days) == 0:
         binds = sorted({str(o.get("capacity_binding")) for o in per_order if o.get("capacity_binding")})
-        zero_crew = [str(o.get("model_code")) for o in per_order
-                     if float(o.get("people_present_avg") or 0.0) <= 0.0]
+        # 到底是"没人可扣"还是"根本没有线档案认领这台机种"，看的是 run 里的 line，不是我猜的
+        unclaimed = [str(o.get("model_code")) for o in per_order if not o.get("line")]
         parts = []
         if binds:
             parts.append("卡点写着 " + "、".join(binds))
-        if zero_crew:
-            parts.append(f"其中 {len(zero_crew)} 个机种所在线「在册人数为 0」"
-                         f"（{('、'.join(zero_crew[:3]))}{'…' if len(zero_crew) > 3 else ''}）"
-                         "—— 到岗曲线乘的是在册班组，没人可扣所以改不动完工日；这是人数数据缺口，不是高温无害")
+        if unclaimed:
+            parts.append(f"其中 {len(unclaimed)} 个机种**没有任何线档案认领**"
+                         f"（{('、'.join(unclaimed[:3]))}{'…' if len(unclaimed) > 3 else ''}，"
+                         "沙箱返回 line=null）—— 这些单是按路线工时推进的，"
+                         "到岗曲线与班组都乘不上，所以热不热都不动完工日；"
+                         "这是线档案覆盖缺口，不是高温无害")
         no_change_reason = ("完工日没变：" + ("；".join(parts) if parts else "这批单的约束不是人手")
                             + "。少来的工时落在待命上，别把这条读成「高温没代价」")
     if not comparable:
