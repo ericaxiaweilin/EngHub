@@ -889,6 +889,28 @@ async def get_kit_coverage_gap(
     return await kit_coverage_gap(db, factory_id, per_model=per_model, max_orders=max_orders)
 
 
+@router.get("/stale-followup-review",
+            summary="判不动的 blocked 积压（默认只预演）：payload 里没有类别也没有工单号的那些")
+async def get_stale_followup_review(
+    factory_id: str = Query(..., description="厂区"),
+    apply: bool = Query(False, description="false=只出清单与判定；true 才批量作废（改状态，不删行）"),
+    older_than_days: int = Query(30, ge=1, le=365, description="挂了几天以上才算积压"),
+    limit: int = Query(200, ge=1, le=500, description="本轮最多看多少条"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """收件箱里有一类条目引擎既不能关也不能追：没有任何可判依据的 blocked 积压。
+
+    处置只有"作废并写明原因"一种：删行会让历史跟进变成孤儿，挂着会让人读成有人在处理。
+    默认 apply=false —— 批量改一百多条人看得见的状态，清单得先给人看过。
+    """
+    del current_user
+    from api.services.followup_lifecycle import plan_stale_blocked
+
+    return await plan_stale_blocked(db, factory_id, older_than_days=older_than_days,
+                                    limit=limit, apply=apply)
+
+
 @router.get("/delivery-accuracy",
             summary="交期准度账本（留痕法）：引擎当时说了哪天交 vs 实际哪天完工")
 async def get_delivery_accuracy(

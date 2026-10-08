@@ -140,6 +140,156 @@ def veto_model_closure(new_status: str, conclusion: Dict[str, Any],
     return "open"
 
 
+def _no_evidence(row: Dict[str, Any]) -> bool:
+    """这条 blocked 待办还有没有能判它的依据：payload 里既没类别也没工单号就是没有。
+
+    8 月那批 agent 待办全是这样（跟进 33-38 轮后停住），引擎既不能说它做完了，
+    也不该让它永远挂在收件箱里冒充"有人在处理"。
+    """
+    payload = row.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload or "{}")
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+    payload = payload or {}
+    return not str(payload.get("category") or "") and not str(payload.get("work_order_id") or "")
+
+
+STALE_BLOCKED_SQL = text("""
+    SELECT id, factory_id, title, description, agent_key, status, block_reason,
+           follow_count, max_follows, assigned_to, payload, created_at, last_follow_at
+    FROM followup_tasks
+    WHERE factory_id = :fid AND status = 'blocked'
+      AND created_at < NOW() - make_interval(days => :days)
+    ORDER BY created_at ASC
+    LIMIT :lim
+""")
+
+
+async def plan_stale_blocked(db: AsyncSession, factory_id: str, *,
+                             older_than_days: int = 30, limit: int = 200,
+                             apply: bool = False) -> Dict[str, Any]:
+    """把"判不动的 blocked 积压"处置成作废并写明原因 —— 不删行。
+
+    为什么默认只预演：这是批量改状态（一百多条人看得见的条目），
+    判据只能是"没有任何可判依据 + 挂了 N 天"，动库前得有人先看过那份清单。
+    作废而不是删除：删了以后没人知道这里曾经有过什么，跟进日志也会跟着变孤儿。
+    """
+    rows = [dict(r) for r in (await db.execute(
+        STALE_BLOCKED_SQL, {"fid": factory_id, "days": max(1, int(older_than_days)),
+                            "lim": max(1, int(limit))})).mappings().all()]
+    stale = [r for r in rows if _no_evidence(r)]
+    by_agent: Dict[str, int] = {}
+    for r in stale:
+        key = str(r.get("agent_key") or "(未归口)")
+        by_agent[key] = by_agent.get(key, 0) + 1
+    note = (f"作废：这条 blocked 待办挂在收件箱里已 {older_than_days} 天以上，payload 里没有类别"
+            "也没有工单号，引擎无法用任何台账证据证明它做过或还没做。"
+            "跟进轮数已停住，留在这里会让人读成「有人在处理」。")
+    out: Dict[str, Any] = {
+        "factory_id": factory_id, "apply": apply, "action": "cancel_with_note",
+        "examined": len(rows), "candidates": len(stale),
+        "by_agent": dict(sorted(by_agent.items(), key=lambda kv: -kv[1])),
+        "oldest": str(stale[0]["created_at"]) if stale else None,
+        "newest": str(stale[-1]["created_at"]) if stale else None,
+        "samples": [{"title": str(r.get("title") or "")[:70],
+                     "agent_key": r.get("agent_key"), "follow_count": r.get("follow_count"),
+                     "created_at": str(r.get("created_at"))} for r in stale[:10]],
+        "note": note,
+        "rule": ("判不动的积压只朝一个方向处置：作废并写明「判不动」的原因，不删行、"
+                 "不改任何工单或台账；有依据的（带 category/work_order_id）不在这一格动。"),
+    }
+    if not apply or not stale:
+        return out
+    for r in stale:
+        await db.execute(text("""
+            UPDATE followup_tasks
+            SET status = 'cancelled', closed_at = NOW(), next_follow_at = NULL,
+                last_follow_note = :note, result_summary = :note, updated_at = NOW()
+            WHERE id = :id AND status = 'blocked'
+        """), {"note": note, "id": str(r["id"])})
+        await _log(db, str(r["id"]), factory_id, "stale_blocked_cancel", note,
+                   "cancelled", float(r.get("progress_pct") or 0))
+    await db.commit()
+    return out
+
+
+def _no_evidence(row: Dict[str, Any]) -> bool:
+    """这条 blocked 待办还有没有能判它的依据：payload 里既没类别也没工单号就是没有。
+
+    8 月那批 agent 待办全是这样（跟进 33-38 轮后停住），引擎既不能说它做完了，
+    也不该让它永远挂在收件箱里冒充"有人在处理"。
+    """
+    payload = row.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload or "{}")
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+    payload = payload or {}
+    return not str(payload.get("category") or "") and not str(payload.get("work_order_id") or "")
+
+
+STALE_BLOCKED_SQL = text("""
+    SELECT id, factory_id, title, description, agent_key, status, block_reason,
+           follow_count, max_follows, assigned_to, payload, created_at, last_follow_at
+    FROM followup_tasks
+    WHERE factory_id = :fid AND status = 'blocked'
+      AND created_at < NOW() - make_interval(days => :days)
+    ORDER BY created_at ASC
+    LIMIT :lim
+""")
+
+
+async def plan_stale_blocked(db: AsyncSession, factory_id: str, *,
+                             older_than_days: int = 30, limit: int = 200,
+                             apply: bool = False) -> Dict[str, Any]:
+    """把"判不动的 blocked 积压"处置成作废并写明原因 —— 不删行。
+
+    为什么默认只预演：这是批量改状态（一百多条人看得见的条目），
+    判据只能是"没有任何可判依据 + 挂了 N 天"，动库前得有人先看过那份清单。
+    作废而不是删除：删了以后没人知道这里曾经有过什么，跟进日志也会跟着变孤儿。
+    """
+    rows = [dict(r) for r in (await db.execute(
+        STALE_BLOCKED_SQL, {"fid": factory_id, "days": max(1, int(older_than_days)),
+                            "lim": max(1, int(limit))})).mappings().all()]
+    stale = [r for r in rows if _no_evidence(r)]
+    by_agent: Dict[str, int] = {}
+    for r in stale:
+        key = str(r.get("agent_key") or "(未归口)")
+        by_agent[key] = by_agent.get(key, 0) + 1
+    note = (f"作废：这条 blocked 待办挂在收件箱里已 {older_than_days} 天以上，payload 里没有类别"
+            "也没有工单号，引擎无法用任何台账证据证明它做过或还没做。"
+            "跟进轮数已停住，留在这里会让人读成「有人在处理」。")
+    out: Dict[str, Any] = {
+        "factory_id": factory_id, "apply": apply, "action": "cancel_with_note",
+        "examined": len(rows), "candidates": len(stale),
+        "by_agent": dict(sorted(by_agent.items(), key=lambda kv: -kv[1])),
+        "oldest": str(stale[0]["created_at"]) if stale else None,
+        "newest": str(stale[-1]["created_at"]) if stale else None,
+        "samples": [{"title": str(r.get("title") or "")[:70],
+                     "agent_key": r.get("agent_key"), "follow_count": r.get("follow_count"),
+                     "created_at": str(r.get("created_at"))} for r in stale[:10]],
+        "note": note,
+        "rule": ("判不动的积压只朝一个方向处置：作废并写明「判不动」的原因，不删行、"
+                 "不改任何工单或台账；有依据的（带 category/work_order_id）不在这一格动。"),
+    }
+    if not apply or not stale:
+        return out
+    for r in stale:
+        await db.execute(text("""
+            UPDATE followup_tasks
+            SET status = 'cancelled', closed_at = NOW(), next_follow_at = NULL,
+                last_follow_note = :note, result_summary = :note, updated_at = NOW()
+            WHERE id = :id AND status = 'blocked'
+        """), {"note": note, "id": str(r["id"])})
+        await _log(db, str(r["id"]), factory_id, "stale_blocked_cancel", note,
+                   "cancelled", float(r.get("progress_pct") or 0))
+    await db.commit()
+    return out
+
+
 async def blocked_shortage_tasks(db: AsyncSession, factory_id: str,
                                  *, limit: int = 80) -> list:
     """升级后停在 blocked 的缺料催办：它们不进跟进扫描（跟进是给 open 的），
