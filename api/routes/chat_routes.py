@@ -1051,11 +1051,18 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         headline = (f"多延 {extra} 天" if extra > 0
                     else ("没有延期变化" if result.get("no_change_reason") else "无变化"))
         secs = att.get("by_section") or []
+        hc = att.get("headcount") or {}
+        heads = int(hc.get("heads") or 0)
+        scope_word = "该段" if str(hc.get("scope")) == "section" else "该厂"
+        head_line = (f"｜{scope_word}每天排班约 {heads} 人（台账实测）→ 约 "
+                     f"{round((1.0 - float(att.get('under_conditions') or 0)) * heads)} 人这天请不到"
+                     if hc.get("available") and heads > 0 else
+                     "｜没折算人头：" + str(hc.get("why") or "台账里取不到每天排班人数"))
         att_line = (f"- 到岗：{round(float(att.get('normal') or 0) * 100, 2)}%"
                     f"（{'段 ' + str(att.get('section')) if att.get('scope') == 'section' else '全厂'}"
                     f"台账基线）→ {round(float(att.get('under_conditions') or 0) * 100, 2)}%"
                     f"（这条工况）｜WBGT {att.get('wbgt_c')}℃ vs "
-                    f"{att.get('metabolic_level')} 档限值 {att.get('tlv_wbgt_c')}℃")
+                    f"{att.get('metabolic_level')} 档限值 {att.get('tlv_wbgt_c')}℃{head_line}")
         section_line = ("- 段级最紧的："
                         + "、".join(f"{x['section']} {round(x['under_conditions_presence'] * 100, 1)}%"
                                     for x in secs[:3])

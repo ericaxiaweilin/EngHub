@@ -1766,6 +1766,25 @@ async def _get_user_by_name(db: AsyncSession, operator: str) -> Optional[User]:
     return (await db.execute(select(User).where(User.username == operator))).scalar_one_or_none()
 
 
+def _absence_headcount_phrase(hc: Optional[Dict[str, Any]], predicted_rate: Optional[float],
+                              increment_pp: Optional[float]) -> str:
+    """把缺勤百分率落成"少来几个人"：乘数是台账里每天真正排班的人数，不是"按 100 人"。
+
+    以前这三处读数都按 100 人折算，而金属厂台账里每天排班 800 多人、单个工段也有几十到几百人
+    —— 同一条工况的出勤代价被说小了一个数量级。取不到人头就明说不折算。
+    """
+    heads = int((hc or {}).get("heads") or 0)
+    if not hc or not hc.get("available") or heads <= 0:
+        return f"没折算人数：{(hc or {}).get('why') or '台账里取不到每天排班人数'}"
+    scope_word = "该段" if str(hc.get("scope")) == "section" else "该厂"
+    bits = [f"{scope_word}每天排班约 {heads} 人（attendance 台账实测，不是按 100 人折算）"]
+    if predicted_rate is not None:
+        bits.append(f"预测约 {round(float(predicted_rate) * heads, 1)} 人请不到")
+    if increment_pp:
+        bits.append(f"其中这条工况多带走 {round(float(increment_pp) / 100.0 * heads, 1)} 人")
+    return "，".join(bits)
+
+
 async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any], operator: str,
                                           factory_id: Optional[str] = None) -> Dict[str, Any]:
     """运行 Sim-ERP 合规仿真（直连引擎），落审计记录并返回判定摘要。"""
@@ -1802,8 +1821,11 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     # 出勤基线只能从台账取（规则包里不写死）：换厂区就是换一个实测数，取不到就只报增量
     from core.mes.data_evidence import absence_baseline
 
+    from core.mes.data_evidence import scheduled_headcount
+
     scope = await _factory_scoped_id(db, args, factory_id)
     ledger = await absence_baseline(db, scope["factory_id"])
+    heads = await scheduled_headcount(db, scope["factory_id"])
     plugins = _sim_registry.create_many(DEFAULT_SIM_PLUGINS)
     record = _sim_engine.evaluate(phys, plugins, attendance_baseline=ledger)
 
@@ -1884,8 +1906,7 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
     if ai.get("predicted_absence_rate") is not None:
         att_effect = (f"出勤 {round(float(ai['baseline_absence_rate']) * 100, 2)}%（台账基线）→ "
                       f"{round(float(ai['predicted_absence_rate']) * 100, 2)}%"
-                      f"（这条工况加 {ai['increment_pp']} 个百分点，100 人里约 "
-                      f"{round(float(ai['predicted_absence_rate']) * 100, 1)} 人请不到）")
+                      + f"（{_absence_headcount_phrase(heads, ai.get('predicted_absence_rate'), ai.get('increment_pp'))}）")
     elif ai.get("increment_pp"):
         att_effect = (f"缺勤增量 {ai['increment_pp']} 个百分点，但 {ai.get('no_baseline_reason') or '没有台账基线'}")
     result = {
@@ -1944,14 +1965,18 @@ async def _tool_run_compliance_simulation(db: AsyncSession, args: Dict[str, Any]
                    f"{round(float(snap.attendance_impact['predicted_absence_range'][0]) * 100, 2)}%~"
                    f"{round(float(snap.attendance_impact['predicted_absence_range'][1]) * 100, 2)}%）"
                    if snap.attendance_impact.get("predicted_absence_range") else "")
-                + f"；按 100 人算约 {round(float(snap.attendance_impact['predicted_absence_rate']) * 100, 1)} 人请不到"
+                + f"；{_absence_headcount_phrase(heads, snap.attendance_impact.get('predicted_absence_rate'), snap.attendance_impact.get('increment_pp'))}"
                 + ("（台账各天请假率持平，给不出浮动区间）"
                    if snap.attendance_impact.get("baseline_band_flat") else "")
             ) if (snap.attendance_impact or {}).get("predicted_absence_rate") is not None else (
                 f"缺勤增量 {((snap.attendance_impact or {}).get('increment_pp'))} 个百分点"
                 "（没有台账基线，只给增量不给总缺勤率）")),
-            "headcount_hint": ("按 100 人折算的请不到人数；乘实际人数就是这条工况的出勤代价，"
-                               "排产要减人的那部分不是效率折扣，是可用人头"),
+            "headcount": ({"heads": heads.get("heads"), "scope": heads.get("scope"),
+                          "section": heads.get("section"), "basis": heads.get("basis"),
+                          "available": bool(heads.get("available")),
+                          "why": heads.get("why")} if heads else None),
+            "headcount_hint": ("请不到人数是按 attendance 台账里每天真正排班的工号数折算的（见 headcount）；"
+                               "取不到人头就只报百分点。排产要减的那部分不是效率折扣，是可用人头"),
         },
         "max_required_break_minutes": arb.max_required_break_minutes,
         "total_penalty_score": arb.total_penalty_score,
@@ -2039,7 +2064,8 @@ async def _tool_query_working_condition_impact(
         hum = 60.0
 
     from api.services.virtual_run import run_sandbox
-    from core.mes.data_evidence import absence_baseline, workforce_presence_under_conditions
+    from core.mes.data_evidence import (absence_baseline, scheduled_headcount,
+                                        workforce_presence_under_conditions)
 
     ledger_all = await absence_baseline(db, fid)
     # 原话里的"X段"未必正好是台账的段名（"厂涂装" vs "涂装"）→ 用真实段名反查，认不到就报段名清单
@@ -2058,6 +2084,7 @@ async def _tool_query_working_condition_impact(
             "hint": ("想看全厂就别传 section；想看某一段就用上面列出的段名"
                      if ledger.get("sections_seen") else
                      "这个厂区没有打卡行，缺勤基线无从观测")}, scope)
+    heads = await scheduled_headcount(db, fid, section=resolved)
     under = await workforce_presence_under_conditions(
         db, fid, temperature_c=float(temp), humidity_percent=hum,
         task_type=str(args.get("task_type") or "assembly"),
@@ -2180,14 +2207,19 @@ async def _tool_query_working_condition_impact(
                        "wbgt_c": under["wbgt_c"], "tlv_wbgt_c": under["tlv_wbgt_c"],
                        "metabolic_level": under["metabolic_level"],
                        "work_efficiency": under["work_efficiency"],
-                       "slope_status": under["slope_status"]},
+                       "slope_status": under["slope_status"],
+                       # 到岗率要乘在真人数上：这个人头也来自 attendance 台账（distinct 工号/天）
+                       "headcount": {"heads": heads.get("heads"), "scope": heads.get("scope"),
+                                     "section": heads.get("section"), "basis": heads.get("basis"),
+                                     "available": bool(heads.get("available")),
+                                     "why": heads.get("why")}},
         "normal": b, "under_conditions": h,
         "per_order": per_order, "no_change_reason": no_change_reason,
         "extra_days_per_order": delta_days,
         "extra_total_days_late": (int(h["total_days_late"] or 0) - int(b["total_days_late"] or 0)),
         "reading": (f"{float(temp):g}℃/{hum:g}% 到岗从 {round((1.0 - float(ledger['rate'])) * 100, 2)}% 掉到 "
-                    f"{round(float(under['present_ratio']) * 100, 2)}%（每 100 人少 "
-                    f"{round(float(under['predicted_absence_rate']) * 100 - float(ledger['rate']) * 100, 1)} 人）→ "
+                    f"{round(float(under['present_ratio']) * 100, 2)}%"
+                    f"（{_absence_headcount_phrase(heads, under['predicted_absence_rate'], under.get('increment_pp'))}）→ "
                     f"这批单完工天数 {'、'.join(str(d) for d in delta_days)} 天变化，"
                     f"迟交合计 {'+' if (h['total_days_late'] or 0) >= (b['total_days_late'] or 0) else ''}"
                     f"{int(h['total_days_late'] or 0) - int(b['total_days_late'] or 0)} 天"),
@@ -5161,6 +5193,45 @@ def _extract_model_keyword(message: str) -> Optional[str]:
     return name.group(1) if name else None
 
 
+# 温度已经给出时，这些问题必须由引擎回答（合规判定、工休、出勤、交期都来自同一套依据）
+# 工段锤/矩阵那种"要看某张单的证据矩阵"的问题不被温度抢走；
+# 插单影响不在这里豁免 —— 它齐不齐参数由 _rush_intent_args 判，齐了才归它，
+# 否则一条"40度涂装段还能干吗、这批单会延几天"会因为句里有"会延几"而被截给插单工具，
+# 插单工具又因缺数量返回 None，最后模型自由发挥编出一套延误天数。
+_HEAT_PREEMPT_EXEMPT = frozenset({"query_pmc_work_matrix"})
+_WORK_CONDITION_WORDS = (
+    "能干", "还能", "干得动", "干不动", "要不要休", "要休多久", "休息", "工休", "连续作业",
+    "出勤", "缺勤", "延几", "会延", "推迟", "赶不上", "中暑", "热不热", "车间温度", "体感",
+)
+
+
+def _asks_working_condition(message: str) -> bool:
+    return any(w in (message or "") for w in _WORK_CONDITION_WORDS)
+
+
+def _rush_intent_args(message: str) -> Dict[str, Any]:
+    """插单影响的参数：数量、机种、交期、占用比例。
+
+    机种只认"产品：X"或编码/中文机种名，认不到就留空 —— 由台账解析或干脆不跑，
+    不在这里替厂里选一个机种。
+    """
+    out: Dict[str, Any] = {}
+    quantity_match = re.search(r"(\d+)\s*(?:台|件|pcs|个|数量)", message or "", flags=re.IGNORECASE)
+    if quantity_match:
+        out["quantity"] = int(quantity_match.group(1))
+    product_match = re.search(r"(?:产品|product(?:_id)?)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{2,})",
+                              message or "", flags=re.IGNORECASE)
+    keyword = product_match.group(1) if product_match else _extract_model_keyword(message)
+    if keyword:
+        out["product_id"] = keyword
+    due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message or "")
+    if due_match:
+        out["due_date"] = due_match.group(1)
+    share_match = re.search(r"(?:占|占用)\s*(\d+(?:\.\d+)?)\s*%\s*(?:产能)?", message or "")
+    out["capacity_share"] = float(share_match.group(1)) / 100 if share_match else 1.0
+    return out
+
+
 def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
     """确定性意图解析：命中业务关键词返回 {"tool", "args"}，否则 None。
 
@@ -5181,6 +5252,18 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
                       if k in ("temperature_c", "humidity_percent", "continuous_work_minutes",
                                "task_type")}
         return {"tool": "run_workflow", "args": {"workflow_name": wf_name, "params": params}}
+
+    # 句子里点了车间温度、问的是"还能干吗/延几天"时，必须由引擎回答：
+    # 让"这批单""工单"这些词把问题截成普通工单查询，模型就会自己编一套涂装车间的延误天数
+    # （2026-10-08 实测发生过：40度/90%/涂装段 → 模型答"延 1.5~3 天"，一个数都不是台账来的）。
+    heat = extract_heat_scenario(message)
+    if "temperature_c" in heat and _asks_working_condition(message):
+        preempt = detect_intent_tool(message)
+        rush_args = _rush_intent_args(message) if preempt == "query_pmc_rush_impact" else None
+        if rush_args and rush_args.get("quantity") and rush_args.get("product_id"):
+            pass          # 点名了数量与机种的插单问题归插单影响工具，它自己也带温度无关的产能依据
+        elif preempt is None or preempt not in _HEAT_PREEMPT_EXEMPT:
+            return {"tool": "run_compliance_simulation", "args": heat}
 
     tool = detect_intent_tool(message)
     if not tool:
@@ -5302,18 +5385,7 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if due_match:
             args["rush_due_date"] = due_match.group(1)
     elif tool == "query_pmc_rush_impact":
-        quantity_match = re.search(r"(\d+)\s*(?:台|件|pcs|个|数量)", message, flags=re.IGNORECASE)
-        if quantity_match:
-            args["quantity"] = int(quantity_match.group(1))
-        product_match = re.search(r"(?:产品|product(?:_id)?)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{2,})", message, flags=re.IGNORECASE)
-        keyword = product_match.group(1) if product_match else _extract_model_keyword(message)
-        if keyword:
-            args["product_id"] = keyword
-        due_match = re.search(r"(20\d{2}-\d{2}-\d{2})", message)
-        if due_match:
-            args["due_date"] = due_match.group(1)
-        share_match = re.search(r"(?:占|占用)\s*(\d+(?:\.\d+)?)\s*%\s*(?:产能)?", message)
-        args["capacity_share"] = float(share_match.group(1)) / 100 if share_match else 1.0
+        args.update(_rush_intent_args(message))
     elif tool == "query_pmc_work_matrix":
         wo_code = _extract_wo_code(message)
         if not wo_code:

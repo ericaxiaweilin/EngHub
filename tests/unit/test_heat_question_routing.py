@@ -51,3 +51,42 @@ def test_section_word_is_carried_to_the_engine():
     assert "涂装" in extract_heat_scenario("机械厂涂装段车间38度、湿度70%，还开得起吗")["section"]
     # 但"连续干3小时"里的"小时"不是段
     assert "section" not in extract_heat_scenario("车间38度、装配岗连续干3小时合规吗")
+
+
+def test_temperature_question_beats_a_work_order_keyword():
+    """点了车间温度又问"还能干吗/延几天"的问题必须由引擎答。
+
+    实测事故：「40度、湿度90%，涂装段还能干吗？这批单会延几天？」里"会延几"先命中插单关键词，
+    插单工具又因为没给数量返回 None，于是整条确定性路径让位给模型 —— 模型编出一套
+    "涂装节拍下降 30~50%、延 1.5~3 天"，一个数都不是台账来的。
+    """
+    from api.services.chat_tools_service import _resolve_intent_keyword
+
+    hit = _resolve_intent_keyword("40度、湿度90%，涂装段还能干吗？这批单会延几天？")
+    assert hit["tool"] == "run_compliance_simulation"
+    assert hit["args"]["temperature_c"] == 40.0 and hit["args"]["humidity_percent"] == 90.0
+    assert "涂装" in str(hit["args"].get("section"))
+
+
+def test_complete_rush_question_still_goes_to_the_rush_tool():
+    """给了数量与机种的插单问题不被温度抢走（它自己就是产能题，且参数齐）。"""
+    from api.services.chat_tools_service import _resolve_intent_keyword
+
+    hit = _resolve_intent_keyword("插单 500 台 A-50-04-F 会延几天")
+    assert hit["tool"] == "query_pmc_rush_impact"
+    assert hit["args"]["quantity"] == 500 and hit["args"]["product_id"] == "A-50-04-F"
+
+
+def test_temperature_without_a_condition_question_is_not_forced_into_the_engine():
+    """只有温度、没问工况后果（能干吗/要不要休/延几天）就不抢模型的活。"""
+    from api.services.chat_tools_service import _asks_working_condition, _resolve_intent_keyword
+
+    assert _asks_working_condition("烘干炉设定 40 度是多少") is False
+    assert _resolve_intent_keyword("烘干炉设定 40 度是多少") is None
+
+
+def test_work_matrix_question_keeps_its_own_route():
+    """工段锤/矩阵那种"看这张单的证据"的问题不因句中出现温度就被改成合规仿真。"""
+    from api.services.chat_tools_service import _HEAT_PREEMPT_EXEMPT
+
+    assert "query_pmc_work_matrix" in _HEAT_PREEMPT_EXEMPT

@@ -353,6 +353,33 @@ ATT_ABSENCE_DAILY_SQL = text("""
     FROM d
 """)
 
+# 一天真正排班多少人：工况的出勤代价要乘的是这个数，不是"按 100 人"这种方便数字。
+# 只数 distinct 工号（一个人一天多条打卡行也只算一个人），并要求当天人数够门槛 —— 个位数
+# 的日子平均进去会把段里真实的人头摊薄。
+ATT_HEADCOUNT_SQL = text("""
+    WITH d AS (
+        SELECT a.date, count(DISTINCT a.operator_id) AS heads
+        FROM attendance a WHERE a.factory_id = :fid
+        GROUP BY 1 HAVING count(DISTINCT a.operator_id) >= :min_heads
+    )
+    SELECT count(*) AS days, round(avg(heads)) AS mean_heads, max(heads) AS peak_heads,
+           min(heads) AS low_heads FROM d
+""")
+
+ATT_HEADCOUNT_BY_SECTION_SQL = text("""
+    WITH d AS (
+        SELECT h.station AS section, a.date, count(DISTINCT a.operator_id) AS heads
+        FROM attendance a
+        JOIN operators o ON o.id = a.operator_id
+        JOIN hr_employees h ON h.factory_id = o.factory_id
+             AND (h.employee_code = o.employee_id OR h.id::text = o.employee_id)
+        WHERE a.factory_id = :fid
+        GROUP BY 1,2 HAVING count(DISTINCT a.operator_id) >= :min_heads
+    )
+    SELECT section, count(*) AS days, round(avg(heads)) AS mean_heads, max(heads) AS peak_heads
+    FROM d GROUP BY 1 ORDER BY avg(heads) DESC
+""")
+
 ATT_SUMMARY_SQL = text("""
     SELECT count(*) AS rows, count(DISTINCT operator_id) AS people, count(DISTINCT date) AS days,
            min(date)::text AS from_day, max(date)::text AS to_day,
@@ -623,6 +650,56 @@ async def absence_baseline(db: AsyncSession, factory_id: str, *,
                              "所以温度→缺勤的斜率拿这张表验证不了，只能当声明值")
                             if (dmin is not None and dmax is not None and abs(dmax - dmin) < 1e-9)
                             else "日级请假率有浮动，可用来对照温度读数（仍需逐日车间温度实测才能回归）"),
+    }
+
+
+async def scheduled_headcount(db: AsyncSession, factory_id: str, *,
+                              section: Optional[str] = None,
+                              min_heads: int = 50) -> Dict[str, Any]:
+    """这条工况影响的是多少人：attendance 台账里一天真正排班的 distinct 工号数。
+
+    答复里要把"预测缺勤 5.91%"落成"少来几个人"，那个乘数必须有出处。以前写的是"按 100 人"，
+    而台账里金属厂每天排班 800 多人、单个工段也有几十到几百人 —— 用 100 会把同一条工况的
+    出勤代价说小一个数量级。取不到人头就只报百分点，不折算人数。
+    """
+    if section:
+        rows = [dict(r) for r in (await db.execute(
+            ATT_HEADCOUNT_BY_SECTION_SQL, {"fid": factory_id, "min_heads": min_heads}
+        )).mappings().all()]
+        hit = [r for r in rows if str(r.get("section")) == str(section)]
+        if not hit:
+            return {"available": False, "factory_id": factory_id, "section": str(section),
+                    "heads": None,
+                    "sections_seen": sorted({str(r.get("section")) for r in rows if r.get("section")})[:20],
+                    "why": (f"段「{section}」在 attendance 里没有一天排班满 {min_heads} 人的记录 "
+                            f"（台账里能看到这些段：{('、'.join(sorted({str(r.get('section')) for r in rows if r.get('section')})) or '无')}）")}
+        row = hit[0]
+        heads = int(row.get("mean_heads") or 0)
+        if heads <= 0:
+            return {"available": False, "factory_id": factory_id, "section": str(section),
+                    "heads": None, "why": f"段「{section}」的排班人数算不出（台账行为空）"}
+        return {
+            "available": True, "factory_id": factory_id, "scope": "section",
+            "section": str(section), "heads": heads,
+            "peak_heads": int(row.get("peak_heads") or 0), "days": int(row.get("days") or 0),
+            "basis": (f"attendance 台账实测（段 {section}）：{int(row.get('days') or 0)} 天里"
+                      f"平均每天排班 {heads} 人（最多 {int(row.get('peak_heads') or 0)} 人），"
+                      "按 distinct operator_id 计"),
+        }
+    row = dict((await db.execute(
+        ATT_HEADCOUNT_SQL, {"fid": factory_id, "min_heads": min_heads})).mappings().first() or {})
+    heads = int(row.get("mean_heads") or 0)
+    if heads <= 0:
+        return {"available": False, "factory_id": factory_id, "heads": None,
+                "why": (f"{factory_id} 在 attendance 里没有一天排班满 {min_heads} 人的日子 → "
+                        "折算人数没有依据，只报百分点")}
+    return {
+        "available": True, "factory_id": factory_id, "scope": "factory", "section": None,
+        "heads": heads, "peak_heads": int(row.get("peak_heads") or 0),
+        "low_heads": int(row.get("low_heads") or 0), "days": int(row.get("days") or 0),
+        "basis": (f"attendance 台账实测（全厂）：{int(row.get('days') or 0)} 天里平均每天排班 {heads} 人"
+                  f"（{int(row.get('low_heads') or 0)}~{int(row.get('peak_heads') or 0)} 人），"
+                  "按 distinct operator_id 计"),
     }
 
 
