@@ -27,6 +27,10 @@ class _Result:
     def scalar(self):
         return self._rows[0][0] if self._rows else None
 
+    def scalars(self):
+        # 回填链路会经 virtual_run.default_models，那条查询用的是 .scalars().all()
+        return self
+
     def first(self):
         # mappings().first() 要的是"一行记录"，本桩只喂得出列表行 —— 列表行不是记录，返回 None。
         for row in self._rows:
