@@ -147,6 +147,7 @@ export default function PmcWorkbench() {
       const pr: any = await api.get('/api/v1/pmc/measurement-priority', {
         params: { factory_id: factoryId, units: 1200 } })
       setRuleFlow({ questions: q?.open_questions || [], pending: q?.pending_candidates || [],
+                   capacity: q?.capacity_questions || null,
                    census: q?.workforce_census || null, events: e?.events || [],
                    staff: c?.attendance_observed || null,
                    otRule: (c?.actions || []).find((a: any) => a.action === 'add_overtime') || null,
@@ -459,7 +460,8 @@ export default function PmcWorkbench() {
               待确认 {(ruleFlow.pending || []).length} 条 · 近 30 天执行 {(ruleFlow.events || []).length} 次
             </Tag>}>
             {(ruleFlow.error || '') && <Text type="danger">{ruleFlow.error}</Text>}
-            {(ruleFlow.pending || []).length === 0 && (ruleFlow.questions || []).length === 0 && (
+            {(ruleFlow.pending || []).length === 0 && (ruleFlow.questions || []).length === 0
+              && !(ruleFlow.capacity?.questions || []).length && (
               <Text type="secondary">没有待确认的候选规律，也没有空白规则要问现场。</Text>
             )}
             {(ruleFlow.pending || []).length > 0 && (
@@ -480,6 +482,29 @@ export default function PmcWorkbench() {
                     </Space>
                   </List.Item>
                 )} />
+            )}
+            {!!(ruleFlow.capacity?.questions || []).length && (
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid rgba(255,255,255,0.09)' }}>
+                <Text strong style={{ fontSize: 12 }}>
+                  <WarningOutlined style={{ color: '#faad14' }} /> 产能口径还没人定过（引擎不敢替厂里选）
+                </Text>
+                <List
+                  size="small"
+                  dataSource={ruleFlow.capacity.questions}
+                  rowKey={(r: any) => r.topic}
+                  renderItem={(q: any) => (
+                    <List.Item>
+                      <Space direction="vertical" size={2}>
+                        <Text>{q.question}</Text>
+                        <Text type="secondary" style={{ fontSize: 12 }}>{q.why_it_matters}</Text>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          已查到：{q.prefilled_evidence}　·　要回答：{q.expected_answer}
+                        </Text>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              </div>
             )}
             {!!ruleFlow.staff && (
               <div style={{ marginTop: 8 }}>

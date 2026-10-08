@@ -424,8 +424,10 @@ async def open_questions(db: AsyncSession, factory_id: str, *,
                     "prefilled_evidence": hint,
                     "record_as": {"subject": action, "verdict": "allowed|forbidden|bounded",
                                   "status": "declared", "source": "chat"}})
+    cap_q = await capacity_questions(db, factory_id)
     pend = await pending_rules(db, factory_id, limit=10)
     return {"factory_id": factory_id, "line": line_code, "open_questions": out,
+            "capacity_questions": cap_q,
             "pending_candidates": pend,
             "confirm_how": "同意的用 confirm_rule(rule_id, agree=true) 升成 validated；"
                            "不对就 agree=false 驳回（留痕，不再反复问）",
@@ -434,6 +436,55 @@ async def open_questions(db: AsyncSession, factory_id: str, *,
             "workforce_census": census,
             "how_to_answer": "POST /api/v1/pmc/factory-rules 或在对话里直接回答，"
                              "助手用工具 record_factory_rule 落成 declared 规则"}
+
+
+async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str, Any]]:
+    """引擎要按产能算、但口径还没人定过的问题 —— 现场一句话就能定，定了产能才算得动。
+
+    为什么单列：这些不是"厂里还没写的规则"，是"数据结构没填/单位没说清"。
+    我拿 capacity_per_hour 乘班时能出一个数，但那个数是我猜的单位口径，
+    排产吃了它就是把猜测当事实。
+    """
+    from core.mes.data_evidence import line_claim_coverage
+
+    cov = await line_claim_coverage(db, factory_id)
+    out: List[Dict[str, Any]] = []
+    if int(cov.get("unclaimed_models") or 0) > 0:
+        codes = cov.get("unclaimed_codes") or []
+        out.append({
+            "topic": "line_claim",
+            "question": (f"{'、'.join(str(c) for c in codes[:4])}"
+                         f"{'…' if len(codes) > 4 else ''} 这几台机实际是哪条线做的？"
+                         f"（现在 {cov.get('unclaimed_models')} 个机种、"
+                         f"{cov.get('unclaimed_orders')} 张母单、{cov.get('unclaimed_units')} 台，"
+                         "line_profiles 里没有一条线认领它们）"),
+            "why_it_matters": ("这些单在推演里 line=null：日产能没有被线约束，时间线只是路线工时 + 来料日；"
+                               "加班、借人、双班、闷热天扣人这些人力动作在这张单上乘不上，"
+                               "所以现在给出的完工天数不能当线能力算过的数"),
+            "expected_answer": "机种 → 线编码（LINE-…），或说明它们本来就不走线（按工位做）",
+            "prefilled_evidence": cov.get("reading"),
+            "record_as": {"subject": "line_claim", "verdict": "declared", "status": "declared",
+                          "source": "chat"},
+        })
+    if cov.get("capacity_unit_ambiguous") or int(cov.get("station_capacity_rows") or 0) == 0:
+        out.append({
+            "topic": "station_capacity_basis",
+            "question": ("工位产能怎么算：stations.capacity_per_hour 是「每件每小时」还是「每线每小时」？"
+                         f"每站每天可用几小时、按几成效率算？（现在 {cov.get('stations')} 个站里 "
+                         f"station_capacity 填了 {cov.get('station_capacity_rows')} 个）"),
+            "why_it_matters": ("单位口径没定的时候，引擎不敢把 per_hour 乘班时当产能：那要么把「人」当「件」乘，"
+                               "要么把 6 成效率当 10 成。按工位走的机种（比如上面那几台）因此只能用路线工时推，"
+                               "算不出'这条工位最多一天出多少'"),
+            "expected_answer": "单位含义 + 每站可用工时 + 效率（或直接说按线算、工位不单独算）",
+            "prefilled_evidence": (f"capacity 单位在站间混用：{'、'.join(cov.get('capacity_unit_mix') or [])}"
+                                   if cov.get("capacity_unit_ambiguous") else
+                                   "capacity 单位一致，但 station_capacity 表没填每站工时与效率"),
+            "record_as": {"subject": "station_capacity_basis", "verdict": "declared",
+                          "status": "declared", "source": "chat"},
+        })
+    return {"questions": out, "coverage": cov,
+            "answer_how": ("同 capacity 口径这类问题，回答后用 record_factory_rule 落成 declared 规则；"
+                           "线认领关系要改的是 line_profiles（事实表），引擎不自动写")}
 
 
 async def record_candidates_from_census(db: AsyncSession, factory_id: str, *,

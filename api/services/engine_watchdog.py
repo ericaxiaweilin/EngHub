@@ -491,23 +491,6 @@ SUPPLIER_GAP_SQL = """
       AND COALESCE(m.default_supplier, '') = ''
 """
 
-# 开放母单里的机种有没有被某条线的档案认领（can_make_models）——
-# 没认领的单在沙箱里 line=null，到岗/班组/人力动作全都乘不上，产能只按路线工时走
-LINE_CLAIM_SQL = """
-    SELECT count(DISTINCT p.product_code) AS unclaimed_models,
-           count(*) AS orders,
-           COALESCE(SUM(o.planned_qty), 0) AS units,
-           array_agg(DISTINCT p.product_code) AS codes
-    FROM work_orders o
-    JOIN products p ON p.id = o.product_id
-    WHERE o.factory_id = :fid AND o.wo_type = 'master'
-      AND o.status IN ('pending', 'released', 'in_progress')
-      AND NOT EXISTS (SELECT 1 FROM line_profiles lp
-                      WHERE lp.factory_id = o.factory_id
-                        AND COALESCE(lp.can_make_models::text, '') LIKE '%' || p.product_code || '%')
-"""
-
-
 TEMPERATURE_OBSERVATION_SQL = """
     SELECT (SELECT count(*) FROM equipment_readings er
               WHERE er.factory_id = :fid
@@ -597,7 +580,9 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     lead = (await db.execute(text(LEAD_DEFAULT_SQL), {"fid": factory_id})).mappings().first()
     mob = (await db.execute(text(MOB_CONTRADICTION_SQL), {"fid": factory_id})).mappings().first()
     wc = (await db.execute(text(TEMPERATURE_OBSERVATION_SQL), {"fid": factory_id})).mappings().first()
-    claim = (await db.execute(text(LINE_CLAIM_SQL), {"fid": factory_id})).mappings().first()
+    from core.mes.data_evidence import line_claim_coverage
+
+    claim = await line_claim_coverage(db, factory_id)
     if evaluated_out is not None:
         evaluated_out.update({"kit_line_generation", "supplier_master",
                               "lead_time_evidence", "material_make_or_buy_conflict",
@@ -633,7 +618,7 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     ready = readiness_out if readiness_out is not None else await _readiness(db, factory_id)
     return gap_readings(gen=dict(gen or {}), sup=dict(sup or {}), ready=ready or {},
                         lead=dict(lead or {}), mob=dict(mob or {}), cons=dict(cons or {}),
-                        wc=dict(wc or {}), claim=dict(claim or {}),
+                        wc=dict(wc or {}), claim=claim or {},
                         pending=list(pending or []), mp=dict(mp or {}),
                         evaluated_out=evaluated_out)
 
@@ -698,7 +683,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  "**到岗曲线、班组人数、加班/双班/借人这些人力动作在这张单上乘不上**，"
                  "工况缺勤也算不出交期影响（读数会写 line=null）。"
                  f"\n涉及的机种：{('、'.join(codes))}；开放母单 {int(claim.get('orders') or 0)} 张、"
-                 f"{int(float(claim.get('units') or 0))} 台。"
+                 f"{int(float(claim.get('unclaimed_units') or 0))} 台。"
                  "\n能补的两件事，按顺序：① 在 line_profiles 里把这些机种加进实际做它的那条线"
                  "（或新建线档案声明 units_per_day/crew_size/hours_per_day）；"
                  "② 若它们其实按工位走，station_capacity 表现在是 **0 行**（没有 available_hours_per_day、"
@@ -710,8 +695,10 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                 "这些单的人力/工况约束在引擎里是盲区：加班、借人、闷热天扣人都算不出效果",
                 "run_sandbox",
                 "把这些机种登记进对应线档案的 can_make_models，并核对 units_per_day/crew_size",
-                {"unclaimed_models": unclaimed, "orders": int(claim.get("orders") or 0),
-                 "units": int(float(claim.get("units") or 0)), "codes": codes},
+                {"unclaimed_models": unclaimed, "orders": int(claim.get("unclaimed_orders") or 0),
+                 "units": int(float(claim.get("unclaimed_units") or 0)), "codes": codes,
+                 "stations": claim.get("stations"), "station_capacity_rows": claim.get("station_capacity_rows"),
+                 "capacity_unit_mix": claim.get("capacity_unit_mix")},
             ))
 
     stale = int(gen.get("stale_gen") or 0)

@@ -614,3 +614,65 @@ async def workforce_presence_under_conditions(
     if present is None:
         out["why"] = ai.get("no_baseline_reason")
     return out
+
+
+# 开放母单里的机种有没有被某条线的档案认领（can_make_models）：
+# 没认领的单在沙箱里 line=null，人力类动作全都乘不上（唯一口径放在这里，别处只调用）
+LINE_CLAIM_SQL = text("""
+    SELECT count(DISTINCT p.product_code) AS unclaimed_models,
+           count(*) AS orders,
+           COALESCE(SUM(o.planned_qty), 0) AS units,
+           array_agg(DISTINCT p.product_code) AS codes
+    FROM work_orders o
+    JOIN products p ON p.id = o.product_id
+    WHERE o.factory_id = :fid AND o.wo_type = 'master'
+      AND o.status IN ('pending', 'released', 'in_progress')
+      AND NOT EXISTS (SELECT 1 FROM line_profiles lp
+                      WHERE lp.factory_id = o.factory_id
+                        AND COALESCE(lp.can_make_models::text, '') LIKE '%' || p.product_code || '%')
+""")
+
+STATION_CAPACITY_SHAPE_SQL = text("""
+    SELECT s.capacity_unit AS unit, count(*) AS stations,
+           count(*) FILTER (WHERE COALESCE(s.capacity_per_hour, 0) > 0) AS with_per_hour,
+           count(*) FILTER (WHERE sc.station_id IS NOT NULL) AS with_capacity_row
+    FROM stations s LEFT JOIN station_capacity sc ON sc.station_id = s.id
+    WHERE s.factory_id = :fid
+    GROUP BY 1 ORDER BY 2 DESC
+""")
+
+
+async def line_claim_coverage(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """这些单的产能到底被什么约束过：有没有线认领、工位侧有没有填、单位口径是否统一。
+
+    只读数、不改表。工位级产能引擎现在不做折算 —— `capacity` 在车间写「人」、CNC 写「sets/day」，
+    capacity_per_hour 是每件每小时还是每线每小时没定过，口径没定就乘出来的数是我猜的。
+    """
+    row = dict((await db.execute(LINE_CLAIM_SQL, {"fid": factory_id})).mappings().first() or {})
+    shapes = [dict(r) for r in (await db.execute(STATION_CAPACITY_SHAPE_SQL,
+                                                 {"fid": factory_id})).mappings().all()]
+    unclaimed = int(row.get("unclaimed_models") or 0)
+    units_mix = [str(r.get("unit") or "") for r in shapes if (r.get("stations") or 0) >= 2]
+    return {
+        "factory_id": factory_id,
+        "unclaimed_models": unclaimed,
+        "unclaimed_orders": int(row.get("orders") or 0),
+        "unclaimed_units": int(float(row.get("units") or 0)),
+        "unclaimed_codes": [str(c) for c in (row.get("codes") or [])][:12],
+        "stations": sum(int(r.get("stations") or 0) for r in shapes),
+        "station_capacity_rows": sum(int(r.get("with_capacity_row") or 0) for r in shapes),
+        "stations_with_per_hour": sum(int(r.get("with_per_hour") or 0) for r in shapes),
+        "capacity_units": shapes,
+        "capacity_unit_mix": units_mix,
+        "capacity_unit_ambiguous": len(units_mix) > 1,
+        "reading": (
+            (f"{unclaimed} 个在流程单没有线档案认领（{int(row.get('orders') or 0)} 张母单、"
+             f"{int(float(row.get('units') or 0))} 台）→ 这些单在沙箱里 line=null，"
+             "产能只按路线工时推，人力动作乘不上"
+             if unclaimed else "在流程单都各有线档案认领（没有 line=null 的单）")
+            + f"；工位侧 {sum(int(r.get('stations') or 0) for r in shapes)} 个站里 "
+            f"station_capacity 填了 {sum(int(r.get('with_capacity_row') or 0) for r in shapes)} 个"
+            + ("，且 capacity 单位在站间不一致（" + "、".join(units_mix) + "）"
+               "→ 单位口径没定，引擎不做工位级折算" if len(units_mix) > 1
+               else "；单位口径一致，缺的是每站可用工时与效率（这张表没填）")),
+    }
