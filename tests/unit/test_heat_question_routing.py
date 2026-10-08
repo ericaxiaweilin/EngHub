@@ -90,3 +90,13 @@ def test_work_matrix_question_keeps_its_own_route():
     from api.services.chat_tools_service import _HEAT_PREEMPT_EXEMPT
 
     assert "query_pmc_work_matrix" in _HEAT_PREEMPT_EXEMPT
+
+
+def test_fewer_person_days_is_not_reported_as_cheaper_labour():
+    """闷热天人日反而变少时，读数必须说清那不是省人力（在岗的人少了、活摊长了）。"""
+    from api.routes.chat_routes import _person_days_note
+
+    down = _person_days_note({"person_days_total": 7053.1}, {"person_days_total": 6856.5})
+    assert "少 196.6 人日" in down and "不是省了人力" in down and "完工天数" in down
+    assert _person_days_note({"person_days_total": 7053.1}, {"person_days_total": 7400.0}) == ""
+    assert _person_days_note({}, {}) == ""

@@ -898,6 +898,24 @@ def _sim_default_labels(keys) -> str:
     return "、".join(_SIM_DEFAULT_LABELS.get(str(k), str(k)) for k in (keys or []) if str(k) not in skip)
 
 
+def _person_days_note(normal: Dict[str, Any], under: Dict[str, Any]) -> str:
+    """人日变少不等于省人力：这条读数容易被读成"高温天反而省事"。
+
+    人日 = 当天在岗人数 × 天数。闷热把到岗的人扣掉之后，同样的活要摊更久才做完，
+    两个方向相反的量合起来可能让总数略降 —— 那说的是"没来的人不记人日"，
+    不是"这单更省工"。所以变少时必须把方向讲出来。
+    """
+    try:
+        a = float(normal.get("person_days_total") or 0)
+        c = float(under.get("person_days_total") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not a or c >= a:
+        return ""
+    return (f"（少 {round(a - c, 1)} 人日不是省了人力：在岗的人少了、同样的活摊得更久，"
+            "没来的人不记人日 —— 要看的是完工天数与迟交天数变多）")
+
+
 def _format_rush_impact(result: Dict[str, Any]) -> str:
     """插单影响的答复：数字全来自 virtual_run.rush_impact()，缺依据时把缺哪一环说清楚。"""
     if result.get("error"):
@@ -1078,7 +1096,7 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
             f"- 完工：{'、'.join(str(x) for x in (b.get('finish_days') or []))} 天 → "
             f"{'、'.join(str(x) for x in (h.get('finish_days') or []))} 天"
             f"｜迟交合计 {b.get('total_days_late')} → {h.get('total_days_late')} 天"
-            f"｜用工 {b.get('person_days_total')} → {h.get('person_days_total')} 人日",
+            f"｜用工 {b.get('person_days_total')} → {h.get('person_days_total')} 人日{(_person_days_note(b, h))}",
             f"- 同一批人到岗时的效率另算：{round(float(att.get('work_efficiency') or 0) * 100)}%"
             "（这条不在天数里重复乘）",
             f"- 依据：{att.get('baseline_basis')}",
