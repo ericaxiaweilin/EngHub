@@ -1120,12 +1120,25 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
                         + "（工况前常态："
                         + "、".join(f"{x['section']} {round(x['normal_presence'] * 100, 1)}%"
                                     for x in secs[:3]) + "）") if secs else None
+        # 排产用的产能与工位自己声明的产能差几倍 —— 沙箱数与依据数并排说出来，别只报一边
+        conflicts = [o for o in (result.get("per_order") or [])
+                     if (o.get("line_vs_station") or {}).get("agrees") is False]
+        conflict_line = None
+        if conflicts:
+            worst = max(conflicts, key=lambda o: float((o["line_vs_station"] or {}).get("ratio_line_over_station") or 0))
+            wv = worst["line_vs_station"]
+            conflict_line = (f"- 产能两边对不上：{'、'.join(str(o.get('model_code')) for o in conflicts[:4])}"
+                             f" 按线档案排（{wv.get('line_declared_units_per_day')} 台/天），"
+                             f"但这些机的路线在自己工位上最多出 {wv.get('station_bound_units_per_day')} 台/天"
+                             f"（差 {wv.get('ratio_line_over_station')} 倍，最紧的是 "
+                             f"{wv.get('tight_station')}）→ 哪边是真的要厂里定，引擎不自己取小")
         lines = [
             f"工况对交期的影响：{headline}",
             f"- 工况：{cond.get('temperature_c')}℃、湿度 {cond.get('humidity_percent')}%、"
             f"{cond.get('task_type')}｜目标：{cond.get('targets_source')}",
             att_line,
             section_line,
+            conflict_line,
             f"- 完工：{'、'.join(str(x) for x in (b.get('finish_days') or []))} 天 → "
             f"{'、'.join(str(x) for x in (h.get('finish_days') or []))} 天"
             f"｜迟交合计 {b.get('total_days_late')} → {h.get('total_days_late')} 天"

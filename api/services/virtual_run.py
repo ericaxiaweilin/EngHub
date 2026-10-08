@@ -784,7 +784,12 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                                   f"（{station_cap.get('why')}）→ 日产能没有被约束，"
                                   "时间线只由路线工时 + 来料日推出来；加班/借人/双班/工况扣人乘不上")}
     else:
-        station_cap = None
+        # 有线档案时以前这里直接置 None —— 于是沙箱只说"这线一天 300 台"，
+        # 同一台机在自己工位上声明的数（实测 44 台/天）从没和它并列出现过。
+        # 产能决定权仍在线档案（那是厂里给的参数），这里只是把矛盾量出来给人看。
+        shift = census["shift_hours"]
+        station_hours = float(shift.get("hours") or 0.0) or hours_per_day
+        station_cap = station_route_capacity(route, census["stations"], station_hours)
     present, present_by_line = staffing_crew_factor(lines, line or {}, parallel_lines, staffing)
     crew = round(group_cap["crew"] * (1.0 + crew_bonus) * present, 1)
     cap_line = round(group_cap["units_per_day"] * max(0.1, min(1.0, equip_rate)), 2)  # 设备可用率折进日产能
@@ -923,6 +928,7 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         "capacity_after_equipment": cap,
         "capacity_basis": group_cap["capacity_basis"],
         "station_capacity": (station_cap if (line is None and station_cap) else None),
+        "line_vs_station": _line_station_conflict(group_cap, station_cap),
         "capacity_binding": capacity_binding,
         "capacity_line_declared": cap_line, "capacity_hours_implied": cap_hours,
         "standby_note": ("等料那几天这条线是空的；只有把整班人守着这条线才算损失。"
@@ -1959,6 +1965,30 @@ def capacity_limits(*, crew: float, hours_per_day: float, hours_per_unit: float,
             "line_declared": float(line_declared or 0), "hours_implied": hours_implied}
 
 
+def _line_station_conflict(line_cap: Dict[str, Any],
+                           station_cap: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """线声明的台/天 vs 同一条路线上工位自己声明的下界 —— 只量矛盾，不选真相。
+
+    取小等于把 `capacity_per_hour` 当已定义口径（它到底是整站还是每人，厂里从没说过，
+    两种读法差 164 倍）；取大等于没对撞。所以这里只把两个数与倍数交出去。
+    """
+    line_day = float((line_cap or {}).get("units_per_day") or 0)
+    station_day = float((station_cap or {}).get("units_per_day") or 0) if station_cap else 0.0
+    if line_day <= 0 or station_day <= 0:
+        return None
+    ratio = round(line_day / station_day, 2)
+    out = {"line_declared_units_per_day": round(line_day, 2),
+           "station_bound_units_per_day": round(station_day, 2),
+           "ratio_line_over_station": ratio,
+           "tight_station": (station_cap or {}).get("bottleneck_station"),
+           "agrees": ratio < 2.0}
+    if not out["agrees"]:
+        out["note"] = (f"沙箱按线档案的 {line_day:g} 台/天排产，但这台机的路线在自己工位上"
+                       f"最多出 {station_day:g} 台/天（最紧的是 {out['tight_station']}）→ 差 {ratio} 倍。"
+                       "两边都在台账里，哪边是真的要厂里定；引擎不自己取小也不自己取大")
+    return out
+
+
 def group_capacity(lines: List[Dict[str, Any]], line: Dict[str, Any],
                    parallel_lines: int) -> Dict[str, Any]:
     """并联产能只能按线组声明的合并产能算 —— 跑步机线 11h/300 台、bike 单线 400 台但
@@ -2351,6 +2381,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         "changeover_days_added": x["run"].get("changeover_days_added"),
                         "queue_days_before_this_order": x["run"].get("line_busy_days_before_order"),
                         "capacity_basis": x["run"].get("capacity_basis"),
+                        "line_vs_station": x["run"].get("line_vs_station"),
                         "capacity_binding": x["run"].get("capacity_binding"),
                         "work_days": x["run"].get("work_days"),
                         "started_on_day": x["run"].get("started_on_day"),

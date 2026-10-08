@@ -2174,6 +2174,8 @@ async def _tool_query_working_condition_impact(
         "people_present_avg": r.get("people_present_avg"),
         "line": r.get("line") if isinstance(r.get("line"), str) else None,
         "capacity_basis": r.get("capacity_basis"),
+        # 同一台机在线档案与工位表里差几倍：沙箱用的那一边必须让人看得见另一边
+        "line_vs_station": r.get("line_vs_station"),
     } for i, r in enumerate(hot_runs)]
     no_change_reason = None
     if comparable and sum(abs(int(d or 0)) for d in delta_days) == 0:

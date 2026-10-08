@@ -105,3 +105,31 @@ def test_architecture_model_carries_the_cross_check_and_the_open_question():
     assert "cross_check" in src
     sig = inspect.signature(capacity_cross_check)
     assert list(sig.parameters) == ["db", "factory_id", "max_models"]
+
+
+def test_run_target_reports_line_vs_station_without_choosing_a_side():
+    from api.services.virtual_run import _line_station_conflict
+
+    clash = _line_station_conflict({"units_per_day": 400.0},
+                                   {"units_per_day": 40.0, "bottleneck_station": "ST-JG-01"})
+    assert clash["agrees"] is False and clash["ratio_line_over_station"] == 10.0
+    assert "不自己取小" in clash["note"] and "ST-JG-01" in clash["note"]
+    # 线声明数不会因为工位侧更小而被偷偷替换
+    assert clash["line_declared_units_per_day"] == 400.0
+    ok = _line_station_conflict({"units_per_day": 300.0}, {"units_per_day": 260.0})
+    assert ok["agrees"] is True and "note" not in ok
+    assert _line_station_conflict({"units_per_day": 300.0}, None) is None
+    assert _line_station_conflict({"units_per_day": 0}, {"units_per_day": 40.0}) is None
+
+
+def test_run_target_still_computes_station_bound_when_a_line_exists():
+    """以前 line 存在时 station_cap 被置 None —— 于是两个数从没同时出现过。"""
+    import inspect
+
+    from api.services.virtual_run import run_target
+
+    src = inspect.getsource(run_target)
+    assert "station_cap = station_route_capacity(route, census[\"stations\"], station_hours)" in src
+    # 分支前的初始化可以留，但"有线就不算工位侧"那条置空不许回来
+    assert src.count("station_cap = None") == 1
+    assert '"line_vs_station": _line_station_conflict' in src
