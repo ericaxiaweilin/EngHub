@@ -593,12 +593,17 @@ KIT_REUPGRADE_MAX_LINES = 400
 
 async def reupgrade_stale_kit_lines(
     db: AsyncSession, factory_id: str, *, apply: Optional[bool] = None, limit: int = 20,
+    max_lines: int = 20,
 ) -> Dict[str, Any]:
     """把还停在旧登记世代的工单齐套表**补到多层结构**，一行老的都不动。
 
     为什么要补：70 张可比单里 64 张的领料行还停在 1-20 行（同机种按多层展开登记过的能到 680 行、
     深 9 层）。齐套表只看得到一小截结构，`台账缺口行覆盖率` 与瓶颈件一致率就被封顶 —— 判据读起来像
     "引擎不准"，实际是台账没跟上。
+
+    `max_lines` 是选单的那道闸：20（默认）只捞"停在旧世代"的薄单；放到 80 就同时捞
+    "看见了结构、但只登记了一小截"的单 —— 10-08 实测覆盖率 0.30（引擎 967 件缺口 vs 台账 290 行）
+    差的就是这一档。写入规则一模一样，还是只加不改不删。
 
     三条硬规矩：
     ① **只加不改不删**：已有的料号一律跳过（不重写 required/shortage），所以缺料只会因为看见更多行
@@ -611,7 +616,8 @@ async def reupgrade_stale_kit_lines(
     if apply is None:
         apply = KIT_REUPGRADE_APPLY
     rows = (await db.execute(text(STALE_KIT_SQL), {
-        "fid": factory_id, "limit": max(1, int(limit)), "max_lines": 20})).mappings().all()
+        "fid": factory_id, "limit": max(1, int(limit)),
+        "max_lines": max(1, min(200, int(max_lines)))})).mappings().all()
     receipt: Dict[str, Any] = {
         "factory_id": factory_id, "apply": apply, "dry_run": not apply,
         "orders_stale": len(rows), "orders_upgraded": 0, "lines_added": 0,

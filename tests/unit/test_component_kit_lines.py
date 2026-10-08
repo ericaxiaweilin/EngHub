@@ -156,3 +156,64 @@ async def test_retire_is_quiet_when_nothing_is_covered():
     assert receipt["status"] == "nothing_to_retire"
     assert receipt["covered_children_found"] == 0
     assert not [s for s, _ in db.sqls if s.strip().upper().startswith("UPDATE")]
+
+
+# ── 补登的选单闸：max_lines 要真的进到 SQL 参数里（否则"覆盖不足档"是假的）──────
+class _RecordingResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):        # execute 才是 await 的，mappings()/all() 是同步的
+        return self
+
+    def all(self):
+        return self._rows
+
+
+class _RecordingDb:
+    """只记参数不执行 SQL：断言的是"传进去的是什么"，不是"能不能跑通"。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def execute(self, stmt, params=None):
+        self.calls.append({"sql": str(stmt), "params": dict(params or {})})
+        if "WITH o AS" in str(stmt):          # 选单那条 SQL
+            return _RecordingResult([])
+        return _RecordingResult([])
+
+    async def commit(self):
+        pass
+
+    async def rollback(self):
+        pass
+
+
+def _run_reupgrade(**kw):
+    import asyncio
+
+    db = _RecordingDb()
+    out = asyncio.run(co.reupgrade_stale_kit_lines(db, "FAC_MECH_001", **kw))
+    return db, out
+
+
+def test_default_candidate_window_is_the_stale_generation_band():
+    db, out = _run_reupgrade(apply=False, limit=5)
+    pick = db.calls[0]["params"]
+    assert pick["max_lines"] == 20, pick
+    assert pick["limit"] == 5, pick
+    assert out["dry_run"] is True and out["orders_stale"] == 0
+
+
+def test_widened_window_is_what_reaches_the_under_registered_orders():
+    """覆盖率 0.30 那档要靠 max_lines=80 才捞得到单：闸没传下去就等于没这条路径。"""
+    db, _ = _run_reupgrade(apply=False, limit=8, max_lines=80)
+    assert db.calls[0]["params"]["max_lines"] == 80
+
+
+def test_candidate_window_is_clamped_not_trusted():
+    # 传 5000 行闸等于"把全厂都当成薄单"，那会把几十万次展开拉进一轮巡检
+    db, _ = _run_reupgrade(apply=False, limit=8, max_lines=5000)
+    assert db.calls[0]["params"]["max_lines"] == 200
+    db2, _ = _run_reupgrade(apply=False, limit=8, max_lines=0)
+    assert db2.calls[0]["params"]["max_lines"] == 1

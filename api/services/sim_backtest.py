@@ -131,6 +131,36 @@ ORDER_SHORT_SQL = """
 """
 
 
+def agreement_by_depth(per_order: List[Dict[str, Any]],
+                       depth_by_order: Dict[str, int]) -> Dict[str, Any]:
+    """把一致率按"这张单在台账里登记了多少行"分档 —— 用来判封顶的是算法还是登记深度。
+
+    为什么必须分档看：整池一致率 0.017 同时兼容两种解释（引擎真判错 / 台账没登记到位），
+    只有把单按登记深度切开，才知道补登记到底值不值。档位边界跟着选单闸走：
+    20 行以下是"停在旧世代"那一档，400 行以上是"刚被补登过"那一档。
+    """
+    bands = [("1-20 行（旧登记世代）", 1, 20), ("21-99 行", 21, 99),
+             ("100-399 行", 100, 399), ("≥400 行（补登过）", 400, 10 ** 9)]
+    out: Dict[str, Any] = {}
+    for label, lo, hi in bands:
+        sub = [x for x in per_order
+               if lo <= int(depth_by_order.get(str(x.get("work_order_id"))) or 0) <= hi]
+        if not sub:
+            continue
+        lead = sum(1 for x in sub if x.get("lead_agrees"))
+        qty = sum(1 for x in sub if x.get("qty_agrees"))
+        n = len(sub)
+        out[label] = {"orders": n, "lead_agree": lead, "qty_agree": qty,
+                      "lead_rate": round(lead / n, 3), "qty_rate": round(qty / n, 3)}
+    rates = [v["lead_rate"] for v in out.values()]
+    out["reading"] = ("各档一致率若随登记深度上升，封顶的就是登记深度（补登记有效）；"
+                      f"本轮各档提前期口径一致率 = "
+                      f"{ {k: v['lead_rate'] for k, v in out.items() if isinstance(v, dict)} }；"
+                      f"最低与最高档差 {round(max(rates) - min(rates), 3) if rates else None}"
+                      ) if out else "没有可比单，分不出来"
+    return out
+
+
 async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int = 120) -> Dict[str, Any]:
     """引擎选的那件料 vs 台账同一张单选的那件 —— 两种定义 + 排名重叠度一起算。
 
@@ -398,8 +428,20 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
         "所以这一格读的是『两种需求算法点的第一名是否相同』，不是引擎准不准；"
         "要判准不准，得先把齐套行按同一算法刷一遍")
 
+    # 各档登记深度：一次 GROUP BY，不重跑展开
+    depth_by_order: Dict[str, int] = {}
+    if per_order:
+        depth_by_order = {str(d["work_order_id"]): int(d["lines"] or 0) for d in
+                          (await db.execute(text("""
+                              SELECT w.work_order_id, COUNT(*) AS lines
+                              FROM work_order_materials w
+                              WHERE w.work_order_id = ANY(CAST(:ids AS text[]))
+                              GROUP BY 1
+                          """), {"ids": [x["work_order_id"] for x in per_order]})).mappings().all()}
+
     return {
         "orders_compared": n,
+        "agreement_by_registration_depth": agreement_by_depth(per_order, depth_by_order),
         "bom_universe": {
             "note": univ_note,
             "ledger_top_in_engine_bom": u_top,

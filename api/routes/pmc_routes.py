@@ -3,6 +3,8 @@
 from datetime import date
 from typing import Any, Dict, Optional
 
+import json
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -747,6 +749,7 @@ async def get_sim_schedule_risk(
     n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
     samples: int = Query(48, description="抽样次数（6~200；每抽一次真跑一遍沙箱）"),
     seed: int = Query(20261008, description="固定种子：同一批数据要能重算出同一条分布"),
+    against: str = Query("", description='同序配对比较的政策，JSON 数组，如 [{"name":"加急到 7 天","expedite_lead_days":7}]'),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -765,7 +768,16 @@ async def get_sim_schedule_risk(
     models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
     if not models:
         raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
-    return await schedule_risk(db, factory_id, models, samples=samples, seed=seed)
+    try:
+        alts = json.loads(against) if against.strip() else []
+    except ValueError as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"against 要的是 JSON 数组，不能被猜：{exc}") from exc
+    if not isinstance(alts, list) or any(not isinstance(x, dict) for x in alts):
+        raise HTTPException(status_code=422,
+                            detail='against 形如 [{"name":"加急到 7 天","expedite_lead_days":7}]')
+    return await schedule_risk(db, factory_id, models, samples=samples, seed=seed,
+                             against=alts or None)
 
 
 @router.get("/sim-sensitivity", summary="建模精度×敏感度：每个输入动一档，交期/准点/钱各变多少")
@@ -807,24 +819,26 @@ async def _engine_contract_call(iface: str, db: AsyncSession, factory_id: str,
         raise HTTPException(status_code=422, detail=exc.as_dict())
 
 
-@router.get("/kit-lines-reupgrade", summary="把停在旧登记世代的齐套表补到多层结构（默认只预演，只加不改不删）")
+@router.get("/kit-lines-reupgrade",
+            summary="把停在旧登记世代的工单齐套表补到多层结构（只加不改不删，默认只预演）")
 async def get_kit_lines_reupgrade(
     factory_id: str = Query(..., description="厂区"),
-    apply: bool = Query(False, description="false=只出预演不动库；true 才真的补行"),
-    limit: int = Query(20, ge=1, le=200, description="本轮最多看多少张单"),
+    apply: bool = Query(False, description="false=只预演；true 才写库（也受 ENGINE_KIT_REUPGRADE_APPLY 控制）"),
+    limit: int = Query(20, ge=1, le=200, description="本轮最多补几张单"),
+    max_lines: int = Query(20, ge=1, le=200,
+                           description="选单闸：台账现有齐套行数少于这个数的单才补（20=旧世代档，80=覆盖不足档）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-):
-    """L2B 的覆盖率与瓶颈件一致率被台账的**登记世代**压着：同机种按多层展开登记过的单能到 680 行，
-    而这些单只有十几行 —— 这一格给的是把结构补齐的那条路，不是再推演一遍。
+) -> Dict[str, Any]:
+    """只加行：已有的料号一律跳过，所以缺料只会因为看见更多行而变多，门不会因此放松。
 
-    只加不改不删：表里已有的料号一律跳过，所以缺料只会因为看见更多行而变多，
-    齐套门不会因为补登而放松；数量口径沿用 `_from_explosion` 那一条。
+    每张单最多补 400 行（磁盘寿命）。齐套门不会因为补登而放松；数量口径沿用 `_from_explosion` 那一条。
     """
     del current_user
     from api.services.component_orders import reupgrade_stale_kit_lines
 
-    return await reupgrade_stale_kit_lines(db, factory_id, apply=apply, limit=limit)
+    return await reupgrade_stale_kit_lines(db, factory_id, apply=apply, limit=limit,
+                                           max_lines=max_lines)
 
 
 @router.get("/kit-coverage-gap",
@@ -836,7 +850,7 @@ async def get_kit_coverage_gap(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """只读：覆盖率 + 写入成本 + 门本轮判定分布（放行洞与没依据分开报）。
+    """只读：覆盖率 + 写入成本 + 门本轮判定分布（放行洞与"没依据/已下达"分开报）。
 
     补登记会新增行、并把相关单变成不齐套，所以这里只给数与成本，不动库；
     真要补走 /kit-lines-reupgrade（显式开关 + 行上限）。
