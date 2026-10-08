@@ -561,7 +561,10 @@ STALE_KIT_SQL = """
 WITH o AS (
     SELECT w.id, w.work_order_code, w.product_id, w.planned_qty,
            COALESCE(pp.product_code, p.product_code, w.product_id) AS model,
-           COUNT(wm.id) AS kit_lines,
+           -- 选单闸数的是**外购行**：覆盖率、登记深度分档、L2B 说的都是外购缺口那一堆行，
+           -- 这里若数全部行（含自制），一张"外购只登记 150 行、自制登记 600 行"的单
+           -- 会被当成"已登记到位"永久跳过 —— 实测就是这样卡住了 45 张单。
+           COUNT(wm.id) FILTER (WHERE wm.item_type = 'buy') AS kit_lines,
            COALESCE(SUM(wm.shortage_qty) FILTER (WHERE COALESCE(wm.shortage_qty,0) > 0), 0) AS shortage_now
     FROM work_orders w
     LEFT JOIN work_order_materials wm ON wm.work_order_id = w.id
