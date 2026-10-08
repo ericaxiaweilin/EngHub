@@ -556,6 +556,30 @@ async def sensitivity(db: AsyncSession, factory_id: str,
                                             or vr.PROMISE_LEAD_MARGIN),
                           attendance=WEATHER.get(str(parsed["scope"].get("weather") or "fair"), 0.97))
     sens, acc, unc = rep["sensitivity"], rep["accuracy"], rep["uncertainty"]
+    inter = rep.get("interactions") or {}
+    # 组合效应只按受控词表出去：对不上业务名的杠杆宁可不说，也不能把内部键念给下游
+    solo_pub = {str(k): {"days_saved": v.get("days_saved"), "extra_cost_usd": v.get("cost_usd"),
+                         "label": v.get("label")}
+                for k, v in (inter.get("solo") or {}).items()}
+    interactions_pub: List[Dict[str, Any]] = []
+    for p in (inter.get("pairs") or []):
+        if p.get("status") != "ok":
+            continue
+        keys = [str(x) for x in (p.get("keys") or [])]
+        pub = [_public_input_for(k) for k in keys]
+        if any(x is None for x in pub):
+            continue
+        interactions_pub.append({
+            "inputs": pub, "labels": [solo_pub.get(k, {}).get("label") for k in keys],
+            "solo_days_saved": [solo_pub.get(k, {}).get("days_saved") for k in keys],
+            "solo_extra_cost_usd": [solo_pub.get(k, {}).get("extra_cost_usd") for k in keys],
+            "joint_days_saved": p.get("joint_days_saved"),
+            "interaction_days": p.get("interaction_days"),
+            "relation": p.get("relation"),
+            "joint_extra_cost_usd": (p.get("cost_usd") or {}).get("joint"),
+            "cost_double_counted_usd": (p.get("cost_usd") or {}).get("joint_minus_sum"),
+            "reading": p.get("reading"),
+        })
 
     rows: List[Dict[str, Any]] = []
     unavailable: List[Dict[str, Any]] = []
@@ -605,6 +629,14 @@ async def sensitivity(db: AsyncSession, factory_id: str,
         "ranking": [{"input": r["input"], "label": r["label"],
                      "days_per_step": r["days_per_step"], "step_like": r["step_like"]}
                     for r in ranked if abs(float(r["days_per_step"] or 0)) > 0],
+        "lever_interactions": interactions_pub,
+        "interaction_rule": {
+            "tolerance_days": inter.get("tolerance_days"),
+            "meaning": ("交互项 = 一起上买到的天数 − 各自上买到的天数之和。0=两把钥匙各开各的锁"
+                        "（钱可以分开算）；负=替代（同一个瓶颈，第二个白花钱）；"
+                        "正=互补（有先后，先上前提那个）"),
+            "money_basis": str((rep.get("economic_readiness") or {}).get("usable_for") or ""),
+        },
         "answer_confidence": {
             "uncertainty_days_worst_single_input": round(
                 max((float(x.get("uncertainty_days_now") or 0) for r in per_model
@@ -633,6 +665,8 @@ async def sensitivity(db: AsyncSession, factory_id: str,
                 "自制外购10/单价5 是本系统口径，改口径改 sim_sensitivity.ACCURACY_WEIGHTS"),
         _metric("台阶型输入数", sum(1 for r in rows if r["step_like"]), "个",
                 "近处 0 天、跨门槛那档才跳的曲线；按平均斜率引用会低报"),
+        _metric("杠杆组合测了几对", len(interactions_pub), "对",
+                "两把钥匙是不是开同一把锁：交互=一起上 −（各自上之和），只按受控词表里的输入名出去"),
     ]
     caveats = ["斜率只取基准两侧最近档：台阶型要看 days_at_steepest_step 并说明门槛在哪",
                str((rep.get("economic_readiness") or {}).get("usable_for") or ""),

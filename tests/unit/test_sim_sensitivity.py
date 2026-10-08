@@ -97,3 +97,111 @@ def test_every_lever_has_a_base_and_a_step():
         assert lever["step"] > 0 and lever["levels"]
         if lever["kind"] in ("ratio", "batch", "margin", "policy"):
             assert lever.get("base") is not None or lever["kind"] == "policy"
+
+
+def test_interaction_classifies_additive_substitutable_and_complementary():
+    """两把钥匙开同一把锁 → 第二个白花钱，这条必须能被分类出来。"""
+    kind, reading = ss.classify_interaction(0.0, 6.0, 0.0)
+    assert kind == "additive" and "分开算" in reading
+    kind, reading = ss.classify_interaction(-2.0, 6.0, 2.0)
+    assert kind == "substitutable" and "白花" in reading
+    kind, reading = ss.classify_interaction(3.0, 0.0, 0.0)
+    assert kind == "complementary" and "前提" in reading
+    # 一天以内的差值不解读：这套台账的分辨率不支持把它当成"互补"
+    assert ss.classify_interaction(0.4, 5.0, 5.0)[0] == "additive"
+
+
+def test_pairwise_scan_reads_joint_effect_off_the_same_path_as_solo(monkeypatch):
+    """Δ(AB) 必须与 Δ(A)、Δ(B) 走同一条推演路（scan_policies），不能另建一套算法。"""
+    import asyncio
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": m, "units": 1800, "due_in_days": 23} for m in models]
+
+    # 真实关系：卡的是料 —— 压提前期买 9 天，加班买 0 天，一起上还是 9 天
+    table = {
+        "": {"days_late_worst": 9.0, "labor_cost_usd": 100000.0, "expedite_cost_usd": 0.0,
+             "line_activation_cost_usd": 0.0, "finish_date": "2026-11-21", "binding": "line_declared"},
+        "expedite": {"days_late_worst": 0.0, "labor_cost_usd": 100000.0, "expedite_cost_usd": 6030.0,
+                     "line_activation_cost_usd": 0.0, "finish_date": "2026-11-12", "binding": "line_declared"},
+        "crew": {"days_late_worst": 9.0, "labor_cost_usd": 131428.0, "expedite_cost_usd": 0.0,
+                 "line_activation_cost_usd": 0.0, "finish_date": "2026-11-21", "binding": "line_declared"},
+        "parallel": {"days_late_worst": 9.0, "labor_cost_usd": 100000.0, "expedite_cost_usd": 0.0,
+                     "line_activation_cost_usd": 8730.0, "finish_date": "2026-11-21", "binding": "line_declared"},
+        "expedite+crew": {"days_late_worst": 0.0, "labor_cost_usd": 131428.0, "expedite_cost_usd": 6030.0,
+                          "line_activation_cost_usd": 0.0, "finish_date": "2026-11-12", "binding": "line_declared"},
+        "expedite+parallel": {"days_late_worst": 0.0, "labor_cost_usd": 100000.0, "expedite_cost_usd": 6030.0,
+                              "line_activation_cost_usd": 8730.0, "finish_date": "2026-11-12", "binding": "line_declared"},
+        "crew+parallel": {"days_late_worst": 9.0, "labor_cost_usd": 131428.0, "expedite_cost_usd": 0.0,
+                          "line_activation_cost_usd": 8730.0, "finish_date": "2026-11-21", "binding": "line_declared"},
+    }
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        keys = []
+        if policy.get("expedite_lead_days"):
+            keys.append("expedite")
+        if policy.get("crew_bonus"):
+            keys.append("crew")
+        if int(policy.get("parallel_lines") or 1) > 1:
+            keys.append("parallel")
+        return dict(table["+".join(keys)])
+
+    monkeypatch.setattr(ss.vr, "derive_targets", fake_targets)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+    out = asyncio.run(ss.interactions(None, "FAC_MECH_001", ["A-50-04-F"]))
+
+    assert out["base"]["days_late_worst"] == 9.0
+    solo = out["solo"]
+    assert solo["expedite_lead_days"]["days_saved"] == 9.0
+    assert solo["crew_bonus"]["days_saved"] == 0.0
+    assert solo["parallel_lines"]["cost_usd"] == 8730.0
+    pairs = {p["pair"]: p for p in out["pairs"]}
+    ec = next(p for k, p in pairs.items() if "提前期" in k and "加班" in k)
+    assert ec["joint_days_saved"] == 9.0 and ec["interaction_days"] == 0.0
+    assert ec["relation"] == "additive"
+    # 加班单独上白花 $31,428：这条要在读数里看得见，不能只剩一个 0
+    assert ec["cost_usd"]["b"] == 31428.0
+    cp = next(p for k, p in pairs.items() if "加班" in k and "并联" in k)
+    assert cp["interaction_days"] == 0.0 and cp["cost_usd"]["joint_minus_sum"] == 0.0
+
+
+def test_interaction_levers_only_use_keys_the_same_path_accepts():
+    import inspect
+
+    from api.services.virtual_run import run_target
+
+    accepted = set(inspect.signature(run_target).parameters)
+    for lever in ss.INTERACTION_LEVERS:
+        assert lever["on"] and lever.get("buys")
+        assert set(lever["on"]) <= accepted, f"{lever['key']} 的开关不是 run_target 的参数"
+
+
+def test_every_interaction_lever_has_a_business_name_for_the_contract():
+    """契约只按受控词表出去：对不上业务名的杠杆会被整条丢掉，宁可事先知道。"""
+    from api.services.engine_contract import INPUTS, _public_input_for
+
+    for lever in ss.INTERACTION_LEVERS:
+        pub = _public_input_for(str(lever["key"]))
+        assert pub, f"{lever['label']} 没有业务输入名，进不了 /engine-sensitivity"
+        assert pub in INPUTS, f"{pub} 不在受控词表里"
+
+
+def test_interaction_rows_carry_internal_keys_for_the_public_mapping(monkeypatch):
+    """pair 只带中文名就没法映射成业务名 —— keys 字段是契约那一层的唯一依据。"""
+    import asyncio
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 5}]
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        return {"days_late_worst": 3.0, "labor_cost_usd": 100.0, "expedite_cost_usd": 0.0,
+                "line_activation_cost_usd": 0.0, "finish_date": "2026-01-10",
+                "binding": "line_declared"}
+
+    monkeypatch.setattr(ss.vr, "derive_targets", fake_targets)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+    out = asyncio.run(ss.interactions(None, "FAC", ["M-1"]))
+    assert out["pairs"], "三对组合都该有读数"
+    known = {str(l["key"]) for l in ss.INTERACTION_LEVERS}
+    for p in out["pairs"]:
+        assert p["status"] == "ok" and set(p["keys"]) <= known and len(p["keys"]) == 2

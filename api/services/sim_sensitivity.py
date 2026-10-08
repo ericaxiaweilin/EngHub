@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -468,6 +468,7 @@ async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -
 async def report(db: AsyncSession, factory_id: str, models: List[str], **kw: Any) -> Dict[str, Any]:
     acc = await mapping_accuracy(db, factory_id, models)
     sens = await sensitivity(db, factory_id, models, **kw)
+    inter = await interactions(db, factory_id, models, **kw)
     unc = propagate_uncertainty(sens, acc)
     priced = sum(1 for m in acc.get("models") or []
                  if float((m.get("components") or {}).get("price", {}).get("score") or 0) > 0)
@@ -482,7 +483,108 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], **kw: Any
                         "「收益侧未建模，这只是成本差值」"),
     }
     return {"factory_id": factory_id, "models": models, "economic_readiness": economy,
-            "accuracy": acc, "sensitivity": sens, "uncertainty": unc,
+            "accuracy": acc, "sensitivity": sens, "uncertainty": unc, "interactions": inter,
             "how_to_read": ("要交期就给交期：base.finish_date 是这批的组合完工日，"
                             "curves 给每个输入动一档之后的完工日/人工/加急差值，"
-                            "uncertainty 给这些数现在可信到几成、补哪项数据能压掉几天。")}
+                            "uncertainty 给这些数现在可信到几成、补哪项数据能压掉几天，"
+                            "interactions 给两个杠杆一起上时多出来（或白花）的那部分。")}
+
+
+# 两个杠杆一起上才看得出来的东西：各自的边际是"在别的都卡着"的前提下测的，
+# 那前提本身可能正是另一个杠杆要解掉的瓶颈。
+INTERACTION_LEVERS: List[Dict[str, Any]] = [
+    {"key": "expedite_lead_days", "label": "压瓶颈件提前期（→7 天）", "on": {"expedite_lead_days": 7},
+     "buys": "到货日"},
+    {"key": "crew_bonus", "label": "加班加人 30%", "on": {"crew_bonus": 0.30}, "buys": "人手"},
+    {"key": "parallel_lines", "label": "同组并联开满（2 条线）", "on": {"parallel_lines": 2},
+     "buys": "线"},
+]
+
+# 交互项小于这个天数就当作"可加"（一天的差别在这套台账上是噪声级）
+INTERACTION_TOLERANCE_DAYS = 0.5
+
+
+def classify_interaction(inter_days: float, solo_a: float, solo_b: float) -> Tuple[str, str]:
+    """把 Δ(AB)−Δ(A)−Δ(B) 翻成能引用的话：可加 / 替代 / 互补。
+
+    替代（负）= 两个杠杆抢的是同一个瓶颈，第二个白花钱；互补（正）= 必须先上一个，
+    另一个才 effective。0 不代表"两个都一样有用"，只代表这一个的钱能单独算。
+    """
+    if abs(inter_days) <= INTERACTION_TOLERANCE_DAYS:
+        return ("additive",
+                f"交互 {inter_days:+g} 天（≤±{INTERACTION_TOLERANCE_DAYS:g} 天视为可加）："
+                "两个杠杆各解各的，钱可以分开算")
+    if inter_days < 0:
+        return ("substitutable",
+                f"交互 {inter_days:+g} 天：一起上比分别上少买 {abs(inter_days):g} 天 —— "
+                "它们解的是同一个瓶颈，第二个的钱白花，先挑便宜的那个")
+    return ("complementary",
+            f"交互 {inter_days:+g} 天：一起上比分别上多买 {inter_days:g} 天 —— "
+            "有一个是另一个的前提（先上前提那个，单独上另一个会白花钱）")
+
+
+async def interactions(db: AsyncSession, factory_id: str, models: List[str], *,
+                       days_of_output: float = 6.0, lead_margin: Optional[float] = None,
+                       attendance: float = 0.97,
+                       levers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """两两组合扫描：单独效果、联合效果与交互项（天 + 钱），走的还是 scan_policies 那一条路。"""
+    margin = lead_margin if lead_margin is not None else vr.PROMISE_LEAD_MARGIN
+    picks = levers or INTERACTION_LEVERS
+    pol = {"name": "基准政策（分批开工）", "allow_partial": True}
+    targets = await vr.derive_targets(db, factory_id, models,
+                                      days_of_output=days_of_output, lead_margin=margin)
+
+    async def measure(policy: Dict[str, Any]) -> Dict[str, Any]:
+        m = await _run_one(db, factory_id, targets, policy, attendance=attendance)
+        cost = (float(m.get("labor_cost_usd") or 0) + float(m.get("expedite_cost_usd") or 0)
+                + float(m.get("line_activation_cost_usd") or 0))
+        return {"m": m, "cost": round(cost, 2),
+                "days_late_worst": (float(m["days_late_worst"])
+                                    if m.get("days_late_worst") is not None else None)}
+
+    base = await measure(pol)
+    solo = {str(l["key"]): await measure({**pol, **l["on"]}) for l in picks}
+
+    def saved(x: Dict[str, Any]) -> Optional[float]:
+        """买回来的天数 = 基准延误 − 该政策的延误（正数=提前）。"""
+        if x["days_late_worst"] is None or base["days_late_worst"] is None:
+            return None
+        return round(base["days_late_worst"] - x["days_late_worst"], 2)
+
+    rows: List[Dict[str, Any]] = []
+    for i in range(len(picks)):
+        for j in range(i + 1, len(picks)):
+            a, b = picks[i], picks[j]
+            both = await measure({**pol, **a["on"], **b["on"]})
+            d_a, d_b, d_ab = saved(solo[a["key"]]), saved(solo[b["key"]]), saved(both)
+            c_a = round(solo[a["key"]]["cost"] - base["cost"], 2)
+            c_b = round(solo[b["key"]]["cost"] - base["cost"], 2)
+            c_ab = round(both["cost"] - base["cost"], 2)
+            if None in (d_a, d_b, d_ab):
+                rows.append({"pair": f"{a['label']} × {b['label']}", "status": "no_late_reading",
+                             "why": "基准或该政策没有延天数读数（推演没给出日期）→ 不算交互"})
+                continue
+            inter = round(d_ab - d_a - d_b, 2)
+            kind, reading = classify_interaction(inter, d_a, d_b)
+            rows.append({
+                "pair": f"{a['label']} × {b['label']}", "status": "ok",
+                "keys": [str(a["key"]), str(b["key"])],
+                "solo_days_saved": {"a": d_a, "b": d_b, "label_a": a["label"], "label_b": b["label"]},
+                "joint_days_saved": d_ab, "interaction_days": inter,
+                "cost_usd": {"a": c_a, "b": c_b, "joint": c_ab, "joint_minus_sum": round(c_ab - c_a - c_b, 2)},
+                "relation": kind,
+                "cheapest_path_usd_per_day": (round(min([c for c in (c_a, c_b, c_ab) if c > 0], default=0.0), 2)),
+                "reading": reading,
+            })
+    return {"factory_id": factory_id, "models": models, "attendance": attendance,
+            "base": {"days_late_worst": base["days_late_worst"], "cost_usd": base["cost"],
+                     "finish_date": base["m"].get("finish_date"), "binding": base["m"].get("binding")},
+            "solo": {str(l["key"]): {"days_saved": saved(solo[l["key"]]),
+                                     "cost_usd": round(solo[l["key"]]["cost"] - base["cost"], 2),
+                                     "finish_date": solo[l["key"]]["m"].get("finish_date"),
+                                     "label": l["label"], "buys": l["buys"]} for l in picks},
+            "pairs": rows, "tolerance_days": INTERACTION_TOLERANCE_DAYS,
+            "note": ("单杠杆斜率是在『其它约束都还在』的前提下测的，所以它会说『加班买 0 天』；"
+                     "这一格测的是把两个杠杆一起打开之后多出来（或少掉）的那部分 —— "
+                     "替代关系为负意味着第二个的钱白花，互补为正意味着有一个是另一个的前提。"
+                     "钱的口径=人工+加急+开线，收益侧未建模，所以只是成本差值。")}
