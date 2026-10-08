@@ -72,9 +72,16 @@ def derive_intensity(*, pack: Dict[str, Any], task_meta: Dict[str, Any],
     levels = pack.get("metabolic_levels") or {}
     if explicit_level and explicit_level in levels:
         row = levels[explicit_level]
-        return {**task_meta, "route": "explicit_level",
-                "why": f"调用方点名了强度档 {explicit_level} → 不反推",
-                "components": {}, "gait": {}, "assumptions": []}
+        # 点名的档要真的换掉代谢率与限值：原来 row 取出来就丢了，于是"按 heavy 判"的请求
+        # 实际拿的是工序名义档的 29.0℃ —— 声明与执行不一致，还在读数里写着 explicit_level。
+        return {**task_meta, **row, "level": explicit_level, "route": "explicit_level",
+                "why": (f"调用方点名了强度档 {explicit_level} → 不反推"
+                        f"（代谢率与 WBGT 限值取自该档：{row.get('kcal_per_hour')} kcal/h、"
+                        f"{row.get('wbgt_limit_c')}℃）"),
+                "components": {"task_baseline_kcal_per_hour": float(task_meta.get("kcal_per_hour") or 0.0),
+                               "named_level_kcal_per_hour": row.get("kcal_per_hour"),
+                               "named_level_wbgt_limit_c": row.get("wbgt_limit_c")},
+                "gait": {}, "assumptions": []}
     wf = pack.get("metabolic_from_workload") or {}
     base = float(task_meta.get("kcal_per_hour") or 0.0)
     out: Dict[str, Any] = {"route": "task_map_only", "components": {"task_baseline_kcal_per_hour": base},
