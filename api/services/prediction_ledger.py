@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 # 预计口径只认这一条：time_basis 的流水线口径（数量÷线产能 + 首件节拍，按线自己声明的班时折算）。
 BASIS = "time_basis_flow"
 MIN_PAIRS_FOR_MAPE = 10
+# 一轮最多读几页：正常一轮读完在流程单；超过就是工单量爆了，宁可报"截断在哪"也不要静默漏记
+MAX_LEDGER_PAGES = 20
 
 DDL = """
 CREATE TABLE IF NOT EXISTS engine_order_predictions (
@@ -72,8 +74,8 @@ OPEN_SQL = """
       AND o.status IN ('pending','released','in_progress')
       AND o.id NOT LIKE 'wo-vf-%'
       AND o.planned_qty > 0
-    ORDER BY o.planned_due NULLS LAST, o.created_at DESC
-    LIMIT :limit
+    ORDER BY o.planned_due NULLS LAST, o.created_at DESC, o.id
+    LIMIT :limit OFFSET :off
 """
 
 COMPLETED_SQL = """
@@ -149,25 +151,54 @@ def predicted_finish_for(made_on: date, estimated_days: float) -> date:
 async def record_predictions(db: AsyncSession, factory_id: str, *,
                              limit: int = 400, apply: bool = True,
                              today: Optional[date] = None) -> Dict[str, Any]:
-    """给今天在流程单各记一行"我以为这天能交"（一天一行，重复跑不改已有行）。"""
+    """给今天在流程单各记一行"我以为这天能交"（一天一行，重复跑不改已有行）。
+
+    `limit` 是**一页**的行数，不是本轮上限：以前单轮只取前 limit 张，尾巴上的单
+    （10-09 实测 726 张在流程单里被切掉 126 张）整天没人替它们说过话，而读数里
+    只看得到"记了 550 张"，看不出来"还有 126 张没轮到"。现在分页读到读不满一页为止，
+    最多 `MAX_LEDGER_PAGES` 页，读完仍是截断的话把 `truncated_after` 报出来。
+    分页必须有决定性排序键（`o.id` 收尾）：只按 planned_due/created_at 排时同键的行序
+    是 Postgres 随手给的，OFFSET 会在页边重复一些、漏掉另一些 —— 实测过：一页 400 时
+    无依据的单数报 74，而按机种统计是 67。
+    """
     await ensure_schema(db)
     made_on = today or _today()
-    rows = (await db.execute(text(OPEN_SQL),
-                             {"fid": factory_id, "limit": max(1, int(limit))})).mappings().all()
+    chunk = max(1, min(int(limit), 2000))
+    rows: List[Any] = []
+    pages = 0
+    truncated_after = None
+    while pages < MAX_LEDGER_PAGES:
+        page = (await db.execute(text(OPEN_SQL), {"fid": factory_id, "limit": chunk,
+                                                  "off": pages * chunk})).mappings().all()
+        pages += 1
+        rows.extend(page)
+        if len(page) < chunk:
+            break
+        if pages == MAX_LEDGER_PAGES:
+            truncated_after = len(rows)
     from api.services.time_basis import load_time_basis
 
     basis = await load_time_basis(db, factory_id)
     receipt: Dict[str, Any] = {"factory_id": factory_id, "made_on": made_on.isoformat(),
-                               "apply": apply, "open_orders": len(rows), "recorded": 0,
+                               "apply": apply, "open_orders": len(rows), "pages_read": pages,
+                               "page_size": chunk, "truncated_after": truncated_after,
+                               "recorded": 0, "same_day": 0, "estimate_missing": 0,
                                "already_recorded_today": 0, "no_line_capacity": 0}
     pending: Dict[str, Any] = {}
     for r in rows:
         est = basis.order_flow_estimate(model=str(r["model_code"] or ""),
                                        qty=float(r["units"] or 0),
                                        steps=int(r["route_steps"] or 1))
-        if not est or not est.get("estimated_days"):
+        if not est:
             receipt["no_line_capacity"] += 1
             continue
+        if est.get("estimated_days") is None:
+            receipt["estimate_missing"] += 1
+            continue
+        # 不足一个班日的小单（10-09 实测 7 张 1 台单算出 0.0 天）是"今天能交"，
+        # 不是"没依据" —— 以前两者混在一个计数里，读数会把有依据的单说成没依据
+        if float(est["estimated_days"]) <= 0:
+            receipt["same_day"] += 1
         finish = predicted_finish_for(made_on, float(est["estimated_days"]))
         params = {"id": str(uuid.uuid4()), "fid": factory_id, "wid": str(r["work_order_id"]),
                   "code": r["work_order_code"], "model": str(r["model_code"] or ""),
@@ -194,8 +225,11 @@ async def record_predictions(db: AsyncSession, factory_id: str, *,
         await db.rollback()
     receipt["status"] = "ok"
     receipt["message"] = (f"{'记下' if apply else '预演'} {receipt['recorded']} 张单的预计完工日"
-                          f"（今天已记过的 {receipt['already_recorded_today']} 张不改，"
-                          f"机种没落到声明日产量的线上算不出 {receipt['no_line_capacity']} 张）")
+                          f"（今天已记过的 {receipt['already_recorded_today']} 张不改；"
+                          f"不足一个班日按今天交的 {receipt['same_day']} 张；"
+                          f"机种没落到声明过日产量的线上、算不出的 {receipt['no_line_capacity']} 张"
+                          + (f"；有依据但天数取不到的 {receipt['estimate_missing']} 张"
+                             if receipt["estimate_missing"] else "") + "）")
     return receipt
 
 
@@ -234,7 +268,8 @@ async def pair_completed_predictions(db: AsyncSession, factory_id: str, *,
 
 
 def summarize(ledger: Dict[str, Any], bands: Dict[str, int], pairs_needed: int,
-              pop: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+              pop: Optional[Dict[str, Any]] = None,
+              gap: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把账本读成一句能判线的话：样本不够就明说还差几条，不给 0 分也不给假绿灯。"""
     paired = int(ledger.get("paired") or 0)
     mape = ledger.get("mape")
@@ -253,7 +288,7 @@ def summarize(ledger: Dict[str, Any], bands: Dict[str, int], pairs_needed: int,
     out["state"] = ("reported" if paired < pairs_needed or mape is None else
                     ("pass" if float(mape) <= 0.20 else "fail"))
     if paired < pairs_needed:
-        out["missing"] = pairing_missing(paired, pairs_needed, pop)
+        out["missing"] = pairing_missing(paired, pairs_needed, pop, gap)
     elif mape is None:
         # 样本够但算不出数：这是数据形状问题（预计日或实际日为空），不能拿"样本不足"当解释
         out["missing"] = (f"成对 {paired} 对但误差算不出：paired_on 有值而 mape 为空，"
@@ -288,7 +323,58 @@ SELECT (SELECT COUNT(*) FROM done) AS completed_total,
 """
 
 
-def pairing_missing(paired: int, pairs_needed: int, pop: Optional[Dict[str, Any]] = None) -> str:
+OPEN_POP_SQL = """
+SELECT COALESCE(pp.product_code, p.product_code, o.product_id) AS model_code,
+       count(*) AS orders, sum(o.planned_qty) AS units
+FROM work_orders o
+LEFT JOIN products p ON p.id::text = o.product_id OR p.product_code = o.product_id
+LEFT JOIN work_orders par ON par.id = o.parent_work_order_id
+LEFT JOIN products pp ON pp.factory_id = par.factory_id
+     AND (pp.id::text = par.product_id OR pp.product_code = par.product_id)
+WHERE o.factory_id = :fid
+  AND o.status IN ('pending','released','in_progress')
+  AND o.id NOT LIKE 'wo-vf-%' AND o.planned_qty > 0
+GROUP BY 1 ORDER BY orders DESC
+"""
+
+
+async def capacity_gap(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """哪些在流程单根本无处留痕：机种没落到任何一条声明过日产量的线上。
+
+    这不是算法能补的 —— `line_profiles` 的 can_make_models/default_model 是厂里的声明，
+    引擎不替它编一条线和一个日产量；编出来的完工日会变成账本里的假承诺。
+    """
+    from api.services.time_basis import load_time_basis
+
+    basis = await load_time_basis(db, factory_id)
+    known = set((getattr(basis, "line_by_model", None) or {}).keys())
+    rows = (await db.execute(text(OPEN_POP_SQL), {"fid": factory_id})).mappings().all()
+    missing = [{"model_code": str(r["model_code"]), "orders": int(r["orders"] or 0),
+                "units": round(float(r["units"] or 0), 1)}
+               for r in rows if str(r["model_code"]) not in known]
+    return {"models": missing, "orders": sum(m["orders"] for m in missing),
+            "units": round(sum(m["units"] for m in missing), 1),
+            "open_orders_total": sum(int(r["orders"] or 0) for r in rows),
+            "models_with_capacity": len(known),
+            "basis": "line_profiles（can_make_models / default_model）里声明过这台机种能做、"
+                     "且给了 units_per_day 的线"}
+
+
+def capacity_gap_note(gap: Optional[Dict[str, Any]]) -> Optional[str]:
+    """把缺口说成一句人话：谁没处留痕、多少张、要么声明线产能、要么接受不进账本。"""
+    if not gap or not gap.get("models"):
+        return None
+    named = "、".join(f"{m['model_code']}（{m['orders']} 张/{m['units']:g} 台）"
+                      for m in (gap.get("models") or [])[:5])
+    more = "…" if len(gap.get("models") or []) > 5 else ""
+    return (f"还有 {gap.get('orders')} 张在流程单（{gap.get('units') or 0:g} 台）压根无处留痕："
+            f"这些机种没落到任何一条声明过日产量的线上 —— {named}{more}；"
+            "要么厂里在 line_profiles 里给它们声明能做的线+日产量，要么接受这批单不进交期账本，"
+            "我不会替它们编一个完工日")
+
+
+def pairing_missing(paired: int, pairs_needed: int, pop: Optional[Dict[str, Any]] = None,
+                    gap: Optional[Dict[str, Any]] = None) -> str:
     """成对样本不够时点名缺的是**天数**还是**人群** —— 这两种"再等等"完全不是一回事。
 
     等天数：账本里已有单完工，只是还没配上 —— 下一轮闸门自然会长。
@@ -303,13 +389,17 @@ def pairing_missing(paired: int, pairs_needed: int, pop: Optional[Dict[str, Any]
     in_led = int(pop.get("completed_in_ledger") or 0)
     if in_led == 0:
         future = done - int(pop.get("completed_dated_past") or 0)
-        return base + (f"{done} 张已完工单里没有一张在账本里（账本覆盖 "
-                       f"{pop.get('ledger_models')} 个机种的在流程单；完工单落在这些机种上的 "
-                       f"{pop.get('completed_on_ledger_models')} 张）—— "
-                       "缺的不是天数，是**会完工的那批单从来没被留痕**。"
-                       f"另：完工单里完工日 ≤ 今天 {pop.get('completed_dated_past')} 张、"
-                       f"未来日期 {future} 张 —— 那些单还没真做过，"
-                       "把它们当实绩配对会算出假误差")
+        base += (f"{done} 张已完工单里没有一张在账本里（账本覆盖 "
+                 f"{pop.get('ledger_models')} 个机种的在流程单；完工单落在这些机种上的 "
+                 f"{pop.get('completed_on_ledger_models')} 张）—— "
+                 "缺的不是天数，是**会完工的那批单从来没被留痕**。"
+                 f"另：完工单里完工日 ≤ 今天 {pop.get('completed_dated_past')} 张、"
+                 f"未来日期 {future} 张 —— 那些单还没真做过，"
+                 "把它们当实绩配对会算出假误差")
+        note = capacity_gap_note(gap)
+        if note:
+            base += "；" + note
+        return base
     return base + (f"账本里已有 {in_led} 张单完工，下一轮 delivery_prediction_ledger（每 24 小时）"
                    "会把它们配上")
 
@@ -322,8 +412,10 @@ async def delivery_accuracy(db: AsyncSession, factory_id: str) -> Dict[str, Any]
              (await db.execute(text(BANDS_SQL), {"fid": factory_id})).mappings().all()}
     pop = dict((await db.execute(text(POPULATION_SQL),
                                  {"fid": factory_id})).mappings().first() or {})
-    out = summarize(dict(ledger), bands, MIN_PAIRS_FOR_MAPE, pop)
+    gap = await capacity_gap(db, factory_id)
+    out = summarize(dict(ledger), bands, MIN_PAIRS_FOR_MAPE, pop, gap)
     out["population"] = pop
+    out["coverage"] = gap
     out["method"] = ("当时说了什么 vs 实际哪天完工（最早一条留痕配对）。"
                      "与 /sim-backtest 那条追溯法回测不是一件事：那条是用今天的主数据重跑历史单")
     out["caveat"] = ("误差带按实际日历日算（含停工日）；机种没落到声明过日产量的线上时当天不记，"

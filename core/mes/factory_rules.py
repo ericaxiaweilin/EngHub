@@ -598,6 +598,46 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                           "status": "declared", "source": "chat"},
         })
 
+    # 交期留痕的落点缺口：机种没落到声明过日产量的线上，账本永远攒不到那批单的样本。
+    # 这不是引擎能补的 —— 线能不能做这台机种、一天做几台，是 line_profiles 里厂里的声明。
+    try:
+        from api.services.prediction_ledger import capacity_gap
+
+        gap = await capacity_gap(db, factory_id)
+    except Exception as exc:  # noqa: BLE001
+        gap = None
+        gap_error = type(exc).__name__
+    else:
+        gap_error = None
+    if gap and (gap.get("models") or []):
+        out.append({
+            "topic": "delivery_ledger_capacity_basis",
+            "question": (f"{gap['orders']} 张在流程单（{gap['units']:g} 台）没处留痕 ——"
+                         f" 这些机种没落到任何一条声明过日产量的线上 —— "
+                         f"要不要在 line_profiles 里给它们声明能做的线 + units_per_day？"),
+            "why_it_matters": ("留痕法（当时说了哪天交 vs 实际哪天完工）是唯一能回答"
+                               "「客户拿到的日期准不准」的一格；追溯法只能回答「今天这套数据"
+                               "会不会算错」。没声明线产能的机种算不出预计完工日，引擎就写不下"
+                               "那句话，这批单的交付准度就永远是 0 对样本 —— 等多久都不会自己长出来"),
+            "expected_answer": ("① 在 line_profiles 给这些机种声明能做的线与 units_per_day"
+                                "（事实表，厂里改，引擎不自动写）；② 明确这批机种不进交期账本；"
+                                "③ 或先量节拍/IE 工时再声明日产量"),
+            "prefilled_evidence": "、".join(
+                f"{m['model_code']} {m['orders']} 张/{m['units']:g} 台"
+                for m in (gap.get("models") or [])[:8]) or "无",
+            "ledger_coverage": {"open_orders_total": gap.get("open_orders_total"),
+                                "models_with_capacity": gap.get("models_with_capacity"),
+                                "basis": gap.get("basis")},
+        })
+    elif gap_error:
+        out.append({
+            "topic": "delivery_ledger_capacity_basis",
+            "question": "交期留痕的覆盖缺口这轮没核出来：取数失败，不能当成没有缺口",
+            "why_it_matters": f"capacity_gap 取数异常（{gap_error}）—— 空集合不等于通过",
+            "expected_answer": "看 /pmc/delivery-accuracy 的 coverage 为什么取不到",
+            "prefilled_evidence": gap_error,
+        })
+
 
     declared_anchor = None
     if declared:

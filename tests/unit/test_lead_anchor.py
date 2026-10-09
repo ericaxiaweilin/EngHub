@@ -581,3 +581,80 @@ def test_calibration_impact_names_the_tier_when_hybrid_cannot_move(monkeypatch):
     line2 = [x for x in out2["reading"] if "最长档被 map 改了" in x]
     assert line2 and "另 1 台一天没动" in line2[0]
     assert "RM-ELEC-101" in line2[0] and "20→15" in line2[0]
+
+
+def _gap_env(monkeypatch, gap_result=None, raise_exc=False):
+    """把 capacity_questions 依赖的几张表都糊过去，只留 capacity_gap 被测。"""
+    async def fake_cov(db, fid):
+        return {"capacity_unit_ambiguous": False, "station_capacity_rows": 0, "stations": 0,
+                "station_capacity_hours_min": None, "station_capacity_hours_max": None,
+                "capacity_unit_mix": [], "reading": "…"}
+
+    async def fake_eff(db, fid):
+        return {"rows": [], "note": "…"}
+
+    async def fake_cross(db, fid):
+        return {"verdict": {}}
+
+    async def fake_census(db, fid):
+        return {"rows": 0, "zero_ratio_rows": 0, "median_all": None, "median_nonzero": None,
+                "p25_nonzero": None, "p75_nonzero": None, "min_nonzero": None, "max_nonzero": None,
+                "reliable_rows": 0, "anchor": None, "examples": [], "caveat": "…"}
+
+    async def no_rules(db, fid):
+        return {}
+
+    monkeypatch.setattr("core.mes.capacity_math.efficiency_basis_census", fake_eff)
+    monkeypatch.setattr("core.mes.data_evidence.line_claim_coverage", fake_cov)
+    monkeypatch.setattr("core.mes.plant_architecture.capacity_cross_check", fake_cross)
+    monkeypatch.setattr(mp, "lead_ratio_census", fake_census)
+    monkeypatch.setattr("core.mes.factory_rules.binding_rules", no_rules)
+
+    async def gap(db, fid):
+        if raise_exc:
+            raise RuntimeError("boom")
+        return gap_result or {"models": [], "orders": 0, "units": 0, "open_orders_total": 0,
+                              "models_with_capacity": 1, "basis": "line_profiles"}
+
+    monkeypatch.setattr("api.services.prediction_ledger.capacity_gap", gap)
+
+
+def test_ledger_capacity_gap_becomes_a_question_the_plant_can_act_on(monkeypatch):
+    import asyncio
+
+    from core.mes import factory_rules as fr
+
+    _gap_env(monkeypatch, {"models": [{"model_code": "A-30-04-F", "orders": 16, "units": 712.0},
+                                      {"model_code": "MPL0113-00", "orders": 15, "units": 718.0}],
+                           "orders": 31, "units": 1430.0, "open_orders_total": 726,
+                           "models_with_capacity": 1, "basis": "line_profiles（can_make/default）"})
+    res = asyncio.run(fr.capacity_questions(None, "FAC"))
+    q = [x for x in res["questions"] if x.get("topic") == "delivery_ledger_capacity_basis"]
+    assert len(q) == 1
+    assert "31" in q[0]["question"] and "A-30-04-F 16 张/712 台" in q[0]["prefilled_evidence"]
+    assert "line_profiles" in q[0]["expected_answer"], "要指到厂里能改的那张表"
+    assert "留痕法" in q[0]["why_it_matters"]
+
+
+def test_no_ledger_question_when_every_open_order_has_a_capacity_basis(monkeypatch):
+    import asyncio
+
+    from core.mes import factory_rules as fr
+
+    _gap_env(monkeypatch)
+    res = asyncio.run(fr.capacity_questions(None, "FAC"))
+    assert not [x for x in res["questions"]
+                if x.get("topic") == "delivery_ledger_capacity_basis"], "没缺口就不该催"
+
+
+def test_a_failed_gap_read_is_reported_instead_of_looking_like_no_gap(monkeypatch):
+    """空集合≠通过：取数挂了必须自己说出来。"""
+    import asyncio
+
+    from core.mes import factory_rules as fr
+
+    _gap_env(monkeypatch, raise_exc=True)
+    res = asyncio.run(fr.capacity_questions(None, "FAC"))
+    q = [x for x in res["questions"] if x.get("topic") == "delivery_ledger_capacity_basis"]
+    assert len(q) == 1 and "没核出来" in q[0]["question"]
+    assert q[0]["prefilled_evidence"] == "RuntimeError"

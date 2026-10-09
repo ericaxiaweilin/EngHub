@@ -3,6 +3,7 @@
 只测纯函数（predicted_finish_for / summarize）—— 动库那两条（record/pair）
 在 /api/v1/pmc/delivery-accuracy 的预演里看得到。
 """
+import pytest
 from datetime import date
 
 from api.services.prediction_ledger import (
@@ -91,3 +92,166 @@ def test_pairing_missing_without_any_completion_says_so():
 
     assert "还没有一张已完工单" in pairing_missing(0, 10, {"completed_total": 0})
     assert "还没有一张已完工单" in pairing_missing(0, 10, None), "查不动人群时不许编归因"
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+
+class _PagedDb:
+    """OPEN_SQL 按 off 分页返回；其它语句回空。"""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    async def execute(self, stmt, params=None):
+        p = params or {}
+        self.calls.append(p)
+        if "off" in p:
+            return _Rows(self.pages.get(int(p["off"]), []))
+        return _Rows([])
+
+    async def rollback(self):
+        return None
+
+    async def commit(self):
+        raise AssertionError("预演（apply=False）不能提交")
+
+
+class _Basis:
+    line_by_model = {"A-50-04-F": {}}
+
+    def order_flow_estimate(self, *, model, qty, steps):
+        return {"estimated_days": 3.0, "line_code": "LINE-TREAD-01"}
+
+
+async def _noop_ensure(db):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_record_predictions_pages_past_the_page_size(monkeypatch):
+    """limit 是页大小不是本轮上限：726 张那种量级不能再静默只记 600 张。"""
+    from api.services import prediction_ledger as pl
+
+    db = _PagedDb({0: [{"work_order_id": f"w{i}", "work_order_code": f"C{i}",
+                        "model_code": "A-50-04-F", "units": 10, "planned_due": None,
+                        "route_steps": 2} for i in range(2)],
+                   2: [{"work_order_id": f"w{i}", "work_order_code": f"C{i}",
+                        "model_code": "A-50-04-F", "units": 10, "planned_due": None,
+                        "route_steps": 2} for i in range(2, 4)],
+                   4: [{"work_order_id": "w4", "work_order_code": "C4",
+                        "model_code": "A-50-04-F", "units": 10, "planned_due": None,
+                        "route_steps": 2}]})
+    monkeypatch.setattr(pl, "ensure_schema", _noop_ensure)
+    monkeypatch.setattr("api.services.time_basis.load_time_basis", _async(_Basis()))
+    receipt = await pl.record_predictions(db, "FAC", limit=2, apply=False, today=date(2026, 10, 9))
+    assert receipt["open_orders"] == 5 and receipt["pages_read"] == 3
+    assert receipt["recorded"] == 5 and receipt["truncated_after"] is None
+    assert receipt["apply"] is False, "预演不能写库"
+
+
+@pytest.mark.asyncio
+async def test_record_predictions_reports_truncation_instead_of_hiding_it(monkeypatch):
+    from api.services import prediction_ledger as pl
+
+    full = [{"work_order_id": f"w{i}", "work_order_code": f"C{i}", "model_code": "A-50-04-F",
+             "units": 10, "planned_due": None, "route_steps": 2} for i in range(4)]
+    db = _PagedDb({0: full[:2], 2: full[2:]})          # 每页都满，页数用完仍没读完
+    monkeypatch.setattr(pl, "ensure_schema", _noop_ensure)
+    monkeypatch.setattr(pl, "MAX_LEDGER_PAGES", 2)
+    monkeypatch.setattr("api.services.time_basis.load_time_basis", _async(_Basis()))
+    receipt = await pl.record_predictions(db, "FAC", limit=2, apply=False, today=date(2026, 10, 9))
+    assert receipt["pages_read"] == 2 and receipt["truncated_after"] == 4
+    assert receipt["open_orders"] == 4, "截断过也要把读了多少报出来，不能只报记了几张"
+
+
+def _async(value):
+    import asyncio
+
+    async def _v(*a, **k):
+        return value
+    return _v
+
+
+def test_capacity_gap_note_names_models_and_refuses_to_invent():
+    from api.services.prediction_ledger import capacity_gap_note
+
+    gap = {"models": [{"model_code": "A-30-04-F", "orders": 16, "units": 712.0},
+                      {"model_code": "MPL0113-00", "orders": 15, "units": 718.0}],
+           "orders": 31, "units": 1430.0}
+    text = capacity_gap_note(gap)
+    assert "A-30-04-F（16 张/712 台）" in text and "MPL0113-00" in text
+    assert "31 张在流程单（1430 台）" in text
+    assert "不会替它们编一个完工日" in text, "缺依据时要把不写假承诺这件事说出口"
+    assert capacity_gap_note({"models": []}) is None
+    assert capacity_gap_note(None) is None
+
+
+def test_pairing_missing_appends_the_capacity_gap_when_there_is_one():
+    from api.services.prediction_ledger import pairing_missing
+
+    pop = {"completed_total": 28, "completed_dated_past": 3, "completed_on_ledger_models": 0,
+           "completed_in_ledger": 0, "ledger_models": 1}
+    gap = {"models": [{"model_code": "VF-CMECH001-40HQ", "orders": 36, "units": 10800.0}],
+           "orders": 36, "units": 10800.0}
+    text = pairing_missing(0, 10, pop, gap)
+    assert "从来没被留痕" in text and "25 张" in text
+    assert "VF-CMECH001-40HQ（36 张/10800 台）" in text
+    assert "line_profiles" in text, "要指到人能改的那张表，不是只说算不出"
+
+
+def test_sub_day_orders_are_not_reported_as_lacking_a_capacity_basis():
+    """10-09 实测：7 张 1 台的单流水线口径算出 0.0 天，以前被混进"没落到线上"那格。"""
+    import asyncio
+
+    from api.services import prediction_ledger as pl
+
+    class _ZeroBasis(_Basis):
+        def order_flow_estimate(self, *, model, qty, steps):
+            return {"estimated_days": 0.0, "line_code": "LINE-TREAD-01"}
+
+    rows = [{"work_order_id": "w1", "work_order_code": "C1", "model_code": "A-50-04-F",
+             "units": 1, "planned_due": None, "route_steps": 2}]
+    db = _PagedDb({0: rows})
+    monkeypatch = _Monkey()
+    monkeypatch.setattr(pl, "ensure_schema", _noop_ensure)
+    monkeypatch.setattr("api.services.time_basis.load_time_basis", _async(_ZeroBasis()))
+    receipt = asyncio.run(pl.record_predictions(db, "FAC", limit=400, apply=False,
+                                                today=date(2026, 10, 9)))
+    assert receipt["recorded"] == 1 and receipt["same_day"] == 1
+    assert receipt["no_line_capacity"] == 0, "当天能做完 ≠ 没有产能依据"
+    assert "不足一个班日按今天交的 1 张" in receipt["message"]
+
+
+class _Monkey:
+    """不用 pytest 的 monkeypatch fixture（纯函数用例里手搓一个够用的）。"""
+
+    def __init__(self):
+        self._saved = []
+
+    _MISS = object()
+
+    def setattr(self, target, name=_MISS, value=_MISS):
+        import importlib
+
+        if isinstance(target, str):
+            # 字符串形式按 pytest 的约定：setattr("pkg.mod.attr", value)
+            mod_name, attr = target.rsplit(".", 1)
+            holder = importlib.import_module(mod_name)
+            new_value = name
+        else:
+            holder, attr, new_value = target, name, value
+        self._saved.append((holder, attr, getattr(holder, attr)))
+        setattr(holder, attr, new_value)

@@ -1229,7 +1229,8 @@ async def get_stale_followup_review(
 async def get_delivery_accuracy(
     factory_id: str = Query(..., description="厂区"),
     record: bool = Query(False, description="true=先把今天在流程单的预计完工日记一行（一天一行，不改已记的）"),
-    limit: int = Query(400, ge=1, le=1000, description="本轮最多记几张单"),
+    limit: int = Query(400, ge=1, le=1000, description="一页读多少张在流程单"
+                                              "（会分页读到读不满一页为止，不再静默截断）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
