@@ -788,4 +788,52 @@ async def fifo_check(
     return await svc.check_fifo(factory_id, material_id)
 
 
+@router.get("/wms/capability", summary="WMS 能力矩阵：每一格是活的、空的、还是缺外部新数（只读）")
+async def wms_capability(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把"仓储功能很弱"变成可核对的读数：15 张表里哪几格 0 行、哪几格缺新数据。
+
+    判词分 live / thin / empty / blocked_on_source 四种 —— "空表"和"坏了"和"外部源没新数"
+    是三件事，混成一个"弱"字就没法修。
+    """
+    del current_user
+    from api.services.wms_audit import capability_matrix
+
+    return await capability_matrix(db, factory_id)
+
+
+@router.get("/wms/location-sync", summary="库位对象化：会登记哪些库位、多少台账行会挂上（默认只算不写）")
+async def wms_location_sync(
+    factory_id: str,
+    apply: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """locations 表现在 0 行，而台账里有上千个库位号 —— 号是字符串，不是能挂东西的对象。
+
+    apply=false 只回报"会建哪些"；只新增，不改不删已有库位档案，容量没声明就留空。
+    """
+    del current_user
+    from api.services.wms_locations import sync_locations
+
+    return await sync_locations(db, factory_id, apply=apply)
+
+
+@router.get("/wms/location-occupancy", summary="库位占用：每个格子挂了多少料/多少件")
+async def wms_location_occupancy(
+    factory_id: str,
+    limit: int = 12,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+    from api.services.wms_locations import location_occupancy
+
+    return await location_occupancy(db, factory_id, limit=max(1, min(50, int(limit))))
+
+
+
 __all__ = ["router"]

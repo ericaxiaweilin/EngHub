@@ -561,6 +561,9 @@ DATA_LOOPS = frozenset({
     "action_constraints", "action_execution_silence", "candidate_rules",
     "working_conditions_evidence", "kit_line_coverage",
     "line_profile_coverage", "station_efficiency_basis", "rule_ledger_write",
+    # WMS 三格（10-09 加的）：脏行、库位对象、库内作业单据 —— 进了这个名单就意味着
+    # "某一轮查不成时不许被自动关掉"（见 plan_actions 的 protected_loops 分支）
+    "ledger_data_quality", "location_objects", "yard_work",
     "reply_grounding",
 })
 
@@ -574,6 +577,37 @@ def _gap(loop: str, kind: str, sig: str, title: str, description: str, block: st
             "title": title[:200], "description": description[:4000],
             "block_reason": block[:500], "evidence": evidence,
             "recovered_note": f"自动关闭：{loop} 这一格的数据缺口已经缩到判据线以下（曾报：{title}）。"}
+
+
+# ── WMS 三格：台账脏行 / 库位对象 / 库内作业单据（10-09 清点：15 张表里 11 张 0 行）──
+# 料号 nan 的一行独占 35,583,657 件 = 台账件数一半，是 engflow 导入时 pandas 的 NaN 一路落库。
+LEDGER_DIRT_SQL = """
+    SELECT COUNT(*) AS rows_total,
+           COUNT(*) FILTER (WHERE UPPER(COALESCE(material_code,'')) IN ('NAN','NULL','NONE','NA')) AS dirty_rows,
+           COALESCE(SUM(total_qty),0) AS qty_total,
+           COALESCE(SUM(total_qty) FILTER (WHERE UPPER(COALESCE(material_code,'')) IN ('NAN','NULL','NONE','NA')),0) AS dirty_qty,
+           COUNT(*) FILTER (WHERE COALESCE(location_code,'') = '') AS no_location_rows,
+           COUNT(*) FILTER (WHERE COALESCE(unit_cost,0) = 0) AS no_unit_cost_rows
+    FROM inventory WHERE factory_id = :fid
+"""
+
+# 库位号写了、对象没建、台账行没挂上 —— 三件事分开报，别混成"库位没数据"
+LOCATION_OBJECTS_SQL = """
+    SELECT (SELECT COUNT(*) FROM locations) AS location_objects,
+           (SELECT COUNT(DISTINCT location_code) FROM inventory
+             WHERE factory_id = :fid AND COALESCE(location_code,'') <> '') AS codes_in_ledger,
+           (SELECT COUNT(*) FROM inventory WHERE factory_id = :fid
+             AND COALESCE(location_code,'') <> '' AND location_id IS NULL) AS unlinked_rows
+"""
+
+# 盘点/冻结/移库单：表和接口都在、0 行 —— 判词是"没被走过"，不是"坏了"
+YARD_WORK_SQL = """
+    SELECT (SELECT COUNT(*) FROM inventory_counts WHERE factory_id = :fid) AS count_orders,
+           (SELECT COUNT(*) FROM inventory_freezes WHERE factory_id = :fid) AS freezes,
+           (SELECT COUNT(*) FROM wms_transfer_requests WHERE factory_id = :fid) AS transfer_docs,
+           (SELECT COUNT(*) FROM inventory_transactions
+             WHERE transaction_type = 'transfer' AND COALESCE(reference_doc_no,'') = '') AS transfers_without_doc
+"""
 
 
 async def data_findings(db: AsyncSession, factory_id: str, *,
@@ -593,6 +627,9 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
     from core.mes.capacity_math import efficiency_basis_census
     from core.mes.data_evidence import line_claim_coverage
 
+    dirt = (await db.execute(text(LEDGER_DIRT_SQL), {"fid": factory_id})).mappings().first()
+    loc = (await db.execute(text(LOCATION_OBJECTS_SQL), {"fid": factory_id})).mappings().first()
+    yard = (await db.execute(text(YARD_WORK_SQL), {"fid": factory_id})).mappings().first()
     claim = await line_claim_coverage(db, factory_id)
     eff = await efficiency_basis_census(db, factory_id)
     # 覆盖率要把引擎本轮的展开和门的判定配成对，一轮 ~1 分钟；查不动时 cov=None，
@@ -652,6 +689,7 @@ async def data_findings(db: AsyncSession, factory_id: str, *,
                         wc=dict(wc or {}), claim=claim or {}, eff=eff or {}, rejected=rejected,
                         pending=list(pending or []), mp=dict(mp or {}),
                         cov=cov or {}, ground=ground or {},
+                        dirt=dict(dirt or {}), loc=dict(loc or {}), yard=dict(yard or {}),
                         evaluated_out=evaluated_out)
 
 
@@ -664,6 +702,8 @@ MIN_KIT_COVERAGE_ROWS = 200
 MIN_KIT_GATE_HOLE_ORDERS = 1
 
 # 转述忠实度：够 10 条才判（与总结格同一条件），线跟总结格同一条 0.90。
+# 台账脏行占件数到这个比例就要报：不到 1% 算噪声，一半就是事故（10-09 实测 49.99%）
+MIN_DIRTY_QTY_SHARE = 0.01
 MIN_GROUNDING_REPLIES = 10
 MIN_GROUNDING_BACKING = 0.90
 
@@ -681,6 +721,8 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                  ground: Optional[Dict[str, Any]] = None,
                  wc: Optional[Dict[str, Any]] = None,
                  claim: Optional[Dict[str, Any]] = None,
+                 dirt: Optional[Dict[str, Any]] = None, loc: Optional[Dict[str, Any]] = None,
+                 yard: Optional[Dict[str, Any]] = None,
                  rejected: Optional[List[Dict[str, Any]]] = None,
                  evaluated_out: Optional[set] = None) -> List[Dict[str, Any]]:
     """五格"不是引擎算不出，是台账没跟上"的缺口，量出来就派一条补数据催办。
@@ -1035,6 +1077,69 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             f"{no_sup} 个外购缺口料号缺供应商主数据",
             "procurement_agent", "供应商要么从采购台账补进 materials，要么改承诺口径（按提前期不指名供应商）。",
             {"shortage_parts_without_supplier": no_sup}))
+
+    # ── WMS 三格（10-09 清点：15 张表里 11 张 0 行；"功能弱"要弱得可以说出是哪一格）──
+    dirt = dict(dirt or {})
+    ev.add("ledger_data_quality")
+    dirty_rows = int(dirt.get("dirty_rows") or 0)
+    qty_total = float(dirt.get("qty_total") or 0)
+    share = round(float(dirt.get("dirty_qty") or 0) / qty_total, 4) if qty_total else 0.0
+    if dirty_rows and share >= MIN_DIRTY_QTY_SHARE:
+        out.append(_gap(
+            "ledger_data_quality", "nan_rows_in_stock_ledger", f"dirt|{int(share * 1000)}",
+            f"补数据｜库存台账 {dirt.get('rows_total')} 行里有 {dirty_rows} 行料号是 nan/NULL，"
+            f"合计 {int(float(dirt.get('dirty_qty') or 0)):,} 件 = 占台账件数 {round(share * 100, 2)}%",
+            "这是 engflow 导入时 pandas 的 NaN 一路穿过落库留下的（10-09 实测：料号 nan、"
+            "库位 LOC-LG-NAN、批次 B-LG-NAN 的一行独占 35,583,657 件）。\n"
+            "影响面：所有按件数算的读数 —— 库存总量、齐套件数、呆滞、周转 —— 都被这一行抬高，"
+            "按件数排序时它永远第一。\n"
+            "引擎**不自己删**：删库存行是厂里的账，要么补真料号、要么由人确认后冲回。\n"
+            f"顺带：{dirt.get('no_location_rows')} 行连库位号都没有、"
+            f"{dirt.get('no_unit_cost_rows')} 行没有单价（库存金额算不出来）。\n"
+            "复核：GET /api/v1/wms/capability?factory_id=<厂区> 的「台账数据质量」那一格。",
+            f"{dirty_rows} 行脏料号占台账件数 {round(share * 100, 2)}%",
+            "warehouse_agent",
+            "源侧导入要在落库前挡住 NaN；已入库的行由人决定补料号还是冲回，引擎不自作主张删账。",
+            {"dirty_rows": dirty_rows, "dirty_qty": float(dirt.get("dirty_qty") or 0),
+             "qty_share": share, "no_location_rows": int(dirt.get("no_location_rows") or 0),
+             "no_unit_cost_rows": int(dirt.get("no_unit_cost_rows") or 0)}))
+
+    loc = dict(loc or {})
+    ev.add("location_objects")
+    if int(loc.get("location_objects") or 0) > 0 and int(loc.get("unlinked_rows") or 0) > 0:
+        out.append(_gap(
+            "location_objects", "locations_not_registered", f"loc|{int(loc['unlinked_rows'])}",
+            f"补数据｜{loc['unlinked_rows']} 行写了库位号但挂不上库位对象"
+            f"（locations {loc['location_objects']} 个 / 台账 {loc['codes_in_ledger']} 个不同号）",
+            "库位号是字符串、不是对象时：上架没有目标、移库没有 from/to、盘点没有范围、容量没得校验。\n"
+            "派生已经做过一次（`wms_locations.sync_locations`：只从台账已有的号派生，"
+            "容量没人声明就留空，不编货架结构）。剩下的这一批是**非规范号**（NaN 一类），"
+            "故意不登记 —— 登记等于把脏数据转正，之后所有按库位聚合的读数都会把它当一个真格子。\n"
+            "复核：GET /api/v1/wms/location-sync?factory_id=<厂区>（apply=false 只算不写）。",
+            f"{loc['unlinked_rows']} 行有库位号但没对象", "warehouse_agent",
+            "由人给这些行一个真库位号，或确认它们是脏数据；引擎不替厂里编格子。",
+            {"location_objects": int(loc["location_objects"]),
+             "codes_in_ledger": int(loc["codes_in_ledger"]),
+             "unlinked_rows": int(loc["unlinked_rows"])}))
+
+    yard = dict(yard or {})
+    ev.add("yard_work")
+    if (int(yard.get("count_orders") or 0) == 0 and int(yard.get("freezes") or 0) == 0
+            and int(yard.get("transfer_docs") or 0) == 0):
+        out.append(_gap(
+            "yard_work", "no_yard_documents", f"yard|{int(yard.get('transfers_without_doc') or 0)}",
+            "补流程｜库内作业从来没发生过：盘点 0 单、冻结 0 行、移库单 0 张",
+            f"而流水里有 {yard.get('transfers_without_doc')} 条移库记录**全部没有单据号** —— "
+            "仓库在动，但每一次动都是绕过申请/审批直接改账。\n"
+            "没有盘点这条腿，台账说有多少就是多少，谁也没验证过；10-08 那次"
+            "『零领料却完工入库 165 件虚假半成品』就是这类没被盘出来的。\n"
+            "接口都在（建盘点单 / 录入 / 审批 / FIFO / 追溯），0 行走的是**没人开单**，不是功能坏了。\n"
+            "复核：GET /api/v1/wms/capability?factory_id=<厂区>（判词 empty ≠ 坏了）。",
+            "盘点/冻结/移库单三格 0 行，移库流水无单据", "warehouse_agent",
+            "要么由周期任务自动开盘点单（按 ABC/库位抽范围），要么给仓管员一个界面上的开单入口。",
+            {"count_orders": 0, "freezes": 0, "transfer_docs": 0,
+             "transfers_without_doc": int(yard.get("transfers_without_doc") or 0)}))
+
     return out
 
 
