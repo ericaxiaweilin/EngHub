@@ -1682,6 +1682,17 @@ UNVERIFIED_NOTE = (
 )
 
 
+def _disclose_missing_gaps(reply: str, facts: List[Dict[str, Any]]) -> str:
+    """引擎报了算不出、答复却没带到 → 出口补一行点名。
+
+    写在出口而不是指望模型自觉：无人工厂里"这条没人提"会被读成"这条没问题"。
+    """
+    from core.kernel.reply_sanitizer import iter_unavailable, missing_gap_note
+
+    items = [it for f in facts for it in iter_unavailable(f.get("result"))]
+    return (reply or "") + missing_gap_note(items, reply)
+
+
 def _numeric_claims(reply: str) -> List[str]:
     from core.kernel.reply_sanitizer import numeric_claims
 
@@ -1754,14 +1765,14 @@ async def _verify_grounded_reply(
         request_timeout=route["request_timeout"],
     )
     if resp.status_code >= 400:
-        return reply
+        return _disclose_missing_gaps(reply, facts)
     data = resp.json()
     content = (
         data.get("choices", [{}])[0]
         .get("message", {})
         .get("content", "")
     )
-    return _clean_model_reply(content) or reply
+    return _disclose_missing_gaps(_clean_model_reply(content) or reply, facts)
 
 
 async def _load_attachment_records(

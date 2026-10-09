@@ -373,3 +373,66 @@ def test_numeric_claims_ignores_years_and_short_numbers():
     assert numeric_claims("2026 年 10 月完成 1,204 件") == ["1,204"]
     assert numeric_claims("没有数字") == []
 
+
+def test_missing_gap_note_appends_when_the_item_is_not_conveyed():
+    """引擎报了算不出、答复里没这句话 → 出口要补一行。"""
+    from core.kernel.reply_sanitizer import missing_gap_note
+
+    item = {"name": "change_attribution", "state": "not_computable",
+            "reason": "请求没给 compare，算不出「为什么变了」",
+            "ask": "问变化就传两组输入"}
+    note = missing_gap_note([item], "交期是 2026-11-06，最晚延 8 天。")
+    assert note.strip().startswith("〔引擎本轮还有 1 项给不出数〕")
+    assert "请求没给 compare" in note, "补的那行要把缺项的整句 reason 交出去，不是半截片段"
+
+
+def test_missing_gap_note_stays_quiet_when_the_item_was_conveyed():
+    """答复已经把那条说法带出来了就不许再补 —— 否则每次都多一行噪声，
+    而点名率这一格也会永远满分（因为是我们自己补的字）。"""
+    from core.kernel.reply_sanitizer import missing_gap_note
+
+    item = {"name": "expedite_bottleneck_to_days",
+            "reason": "这一维测不出斜率，无法归因"}
+    reply = "外购提前期这一维测不出斜率，本轮不给斜率。"
+    assert missing_gap_note([item], reply) == ""
+    assert missing_gap_note([], reply) == ""
+
+
+def test_generic_words_do_not_count_as_disclosing_a_specific_gap():
+    """讲"另几个杠杆未测出有效改善"不等于点名了这条缺项 —— 旧尺就是在这里放行的。"""
+    from core.kernel.reply_sanitizer import gap_is_disclosed
+
+    item = {"name": "change_attribution", "reason": "请求没给 compare，算不出「为什么变了」"}
+    other = ("到岗比例、单件工时、设备可用率均未测出有效改善效果，"
+             "这一项算不出。")
+    assert not gap_is_disclosed(item, other)
+    assert gap_is_disclosed(item, "变更归因这项算不出：请求没给 compare 两组输入。")
+
+
+def test_iter_unavailable_walks_list_answers_and_layers():
+    """三种形状都要认（少认一层就把"有缺项"读成"没缺项"，等于静默放行）。"""
+    from core.kernel.reply_sanitizer import iter_unavailable
+
+    one = {"unavailable": [{"name": "a", "reason": "缺基准档"}]}
+    wrapped = {"answers": {"x": {"unavailable": [{"name": "b", "reason": "缺对比档"}]}}}
+    layered = {"layers": [{"unavailable": [{"name": "c", "reason": "没有实测温度"}]}]}
+    assert [i["name"] for i in iter_unavailable(one)] == ["a"]
+    assert [i["name"] for i in iter_unavailable(wrapped)] == ["b"]
+    assert [i["name"] for i in iter_unavailable(layered)] == ["c"]
+    assert [i["name"] for i in iter_unavailable([one, wrapped, layered])] == ["a", "b", "c"]
+
+
+def test_item_without_any_phrase_is_noted_but_never_demands_an_internal_key():
+    """只写了 name 的缺项：出口要提一句"没写清缺什么"，但绝不要求答复写键名。
+
+    要求答复里出现 `silent_one` 这种内部标识，会被 L4「契约泄漏内部标识数」判成泄漏；
+    所以这类条目既不参与"点名率"的判线（见 engine_capability 那条测试），
+    也不能被静默忽略 —— 出口这一行就是留给读者知道本轮有几项没交代清楚。
+    """
+    from core.kernel.reply_sanitizer import gap_phrases, missing_gap_note
+
+    silent = {"name": "silent_one"}
+    assert gap_phrases(silent) == [], "没写 reason/ask/missing 就不该有可核说法"
+    note = missing_gap_note([silent], "交期 2026-11-06。")
+    assert note.startswith("\n\n") and "没写清缺什么" in note
+    assert "silent_one" not in note, "不许把内部键名塞进给用户看的答复"

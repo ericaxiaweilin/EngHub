@@ -405,3 +405,78 @@ def numeric_claims(text: str) -> list:
             continue
         out.append(tok)
     return out
+
+
+# ── 「引擎报了算不出」的唯一判据：出口要补一行、读数要判点名率，两处必须同一把尺 ──
+_GAP_FIELDS = ("reason", "ask", "missing")
+_GAP_SPLIT = re.compile(r"[，。；、：:（）()\[\]「」\s→/]+")
+
+
+def iter_unavailable(result):
+    """从一次（或一批）工具返回里摊平所有 unavailable 条目。
+
+    形状有三层：list（一条答复里多个工具）、dict、以及放在 answers/layers 里的结果。
+    少认一层就会把"有缺项"读成"没缺项" —— 那是静默放行。
+    """
+    if isinstance(result, list):
+        flat = []
+        for one in result:
+            flat.extend(iter_unavailable(one))
+        return flat
+    if not isinstance(result, dict):
+        return []
+    blocks = [result]
+    answers = result.get("answers")
+    if isinstance(answers, dict):
+        # answers 是 {"键": {…}}：真正的 unavailable 常在值里，只认这一层 dict 本身会漏
+        blocks.append(answers)
+        blocks.extend(x for x in answers.values() if isinstance(x, dict))
+    layers = result.get("layers")
+    if isinstance(layers, list):
+        blocks.extend(x for x in layers if isinstance(x, dict))
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        items = b.get("unavailable")
+        if isinstance(items, list):
+            out.extend(x for x in items if isinstance(x, dict))
+    return out
+
+
+def gap_phrases(item):
+    """这一条缺项"该出现在正文里"的说法：只取它自己的 reason/ask/missing 片段。
+
+    通用词表（算不出/缺/没有…）判不得这件事：答复讲**另一批杠杆**没效果时句子里也有
+    那些词，会被误判成"这条点名了"（实测 3db81365 就是这样）。
+    """
+    out = []
+    for field in _GAP_FIELDS:
+        for seg in _GAP_SPLIT.split(str((item or {}).get(field) or "")):
+            seg = seg.strip(" 。.；;，,")
+            if len(seg) >= 4 and seg not in out:
+                out.append(seg)
+    # 不回退到 name：那等于要求答复里写 `change_attribution` 这种内部键名，
+    # 而 L4「契约泄漏内部标识数」正是罚这个。三样都没有 = 信封不合格（另有判线罚它），
+    # 这一格对它不判：既不给分也不扣分。
+    return out
+
+
+def gap_is_disclosed(item, reply: str) -> bool:
+    """答复有没有把这一条缺项交代给读者。"""
+    phrases = gap_phrases(item)
+    return bool(phrases) and any(p in (reply or "") for p in phrases)
+
+
+def missing_gap_note(items, reply: str, cap: int = 3) -> str:
+    """有缺项没带到 → 要追加的一行；都带到了（或没缺项）→ 空串。"""
+    lost = [it for it in (items or []) if not gap_is_disclosed(it, reply)]
+    if not lost:
+        return ""
+    shown = [str(it.get("reason") or it.get("ask") or (gap_phrases(it) or [""])[0]
+                or "这条没写清缺什么")[:60] for it in lost[:cap]]
+    more = f"…共 {len(lost)} 项" if len(lost) > cap else ""
+    return ("\n\n〔引擎本轮还有 " + str(len(lost)) + " 项给不出数〕"
+            + "；".join(shown) + more
+            + " —— 这不是「没做」，是这一项缺输入、或这一维测不出斜率；"
+              "把输入补上才谈得到一个数。")

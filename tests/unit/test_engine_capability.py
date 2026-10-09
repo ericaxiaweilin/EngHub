@@ -100,16 +100,36 @@ def test_summary_gap_rate_only_judges_replies_that_had_engine_gaps():
     assert named["gap_named_replies"] == 1 and named["gap_disclosure_rate"] == 1.0
 
 
-def test_gap_phrase_falls_back_to_markers_when_the_item_names_nothing():
-    """缺项自己没写 reason/ask/missing 时不许免检：它得退回字面记号表。"""
+def test_item_without_a_phrase_is_excluded_from_the_disclosure_ruler():
+    """没写"缺什么"的条目不参与点名率：判不了的东西既不扣分也不给过（今天推翻的旧语义）。
+
+    旧写法是"退回通用词表"，等于只要答复里出现过『没有依据』就算这条被点名了 ——
+    那正是通用词表的假阳性；而按 name 去要求正文写 `silent_one`，又会撞上
+    L4 的契约泄漏判线。两头都不成立，所以这一格对它不判，交给
+    「契约信封违规数」（说算不出却没点名缺什么）去罚 —— 那才是这条问题的正确落点。
+    """
     only_name = [{"tool": "query_engine_attribution",
                   "result": {"unavailable": [{"name": "silent_one"}]}}]
-    s = summary_score([_reply("交期 2026-11-06，没有依据", only_name,
+    s = summary_score([_reply("交期 2026-11-06，这一项算不出", only_name,
                               session_tools="2026-11-06")])
-    assert s["engine_gap_items"] == 1, "空说法的缺项也要进分母"
-    assert s["gap_named_replies"] == 1
-    quiet = summary_score([_reply("交期 2026-11-06", only_name, session_tools="2026-11-06")])
-    assert quiet["gap_named_replies"] == 0
+    assert s["engine_gap_items"] == 0, "无可核说法的条目不进分母"
+    assert s["replies_with_engine_gaps"] == 0
+    assert s["gap_disclosure_rate"] is None, "没有可判的缺项就不许出一个比率"
+
+
+def test_disclosure_counts_items_not_replies_and_needs_all_conveyed():
+    """一轮里有两条缺项、只带到一条 → 这一轮仍算丢（另一条用户根本没看见）。"""
+    two = [{"tool": "query_engine_attribution",
+            "result": {"unavailable": [
+                {"name": "a", "reason": "档位曲线里缺基准档"},
+                {"name": "b", "reason": "请求没给 compare 两组输入"}]}}]
+    half = summary_score([_reply("本轮档位曲线里缺基准档，所以给不出斜率。", two,
+                                 session_tools="x")])
+    assert half["engine_gap_items"] == 2
+    assert half["gap_named_replies"] == 0 and half["gap_disclosure_rate"] == 0.0
+    full = summary_score([_reply("档位曲线里缺基准档；请求没给 compare 两组输入。", two,
+                                 session_tools="x")])
+    assert full["gap_named_replies"] == 1 and full["gap_disclosure_rate"] == 1.0
 
 
 def test_gap_words_are_the_only_surface_the_ruler_reads():

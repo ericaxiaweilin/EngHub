@@ -169,43 +169,17 @@ def unbacked_kind(claim: str, reply: str, corpus: str) -> str:
     return "找不到来源"
 
 
-_SEG = re.compile(r"[，。；、：:：（）()\[\]「」\s→/]+")
-
-
 def gap_phrases(result: Any) -> List[List[str]]:
-    """引擎每条"算不出"给出它自己的说法 —— 判"点名没点名"就按这些词，不按固定词表。
+    """每条缺项该被带到正文里的说法 —— 判据本体在 kernel，出口与读数共用一把尺。
 
-    固定词表（算不出/缺/没有…）两头都判错：答复换个说法就判它没带出来，
-    而答复讲了**另一批杠杆**没效果时又会被算成带出来了。
-    每条缺项返回一串候选说法（reason / ask / missing 里的片段），命中任一段算这条被带到。
+    两处各写一遍的话，下一轮就会一个放行一个扣分（今天已经为"同名两把尺"改过三次口径）。
+    切分片段用的 `_SEG` 也一并搬进 kernel，这里不再留第二份正则。
     """
-    if isinstance(result, list):        # 一条答复里多个工具返回：逐个收，别把列表当空 dict
-        collected: List[List[str]] = []
-        for one in result:
-            collected.extend(gap_phrases(one))
-        return collected
-    body = result if isinstance(result, dict) else {}
-    blocks: List[Any] = [body, body.get("answers") or {}]
-    layers = body.get("layers")
-    if isinstance(layers, list):
-        blocks.extend(x for x in layers if isinstance(x, dict))
-    out: List[List[str]] = []
-    for b in blocks:
-        if not isinstance(b, dict):
-            continue
-        for item in (b.get("unavailable") or []):
-            if not isinstance(item, dict):
-                continue
-            phrases: List[str] = []
-            for field in ("reason", "ask", "missing"):
-                for seg in _SEG.split(str(item.get(field) or "")):
-                    seg = seg.strip(" 。.；;，,")
-                    if len(seg) >= 4:
-                        phrases.append(seg)
-            # 一条都拼不出说法的缺项（只有 name）不能免检：退回字面记号表，
-            # 否则它不进分母，反而让"没把自己缺什么写清楚"的那条显得更好看
-            out.append(phrases or list(GAP_WORDS))
-    return out
+    from core.kernel.reply_sanitizer import gap_phrases as _phrases, iter_unavailable
+
+    # 只留有说法可核的缺项：没写清缺什么的条目从分母里排除（不给分也不给过），
+    # 那种"自己没交代清楚"由契约信封那一格去罚，不在这把尺里混着算。
+    return [ph for ph in (_phrases(item) for item in iter_unavailable(result)) if ph]
 
 
 def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
