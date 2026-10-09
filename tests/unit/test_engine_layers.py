@@ -64,10 +64,11 @@ def layer_pass():
 def test_bootstrap_slope_ci_is_narrow_on_clean_line_and_refuses_flat_curve():
     lin = el.boot_ci_slope([0.8, 0.9, 1.0, 1.1, 1.2], [-4, -2, 0, 2, 4], 0.1)
     assert lin["computable"] and abs(lin["slope_per_step"] - 2.0) < 0.35
-    assert lin["ci_width_steps"] <= 1.5, "干净的线性曲线不该被判成量不出来"
+    assert lin["ci_width_over_slope"] <= 1.5, "干净的线性曲线不该被判成量不出来"
     # 完全平的曲线是"测出来不敏感"，不是"测不出来"：斜率 0、区间宽度 0，照实报
     flat = el.boot_ci_slope([0.8, 0.9, 1.0, 1.1], [0, 0, 0, 0], 0.1)
-    assert flat["computable"] is True and flat["slope_per_step"] == 0.0 and flat["ci_width_steps"] == 0.0
+    assert flat["computable"] is True and flat["slope_per_step"] == 0.0
+    assert flat["ci_width_over_slope"] == 0.0 and flat["width_undetermined"] is False
     # 档位全挤在同一个值上才是真的测不出来（没有横轴跨度可拟合）
     same = el.boot_ci_slope([1.0, 1.0, 1.0], [0, 2, 4], 0.1)
     assert same["computable"] is False
@@ -154,12 +155,36 @@ def test_row_coverage_without_engine_rows_is_none_not_zero():
 def test_worst_ci_row_names_the_widest_curve_and_direction_test_is_decidable():
     """「最差」必须指到具体一条曲线；区间跨 0 与不跨 0 是两种不同的缺陷。"""
     rows = [
-        {"lever": "外购提前期", "ci_width_steps": 1.2, "ci90": [-0.4, 0.8], "step": 0.1},
-        {"lever": "到岗率", "ci_width_steps": 44.71, "ci90": [-3.1, 41.6], "step": 0.05},
-        {"lever": "设备节拍", "ci_width_steps": 0.3, "ci90": [1.0, 1.3], "step": 0.1},
+        {"lever": "外购提前期", "ci_width_over_slope": 1.2, "ci90": [-0.4, 0.8], "step": 0.1},
+        {"lever": "到岗率", "ci_width_over_slope": 44.71, "ci90": [-3.1, 41.6], "step": 0.05},
+        {"lever": "设备节拍", "ci_width_over_slope": 0.3, "ci90": [1.0, 1.3], "step": 0.1},
     ]
     assert el.worst_ci_row(rows)["lever"] == "到岗率"
     assert el.worst_ci_row([]) is None
     # 不跨 0 的那条是"幅值不定"，跨 0 的那条才是"方向没定"
     assert not (rows[2]["ci90"][0] <= 0.0 <= rows[2]["ci90"][1])
     assert rows[1]["ci90"][0] <= 0.0 <= rows[1]["ci90"][1]
+
+
+def test_ci_width_is_measured_against_the_slope_not_the_x_step_size():
+    """量纲判据：同一条曲线换个步长报法，"测没测得出来"的结论不能变。
+
+    旧写法 `宽 ÷ step` 把"天/档"除到 x 步长上：设备可用率（step 0.05）被报成
+    "宽 44.71 档距"，而同一条曲线只要把步长写成 1.0 就"变准了" —— 判据跟着报表口径
+    跳舞，等于没有判据。
+    """
+    by_rate = el.boot_ci_slope([0.8, 0.9, 1.0, 1.1, 1.2], [-4, -2, 0, 2, 4], 0.1)
+    by_step = el.boot_ci_slope([-2.0, -1.0, 0.0, 1.0, 2.0], [-4, -2, 0, 2, 4], 1.0)
+    assert abs(by_rate["slope_per_step"] - by_step["slope_per_step"]) < 0.01
+    assert abs(by_rate["ci_width_days_per_step"] - by_step["ci_width_days_per_step"]) < 0.01
+    assert abs(by_rate["ci_width_over_slope"] - by_step["ci_width_over_slope"]) < 0.05, \
+        "同一条曲线不该因为步长怎么报就换一个结论"
+    assert by_rate["ci_width_over_slope"] <= 1.5 and by_step["ci_width_over_slope"] <= 1.5
+
+
+def test_worst_row_skips_rows_whose_ratio_cannot_be_taken(monkeypatch):
+    """斜率为 0 但区间不窄：比值取不出 —— 不能当成"最宽"，也不能当成"通过"。"""
+    rows = [{"lever": "平的", "ci_width_over_slope": None, "ci90": [-1.0, 1.0], "step": 0.05},
+            {"lever": "有斜率", "ci_width_over_slope": 2.4, "ci90": [1.0, 5.8], "step": 0.1}]
+    assert el.worst_ci_row(rows)["lever"] == "有斜率"
+    assert el.worst_ci_row([rows[0]]) is None

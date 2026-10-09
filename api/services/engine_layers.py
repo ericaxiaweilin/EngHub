@@ -33,7 +33,7 @@ THRESHOLDS: Dict[str, Dict[str, float]] = {
            "heartbeat_stalled_loops_max": 0},
     "L2A": {"elastic_coverage": 0.60,       # 六成以上参数能算出弹性，才谈"弹性表"
             "direction_hit_rate": 1.0,      # 符号错就是模型坏，不是精度问题
-            "ci_width_steps": 1.5,           # 90% 置信区间宽过 1.5 个档距就等于没测出来
+            "ci_width_over_slope": 1.5,      # 区间宽超过斜率本身的 1.5 倍就等于没测出来（无量纲）
             "elastic_ci_usable": 0.5},      # 至少一半杠杆的弹性是"测得出来的"，才算这一层成立
     "L2B": {"kit_line_coverage": 0.60,    # 台账缺口行至少覆盖引擎展开的六成，否则一致率没有意义
             "top5_overlap": 0.50,         # 两边前 5 名要有一半以上重合
@@ -177,10 +177,18 @@ def _metric(name: str, value: Any, threshold: Optional[float], sense: str, unit:
 
 def boot_ci_slope(levels: List[float], days: List[float], step: float,
                   *, samples: int = 200, seed: int = 7) -> Dict[str, Any]:
-    """弹性系数的置信区间：对曲线档位做 bootstrap 重采样，量它的散布（单位=档距）。
+    """弹性系数的置信区间：对曲线档位做 bootstrap 重采样，量它的散布。
 
     用 bootstrap 而不是解析式，是因为这些曲线本来就是台阶型的：正态假设会给出一条
-    看起来很窄、其实不存在的区间。区间宽过 1.5 个档距就是"没测出来"，不该报斜率。
+    看起来很窄、其实不存在的区间。
+
+    **宽度必须用斜率自己的量纲去除**（10-09 修）：`base/lo/hi` 的单位是"天/档"，
+    旧写法 `abs(hi-lo)/step` 把"天/档"除到了杠杆的 x 步长（设备可用率 0.05）上，
+    量纲直接错 —— 同一条曲线换个步长报法结论就变，设备可用率因此被报成"宽 44.71 档距"。
+    现在报两个数：`ci_width_days_per_step`（绝对宽度，天/档）与
+    `ci_width_over_slope`（宽度 ÷ |斜率|，无量纲，判线用这个）。斜率为 0 的平曲线
+    取不出这个比值：宽度也是 0 就是"测出来不敏感"，宽度不是 0 就标 `width_undetermined`
+    单独点名，不当通过也不当 0 分。
     """
     xs, ys = [list(map(float, levels)), list(map(float, days))]
     if len(xs) < 3 or step <= 0:
@@ -206,9 +214,16 @@ def boot_ci_slope(levels: List[float], days: List[float], step: float,
     draws.sort()
     lo = draws[int(0.05 * len(draws))]
     hi = draws[min(len(draws) - 1, int(0.95 * len(draws)))]
+    width = abs(hi - lo)
+    if abs(base) < 1e-12:
+        over = 0.0 if width < 1e-12 else None
+    else:
+        over = round(width / abs(base), 3)
     return {"computable": True, "slope_per_step": round(base, 3),
             "ci90": [round(lo, 3), round(hi, 3)],
-            "ci_width_steps": round(abs(hi - lo) / step, 2)}
+            "ci_width_days_per_step": round(width, 3),
+            "ci_width_over_slope": over,
+            "width_undetermined": over is None}
 
 
 def worst_ci_row(ci_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -218,7 +233,10 @@ def worst_ci_row(ci_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     if not ci_rows:
         return None
-    return max(ci_rows, key=lambda r: float(r.get("ci_width_steps") or 0.0))
+    rows = [r for r in ci_rows if r.get("ci_width_over_slope") is not None]
+    if not rows:
+        return None
+    return max(rows, key=lambda r: float(r["ci_width_over_slope"]))
 
 
 def direction_expectations() -> List[Dict[str, Any]]:
@@ -383,7 +401,7 @@ async def _l2a_sensitivity(db: AsyncSession, factory_id: str, models: List[str],
     sens = await sensitivity(db, factory_id, models)
     levers = sens.get("levers") or []
     computable = [l for l in levers if (l.get("slope") or {}).get("computable")]
-    ci_rows, width_worst = [], None
+    ci_rows, width_worst, undetermined = [], None, []
     ci_usable = 0
     for l in levers:
         rows = [c for c in (l.get("curve") or []) if c.get("finish_date") is not None]
@@ -393,9 +411,12 @@ async def _l2a_sensitivity(db: AsyncSession, factory_id: str, models: List[str],
         ci = boot_ci_slope(levels, days, step)
         if ci.get("computable"):
             ci_rows.append({"lever": l["label"], "step": step, **ci})
-            if float(ci["ci_width_steps"]) <= THRESHOLDS["L2A"]["ci_width_steps"]:
+            if ci.get("ci_width_over_slope") is None:
+                undetermined.append(str(l["label"]))
+                continue
+            if float(ci["ci_width_over_slope"]) <= THRESHOLDS["L2A"]["ci_width_over_slope"]:
                 ci_usable += 1
-            width_worst = max(width_worst or 0.0, float(ci["ci_width_steps"]))
+            width_worst = max(width_worst or 0.0, float(ci["ci_width_over_slope"]))
     # 方向探针：已知冲击打进去，看符号会不会反
     targets = await derive_targets(db, factory_id, models, days_of_output=6.0, lead_margin=1.15)
     pol = {"name": "基准（分批开工）", "allow_partial": True}
@@ -430,17 +451,22 @@ async def _l2a_sensitivity(db: AsyncSession, factory_id: str, models: List[str],
                 THRESHOLDS["L2A"]["direction_hit_rate"], "gte", "",
                 "已知冲击打进去，完工日只能朝一个方向动；符号反了就是模型坏"),
         _metric("置信区间可用的杠杆占比", ci_usable_rate, THRESHOLDS["L2A"]["elastic_ci_usable"], "gte", "",
-                f"{ci_usable}/{len(ci_rows)} 个杠杆的 90% 区间宽 <= {THRESHOLDS['L2A']['ci_width_steps']} 个档距"
-                "（bootstrap 200 次重采样；区间宽过档距就是没测出来，不报斜率）",
+                f"{ci_usable}/{len(ci_rows)} 个杠杆的 90% 区间宽 <= 斜率本身的 "
+                f"{THRESHOLDS['L2A']['ci_width_over_slope']} 倍（bootstrap 200 次重采样；区间比斜率本身还宽"
+                "就是没测出来，不报斜率。"
+                + (f"另有 {len(undetermined)} 条斜率为 0 但区间不窄（{'、'.join(undetermined)}）—— "
+                   "这个比值取不出，既不记通过也不记 0 分"
+                   if undetermined else "斜率为 0 而区间不窄的杠杆本轮没有") + "）",
                 n=len(ci_rows), min_n=3),
-        _metric("最差置信区间宽度", width_worst, None, "lte", "档距",
-                (f"最差的是「{worst['lever']}」：{worst['ci_width_steps']} 个档距，"
-                 f"斜率 {worst['slope_per_step']} 天/档，90% 区间 {worst['ci90']}。"
+        _metric("最差置信区间宽（÷斜率）", width_worst, None, "lte", "倍斜率",
+                (f"最差的是「{worst['lever']}」：区间宽 {worst['ci_width_days_per_step']} 天/档，"
+                 f"是斜率 {worst['slope_per_step']} 天/档 的 {worst['ci_width_over_slope']} 倍，"
+                 f"90% 区间 {worst['ci90']}。"
                  + ("区间跨过 0 —— 这条杠杆连方向都没定，斜率不报；"
                     if float(worst['ci90'][0]) <= 0.0 <= float(worst['ci90'][1])
                     else "区间没跨 0 —— 方向定了，只是幅值量不准；")
-                 + f"步长 {worst.get('step')} 档，判线是宽 <= "
-                   f"{THRESHOLDS['L2A']['ci_width_steps']} 个档距算测出来")
+                 + f"这条杠杆 x 步长 {worst.get('step')}，判线看宽 ÷ |斜率| <= "
+                   f"{THRESHOLDS['L2A']['ci_width_over_slope']}（量纲与步长无关）")
                 if worst else "本轮没有算得出区间的杠杆"),
     ], "probes": probes, "ci": ci_rows, "base_finish": base_finish,
         "levers": [{"lever": l["label"], "slope": l.get("slope"),
