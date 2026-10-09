@@ -60,3 +60,36 @@ def test_warehouse_is_part_of_the_identity_but_batch_is_not():
     assert plan["to_create_count"] == 2, "两个仓两条，同仓两批次并成一条"
     whs = sorted({p["warehouse_id"] for p in plan["to_create"]})
     assert whs == ["wh1", "wh2"]
+
+
+def test_foreign_kinds_flags_a_second_ruler_writing_the_same_table():
+    """`stock_alert_service.py` 的 run_alert_check 往同一张 stock_alerts 写
+    below_safety/above_max/dead_stock，而本服务的收口规矩是"只关本轮评估过的类型" ——
+    别人的类型一旦落库就永远关不掉。这一格就是探这件事的。"""
+    from api.services.stock_alerts import foreign_kinds
+
+    mine = ["zero_stock", "below_reorder_point", "low_stock_legacy_below_10",
+            "available_below_reserved"]
+    assert foreign_kinds(mine) == []          # 反向：全是自己的尺 → 不报警
+    got = foreign_kinds(mine + ["dead_stock", "above_max", "", None])
+    assert got == ["above_max", "dead_stock"], f"空值/None 不该进结果：{got}"
+
+
+def test_foreign_kinds_sorts_and_dedups():
+    from api.services.stock_alerts import foreign_kinds
+
+    assert foreign_kinds(["dead_stock", "above_max", "dead_stock"]) == ["above_max", "dead_stock"]
+
+
+def test_merge_alerts_leaves_foreign_types_alone_rather_than_closing_them():
+    """第二把尺的告警在本轮"没被评估"之列 —— 必须一条都不关（对账式写入的红线）。"""
+    from api.services.stock_alerts import merge_alerts
+
+    open_rows = [{"alert_type": "dead_stock", "material_id": "m1",
+                  "warehouse_id": "w1", "status": "open"},
+                 {"alert_type": "zero_stock", "material_id": "m2",
+                  "warehouse_id": "w1", "status": "open"}]
+    plan = merge_alerts({"zero_stock": []}, open_rows)   # 本轮只评估 zero_stock，且它没 fire
+    closed = {(c["alert_type"], c["material_id"]) for c in plan["to_close"]}
+    assert closed == {("zero_stock", "m2")}, f"该关的没关或关多了：{closed}"
+    assert plan["left_alone_count"] == 1, "dead_stock 不是本轮评估的类型，一条都不许碰"

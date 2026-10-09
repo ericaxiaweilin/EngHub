@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # 报警类型 → 判它的尺是什么（写进 severity/basis，读的人不用猜）
 ALERT_KINDS: Tuple[Tuple[str, str, str], ...] = (
@@ -101,6 +101,22 @@ def _payload(key: Tuple[Any, ...], firing: Dict[str, List[Dict[str, Any]]]) -> D
                     "severity": dict((k, sev) for k, sev, _b in ALERT_KINDS).get(kind, "warning")}
     return {"alert_type": kind, "material_id": material_id, "warehouse_id": warehouse or None}
 
+
+
+def foreign_kinds(seen: Iterable[str]) -> List[str]:
+    """表里出现过、但不属于本轮这几把尺的 alert_type —— 有第二把尺在写同一张表的信号。
+
+    为什么要单独探这一件事：`api/services/stock_alert_service.py` 的 `run_alert_check`
+    往**同一张** `stock_alerts` 写 `below_safety` / `above_max` / `dead_stock`，
+    而它按 material 聚合（不按 material+warehouse）。本服务的收口规矩是
+    "只关本轮评估过的类型"，所以那些类型一旦落了库就**永远关不掉** ——
+    同一条缺料被两把尺各报一遍，其中一遍没人收口。
+    10-09 实测：那三格都挂在 `safety_stock_config`（0 行）上，`if not config: continue`
+    直接跳过，所以目前表里只有我这四类（这是巧合活着，不是设计如此）。
+    """
+    mine = {k for k, _sev, _basis in ALERT_KINDS}
+    out = {str(s).strip() for s in (seen or []) if str(s or "").strip()}
+    return sorted(out - mine)
 
 async def evaluate(db, factory_id: str) -> Dict[str, Any]:
     """按四把尺各算一遍当前告警。某一格查不动就少这一格，不牵连别的格。"""

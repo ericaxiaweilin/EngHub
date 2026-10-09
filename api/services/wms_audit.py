@@ -15,7 +15,7 @@ wms_transfer_requests / wms_rfid_tags / wms_automation_jobs）。
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 # 账实核对要求的源快照新鲜度：超过这个天数就不判（源是 engflow 的一次性导入，
@@ -189,7 +189,9 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
                COUNT(*) FILTER (WHERE LOWER(status)='resolved'
                                 AND COALESCE(resolved_by,'') LIKE 'system:%') AS 系统自动消,
                COUNT(*) FILTER (WHERE LOWER(status)='resolved'
-                                AND COALESCE(resolved_by,'') NOT LIKE 'system:%') AS 人处理
+                                AND COALESCE(resolved_by,'') NOT LIKE 'system:%') AS 人处理,
+               (SELECT string_agg(DISTINCT alert_type, ',') FROM stock_alerts
+                 WHERE factory_id = :fid) AS 出现过的类型
         FROM stock_alerts WHERE factory_id = :fid""")
     below = await one("""
         SELECT COUNT(*) AS 低于补货点, COUNT(*) FILTER (WHERE COALESCE(total_qty,0)=0) AS 其中零库存
@@ -214,6 +216,68 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
                 "落库之后还要能分清'人处理了'与'条件自己消失'，否则自动消警会被读成人已处理",
         missing=None if int(alert.get("落库报警") or 0)
         else "GET /api/v1/wms/alert-sync?apply=false 先看四把尺各报多少"))
+
+    # 有第二把尺在写同一张表吗？见 stock_alerts.foreign_kinds 的说明。
+    from api.services.stock_alerts import foreign_kinds as _foreign
+
+    _seen = [t for t in str(alert.get("出现过的类型") or "").split(",") if t.strip()]
+    _foreign_types = _foreign(_seen)
+    caps.append(_grade(
+        "live" if not _foreign_types else "thin", "报警这张表有几把尺在写",
+        f"落库类型 {sorted(_seen)}；不属于本轮判据的 {len(_foreign_types)} 个"
+        f"{('：' + '、'.join(_foreign_types)) if _foreign_types else ''}",
+        so_what="收口规矩是「只关本轮评估过的类型」，所以别人的类型一旦落库就永远关不掉 —— "
+                "同一条缺料被两把尺各报一遍，其中一遍没人收。这一格专门探这件事"))
+
+    cfgd = await one("""
+        SELECT (SELECT COUNT(*) FROM safety_stock_config) AS 配置行,
+               (SELECT COUNT(*) FROM safety_stock_config WHERE is_active) AS 活跃,
+               (SELECT MIN(COALESCE(created_at, last_movement_at)) FROM inventory
+                 WHERE factory_id=:fid) AS 台账最早时间,
+               (SELECT COUNT(*) FROM inventory WHERE factory_id=:fid
+                 AND last_movement_at IS NULL) AS 从没记过动销,
+               (SELECT COUNT(DISTINCT material_id) FROM inventory WHERE factory_id=:fid
+                 AND COALESCE(total_qty,0) > 0
+                 AND UPPER(COALESCE(material_code,'')) NOT IN ('NAN','NULL','NONE','NA')
+                 AND COALESCE(last_movement_at, created_at) < :d30) AS 没动30,
+               (SELECT COUNT(DISTINCT material_id) FROM inventory WHERE factory_id=:fid
+                 AND COALESCE(total_qty,0) > 0
+                 AND UPPER(COALESCE(material_code,'')) NOT IN ('NAN','NULL','NONE','NA')
+                 AND COALESCE(last_movement_at, created_at) < :d60) AS 没动60,
+               (SELECT COUNT(DISTINCT material_id) FROM inventory WHERE factory_id=:fid
+                 AND COALESCE(total_qty,0) > 0
+                 AND UPPER(COALESCE(material_code,'')) NOT IN ('NAN','NULL','NONE','NA')
+                 AND COALESCE(last_movement_at, created_at) < :d90) AS 没动90
+        """, {"d30": now - timedelta(days=30), "d60": now - timedelta(days=60),
+              "d90": now - timedelta(days=90)})
+    # 为什么这一格不能报成"呆滞 0 条 = 没有呆滞料"：10-09 实测台账最早的时间戳是
+    # 2026-08-09（`created_at` 记的是**镜像导入时间**，不是真实收货时间），
+    # 所以 90 天口径在当前数据上恒为 0 —— 结构上到 2026-11-07 才可能第一次成立。
+    # 空集合不等于"通过"：这里判的是这条尺**现在有没有资格开口**。
+    can_fire_90 = bool(cfgd.get("台账最早时间")) and \
+        cfgd["台账最早时间"] < now - timedelta(days=90)
+    # 这条尺最早可能成立的日子 = 台账第一个时间戳 + 90 天（不是"今天 + 90 天"：
+    # 报出去的日期要能从数据本身推出来，否则就是一句看着像结论的错话）
+    _first_fire = (cfgd["台账最早时间"] + timedelta(days=90)) if cfgd.get("台账最早时间") else None
+    caps.append(_grade(
+        "blocked_on_source" if (int(cfgd.get("配置行") or 0) == 0 or not can_fire_90)
+        else "empty",
+        "呆滞料 / 超储 / 低于安全库存",
+        f"safety_stock_config {cfgd.get('配置行')} 行（活跃 {cfgd.get('活跃')}）—— 这三个判据都在 "
+        f"`if not config: continue` 后面，一条都不会报。"
+        f"换到能算的口径上看：{cfgd.get('没动30')} 个有货料号 30 天没动、"
+        f"{cfgd.get('没动60')} 个 60 天没动、{cfgd.get('没动90')} 个 90 天没动；"
+        f"但**这最后一档现在是假零** —— 台账最早时间戳 {str(cfgd.get('台账最早时间'))[:10]} "
+        f"晚于今天减 90 天，90 天这条尺结构上到 {str(_first_fire)[:10]} 之后"
+        f"才可能第一次成立；另有 {cfgd.get('从没记过动销')} 行 last_movement_at 为空"
+        f"（导入的是余额，不是动销历史）",
+        so_what="不是厂里没有呆滞料，是这条尺还没资格开口：① 阈值（多少天算呆、多高算超储）"
+                "厂里从没声明，代码里的 90 天是默认值不是核定值；② 台账 `created_at` 是镜像"
+                "导入时间，拿它当'最后一次动销'的兜底会把'导入即静止'误读成'一直没人动'。"
+                "两个原因叠在一起，报'呆滞 0 条'就是把'测不出'当成'没有'",
+        missing="① 人把 safety_stock_config 填上（safety_stock / max_stock / dead_stock_days）；"
+                "② 台账要带真实入库时间（或从 inventory_transactions 反推动销），"
+                f"否则 90 天口径在 {str(_first_fire)[:10]} 之前都不会有意义"))
 
     money = await one("""
         SELECT COUNT(*) AS 行, COUNT(*) FILTER (WHERE COALESCE(unit_cost,0)>0) AS 有单价,
