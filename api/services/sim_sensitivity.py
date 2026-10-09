@@ -75,6 +75,7 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
     sols = block.get("solutions") or []
     if not sols:
         return {"dated_models": 0, "finish_date": None, "blocked_models": [],
+                "days_late_per_model": {}, "finish_date_per_model": {},
                 "labor_cost_usd": 0.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
                 "first_batch_units": 0.0, "waiting_for_material_units": 0.0,
                 "crew_before_staffing_sum": 0.0, "crew_effective_sum": 0.0}
@@ -107,6 +108,11 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
                 float((d.get("staffing") or {}).get("crew_before_staffing") or 0) for d in detail), 1),
             "crew_effective_sum": round(sum(
                 float((d.get("staffing") or {}).get("crew_effective") or 0) for d in detail), 1),
+            # 每台机自己的完工日与延误：料号级报价要把"省下的天数"归到具体那台机
+            "days_late_per_model": {str(d.get("model_code")): float(d["days_late"])
+                                    for d in detail if d.get("days_late") is not None},
+            "finish_date_per_model": {str(d.get("model_code")): str(d["finish_date"])
+                                      for d in detail if d.get("finish_date")},
             "blocked_models": blocked,
             # 卡住的东西要点名：瓶颈件、到货关键件、用了哪条线 —— 否则"卡在料上"是一句空话
             "bottleneck_parts": {str(d.get("model_code")): d.get("bottleneck_part")
@@ -816,6 +822,8 @@ async def _sample_rows(db: AsyncSession, factory_id: str, targets: List[Dict[str
                      "labor_cost_usd": m.get("labor_cost_usd"),
                      "crew_before_staffing_sum": m.get("crew_before_staffing_sum"),
                      "crew_effective_sum": m.get("crew_effective_sum"),
+                     "days_late_per_model": m.get("days_late_per_model") or {},
+                     "finish_date_per_model": m.get("finish_date_per_model") or {},
                      "expedite_cost_usd": m.get("expedite_cost_usd"),
                      "line_activation_cost_usd": m.get("line_activation_cost_usd")})
     return rows
@@ -1770,4 +1778,150 @@ async def delivery_blockers(db: AsyncSession, factory_id: str, models: List[str]
            "claim_guard": ("这一格只回答'该动哪一处'，不回答'该不该接单'；"
                            "改承诺日、砍台数、花加急费都是企业授权动作，引擎只给数"),
            }
+    return out
+
+# 判定卡点名了瓶颈件，接下来现场要问的是"压这个件值几天、花多少钱、那个天数量过没有"。
+EXPEDITE_LEAD_DAYS = (5, 7, 10)
+# 只有量过的天数才配拿去做加急报价：其它依据标签的"省几天"是拿假设当事实
+MEASURED_EVIDENCE = ("measured",)
+
+
+def _per_model_median(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    """逐抽同序配对后按机种取中位延误（组合数只能看整体，归不到件上）。"""
+    from statistics import median
+
+    out: Dict[str, Optional[float]] = {}
+    for code in sorted({c for r in rows for c in (r.get("days_late_per_model") or {})}):
+        vals = [float(r["days_late_per_model"][code]) for r in rows
+                if code in (r.get("days_late_per_model") or {})]
+        out[code] = round(float(median(vals)), 2) if vals else None
+    return out
+
+
+async def expedite_price_by_part(db: AsyncSession, factory_id: str, models: List[str], *,
+                                 samples: int = 12, seed: int = 20261008,
+                                 lead_days: Tuple[int, ...] = EXPEDITE_LEAD_DAYS,
+                                 days_of_output: float = 6.0,
+                                 lead_margin: Optional[float] = None,
+                                 policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """把瓶颈件压到 D 天，逐档真跑同一串抽样：省几天归到机种与料号，钱按同序配对取中位。
+
+    依据标签决定这条报价能不能用：`measured` 是按请购→到货量过的，可以拿去谈价；
+    `unverified_default` 那个天数是铺进台账的默认值 —— 省下来的天数是算出来的假数，
+    所以照常给数但标成不可用，并说明先量哪个数。
+    """
+    pol = policy or {"name": "现政策（分批开工）", "allow_partial": True}
+    setup = await _risk_setup(db, factory_id, models, days_of_output=days_of_output,
+                              lead_margin=lead_margin, samples=samples, seed=seed)
+    n, bands = setup["n"], setup["bands"]
+    note = ("抽样与交期分布同一串（同 seed）；每档只加 expedite_lead_days，"
+            "到岗/带宽逐抽原样 —— 所以天数差是加急的，不是抽样的。")
+
+    async def sample(one_policy: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        rows = await _sample_rows(db, factory_id, setup["targets"], one_policy, setup["draws"])
+        return rows, _risk_summary(rows, factory_id=factory_id, models=models,
+                                   policy_name=one_policy.get("name") or "政策", samples=n,
+                                   seed=seed, bands=bands, with_date_note=note)
+
+    base_rows, base = await sample(pol)
+    if base.get("status") != "ok" or not _per_model_median(base_rows):
+        return {"status": "no_dates", "factory_id": factory_id, "models": models, "runs": [],
+                "reading": ["加急报价没跑成：这一串抽样里没有一台机推得出完工日 —— "
+                            "没有机种级延误就归不出哪个件值钱"]}
+    probe = await _run_one(db, factory_id, setup["targets"], pol,
+                           attendance=RISK_ATTENDANCE_LEVELS[0])
+    parts = probe.get("bottleneck_parts") or {}
+    base_pm = _per_model_median(base_rows)
+
+    runs: List[Dict[str, Any]] = []
+    for d in lead_days:
+        one = {**pol, "name": f"{pol['name']}＋瓶颈件加急到 {d} 天", "expedite_lead_days": int(d)}
+        rows, s = await sample(one)
+        pm = _per_model_median(rows)
+        bought = {c: (round(base_pm[c] - pm[c], 2)
+                      if base_pm.get(c) is not None and pm.get(c) is not None else None)
+                  for c in pm}
+        runs.append({
+            "expedite_lead_days": int(d), "status": s.get("status"),
+            "p_on_time": s.get("p_on_time"), "p90_finish_date": _p90(s).get("finish_date"),
+            "p90_days_late": _p90(s).get("days_late_worst"),
+            "p90_days_late_saved": (round(float(_p90(base).get("days_late_worst") or 0)
+                                          - float(_p90(s).get("days_late_worst") or 0), 1)
+                                    if s.get("status") == "ok" else None),
+            "days_bought_per_model": bought,
+            "median_expedite_cost_usd": _median([r.get("expedite_cost_usd") for r in rows]),
+            "median_extra_expedite_cost_usd": _paired_median_delta(base_rows, rows, "expedite_cost_usd"),
+            "binding_seen": sorted({str(r.get("binding")) for r in rows if r.get("binding")}),
+        })
+
+    priced = [r for r in runs if r.get("status") == "ok"]
+    per_part: List[Dict[str, Any]] = []
+    for model, part in (parts or {}).items():
+        if not isinstance(part, dict):
+            continue
+        best = max(priced, key=lambda r: float((r["days_bought_per_model"] or {}).get(model) or -999),
+                   default=None) if priced else None
+        bought = (best or {}).get("days_bought_per_model", {}).get(model)
+        evidence = str(part.get("lead_evidence") or "unknown")
+        unit_price = part.get("unit_price")
+        usable = evidence in MEASURED_EVIDENCE
+        per_part.append({
+            "material_code": part.get("material_code"), "bottlenecks_model": model,
+            "supplier": part.get("supplier"), "short_units": part.get("short"),
+            "ledger_lead_time_days": part.get("ledger_lead_time_days"),
+            "effective_lead_time_days": part.get("lead_time_days"),
+            "lead_evidence": evidence, "unit_price_usd": unit_price,
+            "days_bought": bought,
+            "expedite_lead_days": (best or {}).get("expedite_lead_days"),
+            # 这一档的钱是整包政策费（台数×压短天数×$0.15/件·天），多个件共用，不是这一个件的价格
+            "policy_extra_expedite_cost_usd": (best or {}).get("median_extra_expedite_cost_usd"),
+            "cost_scope": "整档加急政策的中位费（该档所有缺口外购件共用），不是这一个件的价格",
+            "unit_price_missing": part.get("unit_price") in (None, 0, 0.0, "0"),
+            "usable_for_pricing": usable,
+            "why": (None if usable else
+                    f"依据标签是 {evidence}：这个提前期不是量出来的，省下来的天数是算出来的假数 —— "
+                    f"先把这条件的请购→到货逐单量过，再谈加急费"),
+            # 加急费公式与单价无关（台数×压短天数×0.15），单价缺失影响的是金额折算那一格，
+            # 不许再挂到这一格上（virtual_run 里已有一次错误归因被配对验算推翻）
+            "unit_price_affects_this_quote": False,
+        })
+    per_part.sort(key=lambda x: -(float(x.get("days_bought") or 0)))
+    usable_parts = [p for p in per_part if p["usable_for_pricing"]]
+
+    out: Dict[str, Any] = {
+        "status": "ok", "factory_id": factory_id, "models": models, "samples": n, "seed": seed,
+        "promise_date": base.get("promise_date"), "bands_used": bands,
+        "base_days_late_per_model": base_pm,
+        "base_p90": {"finish_date": _p90(base).get("finish_date"),
+                     "days_late": _p90(base).get("days_late_worst")},
+        "runs": runs, "parts": per_part,
+        "first_escalation": (usable_parts or [None])[0],
+        "usable_quote_count": len(usable_parts),
+        "unverified_parts": [str(p.get("material_code")) for p in per_part
+                             if not p["usable_for_pricing"]],
+        "reading": [
+            f"现政策（{n} 抽·同一条分布）：组合 P90 完工 {_p90(base).get('finish_date')}"
+            f"（承诺 {base.get('promise_date')}、延 {_p90(base).get('days_late_worst')} 天）、"
+            f"准点概率 {base.get('p_on_time'):.0%}；按机种的中位延误："
+            + "、".join(f"{k} 延 {v:g} 天" for k, v in base_pm.items()),
+            "加急档位：" + "；".join(
+                f"压到 {r['expedite_lead_days']} 天 → 组合 P90 少延 "
+                f"{r.get('p90_days_late_saved') if r.get('p90_days_late_saved') is not None else '—'} 天、"
+                f"准点 {r.get('p_on_time') or 0:.0%}、整包加急费中位 "
+                f"${r.get('median_extra_expedite_cost_usd') or 0:,.0f}" for r in priced)
+            or "没有一档跑出完工日",
+            "按料号：" + "；".join(
+                f"{p['material_code']}（{p['lead_evidence']}·台账 {p['ledger_lead_time_days']} 天·"
+                f"缺 {p['short_units']:g} 件·{p['supplier'] or '无供应商记录'}）"
+                f"压到 {p['expedite_lead_days']} 天省 {p['days_bought']:g} 天"
+                + ("｜可用" if p["usable_for_pricing"] else f"｜不可用（{p['why']}）")
+                for p in per_part[:6]) or "这一轮没有带瓶颈件的机种（齐套表没缺口行？）",
+        ],
+        "method": ("逐档 expedite_lead_days 在同一串抽样上真跑，机种级延误按同序配对取中位差；"
+                   "加急费＝台数 × 压短天数 × SIM_EXPEDITE_COST_PER_UNIT_DAY(标定 0.15 $/件·天)，"
+                   "是该档政策的整包费用、与件单价无关；收益侧与违约罚则未建模"),
+        "claim_guard": ("报价只给'省几天/整包加急费多少'，不给'该不该加急'；"
+                        "依据不是 measured 的那几条，天数本身没量过 —— 先量数再谈钱，"
+                        "否则这份报价是拿默认值当事实。$0.15/件·天 是内置标定不是厂里报价"),
+    }
     return out

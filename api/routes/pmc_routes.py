@@ -360,6 +360,9 @@ async def get_pmc_capabilities(
             {"key": "delivery_blockers",
              "name": "交付判定卡（为什么做不到 + 改日期/加人/修数据/减量 四条路各实测换到几天）",
              "path": "/api/v1/pmc/delivery-blockers", "mode": "read_only"},
+            {"key": "sim_expedite_price",
+             "name": "料号级加急报价（压这个瓶颈件省几天、多花多少加急费、那个提前期天数量过没有）",
+             "path": "/api/v1/pmc/sim-expedite-price", "mode": "read_only"},
             {"key": "data_flow_profile",
              "name": "数据流节点剖面（台账/展开/推演三层各多少节点，按规模外推需要多少行）",
              "path": "/api/v1/pmc/data-flow-profile", "mode": "read_only"},
@@ -990,6 +993,42 @@ async def get_delivery_blockers(
     return await delivery_blockers(db, factory_id, models,
                                    samples=max(6, min(20, int(samples))), seed=seed,
                                    required=required)
+
+
+@router.get("/sim-expedite-price", summary="料号级加急报价：压每个瓶颈件省几天、花多少钱、那个天数量过没有")
+async def get_sim_expedite_price(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(5, description="取 BOM 最完整的 n 个机种"),
+    samples: int = Query(12, description="每档抽几轮（6~40；档位与基准共用同一串）"),
+    seed: int = Query(20261008, description="与交期分布同一串抽样的种子"),
+    lead_days: str = Query("5,7,10", description="把瓶颈件提前期压到几天，逗号分隔的正整数列表"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """判定卡点名了瓶颈件，这一格回答现场下一句："压它值几天、花多少钱、那个天数量过没有"。
+
+    逐档 `expedite_lead_days` 在同一串抽样上真跑，机种级延误按同序配对取中位差，再归到料号。
+    依据标签决定报价能不能用：`measured` 可以拿去谈价；`unverified_default`/`ledger_declared`
+    的那些天数不是量出来的，照样给数但标成不可用，并说明要先量哪一条。
+    单价缺失时加急费按 0 计 —— 这一条会写进行内（代价被低报），不装作免费。
+    """
+    del current_user
+    from api.services.sim_sensitivity import expedite_price_by_part
+    from api.services.virtual_run import default_models
+
+    try:
+        days = tuple(int(x) for x in str(lead_days).replace("，", ",").split(",") if x.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"lead_days 要的是逗号分隔的正整数，不能被猜：{exc}") from exc
+    if not days or any(d <= 0 or d > 365 for d in days):
+        raise HTTPException(status_code=422, detail="lead_days 形如 5,7,10（1~365 天）")
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await expedite_price_by_part(db, factory_id, models,
+                                        samples=max(6, min(40, int(samples))), seed=seed,
+                                        lead_days=days)
 
 
 

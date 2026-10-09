@@ -1126,6 +1126,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "with_blocker_card": {"type": "boolean",
                                       "description": ("要'这单为什么做不到、该动哪一处'的一屏判定时置 true"
                                                       "（四条路各跑几档粗筛，最慢的一格）")},
+                "with_expedite_price": {"type": "boolean",
+                                        "description": ("要'压这个瓶颈件省几天、花多少钱、那个天数量过没有'时置 true"
+                                                        "（3 档加急 × 12 抽同一串）")},
             }},
         },
     },
@@ -3321,6 +3324,18 @@ def _compact_data_repair(rep: Optional[Dict[str, Any]]) -> Optional[Dict[str, An
     }
 
 
+def _compact_expedite(exp: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """加急报价的聊天载荷：逐抽明细与带宽不进载荷，料号行与档位行留着。"""
+    if not exp:
+        return None
+    if exp.get("status") != "ok":
+        return {"status": exp.get("status"), "reading": exp.get("reading") or []}
+    return {k: exp.get(k) for k in ("status", "factory_id", "models", "samples", "seed",
+                                    "promise_date", "base_days_late_per_model", "base_p90",
+                                    "runs", "parts", "first_escalation", "usable_quote_count",
+                                    "unverified_parts", "reading", "method", "claim_guard")}
+
+
 def _compact_crew_margin(margin: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """加人档位那一格只留结论与逐档读数，逐抽明细不进聊天载荷。"""
     if not margin:
@@ -3368,6 +3383,9 @@ async def _tool_query_simulation_sensitivity(
         # 四条路一起跑（每条几档粗筛），所以这一格慢；它回答"为什么做不到、该动哪一处"
         from api.services.sim_sensitivity import delivery_blockers
         out["blockers"] = await delivery_blockers(db, fid, models, samples=8)
+    if args.get("with_expedite_price"):
+        from api.services.sim_sensitivity import expedite_price_by_part
+        out["expedite"] = await expedite_price_by_part(db, fid, models, samples=12)
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3420,6 +3438,9 @@ async def _tool_query_simulation_sensitivity(
         "volume_not_sampled_because": (None if out.get("volume") else
                                        "没点要减量测算（with_volume_ceiling=true 才逐档改量真跑）"),
         "delivery_blockers": (out.get("blockers") or {}),
+        "expedite_not_sampled_because": (None if out.get("expedite") else
+                                        "没点要件级加急报价（with_expedite_price=true 才逐档真跑）"),
+        "expedite_price": _compact_expedite(out.get("expedite")),
         "promise_not_sampled_because": (None if out.get("promise") else
                                         "没点要承诺上限（with_promise_headroom=true 才逐条政策取 P90）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
@@ -5021,6 +5042,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
                      "最早能承诺", "能承诺哪天", "承诺哪天", "报哪天", "改到哪天", "9 成把握", "九成把握",
                      "最多能做几台", "能做几台", "要砍多少台", "减量", "砍多少台", "少做几台",
                      "为什么做不到", "该动哪一处", "该动什么", "卡在哪", "怎么办才能", "哪一处能动", "还有救吗",
+                     "加急值几天", "加急多少钱", "压到几天", "压到 7 天", "瓶颈件报价", "件级报价", "值多少加急费",
                      "sensitivity", "斜率"],
     },
     {
@@ -5694,6 +5716,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if any(k in message for k in ("为什么做不到", "该动哪一处", "该动什么", "卡在哪",
                                       "怎么办才能", "哪一处能动", "还有救吗")):
             args["with_blocker_card"] = True
+        # "压哪个件值几天/花多少钱"要逐档真跑加急档位并归到料号，斜率那一格只给组合层面的数
+        if any(k in message for k in ("加急", "压到几天", "值几天", "催哪个件", "先催哪件",
+                                      "瓶颈件", "报价")):
+            args["with_expedite_price"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
         flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)

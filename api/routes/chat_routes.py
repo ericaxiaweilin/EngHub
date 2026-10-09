@@ -1466,6 +1466,28 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
         lines.append(f"  · 规矩：{blk.get('claim_guard') or ''}")
     elif blk:
         lines.append(f"- 判定卡：没生成 —— {blk.get('why') or blk.get('status')}")
+    exp = result.get("expedite_price") or {}
+    if exp.get("status") == "ok":
+        fe = exp.get("first_escalation") or {}
+        if fe:
+            lines.append(
+                f"- 先催哪个件（只算量过的）：{fe.get('material_code')} → {fe.get('bottlenecks_model')} "
+                f"省 {fe.get('days_bought'):g} 天（依据 {fe.get('lead_evidence')}"
+                f"·台账 {fe.get('ledger_lead_time_days')} 天·缺 "
+                f"{fe.get('short_units') if fe.get('short_units') is not None else '—'} 件）；"
+                f"这一档整包加急费中位 ${(fe.get('policy_extra_expedite_cost_usd') or 0):,.0f}"
+                f"（台数×压短天数×$0.15/件·天·标定，不是这一个件的价格）")
+        else:
+            lines.append(
+                f"- 先催哪个件：给不出 —— 这一轮 {len(exp.get('unverified_parts') or [])} 个瓶颈件的"
+                f"提前期都不是量出来的（{('、'.join((exp.get('unverified_parts') or [])[:4])) or '无'}）；"
+                f"拿默认值算出的'省几天'去谈加急费就是假话，先逐单量请购→到货")
+        for x in (exp.get("reading") or [])[1:]:
+            lines.append(f"- {x}")
+    elif result.get("expedite_not_sampled_because"):
+        lines.append(f"- 加急报价：没算 —— {result['expedite_not_sampled_because']}")
+    elif exp:
+        lines.append(f"- 加急报价：没算成 —— {(exp.get('reading') or ['未知原因'])[0]}")
     lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
     for u in (result.get("uncertainty") or [])[:2]:
         lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"

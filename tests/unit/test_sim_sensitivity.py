@@ -1153,3 +1153,148 @@ def test_delivery_blockers_chat_answer_is_one_screen_with_the_four_paths():
     broken = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
               "delivery_blockers": {"status": "no_dates", "why": "抽不出完工日", "reading": []}}
     assert "判定卡：没生成 —— 抽不出完工日" in _format_sensitivity_reply(broken)
+
+
+def _expedite_env(monkeypatch, *, parts=None, dated=True):
+    from datetime import date, timedelta
+
+    due = date(2026, 11, 1)
+    default_parts = {
+        "FG-TREAD-001": {"material_code": "RM-ELEC-036", "lead_time_days": 20,
+                         "ledger_lead_time_days": 20, "lead_evidence": "measured",
+                         "short": 15180.0, "supplier": "中联重工(佛山)", "unit_price": 12.0},
+        "A-50-04-F": {"material_code": "1000489841", "lead_time_days": 12,
+                      "ledger_lead_time_days": 12, "lead_evidence": "unverified_default",
+                      "short": 428.0, "supplier": None, "unit_price": None},
+    }
+    parts_map = default_parts if parts is None else parts
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": m, "units": 600, "due_in_days": 23} for m in ("FG-TREAD-001", "A-50-04-F")]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": m, "accuracy_score": 70.0, "hours_error_band": 0.05,
+                            "components": {"lead_time": {"score": 1.0},
+                                           "hours": {"score": 1.0, "basis": "route_standard_hours"}}}
+                           for m in ("FG-TREAD-001", "A-50-04-F")]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        p = policy or {}
+        d = perturb or {}
+        cut = float(p.get("expedite_lead_days") or 0)
+        detail = []
+        for t in targets:
+            code = str(t.get("model_code"))
+            base_days = 20.0 * float(d.get("lead_multiplier", 1.0)) * (2.0 - float(attendance))
+            if code == "A-50-04-F":
+                base_days = 12.0 * float(d.get("lead_multiplier", 1.0))
+            days = max(1.0, base_days - cut)
+            late = round(days - 23.0, 1)
+            part = parts_map.get(code) or {}
+            detail.append({"model_code": code, "units": t.get("units"), "finish_date": None,
+                           "days_late": late, "bottleneck_part": part, "capacity_binding": "material_arrival",
+                           "binding_terms": ["material_arrival"], "staffing": {"line": "LINE-TREAD-01",
+                                                                              "crew_before_staffing": 100.0,
+                                                                              "crew_effective": 90.0},
+                           "material_arrival_day": int(round(base_days))})
+        return {"finish_date": str(due + timedelta(days=int(max(late, 1.0)))),
+                "days_late_worst": late, "days_late_per_model": {str(x["model_code"]): x["days_late"]
+                                                                 for x in detail},
+                "finish_date_per_model": {str(x["model_code"]): str(x["finish_date"]) for x in detail},
+                "labor_cost_usd": 1000.0,
+                "expedite_cost_usd": round(900.0 * cut, 2),
+                "line_activation_cost_usd": 0.0, "binding": "material_arrival",
+                "bottleneck_parts": {k: v for k, v in parts_map.items()},
+                "arrival_critical_parts": {}, "material_arrival_days": {},
+                "lines_used": ["LINE-TREAD-01"], "capacity_line_declared_max": 300.0,
+                "crew_before_staffing_sum": 200.0, "crew_effective_sum": 180.0,
+                } if dated else {
+            "finish_date": None, "days_late_worst": None, "binding": "no_material",
+            "days_late_per_model": {}, "finish_date_per_model": {},
+            "bottleneck_parts": {}, "labor_cost_usd": 0.0, "expedite_cost_usd": 0.0,
+            "line_activation_cost_usd": 0.0}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+
+def test_expedite_price_attributes_days_to_models_and_labels_evidence(monkeypatch):
+    import asyncio
+
+    _expedite_env(monkeypatch)
+    out = asyncio.run(ss.expedite_price_by_part(None, "FAC", ["M-1", "M-2"], samples=12, seed=7))
+    assert out["status"] == "ok" and len(out["runs"]) == len(ss.EXPEDITE_LEAD_DAYS)
+    assert out["base_days_late_per_model"], "机种级延误是归件的前提"
+    by_code = {p["material_code"]: p for p in out["parts"]}
+    assert by_code["RM-ELEC-036"]["usable_for_pricing"] is True
+    assert by_code["RM-ELEC-036"]["days_bought"] > 0, "量过的件压 20→5 天必须省出天数"
+    assert by_code["1000489841"]["usable_for_pricing"] is False
+    assert "unverified_default" in by_code["1000489841"]["why"]
+    # 加急费公式与单价无关（台数×压短天数×0.15），单价缺失不能挂在这一格上（已被配对验算推翻过一次）
+    assert by_code["1000489841"]["unit_price_affects_this_quote"] is False
+    assert by_code["RM-ELEC-036"]["unit_price_affects_this_quote"] is False
+    assert "不是这一个件的价格" in by_code["RM-ELEC-036"]["cost_scope"]
+    assert "SIM_EXPEDITE_COST_PER_UNIT_DAY" in out["method"] and "内置标定" not in out["method"]
+    assert out["first_escalation"]["material_code"] == "RM-ELEC-036"
+    assert out["usable_quote_count"] == 1 and out["unverified_parts"] == ["1000489841"]
+    assert any("先催哪个件（只算量过的）" in x or "按料号" in x for x in out["reading"])
+    assert "拿默认值当事实" in out["claim_guard"]
+
+
+def test_expedite_price_refuses_to_name_a_first_part_when_nothing_is_measured(monkeypatch):
+    """全是铺的默认值时不许摆出'先催这个'，要交回'先量哪个数'。"""
+    import asyncio
+
+    _expedite_env(monkeypatch, parts={
+        "FG-TREAD-001": {"material_code": "RM-A", "lead_time_days": 20, "ledger_lead_time_days": 20,
+                         "lead_evidence": "unverified_default", "short": 5.0, "supplier": None,
+                         "unit_price": 3.0},
+        "A-50-04-F": {"material_code": "RM-B", "lead_time_days": 12, "ledger_lead_time_days": 12,
+                      "lead_evidence": "ledger_declared", "short": 7.0, "supplier": "某厂",
+                      "unit_price": 4.0}})
+    out = asyncio.run(ss.expedite_price_by_part(None, "FAC", ["M-1"], samples=10, seed=4))
+    assert out["first_escalation"] is None and out["usable_quote_count"] == 0
+    assert set(out["unverified_parts"]) == {"RM-A", "RM-B"}
+    assert all(p["usable_for_pricing"] is False for p in out["parts"])
+
+
+def test_expedite_price_gives_no_quote_when_no_model_gets_a_date(monkeypatch):
+    import asyncio
+
+    _expedite_env(monkeypatch, dated=False)
+    out = asyncio.run(ss.expedite_price_by_part(None, "FAC", ["M-1"], samples=8, seed=2))
+    assert out["status"] == "no_dates" and out["runs"] == []
+    assert any("没跑成" in x for x in out["reading"])
+
+
+def test_expedite_price_chat_line_names_the_part_and_the_fallback():
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    ok = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+          "expedite_price": {"status": "ok", "unverified_parts": ["1000489841"],
+                             "reading": ["现政策…", "加急档位：压到 5 天 → 组合 P90 少延 15 天"],
+                             "first_escalation": {"material_code": "RM-ELEC-036",
+                                                  "bottlenecks_model": "FG-TREAD-001",
+                                                  "days_bought": 15.0,
+                                                  "policy_extra_expedite_cost_usd": 13500.0,
+                                                  "lead_evidence": "measured",
+                                                  "ledger_lead_time_days": 20}},
+          }
+    text = _format_sensitivity_reply(ok)
+    assert "先催哪个件（只算量过的）：RM-ELEC-036 → FG-TREAD-001 省 15 天" in text
+    assert "整包加急费中位 $13,500" in text and "不是这一个件的价格" in text
+
+    none_measured = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+                     "expedite_price": {"status": "ok", "unverified_parts": ["RM-A", "RM-B"],
+                                        "first_escalation": None, "reading": ["现政策…"]}}
+    t2 = _format_sensitivity_reply(none_measured)
+    assert "给不出" in t2 and "RM-A" in t2 and "先逐单量请购→到货" in t2
+
+    not_run = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+               "expedite_not_sampled_because": "没点要件级加急报价（with_expedite_price=true 才逐档真跑）"}
+    assert "加急报价：没算 —— 没点要件级加急报价" in _format_sensitivity_reply(not_run)
