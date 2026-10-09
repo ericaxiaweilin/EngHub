@@ -477,7 +477,10 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
             "expected_answer": ("一句定口径：stations.capacity_per_hour 是『整站每小时几件』还是"
                                 "『每人每小时几件』？定了之后要么改工位表、要么改线档案，"
                                 "引擎不自己取小也不自己取大"),
-            "prefilled_evidence": {"verdict": cv, "unit_open_question": cross["unit_open_question"]},
+            # 这个字段的约定是**一句人话**（前端直接渲染，tests 按子串断言）：
+            # 放 dict 会让 React 把对象当 child 渲染，整个 /pmc 页面挂掉（10-09 实测）。
+            "prefilled_evidence": (f"两条出口对同一机种实测差 {cv.get('min')}~{cv.get('max')} 倍；"
+                                   f"单位口径没定：{cross.get('unit_open_question')}"),
         })
 
     total_st = int(eff.get("active_stations") or 0)
@@ -497,9 +500,11 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                                 "station_capacity.efficiency_rate 并填 verified_at —— 有 verified_at "
                                 "才算量过，这条会自动缩掉；不要用报工台账的 cycle_time_sec 反推，"
                                 "那批 production_reports 是仿真自写的行"),
-            "prefilled_evidence": {"used_values": eff.get("used_values") or [],
-                                   "verified": eff.get("verified"), "declared": eff.get("declared"),
-                                   "placeholder": eff.get("placeholder"), "unset": eff.get("unset")},
+            # 同上：这四个数是效率普查的分堆，写成一句，别交对象给前端。
+            "prefilled_evidence": (
+                "排程用到的效率值 " + ("、".join(str(x) for x in (eff.get("used_values") or [])) or "—")
+                + f"；量过 {eff.get('verified')} 个、档案声明 {eff.get('declared')} 个、"
+                f"占位 {eff.get('placeholder')} 个、没填按 1.0 计 {eff.get('unset')} 个"),
         })
     if int(cov.get("unclaimed_models") or 0) > 0:
         codes = cov.get("unclaimed_codes") or []

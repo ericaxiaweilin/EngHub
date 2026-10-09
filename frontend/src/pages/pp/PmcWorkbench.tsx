@@ -36,6 +36,24 @@ import { getWorkOrders, type WorkOrder } from '../../services/mes'
 import { getActiveFactoryId } from '../../utils/factory'
 import RushOrderApprovals from './RushOrderApprovals'
 
+// `prefilled_evidence` 这类字段的约定是"一句人话"（后端 tests 也按子串断言）。
+// 10-09 实测有两处把 dict 塞了进来，React 拿对象当 child 会抛 "Objects are not valid as a
+// React child"，整页被 error boundary 换成"页面渲染失败" —— 一个字段的数据形状不该让
+// PMC 工作台打不开。这里兜一层：对象拼成"字段：值"的可读句子，不 JSON 糊在界面上。
+function asText(v: any): string {
+  if (v === null || v === undefined) return ''
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  if (Array.isArray(v)) return v.map(asText).filter(Boolean).join('、')
+  if (typeof v === 'object') {
+    return Object.entries(v)
+      .map(([k, val]) => `${k}：${asText(val)}`)
+      .filter((x) => !x.endsWith('：'))
+      .join('；')
+  }
+  return String(v)
+}
+
 const { Text, Title, Paragraph } = Typography
 
 interface PmcOptionDefinition {
@@ -502,7 +520,7 @@ export default function PmcWorkbench() {
                         )}
                         <Text type="secondary" style={{ fontSize: 12 }}>{q.why_it_matters}</Text>
                         <Text type="secondary" style={{ fontSize: 12 }}>
-                          已查到：{q.prefilled_evidence}　·　要回答：{q.expected_answer}
+                          已查到：{asText(q.prefilled_evidence)}　·　要回答：{asText(q.expected_answer)}
                         </Text>
                       </Space>
                     </List.Item>
