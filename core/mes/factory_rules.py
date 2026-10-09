@@ -477,10 +477,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
             "expected_answer": ("一句定口径：stations.capacity_per_hour 是『整站每小时几件』还是"
                                 "『每人每小时几件』？定了之后要么改工位表、要么改线档案，"
                                 "引擎不自己取小也不自己取大"),
-            # 这个字段的约定是**一句人话**（前端直接渲染，tests 按子串断言）：
-            # 放 dict 会让 React 把对象当 child 渲染，整个 /pmc 页面挂掉（10-09 实测）。
-            "prefilled_evidence": (f"两条出口对同一机种实测差 {cv.get('min')}~{cv.get('max')} 倍；"
-                                   f"单位口径没定：{cross.get('unit_open_question')}"),
+            "prefilled_evidence": {"verdict": cv, "unit_open_question": cross["unit_open_question"]},
         })
 
     total_st = int(eff.get("active_stations") or 0)
@@ -500,11 +497,9 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                                 "station_capacity.efficiency_rate 并填 verified_at —— 有 verified_at "
                                 "才算量过，这条会自动缩掉；不要用报工台账的 cycle_time_sec 反推，"
                                 "那批 production_reports 是仿真自写的行"),
-            # 同上：这四个数是效率普查的分堆，写成一句，别交对象给前端。
-            "prefilled_evidence": (
-                "排程用到的效率值 " + ("、".join(str(x) for x in (eff.get("used_values") or [])) or "—")
-                + f"；量过 {eff.get('verified')} 个、档案声明 {eff.get('declared')} 个、"
-                f"占位 {eff.get('placeholder')} 个、没填按 1.0 计 {eff.get('unset')} 个"),
+            "prefilled_evidence": {"used_values": eff.get("used_values") or [],
+                                   "verified": eff.get("verified"), "declared": eff.get("declared"),
+                                   "placeholder": eff.get("placeholder"), "unset": eff.get("unset")},
         })
     if int(cov.get("unclaimed_models") or 0) > 0:
         codes = cov.get("unclaimed_codes") or []
@@ -643,6 +638,57 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
             "prefilled_evidence": gap_error,
         })
 
+
+    # 安全库存这句话现在有两套互相矛盾的声明：报几条告警取决于信哪张表，
+    # 这不是算法能定的，所以挂成待回答的问题；已经拍过就不再问。
+    try:
+        from core.mes.safety_stock_authority import safety_stock_authority
+
+        ss_auth = await safety_stock_authority(db, factory_id)
+    except Exception as exc:  # noqa: BLE001
+        ss_auth = None
+        ss_error = type(exc).__name__
+    else:
+        ss_error = None
+    if ss_auth and ss_auth.get("status") == "ok":
+        if not (await binding_rules(db, factory_id)).get("safety_stock_authority"):
+            disagree = ss_auth["disagreement"]
+            ss_rulers = ss_auth["rulers"]
+            out.append({
+                "topic": "safety_stock_authority",
+                "question": (f"『安全库存』这两处声明哪个作准 —— inventory.safety_stock"
+                             f"（众数 {ss_auth['sources'][0]['mode_value']:g}）还是 "
+                             f"materials.safety_stock（众数 {ss_auth['sources'][1]['mode_value']:g}）？"
+                             f"两表都有的 {disagree['materials_in_both']} 个料号里 "
+                             f"{disagree['disagree']} 个不一致。"),
+                "what_records_say": [
+                    {"ruler": r["ruler"], "alerts": r["alerts"], "condition": r["condition"],
+                     "basis": r["basis"]} for r in ss_rulers],
+                "widest_examples": disagree["widest_examples"],
+                "why_it_matters": (f"同一句『低于安全库存』按出处给出 "
+                                   f"{ss_rulers[0]['alerts']}/{ss_rulers[1]['alerts']}/"
+                                   f"{ss_rulers[2]['alerts']} 条（最大最小差 "
+                                   f"{ss_auth.get('ruler_spread_x') or '—'} 倍）；"
+                                   "自动补货那条链读的是 inventory 侧 + reorder_point，"
+                                   "物料主数据那句在 materials 侧，两边已经在互相否证。"
+                                   f"本该作准的 safety_stock_config 本厂 "
+                                   f"{ss_auth['config_table_rows']} 行 —— 空表不等于库存正常"),
+                "expected_answer": ("① 以 inventory.safety_stock 作准（补货链现读它），"
+                                    "materials 侧改成同一条口径；② 以 materials.safety_stock 作准，"
+                                    "触发线改读它；③ 逐料号重写（先重写决定开工那一档的件）。"
+                                    "三条都是字段级决定，不是调阈值。"),
+                "record_as": {"subject": "safety_stock_authority",
+                              "verdict": "inventory|materials|per_item_rewritten",
+                              "status": "declared", "source": "chat"},
+            })
+    elif ss_error:
+        out.append({
+            "topic": "safety_stock_authority",
+            "question": "安全库存的两处声明这轮没比成：取数失败，不能当成『两边一致』或『没有缺口』",
+            "why_it_matters": f"safety_stock_authority 取数异常（{ss_error}）—— 空集合≠通过",
+            "expected_answer": "看 /pmc/safety-stock-authority 为什么取不到",
+            "prefilled_evidence": ss_error,
+        })
 
     declared_anchor = None
     if declared:

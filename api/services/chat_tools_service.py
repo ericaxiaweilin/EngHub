@@ -1143,6 +1143,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_safety_stock_authority",
+            "description": (
+                "安全库存这句话到底是谁说的（只读、全部实测）：inventory.safety_stock 与 "
+                "materials.safety_stock 两处声明逐料号比对、各自是不是模板铺的默认值"
+                "（众数占比与取值个数，同一把尺判提前期那种铺值），以及同一句"
+                "『低于安全库存』按不同出处各报几条 —— 补货触发线（行级）、按 inventory 侧"
+                "（料号级）、按 materials 侧（料号级）、以及 safety_stock_config 那张专用配置表"
+                "（本厂填了几行）。引擎不替厂里选哪条作准，只把口径与差值摆出来；"
+                "用于'该不该补货''安全库存准不准''为什么告警数对不上''这几张表谁作准'类问题。不写任何系统。"),
+            "parameters": {"type": "object", "properties": {
+                "examples": {"type": "integer",
+                             "description": "列几例两表差得最远的料号（默认 5，最多 20）"}}}},
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_data_flow_profile",
             "description": (
                 "仿真引擎的数据流节点剖面（只读，三层全部实测）：台账层——这座厂 18 类节点各有多少行、"
@@ -3493,6 +3509,27 @@ async def _tool_query_simulation_sensitivity(
     }
 
 
+async def _tool_query_safety_stock_authority(
+    db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """安全库存的口径对照：两处声明、四条尺、模板判定，全部现算，不挑一条作准。"""
+    from core.mes.safety_stock_authority import safety_stock_authority
+
+    fid = factory_id or "FAC_MECH_001"
+    out = await safety_stock_authority(db, fid,
+                                       examples=max(1, min(20, int(args.get("examples") or 5))))
+    if out.get("status") != "ok":
+        return {"status": out.get("status"), "factory_id": fid, "has_data": False,
+                "message": (out.get("reading") or ["没读到声明"])[0]}
+    return {"status": "ok", "factory_id": fid, "has_data": True,
+            "sources": out.get("sources"), "rulers": out.get("rulers"),
+            "disagreement": out.get("disagreement"), "config_table_rows": out.get("config_table_rows"),
+            "trigger_fallbacks": out.get("trigger_fallbacks"),
+            "shortfall_units": out.get("shortfall_units"),
+            "ruler_spread_x": out.get("ruler_spread_x"),
+            "reading": out.get("reading"), "claim_guard": out.get("claim_guard")}
+
+
 async def _tool_query_data_flow_profile(
     db: AsyncSession, args: Dict[str, Any], factory_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -4568,6 +4605,7 @@ _TOOL_EXECUTORS = {
     "query_engine_capability_profile": _tool_query_engine_capability_profile,
     "query_simulation_recommendation": _tool_query_simulation_recommendation,
     "query_simulation_sensitivity": _tool_query_simulation_sensitivity,
+    "query_safety_stock_authority": _tool_query_safety_stock_authority,
     "query_data_flow_profile": _tool_query_data_flow_profile,
     "query_engine_attribution": _tool_query_engine_attribution,
     "query_chain_convergence": _tool_query_chain_convergence,
@@ -4983,6 +5021,7 @@ TOOL_LABELS = {
     "query_sim_evidence_readiness": "精度判据就绪度",
     "query_engine_capability_profile": "能力三格画像（总结/分析/推演）",
     "query_simulation_sensitivity": "建模精度与敏感度",
+    "query_safety_stock_authority": "安全库存是谁说的（两处声明、四条尺）",
     "query_data_flow_profile": "数据流节点剖面（台账/展开/推演/规模）",    "query_engine_attribution": "交期为什么是这个数（归因）",
     "query_shortage_alerts": "缺料预警",
     "query_stagnant": "呆滞物料",
@@ -5067,6 +5106,12 @@ INTENT_RULES: List[Dict[str, Any]] = [
         "tool": "query_data_flow_profile",
         "keywords": ["数据流节点", "数据节点", "多少节点", "节点数", "节点剖面", "数据流",
                      "台账有多少", "多少行台账", "流经多少", "data flow"],
+    },
+    {
+        # 「该不该补货/告警数为什么对不上」必须有出处：两处声明差几十倍，模型会随口挑一条
+        "tool": "query_safety_stock_authority",
+        "keywords": ["安全库存", "补货线", "低于安全", "该不该补货", "要不要补货",
+                     "safety stock", "告警数对不上", "哪个表作准"],
     },
     {
         # "百人/千人/几千人厂"这类规模问题必须走引擎：让模型自己描述一座厂，
@@ -5957,6 +6002,8 @@ DETERMINISTIC_INTENT_TOOLS = frozenset({
     # 模型会被要求给一个它没有的数字 —— 它没有分布，只有印象
     "query_simulation_sensitivity",
     # "百人/千人工厂有多少数据流节点"：节点数在台账与真推演里，模型数不出来也不该猜
+    # 「安全库存谁作准」这种口径问题不能让模型随口挑一张表：它会给一个看着合理的告警数
+    "query_safety_stock_authority",
     "query_data_flow_profile",
     "query_pmc_control_tower",
     "query_order_work_order_status",

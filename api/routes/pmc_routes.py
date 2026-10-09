@@ -366,6 +366,9 @@ async def get_pmc_capabilities(
             {"key": "sim_lead_calibration",
              "name": "提前期锚定核对（实测÷台账 的中位校准比；按实测锚 P50/P90 后移几天、默认锚定未改）",
              "path": "/api/v1/pmc/sim-lead-calibration", "mode": "read_only"},
+            {"key": "safety_stock_authority",
+             "name": "安全库存是谁说的（两处声明 100% 不一致 + 四条尺各报几条，只读）",
+             "path": "/api/v1/pmc/safety-stock-authority", "mode": "read_only"},
             {"key": "data_flow_profile",
              "name": "数据流节点剖面（台账/展开/推演三层各多少节点，按规模外推需要多少行）",
              "path": "/api/v1/pmc/data-flow-profile", "mode": "read_only"},
@@ -887,6 +890,27 @@ async def get_sim_schedule_risk(
                             detail='against 形如 [{"name":"加急到 7 天","expedite_lead_days":7}]')
     return await schedule_risk(db, factory_id, models, samples=samples, seed=seed,
                              against=alts or None, lead_center=lead_center)
+
+
+@router.get("/safety-stock-authority",
+            summary="安全库存这句话有几处声明、各把尺报几条告警（只读，不替厂里选哪条作准）")
+async def get_safety_stock_authority(
+    factory_id: str = Query(..., description="厂区"),
+    examples: int = Query(5, description="列几例两表差得最远的料号"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """同一句"低于安全库存"现在按出处给出三个数 —— 这一格把每个数的条件、粒度、依据摆出来。
+
+    两条声明（inventory.safety_stock 与 materials.safety_stock）逐料号比对；
+    模板判定用的是与提前期那次同一把尺（众数占比 / 取值个数）。
+    引擎不选哪张表作准：那是要厂里拍的口径，已挂成 /pmc/open-rule-questions 的问题；
+    这一格也不写 stock_alerts（那是等人确认的动作表）。
+    """
+    del current_user
+    from core.mes.safety_stock_authority import safety_stock_authority
+
+    return await safety_stock_authority(db, factory_id, examples=max(1, min(20, int(examples))))
 
 
 @router.get("/data-flow-profile", summary="数据流节点剖面：这座厂一次推演流经多少节点、按规模要多多少")

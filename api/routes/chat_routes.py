@@ -1316,6 +1316,8 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
         return "\n".join(lines)
     if tool_name == "query_simulation_sensitivity":
         return _format_sensitivity_reply(result)
+    if tool_name == "query_safety_stock_authority":
+        return _format_safety_stock_authority_reply(result)
     if tool_name == "query_data_flow_profile":
         return _format_data_flow_reply(result)
     if tool_name == "generate_plant_architecture":
@@ -1323,6 +1325,25 @@ def _direct_tool_reply(tool_name: str, result: Dict[str, Any]) -> str:
     if tool_name == "query_pmc_rush_impact":
         return _format_rush_impact(result)
     return f"{label}已完成：\n{json.dumps(result, ensure_ascii=False, default=str)[:1800]}"
+
+
+def _format_safety_stock_authority_reply(result: Dict[str, Any]) -> str:
+    """安全库存口径对照的答复：每个数都带着它的条件、粒度与出处。"""
+    if not result.get("has_data"):
+        return f"安全库存的口径对照没生成：{result.get('message') or result.get('status')}"
+    lines = [f"安全库存口径对照（工厂 {result.get('factory_id')}，只读）："]
+    for x in (result.get("reading") or []):
+        lines.append(f"- {x}")
+    for rl in (result.get("rulers") or []):
+        lines.append(f"  · {rl.get('ruler')}：{rl.get('alerts')} 条｜条件 {rl.get('condition')}"
+                     f"｜粒度 {rl.get('grain')}｜依据 {rl.get('basis')}")
+    lines.append(f"- 规矩：{result.get('claim_guard') or ''}")
+    fb = result.get("trigger_fallbacks") or {}
+    if fb:
+        lines.append(f"- 触发线的兜底现在会不会生效：reorder_point 空 {fb.get('no_reorder_point')} 行、"
+                     f"inventory.safety_stock 空 {fb.get('no_inventory_safety')} 行"
+                     f"（硬编码 10 与 ×2 只在这些行上会被用到 —— 报的是潜在，不是当前成因）")
+    return "\n".join(lines)
 
 
 def _format_data_flow_reply(result: Dict[str, Any]) -> str:
