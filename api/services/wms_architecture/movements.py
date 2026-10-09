@@ -82,6 +82,84 @@ OUTBOUND_TYPE_BY_DOC: Dict[str, TransactionType] = {
 
 class MovementError(ValueError):
     """记不了账：锚点缺失、数量不合法或类型认不出来。"""
+# 调拨的两个方向。`apply_movement` 故意不收这两个类型 —— 单边记账等于把货变出来或变没了，
+# 调拨必须成对：源出一、目标入，同一张单据号下两条流水一起落。
+TRANSFER_OUT = TransactionType.TRANSFER_OUT.value
+TRANSFER_IN = TransactionType.TRANSFER_IN.value
+
+
+async def apply_transfer_pair(
+    db: Any,
+    *,
+    source: Any,
+    target: Any,
+    quantity: int,
+    reference_type: str,
+    reference_id: str,
+    reference_doc_no: str,
+    operator: Optional[str] = None,
+    remark: Optional[str] = None,
+) -> tuple:
+    """一次调拨 = 两条流水 + 两处数量变更，全部在一个事务里。
+
+    为什么要单独一个原语而不是调两次 `apply_movement`：
+    · 那个原语按"收货/消耗"分类，调拨两边都不属于（`transfer_out` 不是消耗、
+      `transfer_in` 不是收货 —— 货没离开厂）；
+    · 分两次调就可能只成一次：源扣了、目标没加，库存凭空消失；
+    · 两边必须挂同一个 `reference_doc_no`，否则事后无法证明这两条是同一笔搬移。
+
+    数量恒为正（与 `apply_movement` 同一约定），方向由流水类型决定。
+    历史上那 89 条 `transaction_type='transfer'` 且带负数量、没有单据号的流水
+    就是这个约定没立住留下的，保留原样、不回填。
+    """
+    qty = int(quantity)
+    if qty <= 0:
+        raise MovementError(f"调拨数量必须是正整数，收到 {quantity!r}")
+    if not (reference_id or "").strip() or not (reference_doc_no or "").strip():
+        raise MovementError("调拨缺少单据锚点（reference_id / reference_doc_no），拒绝记账")
+    if source is None or target is None:
+        raise MovementError("调拨必须有源库存行和目标库存行")
+    if source.id == target.id:
+        raise MovementError("源与目标是同一行库存，这不是一次搬移")
+    if int(source.available_qty or 0) < qty:
+        raise MovementError(
+            f"源库存可用量不足：available={source.available_qty} 需移 {qty}")
+
+    now = datetime.utcnow()
+    src_before = int(source.total_qty or 0)
+    tgt_before = int(target.total_qty or 0)
+    source.total_qty = src_before - qty
+    source.available_qty = int(source.available_qty or 0) - qty
+    source.last_movement_at = now
+    source.updated_at = now
+    target.total_qty = tgt_before + qty
+    target.available_qty = int(target.available_qty or 0) + qty
+    target.last_movement_at = now
+    target.updated_at = now
+
+    out_txn = InventoryTransaction(
+        id=str(uuid.uuid4()), factory_id=source.factory_id, inventory_id=source.id,
+        material_id=source.material_id, batch_code=source.batch_code,
+        transaction_type=TRANSFER_OUT, quantity=qty,
+        before_qty=src_before, after_qty=src_before - qty,
+        reference_type=reference_type, reference_id=reference_id,
+        reference_doc_no=reference_doc_no, operator=operator,
+        remark=remark or "调拨出", created_at=now,
+    )
+    in_txn = InventoryTransaction(
+        id=str(uuid.uuid4()), factory_id=target.factory_id, inventory_id=target.id,
+        material_id=target.material_id, batch_code=target.batch_code or source.batch_code,
+        transaction_type=TRANSFER_IN, quantity=qty,
+        before_qty=tgt_before, after_qty=tgt_before + qty,
+        reference_type=reference_type, reference_id=reference_id,
+        reference_doc_no=reference_doc_no, operator=operator,
+        remark=remark or "调拨入", created_at=now,
+    )
+    db.add(out_txn)
+    db.add(in_txn)
+    return out_txn, in_txn
+
+
 
 
 def document_movement_type(direction: str, doc_type: Optional[str]) -> str:

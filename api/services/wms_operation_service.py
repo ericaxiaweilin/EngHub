@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, text, update
 
+from api.services.wms_architecture.movements import MovementError, apply_transfer_pair
 from database.models import Inventory, InventoryTransaction
 
 
@@ -266,14 +267,7 @@ class WmsOperationService:
         if src_inv.available_qty < quantity:
             return {"error": f"源库存不足：需要 {quantity}，可用 {src_inv.available_qty}"}
 
-        # 扣减源
-        before_src = src_inv.total_qty
-        src_inv.total_qty -= quantity
-        src_inv.available_qty -= quantity
-        src_inv.last_movement_at = now
-        src_inv.updated_at = now
-
-        # 目标库存
+        # 目标库存行（没有就按源行的属性新建一行，数量由成对原语一次写对）
         dst_stmt = select(Inventory).where(
             and_(
                 Inventory.factory_id == factory_id,
@@ -283,15 +277,7 @@ class WmsOperationService:
         )
         dst_result = await self.db.execute(dst_stmt)
         dst_inv = dst_result.scalar_one_or_none()
-
-        before_dst = 0
-        if dst_inv:
-            before_dst = dst_inv.total_qty
-            dst_inv.total_qty += quantity
-            dst_inv.available_qty += quantity
-            dst_inv.last_movement_at = now
-            dst_inv.updated_at = now
-        else:
+        if dst_inv is None:
             dst_inv = Inventory(
                 id=_gen_id(),
                 material_id=material_id,
@@ -301,39 +287,54 @@ class WmsOperationService:
                 warehouse_id=to_warehouse_id,
                 location_id=to_location_id,
                 batch_code=src_inv.batch_code,
-                total_qty=quantity,
-                available_qty=quantity,
+                total_qty=0,
+                available_qty=0,
                 reserved_qty=0,
                 unit=src_inv.unit or "pcs",
                 status="available",
-                last_movement_at=now,
                 created_at=now,
                 updated_at=now,
             )
             self.db.add(dst_inv)
+            await self.db.flush()
 
-        # 记录流水（出+入）
-        self.db.add(InventoryTransaction(
-            id=_gen_id(), factory_id=factory_id, inventory_id=src_inv.id,
-            material_id=material_id, batch_code=src_inv.batch_code,
-            transaction_type="transfer", quantity=-quantity,
-            before_qty=before_src, after_qty=before_src - quantity,
-            reference_type="transfer", reference_id=to_warehouse_id,
-            operator=operator, remark=remark or f"移库→{to_warehouse_id}", created_at=now,
-        ))
-        self.db.add(InventoryTransaction(
-            id=_gen_id(), factory_id=factory_id, inventory_id=dst_inv.id,
-            material_id=material_id, batch_code=src_inv.batch_code,
-            transaction_type="transfer", quantity=quantity,
-            before_qty=before_dst, after_qty=before_dst + quantity,
-            reference_type="transfer", reference_id=from_warehouse_id,
-            operator=operator, remark=remark or f"移库←{from_warehouse_id}", created_at=now,
-        ))
+        # 每一笔搬移都要有单据号：历史上那 89 条 transfer 流水没有 reference_doc_no，
+        # 事后谁也说不清是谁批准的、从哪搬到哪（wms_audit 把这一格判成 empty 就是这个原因）。
+        request_code = f"TR-{(factory_id or '')[:4]}-{now:%Y%m%d%H%M%S}-{_gen_id()[:6]}"
+        # 这张表没有 ORM 模型（只有库里的表），所以直接写 SQL —— 也不打算为一个读数去加模型
+        await self.db.execute(text("""
+            INSERT INTO wms_transfer_requests
+              (id, factory_id, request_code, material_id, material_code, material_name,
+               quantity, from_warehouse_id, to_warehouse_id, to_location_id, status,
+               requested_by, approved_by, approved_at, completed_at, remark,
+               created_at, updated_at)
+            VALUES (:id, :fid, :code, :mid, :mc, :mn, :qty, :fw, :tw, :tl, 'completed',
+                    :by, :by, :now, :now, :rm, :now, :now)
+        """), {"id": _gen_id(), "fid": factory_id, "code": request_code,
+               "mid": material_id, "mc": src_inv.material_code,
+               "mn": src_inv.material_name, "qty": int(quantity),
+               "fw": from_warehouse_id, "tw": to_warehouse_id, "tl": to_location_id,
+               "by": operator or "unknown",
+               "rm": remark or "直接执行的调拨（执行人即责任人）", "now": now})
+
+        # 数量与流水一起落，走成对原语：源出一、目标入，同一个单据号，数量恒为正
+        try:
+            await apply_transfer_pair(
+                self.db, source=src_inv, target=dst_inv, quantity=quantity,
+                reference_type="transfer_request", reference_id=request_code,
+                reference_doc_no=request_code, operator=operator, remark=remark,
+            )
+        except MovementError as exc:
+            # 单据还没提交就失败 → 整笔回滚，不留"有单无账"，也不留"扣了没加"
+            await self.db.rollback()
+            return {"error": f"调拨没记成：{exc}"}
         await self.db.commit()
 
         return {
             "success": True,
             "type": "transfer",
+            # 单据号回到返回值里：调用方（界面/agent）要能拿它去查这两条流水
+            "request_code": request_code,
             "material_id": material_id,
             "material_code": src_inv.material_code,
             "quantity": quantity,
