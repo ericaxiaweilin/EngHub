@@ -1488,6 +1488,32 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
         lines.append(f"- 加急报价：没算 —— {result['expedite_not_sampled_because']}")
     elif exp:
         lines.append(f"- 加急报价：没算成 —— {(exp.get('reading') or ['未知原因'])[0]}")
+    cal = result.get("lead_anchor_modes") or {}
+    if cal.get("status") == "ok":
+        def sgn(v: Any) -> str:
+            return "—" if v is None else f"{v:+g}"
+        lines.append(f"- 三档锚定（{cal.get('factory_id')}，{len(cal.get('models') or [])} 台机、"
+                     f"{cal.get('samples')} 抽、同一串抽样只换锚）：")
+        for m in (cal.get("modes") or []):
+            lines.append(
+                f"  · {m.get('label')}：P50 {m.get('p50')}｜P90 {m.get('p90')}｜"
+                f"准点 {(m.get('p_on_time') or 0):.0%}｜相对台账 P50/P90 "
+                f"{sgn(m.get('p50_shift_days'))}/{sgn(m.get('p90_shift_days'))} 天")
+        hy = cal.get("hybrid") or {}
+        reach = hy.get("reach") or {}
+        moved = reach.get("moved_days_per_model") or {}
+        lines.append(
+            f"  · hybrid 只覆盖 {hy.get('map_codes')}/{hy.get('ledger_rows_with_lead')} 个外购料号"
+            f"（{(hy.get('coverage') or 0):.2%}），够得着 {reach.get('models_reachable')}/"
+            f"{reach.get('models_checked')} 台："
+            + "、".join(f"{k} {sgn(v)} 天" for k, v in moved.items()))
+        force = cal.get("in_force") or {}
+        lines.append(f"  · 当前在用的是 {force.get('in_force') or '没读到厂规'} ——"
+                     f" {force.get('basis') or '没有库会话，读不到 declared 口径'}")
+    elif result.get("calibration_not_sampled_because"):
+        lines.append(f"- 三档锚定：没算 —— {result['calibration_not_sampled_because']}")
+    elif cal:
+        lines.append(f"- 三档锚定：没算成 —— {(cal.get('reading') or ['未知原因'])[0]}")
     lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
     for u in (result.get("uncertainty") or [])[:2]:
         lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"

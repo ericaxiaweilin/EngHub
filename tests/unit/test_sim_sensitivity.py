@@ -1452,3 +1452,84 @@ def test_calibration_impact_refuses_to_anchor_without_evidence(monkeypatch):
     out = asyncio.run(ss.calibration_impact(None, "FAC", ["M-1"], samples=6, seed=1))
     assert out["status"] == "no_calibration" and out["calibration"]["anchor"] is None
     assert any("只能按『台账无偏』抽" in x for x in out["reading"]), "没实测也要把默认锚定的性质说出去"
+
+
+def _anchor_payload():
+    return {"status": "ok", "has_data": True, "factory_id": "FAC_MECH_001",
+            "models": ["FG-TREAD-001", "A-50-04-F", "FG-TREAD-003"],
+            "base": {"finish_date": "2026-11-21", "days_late_worst": 21.0, "on_time_rate": 0.0,
+                     "labor_cost_usd": 314280.0, "expedite_cost_usd": 0.0,
+                     "line_activation_cost_usd": 0.0, "binding": "material_arrival"},
+            "levers": [], "accuracy_overall": 71.6, "method": "同一串抽样只换锚",
+            "lead_anchor_modes": {
+                "status": "ok", "factory_id": "FAC_MECH_001",
+                "models": ["FG-TREAD-001", "A-50-04-F"], "samples": 12, "seed": 20261008,
+                "anchor": 9.033,
+                "modes": [
+                    {"mode": "ledger", "label": "按台账（未校准）", "p50": "2026-11-14",
+                     "p90": "2026-11-23", "p_on_time": 0.0, "p50_shift_days": 0,
+                     "p90_shift_days": 0},
+                    {"mode": "global_measured", "label": "整批按实测中位", "p50": "2027-04-23",
+                     "p90": "2027-04-28", "p_on_time": 0.0, "p50_shift_days": 160,
+                     "p90_shift_days": 156},
+                    {"mode": "hybrid", "label": "料号级 hybrid", "p50": "2026-10-31",
+                     "p90": "2026-11-04", "p_on_time": 0.583, "p50_shift_days": -5,
+                     "p90_shift_days": -6}],
+                "hybrid": {"map_codes": 9, "coverage": 0.000286, "ledger_rows_with_lead": 31452,
+                           "p_on_time_change_pp": 58.3,
+                           "reach": {"models_checked": 2, "models_reachable": 1,
+                                     "moved_days_per_model": {"FG-TREAD-001": -5,
+                                                             "A-50-04-F": 0}}},
+                "in_force": {"in_force": "ledger", "basis": "没人定过锚定口径；实测说台账偏乐观 9.033×"},
+                "default_unchanged": True},
+            "calibration_not_sampled_because": None}
+
+
+def test_sensitivity_chat_answer_carries_the_three_anchor_modes():
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    text = _format_sensitivity_reply(_anchor_payload())
+    assert "三档锚定（FAC_MECH_001，2 台机、12 抽" in text
+    assert "按台账（未校准）：P50 2026-11-14" in text
+    assert "整批按实测中位" in text and "相对台账 P50/P90 +160/+156 天" in text
+    assert "料号级 hybrid" in text and "-5/-6 天" in text, "往前挪的天数必须带符号，不许念成正数"
+    assert "准点 58%" in text
+    assert "hybrid 只覆盖 9/31452 个外购料号（0.03%）" in text
+    assert "够得着 1/2 台" in text and "A-50-04-F +0 天" in text
+    assert "当前在用的是 ledger" in text and "没人定过锚定口径" in text
+    assert "三档锚定：没算" not in text
+
+
+def test_sensitivity_chat_says_the_anchor_comparison_was_not_run():
+    """没点这一格要明说没算，不能整块消失让模型自己补一句。"""
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    payload = _anchor_payload()
+    payload["lead_anchor_modes"] = None
+    payload["calibration_not_sampled_because"] = "没点要三档锚定对照（with_calibration=true 才跑）"
+    text = _format_sensitivity_reply(payload)
+    assert "三档锚定：没算 —— 没点要三档锚定对照" in text
+    assert "2027-04-28" not in text, "没跑就不许出现任何一档的日期"
+
+
+def test_sensitivity_chat_handles_a_missing_mode_shift():
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    payload = _anchor_payload()
+    payload["lead_anchor_modes"]["modes"][2]["p90_shift_days"] = None
+    payload["lead_anchor_modes"]["hybrid"]["reach"]["moved_days_per_model"]["A-50-04-F"] = None
+    text = _format_sensitivity_reply(payload)
+    assert "-5/— 天" in text and "A-50-04-F +0" not in text and "A-50-04-F — 天" in text
+
+
+def test_anchor_questions_route_to_sensitivity_without_stealing_evidence_tools():
+    from api.services.chat_tools_service import _resolve_intent_keyword as ri
+
+    for q in ("按实测锚推演要后移几天", "hybrid 动得了这台机的交期吗", "三种锚定的 P90 差几天",
+              "这个交期偏乐观多少"):
+        hit = ri(q)
+        assert hit and hit["tool"] == "query_simulation_sensitivity", q
+        assert (hit.get("args") or {}).get("with_calibration") is True, q
+
+    assert ri("先量哪些件值得实测")["tool"] == "list_measurement_priority"
+    assert ri("台账提前期是不是量出来的")["tool"] == "query_lead_time_evidence"

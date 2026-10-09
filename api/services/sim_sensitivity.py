@@ -2239,6 +2239,7 @@ async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str
     else:
         between = (f"hybrid 把 P90 挪了 {hyb_p90} 天，不低于整批锚的 {p90_shift} 天 —— "
                    "已量过的这几件偏得比中位还狠，剩下未量的仍按台账")
+    in_force = await resolve_lead_anchor(db, factory_id) if db is not None else None
     out = {
         "status": "ok", "factory_id": factory_id, "models": models, "samples": samples, "seed": seed,
         "calibration": cal, "anchor": float(cal["anchor"]),
@@ -2256,6 +2257,7 @@ async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str
                                    "min_po": fm["min_po"], "caveat": fm["caveat"],
                                    "p_on_time_change_pp": hyb_change_pp, "reach": reach},
         "on_time_drop_pp": drop_pp, "on_time_change_pp": on_time_change_pp,
+        "anchor_in_force": in_force,
         "default_unchanged": True,
         "reading": [
             f"校准依据：{cal['reliable_rows']}/{cal['rows']} 条能算依据（po≥2 且非零），"
@@ -2272,7 +2274,9 @@ async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str
             f"准点 {hyb_change_pp:+g}pp（map 覆盖 {fm['codes']}/{fm['ledger_rows_with_lead']} 个有提前期的外购料号）"
             f"—— 整批那 {p90_shift:+g} 天不是新增的不确定，是台账偏乐观的系统性偏差",
             between,
-            "默认锚定没改（这一格只算差值）：要不要按实测承诺是厂里的口径，"
+            ("当前在用的是哪一档：" + (f"{in_force['in_force']} —— {in_force['basis']}" if in_force
+                                      else "没有库会话，读不到厂规，这一格只给三档差值")
+             + "；默认锚定没改（这一格只算差值）：要不要按实测承诺是厂里的口径，"),
             f"但既然现场量出来是 {cal['median_ratio_nonzero']:g}×，继续按台账报 P90 就是在报一个已知偏乐观的数",
         ],
         "method": ("同一串抽样只把 lead_multiplier 的中心从 1.0 挪到实测中位校准比，"

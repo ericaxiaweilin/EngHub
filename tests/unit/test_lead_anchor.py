@@ -539,7 +539,12 @@ def test_calibration_impact_names_the_tier_when_hybrid_cannot_move(monkeypatch):
     monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
     monkeypatch.setattr(ss, "_run_one", fake_run_one)
     monkeypatch.setattr(ss, "lead_calibration", cal)
+    async def force(db, fid, *, census=None):
+        return {"in_force": "ledger", "basis": "没人定过锚定口径；实测说台账偏乐观 9.033×",
+                "center": 1.0, "anchor": 9.033}
+
     monkeypatch.setattr(ss, "hybrid_reach", no_reach)
+    monkeypatch.setattr(ss, "resolve_lead_anchor", force)
     monkeypatch.setattr("core.mes.measurement_priority.measured_lead_factors", factors)
 
     out = asyncio.run(ss.calibration_impact(object(), "FAC", ["M-1"], samples=8, seed=3))
@@ -551,6 +556,9 @@ def test_calibration_impact_names_the_tier_when_hybrid_cannot_move(monkeypatch):
     assert line, "够不着要有专门那句，不能混在覆盖率里"
     assert "RM-ELEC-101" in line[0] and "20" in line[0] and "engflow_mirror_multi_level" in line[0]
     assert "量上面点名的那一档" in line[0]
+    force_line = [x for x in out["reading"] if "当前在用的是哪一档" in x]
+    assert force_line and "ledger" in force_line[0], "三档都算了，还得说清厂里当前拍的是哪一档"
+    assert out["anchor_in_force"]["in_force"] == "ledger"
 
     # 有一台被碰到时，没被碰到的那几台也要点名（否则读数只讲了 successes）
     async def partly(db, fid, targets, fac):

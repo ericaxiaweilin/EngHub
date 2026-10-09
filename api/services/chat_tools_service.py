@@ -1104,9 +1104,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "毛边里几天修得掉几天修不掉），以及 with_crew_margin=true 时的"
                 "人手余量（逐档加人在同一串抽样上真跑，报'要加百分之几人手、每天多几个人，"
                 "才让 P90 也赶上承诺'，并给低一档实测到达的准点概率）。"
+                "with_calibration=true 时再加一格三档锚定对照：同一串抽样只把提前期分布的锚换成"
+                "『按台账』『整批按实测中位』『料号级 hybrid（只动量过的料号）』各跑一遍，"
+                "报三档各自 P50/P90/准点与相对台账的带符号差，并核 hybrid 够不够得着最长档。"
                 "用于'补 IE 工时值多少''加急值几天''该不该开第二条线''加班划不划算'"
                 "'这个交期有多可信''哪个杠杆最值钱''数据补齐能改善多少'"
-                "'先修哪条数据''修数据能把毛边压掉几天''赶得上这单要加多少人''加人行不行'类问题。"
+                "'先修哪条数据''修数据能把毛边压掉几天''赶得上这单要加多少人''加人行不行'"
+                "'按哪个锚推演''换实测锚要后移几天''这个交期偏乐观多少'"
+                "'按已量过的件锚动得了交期吗'类问题。"
                 "不写任何系统。"),
             "parameters": {"type": "object", "properties": {
                 "with_schedule_risk": {"type": "boolean",
@@ -1129,6 +1134,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "with_expedite_price": {"type": "boolean",
                                         "description": ("要'压这个瓶颈件省几天、花多少钱、那个天数量过没有'时置 true"
                                                         "（3 档加急 × 12 抽同一串）")},
+                "with_calibration": {"type": "boolean",
+                                     "description": ("要'按台账 / 整批按实测中位 / 料号级 hybrid 三种锚各是哪天'时置 true"
+                                                     "（3 档 × 12 抽同一串抽样，并核 hybrid 够不够得着最长档）")},
             }},
         },
     },
@@ -3336,6 +3344,34 @@ def _compact_expedite(exp: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
                                     "unverified_parts", "reading", "method", "claim_guard")}
 
 
+def _compact_calibration(cal: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """三档锚定的聊天载荷：留 modes 与 hybrid 的覆盖/够得着，逐抽明细与校准样本明细不进载荷。"""
+    if not cal:
+        return None
+    if cal.get("status") != "ok":
+        return {"status": cal.get("status"), "reading": cal.get("reading") or [],
+                "calibration": cal.get("calibration")}
+    hy = dict(cal.get("hybrid") or {})
+    reach = dict(hy.get("reach") or {})
+    reach["per_model"] = [{k: m.get(k) for k in ("model_code", "bom_source", "short_buy_rows",
+                                                 "max_short_lead_days", "hybrid_max_lead_days",
+                                                 "moved_days", "binding_parts",
+                                                 "binding_parts_total", "measured_in_bom")}
+                          for m in (reach.get("per_model") or [])]
+    hy["reach"] = reach
+    return {"status": "ok", "factory_id": cal.get("factory_id"), "models": cal.get("models"),
+            "samples": cal.get("samples"), "seed": cal.get("seed"),
+            "anchor": cal.get("anchor"), "modes": cal.get("modes"), "hybrid": hy,
+            "at_ledger": cal.get("at_ledger"), "at_measured": cal.get("at_measured"),
+            "p50_shift_days": cal.get("p50_shift_days"), "p90_shift_days": cal.get("p90_shift_days"),
+            "on_time_drop_pp": cal.get("on_time_drop_pp"),
+            "on_time_change_pp": cal.get("on_time_change_pp"),
+            "default_unchanged": cal.get("default_unchanged"),
+            "reading": cal.get("reading") or [], "method": cal.get("method"),
+            "claim_guard": cal.get("claim_guard"),
+            "in_force": (cal.get("anchor_in_force") or {})}
+
+
 def _compact_crew_margin(margin: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """加人档位那一格只留结论与逐档读数，逐抽明细不进聊天载荷。"""
     if not margin:
@@ -3386,6 +3422,10 @@ async def _tool_query_simulation_sensitivity(
     if args.get("with_expedite_price"):
         from api.services.sim_sensitivity import expedite_price_by_part
         out["expedite"] = await expedite_price_by_part(db, fid, models, samples=12)
+    if args.get("with_calibration"):
+        # 三档锚要在同一串抽样上比才成立，所以取 3 台机（与 /pmc/sim-lead-calibration 同一口径）
+        from api.services.sim_sensitivity import calibration_impact
+        out["calibration"] = await calibration_impact(db, fid, models[:3], samples=12)
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3441,6 +3481,10 @@ async def _tool_query_simulation_sensitivity(
         "expedite_not_sampled_because": (None if out.get("expedite") else
                                         "没点要件级加急报价（with_expedite_price=true 才逐档真跑）"),
         "expedite_price": _compact_expedite(out.get("expedite")),
+        "lead_anchor_modes": _compact_calibration(out.get("calibration")),
+        "calibration_not_sampled_because": (None if out.get("calibration") else
+                                            "没点要三档锚定对照（with_calibration=true 才把按台账/整批实测/"
+                                            "料号级 hybrid 在同一串抽样上各跑一遍）"),
         "promise_not_sampled_because": (None if out.get("promise") else
                                         "没点要承诺上限（with_promise_headroom=true 才逐条政策取 P90）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
@@ -5043,6 +5087,8 @@ INTENT_RULES: List[Dict[str, Any]] = [
                      "最多能做几台", "能做几台", "要砍多少台", "减量", "砍多少台", "少做几台",
                      "为什么做不到", "该动哪一处", "该动什么", "卡在哪", "怎么办才能", "哪一处能动", "还有救吗",
                      "加急值几天", "加急多少钱", "压到几天", "压到 7 天", "瓶颈件报价", "件级报价", "值多少加急费",
+                     "锚定", "按哪个锚", "锚在哪", "按实测锚", "按台账锚", "整批锚", "料号级",
+                     "三档", "换锚", "hybrid", "偏乐观",
                      "sensitivity", "斜率"],
     },
     {
@@ -5720,6 +5766,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if any(k in message for k in ("加急", "压到几天", "值几天", "催哪个件", "先催哪件",
                                       "瓶颈件", "报价")):
             args["with_expedite_price"] = True
+        # "按哪个锚/换锚差几天/hybrid 动得了吗"必须在同一串抽样上只换锚，别处给不出这三档
+        if any(k in message for k in ("锚定", "按哪个锚", "锚在哪", "按实测锚", "按台账锚",
+                                      "整批锚", "料号级", "三档", "换锚", "hybrid", "偏乐观")):
+            args["with_calibration"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
         flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)
