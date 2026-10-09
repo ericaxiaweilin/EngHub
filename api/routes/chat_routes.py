@@ -316,13 +316,12 @@ _GENERIC_READ_TOOL_NAMES = (
 
 
 async def _select_tool_names_for_message(message: str) -> set[str]:
-    """Return the smallest useful capability set for one user turn.
+    """词表探针：这张手写表命中时会挑出哪些工具名。
 
-    Deterministic intent rules remain the source of truth.  The extra action
-    cues cover mutation and administrative tools which deliberately do not use
-    ``resolve_intent`` (their parameters need model extraction).  Unknown
-    social messages intentionally return no tool: the model can converse
-    without paying the function-schema token cost.
+    **不再决定生产可见性** —— 每轮下发的是整份目录（见 `_chat_tool_definitions`），
+    由模型自选。这里保留只服务 L4 的路由回归：它量的是"词表命中什么"，
+    不能读成"用户问 X 时系统答得上来"。词表没命中的问法现在仍能被模型自选解决，
+    所以这一格分子下降不等于能力下降，反而是在提示词表该补哪几条。
     """
     text = (message or "").strip()
     normalized = text.casefold()
@@ -363,30 +362,38 @@ async def _chat_tool_definitions(
     workbook_id: Optional[str] = None,
     user_message: str = "",
 ) -> List[Dict[str, Any]]:
-    """选择本轮模型工具，并把表格附件绑定到唯一工作簿。
+    """本轮下发给模型的工具集 —— 可见性不再由关键词表决定。
 
-    有 XLSX 附件时只开放在线工作簿工具，避免模型把附件文件名误当成
-    MES 业务实体调用 search_entity；但不再关闭表格工具，这样同一轮可以
-    读取公式、修改单元格并导出原工作簿。普通对话按本轮意图收窄工具集，
-    防止完整 catalog 超出模型网关的 token-per-minute 限制。
+    以前这里调 `_select_tool_names_for_message`：46 条规则 / 673 个关键词 + 28 张 hint 表
+    先猜"这人想问什么"，猜不到就不发 schema。后果是词表没写过的自然问法（实测
+    "帮我看看这批货晚不晚，还有没有法子往前挪"）模型连工具都看不见，只能凭印象编数
+    或者答"算不了"。现在整份目录都发，由模型自己 function calling 选；引擎那 9 个
+    确定性抢跑（DETERMINISTIC_INTENT_TOOLS）照旧在模型之前由引擎给数，那是防编数，不是防问法。
+
+    只留两条**不是语义判断**的例外：
+    ① 带 XLSX 附件时只开在线工作簿工具 —— 那是把附件绑到唯一工作簿的物理约束；
+    ② 整句恰好只是问候词时不发目录 —— 省的是每轮约 4.2 万字符，用的是 fullmatch，
+       挡不掉任何带业务内容的句子。
+
+    原来那句"收窄是为了不超网关 TPM"是推测、没量过：实测目录 75 个 = 42,279 字符
+    （按中英混排粗估 1.1~2.6 万 token/轮），而今天真正卡住的是 requests-per-day
+    （免费额度 1000/1000 用满 → 429）。全目录并不增加请求数，一轮还是一次请求。
     """
     try:
         tool_catalog = _get_skill_registry().all_tool_definitions()
     except Exception:  # noqa: BLE001
         # Import/startup fallback only; normal requests always use the registry.
         tool_catalog = TOOL_DEFINITIONS
-    if not has_spreadsheet_attachment:
-        selected_names = await _select_tool_names_for_message(user_message)
+    if has_spreadsheet_attachment:
+        if not workbook_id:
+            return []
         return [
             definition for definition in tool_catalog
-            if definition.get("function", {}).get("name") in selected_names
+            if definition.get("function", {}).get("name") in _ONLINE_WORKBOOK_TOOL_NAMES
         ]
-    if not workbook_id:
+    if _CONVERSATIONAL_ONLY_RE.fullmatch((user_message or "").strip()):
         return []
-    return [
-        definition for definition in tool_catalog
-        if definition.get("function", {}).get("name") in _ONLINE_WORKBOOK_TOOL_NAMES
-    ]
+    return list(tool_catalog)
 
 
 def _attachment_analysis_context(

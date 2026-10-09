@@ -47,10 +47,11 @@ def test_update_plan_has_a_chinese_label():
 async def test_update_plan_is_selected_for_multi_step_turns():
     """**真正的契约**：每轮实际下发给模型的工具集里必须有它。
 
-    ``GET /api/v1/chat/tools`` 返回的是全量静态目录（55 个），不代表每轮会发 ——
-    实际发的是 ``_select_tool_names_for_message`` 的"最小可用集"。
-    当初就是只验了前者，工具定义、执行器、提示词、前端全对，模型却永远收不到它，
-    实测两次一次没调。这条用例钉住这个洞。
+    历史：这条用例当年钉的是"每轮实际下发"与"静态目录"不是一回事 ——
+    当时每轮只发 ``_select_tool_names_for_message`` 的最小可用集，工具没被词表挑中
+    就永远到不了模型手上。10-09 起可见性改成整份目录下发（关键词表不再决定能不能看见，
+    见 tests/unit/test_tool_visibility.py），本用例保留是因为它验的是**表意**：
+    多步任务这类轮次里，计划工具仍然必须在目录里，且词表探针别再把它漏掉。
     """
     from api.routes.chat_routes import _select_tool_names_for_message
 
