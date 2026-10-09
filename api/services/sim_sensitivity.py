@@ -1955,37 +1955,25 @@ def _quantile(vals: List[float], frac: float) -> Optional[float]:
 
 
 async def lead_calibration(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
-    """实测÷台账 的提前期校准比：把"能不能拿去锚定分布"与"只是样本"分开说。"""
-    from core.mes.measurement_priority import MEASURED_RATIO_SQL
+    """提前期锚定的唯一出处是 core/mes/measurement_priority.lead_ratio_census，这里只换名不改算。
 
-    rows = [(str(r["material_code"]), int(r["ledger_days"] or 0), float(r["measured_days"]),
-             int(r["n"] or 0), float(r["ratio"]))
-            for r in (await db.execute(MEASURED_RATIO_SQL, {"fid": factory_id})).mappings().all()
-            if r["ratio"] is not None]
-    all_r = [x[4] for x in rows]
-    nonzero = [x for x in rows if x[4] > 0]
-    reliable = [x for x in nonzero if x[3] >= 2]
-    median_all = _quantile(all_r, 0.50)
-    median_nz = _quantile([x[4] for x in nonzero], 0.50)
+    同一把尺在两处用：分布该锚在台账值还是实测量级（这一格），与"该先量哪些件"的摆动天数
+    （measurement_priority 自己）—— 两边各算一遍迟早会对不上账。
+    """
+    from core.mes.measurement_priority import lead_ratio_census
+
+    c = await lead_ratio_census(db, factory_id)
     return {
-        "factory_id": factory_id, "rows": len(rows),
-        "zero_ratio_rows": len(rows) - len(nonzero),
-        "median_ratio_all_rows": median_all, "median_ratio_nonzero": median_nz,
-        "spread_nonzero": {"p25": _quantile([x[4] for x in nonzero], 0.25),
-                           "p75": _quantile([x[4] for x in nonzero], 0.75),
-                           "min": min([x[4] for x in nonzero], default=None),
-                           "max": max([x[4] for x in nonzero], default=None)},
-        "reliable_rows": len(reliable),
-        "median_ratio_reliable": _quantile([x[4] for x in reliable], 0.50),
-        "anchor": median_nz,
-        "anchor_basis": "非零校准比的中位" if median_nz else None,
-        "examples": [{"material_code": x[0], "ledger_days": x[1], "measured_median_days": round(x[2], 1),
-                      "po_count": x[3], "ratio": round(x[4], 2)} for x in reliable[:8]],
-        "caveat": ("ratio=0 的行是『实测到货 0 天』—— 那不是快，是收货记录缺失或同日进出，"
-                   "它会同时把中位数往下拖又让极端倍数上位，所以锚定只用非零那一子集；"
-                   "po_count=1 的行只能算样本，不算依据"),
-        "note": ("校准比 >1 = 台账比现场快，交付分布因此整体偏乐观；"
-                 "这一格只报『实测说台账偏了几倍』，改不改默认锚定要厂里定口径"),
+        "factory_id": factory_id, "rows": c["rows"], "zero_ratio_rows": c["zero_ratio_rows"],
+        "median_ratio_all_rows": c["median_all"], "median_ratio_nonzero": c["median_nonzero"],
+        "spread_nonzero": {"p25": c["p25_nonzero"], "p75": c["p75_nonzero"],
+                           "min": c["min_nonzero"], "max": c["max_nonzero"]},
+        "reliable_rows": c["reliable_rows"], "anchor": c["anchor"],
+        "anchor_basis": "非零校准比的中位" if c["anchor"] else None,
+        "examples": c["examples"], "caveat": c["caveat"],
+        "single_source": "core/mes/measurement_priority.lead_ratio_census",
+        "note": ("校准比 >1 = 台账比现场快，交付分布因此整体偏乐观；这一格只报『实测说台账偏了几倍』，"
+                 "改不改默认锚定要厂里定口径"),
     }
 
 

@@ -556,6 +556,46 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
             "record_as": {"subject": "station_capacity_basis", "verdict": "declared",
                           "status": "declared", "source": "chat"},
         })
+    from core.mes.measurement_priority import lead_ratio_census
+
+    ratio = await lead_ratio_census(db, factory_id)
+    if ratio["anchor"]:
+        out.append({
+            "topic": "lead_time_anchor",
+            "question": ("交期分布现在按『台账提前期无偏』抽（中心 1.0），但本厂下单→到货实测说台账"
+                         f"偏乐观 {ratio['anchor']:g}×（非零中位，p25 {ratio['p25_nonzero']}、"
+                         f"p75 {ratio['p75_nonzero']}，能当依据的 {ratio['reliable_rows']} 条 / "
+                         f"另有 {ratio['zero_ratio_rows']} 条实测 0 天已排除）——"
+                         "默认锚要不要改成实测中位？"),
+            "why_it_matters": ("中心与带宽是两件事：带宽说『这个数有多不准』，中心说『这个数偏朝哪边』。"
+                               f"现在每一格的 P50/P90 与准点概率都是拿偏乐观 {ratio['anchor']:g}× 的台账算的，"
+                               "所以准点概率系统性偏高。改成实测锚会让 P90 往后挪多少，"
+                               "/pmc/sim-lead-calibration 已经量过（同一串抽样只挪中心）；"
+                               "不改也要得起另一个说法：对外报的数是已知偏乐观的"),
+            "expected_answer": ("① 默认锚按实测中位（引擎把分布中心挪到 "
+                                f"{ratio['anchor']:g}×）；② 仍按台账，但对外读数必须标『未校准』；"
+                                "③ 分批：先按已量过的料号锚，其余照台账"),
+            "prefilled_evidence": ("样本：" + "、".join(
+                f"{e['material_code']} 台账 {e['ledger_days']} 天 vs 实测中位 "
+                f"{e['measured_median_days']} 天（{e['po_count']} 张单，{e['ratio']:g}×）"
+                for e in ratio["examples"][:3]) or "没有可靠样本"),
+            "record_as": {"subject": "lead_time_anchor", "verdict": "measured|ledger|hybrid",
+                          "status": "declared", "source": "chat"},
+        })
+    elif ratio["rows"]:
+        out.append({
+            "topic": "lead_time_anchor",
+            "question": ("有实测到货记录但没有可用校准比（非零行为 0）——"
+                         "现在既不能按实测锚，也不能说台账准；要不要先把决定开工日那一档的件量出来？"),
+            "why_it_matters": "没有可用实测时，分布只能按台账锚，这一点必须跟着每次交期承诺一起说出去，"
+                              "不能让它看起来像量过的",
+            "expected_answer": "先量哪些档 / 或明确接受『按台账且未校准』这个口径",
+            "prefilled_evidence": f"全部 {ratio['rows']} 行里 {ratio['zero_ratio_rows']} 行实测为 0 天（收货记录缺失或同日进出）",
+            "record_as": {"subject": "lead_time_anchor", "verdict": "measured|ledger|hybrid",
+                          "status": "declared", "source": "chat"},
+        })
+
+
     return {"questions": out, "coverage": cov,
             "answer_how": ("同 capacity 口径这类问题，回答后用 record_factory_rule 落成 declared 规则；"
                            "线认领关系要改的是 line_profiles（事实表），引擎不自动写")}

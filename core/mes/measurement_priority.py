@@ -35,6 +35,49 @@ MEASURED_RATIO_SQL = text("""
 """)
 
 
+def _median(vals: List[float]) -> Optional[float]:
+    if not vals:
+        return None
+    ordered = sorted(vals)
+    mid = len(ordered) // 2
+    return round(float(ordered[mid]) if len(ordered) % 2
+                 else (ordered[mid - 1] + ordered[mid]) / 2.0, 3)
+
+
+async def lead_ratio_census(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """实测到货 ÷ 台账提前期：整厂一个数的唯一出处（交期承诺、分布锚定、优先级都从这里取）。
+
+    两件事必须分开报：**中位数偏多少倍**（锚定该挪到哪）与**有多少条能当依据**。
+    实测 0 天的行是收货记录缺失或同日进出，不是"快"，留着会同时把中位数往下拖、把极值往上抬；
+    只有 1 张单的料号算样本不算依据。两者都不进 anchor。
+    """
+    rows = [(str(r["material_code"]), int(r["ledger_days"] or 0), float(r["measured_days"]),
+             int(r["n"] or 0), float(r["ratio"]))
+            for r in (await db.execute(MEASURED_RATIO_SQL, {"fid": factory_id})).mappings().all()
+            if r["ratio"] is not None]
+    nonzero = [x for x in rows if x[4] > 0]
+    reliable = [x for x in nonzero if x[3] >= 2]
+    nz_vals = [x[4] for x in nonzero]
+    spread = sorted(nz_vals)
+    return {
+        "factory_id": factory_id, "rows": len(rows),
+        "zero_ratio_rows": len(rows) - len(nonzero),
+        "median_all": _median([x[4] for x in rows]),
+        "median_nonzero": _median(nz_vals),
+        "p25_nonzero": (round(float(spread[int(0.25 * (len(spread) - 1))]), 2) if spread else None),
+        "p75_nonzero": (round(float(spread[int(0.75 * (len(spread) - 1))]), 2) if spread else None),
+        "min_nonzero": (round(float(spread[0]), 2) if spread else None),
+        "max_nonzero": (round(float(spread[-1]), 2) if spread else None),
+        "reliable_rows": len(reliable),
+        "anchor": _median(nz_vals),
+        "examples": [{"material_code": x[0], "ledger_days": x[1], "measured_median_days": round(x[2], 1),
+                      "po_count": x[3], "ratio": round(x[4], 2)} for x in reliable[:12]],
+        "caveat": ("实测 0 天的行＝收货记录缺失或同日进出，不是快；单张单的料号只算样本不算依据。"
+                   "两者都不进 anchor，所以 anchor 可能比『全部行的中位数』更极端 —— 那不是挑数据，"
+                   "是不肯把缺失当观测"),
+    }
+
+
 async def measurement_priority(db: AsyncSession, factory_id: str,
                                models: Optional[List[str]] = None,
                                *, units: Optional[float] = None,
@@ -44,21 +87,18 @@ async def measurement_priority(db: AsyncSession, factory_id: str,
 
     today = date.today()
     chosen = [str(m) for m in (models or [])] or await vr.default_models(db, factory_id, n=n_models)
-    ratios = [(float(r["ratio"]), int(r["n"]), str(r["material_code"]), int(r["ledger_days"]),
-               round(float(r["measured_days"]), 1))
-              for r in (await db.execute(MEASURED_RATIO_SQL, {"fid": factory_id})).mappings().all()
-              if r["ratio"] is not None]
-    ratios.sort()
-    if ratios:
-        mid = ratios[len(ratios) // 2]
-        calibration = {"basis": "本厂采购下单→到货实测 ÷ 台账提前期，取中位数",
-                       "n_materials": len(ratios), "median_ratio": round(mid[0], 2),
-                       "example": {"material_code": mid[2], "ledger_days": mid[3],
-                                   "measured_median_days": mid[4]},
-                       "samples": [{"material_code": r[2], "ledger_days": r[3],
-                                    "measured_median_days": r[4], "n_po": r[1],
-                                    "ratio": round(r[0], 2)} for r in ratios[:12]]}
-        factor = max(1.0, float(mid[0]))
+    census = await lead_ratio_census(db, factory_id)
+    if census["rows"]:
+        calibration = {"basis": "本厂采购下单→到货实测 ÷ 台账提前期，取非零行的中位数（唯一出处 lead_ratio_census）",
+                       "n_materials": census["rows"], "median_ratio": census["median_nonzero"],
+                       "median_all_rows": census["median_all"],
+                       "zero_ratio_excluded": census["zero_ratio_rows"],
+                       "reliable_rows": census["reliable_rows"],
+                       "spread_nonzero": {"p25": census["p25_nonzero"], "p75": census["p75_nonzero"],
+                                          "min": census["min_nonzero"], "max": census["max_nonzero"]},
+                       "example": (census["examples"] or [None])[0],
+                       "samples": census["examples"]}
+        factor = max(1.0, float(census["median_nonzero"] or census["median_all"] or 0.0))
     else:
         calibration = {"basis": "本厂没有任何「下单→到货」的实测记录可用来校准 —— 下面的摆动天数是假设值",
                        "n_materials": 0, "median_ratio": None,
