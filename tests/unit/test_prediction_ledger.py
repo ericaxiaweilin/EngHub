@@ -63,3 +63,31 @@ def test_error_bands_are_carried_into_the_summary():
                      "last_day": date(2026, 10, 9)},
                     {"e. 晚 8 天以上": 2, "c. 准（±2 天）": 1}, 10)
     assert out["error_bands"] == {"e. 晚 8 天以上": 2, "c. 准（±2 天）": 1}
+
+
+def test_pairing_missing_names_the_population_not_the_clock():
+    """账本 550 张、成对 0 对、已完工单里 0 张在账本里 —— 这种等多久都是 0。"""
+    from api.services.prediction_ledger import pairing_missing
+
+    pop = {"completed_total": 28, "completed_dated_past": 3, "completed_on_ledger_models": 0,
+           "completed_in_ledger": 0, "ledger_models": 1}
+    txt = pairing_missing(0, 10, pop)
+    assert "从来没被留痕" in txt and "缺的不是天数" in txt
+    assert "28 张" in txt and "未来日期 25 张" in txt, "文案里的数要能从读数复算出来"
+
+
+def test_pairing_missing_when_completions_are_being_recorded():
+    """账本里已有完工单才说"下一轮会配上" —— 两种情况不许混成同一句。"""
+    from api.services.prediction_ledger import pairing_missing
+
+    pop = {"completed_total": 28, "completed_dated_past": 12, "completed_on_ledger_models": 5,
+           "completed_in_ledger": 4, "ledger_models": 2}
+    txt = pairing_missing(2, 10, pop)
+    assert "已有 4 张单完工" in txt and "从来没被留痕" not in txt
+
+
+def test_pairing_missing_without_any_completion_says_so():
+    from api.services.prediction_ledger import pairing_missing
+
+    assert "还没有一张已完工单" in pairing_missing(0, 10, {"completed_total": 0})
+    assert "还没有一张已完工单" in pairing_missing(0, 10, None), "查不动人群时不许编归因"

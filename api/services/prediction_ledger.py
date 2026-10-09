@@ -233,7 +233,8 @@ async def pair_completed_predictions(db: AsyncSession, factory_id: str, *,
     return out
 
 
-def summarize(ledger: Dict[str, Any], bands: Dict[str, int], pairs_needed: int) -> Dict[str, Any]:
+def summarize(ledger: Dict[str, Any], bands: Dict[str, int], pairs_needed: int,
+              pop: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把账本读成一句能判线的话：样本不够就明说还差几条，不给 0 分也不给假绿灯。"""
     paired = int(ledger.get("paired") or 0)
     mape = ledger.get("mape")
@@ -252,8 +253,7 @@ def summarize(ledger: Dict[str, Any], bands: Dict[str, int], pairs_needed: int) 
     out["state"] = ("reported" if paired < pairs_needed or mape is None else
                     ("pass" if float(mape) <= 0.20 else "fail"))
     if paired < pairs_needed:
-        out["missing"] = (f"成对样本 {paired} 对（判线要 ≥{pairs_needed} 对）："
-                          "留痕只能从今天起攒，历史单当时没说过这句话，配不出对")
+        out["missing"] = pairing_missing(paired, pairs_needed, pop)
     elif mape is None:
         # 样本够但算不出数：这是数据形状问题（预计日或实际日为空），不能拿"样本不足"当解释
         out["missing"] = (f"成对 {paired} 对但误差算不出：paired_on 有值而 mape 为空，"
@@ -263,13 +263,67 @@ def summarize(ledger: Dict[str, Any], bands: Dict[str, int], pairs_needed: int) 
     return out
 
 
+POPULATION_SQL = """
+WITH led AS (SELECT DISTINCT model_code FROM engine_order_predictions),
+done AS (
+    SELECT COALESCE(p.product_code, o.product_id::text) AS model,
+           o.actual_complete::date AS d
+    FROM work_orders o
+    LEFT JOIN products p ON p.factory_id = o.factory_id
+         AND (p.id::text = o.product_id OR p.product_code = o.product_id::text)
+    WHERE o.factory_id = :fid AND o.status = 'completed' AND o.actual_complete IS NOT NULL
+),
+recorded_done AS (
+    SELECT DISTINCT o.id
+    FROM engine_order_predictions e
+    JOIN work_orders o ON o.id::text = e.work_order_id
+    WHERE o.status = 'completed' AND o.actual_complete IS NOT NULL
+)
+SELECT (SELECT COUNT(*) FROM done) AS completed_total,
+       (SELECT COUNT(*) FROM done WHERE d <= CURRENT_DATE) AS completed_dated_past,
+       (SELECT COUNT(*) FROM done
+         WHERE model IN (SELECT model_code FROM led)) AS completed_on_ledger_models,
+       (SELECT COUNT(*) FROM recorded_done) AS completed_in_ledger,
+       (SELECT COUNT(*) FROM led) AS ledger_models
+"""
+
+
+def pairing_missing(paired: int, pairs_needed: int, pop: Optional[Dict[str, Any]] = None) -> str:
+    """成对样本不够时点名缺的是**天数**还是**人群** —— 这两种"再等等"完全不是一回事。
+
+    等天数：账本里已有单完工，只是还没配上 —— 下一轮闸门自然会长。
+    等人群：已完工的那批单从来没被留痕（10-09 实测：完工的是组件号子单，
+    账本记的是整机机种的在流程单）—— 等多久都是 0 对，要动的是留痕覆盖的人群。
+    """
+    base = f"成对样本 {paired} 对（判线要 ≥{pairs_needed} 对）："
+    pop = pop or {}
+    done = int(pop.get("completed_total") or 0)
+    if not pop or done == 0:
+        return base + "这座厂还没有一张已完工单 —— 没有完工事件可配，样本只能攒不能补"
+    in_led = int(pop.get("completed_in_ledger") or 0)
+    if in_led == 0:
+        future = done - int(pop.get("completed_dated_past") or 0)
+        return base + (f"{done} 张已完工单里没有一张在账本里（账本覆盖 "
+                       f"{pop.get('ledger_models')} 个机种的在流程单；完工单落在这些机种上的 "
+                       f"{pop.get('completed_on_ledger_models')} 张）—— "
+                       "缺的不是天数，是**会完工的那批单从来没被留痕**。"
+                       f"另：完工单里完工日 ≤ 今天 {pop.get('completed_dated_past')} 张、"
+                       f"未来日期 {future} 张 —— 那些单还没真做过，"
+                       "把它们当实绩配对会算出假误差")
+    return base + (f"账本里已有 {in_led} 张单完工，下一轮 delivery_prediction_ledger（每 24 小时）"
+                   "会把它们配上")
+
+
 async def delivery_accuracy(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
     """留痕法交期准度（只读）：记了多少、配了多少、误差分布长什么样。"""
     await ensure_schema(db)
     ledger = (await db.execute(text(LEDGER_SQL), {"fid": factory_id})).mappings().first() or {}
     bands = {str(r["band"]): int(r["n"]) for r in
              (await db.execute(text(BANDS_SQL), {"fid": factory_id})).mappings().all()}
-    out = summarize(dict(ledger), bands, MIN_PAIRS_FOR_MAPE)
+    pop = dict((await db.execute(text(POPULATION_SQL),
+                                 {"fid": factory_id})).mappings().first() or {})
+    out = summarize(dict(ledger), bands, MIN_PAIRS_FOR_MAPE, pop)
+    out["population"] = pop
     out["method"] = ("当时说了什么 vs 实际哪天完工（最早一条留痕配对）。"
                      "与 /sim-backtest 那条追溯法回测不是一件事：那条是用今天的主数据重跑历史单")
     out["caveat"] = ("误差带按实际日历日算（含停工日）；机种没落到声明过日产量的线上时当天不记，"

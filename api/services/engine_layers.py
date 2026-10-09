@@ -653,11 +653,11 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                 "只有这一格才回答「客户拿到的那个日期准不准」。样本只能攒不能补："
                 "历史单当时没写过这句话，配不出对。",
                 n=_led["paired"], min_n=THRESHOLDS["L2B"]["backtest_min_pairs"],
+                # 文案取自账本那一格自己算的归因：同一条判线结论不许两处各拼一次
                 missing=(None if _led["paired"] >= THRESHOLDS["L2B"]["backtest_min_pairs"] and
                          _led["mape"] is not None else
-                         f"账本里已记 {_led['orders_recorded']} 张在流程单的当日预计，"
-                         f"成对 {_led['paired']} 对（判线要 ≥{THRESHOLDS['L2B']['backtest_min_pairs']} 对）："
-                         "每天由 delivery_prediction_ledger 那道闸门记账，完工即配对")),
+                         (f"账本里已记 {_led['orders_recorded']} 张在流程单的当日预计；"
+                          f"{_led.get('missing') or '成对够数'}"))),
         _metric("输入映射精度", round(priced / 100.0, 3), None, "gte", "0~1",
                 "六项输入的加权覆盖率（工时/提前期/供应商/库存/自制外购/单价），只作分母透明化"),
     ], "readiness": await _readiness(db, factory_id),
