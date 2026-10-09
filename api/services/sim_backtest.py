@@ -306,9 +306,8 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
                 higher += 1
                 if led_req > 0:
                     ratios.append(eng_need / led_req)
-    # 覆盖率低到底是被什么封顶的：逐单数一下台账登记了几行外购齐套行。
-    # 实测 70 张里 63 张还停在旧的单层快照（中位 8 行），只有 6 张按多层展开登记过（最多 680 行、深 9 层）——
-    # 那是"重跑一次登记作业"就能挪动的盖子，不是"镜像里没有子 BOM"那种源侧死账，两条出路不能混着写。
+    # 覆盖率低到底是被什么封顶：逐单数一下台账登记了几行外购齐套行，按档报当轮张数。
+    # 浅档是"重跑一次登记作业"就能挪动的盖子，深档还缺的才是源侧没子 BOM，两条出路不能混着写。
     per_order_rows = [len(order_rows.get(x["work_order_id"]) or []) for x in per_order]
     per_order_rows.sort()
     synth_orders = sum(1 for x in per_order
@@ -323,9 +322,11 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
         "median_buy_rows": (per_order_rows[len(per_order_rows) // 2] if per_order_rows else None),
         "max_buy_rows": (per_order_rows[-1] if per_order_rows else None),
         "orders_with_synthetic_rows": synth_orders,
-        "meaning": ("覆盖率是被登记世代封顶的：多数单还停在旧的单层快照（一个机种十几行），"
-                    "少数单已按多层展开登记（同机种 680 行、深 9 层）。"
-                    "前者重跑一次齐套登记就能对齐，不是源侧缺组件级子 BOM"),
+        "meaning": ("覆盖率是被登记世代封顶的：本轮 "
+                    + "、".join(f"{k} {v} 张" for k, v in buckets.items() if v)
+                    + f"（中位 {per_order_rows[len(per_order_rows) // 2] if per_order_rows else 0} 行、"
+                    + f"最多 {per_order_rows[-1] if per_order_rows else 0} 行）。"
+                    "停在浅档的单重跑一次齐套登记就能对齐，不是源侧缺组件级子 BOM"),
     }
 
     ratios.sort()
@@ -487,10 +488,40 @@ async def bottleneck_agreement(db: AsyncSession, factory_id: str, *, limit: int 
                                  if n else None),
         "median_ledger_parts": (sorted(x["ledger_shortage_parts"] for x in per_order)[n // 2]
                                 if n else None),
+        # 覆盖率有两把尺：两张中位数之比说的是「典型那张单」，逐单求和之比说的才是
+        # 「台账一共还漏多少行没登记」。上一版只报前者，于是同一格读 0.961 而
+        # /kit-coverage-gap 读 0.649 —— 名字一样、数不一样，人按 0.961 就当登记完了。
+        # 两把都算出来放在一起，先让账面能对上，再谈判线格指哪一把。
+        "short_row_sums": {
+            "ledger_rows": sum(int(x["ledger_shortage_parts"] or 0) for x in per_order),
+            "engine_rows": sum(int(x["engine_shortage_parts"] or 0) for x in per_order),
+        },
+        # 「提前期最长那件」与「净缺最大那件」是两个定义，但常在同一批料号上点到同一件。
+        # 重合率不报出来，两个 0.7 就会被读成两次独立验证。
+        "top_choice_coincidence": top_coincidence(per_order),
         "bom_sources": sorted({str(x["bom_source"]) for x in per_order}),
         "disagreements": [x for x in per_order if not x["qty_agrees"]][:8],
         "meaning": ("第一名一致率之外再看 top-5 重叠与倒数排名：前者说明两边是不是在盯同一批料，"
                     "后者说明差多远。库存取今天而非当时快照，所以对老单名次漂移是预期内的。"),
+    }
+
+
+def top_coincidence(per_order: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """两个定义（提前期最长 vs 净缺最大）点到同一件料号的单数。
+
+    「瓶颈件一致率」按两种定义分开报，但两边在同一批料号上常选到同一个第一名（10-09 实测
+    引擎两名重合 112/120、台账 118/120）—— 重合率不报出来，两个 0.70 就会被读成两次独立验证，
+    而它只是一个数读了两遍。
+    """
+    n = len(per_order)
+    return {
+        "of": n,
+        "engine_two_names_same": sum(1 for x in per_order
+                                     if x.get("engine_lead_top")
+                                     and x["engine_lead_top"] == x.get("engine_qty_top")),
+        "ledger_two_names_same": sum(1 for x in per_order
+                                     if str(x.get("ledger_longest_lead"))
+                                     == str(x.get("ledger_most_missing"))),
     }
 
 

@@ -103,6 +103,17 @@ MACHINE_ACTORS = frozenset({
 MIN_ADOPTION_DISPOSITIONS = 3
 
 
+def row_coverage(ledger_rows: int, engine_rows: int) -> Optional[float]:
+    """台账登记到的缺口行 ÷ 引擎本轮展开出的缺口件行 —— 「台账缺口行覆盖率」只允许这一把尺。
+
+    必须是**逐单求和**之比：两张中位数之比说的是「典型那张单齐了没」，浅档单少时它会
+    明显乐观（10-09 实测：中位数比 0.961、求和比 0.821），而补登记的工作量是按行数推进的，
+    放行门看的也是行。分母为 0 时返回 None —— 引擎没展开出缺口件，覆盖率无从计算，不许报 0。
+    """
+    eng = int(engine_rows or 0)
+    return round(int(ledger_rows or 0) / eng, 3) if eng else None
+
+
 def adoption_from_dispositions(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """人工采纳率：只数**有人的账号写过处置日志**的那些单。
 
@@ -549,6 +560,11 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
     except Exception:  # noqa: BLE001 - 账本读不动时这一格如实 not_computable，不带崩整层
         _led = {"mape": None, "paired": 0, "orders_recorded": 0}
     priced = float(acc.get("overall_accuracy") or 0)
+    srs = agree.get("short_row_sums") or {}
+    eng_rows = int(srs.get("engine_rows") or 0)
+    led_rows = int(srs.get("ledger_rows") or 0)
+    row_cov = row_coverage(led_rows, eng_rows)
+    coinc = agree.get("top_choice_coincidence") or {}
     univ = agree.get("bom_universe") or {}
     same_gen = univ.get("same_generation") or {}
     basis = same_gen.get("requirement_basis") or {}
@@ -573,23 +589,38 @@ async def _l2b_accuracy(db: AsyncSession, factory_id: str, models: List[str]) ->
                 f"（另有 {univ.get('off_universe_orders')} 张的引擎第一件压根不在该单当日的缺口行里），"
                 f"在这 {univ.get('shared_universe_orders')} 张上的一致率是 "
                 f"{univ.get('qty_based_on_shared_universe', {}).get('rate')} —— "
-                "同一宇宙的分母才谈得上对错，剩下的分母是覆盖率问题"),
+                "同一宇宙的分母才谈得上对错，剩下的分母是覆盖率问题。"
+                f"本轮引擎两名（提前期最长 vs 净缺最大）点到同一件料号的单 "
+                f"{coinc.get('engine_two_names_same')}/{coinc.get('of')}，"
+                f"台账两名（提前期最长 vs 缺最多）为同一件的单 "
+                f"{coinc.get('ledger_two_names_same')}/{coinc.get('of')} —— "
+                "两名重合率高时这两格不是两次独立验证，只是一个数读了两遍"),
         _metric("BOM 取数来源", (agree.get("bom_sources") or [None])[0], None, "lte", "",
                 f"这批可比单的仿真取数来自 {agree.get('bom_sources')}；"
                 "镜像没有行的机种会如实回落本地 bom_items 并在每台单的读数里标注（见 sim-readiness）"),
-        _metric("台账缺口行覆盖率", (round(agree.get("median_ledger_parts") / max(1, agree.get("median_shortage_parts") or 1), 3)
-                  if agree.get("median_ledger_parts") is not None else None),
+        _metric("台账缺口行覆盖率", row_cov,
                 THRESHOLDS["L2B"]["kit_line_coverage"], "gte", "比例",
-                f"每张单台账里记录的缺口件数中位 {agree.get('median_ledger_parts')} 件 vs 引擎按真源 BOM "
-                f"展开的缺口件数中位 {agree.get('median_shortage_parts')} 件 —— "
-                "一致率与 top-5 重叠都被这个覆盖率封顶：台账只看得到一部分缺料行。"
-                f"但盖子是**登记世代**不是源侧缺账 —— {order_n} 张里 {depth_txt}"
-                f"（中位 {depth.get('median_buy_rows')} 行、最多 {depth.get('max_buy_rows')} 行；"
-                "同一个机种按多层展开登记过的单能到 680 行、深 9 层），"
-                "所以这一格要先重跑齐套登记（#30 那条路径）才谈得上命中率准不准；"
-                "#46 只解释其中键在镜像里压根没有子 BOM 的那部分",
-                missing=(None if agree.get("median_shortage_parts") else
-                         "引擎没展开出缺口件，覆盖率无从计算")),
+                f"这 {order_n} 张可比单上：引擎按真源 BOM 展开出的外购缺口件共 {eng_rows} 行，"
+                f"台账登记到的缺口行共 {led_rows} 行 —— 比值 {row_cov}。"
+                "一致率与 top-5 重叠都被这一格封顶：台账只看得到一部分缺料行。"
+                f"盖子是**登记世代**不是源侧缺账 —— {order_n} 张里 {depth_txt}"
+                f"（中位 {depth.get('median_buy_rows')} 行、最多 {depth.get('max_buy_rows')} 行），"
+                "补登记由 engine_kit_backfill 那道闸在做（只加行、每单有行数上限）；"
+                "这一格与 /api/v1/pmc/kit-coverage-gap 的 coverage_rate、"
+                "engine_watchdog 的 kit_line_coverage 同一把尺"
+                "（那里按抽样单、这里按可比单池，两个数不必相等但必须同向）。"
+                "旧读法取两张中位数之比，说的是「典型那张单齐了没」，"
+                "浅档单少时它比求和口径乐观 —— 判线换到求和口径，中位数留成下面那格对照",
+                missing=(None if eng_rows else "引擎没展开出缺口件，覆盖率无从计算")),
+        _metric("每单缺口件数中位比（只报数）",
+                (round(agree.get("median_ledger_parts")
+                       / max(1, agree.get("median_shortage_parts") or 1), 3)
+                 if agree.get("median_ledger_parts") is not None else None),
+                None, "gte", "比例",
+                f"台账缺口件数中位 {agree.get('median_ledger_parts')} 件 vs 引擎按真源 BOM 展开的"
+                f"缺口件数中位 {agree.get('median_shortage_parts')} 件 —— 判线曾经用这个比值。"
+                "留着当对照：它比上面那格乐观，说明浅档单被中位数抹掉了；"
+                "两格反向时先信求和那格，因为补登记是按行数推进的"),
         _metric("瓶颈件 top-5 重叠率", agree.get("top5_overlap_rate"),
                 THRESHOLDS["L2B"]["top5_overlap"], "gte", "",
                 f"两边各取前 5 名的交集比例；台账第一件落进引擎前 5 的有 "

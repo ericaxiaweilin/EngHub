@@ -107,3 +107,29 @@ def test_registration_bands_report_line_and_qty_ratios():
 def test_band_reading_admits_when_the_full_band_is_missing():
     out = coverage_summary([_deep("WO-thin", 10, 5, 100, 200, 9000)])
     assert "分档样本不足" in out["short_qty_by_registration_band"]["reading"]
+
+
+def test_top_coincidence_counts_orders_where_both_names_are_the_same_part():
+    """两个定义点到同一件料号的单要单独报数：否则两条一致率会被当成两次独立验证。"""
+    from api.services.sim_backtest import top_coincidence
+
+    rows = [
+        {"engine_lead_top": "A", "engine_qty_top": "A",
+         "ledger_longest_lead": "A", "ledger_most_missing": "A"},
+        {"engine_lead_top": "B", "engine_qty_top": "C",
+         "ledger_longest_lead": "D", "ledger_most_missing": "D"},
+        {"engine_lead_top": "E", "engine_qty_top": "E",
+         "ledger_longest_lead": "F", "ledger_most_missing": "G"},
+    ]
+    out = top_coincidence(rows)
+    # 台账两名相同的有 2 张（A/A 与 D/D），engine 两名相同的也有 2 张（A/A 与 E/E）
+    assert out == {"of": 3, "engine_two_names_same": 2, "ledger_two_names_same": 2}
+
+
+def test_top_coincidence_survives_a_missing_engine_pick():
+    """引擎没选出第一名时不许把 None==None 记成重合。"""
+    from api.services.sim_backtest import top_coincidence
+
+    out = top_coincidence([{"engine_lead_top": None, "engine_qty_top": None,
+                            "ledger_longest_lead": "A", "ledger_most_missing": "A"}])
+    assert out["engine_two_names_same"] == 0 and out["ledger_two_names_same"] == 1

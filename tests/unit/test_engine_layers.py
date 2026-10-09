@@ -132,3 +132,20 @@ def test_machine_accounts_are_churn_even_without_the_supersede_note():
             _disp("done", "pmc_agent")]
     out = el.adoption_from_dispositions(rows)
     assert out["judged"] == 0 and out["engine_churn"] == 3
+
+
+def test_row_coverage_is_the_row_sum_ruler_not_the_median_ratio():
+    """同名只许一把尺：判线用的必须是逐单求和之比。
+
+    这组数是 10-09 实测形状：多数单台账≈引擎（中位数之比因此读 0.961），
+    另有几张单的引擎缺口行完全没登记 —— 求和口径 0.821 才说明还差多少行没写。
+    """
+    assert el.row_coverage(15895, 19352) == 0.821
+    assert el.row_coverage(146, 152) == 0.961, "两张中位数之比会明显乐观，所以它不判线"
+
+
+def test_row_coverage_without_engine_rows_is_none_not_zero():
+    """引擎没展开出缺口件时无从计算 —— 报 0 会被读成"台账一行都没登记"。"""
+    assert el.row_coverage(120, 0) is None
+    assert el.row_coverage(0, 0) is None
+    assert el.row_coverage(0, 500) == 0.0, "引擎有缺口行而台账零行，这才是真的 0"
