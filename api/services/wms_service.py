@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.services import bom_source
 from api.services.wms_architecture.movements import (
     apply_movement,
+    MovementError,
     document_movement_type,
 )
 from database.models import (
@@ -196,34 +197,41 @@ class WmsService:
 
         adjusted_count = 0
         total_diff = 0
+        blocked: List[Dict[str, Any]] = []
         for item in items:
             if item.counted_qty is None:
                 continue
-            diff = item.counted_qty - item.system_qty
-            if diff != 0 and item.inventory_id:
-                # 调整库存
-                inv = await self.db.get(Inventory, item.inventory_id)
-                if inv:
-                    inv.total_qty = item.counted_qty
-                    inv.available_qty = item.counted_qty - (inv.reserved_qty or 0)
-                    inv.updated_at = datetime.utcnow()
-
-                # 写流水
-                await self.record_transaction(
-                    factory_id=count_order.factory_id,
-                    material_id=item.material_id,
-                    transaction_type="count_diff",
-                    quantity=diff,
-                    inventory_id=item.inventory_id,
-                    batch_code=item.batch_code,
-                    reference_type="count_order",
-                    reference_id=count_id,
+            diff = int(item.counted_qty) - int(item.system_qty or 0)
+            if diff == 0 or not item.inventory_id:
+                continue
+            inv = await self.db.get(Inventory, item.inventory_id)
+            if inv is None:
+                blocked.append({"inventory_id": item.inventory_id, "why": "库存行已不存在"})
+                continue
+            # 数量与流水必须同时落 —— 走唯一写入原语。原来这里是"先手改 total_qty，
+            # 再 record_transaction 记一条"，两个错：① 流水的 after_qty 是在改完之后
+            # 算的，于是记成"实测数 + 差值"，账对不上；② 写的类型 count_diff 不在
+            # 收货/消耗词表里，成本核算与周转都读不到这次调整。
+            # 盘盈 = adjustment_in、盘亏 = adjustment_out（枚举里本来就有这一对）。
+            try:
+                await apply_movement(
+                    self.db, inventory=inv,
+                    transaction_type=document_movement_type(
+                        "in" if diff > 0 else "out", "adjustment"),
+                    quantity=abs(diff),
+                    reference_type="count_order", reference_id=count_id,
+                    reference_doc_no=count_order.count_code or count_id,
                     operator=approved_by,
                     remark=f"盘点调整: {item.system_qty} → {item.counted_qty}",
                 )
-                item.adjusted = True
-                adjusted_count += 1
-                total_diff += abs(diff)
+            except MovementError as exc:
+                # 例如实测数比已预留的量还小 —— 不能硬扣，也不能悄悄跳过：写进单子的差异说明
+                blocked.append({"inventory_id": item.inventory_id,
+                                "material_code": item.material_id, "why": str(exc)})
+                continue
+            item.adjusted = True
+            adjusted_count += 1
+            total_diff += abs(diff)
 
         # 更新盘点单
         count_order.status = "approved"
@@ -231,6 +239,11 @@ class WmsService:
         count_order.completed_at = datetime.utcnow()
         count_order.diff_items = adjusted_count
         count_order.total_diff_qty = total_diff
+        count_order.variance_summary = (
+            f"审批人 {approved_by}：调差 {adjusted_count} 行、合计 {total_diff} 件"
+            + (f"；{len(blocked)} 行没能调整：" + "；".join(
+                f"{b.get('material_code') or b.get('inventory_id')} {b['why']}"
+                for b in blocked[:5]) if blocked else ""))
 
         await self.db.commit()
         return {"success": True, "message": f"盘点已审批，调整 {adjusted_count} 项", "adjusted_items": adjusted_count}

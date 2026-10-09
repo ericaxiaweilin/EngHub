@@ -110,13 +110,34 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
         missing="源侧导入要把 NaN 挡在落库前；已入库的这类行要人决定冲回还是补料号，"
                 "引擎不自己删（删库存行是厂里的账）"))
 
-    cnt = await one("SELECT COUNT(*) AS 盘点单 FROM inventory_counts WHERE factory_id = :fid")
+    cnt = await one("""
+        SELECT (SELECT COUNT(*) FROM inventory_counts WHERE factory_id = :fid) AS 盘点单,
+               (SELECT COUNT(*) FROM inventory_counts WHERE factory_id = :fid
+                 AND LOWER(status) = 'approved') AS 已审批,
+               (SELECT COUNT(*) FROM inventory_count_items ci
+                 JOIN inventory_counts c ON c.id = ci.count_id
+                 WHERE c.factory_id = :fid) AS 明细行,
+               (SELECT COUNT(*) FROM inventory_count_items ci
+                 JOIN inventory_counts c ON c.id = ci.count_id
+                 WHERE c.factory_id = :fid AND ci.counted_qty IS NOT NULL) AS 已录入,
+               (SELECT COUNT(*) FROM inventory_count_items ci
+                 JOIN inventory_counts c ON c.id = ci.count_id
+                 WHERE c.factory_id = :fid AND ci.adjusted) AS 已调差""")
+    orders = int(cnt.get("盘点单") or 0)
+    counted = int(cnt.get("已录入") or 0)
+    approved = int(cnt.get("已审批") or 0)
+    # 三态分开：开了单 ≠ 盘过了 ≠ 调过账。只数"单"会把引擎自己开的空单读成功能上线。
+    state = "empty" if not orders else ("live" if approved else "thin")
     caps.append(_grade(
-        "empty" if not int(cnt.get("盘点单") or 0) else "live", "盘点（账实一致）",
-        f"inventory_counts {cnt.get('盘点单')} 单（建单/录入/审批三个接口都在，从来没人开过单）",
+        state, "盘点（账实一致）",
+        (f"inventory_counts {orders} 单、明细 {cnt.get('明细行')} 行，"
+         f"其中已录实测数 {counted} 行、已审批 {approved} 单、已调差 {cnt.get('已调差')} 行"
+         if orders else "inventory_counts 0 单（建单/录入/审批三个接口都在，从来没被调用过）"),
         so_what="没有盘点 = 台账说有多少就是多少，谁也没验证过；"
                 "10-08 那次'零领料却完工入库 165 件虚假半成品'就是这类没被盘出来",
-        missing="周期盘点：按 ABC/库位抽范围自动开单，差异走 apply_movement 调整并留痕"))
+        missing=(None if approved else
+                 ("要人把实测数录进 inventory_count_items（GET /api/v1/wms/count-plan 看该盘哪些行）"
+                  if orders else "GET /api/v1/wms/count-plan?apply=false 先看范围"))))
 
     frz = await one("SELECT COUNT(*) AS 冻结 FROM inventory_freezes WHERE factory_id = :fid")
     caps.append(_grade("empty" if not int(frz.get("冻结") or 0) else "live", "冻结/放行",

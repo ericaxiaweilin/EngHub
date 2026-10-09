@@ -836,4 +836,54 @@ async def wms_location_occupancy(
 
 
 
+@router.get("/wms/count-plan", summary="这轮该盘哪些库存行：按四条范围选，附理由（默认只算不写）")
+async def wms_count_plan(
+    factory_id: str,
+    warehouse_id: Optional[str] = None,
+    apply: bool = False,
+    max_items: int = 200,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """`inventory_counts` 0 行 —— 建单/录入/审批的接口都在，但从没人开过一张单。
+
+    apply=false 只回报"会开哪些行、每行为什么该盘"；开单只写盘点表，不动库存。
+    """
+    del current_user
+    from api.services.stock_counts import open_periodic_count
+
+    return await open_periodic_count(db, factory_id, warehouse_id=warehouse_id,
+                                     apply=apply, max_items=max(1, min(500, int(max_items))))
+
+
+@router.post("/wms/count-plan", summary="开一张周期盘点单（把系统数快照进明细，等人录入实测）")
+async def wms_count_plan_open(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """谁开的单写进备注：引擎自动开和人开单，将来在盘点完成率上要分得开。"""
+    from api.services.stock_counts import open_periodic_count
+
+    return await open_periodic_count(
+        db, str(body.get("factory_id") or ""),
+        warehouse_id=(body.get("warehouse_id") or None),
+        apply=bool(body.get("apply", True)),
+        max_items=max(1, min(500, int(body.get("max_items") or 200))),
+        actor=str(getattr(current_user, "username", None) or "unknown"))
+
+
+@router.get("/wms/count-status", summary="盘点这条腿走到哪一步：开了几张、录了几行、审批调差多少")
+async def wms_count_status(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+    from api.services.stock_counts import count_status
+
+    return await count_status(db, factory_id)
+
+
+
 __all__ = ["router"]
