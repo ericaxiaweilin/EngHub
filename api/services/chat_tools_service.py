@@ -3365,9 +3365,14 @@ async def _tool_query_simulation_sensitivity(
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
                "slope": l.get("slope"),
-               "curve": [{k: c.get(k) for k in ("level", "finish_date", "days_vs_base",
-                                                "on_time_models", "labor_delta_usd",
-                                                "expedite_delta_usd", "activation_delta_usd")}
+               "curve": [{**{k: c.get(k) for k in ("level", "finish_date", "days_vs_base",
+                                                   "on_time_models", "labor_delta_usd",
+                                                   "expedite_delta_usd", "activation_delta_usd")},
+                          # 合计要引擎给：只交三项分量，正文那个总数就是模型自己加的
+                          "total_delta_usd": round(sum(
+                              float(c.get(k) or 0) for k in ("labor_delta_usd",
+                                                             "expedite_delta_usd",
+                                                             "activation_delta_usd")), 2)}
                          for c in (l.get("curve") or [])]}
               for l in sens.get("levers") or []]
     acc = out.get("accuracy") or {}

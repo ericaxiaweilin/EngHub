@@ -114,6 +114,61 @@ GAP_WORDS = ("算不出", "没有算出", "无法", "拿不到", "没有依据",
 MIN_SUMMARY_REPLIES = 10
 
 
+_ALLNUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+_REPLY_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+# 正文里"A → B"这种成对写法：模型接着算出的那个数，两端都是引擎给的
+_PAIR = re.compile(r"(-?\d[\d,]*(?:\.\d+)?)\s*(?:→|->|→|至|到)\s*(-?\d[\d,]*(?:\.\d+)?)")
+
+
+def _fnum(raw):
+    try:
+        return float(str(raw).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _prev_two(reply: str, v):
+    """正文里排在 v 前面的那两个数 —— 只认紧邻的两个分量，不让全池两两组合去凑。"""
+    toks = [(m.group(0), m.start()) for m in _REPLY_NUM.finditer(reply or "")]
+    here = [x for x in toks if abs((_fnum(x[0]) or 0) - v) < 0.06]
+    if not here:
+        return []
+    pos = here[0][1]
+    before = [x[0] for x in toks if x[1] < pos][-2:]
+    if len(before) < 2:
+        return []
+    a, b = _fnum(before[0]), _fnum(before[1])
+    return [(a, b)] if a is not None and b is not None else []
+
+
+def unbacked_kind(claim: str, reply: str, corpus: str) -> str:
+    """一个查不到字面出处的数字属于哪一类缺陷 —— 分类才知道该修谁。
+
+    「两数之差」「百分数写法」「千分位写法」都不是编数：196.6 实测是正文成对出现的
+    7053.1 → 6856.5 之差，两端都在工具返回里、差值不在 —— 该由引擎把减法交出来
+    （已改为 extra_person_days 直接返回）。只有「找不到来源」那一类才该追模型。
+    """
+    v = _fnum(claim)
+    if v is None:
+        return "找不到来源"
+    pool = {x for x in (_fnum(n) for n in _ALLNUM.findall(corpus or "")) if x is not None}
+    for a, b in ((_fnum(p[0]), _fnum(p[1])) for p in _PAIR.findall(reply or "")):
+        # 两端都得真在工具返回里：只按正文有箭头就认差值，等于让模型自己造两个数再相减
+        if a is not None and b is not None and a in pool and b in pool \
+                and abs(abs(b - a) - v) < 0.06:   # 正文写「少 196.6」是幅值，不比符号
+            return "两数之差"
+    for a, b in _prev_two(reply or "", v):
+        # 合计/差值一样是派生：分量都在、总数没在，缺的是引擎那一步加法（$170,460 实测）
+        if a in pool and b in pool and abs((a + b) - v) < 0.06:
+            return "两数之和"
+
+    if any(abs(x * 100 - v) < 0.06 or abs(x - v / 100.0) < 0.0006 for x in pool):
+        return "百分数写法"
+    if any(abs(x - v) < 0.06 for x in pool):
+        return "千分位写法"
+    return "找不到来源"
+
+
 def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
     """总结格：正文里的数字有没有出处；引擎报的缺口有没有被带进答复。
 
@@ -126,6 +181,7 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     backed = unbacked = disclosed = 0
     from_user = 0
+    kinds: Dict[str, int] = {}
     gap_items = replies_with_gaps = gap_named_replies = 0
     verbatim_num = verbatim_den = 0
     per_reply: List[Dict[str, Any]] = []
@@ -157,9 +213,15 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
             disclosed += 1
         else:
             unbacked += 1
+            # 工具返回全文 + 用户原话都算语料：分类只解释"为什么判不到出处"，不改判线
+            corpus = f"{row.get('session_tools') or ''}{row.get('session_user') or ''}"
+            these = {unbacked_kind(c, reply, corpus) for c in still}
+            for k in these:
+                kinds[k] = kinds.get(k, 0) + 1
             if len(per_reply) < 6:
                 per_reply.append({"session": str(row.get("session_id") or "")[:8],
                                   "numbers": still[:4],
+                                  "kinds": sorted(these),
                                   "excerpt": re.sub(r"\s+", " ", reply)[:110]})
     judged = backed + disclosed + unbacked
     return {
@@ -167,6 +229,7 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
         "replies_with_claims": judged,
         "numbers_backed": backed, "numbers_disclosed": disclosed, "numbers_unbacked": unbacked,
         "numbers_from_user": from_user,
+        "unbacked_kinds": kinds,
         "number_backing_rate": round((backed + disclosed) / judged, 3) if judged else None,
         "engine_gap_items": gap_items,
         "replies_with_engine_gaps": replies_with_gaps,
@@ -176,6 +239,9 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
         "headline_verbatim_rate": round(verbatim_num / verbatim_den, 3) if verbatim_den else None,
         "unbacked_samples": per_reply,
         "meaning": ("「数字有出处率」分母=窗口内报过数字且本会话调过引擎工具的助手回复；"
+                    "unbacked_kinds 把无出处的数分类：两数之差/两数之和/百分数写法/千分位写法是"
+                    "**引擎没把派生数交出来**（修法是工具返回那个数），"
+                    "找不到来源才该追模型 —— 判线率不因此放宽；"
                     "「缺口点名率」分母=引擎返回里带 unavailable 的那几轮，是下界判据（只用来判不及格）；"
                     "人自己报的数单列在 numbers_from_user，不算引擎编的"),
     }

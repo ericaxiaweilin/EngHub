@@ -188,3 +188,42 @@ def test_headline_tools_are_all_registered_chat_tools():
     unknown = sorted(set(HEADLINE_TOOLS) - registered)
     assert unknown == [], f"这些引擎工具名不存在：{unknown}"
     assert len(HEADLINE_TOOLS) >= 8, "只剩三五个名字通常意味着名单错拼，不是引擎面变少了"
+
+
+def test_unbacked_kind_separates_engine_side_derivation_from_invention():
+    """分类是为了追对人：差值/百分数缺的是引擎返回，不是模型编数。
+
+    196.6 就是被上一版报成"编的"那条实测：正文写 7053.1 → 6856.5 人日（少 196.6），
+    两端都在工具返回里、减法不在 —— 引擎后来直接返回 extra_person_days 才算齐。
+    """
+    from api.services.engine_capability import unbacked_kind
+
+    reply = "用工 7053.1 → 6856.5 人日（少 196.6 人日）"
+    corpus = ('{"normal": {"person_days_total": 7053.1}, '
+              '"under": {"person_days_total": 6856.5}}')
+    assert unbacked_kind("196.6", reply, corpus) == "两数之差"
+    assert unbacked_kind("100", "产能占用比例：100%", '{"capacity_share": 1.0}') == "百分数写法"
+    # 两端不在工具返回里就不许认差值：否则模型造两个数相减也算"有出处"
+    assert unbacked_kind("196.6", "用工 7053.1 → 6856.5（少 196.6 人日）", "{}") == "找不到来源"
+
+
+def test_unbacked_kind_recognises_a_backed_sum_as_derivation():
+    """$17,460 + $153,000 = $170,460：分量都在工具里、合计是模型加的 —— 归派生，不归编造。
+
+    只认**紧邻的前两个数**：允许全池两两组合去凑，等于模型随便加两个数都算有出处。
+    """
+    from api.services.engine_capability import unbacked_kind
+
+    reply = "- 额外成本：人工费增加 $17,460，开线成本增加 $153,000，合计 $170,460。"
+    corpus = '{"labor_delta_usd": 17460.0, "activation_delta_usd": 153000.0}'
+    assert unbacked_kind("170460", reply, corpus) == "两数之和"
+    # 分量没在工具返回里就不许认合计
+    assert unbacked_kind("170460", reply, "{}") == "找不到来源"
+
+
+def test_unbacked_kind_uses_comma_form_of_the_same_number():
+    """170,460 与 170460 是同一个数：排版差不该被算成"编的"。"""
+    from api.services.engine_capability import unbacked_kind
+
+    assert unbacked_kind("170460", "缺口 170,460 件",
+                         '{"shortage_qty": 170460.0}') == "千分位写法"
