@@ -124,6 +124,9 @@ async def apply_transfer_pair(
     if int(source.available_qty or 0) < qty:
         raise MovementError(
             f"源库存可用量不足：available={source.available_qty} 需移 {qty}")
+    blocked = frozen_stock_error(source, qty, doing="搬出")
+    if blocked:
+        raise blocked
 
     now = datetime.utcnow()
     src_before = int(source.total_qty or 0)
@@ -160,6 +163,32 @@ async def apply_transfer_pair(
     return out_txn, in_txn
 
 
+
+
+# 冻结的硬门放在写入原语里，而不是放在各个调用方的 SQL 里：
+# 10-09 实测有 20 多处 `available_qty > 0` 的选行查询（warehouse_agent、各 executor、
+# wms_operation_service…），挨个补过滤就是一张会随写入方漂移的手抄清单 —— 漏一处，
+# 那处就能把待检料领走。判据只看传进来的这一行自己说什么，不额外查库
+# （现有单测钉住了每条流水的查询次数，守卫不能靠多绕一次 DB 来实现）。
+FROZEN_STATUS = "locked"
+
+
+def frozen_stock_error(inventory: Any, quantity: int, *, doing: str = "扣减") -> Optional[MovementError]:
+    """纯判据：这一行现在被质量冻着吗？冻着就给出能直接念给人的错。
+
+    两个方向都要成立（只验"会拦"就会拦住所有人）：
+    · status='locked' 必须拦，并把原因码、料号、批次一起报出来；
+    · status 为空或 'available' 照常放行 —— 冻结上线不能把正常出入库一起锁死。
+    """
+    if str(getattr(inventory, "status", "") or "").strip().lower() != FROZEN_STATUS:
+        return None
+    reason = str(getattr(inventory, "lock_reason", "") or "").strip() or "未填原因码"
+    return MovementError(
+        f"库存行 {getattr(inventory, 'id', '?')}（料号 {getattr(inventory, 'material_id', '?')}"
+        f"、批次 {getattr(inventory, 'batch_code', None) or '无'}）被质量冻结挡着，"
+        f"不许{doing} {quantity} 件 —— 原因码：{reason}；"
+        f"要放行走 POST /api/v1/wms/freeze/release（谁放的、为什么都要落名）"
+    )
 
 
 def document_movement_type(direction: str, doc_type: Optional[str]) -> str:
@@ -206,6 +235,9 @@ async def apply_movement(
     if transaction_type in WORK_ORDER_ANCHORED_TYPES and not (work_order_id or "").strip():
         raise MovementError(f"{transaction_type} 必须挂 work_order_id，否则领料归不到工单")
     if transaction_type in CONSUMPTION_TYPES:
+        blocked = frozen_stock_error(inventory, qty, doing="扣减")
+        if blocked:
+            raise blocked
         delta = -qty
     elif transaction_type in RECEIPT_TYPES:
         delta = qty
@@ -262,6 +294,7 @@ __all__ = [
     "WORK_ORDER_ANCHORED_TYPES",
     "MovementError",
     "document_movement_type",
+    "frozen_stock_error",
     "apply_movement",
     "TransactionType",
 ]

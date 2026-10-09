@@ -838,12 +838,14 @@ class InventoryService:
         """创建出库单并扣减库存"""
         # 先确认类型认得出来，再分配批次：别让一半的库存被扣掉才发现记不了账
         document_movement_type("out", outbound_type)
+        blocked_out: Dict[str, Any] = {}
         allocations = await self._allocate_fifo_batches(
             factory_id=factory_id,
             warehouse_id=warehouse_id,
             material_id=material_id,
             quantity=quantity,
             batch_code=batch_code,
+            blocked_out=blocked_out,
         )
         outbound = await self._issue_batches(
             factory_id=factory_id,
@@ -867,11 +869,16 @@ class InventoryService:
         quantity: int,
         batch_code: Optional[str] = None,
         allow_partial: bool = False,
+        blocked_out: Optional[Dict[str, Any]] = None,
     ) -> List[tuple]:
         """按 FIFO 决定每个批次扣多少 —— 只分配，不改数量。
         
         数量的变更统一交给 apply_movement，避免"库存扣两次、流水记一条"。
         allow_partial=True 用于领料欠料：能扣多少给多少，缺口由调用方如实上报。
+
+        `blocked_out` 是调用方传进来的字典，这里往里写"有多少件是被质量冻结挡住的" ——
+        领料少发了必须说清是**为什么**少发，不能只报一个"可用量不足"（那是静默降级：
+        料在仓里，只是被待检/不合格锁着，催料和放行是两个完全不同的动作）。
         """
         if quantity <= 0:
             raise ValueError(f"出库数量必须是正整数，收到 {quantity!r}")
@@ -891,7 +898,20 @@ class InventoryService:
         query = query.order_by(Inventory.created_at.asc())
         result = await self.db.execute(query)
         inventories = result.scalars().all()
-        
+
+        # 质量冻结必须真的挡在这一行外面。10-09 实测：`inventory_freezes` 0 行，而且
+        # `inventory.status / lock_reason / qualified_status` 三列在**读取侧没有任何一处用到**
+        # —— 标了冻结照样领得走，那是装饰品不是控制。加冻结表的同时把分配路径接上它。
+        from api.services.wms_freezes import partition_by_status as _partition
+
+        split = _partition(inventories)
+        if split["held_rows"] and blocked_out is not None:
+            blocked_out.update({
+                "frozen_rows": split["held_rows"], "frozen_qty": split["held_qty"],
+                "frozen_reasons": split["held_reasons"],
+            })
+        inventories = split["allocatable"]
+
         remaining_qty = quantity
         allocations: List[tuple] = []
         for inventory in inventories:
@@ -904,7 +924,12 @@ class InventoryService:
             remaining_qty -= deduct_qty
         
         if remaining_qty > 0 and not allow_partial:
-            raise ValueError(f"Insufficient inventory. Short by {remaining_qty}")
+            note = ""
+            if blocked_out and blocked_out.get("frozen_rows"):
+                note = (f"（另有 {blocked_out['frozen_rows']} 行共 {blocked_out['frozen_qty']} 件"
+                        f"被质量冻结挡着，原因码：{'、'.join(blocked_out.get('frozen_reasons') or [])}，"
+                        "放行走 POST /api/v1/wms/freeze/release）")
+            raise ValueError(f"Insufficient inventory. Short by {remaining_qty}{note}")
         return allocations
     
     async def _issue_batches(
@@ -1007,8 +1032,10 @@ class InventoryService:
                 shortages.append({"material_code": code, "required": required,
                                   "issued": 0, "reason": "库存里没有这个物料"})
                 continue
+            blocked_out: Dict[str, Any] = {}
             allocations = await self._allocate_fifo_batches(
-                factory_id, None, material_id, required, allow_partial=True
+                factory_id, None, material_id, required, allow_partial=True,
+                blocked_out=blocked_out,
             )
             got = sum(q for _, q in allocations)
             if allocations:
@@ -1024,8 +1051,15 @@ class InventoryService:
                 issued_lines += 1
                 issued_qty += got
             if got < required:
-                shortages.append({"material_code": code, "required": required,
-                                  "issued": got, "reason": "可用量不足，欠料挂账"})
+                held_note = (f"；另有 {blocked_out['frozen_rows']} 行 "
+                             f"{blocked_out['frozen_qty']} 件被质量冻结挡着"
+                             f"（{'、'.join(blocked_out.get('frozen_reasons') or [])}）"
+                             if blocked_out.get("frozen_rows") else "")
+                row = {"material_code": code, "required": required, "issued": got,
+                       "reason": "可用量不足，欠料挂账" + held_note}
+                if blocked_out.get("frozen_rows"):
+                    row["frozen"] = dict(blocked_out)
+                shortages.append(row)
         
         return {
             "issued_lines": issued_lines,

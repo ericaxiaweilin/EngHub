@@ -139,10 +139,49 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
                  ("要人把实测数录进 inventory_count_items（GET /api/v1/wms/count-plan 看该盘哪些行）"
                   if orders else "GET /api/v1/wms/count-plan?apply=false 先看范围"))))
 
-    frz = await one("SELECT COUNT(*) AS 冻结 FROM inventory_freezes WHERE factory_id = :fid")
-    caps.append(_grade("empty" if not int(frz.get("冻结") or 0) else "live", "冻结/放行",
-                       f"inventory_freezes {frz.get('冻结')} 行",
-                       so_what="待检、质量拦截、事故封存都没有对象可挂 —— 只能靠口头不让领"))
+    frz = await one("""
+        SELECT (SELECT COUNT(*) FROM inventory_freezes WHERE factory_id=:fid
+                 AND LOWER(status)='active') AS 活动,
+               (SELECT COUNT(*) FROM inventory_freezes WHERE factory_id=:fid
+                 AND LOWER(status)='released') AS 人放,
+               (SELECT COUNT(*) FROM inventory_freezes WHERE factory_id=:fid
+                 AND LOWER(status)='expired') AS 到期放,
+               (SELECT COUNT(*) FROM inventory_freezes WHERE factory_id=:fid
+                 AND LOWER(status)='active' AND auto_unfreeze
+                 AND freeze_until IS NOT NULL AND freeze_until <= :now) AS 到期该放没放,
+               (SELECT COUNT(*) FROM inventory WHERE factory_id=:fid
+                 AND LOWER(COALESCE(status,''))='locked') AS 行上锁,
+               (SELECT COUNT(*) FROM inventory i WHERE i.factory_id=:fid
+                 AND LOWER(COALESCE(i.status,''))='locked'
+                 AND NOT EXISTS (SELECT 1 FROM inventory_freezes f
+                          WHERE f.inventory_id=i.id AND LOWER(f.status)='active')) AS 锁了没记,
+               (SELECT COUNT(*) FROM inventory_freezes f WHERE f.factory_id=:fid
+                 AND LOWER(f.status)='active'
+                 AND NOT EXISTS (SELECT 1 FROM inventory i WHERE i.id=f.inventory_id
+                          AND LOWER(COALESCE(i.status,''))='locked')) AS 记了没锁,
+               (SELECT COUNT(*) FROM inventory WHERE factory_id=:fid
+                 AND LOWER(COALESCE(status,''))='active') AS 词表active,
+               (SELECT COUNT(*) FROM inventory WHERE factory_id=:fid
+                 AND LOWER(COALESCE(status,''))='available') AS 词表available
+        """, {"now": now})
+    active = int(frz.get("活动") or 0)
+    drift = int(frz.get("锁了没记") or 0) + int(frz.get("记了没锁") or 0)
+    caps.append(_grade(
+        ("empty" if not active and not int(frz.get("行上锁") or 0)
+         else ("thin" if drift or active < int(frz.get("行上锁") or 0) or int(frz.get("记了没锁") or 0)
+               else "live")),
+        "冻结/放行",
+        f"活动冻结 {frz.get('活动')} 条、行上锁 {frz.get('行上锁')} 行；"
+        f"人放行 {frz.get('人放')}、到期自动放 {frz.get('到期放')}；"
+        f"两笔账对不上 {drift} 处（锁了没记 {frz.get('锁了没记')}、记了没锁 {frz.get('记了没锁')}）；"
+        f"台账 status 词表并存 active {frz.get('词表active')} / available {frz.get('词表available')} —— "
+        f"到期该放还没放的 {frz.get('到期该放没放')} 条",
+        so_what="冻结的判据不是'有没有记录'，而是**领料领不领得走**：写入原语 apply_movement/"
+                "apply_transfer_pair 认 inventory.status='locked'，扣减和搬出当场拒（单测钉住两个方向）。"
+                "'记了没锁'就是要不得的那种 —— 表里看着冻着，货照样被领走",
+        missing=(None if (active and not drift) else
+                 "POST /api/v1/wms/freeze 按库存行点名冻结（要 reason_code）；"
+                 "到期自动放是 expire_due，人放行是 POST /api/v1/wms/freeze/release")))
 
     alert = await one("""
         SELECT COUNT(*) AS 落库报警,

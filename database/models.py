@@ -1126,6 +1126,11 @@ class Inventory(Base):
     expiry_date = Column(Date, nullable=True)
     storage_location = Column(String(100), nullable=True)
     qualified_status = Column(String(20), default="qualified")
+    # 锁这三列线上一直存在、模型却没映射过：freeze() 用裸 SQL 写 lock_reason，
+    # 判据从 ORM 对象读不到 —— 实测报出来永远是「未填原因码」，等于把原因丢在库里。
+    lock_reason = Column(String(200), nullable=True)
+    locked_at = Column(DateTime, nullable=True)
+    locked_by = Column(String(50), nullable=True)
     total_qty = Column(Integer, default=0, nullable=False)
     available_qty = Column(Integer, default=0, nullable=False)
     reserved_qty = Column(Integer, default=0)

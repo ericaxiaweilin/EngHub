@@ -918,4 +918,101 @@ async def wms_alert_summary(
 
 
 
+
+
+@router.post("/wms/freeze", summary="质量冻结：把一批库存行锁住，领料/出库/调拨当场领不走")
+async def wms_freeze(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """冻结必须落在对象上，而且要有原因码。
+
+    10-09 之前的状态：`inventory_freezes` 0 行，`inventory.status/lock_reason/qualified_status`
+    三列在读取侧一处都没用到 —— 标了"待检"照样领得走，那是装饰品不是控制。
+    现在写入原语 `apply_movement`/`apply_transfer_pair` 直接认这一行的锁，
+    所有扣减/搬出路径都挡，不靠各处 SQL 各自记得加过滤。
+    """
+    from datetime import datetime
+
+    from api.services.wms_freezes import freeze
+
+    raw_until = body.get("freeze_until")
+    until = None
+    if isinstance(raw_until, str) and raw_until.strip():
+        try:
+            until = datetime.fromisoformat(raw_until.strip().replace("Z", "+00:00"))
+            until = until.replace(tzinfo=None) if until.tzinfo is None else until.astimezone().replace(tzinfo=None)
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail=f"freeze_until 不是 ISO 时间：{raw_until!r}")
+    ids = body.get("inventory_ids") or []
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="inventory_ids 必须是库存行 id 的数组")
+    out = await freeze(
+        db, str(body.get("factory_id") or ""), [str(i) for i in ids],
+        reason_code=str(body.get("reason_code") or ""),
+        reason_text=str(body.get("reason_text") or ""),
+        until=until, actor=str(getattr(current_user, "username", None) or "unknown"),
+        auto_unfreeze=bool(body.get("auto_unfreeze", False)),
+        apply=bool(body.get("apply", True)))
+    if out.get("error"):
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
+
+
+@router.post("/wms/freeze/release", summary="放行冻结：谁放的、为什么都要落名（人放的和到期自动放分两本账）")
+async def wms_freeze_release(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """这个端点只写 `released`（人主动放的）。
+
+    `expired` 是到期由系统放的，只有 expire_due 会写 —— 两者混成一个数，
+    "质量放行"就会被系统的到期动作冒充，事后没人看得出这批料是谁批的。
+    """
+    from api.services.wms_freezes import release
+
+    out = await release(
+        db, str(body.get("factory_id") or ""),
+        freeze_id=(str(body["freeze_id"]) if body.get("freeze_id") else None),
+        inventory_id=(str(body["inventory_id"]) if body.get("inventory_id") else None),
+        actor=str(getattr(current_user, "username", None) or "unknown"),
+        note=str(body.get("note") or ""), kind="released",
+        apply=bool(body.get("apply", True)))
+    if out.get("error"):
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
+
+
+@router.get("/wms/freeze-status", summary="冻结这格走到哪一步：活动/人放/到期放，以及两笔账对不对得上")
+async def wms_freeze_status(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """除了三态计数，还报 `sync_check`：冻结记录数 vs 行上锁数。
+
+    对不上就是有一边漏写 —— "有记录没锁"意味着领料照样走得掉（装饰品回来了），
+    "有锁没记录"意味着没人知道这批料被谁冻、凭什么冻。
+    """
+    del current_user
+    from sqlalchemy import text
+
+    from api.services.wms_freezes import freeze_status, sync_check
+
+    st = await freeze_status(db, factory_id)
+    agg = await db.execute(text("""
+        SELECT (SELECT COUNT(*) FROM inventory_freezes
+                 WHERE factory_id=:fid AND LOWER(status)='active') AS 记录,
+               (SELECT COUNT(*) FROM inventory
+                 WHERE factory_id=:fid AND LOWER(COALESCE(status,''))='locked') AS 行锁
+    """), {"fid": factory_id})
+    row = dict(agg.mappings().first() or {})
+    await db.rollback()
+    st["ledger"] = sync_check(int(row.get("记录") or 0), int(row.get("行锁") or 0))
+    return st
+
+
 __all__ = ["router"]
