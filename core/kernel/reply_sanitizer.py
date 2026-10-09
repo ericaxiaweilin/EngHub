@@ -473,10 +473,17 @@ def missing_gap_note(items, reply: str, cap: int = 3) -> str:
     lost = [it for it in (items or []) if not gap_is_disclosed(it, reply)]
     if not lost:
         return ""
-    shown = [str(it.get("reason") or it.get("ask") or (gap_phrases(it) or [""])[0]
-                or "这条没写清缺什么")[:60] for it in lost[:cap]]
-    more = f"…共 {len(lost)} 项" if len(lost) > cap else ""
+    # 几个杠杆常共享同一句 reason（实测三个杠杆都是"这一维测不出斜率，无法归因"），
+    # 原样列出来就是把同一句话重复三遍 —— 按说法去重，条数另外报。
+    uniq = []
+    for it in lost:
+        phrase = str(it.get("reason") or it.get("ask")
+                     or (gap_phrases(it) or [""])[0] or "这条没写清缺什么")[:60]
+        if phrase not in uniq:
+            uniq.append(phrase)
+    shown = uniq[:cap]
+    more = f"…（列出 {len(shown)} 种说法，共 {len(lost)} 项）" if len(lost) > len(shown) else ""
     return ("\n\n〔引擎本轮还有 " + str(len(lost)) + " 项给不出数〕"
             + "；".join(shown) + more
-            + " —— 这不是「没做」，是这一项缺输入、或这一维测不出斜率；"
+            + " —— 这不是「没做」，是这一项本轮缺输入或量不出斜率；"
               "把输入补上才谈得到一个数。")

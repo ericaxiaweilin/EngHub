@@ -386,6 +386,19 @@ def test_missing_gap_note_appends_when_the_item_is_not_conveyed():
     assert "请求没给 compare" in note, "补的那行要把缺项的整句 reason 交出去，不是半截片段"
 
 
+def test_missing_gap_note_lists_shared_reason_once_and_is_idempotent():
+    """三个杠杆同一句 reason 只列一次；补过一次的答复再过一次不该又追加。"""
+    from core.kernel.reply_sanitizer import missing_gap_note
+
+    same = [{"name": n, "reason": "这一维测不出斜率，无法归因"}
+            for n in ("absent_line", "absent_share", "expedite_bottleneck_to_days")]
+    note = missing_gap_note(same, "完工 2026-11-02，延 10 天。")
+    assert note.count("这一维测不出斜率") == 1, "同一句理由不许重复三遍"
+    assert "共 3 项" in note
+    # 补过一次之后那些说法就在正文里了 → 第二次必须闭嘴
+    assert missing_gap_note(same, "完工 2026-11-02。" + note) == ""
+
+
 def test_missing_gap_note_stays_quiet_when_the_item_was_conveyed():
     """答复已经把那条说法带出来了就不许再补 —— 否则每次都多一行噪声，
     而点名率这一格也会永远满分（因为是我们自己补的字）。"""

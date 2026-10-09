@@ -1700,10 +1700,19 @@ def _numeric_claims(reply: str) -> List[str]:
 
 
 def _annotate_reply_numbers(reply: str, actions: Any) -> str:
-    """答复出口的统一标注：本轮调过工具就不标（数字有出处），没调过就写明未经核实。"""
-    if actions:
-        return reply or ""
-    return _annotate_unverified_numbers(reply)
+    """答复出口的统一标注：没调工具就标「未经核实」；调过工具也要把引擎报的算不出带出来。
+
+    披露必须挂在这个钩子上：kernel 里写明 annotate_reply 在 model_reviewer 接管时
+    **照样执行**，而 verify_reply 会被设成 None（避开重复 LLM 调用）——
+    挂在 verify 上等于线上不生效（端到端实测过：那一行确实没进答复）。
+    """
+    text = reply or ""
+    if not actions:
+        return _annotate_unverified_numbers(text)
+    return _disclose_missing_gaps(text, [
+        {"tool": getattr(a, "tool", None), "result": getattr(a, "result", None)}
+        for a in actions
+    ])
 
 
 def _annotate_unverified_numbers(reply: str) -> str:
@@ -1765,14 +1774,14 @@ async def _verify_grounded_reply(
         request_timeout=route["request_timeout"],
     )
     if resp.status_code >= 400:
-        return _disclose_missing_gaps(reply, facts)
+        return reply
     data = resp.json()
     content = (
         data.get("choices", [{}])[0]
         .get("message", {})
         .get("content", "")
     )
-    return _disclose_missing_gaps(_clean_model_reply(content) or reply, facts)
+    return _clean_model_reply(content) or reply
 
 
 async def _load_attachment_records(
