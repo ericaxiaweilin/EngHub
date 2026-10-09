@@ -1809,6 +1809,8 @@ async def rush_impact(db: AsyncSession, factory_id: str, *, product_id: Optional
         "rush_order": {
             "product_id": model, "product_resolution": resolved.get("how"),
             "quantity": int(qty), "capacity_share": share,
+            # 人读的是百分数：只给 1.0 就会有人在正文里写 100%（那个 100 不在任何出处里）
+            "capacity_share_pct": round(share * 100, 1),
             "process_hours": round(qty * float(cap["hours_per_unit"]), 1),
             "process_hours_meaning": "这是单件 IE 工时 × 数量的**人工工时合计**，不是这条线要占几个班次日（后者见 own_production_days）",
             "line_code": cap["line_code"], "units_per_day": cap["units_per_day"],

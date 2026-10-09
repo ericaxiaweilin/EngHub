@@ -2239,6 +2239,9 @@ async def _tool_query_working_condition_impact(
     delta_days = [None if (x is None or y is None) else int(y) - int(x)
                   for x, y in zip(b["finish_days"], h["finish_days"])]
     comparable = all(d is not None for d in delta_days) and bool(delta_days)
+    pd_base = float(b.get("person_days_total") or 0)
+    pd_hot = float(h.get("person_days_total") or 0)
+    pd_delta = round(pd_hot - pd_base, 1)
     hot_runs = hot.get("runs") or []
     per_order = [{
         "model_code": r.get("model_code"), "units": r.get("units"),
@@ -2320,12 +2323,19 @@ async def _tool_query_working_condition_impact(
         "per_order": per_order, "no_change_reason": no_change_reason,
         "extra_days_per_order": delta_days,
         "extra_total_days_late": (int(h["total_days_late"] or 0) - int(b["total_days_late"] or 0)),
+        # 减法要引擎做：只给两端让人自己减，那个差值就不在任何出处里（196.6 就是这么来的）
+        "extra_person_days": pd_delta,
+        "person_days_phrase": (f"用工 {pd_base:g} → {pd_hot:g} 人日（差 {pd_delta:+g} 人日）；"
+                               "人日减少不等于省人力 —— 在岗的人少了、同样的活摊得更久，"
+                               "没来的人不记人日，要看的仍是完工天数与迟交天数"),
         "reading": (f"{float(temp):g}℃/{hum:g}% 到岗从 {round((1.0 - float(ledger['rate'])) * 100, 2)}% 掉到 "
                     f"{round(float(under['present_ratio']) * 100, 2)}%"
                     f"（{_absence_headcount_phrase(heads, under['predicted_absence_rate'], under.get('increment_pp'))}）→ "
                     f"这批单完工天数 {'、'.join(str(d) for d in delta_days)} 天变化，"
                     f"迟交合计 {'+' if (h['total_days_late'] or 0) >= (b['total_days_late'] or 0) else ''}"
-                    f"{int(h['total_days_late'] or 0) - int(b['total_days_late'] or 0)} 天"),
+                    f"{int(h['total_days_late'] or 0) - int(b['total_days_late'] or 0)} 天"
+                    f"｜用工 {pd_base:g} → {pd_hot:g} 人日（{pd_delta:+g} 人日，"
+                    "少人日不等于省人力）"),
         "note": ("到岗比例是按台账基线与工况增量算的（增量斜率=声明值，未与温度实测对撞：全库没有车间温度数据）；"
                  "同一批人干得慢那条走 work_efficiency，不在这里重复乘"),
     }, scope)
