@@ -354,6 +354,9 @@ async def get_pmc_capabilities(
             {"key": "sim_promise_headroom",
              "name": "承诺上限（有 9 成把握最早能报哪天、靠哪条政策、比现承诺晚几天）",
              "path": "/api/v1/pmc/sim-promise-headroom", "mode": "read_only"},
+            {"key": "sim_volume_ceiling",
+             "name": "减量测算（保住现承诺最多能做几台；一档都不达标就明说减量换不到时间）",
+             "path": "/api/v1/pmc/sim-volume-ceiling", "mode": "read_only"},
             {"key": "data_flow_profile",
              "name": "数据流节点剖面（台账/展开/推演三层各多少节点，按规模外推需要多少行）",
              "path": "/api/v1/pmc/data-flow-profile", "mode": "read_only"},
@@ -927,6 +930,34 @@ async def get_sim_promise_headroom(
     return await promise_headroom(db, factory_id, models,
                                   samples=max(6, min(60, int(samples))), seed=seed,
                                   required=required)
+
+
+@router.get("/sim-volume-ceiling", summary="减量测算：保住现承诺且有 9 成把握，这批单最多能做几台")
+async def get_sim_volume_ceiling(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(3, description="取 BOM 最完整的 n 个机种"),
+    samples: int = Query(20, description="每档量抽几轮（6~60；逐档同一串抽样）"),
+    seed: int = Query(20261008, description="与交期分布同一串抽样的种子"),
+    required: float = Query(0.90, ge=0.5, le=0.99, description="保住承诺要有几成把握"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """交付对不上时有四条路：改日期、加杠杆、修数据、减量。这一格算第四条，报的是台数不是百分比。
+
+    逐档只改需求台数（100/75/50/35/20%），政策与抽样序列逐抽不动，所以准点概率的差是量造成的。
+    一档都不达标时如实报"减量也换不到时间"——那说明卡的是等料窗口，砍台数只会少卖不会早交。
+    达标时也说明"砍的是哪几台、多少台"，但挑客户不是引擎的权限。只读，不写任何表。
+    """
+    del current_user
+    from api.services.sim_sensitivity import volume_ceiling_for_promise
+    from api.services.virtual_run import default_models
+
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    return await volume_ceiling_for_promise(db, factory_id, models,
+                                            samples=max(6, min(60, int(samples))), seed=seed,
+                                            required=required)
 
 
 

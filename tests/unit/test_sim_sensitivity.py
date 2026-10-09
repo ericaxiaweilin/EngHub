@@ -879,3 +879,151 @@ def test_promise_headroom_chat_answer_names_the_date_and_the_refusal():
               "promise_headroom": {"status": "no_dates", "why": "4 条政策没有一条抽得出完工日"}}
     t3 = _format_sensitivity_reply(broken)
     assert "没算成 —— 4 条政策没有一条抽得出完工日" in t3
+
+
+def _volume_env(monkeypatch, *, units_effect=1.0, offset=12.0, dated=True):
+    from datetime import date, timedelta
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 1800, "due_in_days": 23},
+                {"model_code": "M-2", "units": 600, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 70.0, "hours_error_band": 0.05,
+                            "components": {"lead_time": {"score": 1.0},
+                                           "hours": {"score": 1.0, "basis": "route_standard_hours"}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        if not dated:
+            return {"finish_date": None, "days_late_worst": None, "binding": "no_material",
+                    "labor_cost_usd": 0.0, "expedite_cost_usd": 0.0,
+                    "line_activation_cost_usd": 0.0}
+        d = perturb or {}
+        total = sum(float(t.get("units") or 0) for t in targets)
+        # units_effect=0 时减量完全不改天数（等料窗口卡着的真实形状）
+        scale = (total / 2400.0) if units_effect else 1.0
+        late = round(20.0 * float(d.get("lead_multiplier", 1.0))
+                     * (2.0 - float(attendance)) * scale - offset, 1)
+        return {"finish_date": str(date(2026, 10, 31) + timedelta(days=int(late))),
+                "days_late_worst": late, "labor_cost_usd": round(total * 0.5, 2),
+                "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                "binding": "work_duration"}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+
+def test_volume_ceiling_reports_units_not_percentage(monkeypatch):
+    import asyncio
+
+    _volume_env(monkeypatch)
+    out = asyncio.run(ss.volume_ceiling_for_promise(None, "FAC", ["M-1", "M-2"], samples=20, seed=8))
+    assert out["status"] == "ok" and out["calibrated_units"] == 2400
+    v = out["verdict"]
+    assert v["kind"] == "found"
+    assert v["p_on_time"] >= out["on_time_required"], "报出的台数必须自己就达标"
+    assert (v["next_ratio_p_on_time"] or 0) < out["on_time_required"], "多做一档要真的不达标"
+    assert v["units_total"] == sum(v["units_per_model"].values())
+    assert v["units_cut"] == out["calibrated_units"] - v["units_total"] > 0
+    assert any("最多做" in x and "台" in x for x in out["reading"])
+    assert v["next_ratio_fails"] == 0.5, "反面要贴着的上一档（0.5），不是最大的 1.0"
+    assert any("每台怎么砍" in x for x in out["reading"])
+    assert "少做=少卖" in [x for x in out["reading"] if "省下的人工" in x][0], "省下的钱要说清不等于赚了钱"
+    assert "不替厂里挑客户" in out["claim_guard"]
+
+
+def test_adjacent_above_picks_the_nearest_rung_not_the_biggest():
+    """"多做一档就崩"的反面必须贴着报出的台数：拿 100% 当反例会把结论说轻。"""
+    rungs = [{"status": "ok", "ratio": 1.0, "p_on_time": 0.0},
+             {"status": "ok", "ratio": 0.75, "p_on_time": 0.3},
+             {"status": "ok", "ratio": 0.5, "p_on_time": 0.67},
+             {"status": "no_dates", "ratio": 0.35},
+             {"status": "ok", "ratio": 0.2, "p_on_time": 1.0}]
+    # 0.35 那档抽不出日期，不能拿它当"多做一档"的反例
+    assert ss._adjacent_above(rungs, 0.2)["ratio"] == 0.5
+    assert ss._adjacent_above(rungs, 0.5)["ratio"] == 0.75
+    assert ss._adjacent_above(rungs, 1.0) == {}
+
+
+def test_volume_ceiling_says_volume_is_not_the_lever_when_cutting_buys_nothing(monkeypatch):
+    """一档都不达标就报"减量也换不到时间"，不许把最小那档包装成可行方案。"""
+    import asyncio
+
+    _volume_env(monkeypatch, units_effect=0.0)
+    out = asyncio.run(ss.volume_ceiling_for_promise(None, "FAC", ["M-1"], samples=16, seed=3))
+    v = out["verdict"]
+    assert v["kind"] == "volume_not_the_lever"
+    assert v["units_at_smallest"] < out["calibrated_units"] and v["units_cut_at_smallest"] > 0
+    assert v["base_p_on_time"] == v["best_p_on_time"] == 0.0, "量不动天数时准点概率一格都不变"
+    assert len(out["ladder_tried"]) == len(ss.VOLUME_LADDER)
+    assert any("准点概率一点没动" in x for x in out["reading"])
+    assert "不许被引用成" in out["claim_guard"]
+
+
+def test_volume_ceiling_separates_helps_a_little_from_does_not_help(monkeypatch):
+    """实测形状：砍到 20% 把准点概率从 0% 抬到 ~25%，仍不到 9 成 —— 这不能报成"减量没用"。"""
+    import asyncio
+
+    _volume_env(monkeypatch, offset=4.0)
+    out = asyncio.run(ss.volume_ceiling_for_promise(None, "FAC", ["M-1", "M-2"], samples=16, seed=13))
+    v = out["verdict"]
+    assert v["kind"] == "volume_helps_but_not_enough"
+    assert v["base_p_on_time"] < v["best_p_on_time"] < out["on_time_required"]
+    assert any("抬到" in x for x in out["reading"]) and any("P90 延误随量" in x for x in out["reading"])
+    assert any("只是少卖" in x for x in out["reading"])
+
+
+def test_volume_ceiling_does_not_ask_for_cuts_it_does_not_need(monkeypatch):
+    import asyncio
+
+    _volume_env(monkeypatch, offset=60.0)      # 现量就全部准点
+    out = asyncio.run(ss.volume_ceiling_for_promise(None, "FAC", ["M-1"], samples=10, seed=2))
+    assert out["verdict"]["kind"] == "already_ok" and out["verdict"]["ratio"] == 1.0
+    assert any("减量不是这条路要动的东西" in x for x in out["reading"])
+
+
+def test_volume_ceiling_gives_no_units_when_the_sample_has_no_dates(monkeypatch):
+    import asyncio
+
+    _volume_env(monkeypatch, dated=False)
+    out = asyncio.run(ss.volume_ceiling_for_promise(None, "FAC", ["M-1"], samples=8, seed=1))
+    assert out["status"] == "no_dates" and out["verdict"] is None
+    assert any("没跑成" in x for x in out["reading"])
+
+
+def test_volume_ceiling_chat_answer_names_units_and_the_refusal():
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    found = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+             "volume_ceiling": {"status": "ok", "on_time_required": 0.9, "calibrated_units": 2400,
+                                "verdict": {"kind": "found", "units_total": 1200, "units_cut": 1200,
+                                            "promise_date": "2026-10-31", "p_on_time": 0.95,
+                                            "next_ratio_fails": 0.75, "next_ratio_p_on_time": 0.4}}}
+    text = _format_sensitivity_reply(found)
+    assert "最多做 1,200 台（比标定场景砍 1,200 台）" in text and "掉到 40%" in text
+
+    flat = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+            "volume_ceiling": {"status": "ok", "on_time_required": 0.9, "calibrated_units": 2400,
+                               "verdict": {"kind": "volume_not_the_lever", "units_at_smallest": 480,
+                                           "units_cut_at_smallest": 1920, "base_p_on_time": 0.0,
+                                           "best_p_on_time": 0.0, "p90_days_late_at_base": 33.0,
+                                           "p90_days_late_at_smallest": 21.0,
+                                           "binding_seen": ["material_arrival"]}}}
+    t2 = _format_sensitivity_reply(flat)
+    assert "减量一点用没有：2,400 台砍到 480 台" in t2 and "material_arrival" in t2
+    assert "0%→0%" in t2
+    assert "最多做" not in t2, "一档都不达标时不许摆出一张可行的台数"
+
+    ok = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+          "volume_ceiling": {"status": "ok", "on_time_required": 0.9, "calibrated_units": 2400,
+                             "verdict": {"kind": "already_ok", "units_total": 2400, "p_on_time": 1.0}}}
+    assert "不用砍台数" in _format_sensitivity_reply(ok)
+
+    not_run = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+               "volume_not_sampled_because": "没点要减量测算（with_volume_ceiling=true 才逐档改量真跑）"}
+    assert "减量测算：没算 —— 没点要减量测算" in _format_sensitivity_reply(not_run)

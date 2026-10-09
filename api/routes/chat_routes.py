@@ -1430,6 +1430,31 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
         lines.append(f"- 承诺上限：没算 —— {result['promise_not_sampled_because']}")
     elif head:
         lines.append(f"- 承诺上限：没算成 —— {head.get('why') or head.get('status')}")
+    vol = result.get("volume_ceiling") or {}
+    vv = vol.get("verdict") or {}
+    if vv.get("kind") == "found":
+        lines.append(
+            f"- 保住 {vv.get('promise_date')} 且有 {vol.get('on_time_required'):.0%} 把握：最多做 "
+            f"{vv.get('units_total'):,} 台（比标定场景砍 {vv.get('units_cut'):,} 台），"
+            f"此时准点概率 {vv.get('p_on_time'):.0%}；多做一档（"
+            f"{vv.get('next_ratio_fails'):.0%}）就掉到 {vv.get('next_ratio_p_on_time') or 0:.0%}")
+    elif vv.get("kind") in ("volume_not_the_lever", "volume_helps_but_not_enough"):
+        says = ("减量一点用没有" if vv.get("kind") == "volume_not_the_lever" else "减量有用但不够")
+        lines.append(
+            f"- {says}：{vol.get('calibrated_units'):,} 台砍到 {vv.get('units_at_smallest'):,} 台"
+            f"（少 {vv.get('units_cut_at_smallest'):,} 台），准点概率 "
+            f"{vv.get('base_p_on_time'):.0%}→{vv.get('best_p_on_time'):.0%}"
+            f"（要求 {vol.get('on_time_required'):.0%}）｜P90 延 "
+            f"{vv.get('p90_days_late_at_base'):g}→{vv.get('p90_days_late_at_smallest'):g} 天，"
+            f"最后那 {vv.get('p90_days_late_at_smallest'):g} 天卡的是 "
+            f"{'、'.join(vv.get('binding_seen') or []) or '未明'}，继续砍只是少卖")
+    elif vv.get("kind") == "already_ok":
+        lines.append(f"- 减量测算：现量 {vv.get('units_total'):,} 台已经有 "
+                     f"{vv.get('p_on_time'):.0%} 准点 —— 不用砍台数")
+    elif vol:
+        lines.append(f"- 减量测算：没算成 —— {vol.get('reading') or vv.get('note')}")
+    elif result.get("volume_not_sampled_because"):
+        lines.append(f"- 减量测算：没算 —— {result['volume_not_sampled_because']}")
     lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
     for u in (result.get("uncertainty") or [])[:2]:
         lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"

@@ -493,6 +493,7 @@ async def lever_headline(db: AsyncSession, factory_id: str, models: List[str]) -
 async def report(db: AsyncSession, factory_id: str, models: List[str], *,
                  include_risk: bool = False, include_repair: bool = False,
                  include_crew_margin: bool = False, include_promise: bool = False,
+                 include_volume: bool = False,
                  **kw: Any) -> Dict[str, Any]:
     acc = await mapping_accuracy(db, factory_id, models)
     sens = await sensitivity(db, factory_id, models, **kw)
@@ -519,7 +520,8 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], *,
                            "risk（include_risk=true 时）给按已声明误差带抽出来的完工日分布，"
                            "data_repair（include_repair=true 时）给每条误差带修到下限之后毛边窄几天，"
                            "crew_margin（include_crew_margin=true 时）给要加多少人才让 P90 也赶上承诺，"
-                           "promise（include_promise=true 时）给有把握能承诺的最早日期。")}
+                           "promise（include_promise=true 时）给有把握能承诺的最早日期，"
+                           "volume（include_volume=true 时）给保住现承诺最多能做几台。")}
     if include_risk:
         out["risk"] = await schedule_risk(db, factory_id, models, **kw)
     if include_repair:
@@ -528,6 +530,8 @@ async def report(db: AsyncSession, factory_id: str, models: List[str], *,
         out["crew_margin"] = await crew_margin_for_p90(db, factory_id, models, **kw)
     if include_promise:
         out["promise"] = await promise_headroom(db, factory_id, models, **kw)
+    if include_volume:
+        out["volume"] = await volume_ceiling_for_promise(db, factory_id, models, **kw)
     return out
 
 
@@ -1410,4 +1414,163 @@ async def promise_headroom(db: AsyncSession, factory_id: str, models: List[str],
                      "P90 是『九成情况下不会晚于这天』，所以是能写进承诺的那个数，不是最好看的数")
     out["claim_guard"] = ("引擎只给『哪天有 9 成』，不代做承诺 —— 改承诺日要企业授权流程确认；"
                           "钱只是台账算出的成本差值，收益侧与违约罚则未建模")
+    return out
+
+# 承诺对不上时有四条路：改日期、加杠杆、修数据、减量。前三条都已经各自成格并给了"换不动"的实测，
+# 这一格补第四条：要保住现承诺且有 9 成把握，这批单最多能做几台。
+VOLUME_LADDER = (1.0, 0.75, 0.50, 0.35, 0.20)
+
+
+def _adjacent_above(rungs: List[Dict[str, Any]], ratio: Any) -> Dict[str, Any]:
+    """紧邻的"多做一档"：比这个量大的档位里取最小的那个，不是取最大的。
+
+    报"减到 N 台就有 9 成"时，反面必须贴着它 —— 拿 100% 那档当反例会把"多做一点就崩"说轻。
+    """
+    bigger = [x for x in rungs if x.get("status") == "ok" and float(x["ratio"]) > float(ratio)]
+    if not bigger:
+        return {}
+    return min(bigger, key=lambda x: float(x["ratio"]))
+
+
+async def volume_ceiling_for_promise(db: AsyncSession, factory_id: str, models: List[str], *,
+                                     samples: int = 20, seed: int = 20261008,
+                                     required: float = 0.90,
+                                     ladder: Tuple[float, ...] = VOLUME_LADDER,
+                                     days_of_output: float = 6.0,
+                                     lead_margin: Optional[float] = None,
+                                     policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """按量扫同一串抽样，找"仍然有 9 成把握赶上现承诺"的最大量；报的是台数不是百分比。
+
+    减量与加人不一样：它是把需求削到产能与等料窗口里，所以达标也要说清"少做的是哪几台、
+    少多少台"。一档都不达标时如实说"减量也换不到时间"，这时候卡的是等料窗口不是量。
+    """
+    pol = policy or {"name": "现政策（分批开工）", "allow_partial": True}
+    req = max(0.50, min(0.99, float(required)))
+    setup = await _risk_setup(db, factory_id, models, days_of_output=days_of_output,
+                              lead_margin=lead_margin, samples=samples, seed=seed)
+    n, bands = setup["n"], setup["bands"]
+    note = ("抽样与交期分布同一串（同 seed）；每档只改 targets 的 units，"
+            "到岗/带宽/政策逐抽原样 —— 所以准点概率的差是量造成的。")
+    full_units = sum(int(t.get("units") or 0) for t in setup["targets"])
+
+    rungs: List[Dict[str, Any]] = []
+    reach: Optional[Dict[str, Any]] = None
+    for r in ladder:
+        scaled = [{**t, "units": max(1, int(round(float(t.get("units") or 0) * float(r))))}
+                  for t in setup["targets"]]
+        rows = await _sample_rows(db, factory_id, scaled, pol, setup["draws"])
+        s = _risk_summary(rows, factory_id=factory_id, models=models,
+                          policy_name=f"{pol['name']}·量 {r:.0%}", samples=n, seed=seed,
+                          bands=bands, with_date_note=note)
+        total = sum(int(t["units"]) for t in scaled)
+        rec = {"ratio": float(r), "units_total": total,
+               "units_per_model": {str(t["model_code"]): int(t["units"]) for t in scaled}}
+        if s.get("status") != "ok":
+            rec.update({"status": s.get("status"), "why": s.get("why")})
+            rungs.append(rec)
+            continue
+        p90 = _p90(s)
+        rec.update({"status": "ok", "p_on_time": s["p_on_time"],
+                    "p50_finish_date": _p50(s).get("finish_date"),
+                    "p90_finish_date": p90.get("finish_date"),
+                    "p90_days_late": p90.get("days_late_worst"),
+                    "rough_days": s["rough_days"],
+                    "promise_date": s["promise_date"],
+                    "median_labor_cost_usd": _median([r0.get("labor_cost_usd") for r0 in rows]),
+                    "binding_seen": sorted({str(x.get("binding")) for x in rows if x.get("binding")}),
+                    "meets_required": float(s["p_on_time"]) >= req})
+        rungs.append(rec)
+        if float(s["p_on_time"]) >= req and reach is None:
+            reach = rec
+
+    usable = [x for x in rungs if x.get("status") == "ok"]
+    if not usable:
+        return {"status": "no_dates", "factory_id": factory_id, "models": models,
+                "ladder_tried": rungs, "verdict": None, "on_time_required": req,
+                "reading": [f"减量测算没跑成：{len(rungs)} 档都抽不出完工日 —— "
+                            f"没有日期就没有'减量换不换来'这格的答案"]}
+    out: Dict[str, Any] = {"status": "ok", "factory_id": factory_id, "models": models,
+                           "samples": n, "seed": seed, "on_time_required": req,
+                           "calibrated_units": full_units, "promise_date": usable[0]["promise_date"],
+                           "bands_used": bands, "ladder_tried": rungs}
+    if usable[0]["meets_required"]:
+        out["verdict"] = {"kind": "already_ok", "ratio": 1.0, "units_total": usable[0]["units_total"],
+                          "p_on_time": usable[0]["p_on_time"],
+                          "note": "标定场景的量本来就有 9 成把握 —— 不用减量，问题在别处"}
+        out["reading"] = [f"现量 {full_units:,} 台已经有 {usable[0]['p_on_time']:.0%} 准点"
+                          f"（要求 {req:.0%}）—— 减量不是这条路要动的东西"]
+        return out
+    if reach is None:
+        smallest = min(usable, key=lambda x: float(x["ratio"]))
+        base_p = float(usable[0]["p_on_time"])
+        best_p = max(float(x["p_on_time"]) for x in usable)
+        binding = sorted({b for x in usable for b in (x.get("binding_seen") or [])})
+        helps = best_p > base_p
+        out["verdict"] = {
+            "kind": ("volume_helps_but_not_enough" if helps else "volume_not_the_lever"),
+            "smallest_ratio": float(smallest["ratio"]), "units_at_smallest": int(smallest["units_total"]),
+            "units_cut_at_smallest": full_units - int(smallest["units_total"]),
+            "base_p_on_time": base_p, "best_p_on_time": best_p,
+            "p90_days_late_at_base": usable[0].get("p90_days_late"),
+            "p90_days_late_at_smallest": smallest.get("p90_days_late"),
+            "binding_seen": binding,
+            "note": (f"砍到 {float(smallest['ratio']):.0%}（{int(smallest['units_total']):,} 台）"
+                     f"准点概率只从 {base_p:.0%} 抬到 {best_p:.0%}，仍不到要求的 {req:.0%} —— "
+                     f"减量有用但不够，最后那几天卡的是 {'、'.join(binding) or '未明'}")}
+        curve = "、".join(
+            "{:.0%}→{:.0%}".format(float(x["ratio"]), float(x["p_on_time"])) for x in usable)
+        days_curve = "、".join(
+            "{:.0%}→延{}".format(float(x["ratio"]), x.get("p90_days_late")) for x in usable)
+        out["reading"] = [
+            f"减量换不到 9 成（{n} 抽·同一串抽样）：{full_units:,} 台砍到 "
+            f"{int(smallest['units_total']):,} 台（少 "
+            f"{full_units - int(smallest['units_total']):,} 台）"
+            + (f"准点概率从 {base_p:.0%} 抬到 {best_p:.0%}，仍不到 {req:.0%}"
+               if helps else f"准点概率一点没动（{base_p:.0%}）"),
+            f"P90 延误随量：{days_curve} —— 省下的是 "
+            f"{float(usable[0].get('p90_days_late') or 0) - float(smallest.get('p90_days_late') or 0):g} 天，"
+            f"最后那 {float(smallest.get('p90_days_late') or 0):g} 天不是量能换的（卡的是 "
+            f"{'、'.join(binding) or '未明'}）",
+            f"准点概率随量：{curve}",
+            "要继续追这单：看承诺上限那一格（改日期）或提前期那一格（压瓶颈件）；"
+            "再往下砍就只是少卖，不是早交",
+        ]
+        out["claim_guard"] = ("这条读数只说明'减到最小档也拿不到 9 成'，不许被引用成'量多了所以延期'；"
+                              "减量的确有把 P90 拉早（见 P90 延误随量那一行），只是不够达标")
+        out["method"] = ("同一串抽样上逐档改 targets.units，报每一档的准点概率与 P90 延误；"
+                         "没有一档达标就不给'最多能做几台'这个数，不插值")
+        return out
+
+    full = usable[0]
+    out["verdict"] = {
+        "kind": "found", "ratio": reach["ratio"], "units_total": reach["units_total"],
+        "units_per_model": reach["units_per_model"], "p_on_time": reach["p_on_time"],
+        "p90_finish_date": reach["p90_finish_date"], "promise_date": reach["promise_date"],
+        "units_cut": full_units - int(reach["units_total"]),
+        # "多做一档"取紧邻的那一档，不是最大的那一档 —— 阈值要它自己就成立
+        "next_ratio_fails": _adjacent_above(usable, reach["ratio"])["ratio"],
+        "next_ratio_p_on_time": _adjacent_above(usable, reach["ratio"])["p_on_time"],
+        "median_labor_cost_usd": reach["median_labor_cost_usd"],
+        "labor_released_usd": round(float(full.get("median_labor_cost_usd") or 0)
+                                    - float(reach.get("median_labor_cost_usd") or 0), 2),
+        "note": (f"最多做 {reach['units_total']:,} 台（比标定场景少 "
+                 f"{full_units - int(reach['units_total']):,} 台）仍有 {reach['p_on_time']:.0%} 准点；"
+                 f"多做一档（{_adjacent_above(usable, reach['ratio'])['ratio'] or 0:.0%}）就掉到 "
+                 f"{_adjacent_above(usable, reach['ratio'])['p_on_time'] or 0:.0%}"),
+    }
+    out["reading"] = [
+        f"现量 {full_units:,} 台：准点概率 {full['p_on_time']:.0%}（要求 ≥{req:.0%}），"
+        f"P90 完工 {full['p90_finish_date']}（承诺 {full['promise_date']}）",
+        f"要保住 {full['promise_date']} 且有 {req:.0%} 把握（{n} 抽·同一串抽样）："
+        f"最多做 {reach['units_total']:,} 台"
+        f"（砍 {full_units - int(reach['units_total']):,} 台，-{100 - reach['ratio'] * 100:.0f}%），"
+        f"此时准点概率 {reach['p_on_time']:.0%}、P90 完工 {reach['p90_finish_date']}",
+        f"每台怎么砍：{'、'.join(f'{k} {v:,} 台' for k, v in (reach['units_per_model'] or {}).items())}",
+        f"这省下的人工中位 ${out['verdict']['labor_released_usd']:,.0f}/批"
+        f"（少做=少卖，收益侧不折算，这里只记产能侧省下的钱）",
+    ]
+    out["claim_guard"] = ("减量是把需求削到窗口里，不是把交期提前 —— 少做的那些台仍然要做，"
+                          "只是不赶这个承诺日；要按客户优先级决定砍哪几台，引擎不替厂里挑客户")
+    out["method"] = ("同一串抽样上逐档改 targets.units，取'仍有 9 成准点'的最大量；"
+                     "并报多做一档（上一档）实测到达的准点概率，所以这个台数自己就成立")
     return out

@@ -1120,6 +1120,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "with_promise_headroom": {"type": "boolean",
                                           "description": ("要'有 9 成把握最早能承诺哪天'时置 true"
                                                           "（4 条政策 × 24 抽同一串）")},
+                "with_volume_ceiling": {"type": "boolean",
+                                        "description": ("要'保住现承诺最多能做几台'时置 true"
+                                                        "（5 档量 × 20 抽同一串）")},
             }},
         },
     },
@@ -3346,7 +3349,8 @@ async def _tool_query_simulation_sensitivity(
     out = await report(db, fid, models, include_risk=bool(args.get("with_schedule_risk")),
                        include_repair=bool(args.get("with_data_repair")),
                        include_crew_margin=bool(args.get("with_crew_margin")),
-                       include_promise=bool(args.get("with_promise_headroom")))
+                       include_promise=bool(args.get("with_promise_headroom")),
+                       include_volume=bool(args.get("with_volume_ceiling")))
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3390,6 +3394,9 @@ async def _tool_query_simulation_sensitivity(
         "margin_not_sampled_because": (None if out.get("crew_margin") else
                                        "没点要人手余量（with_crew_margin=true 才逐档加人真跑）"),
         "promise_headroom": _compact_promise_headroom(out.get("promise")),
+        "volume_ceiling": (out.get("volume") or {}),
+        "volume_not_sampled_because": (None if out.get("volume") else
+                                       "没点要减量测算（with_volume_ceiling=true 才逐档改量真跑）"),
         "promise_not_sampled_because": (None if out.get("promise") else
                                         "没点要承诺上限（with_promise_headroom=true 才逐条政策取 P90）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
@@ -4989,6 +4996,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
                      "先修哪条", "修哪条数据", "数据修复", "修数据", "压毛边",
                      "加多少人", "要加几个人", "加人行不行", "人手余量", "排班余量", "赶得上要",
                      "最早能承诺", "能承诺哪天", "承诺哪天", "报哪天", "改到哪天", "9 成把握", "九成把握",
+                     "最多能做几台", "能做几台", "要砍多少台", "减量", "砍多少台", "少做几台",
                      "sensitivity", "斜率"],
     },
     {
@@ -5654,6 +5662,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if any(k in message for k in ("最早能承诺", "能承诺哪天", "承诺哪天", "报哪天",
                                       "9 成把握", "九成把握", "改到哪天")):
             args["with_promise_headroom"] = True
+        # "最多能做几台"同样是分布上的问题：点估给不出"减到多少台才有 9 成把握"
+        if any(k in message for k in ("最多能做几台", "能做几台", "要砍多少台", "减量",
+                                      "砍多少台", "少做几台")):
+            args["with_volume_ceiling"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
         flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)
