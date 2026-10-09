@@ -169,6 +169,45 @@ def unbacked_kind(claim: str, reply: str, corpus: str) -> str:
     return "找不到来源"
 
 
+_SEG = re.compile(r"[，。；、：:：（）()\[\]「」\s→/]+")
+
+
+def gap_phrases(result: Any) -> List[List[str]]:
+    """引擎每条"算不出"给出它自己的说法 —— 判"点名没点名"就按这些词，不按固定词表。
+
+    固定词表（算不出/缺/没有…）两头都判错：答复换个说法就判它没带出来，
+    而答复讲了**另一批杠杆**没效果时又会被算成带出来了。
+    每条缺项返回一串候选说法（reason / ask / missing 里的片段），命中任一段算这条被带到。
+    """
+    if isinstance(result, list):        # 一条答复里多个工具返回：逐个收，别把列表当空 dict
+        collected: List[List[str]] = []
+        for one in result:
+            collected.extend(gap_phrases(one))
+        return collected
+    body = result if isinstance(result, dict) else {}
+    blocks: List[Any] = [body, body.get("answers") or {}]
+    layers = body.get("layers")
+    if isinstance(layers, list):
+        blocks.extend(x for x in layers if isinstance(x, dict))
+    out: List[List[str]] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        for item in (b.get("unavailable") or []):
+            if not isinstance(item, dict):
+                continue
+            phrases: List[str] = []
+            for field in ("reason", "ask", "missing"):
+                for seg in _SEG.split(str(item.get(field) or "")):
+                    seg = seg.strip(" 。.；;，,")
+                    if len(seg) >= 4:
+                        phrases.append(seg)
+            # 一条都拼不出说法的缺项（只有 name）不能免检：退回字面记号表，
+            # 否则它不进分母，反而让"没把自己缺什么写清楚"的那条显得更好看
+            out.append(phrases or list(GAP_WORDS))
+    return out
+
+
 def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
     """总结格：正文里的数字有没有出处；引擎报的缺口有没有被带进答复。
 
@@ -182,22 +221,29 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
     backed = unbacked = disclosed = 0
     from_user = 0
     kinds: Dict[str, int] = {}
-    gap_items = replies_with_gaps = gap_named_replies = 0
+    gap_items = replies_with_gaps = gap_named_replies = named_items = 0
+    missed: List[str] = []
     verbatim_num = verbatim_den = 0
     per_reply: List[Dict[str, Any]] = []
     for row in replies:
         reply = str(row.get("content") or "")
         claims = _nums(reply)
-        gaps = headline_items(_result_of(row.get("tool_json"), only="unavailable"))
+        gap_lists = gap_phrases(_result_of(row.get("tool_json"), only="unavailable"))
+        gaps = [p for group in gap_lists for p in group]
         items = headline_items(_result_of(row.get("tool_json")))
         if items:
             verbatim_den += len(items)
             verbatim_num += sum(1 for it in items if it in reply)
-        if gaps:
-            gap_items += len(gaps)
+        if gap_lists:
+            gap_items += len(gap_lists)
             replies_with_gaps += 1
-            if any(w in reply for w in GAP_WORDS):
+            # 一条答复要把引擎点得出的缺项都带到才算"没丢"；只带到一条也算丢（其它条用户看不见）
+            if all(any(ph in reply for ph in group) for group in gap_lists):
                 gap_named_replies += 1
+                named_items += len(gap_lists)
+            else:
+                missed.extend(group[0] for group in gap_lists
+                              if not any(ph in reply for ph in group))
         if not claims:
             continue
         eng = _hits(claims, str(row.get("session_tools") or ""))
@@ -234,6 +280,8 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
         "engine_gap_items": gap_items,
         "replies_with_engine_gaps": replies_with_gaps,
         "gap_named_replies": gap_named_replies,
+        "gap_items_named": named_items,
+        "gap_missed_examples": missed[:4],
         "gap_disclosure_rate": (round(gap_named_replies / replies_with_gaps, 3)
                                 if replies_with_gaps else None),
         "headline_verbatim_rate": round(verbatim_num / verbatim_den, 3) if verbatim_den else None,

@@ -74,6 +74,12 @@ def test_summary_disclosed_unbacked_counts_as_backed():
 
 
 def test_summary_gap_rate_only_judges_replies_that_had_engine_gaps():
+    """点名 = 把**那一条**缺项自己的说法交出去；只说"算不出"不说哪一项不算。
+
+    两个方向都要钉住（只验"会拦"就等于拦住所有人，只验"会放"就等于放过所有人）：
+    旧尺拿固定词表判，实测 3db81365 那条答复讲的是另外几个杠杆"未测出有效改善效果"，
+    并没有把 change_attribution 这条缺项交给用户，却被判成"点名了"—— 那是假阳性。
+    """
     gap_tool = [{"tool": "query_engine_attribution",
                  "result": {"unavailable": [{"name": "change_attribution",
                                              "ask": "问变化就传两组输入"}]}}]
@@ -83,9 +89,27 @@ def test_summary_gap_rate_only_judges_replies_that_had_engine_gaps():
     assert silent["replies_with_engine_gaps"] == 1
     assert silent["gap_named_replies"] == 0 and silent["gap_disclosure_rate"] == 0.0
 
-    named = summary_score([_reply("交期 2026-11-06；变更归因这一项算不出", gap_tool,
-                                  session_tools="2026-11-06")])
+    # 只带一个通用记号、没说是哪一项 → 仍算丢（旧尺会在这里误判成点名）
+    vague = summary_score([_reply("交期 2026-11-06；这一项算不出", gap_tool,
+                                 session_tools="2026-11-06")])
+    assert vague["gap_named_replies"] == 0, "通用词不能替那条缺项说话，否则点名率永远虚高"
+
+    named = summary_score([_reply("交期 2026-11-06；问变化就传两组输入，"
+                                 "这轮没给两组输入所以给不出变更归因", gap_tool,
+                                 session_tools="2026-11-06")])
     assert named["gap_named_replies"] == 1 and named["gap_disclosure_rate"] == 1.0
+
+
+def test_gap_phrase_falls_back_to_markers_when_the_item_names_nothing():
+    """缺项自己没写 reason/ask/missing 时不许免检：它得退回字面记号表。"""
+    only_name = [{"tool": "query_engine_attribution",
+                  "result": {"unavailable": [{"name": "silent_one"}]}}]
+    s = summary_score([_reply("交期 2026-11-06，没有依据", only_name,
+                              session_tools="2026-11-06")])
+    assert s["engine_gap_items"] == 1, "空说法的缺项也要进分母"
+    assert s["gap_named_replies"] == 1
+    quiet = summary_score([_reply("交期 2026-11-06", only_name, session_tools="2026-11-06")])
+    assert quiet["gap_named_replies"] == 0
 
 
 def test_gap_words_are_the_only_surface_the_ruler_reads():
