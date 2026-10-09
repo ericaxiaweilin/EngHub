@@ -774,10 +774,53 @@ def _paired_delta(base_rows: List[Dict[str, Any]], other_rows: List[Dict[str, An
                      "只看两个分布的分位数相减会把这两种情况抹平")}
 
 
+async def resolve_lead_anchor(db: AsyncSession, factory_id: str, *,
+                             census: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """提前期分布该锚在哪：厂里 declared 的规则优先；没人定过就按台账抽，并把"未校准"说在明处。
+
+    这一格不做决定：`measured` 才挪中心，`ledger`/没规则都留在 1.0，但后者的读数必须带
+    "实测说偏 N×、口径还没人拍"。`hybrid`（只锚已量过的料号）现在实现不了 ——
+    引擎只有一个整批中心旋钮，按它猜一个数等于替厂里做主。
+    """
+    from core.mes.factory_rules import binding_rules
+    from core.mes.measurement_priority import lead_ratio_census
+
+    if db is None:
+        # 没有库会话就拿不到厂规与校准比。这不静默降级：basis 明写"没读厂规、按台账抽"，
+        # 生产路径永远带 db，走到这里只可能是测试或显式 what-if。
+        return {"center": 1.0, "in_force": "no_session", "calibrated": False, "anchor": None,
+                "rule_verdict": None, "rule_status": None, "reliable_rows": 0, "zero_ratio_rows": 0,
+                "basis": "没有数据库会话：厂规与实测校准比都读不到，本次按台账（中心 1.0）抽"}
+
+    cen = census if census is not None else await lead_ratio_census(db, factory_id)
+    anchor = cen.get("anchor")
+    rule = (await binding_rules(db, factory_id)).get("lead_time_anchor") or {}
+    verdict = str(rule.get("verdict") or "").strip().lower()
+    base = {"anchor": anchor, "rule_verdict": verdict or None, "rule_status": rule.get("status"),
+            "reliable_rows": cen.get("reliable_rows"), "zero_ratio_rows": cen.get("zero_ratio_rows")}
+    if verdict == "measured":
+        if anchor and float(anchor) > 1.0:
+            return {**base, "center": float(anchor), "in_force": "measured", "calibrated": True,
+                    "basis": f"厂里定的口径：按实测中位 {anchor:g}× 锚"}
+        return {**base, "center": 1.0, "in_force": "ledger", "calibrated": False,
+                "basis": "规则说按实测锚，可现在没有可用的非零校准比 —— 不能假装锚过，"
+                         "回到台账抽并说明缺什么"}
+    if verdict == "hybrid":
+        return {**base, "center": 1.0, "in_force": "ledger", "calibrated": False,
+                "basis": "hybrid 要按料号分别锚，引擎现在只有『整批中心』这一个旋钮 —— "
+                         "先按台账；要实现 hybrid 得先让抽样支持料号级乘子"}
+    if verdict == "ledger":
+        return {**base, "center": 1.0, "in_force": "ledger", "calibrated": False,
+                "basis": f"厂里定的口径：按台账锚（对外读数要标未校准；实测说偏 {anchor or '—'}×）"}
+    return {**base, "center": 1.0, "in_force": "ledger", "calibrated": False, "question_open": True,
+            "basis": ("没人定过锚定口径" + (f"；实测说台账偏乐观 {anchor:g}×" if anchor else "；也没有实测可比")
+                      + " —— 问题挂在 /pmc/open-rule-questions 的 lead_time_anchor")}
+
+
 async def _risk_setup(db: AsyncSession, factory_id: str, models: List[str], *,
                       days_of_output: float = 6.0, lead_margin: Optional[float] = None,
                       samples: int = 48, seed: int = 20261008,
-                      lead_center: float = 1.0) -> Dict[str, Any]:
+                      lead_center: Optional[float] = None) -> Dict[str, Any]:
     """抽样前的全部依据：目标单、每台机自己的带宽、设备实测率、固定抽次序列。
 
     交期分布和数据修复实验必须共用这一份，否则两边的毛边不是同一条抽样序列，
@@ -785,6 +828,12 @@ async def _risk_setup(db: AsyncSession, factory_id: str, models: List[str], *,
     """
     margin = lead_margin if lead_margin is not None else vr.PROMISE_LEAD_MARGIN
     n = max(6, min(200, int(samples)))
+    if lead_center is None:
+        resolved = await resolve_lead_anchor(db, factory_id)
+        lead_center, anchor_meta = float(resolved["center"]), resolved
+    else:
+        anchor_meta = {"center": float(lead_center), "in_force": "explicit", "calibrated": None,
+                       "basis": "调用方显式给的中心（what-if 或对照实验），不读厂规"}
     targets = await vr.derive_targets(db, factory_id, models,
                                       days_of_output=days_of_output, lead_margin=margin)
     base_eq = float((await vr.equipment_rate(db, factory_id)).get("rate") or 1.0)
@@ -805,7 +854,7 @@ async def _risk_setup(db: AsyncSession, factory_id: str, models: List[str], *,
             "bands": {"purchase_lead_time": round(lead_band, 3), "unit_work_hours": round(hours_band, 3),
                       "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS),
                       "equipment_plus_minus": 0.02},
-            "lead_center": float(lead_center),
+            "lead_center": float(lead_center), "lead_anchor": anchor_meta,
             "draws": _risk_draws(n, seed, lead_band=lead_band, hours_band=hours_band,
                                  base_equip=base_eq, lead_center=lead_center)}
 
@@ -835,7 +884,7 @@ async def _sample_rows(db: AsyncSession, factory_id: str, targets: List[Dict[str
 async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
                         days_of_output: float = 6.0, lead_margin: Optional[float] = None,
                         policy: Optional[Dict[str, Any]] = None, samples: int = 48,
-                        seed: int = 20261008,
+                        seed: int = 20261008, lead_center: Optional[float] = None,
                         against: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """把"可信到几成"换成一条日期分布：按已声明的误差带抽样，给 P50/P90 与准点概率。
 
@@ -850,7 +899,8 @@ async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
     """
     pol = policy or {"name": "基准政策（分批开工）", "allow_partial": True}
     setup = await _risk_setup(db, factory_id, models, days_of_output=days_of_output,
-                              lead_margin=lead_margin, samples=samples, seed=seed)
+                              lead_margin=lead_margin, samples=samples, seed=seed,
+                              lead_center=lead_center)
     n, bands = setup["n"], setup["bands"]
     basis_note = ("提前期按 lead_error_band(覆盖率)、工时按每台机自己的 hours_error_band，"
                   "两者都取这批里最差的那条；到岗按天气标定三档离散抽；设备可用率=台账实测 ±2pp。"
@@ -862,6 +912,14 @@ async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
     base_rows = await sample(pol)
     out = _risk_summary(base_rows, factory_id=factory_id, models=models, policy_name=pol["name"],
                         samples=n, seed=seed, bands=bands, with_date_note=basis_note)
+    centre = float(setup["lead_center"])
+    anchor_word = "按台账（未校准）" if centre <= 1.0 else "按实测 %g×" % centre
+    out["lead_anchor"] = setup["lead_anchor"]
+    out["lead_center_used"] = centre
+    if out.get("status") == "ok":
+        # reading 是字符串（聊天与端点都在原样打印它），追加而不是拼列表，类型一改渲染就裂
+        out["reading"] = f"{out['reading']}；锚定：{anchor_word} —— {setup['lead_anchor']['basis']}；" \
+                         f"准点概率是按这个锚算的，换锚要重算"
     if out.get("status") != "ok":
         out["against"] = []
         return out
@@ -1013,7 +1071,8 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
             repairs.append(entry)
             continue
         keep = float(t["floor_band"]) / float(cur)
-        after = await run(_rescale_draws(setup["draws"], setup["base_equip"], narrowed={inp: keep}),
+        after = await run(_rescale_draws(setup["draws"], setup["base_equip"], narrowed={inp: keep},
+                                         lead_center=setup["lead_center"]),
                           t["label"])
         if after.get("status") != "ok":
             entry.update({"status": "no_dates", "why": after.get("why"), "days_narrowed": None})
@@ -1038,7 +1097,8 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
         cur = band_now[t["input"]]
         if cur and float(cur) > float(t["floor_band"]):
             narrowed[t["input"]] = float(t["floor_band"]) / float(cur)
-    floor = (await run(_rescale_draws(setup["draws"], setup["base_equip"], narrowed=narrowed),
+    floor = (await run(_rescale_draws(setup["draws"], setup["base_equip"], narrowed=narrowed,
+                                      lead_center=setup["lead_center"]),
                        "三条可修数据同时到下限") if narrowed else None)
     floor_ok = bool(floor and floor.get("status") == "ok")
     gap_now = float(base["p90_p50_gap_days"])
@@ -1113,6 +1173,7 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
             f"{r['label']}＝{r['evidence_meaning']}" for r in repairs if r.get("evidence_meaning")))
     return {
         "status": "ok", "factory_id": factory_id, "models": models, "policy": pol["name"],
+        "lead_anchor": setup["lead_anchor"],
         "samples": n, "seed": seed, "bands_now": band_now, "evidence_now": cov_now,
         "baseline": base, "repairs": repairs, "all_repaired": floor,
         "decomposition": decomposition, "first_fix": first, "reading": lines,
@@ -1435,6 +1496,7 @@ async def promise_headroom(db: AsyncSession, factory_id: str, models: List[str],
     now_opt = usable[0]
     out: Dict[str, Any] = {
         "status": "ok", "factory_id": factory_id, "models": models, "samples": n, "seed": seed,
+        "lead_anchor": setup["lead_anchor"],
         "on_time_required": req, "current_promise": now_opt["promise_date"],
         "bands_used": bands, "options": options,
         "verdict": {
@@ -1551,6 +1613,7 @@ async def volume_ceiling_for_promise(db: AsyncSession, factory_id: str, models: 
                 "reading": [f"减量测算没跑成：{len(rungs)} 档都抽不出完工日 —— "
                             f"没有日期就没有'减量换不换来'这格的答案"]}
     out: Dict[str, Any] = {"status": "ok", "factory_id": factory_id, "models": models,
+    "lead_anchor": setup["lead_anchor"],
                            "samples": n, "seed": seed, "on_time_required": req,
                            "calibrated_units": full_units, "promise_date": usable[0]["promise_date"],
                            "bands_used": bands, "ladder_tried": rungs}
@@ -1908,6 +1971,7 @@ async def expedite_price_by_part(db: AsyncSession, factory_id: str, models: List
 
     out: Dict[str, Any] = {
         "status": "ok", "factory_id": factory_id, "models": models, "samples": n, "seed": seed,
+        "lead_anchor": setup["lead_anchor"],
         "promise_date": base.get("promise_date"), "bands_used": bands,
         "base_days_late_per_model": base_pm,
         "base_p90": {"finish_date": _p90(base).get("finish_date"),

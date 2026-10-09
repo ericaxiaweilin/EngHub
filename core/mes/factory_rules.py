@@ -559,7 +559,8 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     from core.mes.measurement_priority import lead_ratio_census
 
     ratio = await lead_ratio_census(db, factory_id)
-    if ratio["anchor"]:
+    declared = (await binding_rules(db, factory_id)).get("lead_time_anchor") or {}
+    if ratio["anchor"] and not declared:
         out.append({
             "topic": "lead_time_anchor",
             "question": ("交期分布现在按『台账提前期无偏』抽（中心 1.0），但本厂下单→到货实测说台账"
@@ -582,7 +583,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
             "record_as": {"subject": "lead_time_anchor", "verdict": "measured|ledger|hybrid",
                           "status": "declared", "source": "chat"},
         })
-    elif ratio["rows"]:
+    elif ratio["rows"] and not declared:
         out.append({
             "topic": "lead_time_anchor",
             "question": ("有实测到货记录但没有可用校准比（非零行为 0）——"
@@ -596,9 +597,17 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
         })
 
 
+    declared_anchor = None
+    if declared:
+        declared_anchor = {"verdict": declared.get("verdict"), "status": declared.get("status"),
+                           "statement": declared.get("statement"),
+                           "anchor_available": ratio.get("anchor"),
+                           "note": "锚定口径已定，所以不再问；引擎每次抽样都按这个口径取中心，"
+                                   "读数里带 lead_anchor.basis。要改口径用 record_factory_rule 覆盖"}
     return {"questions": out, "coverage": cov,
             "answer_how": ("同 capacity 口径这类问题，回答后用 record_factory_rule 落成 declared 规则；"
-                           "线认领关系要改的是 line_profiles（事实表），引擎不自动写")}
+                           "线认领关系要改的是 line_profiles（事实表），引擎不自动写"),
+            "declared_anchor": declared_anchor}
 
 
 async def record_candidates_from_census(db: AsyncSession, factory_id: str, *,

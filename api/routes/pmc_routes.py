@@ -777,6 +777,8 @@ async def get_sim_schedule_risk(
     samples: int = Query(48, description="抽样次数（6~200；每抽一次真跑一遍沙箱）"),
     seed: int = Query(20261008, description="固定种子：同一批数据要能重算出同一条分布"),
     against: str = Query("", description='同序配对比较的政策，JSON 数组，如 [{"name":"加急到 7 天","expedite_lead_days":7}]'),
+    lead_center: Optional[float] = Query(None, ge=1.0, le=20.0,
+                                         description="只改这一次请求的提前期中心（what-if 用，不写厂规；默认按厂规/台账）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -804,7 +806,7 @@ async def get_sim_schedule_risk(
         raise HTTPException(status_code=422,
                             detail='against 形如 [{"name":"加急到 7 天","expedite_lead_days":7}]')
     return await schedule_risk(db, factory_id, models, samples=samples, seed=seed,
-                             against=alts or None)
+                             against=alts or None, lead_center=lead_center)
 
 
 @router.get("/data-flow-profile", summary="数据流节点剖面：这座厂一次推演流经多少节点、按规模要多多少")

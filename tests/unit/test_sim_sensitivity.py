@@ -449,7 +449,8 @@ def test_schedule_risk_rejects_a_malformed_against_list(monkeypatch):
 
     async def call(against_value):
         return await get_sim_schedule_risk("FAC", n_models=1, samples=6, seed=1,
-                                           against=against_value, db=None, current_user=None)
+                                           against=against_value, lead_center=None,
+                                           db=None, current_user=None)
 
     for bad in ("{不是JSON}", '[1,2]', '"加急"'):
         try:
