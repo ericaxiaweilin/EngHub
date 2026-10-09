@@ -521,7 +521,9 @@ def test_gap_note_lists_every_missing_item_without_truncating_the_phrase():
     """出口那一行必须把判据要看的每个说法原样交出去。
 
     判据要求"每条缺项都被带到"，而旧出口只列前 3 种说法、还把句子截到 60 字：
-    第 4 条永远追不上，长句被截断的那条也永远判不到 —— 缺口点名率 0.167 里就有这一半。
+    ≥4 种不同说法、或一句 reason 长过 60 字时，被漏掉/截断的那条永远判不到。
+    10-09 配对实测：当下 6 轮样本里旧写法还没被触发（追加后也 1.0），所以这一版钉的是
+    **潜在**失效条件，不是当前读数 0.167 的成因 —— 那 5 轮早于出口修复上线。
     """
     from core.kernel.reply_sanitizer import gap_phrases, missing_gap_note
 
