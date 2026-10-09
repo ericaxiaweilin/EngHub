@@ -62,6 +62,17 @@ LATEST_SQL = text("""
 """)
 
 
+def _flag_reasons(actions) -> Dict[str, int]:
+    """催购动作身上的旗标按原因计数：读动作里的机器名，不重新判一遍（判据只在 virtual_run 写一次）。"""
+    out: Dict[str, int] = {}
+    for a in actions or []:
+        if a.get("type") != "expedite_purchase":
+            continue
+        for k in a.get("evidence_flag_kinds") or []:
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
 def _action_coverage(scan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """这一轮的政策×天气网格里，每个动作被考虑过几次 —— 没被考虑过的动作不可能有现场采纳记录。
 
@@ -519,6 +530,8 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                               "actions_on_unverified_input": sum(
                                   1 for a in actions
                                   if a.get("type") == "expedite_purchase" and a.get("evidence_flags")),
+                              # 同一条判线结论要能说出"谁能把它清掉"：三种原因分开数（一条动作可占多项）
+                              "action_flag_reasons": _flag_reasons(actions),
                               "actions_total_expedite": sum(
                                   1 for a in actions if a.get("type") == "expedite_purchase"),
                               "lever_economics": (levers.get("ranked") or [])[:8],

@@ -739,15 +739,24 @@ async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> 
     except (TypeError, ValueError):
         cd = {}
     flagged = int(cd.get("actions_on_unverified_input") or 0)
+    reasons = cd.get("action_flag_reasons") or {}
     exp_total = int(cd.get("actions_total_expedite") or 0)
 
     return {"metrics": [
         _metric("推荐动作压在未核实依据上的条数", (flagged if exp_total else None),
                 THRESHOLDS["L3"]["actions_on_unverified_max"], "lte", "条",
-                f"最近一张权衡卡里 {exp_total} 条催购动作有 {flagged} 条至少一项依据未核实"
-                "（提前期是按类别铺的默认值，或料号与供应商来自本地演示 BOM）。"
-                "这一格不过线不是推荐算错，是**照着下单的人没有可核的对象** —— "
-                "要修的是供应商主数据（#48）与实测提前期（#55），不是再推演一遍",
+                f"最近一张权衡卡里 {exp_total} 条催购动作有 {flagged} 条至少一项依据未核实。"
+                + (f"按原因分开数（一条动作可占多项）：提前期未实测 "
+                   f"{reasons.get('lead_time_unverified', 0)} 条、料号来自本地表而非 engflow 镜像 "
+                   f"{reasons.get('bom_source_not_mirror', 0)} 条、没有默认供应商 "
+                   f"{reasons.get('no_supplier', 0)} 条。"
+                   # 料号那一项别记到供应商主数据头上：本轮查取数入口，这些机种在镜像里本来就没行
+                   "料号那一项是这些机种在 engflow 镜像里本来就没有行（回落本地表是如实标注），"
+                   "要清掉它得厂里把那批机种的 BOM 交进来。"
+                   if reasons else
+                   f"这张卡写于旗标原因上线前，{flagged} 条没有原因分解 —— "
+                   "照旧按整条数判线，下一张写卡的轮次起会分开点名三种原因。")
+                + "这一格不过线不是推荐算错，是**照着下单的人没有可核的对象**，不是再推演一遍能解决的",
                 missing=(None if exp_total else "最近这张卡没有催购动作，判不了依据质量")),
         _metric("推荐相对基线的再跑差值（暴雨档）", gain, THRESHOLDS["L3"]["retest_improvement_days"], "gte", "天",
                 "推荐政策比「现况」少延几天；0 = 推荐就是基线，决策层没有增量（差距另报 gap_to_best）"),

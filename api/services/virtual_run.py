@@ -1157,16 +1157,30 @@ def evidence_flags(bp: Dict[str, Any], detail: Dict[str, Any]) -> List[str]:
     真正的 $0 来自代价取错了政策（已在 robust_objectives 修掉）。单价缺失影响的是库存金额与成本口径，
     不是这一格，所以不许再挂在这里。
     """
-    flags: List[str] = []
+    return [t for _, t in _flag_pairs(bp, detail)]
+
+
+def evidence_flag_kinds(bp: Dict[str, Any], detail: Dict[str, Any]) -> List[str]:
+    """同一批旗标的机器名 —— 判线那一格要按原因分开数，才知道谁能把它清掉。"""
+    return [k for k, _ in _flag_pairs(bp, detail)]
+
+
+def _flag_pairs(bp: Dict[str, Any], detail: Dict[str, Any]):
+    """(原因名, 给人读的文案) 一次生成：判据只在这里写一遍，
+    免得文案与计数各判一次、下一轮就对不上账。"""
+    pairs = []
     evd = str(bp.get("lead_evidence") or "unknown")
     if evd != "measured":
-        flags.append(f"提前期 {bp.get('lead_time_days')} 天的依据={evd}（不是实测交期）")
+        pairs.append(("lead_time_unverified",
+                      f"提前期 {bp.get('lead_time_days')} 天的依据={evd}（不是实测交期）"))
     src = str(detail.get("bom_source") or "")
-    if src and src != "engflow_mirror_multi_level":
-        flags.append(f"BOM 取数={src}（料号与供应商可能不是厂里真件）")
+    # 镜像就是真源，单层与多层都算；只有回落本地表才挂旗（FG-TREAD-*/FG-BIKE-* 实测在镜像里 0 行）
+    if src and not src.startswith("engflow_mirror"):
+        pairs.append(("bom_source_not_mirror",
+                      f"BOM 取数={src}（料号与供应商可能不是厂里真件）"))
     if not bp.get("supplier"):
-        flags.append("没有默认供应商 → 催购没有对象")
-    return flags
+        pairs.append(("no_supplier", "没有默认供应商 → 催购没有对象"))
+    return pairs
 
 
 def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
@@ -1247,6 +1261,7 @@ def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
             flags = evidence_flags(bp, d)
             if flags:
                 act["evidence_flags"] = flags
+                act["evidence_flag_kinds"] = evidence_flag_kinds(bp, d)
                 act["note"] = (act.get("note") or "") + "；先核这几项：" + "、".join(flags)
             if bp.get("supplier"):
                 act.update({"type": "expedite_purchase", "supplier": bp["supplier"],

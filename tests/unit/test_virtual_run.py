@@ -413,3 +413,21 @@ def test_capacity_takes_the_tighter_of_line_declaration_and_work_content():
     assert tight["binding"] == "ie_hours" and tight["units_per_day"] == 100.0
     none = vr.capacity_limits(crew=10, hours_per_day=11, hours_per_unit=0, line_declared=0)
     assert none["binding"] == "no_capacity" and none["units_per_day"] == 0.0
+
+
+def test_evidence_flag_kinds_name_the_reasons_without_rejudging():
+    """文案与原因出自同一次判定：判线格按原因分的数，必须与动作上挂的句子一一对应。"""
+    from api.services.virtual_run import evidence_flag_kinds, evidence_flags
+
+    bp = {"lead_evidence": "ledger_declared", "lead_time_days": 20, "supplier": "中联重工(佛山)"}
+    d = {"bom_source": "mes_bom_items"}
+    assert evidence_flag_kinds(bp, d) == ["lead_time_unverified", "bom_source_not_mirror"]
+    assert len(evidence_flags(bp, d)) == 2, "文案条数与原因条数不许分家"
+
+    # 镜像就是真源，单层/多层都算；提前期实测 + 有供应商 → 不该挂任何旗
+    clean = {"lead_evidence": "measured", "lead_time_days": 12, "supplier": "X"}
+    assert evidence_flag_kinds(clean, {"bom_source": "engflow_mirror"}) == []
+    assert evidence_flag_kinds(clean, {"bom_source": "engflow_mirror_multi_level"}) == []
+    # 没供应商单独点名（那是"催购没有对象"，不是料号问题）
+    assert "no_supplier" in evidence_flag_kinds({"lead_evidence": "measured"},
+                                                {"bom_source": "engflow_mirror"})
