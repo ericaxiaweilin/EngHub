@@ -531,6 +531,86 @@ async def get_sim_tradeoffs(
     return await record_tradeoffs(db, factory_id, apply=apply)
 
 
+@router.get("/expedite-drafts", summary="催购落成的请购草稿：等谁批、谁批了、谁拒了")
+async def get_expedite_drafts(
+    factory_id: str = Query(..., description="厂区"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """引擎把"该催哪个料"落成一张 pending 请购单，人只需要批或拒（#63）。
+
+    这一格存在的意义是把两件事分开：**引擎落了单子** 不等于 **厂里采纳了建议**。
+    所以草稿按"谁表态"分堆，`auto_approved` 或机器账号写的都算"没人表态"。
+    """
+    del current_user
+    from sqlalchemy import text
+
+    from api.services.expedite_drafts import decision_summary
+
+    rows = (await db.execute(text("""
+        SELECT pr_code, material_code, material_name, qty, required_date, status,
+               approved_by, approved_at, approved_comment, rejection_reason,
+               auto_approved, source_id, lead_time_days, created_at
+        FROM purchase_requisitions
+        WHERE factory_id = :fid AND source = 'simulation_recommendation'
+        ORDER BY created_at DESC LIMIT 200
+    """), {"fid": factory_id})).mappings().all()
+    out = decision_summary([dict(r) for r in rows])
+    out["factory_id"] = factory_id
+    out["rows"] = [{"pr_code": r.get("pr_code"), "material_code": r.get("material_code"),
+                    "qty": r.get("qty"), "required_date": str(r.get("required_date") or ""),
+                    "status": r.get("status"), "actor": r.get("approved_by"),
+                    "reads_as": next((d["reads_as"] for d in out["detail"]
+                                      if d["pr_code"] == r.get("pr_code")), "")}
+                    for r in [dict(x) for x in rows][:20]]
+    out["note"] = ("草稿 source=simulation_recommendation、created_by=virtual_factory。"
+                   "它们**不计进**『上一轮建议落地了没有』的证据（virtual_run 的复查会按成因排除），"
+                   "判采纳只看人写的 approved_by / rejection_reason。")
+    return out
+
+
+@router.post("/expedite-drafts/decision", summary="采购员批/拒一张引擎开的请购草稿（署名进台账）")
+async def post_expedite_draft_decision(
+    body: Dict[str, Any] = Body(..., description="pr_code, agree(true=批/false=拒), note"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """表态必须是**人的账号**写的。
+
+    引擎的建议如果由系统自己批掉，"人工采纳率"就变成引擎给自己打分 —— 所以这里
+    只认登录用户的 username，且只改引擎自己开的那批单子（source=simulation_recommendation）。
+    """
+    from sqlalchemy import text
+
+    actor = str(getattr(current_user, "username", None) or "").strip()
+    machine = {"system", "virtual_factory", "virtual_factory_scenario", "pending_manual",
+               "night-watch", "ai_assistant", "procurement_agent", "warehouse_agent"}
+    if not actor or actor in machine:
+        return {"ok": False, "rejected": True,
+                "why": f"署名 {actor or '(空)'} 是机器账号：引擎的建议不能由系统自己批",
+                "reads_as": "没人表态"}
+    pr_code = str(body.get("pr_code") or "").strip()
+    agree = bool(body.get("agree"))
+    note = str(body.get("note") or "").strip()[:500]
+    row = (await db.execute(text("""
+        UPDATE purchase_requisitions
+           SET status = CASE WHEN :agree THEN 'approved' ELSE 'rejected' END,
+               approved_by = :by, approved_at = NOW(), updated_at = NOW(),
+               approved_comment = CASE WHEN :agree THEN NULLIF(:cmt, '') ELSE approved_comment END,
+               rejection_reason = CASE WHEN :agree THEN rejection_reason ELSE NULLIF(:why, '') END
+         WHERE pr_code = :code AND source = 'simulation_recommendation'
+           AND LOWER(COALESCE(status, '')) = 'pending'
+      RETURNING pr_code, material_code, status, approved_by
+    """), {"agree": agree, "by": actor, "cmt": note, "why": note,
+                "code": pr_code})).mappings().first()
+    if row is None:
+        return {"ok": False, "why": f"没有一张等人批的引擎草稿叫 {pr_code}",
+                "reads_as": "改不到（已批过/已拒/不是引擎开的草稿）"}
+    return {"ok": True, **dict(row),
+            "reads_as": "人已批" if agree else "人已拒",
+            "note": "这条表态会被 L3「人工采纳率」当作人的态度计入（署名不是机器账号）"}
+
+
 @router.post("/confirm-rule", summary="确认或驳回一条系统发现的候选规则")
 async def post_confirm_rule(
     body: Dict[str, Any] = Body(..., description="rule_id, agree(true=升为正式规则/false=驳回), note"),

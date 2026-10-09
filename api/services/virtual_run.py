@@ -1082,7 +1082,15 @@ FOLLOWTHROUGH_SQL = text("""
            (SELECT COUNT(*) FROM purchase_requisitions rq
              WHERE rq.factory_id = :fid AND rq.material_code = m.material_code
                AND rq.created_at >= CAST(:since AS timestamp)
-               AND UPPER(COALESCE(rq.status, '')) NOT IN ('CANCELLED', 'REJECTED')) AS requis_since
+               -- 引擎自己落的请购草稿不算"有人动过"：#63 起催购会自动开 pending 草稿，
+               -- 按料号计数就会把"引擎自己写过一张单"读成"现场采纳了建议"（自供证据）。
+               -- 草稿数单列在下面那一格给人看，判词只看人/别的系统写的单据。
+               AND COALESCE(rq.source, '') <> 'simulation_recommendation'
+               AND UPPER(COALESCE(rq.status, '')) NOT IN ('CANCELLED', 'REJECTED')) AS requis_since,
+           (SELECT COUNT(*) FROM purchase_requisitions rq
+             WHERE rq.factory_id = :fid AND rq.material_code = m.material_code
+               AND rq.created_at >= CAST(:since AS timestamp)
+               AND rq.source = 'simulation_recommendation') AS engine_draft_since
     FROM materials m
     WHERE m.factory_id = :fid AND m.material_code = ANY(CAST(:codes AS text[]))
 """)
@@ -1123,6 +1131,8 @@ async def recommendation_followthrough(db: AsyncSession, factory_id: str,
                     "purchase_requests": int(row.get("req_since") or 0),
                     "purchase_requisitions": int(row.get("requisition_since") or 0)}
         raised = sum(evidence.values())
+        # 引擎自己开的草稿另记一格，不进 raised —— 它证明"引擎落了单子"，不证明"厂里采纳了"
+        drafts = int(row.get("engine_draft_since") or 0)
         if str(a.get("type")) == "supplier_master_missing":
             item = {"material_code": code, "check": "补供应商",
                     "default_supplier": row.get("default_supplier")}
@@ -1133,17 +1143,23 @@ async def recommendation_followthrough(db: AsyncSession, factory_id: str,
             {"material_code": code,
              "check": f"提前期压到 {target} 天，或采购/请购/申购里查到记录",
              "lead_now": lead_now, "lead_target": target,
-             "evidence": evidence, "records_since": raised})
+             "evidence": evidence, "records_since": raised,
+             "engine_drafts_not_counted": drafts})
     verdict = ("建议有下落：提前期已压缩，或采购/请购/申购里查到了记录" if adopted and not not_acted else
                ("建议还没落地：主档提前期没变，采购/请购/申购三类台账都查不到记录"
                 if not_acted and not adopted else
                 "部分落地：见明细，未落地的部分继续挂在建议里"))
+    engine_drafts = sum(int(x.get("engine_drafts_not_counted") or 0)
+                        for x in (adopted + not_acted))
     return {"checked": len(wanted), "adopted": adopted, "not_acted": not_acted,
             "no_master_row": sorted(set(no_master)), "since": str(until),
-            "verdict": verdict,
+            "verdict": verdict, "engine_drafts_ignored": engine_drafts,
             "note": ("复查只看台账证据：materials.lead_time_days 是否压到建议值，"
                      "以及 purchase_orders / purchase_requests / purchase_requisitions 里该料号"
-                     "在建议之后有没有新增单据（取消/驳回的不算）。查不到就说查不到，不猜有没有人口头催过")}
+                     "在建议之后有没有新增单据（取消/驳回的不算）。查不到就说查不到，不猜有没有人口头催过。"
+                     f"引擎自己落的请购草稿（source=simulation_recommendation）不计进证据 —— "
+                     "那张单是引擎写的，不是厂里动的；本轮按这条排除了 "
+                     f"{engine_drafts} 张")}
 
 
 # 动作排序：先"今天就能下单/开工"的，再"要人去确认"的，最后是主数据缺口。

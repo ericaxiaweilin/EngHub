@@ -647,6 +647,35 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                "**加急不解决交期**，要自洽得改承诺口径或补产能路径（#72）。"
                if delta.get("worst_still_late_days") else "（已能准点）。")
             + "\n")
+        # 催购落点（#63）：把动作落成**等人批的请购草稿**。开关默认关 ——
+        # 写别人的采购申请表是要人点头的动作，不跟着 flywheel 的 apply 一起放开。
+        draft_line = ""
+        try:
+            from api.services.expedite_drafts import sync_drafts
+
+            drafts = await sync_drafts(
+                db, factory_id, task_key=task_key, actions=actions[:20],
+                apply=bool(apply and os.getenv("ENGHUB_EXPEDITE_DRAFTS_APPLY", "") == "1"))
+            receipt["expedite_drafts"] = {
+                "would_write": drafts["would_write"], "written": drafts["written"],
+                "apply": drafts["apply"], "skipped": drafts["skipped"][:6],
+                "drafts": (drafts.get("drafts") or [])[:6],
+                "why_off": (None if drafts["apply"] else
+                            "开关未开：ENGHUB_EXPEDITE_DRAFTS_APPLY=1 才真写"),
+            }
+            draft_line = (
+                f"\n请购草稿：已落 {drafts['written']} 张（source=simulation_recommendation、"
+                f"状态 pending，等采购员批；同一推荐重跑不重复开）。"
+                if drafts["apply"] and drafts["written"] else
+                (f"\n请购草稿：本轮会落 {drafts['would_write']} 张，"
+                 f"开关未开（ENGHUB_EXPEDITE_DRAFTS_APPLY=1 才真写），"
+                 f"跳过 {drafts['skipped_count']} 条：" +
+                 "；".join(f"{x['material_code']} {x['why']}" for x in drafts["skipped"][:3])
+                 if drafts["would_write"] or drafts["skipped"] else ""))
+        except Exception as exc:  # noqa: BLE001  落点失败不能把推荐整条带崩，但要写在卡上
+            receipt["expedite_drafts"] = {"error": f"{type(exc).__name__}: {exc}"}
+            draft_line = f"\n请购草稿：没落成（{type(exc).__name__}: {exc}）"
+
         created = await create_task(
             db, factory_id, "virtual_factory",
             f"推演推荐｜{rec}（{claim}，代价 ${money:,.0f}）"[:200],   # 价钱与正文同一口径：被推荐那条政策自己的代价
@@ -665,6 +694,7 @@ async def record_tradeoffs(db: AsyncSession, factory_id: str, *, apply: bool = T
                 f"场景标定：" + "；".join(f"{c[0]} {c[1]}台/{c[2]}天" for c in receipt["calibration"])
                 + ("\n动作（都在沙箱里，不写 MES/WMS，也不自动开采购单）：\n"
                    + "\n".join(act_lines) if act_lines else "")
+                + (draft_line or "")
                 + ("\n杠杆经济账（每动一档实测值多少）：\n" + "\n".join(lever_lines)
                    if lever_lines else "")),
             agent_key="pmc_agent", item_type="followup", source="virtual_factory",

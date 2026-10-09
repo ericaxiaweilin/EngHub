@@ -747,6 +747,23 @@ async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> 
     """), {"fid": factory_id})).mappings().all()
     disp = adoption_from_dispositions([dict(r) for r in human])
     adoption = disp["rate"]
+    # 催购落点（#63）：引擎把动作落成 pending 请购草稿之后，"人表过态没有"多了一条更细的证据。
+    # 这一格**只报数、不进「人工采纳率」的判线** —— 那条尺数的是"每条推荐有没有人被表态"，
+    # 草稿是按料号开的，混进去会把分母从"条推荐"换成"张单子"，同一个名字就又是两把尺。
+    drafts = {"waiting": 0, "adopted_by_human": 0, "rejected_by_human": 0,
+              "closed_by_machine": 0, "total": 0}
+    draft_error = None
+    try:
+        from api.services.expedite_drafts import decision_summary
+
+        drows = (await db.execute(text("""
+            SELECT pr_code, material_code, status, approved_by, auto_approved
+            FROM purchase_requisitions
+            WHERE factory_id = :fid AND source = 'simulation_recommendation'
+        """), {"fid": factory_id})).mappings().all()
+        drafts = decision_summary([dict(r) for r in drows])
+    except Exception as exc:  # noqa: BLE001  读不到草稿要写出来，不能当"没有草稿"
+        draft_error = f"{type(exc).__name__}: {exc}"
     card = (await db.execute(text("""
         SELECT detail::text AS dt FROM simulation_scorecards
         WHERE factory_id = :fid AND source = 'virtual_run_tradeoff'
@@ -787,6 +804,15 @@ async def _l3_decision(db: AsyncSession, factory_id: str, models: List[str]) -> 
                          f"人处置过的只有 {disp['judged']} 条（判线要 ≥{MIN_ADOPTION_DISPOSITIONS} 条）："
                          "推演建议大多被引擎自己更新的推荐关掉，没人表过态 —— "
                          "这一格算不出，不能读成「没人采纳」")),
+        _metric("催购落成请购草稿（只报数）", drafts.get("total") or None, None, "gte", "张",
+                f"引擎把催购动作开成 pending 请购单：共 {drafts.get('total')} 张 —— "
+                f"等人批 {drafts.get('waiting')}、人已批 {drafts.get('adopted_by_human')}、"
+                f"人已拒 {drafts.get('rejected_by_human')}、系统自己收尾 {drafts.get('closed_by_machine')}。"
+                "批/拒必须是人的账号写的，`auto_approved` 或机器署名都算「没人表态」；"
+                "这些草稿**不计进**「人工采纳率」那条判线（那条按推荐计，这一格按料号计），"
+                "也不计进「上一轮建议落地了没有」的证据 —— 引擎自己写的单子不能当厂里的动作"
+                + (f"（读草稿失败：{draft_error}）" if draft_error else ""),
+                missing=("读不到草稿：" + draft_error if draft_error else None)),
         _metric("推荐翻转率", flip_rate, THRESHOLDS["L3"]["flip_rate"], "lte", "",
                 "最近 12 张记分卡里稳健推荐换人的次数占比；反复翻转=结论不稳"),
     ], "base_policy": (base or {}).get("name"), "recommended_policy": rec_name or (base or {}).get("name"),
