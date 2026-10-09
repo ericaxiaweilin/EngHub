@@ -174,6 +174,7 @@ async def _periodic_scheduler():
         "delivery_prediction_ledger": "_last_delivery_ledger",
         "blocked_followup_recheck": "_last_blocked_recheck",
         "wms_alert_sync": "_last_wms_alert_sync",
+        "wms_freeze_expiry": "_last_wms_freeze_expiry",
     }
     while True:
         did = {}
@@ -532,6 +533,33 @@ async def _periodic_scheduler():
         except Exception as e:
             # 落库失败只影响"告警有没有历史可查"，不能把整个调度器带停
             _logger.warning(f"[scheduler] 库存报警落库异常: {e}")
+
+        # 冻结到期放行 —— 每 30 分钟。为什么这道门默认关着：`expire_due` 写出来之后
+        # 全仓没有一处调用它（10-09 grep 只有定义、审计格的提示文字和端点注释），
+        # 于是"到期自动放"那本账永远是 0，而 `freeze_until` 早过的行一直挂着 ——
+        # 审计里"到期该放还没放"只会长不会短，读起来像功能坏了。
+        # 只有**建单时明确勾了 auto_unfreeze** 的行会被放，其余继续挡着等人签：
+        # 到期是提醒，不是质量放行。开关 WMS_FREEZE_EXPIRY_APPLY=true 才真写。
+        try:
+            import time as _t_fz
+            if not hasattr(_periodic_scheduler, "_last_wms_freeze_expiry"):
+                _periodic_scheduler._last_wms_freeze_expiry = 0
+            if _t_fz.time() - _periodic_scheduler._last_wms_freeze_expiry > 1800:  # 30min
+                _periodic_scheduler._last_wms_freeze_expiry = _t_fz.time()
+                from api.services.engine_watchdog import DEFAULT_FACTORY_ID as _FZ_FID
+                from api.services.wms_freezes import expire_due as _expire_due
+                async with db_config.session_factory() as db:
+                    res = await _expire_due(
+                        db, _FZ_FID,
+                        apply=os.getenv("WMS_FREEZE_EXPIRY_APPLY", "false").lower()
+                            in {"1", "true", "yes", "on"})
+                    did["wms_freeze_expiry"] = {"applied": res["apply"], "due": res["due"],
+                                                "expired": res["expired"]}
+                    if res.get("expired"):
+                        _logger.info(f"[wms-freeze] 到期自动放行 {res['expired']} 条")
+        except Exception as e:
+            # 放行门挂了只影响"到期的还挡着"（偏保守那一侧），不能把调度器带停
+            _logger.warning(f"[scheduler] 冻结到期放行异常: {e}")
 
         # 齐套行覆盖补齐 —— 每 2 小时补 25 张单（只加不改不删，每张 ≤400 行）。
         # 为什么要自动、为什么闸口放到 400 行：10-08 把一致率按登记深度切开实测是
