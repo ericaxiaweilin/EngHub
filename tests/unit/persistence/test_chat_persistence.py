@@ -9,8 +9,12 @@
 """
 
 import asyncio
+import json
+from datetime import date, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
@@ -18,7 +22,10 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import select
 
-from database.models import Base, ChatSession, ChatMessage, ChatTelemetry, ChatMessageAttachment, FileRecord
+from database.models import (
+    Base, ChatSession, ChatMessage, ChatTelemetry, ChatMessageAttachment, FileRecord,
+    generate_uuid,
+)
 from api.services import chat_persistence_service as cp
 
 
@@ -330,3 +337,128 @@ async def test_kernel_persist_hook_failure_does_not_break(db, user):
     )
     result = await kernel.handle(ctx)
     assert result.reply == "仍返回"
+
+
+# ──────────────────────────────────────────────
+# Regression: driver-native types must not break persistence
+# 生产事故：确定性工具（安全库存）返回 Decimal → 落库 flush 抛 TypeError
+# → 事务被污染 → 请求级 get_db commit 抛 PendingRollbackError → 用户看到 500
+# ──────────────────────────────────────────────
+
+def test_json_safe_coerces_driver_native_types():
+    """_json_safe 必须把驱动原生类型降级成 json.dumps 能编码的形式。"""
+    payload = {
+        "dec": Decimal("1.50"),
+        "int_dec": Decimal("3"),
+        "nan": Decimal("NaN"),
+        "when": datetime(2026, 10, 9, 12, 0, 0),
+        "day": date(2026, 10, 9),
+        "id": UUID("12345678-1234-5678-1234-567812345678"),
+        "nested": [Decimal("0.1"), {"deep": Decimal("2")}],
+        "as_set": {Decimal("1")},
+        "none": None,
+        "flag": True,
+        "text": "ok",
+    }
+    safe = cp._json_safe(payload)
+    # 生产里就是这一步抛 TypeError；修好之后必须能过。
+    json.dumps(safe)
+    assert safe["dec"] == 1.5
+    assert safe["int_dec"] == 3 and isinstance(safe["int_dec"], int)
+    assert isinstance(safe["nan"], str)
+    assert safe["when"] == "2026-10-09T12:00:00"
+    assert safe["day"] == "2026-10-09"
+    assert safe["id"] == "12345678-1234-5678-1234-567812345678"
+    assert safe["nested"] == [0.1, {"deep": 2}]
+    assert safe["as_set"] == [1]
+    assert safe["none"] is None
+    assert safe["flag"] is True
+    assert safe["text"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_persist_round_survives_decimal_tool_result(db, user):
+    """真实事故路径：工具轨迹里的 Decimal 必须能落库，且数值可读回。"""
+    s = await cp.get_or_create_session(db, factory_id="F01", user=user)
+    action = SimpleNamespace(
+        tool="query_safety_stock_authority",
+        label="安全库存口径对照",
+        arguments={"factory_id": "FAC_MECH_001"},
+        result={
+            "total": Decimal("12.5"),
+            "count": Decimal("3"),
+            "rows": [{"qty": Decimal("1.25")}],
+        },
+        success=True,
+    )
+    await cp.persist_round(
+        db, session_id=s.id, user_content="安全库存口径",
+        reply="口径如下", model="deterministic-query_safety_stock_authority",
+        actions=[action], request_id="req-decimal",
+    )
+    # 修复前：flush 抛 TypeError，这一步会抛 PendingRollbackError。
+    await db.commit()
+    rows = (await db.execute(
+        select(ChatMessage).where(ChatMessage.role == "assistant")
+    )).scalars().all()
+    assert len(rows) == 1
+    trace = rows[0].tool_calls[0]
+    assert trace["result"]["total"] == 12.5
+    assert trace["result"]["count"] == 3
+    assert trace["result"]["rows"][0]["qty"] == 1.25
+
+
+@pytest.mark.asyncio
+async def test_kernel_rolls_back_session_poisoned_by_persist_failure(db, user):
+    """落库中途 flush 失败会污染共享 session；kernel 必须回滚，
+    否则请求级 get_db 的收尾 commit 抛 PendingRollbackError（对外 500）。"""
+    from core.kernel import HarnessKernel
+    from core.kernel.context import KernelContext
+
+    async def poisoning_hook(ctx, response):
+        # 复刻真实故障：带 Decimal 的工具轨迹在 flush 时炸掉，事务变脏。
+        db.add(ChatMessage(
+            id=generate_uuid(), session_id="sess-poison", role="assistant",
+            content="x", tool_calls=[{"result": {"total": Decimal("3.5")}}],
+        ))
+        await db.flush()
+
+    async def responder(payload):
+        return MagicMock(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"content": "仍返回"}}]},
+        )
+
+    kernel = HarnessKernel(
+        db=db,
+        call_llm=responder,
+        resolve_model_route=AsyncMock(return_value={
+            "task_id": "t", "provider": "p", "gateway_model": "m",
+            "request_timeout": 5.0, "max_completion_tokens": 256,
+        }),
+        execute_tool=AsyncMock(return_value={"ok": True}),
+        clean_reply=lambda c: c,
+        ground_tool_result=lambda r: "result",
+        verify_reply=None,
+        make_tool_action=lambda *a, **k: SimpleNamespace(tool="x"),
+        write_tools=frozenset(), sim_tools=frozenset(),
+        tool_definitions=[],
+        system_prompt="sys", final_grounding_prompt="ground",
+        max_tool_rounds=3,
+        persist_hook=poisoning_hook,
+    )
+    ctx = KernelContext(
+        request_id="req-poison", factory_id="F01", user=user,
+        messages=[{"role": "user", "content": "hi"}],
+        model_route={"task_id": "t", "provider": "p", "gateway_model": "m"},
+        session_id="sess-poison", operator="eric",
+    )
+    result = await kernel.handle(ctx)
+    assert result.reply == "仍返回"
+
+    # 关键断言：session 已恢复可用 —— 修复前这一步抛 PendingRollbackError。
+    await db.commit()
+    rows = (await db.execute(
+        select(ChatMessage).where(ChatMessage.session_id == "sess-poison")
+    )).scalars().all()
+    assert rows == []  # 脏事务被回滚，未写入

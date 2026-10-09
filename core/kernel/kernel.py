@@ -231,6 +231,7 @@ class HarnessKernel:
                                 _logger.exception(
                                     "[kernel] persist hook failed for %s", request_id,
                                 )
+                                await self._rollback_after_persist_failure(request_id)
                         await self._emit_response_events(ctx, direct_response)
                         await self._dispatch_plugin(
                             "turn/end", {"context": ctx, "response": direct_response},
@@ -301,6 +302,7 @@ class HarnessKernel:
                         await self._persist_hook(ctx, response)
                     except Exception:  # noqa: BLE001
                         _logger.exception("[kernel] persist hook failed for %s", request_id)
+                        await self._rollback_after_persist_failure(request_id)
 
                 await self._emit_response_events(ctx, response)
                 await self._dispatch_plugin(
@@ -369,6 +371,25 @@ class HarnessKernel:
             stream = await stream
         async for chunk in stream:
             yield chunk
+
+    async def _rollback_after_persist_failure(self, request_id: str) -> None:
+        """Clear a failed persist transaction so the answer can still be returned.
+
+        Persistence is explicitly best-effort ("失败不阻断响应"): a hook that
+        raises must not change the response.  But a hook that raised mid-flush
+        leaves the shared request-scoped session in a "needs rollback" state,
+        and the request-level ``get_db`` commit then raises
+        ``PendingRollbackError`` — turning an already-built answer into a 500.
+        Rolling back here restores the session to a usable state; the turn is
+        simply not persisted, which is the intended failure mode.
+        """
+        rollback = getattr(self.db, "rollback", None)
+        if rollback is None:
+            return
+        try:
+            await rollback()
+        except Exception:  # noqa: BLE001
+            _logger.exception("[kernel] rollback after persist failure failed for %s", request_id)
 
     async def _commit_events(self, request_id: str) -> None:
         """Flush terminal lifecycle events after they are appended.

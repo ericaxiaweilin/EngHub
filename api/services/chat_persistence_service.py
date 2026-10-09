@@ -6,9 +6,13 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -288,7 +292,7 @@ async def append_message(
         session_id=session_id,
         role=role,
         content=content,
-        tool_calls=tool_calls,
+        tool_calls=_json_safe(tool_calls),
         tool_results=_json_safe(tool_results),
         model=model,
         tokens_used=int(tokens_used),
@@ -514,9 +518,36 @@ async def get_trace(
 
 
 def _json_safe(value: Any) -> Any:
-    if value is None:
-        return None
-    return value
+    """把任意值递归转换成 ``json.dumps`` 能编码的形式。
+
+    工具结果直接来自数据库驱动：``SUM/AVG/COUNT`` 聚合返回 ``Decimal``，
+    时间列返回 ``datetime``，主键可能是 ``UUID``。SQLAlchemy 的 JSON/JSONB
+    列用标准库编码器序列化，遇到这些类型会抛 ``TypeError`` —— 一次查询命中
+    数字聚合，就足以让整轮会话落库失败，并连带把请求事务打成
+    ``PendingRollbackError``（对外表现为 500）。落库失败不能反过来毁掉已经
+    生成好的回答，所以在此统一收口。
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        # NaN/Infinity 不是合法 JSON，Postgres JSONB 会直接拒绝。
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return str(value)
+        # 整数型 Decimal 保持整数，避免 3 变成 3.0 这种无意义的变化。
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "model_dump"):  # Pydantic v2 模型（如 ToolAction）
+        return _json_safe(value.model_dump())
+    return str(value)
 
 
 # ──────────────────────────────────────────────

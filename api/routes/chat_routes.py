@@ -2956,29 +2956,39 @@ async def _handle_kernel_chat(
         )
 
     async def persist_after(ctx, response):
-        """Phase 3：请求结束后落库（消息 + 遥测）。"""
+        """Phase 3：请求结束后落库（消息 + 遥测）。落库失败不影响已生成的回答。"""
         from api.services import chat_persistence_service as cp
         last_user = ctx.last_user_content
-        await cp.persist_round(
-            db, session_id=session_id,
-            user_content=last_user or "（图片/附件消息）",
-            reply=response.reply,
-            model=response.model,
-            actions=response.actions,
-            request_id=ctx.request_id,
-            attachment_ids=[str(record.id) for record in att_records],
-        )
-        await cp.save_telemetry(
-            db, request_id=ctx.request_id, session_id=session_id,
-            model=response.model,
-            tools_called=[a.tool for a in response.actions],
-            rounds=len(response.actions),
-            success=not response.degraded,
-        )
-        # StreamingResponse cleanup happens after the body is consumed. Commit
-        # here so the shared Kernel path never leaves the request transaction
-        # idle while the client or proxy is still holding the response open.
-        await db.commit()
+        try:
+            await cp.persist_round(
+                db, session_id=session_id,
+                user_content=last_user or "（图片/附件消息）",
+                reply=response.reply,
+                model=response.model,
+                actions=response.actions,
+                request_id=ctx.request_id,
+                attachment_ids=[str(record.id) for record in att_records],
+            )
+            await cp.save_telemetry(
+                db, request_id=ctx.request_id, session_id=session_id,
+                model=response.model,
+                tools_called=[a.tool for a in response.actions],
+                rounds=len(response.actions),
+                success=not response.degraded,
+            )
+            # StreamingResponse cleanup happens after the body is consumed. Commit
+            # here so the shared Kernel path never leaves the request transaction
+            # idle while the client or proxy is still holding the response open.
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            # 与流式链路（persist_stream_round）同语义：回滚脏事务，只记日志。
+            # 少了这一步，请求级 get_db 收尾的 commit 会抛 PendingRollbackError，
+            # 把一个已经答好的回合变成 500 —— 落库失败不该毁掉回答。
+            _logger.exception(
+                "[chat-persist] failed session=%s request=%s error=%s",
+                session_id, ctx.request_id, type(exc).__name__,
+            )
+            await db.rollback()
 
     async def persist_event(event):
         """Persist the canonical event envelope for replay and audit."""
