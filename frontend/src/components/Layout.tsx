@@ -91,16 +91,19 @@ const menuIcons: Record<string, React.ReactElement> = {
   '/task-center': <CarryOutOutlined />,
   '/alert-intelligence': <AlertOutlined />,
   '/settings': <SettingOutlined />,
-  '/ie/standard-times': <LineChartOutlined />,
-  '/ie/time-studies': <LineChartOutlined />,
-  '/ie/line-balance': <LineChartOutlined />,
-  '/ie/process-analyses': <LineChartOutlined />,
-  '/ie/lean-metrics': <LineChartOutlined />,
-  '/ie/action-studies': <LineChartOutlined />,
-  '/ie/method-studies': <LineChartOutlined />,
-  '/ie/work-cells': <LineChartOutlined />,
-  '/ie/kanbans': <LineChartOutlined />,
-  '/ie/5s-audits': <LineChartOutlined />,
+  // IE 十个子菜单各自一个图标，且必须与下面"后端没配菜单时的硬编码兜底"那份**逐个相同** ——
+  // 同一个页面按哪条渲染路径都不该换图标（8-22 那份兜底已经是差异化的一套，这里照抄它）。
+  // 全用 LineChartOutlined 是 dbc81f32 带进来的，1797a357/fd997861 各修过一次又被覆盖回来。
+  '/ie/standard-times': <FieldTimeOutlined />,
+  '/ie/time-studies': <HourglassOutlined />,
+  '/ie/line-balance': <BarChartOutlined />,
+  '/ie/process-analyses': <BranchesOutlined />,
+  '/ie/lean-metrics': <RiseOutlined />,
+  '/ie/action-studies': <DragOutlined />,
+  '/ie/method-studies': <ExperimentOutlined />,
+  '/ie/work-cells': <LayoutOutlined />,
+  '/ie/kanbans': <ProjectOutlined />,
+  '/ie/5s-audits': <AuditOutlined />,
 }
 
 // 将后端 menu_items 转换为 Ant Design Menu 格式（label 优先取 i18n 翻译，缺失时回退后端原文）
