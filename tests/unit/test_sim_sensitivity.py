@@ -1087,6 +1087,12 @@ def test_delivery_blockers_runs_all_four_paths_and_names_what_moves_it(monkeypat
     import asyncio
 
     _blockers_env(monkeypatch)
+
+    async def no_calibration(db, fid):   # 卡片默认核对锚定；这里让它报"没有可用校准"
+        return {"rows": 0, "zero_ratio_rows": 0, "median_ratio_nonzero": None,
+                "reliable_rows": 0, "anchor": None, "spread_nonzero": {}, "examples": []}
+
+    monkeypatch.setattr(ss, "lead_calibration", no_calibration)
     out = asyncio.run(ss.delivery_blockers(None, "FAC", ["M-1"], samples=8, seed=5))
     assert out["status"] == "ok"
     assert [p["key"] for p in out["paths"]] == ["date", "crew", "data", "volume"]
@@ -1298,3 +1304,137 @@ def test_expedite_price_chat_line_names_the_part_and_the_fallback():
     not_run = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
                "expedite_not_sampled_because": "没点要件级加急报价（with_expedite_price=true 才逐档真跑）"}
     assert "加急报价：没算 —— 没点要件级加急报价" in _format_sensitivity_reply(not_run)
+
+
+def test_lead_draws_are_anchored_at_the_declared_centre_not_always_one():
+    base = ss._risk_draws(20, 11, lead_band=0.2, hours_band=0.0, base_equip=0.9)
+    assert all(abs(d["lead_multiplier"] - 1.0) <= 0.2 + 1e-9 for d in base), "默认按台账无偏"
+    anchored = ss._risk_draws(20, 11, lead_band=0.2, hours_band=0.0, base_equip=0.9, lead_center=3.0)
+    assert ([d["hours_multiplier"] for d in anchored] == [d["hours_multiplier"] for d in base]), "只挪提前期的中心"
+    assert all(2.8 <= d["lead_multiplier"] <= 3.2 for d in anchored)
+    shifted = [round(d["lead_multiplier"] - 1.0, 2) for d in anchored][:3]
+    plain = [round(d["lead_multiplier"] - 1.0, 2) for d in base][:3]
+    assert shifted != plain, "同种子同带宽但中心不同，偏移序列必须跟着挪"
+
+
+def test_rescale_narrows_around_the_anchored_centre():
+    """锚在 3× 时把带宽收到 0 必须回到 3.0，不是回到 1.0 —— 回 1.0 等于顺手改了中心。"""
+    draws = ss._risk_draws(6, 3, lead_band=0.5, hours_band=0.0, base_equip=0.9, lead_center=3.0)
+    out = ss._rescale_draws(draws, 0.9, narrowed={"purchase_lead_time": 0.0}, lead_center=3.0)
+    assert all(d["lead_multiplier"] == 3.0 for d in out)
+
+
+def test_card_reports_the_anchor_check_and_default_stays_on_the_ledger(monkeypatch):
+    import asyncio
+    from datetime import date, timedelta
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 60.0, "hours_error_band": 0.05,
+                            "components": {"lead_time": {"score": 1.0},
+                                           "hours": {"score": 1.0, "basis": "route_standard_hours"}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        d = perturb or {}
+        late = round(20.0 * float(d.get("lead_multiplier", 1.0)) * (2.0 - float(attendance)) - 20.0, 1)
+        return {"finish_date": str(date(2026, 11, 1) + timedelta(days=int(late))),
+                "days_late_worst": late, "days_late_per_model": {"M-1": late},
+                "labor_cost_usd": 100.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                "binding": "material_arrival", "bottleneck_parts": {}, "lines_used": [],
+                "material_arrival_days": {}, "capacity_line_declared_max": 0.0,
+                "crew_before_staffing_sum": 100.0, "crew_effective_sum": 90.0}
+
+    async def no_calibration(db, fid):
+        return {"rows": 3, "zero_ratio_rows": 3, "median_ratio_nonzero": None,
+                "reliable_rows": 0, "anchor": None, "spread_nonzero": {}, "examples": []}
+
+    async def anchored(db, factory_id, models, *, samples=12, seed=20261008, policy=None):
+        return {"status": "ok", "anchor": 2.5, "calibration": {"reliable_rows": 4, "zero_ratio_rows": 3},
+                "reading": ["校准依据…", "按台账锚…", "差值：P50 后移 9 天、P90 后移 14 天、准点概率掉 30.0pp"]}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+    monkeypatch.setattr(ss, "lead_calibration", no_calibration)
+    monkeypatch.setattr(ss, "calibration_impact", anchored)
+
+    out = asyncio.run(ss.delivery_blockers(None, "FAC", ["M-1"], samples=6, seed=2))
+    line = [x for x in out["reading"] if x.startswith("锚定核对")]
+    assert line and "P90 后移 14 天" in line[0] and "排除 3 条实测 0 天" in line[0]
+    assert out["calibration"]["anchor"] == 2.5
+    assert out["calibration"]["status"] == "ok", "卡只报差值，默认锚定不在这儿改"
+
+    off = asyncio.run(ss.delivery_blockers(None, "FAC", ["M-1"], samples=6, seed=2,
+                                           with_calibration=False))
+    assert off["calibration"] is None and not [x for x in off["reading"] if x.startswith("锚定核对")]
+
+
+def _calib_env(monkeypatch, *, anchor=2.0, rows=6):
+    from datetime import date, timedelta
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 600, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 60.0, "hours_error_band": 0.05,
+                            "components": {"lead_time": {"score": 1.0},
+                                           "hours": {"score": 1.0, "basis": "route_standard_hours"}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        d = perturb or {}
+        late = round(20.0 * float(d.get("lead_multiplier", 1.0)) * (2.0 - float(attendance)) - 25.0, 1)
+        return {"finish_date": str(date(2026, 11, 1) + timedelta(days=int(late))),
+                "days_late_worst": late, "days_late_per_model": {"M-1": late},
+                "labor_cost_usd": 100.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                "binding": "material_arrival", "bottleneck_parts": {}, "lines_used": [],
+                "material_arrival_days": {}, "capacity_line_declared_max": 0.0,
+                "crew_before_staffing_sum": 100.0, "crew_effective_sum": 90.0}
+
+    async def fake_cal(db, fid):
+        if anchor is None:
+            return {"rows": 3, "zero_ratio_rows": 3, "median_ratio_nonzero": None,
+                    "reliable_rows": 0, "anchor": None, "spread_nonzero": {}, "examples": []}
+        return {"rows": rows, "zero_ratio_rows": 2, "median_ratio_all_rows": 7.17,
+                "median_ratio_nonzero": anchor, "reliable_rows": rows - 2, "anchor": anchor,
+                "spread_nonzero": {"p25": anchor / 2, "p75": anchor * 2, "min": 0.05, "max": 38.7},
+                "examples": [{"material_code": "RM-CAST-01", "ledger_days": 15,
+                              "measured_median_days": 95.5, "po_count": 4, "ratio": 6.37}]}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+    monkeypatch.setattr(ss, "lead_calibration", fake_cal)
+
+
+def test_calibration_impact_shifts_the_centre_not_the_band(monkeypatch):
+    """真跑一遍 calibration_impact：读数是在构造字面量里自引用的，只有跑起来才炸得出来。"""
+    import asyncio
+
+    _calib_env(monkeypatch, anchor=2.0)
+    out = asyncio.run(ss.calibration_impact(None, "FAC", ["M-1"], samples=10, seed=5))
+    assert out["status"] == "ok" and out["anchor"] == 2.0
+    assert out["default_unchanged"] is True, "这一格只报差值，不许偷偷改默认锚"
+    assert out["p50_shift_days"] > 0 and out["p90_shift_days"] > 0
+    assert out["at_measured"]["p50"] > out["at_ledger"]["p50"], "实测说台账偏乐观 → 锚过去日期必须后移"
+    assert any("系统性偏差" in x for x in out["reading"])
+    assert any("默认锚定没改" in x for x in out["reading"])
+    assert "中心是" in out["method"] and "带宽是" in out["method"], "中心与带宽必须分开说"
+
+
+def test_calibration_impact_refuses_to_anchor_without_evidence(monkeypatch):
+    import asyncio
+
+    _calib_env(monkeypatch, anchor=None)
+    out = asyncio.run(ss.calibration_impact(None, "FAC", ["M-1"], samples=6, seed=1))
+    assert out["status"] == "no_calibration" and out["calibration"]["anchor"] is None
+    assert any("只能按『台账无偏』抽" in x for x in out["reading"]), "没实测也要把默认锚定的性质说出去"

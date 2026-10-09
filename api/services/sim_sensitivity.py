@@ -727,8 +727,8 @@ def _risk_summary(rows: List[Dict[str, Any]], *, factory_id: str, models: List[s
     }
 
 
-def _risk_draws(n: int, seed: int, *, lead_band: float, hours_band: float,
-                base_equip: float) -> List[Dict[str, Any]]:
+def _risk_draws(n: int, seed: int, *, lead_band: float, hours_band: float, base_equip: float,
+                lead_center: float = 1.0) -> List[Dict[str, Any]]:
     """抽出一串固定的工况序列（到岗/提前期/工时/设备）。
 
     多条政策共用**同一串**：各抽各的再相减，差里混着抽样噪声，会被读成政策的功效；
@@ -740,7 +740,8 @@ def _risk_draws(n: int, seed: int, *, lead_band: float, hours_band: float,
     draws: List[Dict[str, Any]] = []
     for _ in range(n):
         draws.append({"attendance": rng.choice(RISK_ATTENDANCE_LEVELS),
-                      "lead_multiplier": round(1.0 + rng.uniform(-lead_band, lead_band), 4),
+                      "lead_multiplier": round(max(0.05, float(lead_center)
+                                                  + rng.uniform(-lead_band, lead_band)), 4),
                       "hours_multiplier": round(1.0 + rng.uniform(-hours_band, hours_band), 4),
                       "equip_rate": round(max(0.05, min(1.0, base_equip + rng.uniform(-0.02, 0.02))), 4)})
     return draws
@@ -775,7 +776,8 @@ def _paired_delta(base_rows: List[Dict[str, Any]], other_rows: List[Dict[str, An
 
 async def _risk_setup(db: AsyncSession, factory_id: str, models: List[str], *,
                       days_of_output: float = 6.0, lead_margin: Optional[float] = None,
-                      samples: int = 48, seed: int = 20261008) -> Dict[str, Any]:
+                      samples: int = 48, seed: int = 20261008,
+                      lead_center: float = 1.0) -> Dict[str, Any]:
     """抽样前的全部依据：目标单、每台机自己的带宽、设备实测率、固定抽次序列。
 
     交期分布和数据修复实验必须共用这一份，否则两边的毛边不是同一条抽样序列，
@@ -803,8 +805,9 @@ async def _risk_setup(db: AsyncSession, factory_id: str, models: List[str], *,
             "bands": {"purchase_lead_time": round(lead_band, 3), "unit_work_hours": round(hours_band, 3),
                       "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS),
                       "equipment_plus_minus": 0.02},
+            "lead_center": float(lead_center),
             "draws": _risk_draws(n, seed, lead_band=lead_band, hours_band=hours_band,
-                                 base_equip=base_eq)}
+                                 base_equip=base_eq, lead_center=lead_center)}
 
 
 async def _sample_rows(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
@@ -924,8 +927,8 @@ DATA_REPAIR_TARGETS: List[Dict[str, Any]] = [
 ]
 
 
-def _rescale_draws(draws: List[Dict[str, Any]], base_equip: float,
-                   *, narrowed: Dict[str, float]) -> List[Dict[str, Any]]:
+def _rescale_draws(draws: List[Dict[str, Any]], base_equip: float, *, narrowed: Dict[str, float],
+                   lead_center: float = 1.0) -> List[Dict[str, Any]]:
     """把某些因子的抽样偏移按比例收窄，其余因子逐抽原样保留。
 
     必须用**同一条随机序列**再乘比例，而不是重抽：重抽的话两次分布的差里混着抽样噪声，
@@ -945,7 +948,8 @@ def _rescale_draws(draws: List[Dict[str, Any]], base_equip: float,
                                        base_equip + (float(d["equip_rate"]) - base_equip) * keep)), 4)
             else:
                 key = BAND_KEY[inp]
-                e[key] = round(1.0 + (float(d[key]) - 1.0) * keep, 4)
+                center = float(lead_center) if key == "lead_multiplier" else 1.0
+                e[key] = round(max(0.05, center + (float(d[key]) - center) * keep), 4)
         out.append(e)
     return out
 
@@ -1651,7 +1655,8 @@ BLOCK_ENDPOINTS = {
 async def delivery_blockers(db: AsyncSession, factory_id: str, models: List[str], *,
                             samples: int = 8, seed: int = 20261008,
                             required: float = 0.90, days_of_output: float = 6.0,
-                            lead_margin: Optional[float] = None) -> Dict[str, Any]:
+                            lead_margin: Optional[float] = None,
+                            with_calibration: bool = True) -> Dict[str, Any]:
     """把"这单为什么做不到、该动什么"收成一次可核对的判定。
 
     每条路都用同一种粗筛（默认 8 抽 × 少数档），够用来回答"能不能靠它救"，
@@ -1665,7 +1670,7 @@ async def delivery_blockers(db: AsyncSession, factory_id: str, models: List[str]
     base = await schedule_risk(db, factory_id, models, samples=samples, seed=seed)
     if base.get("status") != "ok":
         return {"status": "no_dates", "factory_id": factory_id, "models": models,
-                "why": base.get("why"), "paths": [],
+                "why": base.get("why"), "paths": [], "calibration": None,
                 "reading": [f"判定卡没生成：{base.get('why')} —— 连一条完工日分布都抽不出来，"
                             f"四条路就无从比较"]}
     prom = await promise_headroom(db, factory_id, models, samples=samples, seed=seed,
@@ -1677,6 +1682,8 @@ async def delivery_blockers(db: AsyncSession, factory_id: str, models: List[str]
     vol = await volume_ceiling_for_promise(db, factory_id, models, samples=samples, seed=seed,
                                            required=req, ladder=VOLUME_COARSE,
                                            days_of_output=days_of_output, lead_margin=lead_margin)
+    calib = (await calibration_impact(db, factory_id, models, samples=samples, seed=seed)
+             if with_calibration else None)
     rep = await data_repair_experiment(db, factory_id, models, samples=samples, seed=seed,
                                        days_of_output=days_of_output, lead_margin=lead_margin,
                                        only=("purchase_lead_time", "unit_work_hours",
@@ -1753,11 +1760,21 @@ async def delivery_blockers(db: AsyncSession, factory_id: str, models: List[str]
         "note": ("这两处才是延期的入口：瓶颈件到料日（等料）与所用线的声明台/天（产能上限）。"
                  "四格的实测都落在它们身上时才谈得上改善交付"),
     }
+    calib_line = None
+    if with_calibration:
+        cc = (calib or {}).get("calibration") or {}
+        if (calib or {}).get("status") == "ok":
+            calib_line = (f"锚定核对：{calib['reading'][2]}"
+                          f"｜依据 {cc.get('reliable_rows')} 条（非零中位 {calib['anchor']:g}×、"
+                          f"排除 {cc.get('zero_ratio_rows')} 条实测 0 天）")
+        else:
+            calib_line = "锚定核对：" + ((calib or {}).get("reading") or ["这一格没跑"])[0]
     out = {"status": "ok", "factory_id": factory_id, "models": models, "samples": base["samples"],
            "seed": seed, "on_time_required": req,
            "promise_date": base["promise_date"], "p50": base["percentiles"][1]["finish_date"],
            "p90": base["percentiles"][2]["finish_date"], "p_on_time": base["p_on_time"],
            "rough_days": base["rough_days"], "paths": paths, "what_moves_it": what,
+           "calibration": calib,
            "took_seconds": round(time.time() - started, 1),
            "reading": [
                f"结论（{len(models)} 台机·{samples} 抽·seed {seed}）：承诺 {base['promise_date']} 做不到 —— "
@@ -1769,6 +1786,7 @@ async def delivery_blockers(db: AsyncSession, factory_id: str, models: List[str]
                f"与线声明产能（{'、'.join(what['lines_used'][:3]) or '未'} 最多 "
                f"{float(what['line_declared_units_per_day_max'] or 0):g} 台/天，"
                f"binding={what['binding'] or '未明'}）",
+               *([calib_line] if calib_line else []),
            ] + [f"{p['path']}：{p['measured']}"
                 + (f"｜{p.get('moves_unit', 'P90 少延天数')} {p['moves_days']:g} 天"
                    if p.get("moves_days") else f"｜{p.get('moves_unit', 'P90 少延天数')} 0 天")
@@ -1923,5 +1941,128 @@ async def expedite_price_by_part(db: AsyncSession, factory_id: str, models: List
         "claim_guard": ("报价只给'省几天/整包加急费多少'，不给'该不该加急'；"
                         "依据不是 measured 的那几条，天数本身没量过 —— 先量数再谈钱，"
                         "否则这份报价是拿默认值当事实。$0.15/件·天 是内置标定不是厂里报价"),
+    }
+    return out
+
+# 分布是拿台账提前期锚的 —— 台账偏乐观多少，P50/P90 就整体偏乐观多少。
+# 校准比的唯一出处仍然是采购实测那条 SQL（与 measurement_priority 共用，不另起一把尺）。
+def _quantile(vals: List[float], frac: float) -> Optional[float]:
+    if not vals:
+        return None
+    ordered = sorted(vals)
+    idx = min(len(ordered) - 1, max(0, int(round(frac * (len(ordered) - 1)))))
+    return round(float(ordered[idx]), 2)
+
+
+async def lead_calibration(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """实测÷台账 的提前期校准比：把"能不能拿去锚定分布"与"只是样本"分开说。"""
+    from core.mes.measurement_priority import MEASURED_RATIO_SQL
+
+    rows = [(str(r["material_code"]), int(r["ledger_days"] or 0), float(r["measured_days"]),
+             int(r["n"] or 0), float(r["ratio"]))
+            for r in (await db.execute(MEASURED_RATIO_SQL, {"fid": factory_id})).mappings().all()
+            if r["ratio"] is not None]
+    all_r = [x[4] for x in rows]
+    nonzero = [x for x in rows if x[4] > 0]
+    reliable = [x for x in nonzero if x[3] >= 2]
+    median_all = _quantile(all_r, 0.50)
+    median_nz = _quantile([x[4] for x in nonzero], 0.50)
+    return {
+        "factory_id": factory_id, "rows": len(rows),
+        "zero_ratio_rows": len(rows) - len(nonzero),
+        "median_ratio_all_rows": median_all, "median_ratio_nonzero": median_nz,
+        "spread_nonzero": {"p25": _quantile([x[4] for x in nonzero], 0.25),
+                           "p75": _quantile([x[4] for x in nonzero], 0.75),
+                           "min": min([x[4] for x in nonzero], default=None),
+                           "max": max([x[4] for x in nonzero], default=None)},
+        "reliable_rows": len(reliable),
+        "median_ratio_reliable": _quantile([x[4] for x in reliable], 0.50),
+        "anchor": median_nz,
+        "anchor_basis": "非零校准比的中位" if median_nz else None,
+        "examples": [{"material_code": x[0], "ledger_days": x[1], "measured_median_days": round(x[2], 1),
+                      "po_count": x[3], "ratio": round(x[4], 2)} for x in reliable[:8]],
+        "caveat": ("ratio=0 的行是『实测到货 0 天』—— 那不是快，是收货记录缺失或同日进出，"
+                   "它会同时把中位数往下拖又让极端倍数上位，所以锚定只用非零那一子集；"
+                   "po_count=1 的行只能算样本，不算依据"),
+        "note": ("校准比 >1 = 台账比现场快，交付分布因此整体偏乐观；"
+                 "这一格只报『实测说台账偏了几倍』，改不改默认锚定要厂里定口径"),
+    }
+
+
+def _center_word(center: float) -> str:
+    return "台账值" if abs(float(center) - 1.0) < 1e-9 else "实测校准比"
+
+
+async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str], *,
+                             samples: int = 12, seed: int = 20261008,
+                             policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """同一串抽样把提前期中心从台账值(1.0)挪到实测校准比，量 P50/P90 因此后移几天。
+
+    默认锚定**不改**（那是要厂里拍的口径），这里只把"如果按实测锚，承诺要后移几天"算出来。
+    """
+    from datetime import date
+
+    cal = await lead_calibration(db, factory_id)
+    pol = policy or {"name": "现政策（分批开工）", "allow_partial": True}
+    if not cal.get("anchor") or float(cal["anchor"]) <= 1.0:
+        return {"status": "no_calibration", "calibration": cal, "policy": pol["name"],
+                "reading": [f"锚不出实测中心：这张厂的非零校准比 {cal.get('median_ratio_nonzero')}，"
+                            f"可用行 {cal.get('reliable_rows')} 条 —— "
+                            f"没有可用实测时分布只能按『台账无偏』抽，这句必须跟着读数一起出去"]}
+
+    async def run_at(center: float) -> Dict[str, Any]:
+        setup = await _risk_setup(db, factory_id, models, samples=samples, seed=seed,
+                                  lead_center=center)
+        rows = await _sample_rows(db, factory_id, setup["targets"], pol, setup["draws"])
+        return _risk_summary(rows, factory_id=factory_id, models=models, policy_name=pol["name"],
+                             samples=setup["n"], seed=seed, bands=setup["bands"],
+                             with_date_note=f"提前期中心锚在 {center:g}（{_center_word(center)}）")
+
+    ledger = await run_at(1.0)
+    measured = await run_at(float(cal["anchor"]))
+    if ledger.get("status") != "ok" or measured.get("status") != "ok":
+        return {"status": "no_dates", "calibration": cal,
+                "reading": ["锚定对比没跑成：至少一边抽不出完工日 —— 不给差值"]}
+
+    def _shift(a: Dict[str, Any], b: Dict[str, Any], pct: int) -> Optional[int]:
+        pa = next((p for p in a["percentiles"] if int(p["percentile"]) == pct), None)
+        pb = next((p for p in b["percentiles"] if int(p["percentile"]) == pct), None)
+        if not pa or not pb:
+            return None
+        return (date.fromisoformat(str(pb["finish_date"])) - date.fromisoformat(str(pa["finish_date"]))).days
+
+    p50_shift, p90_shift = _shift(ledger, measured, 50), _shift(ledger, measured, 90)
+    drop_pp = round(100.0 * (float(ledger["p_on_time"]) - float(measured["p_on_time"])), 1)
+    out = {
+        "status": "ok", "factory_id": factory_id, "models": models, "samples": samples, "seed": seed,
+        "calibration": cal, "anchor": float(cal["anchor"]),
+        "at_ledger": {"p50": ledger["percentiles"][1]["finish_date"],
+                      "p90": ledger["percentiles"][2]["finish_date"],
+                      "p_on_time": ledger["p_on_time"], "promise_date": ledger["promise_date"],
+                      "rough_days": ledger["rough_days"]},
+        "at_measured": {"p50": measured["percentiles"][1]["finish_date"],
+                        "p90": measured["percentiles"][2]["finish_date"],
+                        "p_on_time": measured["p_on_time"], "promise_date": measured["promise_date"],
+                        "rough_days": measured["rough_days"]},
+        "p50_shift_days": p50_shift, "p90_shift_days": p90_shift,
+        "on_time_drop_pp": drop_pp,
+        "default_unchanged": True,
+        "reading": [
+            f"校准依据：{cal['reliable_rows']}/{cal['rows']} 条能算依据（po≥2 且非零），"
+            f"非零中位 {cal['median_ratio_nonzero']:g}×（p25 {cal['spread_nonzero']['p25']}、"
+            f"p75 {cal['spread_nonzero']['p75']}）；另有 {cal['zero_ratio_rows']} 条实测 0 天被排除",
+            f"按台账锚：P50={ledger['percentiles'][1]['finish_date']}、"
+            f"P90={ledger['percentiles'][2]['finish_date']}、准点 {ledger['p_on_time']:.0%}；"
+            f"按实测锚：P50={measured['percentiles'][1]['finish_date']}、"
+            f"P90={measured['percentiles'][2]['finish_date']}、准点 {measured['p_on_time']:.0%}",
+            f"差值：P50 后移 {p50_shift} 天、P90 后移 {p90_shift} 天、"
+            f"准点概率掉 {drop_pp:g}pp —— 这几天不是新增的不确定，是台账偏乐观的系统性偏差",
+            "默认锚定没改（这一格只算差值）：要不要按实测承诺是厂里的口径，"
+            f"但既然现场量出来是 {cal['median_ratio_nonzero']:g}×，继续按台账报 P90 就是在报一个已知偏乐观的数",
+        ],
+        "method": ("同一串抽样只把 lead_multiplier 的中心从 1.0 挪到实测中位校准比，"
+                   "分位数逐抽同序比较；中心与带宽是两件事：带宽是『这个数有多不准』，中心是『这个数偏朝哪边』"),
+        "claim_guard": ("校准比只有 po≥2 的非零行能当依据；样本不足时这句要改成『量过再说』。"
+                        "锚定改变的是分布中心，不是把 P90 当成承诺 —— 承诺仍要走授权流程"),
     }
     return out

@@ -363,6 +363,9 @@ async def get_pmc_capabilities(
             {"key": "sim_expedite_price",
              "name": "料号级加急报价（压这个瓶颈件省几天、多花多少加急费、那个提前期天数量过没有）",
              "path": "/api/v1/pmc/sim-expedite-price", "mode": "read_only"},
+            {"key": "sim_lead_calibration",
+             "name": "提前期锚定核对（实测÷台账 的中位校准比；按实测锚 P50/P90 后移几天、默认锚定未改）",
+             "path": "/api/v1/pmc/sim-lead-calibration", "mode": "read_only"},
             {"key": "data_flow_profile",
              "name": "数据流节点剖面（台账/展开/推演三层各多少节点，按规模外推需要多少行）",
              "path": "/api/v1/pmc/data-flow-profile", "mode": "read_only"},
@@ -1029,6 +1032,34 @@ async def get_sim_expedite_price(
     return await expedite_price_by_part(db, factory_id, models,
                                         samples=max(6, min(40, int(samples))), seed=seed,
                                         lead_days=days)
+
+
+@router.get("/sim-lead-calibration", summary="提前期锚定核对：实测说台账偏几倍、按实测锚 P90 后移几天")
+async def get_sim_lead_calibration(
+    factory_id: str = Query(..., description="厂区"),
+    n_models: int = Query(3, description="取 BOM 最完整的 n 个机种"),
+    samples: int = Query(12, description="抽几轮（6~40；两边同一串抽样，只有中心不同）"),
+    seed: int = Query(20261008, description="与交期分布同一串抽样的种子"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """分布是拿台账提前期锚的 —— 台账偏乐观几倍，P50/P90 就整体偏乐观几倍。
+
+    校准比的唯一出处是采购下单→到货实测（与"该先量哪些件"共用同一条 SQL，不另起一把尺）。
+    实测到货 0 天的行不是"快"，是收货记录缺失或同日进出，会被排除；po_count=1 只算样本不算依据。
+    **默认锚定没改**：这一格只算"如果按实测锚，承诺要后移几天"，改不改是厂里的口径。
+    """
+    del current_user
+    from api.services.sim_sensitivity import calibration_impact, lead_calibration
+    from api.services.virtual_run import default_models
+
+    models = await default_models(db, factory_id, n=max(1, min(8, int(n_models))))
+    if not models:
+        raise HTTPException(status_code=404, detail="厂区里没有可推演的机种（BOM 镜像为空？）")
+    impact = await calibration_impact(db, factory_id, models,
+                                      samples=max(6, min(40, int(samples))), seed=seed)
+    impact["calibration_only"] = await lead_calibration(db, factory_id)
+    return impact
 
 
 
