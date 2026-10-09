@@ -743,6 +743,8 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
         ev.add("reply_grounding")
         n = int(ground.get("replies_with_claims") or 0)
         rate = ground.get("number_backing_rate")
+        unbacked_claims = int(ground.get("numbers_unbacked") or 0)
+        dirty_replies = int(ground.get("replies_with_unbacked") or 0)
         if n >= MIN_GROUNDING_REPLIES and rate is not None and rate < MIN_GROUNDING_BACKING:
             samples = ground.get("unbacked_samples") or []
             numbers = sorted({x for s in samples for x in (s.get("numbers") or [])})[:8]
@@ -752,22 +754,30 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
             derived = sum(int(v or 0) for k, v in kinds.items() if k != "找不到来源")
             out.append(_gap(
                 "reply_grounding", "unsourced_numbers", f"ground|{n}|{int(rate * 100) // 5 * 5}",
-                f"转述失真｜近 30 天 {n} 条带数字的答复里 {ground.get('numbers_unbacked')} 条"
-                f"报的数在引擎返回里找不到（有出处率 {rate}，判线 {MIN_GROUNDING_BACKING}）",
+                f"转述失真｜近 30 天 {n} 条带数字的答复报出 {ground.get('claims_total')} 个读数，"
+                f"其中 {unbacked_claims} 个在引擎返回里找不到"
+                f"（有出处率 {rate}，判线 {MIN_GROUNDING_BACKING}）",
                 f"这些数字既不在本会话任何引擎工具的返回里，也不是人自己报过的数。分类：{kinds_txt}。"
                 "「两数之差/两数之和/百分数写法/千分位写法」是引擎只给了分量、没给派生结果 —— "
                 "修法是工具把那个数返回出来（这一类正在逐个补到出口上）；"
                 f"其中真正「找不到来源」的是 {kinds.get('找不到来源', 0)} 处"
                 f"（派生缺失 {derived} 处）—— 无人工厂里这两种都得当场见光，"
                 "不能靠读的人凭感觉分辨。\n"
+                f"判线按**读数条数**算（每个数一票），不是按答复条数：这 {unbacked_claims} 个数"
+                f"落在 {dirty_replies} 条答复里，其余答复通篇都能回溯"
+                f"（reply_clean_rate={ground.get('reply_clean_rate')}，那一格只报数、不判线 —— "
+                "它会把「一张表里 1 个派生数没出处」和「整段都在编」算成同一个扣分）。\n"
                 f"找不到的数：{numbers}；样例见 payload.unbacked_samples。\n"
                 "复核：GET /api/v1/pmc/engine-capability-profile（总结格）、"
                 "GET /api/v1/pmc/kit-coverage-gap 之外的证据链见 /api/v1/pmc/engine-layers 的 L4。",
-                f"{ground.get('numbers_unbacked')} 条答复报了没有出处的数", "pmc_agent",
+                f"{unbacked_claims} 个读数查无出处（{dirty_replies} 条答复）", "pmc_agent",
                 "先在出口把这些数标出来（chat_routes 的未经核实标注目前只在「本轮没调工具」时触发，"
                 "调了工具但复述了没有的数不标 —— 那是这一格剩下的缺口）。",
                 {"replies_with_claims": n, "number_backing_rate": rate,
-                 "numbers_unbacked": ground.get("numbers_unbacked"),
+                 "claims_total": ground.get("claims_total"),
+                 "numbers_unbacked": unbacked_claims,
+                 "replies_with_unbacked": dirty_replies,
+                 "reply_clean_rate": ground.get("reply_clean_rate"),
                  "unbacked_kinds": kinds, "derived_missing": derived,
                  "unbacked_samples": samples[:6]}))
     if wc is not None and int(wc.get("attendance_days") or 0) >= MIN_ATTENDANCE_DAYS_FOR_SLOPE:

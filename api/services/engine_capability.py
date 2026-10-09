@@ -9,7 +9,8 @@
 只能靠人读，而人不可能逐条读 30 天的回复。这一页把三格统一成可判线的数。
 
 三格的数都不新算：推演引用 L1..L4 的同名实测值，分析走对外契约的真实反事实，
-总结用和 L4 同一把尺（reply_sanitizer 的 numeric_claims/is_disclosed）回查真实对话。
+总结调的是 kernel 里那一份判据（reply_sanitizer.numeric_claims 抽数、number_backing 分账），
+和 L4「回答数字可回溯率」同一个函数 —— 同名两把尺是 10-09 在这页上抓出来的第四个口径缺陷。
 只读：不改工单、不写台账、不调模型。
 """
 from __future__ import annotations
@@ -185,29 +186,27 @@ def gap_phrases(result: Any) -> List[List[str]]:
 def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
     """总结格：正文里的数字有没有出处；引擎报的缺口有没有被带进答复。
 
+    出处这一半**调的是 kernel 里那份 number_backing**，和 L4「回答数字可回溯率」同一个函数、
+    同一条判线（按读数条数，每个数一票）。两处人群不同：这一格只看本厂区调过引擎工具的答复，
+    L4 看近 30 天全部厂区带数字的答复 —— 人群差在 basis 里写明，判线差不存在。
     出处语料按**会话**算：上一轮查到的数这一轮引用是正常且必要的，只有整个会话里
     都找不到出处的数才是编的。人自己报给引擎的数单列（numbers_from_user），不进判线分母。
     缺口那一半不逐字比要点标题 —— 引擎的 unavailable[].ask 是一句 15 字指令，
     中文转述不可能原样带出来，逐字比会永远得 0，那是尺错不是答复错。
     """
-    from core.kernel.reply_sanitizer import is_disclosed
+    from core.kernel.reply_sanitizer import number_backing
 
-    backed = unbacked = disclosed = 0
-    from_user = 0
-    kinds: Dict[str, int] = {}
     gap_items = replies_with_gaps = gap_named_replies = named_items = 0
     missed: List[str] = []
     verbatim_num = verbatim_den = 0
-    per_reply: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
     for row in replies:
         reply = str(row.get("content") or "")
-        claims = _nums(reply)
         gap_lists = gap_phrases(_result_of(row.get("tool_json"), only="unavailable"))
-        gaps = [p for group in gap_lists for p in group]
         items = headline_items(_result_of(row.get("tool_json")))
         if items:
             verbatim_den += len(items)
-            verbatim_num += sum(1 for it in items if it in reply)
+            verbatim_num += sum(1 for i in items if i in reply)
         if gap_lists:
             gap_items += len(gap_lists)
             replies_with_gaps += 1
@@ -218,39 +217,44 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
             else:
                 missed.extend(group[0] for group in gap_lists
                               if not any(ph in reply for ph in group))
-        if not claims:
+        rows.append({"claims": _nums(reply), "reply": reply,
+                     "turn": str(row.get("session_tools") or ""), "history": "",
+                     "user": str(row.get("session_user") or ""),
+                     "session": str(row.get("session_id") or "")[:8]})
+    nb = number_backing(rows)
+    kinds: Dict[str, int] = {}
+    per_reply: List[Dict[str, Any]] = []
+    for item in nb["per_reply"]:
+        if item["disclosed"] or not item["unbacked"]:
             continue
-        eng = _hits(claims, str(row.get("session_tools") or ""))
-        usr = _hits([c for c in claims if c not in eng], str(row.get("session_user") or ""))
-        still = [c for c in claims if c not in eng and c not in usr]
-        from_user += len(usr)
-        if not eng and usr and not still:
-            # 这条回复的数全部来自人自己说的话：这一轮不判引擎（既不算有出处也不算编）
-            continue
-        if not still:
-            backed += 1
-        elif is_disclosed(reply):
-            disclosed += 1
-        else:
-            unbacked += 1
-            # 工具返回全文 + 用户原话都算语料：分类只解释"为什么判不到出处"，不改判线
-            corpus = f"{row.get('session_tools') or ''}{row.get('session_user') or ''}"
-            these = {unbacked_kind(c, reply, corpus) for c in still}
-            for k in these:
-                kinds[k] = kinds.get(k, 0) + 1
-            if len(per_reply) < 6:
-                per_reply.append({"session": str(row.get("session_id") or "")[:8],
-                                  "numbers": still[:4],
-                                  "kinds": sorted(these),
-                                  "excerpt": re.sub(r"\s+", " ", reply)[:110]})
-    judged = backed + disclosed + unbacked
+        src = rows[int(item["index"])]
+        # 工具返回全文 + 用户原话都算语料：分类只解释"为什么判不到出处"，不改判线
+        corpus = f"{src['turn']}{src['history']}{src['user']}"
+        for claim in item["unbacked"]:
+            kind = unbacked_kind(claim, src["reply"], corpus)
+            kinds[kind] = kinds.get(kind, 0) + 1
+        if len(per_reply) < 6:
+            per_reply.append({"session": src["session"],
+                              "numbers": item["unbacked"][:4],
+                              "kinds": sorted({unbacked_kind(c, src["reply"], corpus)
+                                               for c in item["unbacked"]}),
+                              "excerpt": re.sub(r"\s+", " ", src["reply"])[:110]})
+    judged = int(nb["replies_judged"])
     return {
         "replies_scanned": len(replies),
         "replies_with_claims": judged,
-        "numbers_backed": backed, "numbers_disclosed": disclosed, "numbers_unbacked": unbacked,
-        "numbers_from_user": from_user,
+        "claims_total": int(nb["claims_total"]),
+        "claims_same_turn": int(nb["claims_same_turn"]),
+        "claims_from_history": int(nb["claims_from_history"]),
+        "numbers_backed": int(nb["claims_total"]) - int(nb["claims_unbacked"])
+                           - int(nb["claims_disclosed"]),
+        "numbers_disclosed": int(nb["claims_disclosed"]),
+        "numbers_unbacked": int(nb["claims_unbacked"]),
+        "numbers_from_user": int(nb["claims_from_user"]),
+        "replies_with_unbacked": int(nb["replies_with_unbacked"]),
+        "reply_clean_rate": nb["reply_clean_rate"],
         "unbacked_kinds": kinds,
-        "number_backing_rate": round((backed + disclosed) / judged, 3) if judged else None,
+        "number_backing_rate": nb["number_backing_rate"],
         "engine_gap_items": gap_items,
         "replies_with_engine_gaps": replies_with_gaps,
         "gap_named_replies": gap_named_replies,
@@ -260,12 +264,17 @@ def summary_score(replies: List[Dict[str, Any]]) -> Dict[str, Any]:
                                 if replies_with_gaps else None),
         "headline_verbatim_rate": round(verbatim_num / verbatim_den, 3) if verbatim_den else None,
         "unbacked_samples": per_reply,
-        "meaning": ("「数字有出处率」分母=窗口内报过数字且本会话调过引擎工具的助手回复；"
+        "meaning": ("「数字有出处率」按**读数条数**算（正文里每个数各占一票），分母=窗口内报过数字"
+                    "且本会话调过引擎工具的答复里那些数；人自己报过的数不进分母（numbers_from_user）。"
+                    "10-09 之前这一格按答复条数判（0.891），L4 同名那格按「整条 ≥60%」判（0.904），"
+                    "同一段对话又绿又红 —— 现在两处调 kernel 的同一个函数，差别只剩人群："
+                    "这一格只看本厂区调过引擎工具的答复，L4 看近 30 天全部带数字的答复。"
+                    "按答复算的那一级降级成只报数：reply_clean_rate（通篇都能回溯的答复占比），"
+                    "它把「一张表里 1 个派生数没出处」和「整段都在编」算成同一个扣分，不能当判线；"
                     "unbacked_kinds 把无出处的数分类：两数之差/两数之和/百分数写法/千分位写法是"
                     "**引擎没把派生数交出来**（修法是工具返回那个数），"
                     "找不到来源才该追模型 —— 判线率不因此放宽；"
-                    "「缺口点名率」分母=引擎返回里带 unavailable 的那几轮，是下界判据（只用来判不及格）；"
-                    "人自己报的数单列在 numbers_from_user，不算引擎编的"),
+                    "「缺口点名率」分母=引擎返回里带 unavailable 的那几轮，是下界判据（只用来判不及格）"),
     }
 
 

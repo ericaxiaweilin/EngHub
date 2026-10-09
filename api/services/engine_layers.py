@@ -852,16 +852,12 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
           AND created_at > NOW() - INTERVAL '30 days'
         ORDER BY session_id, created_at, id
     """))).mappings().all()
-    from core.kernel.reply_sanitizer import is_disclosed, numeric_claims
+    from core.kernel.reply_sanitizer import number_backing, numeric_claims
 
     corpus: Dict[str, str] = {}
     asked: Dict[str, str] = {}
-    checked = same_turn = from_history = disclosed = 0
-    from_user = 0
-    claims_with_tool = 0
-    unbacked_total = unbacked_before_note = 0
-    since_checked = since_ok = 0
-    unbacked_samples: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+    after_note: List[bool] = []
     for r in hist:
         sid = str(r.get("session_id"))
         if str(r.get("role") or "") == "user":
@@ -873,51 +869,45 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
         if len(prior) > 120000:          # 语料只留最近一段，判据要的是"能不能回溯"不是全文检索
             prior = prior[-120000:]
         if nums:
-            def _hit(needle: str, hay: str) -> bool:
-                return bool(hay) and (needle in hay or (len(needle) > 4 and needle[:4] in hay))
-            # 人自己刚报过的数不算引擎的读数：把它算进"无出处"是冤枉，
-            # 算进"可回溯"是放水 —— 所以整条轮次从判线分母里拿出来，单列报数。
-            claims = [n for n in nums if not _hit(n.replace(",", ""), asked.get(sid, ""))]
-            if not claims:
-                from_user += 1
-                corpus[sid] = (prior + " " + tc)[-160000:]
-                continue
-            now_ok = sum(1 for n in claims if _hit(n.replace(",", ""), tc))
-            all_ok = sum(1 for n in claims if _hit(n.replace(",", ""), tc)
-                         or _hit(n.replace(",", ""), prior))
-            rate_now, rate_sess = now_ok / len(claims), all_ok / len(claims)
-            checked += 1
-            if tc.strip(' \"{}[]null'):       # 这一轮真发生了工具调用（不管数是不是从它里面来的）
-                claims_with_tool += 1
+            # 判线本体在 kernel 的 number_backing —— 人的总结格调的是同一个函数，
+            # 不许这里再写第二条"多少算过线"的规则（同名两把尺就是这么长出来的）。
+            rows.append({"claims": [str(n) for n in nums],
+                         "reply": str(r.get("content") or ""),
+                         "turn": tc, "history": prior, "user": asked.get(sid, ""),
+                         "session": sid[:8],
+                         # 这一轮真发生了工具调用（不管数是不是从它里面来的）
+                         "tool_bearing": bool(tc.strip(' \"{}[]null'))})
             stamp = r.get("created_at")
-            after_note = bool(stamp) and stamp.replace(tzinfo=None) >= PROVENANCE_NOTE_SINCE
-            if after_note:
-                since_checked += 1
-            if rate_now >= 0.6:
-                same_turn += 1
-                since_ok += 1 if after_note else 0
-            elif rate_sess >= 0.6:
-                from_history += 1
-                since_ok += 1 if after_note else 0
-            elif is_disclosed(r.get("content")):
-                # 模型自己已经把"这些数没查过库"写在答复上了 —— 那是披露，不是编造。
-                # 判据必须奖励披露，否则只会逼出"听起来像台账读数"的自信假话。
-                disclosed += 1
-                since_ok += 1 if after_note else 0
-            else:
-                unbacked_total += 1
-                if not after_note:
-                    unbacked_before_note += 1
-                if len(unbacked_samples) < 6:
-                    missing = [n for n in claims if not _hit(n.replace(",", ""), tc)
-                               and not _hit(n.replace(",", ""), prior)]
-                    unbacked_samples.append({
-                        "session": sid[:8], "numbers": missing[:5],
-                        "backed_within_session": round(rate_sess, 2),
-                        "excerpt": re.sub(r"\s+", " ", str(r.get("content") or ""))[:110],
-                    })
+            after_note.append(bool(stamp) and stamp.replace(tzinfo=None) >= PROVENANCE_NOTE_SINCE)
         corpus[sid] = (prior + " " + tc)[-160000:]
-    number_rate = round((same_turn + from_history + disclosed) / checked, 3) if checked else None
+    stats = number_backing(rows)
+    since = number_backing([row for row, flag in zip(rows, after_note) if flag])
+    checked = int(stats["replies_judged"])
+    from_user = int(stats["replies_user_only"])
+    number_rate = stats["number_backing_rate"]
+    same_turn = int(stats["claims_same_turn"])
+    from_history = int(stats["claims_from_history"])
+    disclosed = int(stats["claims_disclosed"])
+    unbacked_total = int(stats["claims_unbacked"])
+    # 只在"进了判线分母"的答复里数本轮真调工具的条数：全部报人给的数的答复不算分母，
+    # 也不能算分子（否则「报数轮次里本轮真查的比例」会被抬上去）。
+    claims_with_tool = sum(1 for item in stats["per_reply"]
+                           if rows[int(item["index"])].get("tool_bearing"))
+    unbacked_before_note = unbacked_total - int(since["claims_unbacked"])
+    since_checked = int(since["claims_total"])
+    since_ok = since_checked - int(since["claims_unbacked"])
+    unbacked_samples: List[Dict[str, Any]] = []
+    for item in stats["per_reply"]:
+        if item["disclosed"] or not item["unbacked"]:
+            continue
+        if len(unbacked_samples) >= 6:
+            break
+        src = rows[int(item["index"])]
+        unbacked_samples.append({
+            "session": src.get("session"), "numbers": item["unbacked"][:5],
+            "backed_within_reply": round(item["backed"] / max(1, item["total"]), 2),
+            "excerpt": re.sub(r"\s+", " ", str(src.get("reply") or ""))[:110],
+        })
     contract, contract_error = {}, None
     try:
         from api.services.engine_contract import self_check as contract_self_check
@@ -965,14 +955,26 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
                 "这一格不再当判据：里面一大半是不需要查库的轮次（追问/确认/引用前轮），"
                 "拿它判线只会逼人为了调工具而调工具"),
         _metric("回答数字可回溯率", number_rate, THRESHOLDS["L4"]["number_backing_rate"], "gte", "",
-                f"近 30 天 {checked} 条**引擎自己给数**的助手回复里，数字能在本会话工具返回里找到出处、"
-                f"或答复自己已显式标注未经核实 的比例"
-                f"（本轮直查 {same_turn}、引用前几轮 {from_history}、已披露 {disclosed}）；"
-                f"另有 {from_user} 条报的全是用户自己刚给的数，从判线分母里拿出来单列（见下一格）；"
-                "年份/日期/ID 片段不算引用数据",
+                f"近 30 天 {checked} 条**引擎自己给数**的助手回复里，逐个数出来的：正文共 {stats['claims_total']} 个读数，"
+                f"本轮工具返回里查到 {same_turn} 个、引用本会话前几轮 {from_history} 个、"
+                f"答复自己已标注未经核实 {disclosed} 个、查无字面出处 {unbacked_total} 个。"
+                "**判线按读数条数（每个数一票），不按答复条数** —— 这个名字说的就是"
+                "「数字可回溯」，10-09 之前这里按「整条答复 ≥60% 的数有出处」判（0.904 判过线），"
+                "人的总结格按「整条答复的数全部有出处」判（0.891 判不过线），同一段对话在同一页上又绿又红；"
+                "两条都不是名字说的那件事，现在收成 kernel 里的一份函数（number_backing），"
+                "按答复算的降级成只报数（见下一格）。另有 "
+                f"{from_user} 条报的全是用户自己刚给的数，从判线分母里拿出来单列；年份/日期/ID 片段不算引用数据",
                 n=checked, min_n=20,
                 missing=(None if checked >= 20 else
                          f"可比回复只有 {checked} 条（判线要 ≥20 条）：样本太少不判"),),
+        _metric("整条答复一个查无出处的数都没有的比例（只报数）",
+                stats["reply_clean_rate"], None, "gte", "",
+                f"{checked} 条报数回复里 {checked - stats['replies_with_unbacked']} 条"
+                f"（{stats['reply_clean_rate']}）通篇读数都能回溯。这一格刻意**不判线**："
+                "它把「一张 60 行的表里有 1 个派生数没落进工具返回」和「整段都在编」算成同一个扣分，"
+                "量出来的是模型写了多少个数，不是有没有出处。10-09 实测三套口径："
+                f"按读数 {number_rate}、按答复全中 {stats['reply_clean_rate']}、"
+                "按答复六成放行 0.904（那条 0.6 的常数没人按业务定过，已废）"),
         _metric("报的是用户自己给的数（不进判线分母）", from_user if checked else None, None,
                 "gte", "条",
                 f"{from_user} 条：正文里的数字全部能在用户自己的话里找到 —— 人给的数不需要引擎核实，"
@@ -981,16 +983,18 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
                 (round(since_ok / since_checked, 3) if since_checked else None),
                 THRESHOLDS["L4"]["number_backing_rate"], "gte", "",
                 f"只看 {PROVENANCE_NOTE_SINCE:%Y-%m-%d %H:%M} UTC（提交 22c71493，标注挂上 kernel 出口）"
-                f"之后的 {since_checked} 条：可回溯 {since_ok} 条。"
-                f"判线那格里 {unbacked_total} 条无出处的回复有 {unbacked_before_note} 条早于这次上线 —— "
-                "它们在为历史扣分，不该被当成现在还在编数；这一格攒够 20 条才顶上去判线",
+                f"之后的 {since['replies_judged']} 条答复、{since_checked} 个读数："
+                f"能回溯 {since_ok} 个，查无出处 {since['claims_unbacked']} 个。"
+                f"判线那格里 {unbacked_total} 个无出处读数有 {unbacked_before_note} 个早于这次上线 —— "
+                "它们在为历史扣分，不该被当成现在还在编数；这一格攒够 20 个读数才顶上去判线",
                 n=since_checked, min_n=20,
                 missing=(None if since_checked >= 20 else
-                         f"上线后只有 {since_checked} 条可比回复（判线要 ≥20 条）：样本太少不判"),),
-        _metric("本轮工具直查率", round(same_turn / checked, 3) if checked else None, None, "gte", "",
-                f"{same_turn}/{checked} 条：数字直接来自当轮工具返回（引用前轮结果也算可回溯，但这一格"
-                f"低说明模型在复述而不是重新核实）；已披露率 {round(disclosed / max(1, checked), 3)}"
-                f"（{disclosed} 条写明了未经核实）"),
+                         f"上线后只有 {since_checked} 个可比读数（判线要 ≥20 个）：样本太少不判"),),
+        _metric("本轮工具直查率", (round(same_turn / stats["claims_total"], 3)
+                                  if stats["claims_total"] else None), None, "gte", "",
+                f"{same_turn}/{stats['claims_total']} 个读数直接来自当轮工具返回（引用前几轮也算可回溯，"
+                f"但这一格低说明模型在复述而不是重新核实）；已披露 "
+                f"{round(disclosed / max(1, stats['claims_total']), 3)}（{disclosed} 个写明了未经核实）"),
     ], "routing_misses": misses, "unbacked_samples": unbacked_samples,
         "provenance_note": ("工具返回原文存在 chat_messages.tool_calls[].result；"
                             "tool_results 列没用起来（同一份 JSON 不打算存两遍）")}

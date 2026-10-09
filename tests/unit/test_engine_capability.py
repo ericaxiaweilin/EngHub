@@ -271,3 +271,43 @@ def test_unbacked_kind_uses_comma_form_of_the_same_number():
 
     assert unbacked_kind("170460", "缺口 170,460 件",
                          '{"shortage_qty": 170460.0}') == "千分位写法"
+
+
+# ── 10-09 事故：同一个名字两把尺（L4 按"整条 ≥60%"判 0.904 过线，总结格按"整条全中"
+#    判 0.891 不过线，同一段对话在同一页上又绿又红）。现在两处调 kernel 同一个函数。
+def test_summary_rate_is_per_number_and_matches_the_kernel_function():
+    from core.kernel.reply_sanitizer import number_backing
+
+    rows = [_reply("负荷 1,250 件/时、缺口 300 件", session_tools='{"r": 1250}'),
+            _reply("还有 900 项待补、合计 300 件", session_tools='{"s": 300}')]
+    s = summary_score(rows)
+    expected = number_backing([
+        {"claims": ["1,250", "300"], "reply": rows[0]["content"],
+         "turn": rows[0]["session_tools"], "history": "", "user": ""},
+        {"claims": ["900", "300"], "reply": rows[1]["content"],
+         "turn": rows[1]["session_tools"], "history": "", "user": ""},
+    ])
+    assert s["number_backing_rate"] == expected["number_backing_rate"]
+    # 每个读数一票：4 个里 2 个有出处 → 0.5，不是"两条答复各判一次"的 0.0 或 1.0
+    assert s["claims_total"] == 4
+    assert s["number_backing_rate"] == 0.5
+    assert s["replies_with_claims"] == 2
+    assert s["reply_clean_rate"] == 0.0
+
+
+def test_summary_no_longer_passes_a_reply_just_because_most_numbers_matched():
+    """旧尺给"整条 ≥60% 有出处"放行；现在 3/4 命中就是 0.75，判线（0.90）不过。"""
+    s = summary_score([_reply("1,250、300、900、700 这四个数",
+                              session_tools='{"a": 1250, "b": 300, "c": 900}')])
+    assert s["number_backing_rate"] == 0.75
+    assert s["numbers_unbacked"] == 1
+    assert s["unbacked_samples"][0]["numbers"] == ["700"]
+
+
+def test_summary_unbacked_kinds_count_per_number():
+    """分类按读数条数计：一条答复里两个派生数就该计两处（旧尺按答复只计一次）。"""
+    s = summary_score([_reply("缺口 7053.1 → 6856.5（少 196.6），达成率 1.0 即 100",
+                              session_tools='{"a": 7053.1, "b": 6856.5, "c": 1.0}')])
+    assert s["numbers_unbacked"] == 2
+    assert s["unbacked_kinds"].get("两数之差") == 1
+    assert s["unbacked_kinds"].get("百分数写法") == 1

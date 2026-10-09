@@ -449,3 +449,93 @@ def test_item_without_any_phrase_is_noted_but_never_demands_an_internal_key():
     note = missing_gap_note([silent], "交期 2026-11-06。")
     assert note.startswith("\n\n") and "没写清缺什么" in note
     assert "silent_one" not in note, "不许把内部键名塞进给用户看的答复"
+
+
+# ── 「数字可回溯」的唯一判据：按读数算，每个数一票 ─────────────────────
+def _row(claims, reply, turn="", history="", user=""):
+    return {"claims": claims, "reply": reply, "turn": turn, "history": history, "user": user}
+
+
+def test_number_backing_votes_per_number_not_per_reply():
+    from core.kernel.reply_sanitizer import number_backing
+
+    stats = number_backing([_row(["12.5", "300", "9"],
+                                 "负荷 12.5 件/时、缺口 300 件、还有 9 个待补",
+                                 turn='{"rate": 12.5, "shortage": 300}')])
+    assert stats["claims_total"] == 3
+    assert stats["claims_same_turn"] == 2
+    assert stats["claims_unbacked"] == 1
+    assert stats["number_backing_rate"] == round(2 / 3, 3)
+    # 按答复算的那一级只报数：这一条"至少有一个数没出处"，所以通篇干净的答复占比是 0
+    assert stats["replies_with_unbacked"] == 1
+    assert stats["reply_clean_rate"] == 0.0
+
+
+def test_number_backing_has_no_partial_credit_threshold():
+    """旧的 L4 判线给"整条 ≥60% 有出处"放行 —— 那条 0.6 常数没人按业务定过，已废。
+
+    这里钉住两个方向：4 个里中 3 个（0.75）在旧尺下算这条答复过，现在按读数只算 0.75，
+    而按答复全中算 0.0。判线看的是 0.75 那个数。
+    """
+    from core.kernel.reply_sanitizer import number_backing
+
+    stats = number_backing([_row(["1", "2", "3", "4"],
+                                 "1 2 3 4", turn="1 2 3")])
+    assert stats["number_backing_rate"] == 0.75
+    assert stats["reply_clean_rate"] == 0.0
+    assert stats["per_reply"][0]["unbacked"] == ["4"]
+
+
+def test_number_backing_excludes_numbers_the_human_just_gave():
+    from core.kernel.reply_sanitizer import number_backing
+
+    stats = number_backing([_row(["1200"], "按你说的 1200 台来算",
+                                 turn="{}", user="我们这版排 1200 台")])
+    assert stats["claims_total"] == 0
+    assert stats["replies_user_only"] == 1
+    assert stats["number_backing_rate"] is None
+    assert stats["claims_from_user"] == 1
+
+
+def test_number_backing_counts_disclosed_numbers_as_not_invented():
+    from core.kernel.reply_sanitizer import number_backing
+
+    stats = number_backing([_row(["876"], "这是估算值：省 876 小时", turn="{}")])
+    assert stats["claims_disclosed"] == 1
+    assert stats["claims_unbacked"] == 0
+    assert stats["number_backing_rate"] == 1.0
+    assert stats["replies_with_unbacked"] == 0
+
+
+def test_number_backing_accepts_history_corpus_from_earlier_turns():
+    from core.kernel.reply_sanitizer import number_backing
+
+    stats = number_backing([_row(["44.7"], "最差区间 44.7", turn="{}",
+                                 history="… 44.71 …")])
+    # 44.7 在语料里命中前 4 位（44.71）→ 同一件事，判可回溯
+    assert stats["claims_from_history"] == 1
+    assert stats["number_backing_rate"] == 1.0
+
+
+def test_gap_note_lists_every_missing_item_without_truncating_the_phrase():
+    """出口那一行必须把判据要看的每个说法原样交出去。
+
+    判据要求"每条缺项都被带到"，而旧出口只列前 3 种说法、还把句子截到 60 字：
+    第 4 条永远追不上，长句被截断的那条也永远判不到 —— 缺口点名率 0.167 里就有这一半。
+    """
+    from core.kernel.reply_sanitizer import gap_phrases, missing_gap_note
+
+    items = [{"reason": f"这一维第 {i} 项缺输入，量不出斜率"} for i in range(1, 6)]
+    note = missing_gap_note(items, "交期 2026-11-06。")
+    assert "共 5 项" in note or "5 项给不出数" in note
+    for item in items:
+        assert gap_phrases(item)[0] in note, "判据找的那个串必须整条出现在出口那行里"
+
+
+def test_gap_note_keeps_a_long_reason_whole():
+    from core.kernel.reply_sanitizer import gap_phrases, missing_gap_note
+
+    long_reason = "这一维测不出斜率" + "并且缺输入说明" * 12
+    item = {"reason": long_reason}
+    note = missing_gap_note([item], "交期 2026-11-06。")
+    assert gap_phrases(item)[0] in note

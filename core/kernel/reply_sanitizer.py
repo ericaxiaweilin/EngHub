@@ -30,6 +30,7 @@
 
 import json
 import re
+from typing import Any, Dict, List
 
 _LT = "<"
 _GT = ">"
@@ -407,6 +408,78 @@ def numeric_claims(text: str) -> list:
     return out
 
 
+# ── 「正文里的数有没有出处」的唯一判据：L4 那格与人的总结格共用这一份 ──
+#
+# 2026-10-09 实测到的事故：同一个名字在两处各算一遍，一处按"整条答复 ≥60% 的数有出处"
+# 放行（0.904 判过线），一处按"整条答复的数全部有出处"扣分（0.891 判不过线）。同一段对话
+# 在同一页上又绿又红。三种口径都量过（人群 A=全厂区 30 天 177 条答复 / 3032 个读数，
+# 人群 B=本厂区调过引擎工具的 46 条 / 872 个读数）：
+#   按读数   A 0.959  B 0.993
+#   按答复全中 A 0.870  B 0.891
+#   按答复六成放行 A 0.904  B 1.000
+# 判线收成**按读数**：这个名字（「回答数字可回溯率」/「正文数字有出处的比例」）说的就是
+# 每个数有没有出处，不是整条答复有没有一个数没出处。按答复的两级都留作只报数 —— 它把
+# "一条长表格里 1 个派生数没出处"和"整段都在编"算成同一个扣分，量的是模型话术长度而不是出处。
+# 「≥60% 就放行」这条常数没被任何人按业务定过，废掉。
+def number_hit(needle: str, hay: str) -> bool:
+    """一个读数在语料里算不算找到了出处：允许前 4 位命中（工具给 3,299.6、正文写 3,299）。"""
+    return bool(hay) and (needle in hay or (len(needle) > 4 and needle[:4] in hay))
+
+
+def number_backing(rows) -> Dict[str, Any]:
+    """把一批答复里的读数按**条**数分账，两级一起算。
+
+    rows 每项：{"claims": [读数…], "reply": 正文, "turn": 本轮工具返回原文,
+                "history": 本会话前几轮的工具返回, "user": 本会话里人自己说过的话}
+    人自己刚报过的数从分母里整条拿出（既不算有出处、也不算编造 —— 那是 L4 注释里
+    定过的口径，不是新决定）。已显式披露"这些数没查过库"的读数算披露，不算编造。
+    """
+    claims_total = claims_turn = claims_history = 0
+    claims_disclosed = claims_unbacked = claims_from_user = 0
+    replies_judged = replies_user_only = replies_with_unbacked = 0
+    per_reply: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows or []):
+        reply = str(row.get("reply") or "")
+        user_text = str(row.get("user") or "")
+        turn = str(row.get("turn") or "").replace(",", "")
+        history = str(row.get("history") or "").replace(",", "")
+        raw = [str(c).replace(",", "") for c in (row.get("claims") or [])]
+        claims = [c for c in raw if not number_hit(c, user_text)]
+        claims_from_user += len(raw) - len(claims)
+        if not claims:
+            replies_user_only += 1
+            continue
+        disclosed = is_disclosed(reply)
+        hits_now = sum(1 for c in claims if number_hit(c, turn))
+        hits_any = sum(1 for c in claims
+                       if number_hit(c, turn) or number_hit(c, history))
+        missed = [c for c in claims
+                  if not (number_hit(c, turn) or number_hit(c, history))]
+        claims_total += len(claims)
+        claims_turn += hits_now
+        claims_history += hits_any - hits_now
+        if disclosed:
+            claims_disclosed += len(missed)
+        else:
+            claims_unbacked += len(missed)
+        replies_judged += 1
+        replies_with_unbacked += 1 if (missed and not disclosed) else 0
+        per_reply.append({"index": idx, "total": len(claims), "backed": hits_any,
+                          "disclosed": disclosed, "unbacked": missed})
+    ok = claims_total - claims_unbacked
+    return {
+        "claims_total": claims_total, "claims_same_turn": claims_turn,
+        "claims_from_history": claims_history, "claims_disclosed": claims_disclosed,
+        "claims_unbacked": claims_unbacked, "claims_from_user": claims_from_user,
+        "number_backing_rate": (round(ok / claims_total, 3) if claims_total else None),
+        "replies_judged": replies_judged, "replies_user_only": replies_user_only,
+        "replies_with_unbacked": replies_with_unbacked,
+        "reply_clean_rate": (round((replies_judged - replies_with_unbacked) / replies_judged, 3)
+                             if replies_judged else None),
+        "per_reply": per_reply,
+    }
+
+
 # ── 「引擎报了算不出」的唯一判据：出口要补一行、读数要判点名率，两处必须同一把尺 ──
 _GAP_FIELDS = ("reason", "ask", "missing")
 _GAP_SPLIT = re.compile(r"[，。；、：:（）()\[\]「」\s→/]+")
@@ -468,22 +541,42 @@ def gap_is_disclosed(item, reply: str) -> bool:
     return bool(phrases) and any(p in (reply or "") for p in phrases)
 
 
-def missing_gap_note(items, reply: str, cap: int = 3) -> str:
-    """有缺项没带到 → 要追加的一行；都带到了（或没缺项）→ 空串。"""
+def _gap_raw_text(item) -> str:
+    """这一条缺项"该说给读者听"的整句原文（不截断、不切半截）。
+
+    取 gap_phrases 认的第一个字段的**整句**：判据的片段是从这句切出来的，整句必然包含它 ——
+    于是出口交出去的是一句完整的话，判据也追得上。直接写 gap_phrases[0] 会被空白/标点切开
+    （"请求没给 compare" 变成 "请求没给"），读者看不懂，测试也钉不住。
+    """
+    for field in _GAP_FIELDS:
+        text = str((item or {}).get(field) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def missing_gap_note(items, reply: str) -> str:
+    """有缺项没带到 → 要追加的一行；都带到了（或没缺项）→ 空串。
+
+    这一行必须把**每一条**缺项的说法原样交出去，两处都不能省：
+    · 不能只列前 3 种 —— 判据（engine_capability 的缺口点名率）要求每条缺项都被带到，
+      出口只列 3 条时第 4 条永远追不上，那一轮的点名率就锁死在不及格；
+    · 不能拿 reason[:60] —— 判据认的是 gap_phrases 切出来的整段，半截句子不在其中，
+      被截断的那条同样永远判不到（10-09 实测点名率 0.167 里有这一半）。
+    """
     lost = [it for it in (items or []) if not gap_is_disclosed(it, reply)]
     if not lost:
         return ""
     # 几个杠杆常共享同一句 reason（实测三个杠杆都是"这一维测不出斜率，无法归因"），
     # 原样列出来就是把同一句话重复三遍 —— 按说法去重，条数另外报。
-    uniq = []
+    uniq: List[str] = []
     for it in lost:
-        phrase = str(it.get("reason") or it.get("ask")
-                     or (gap_phrases(it) or [""])[0] or "这条没写清缺什么")[:60]
+        phrase = _gap_raw_text(it) or "这条没写清缺什么"
         if phrase not in uniq:
             uniq.append(phrase)
-    shown = uniq[:cap]
-    more = f"…（列出 {len(shown)} 种说法，共 {len(lost)} 项）" if len(lost) > len(shown) else ""
+    more = (f"…（列出 {len(uniq)} 种说法，共 {len(lost)} 项）"
+            if len(uniq) < len(lost) else "")
     return ("\n\n〔引擎本轮还有 " + str(len(lost)) + " 项给不出数〕"
-            + "；".join(shown) + more
+            + "；".join(uniq) + more
             + " —— 这不是「没做」，是这一项本轮缺输入或量不出斜率；"
               "把输入补上才谈得到一个数。")
