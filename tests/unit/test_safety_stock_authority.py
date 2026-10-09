@@ -8,6 +8,8 @@ import json
 
 from core.mes import safety_stock_authority as ssa
 
+from decimal import Decimal as _D
+
 INV = {"rows_total": 11228, "distinct_values": 47, "mode_value": 2, "nulls": 0, "zeros": 0}
 MAT = {"rows_total": 31672, "distinct_values": 10, "mode_value": 100, "nulls": 0, "zeros": 0}
 JOIN = {"joined_materials": 31685, "in_both": 11171, "disagree": 11171,
@@ -17,6 +19,17 @@ JOIN = {"joined_materials": 31685, "in_both": 11171, "disagree": 11171,
 TRIG = {"below_trigger_line": 476, "no_reorder_qty": 0, "no_reorder_point": 0,
         "no_inventory_safety": 0}
 from decimal import Decimal as _D
+BACKLOG_HEAD = {"parts": 675, "units": _D("3219581"), "work_order_lines": _D("51489"),
+                "without_supplier": 663, "without_lead": 3, "without_cost": 470,
+                "ready_to_act": 12}
+BACKLOG_ROWS = [
+    {"material_code": "1000455461", "need": _D("12000"), "work_orders": 7,
+     "material_name": "电子料甲", "lead_time_days": 20, "default_supplier": "宝钢金属(佛山)",
+     "unit_cost": _D("3.5"), "ready": True},
+    {"material_code": "RM-ELEC-999", "need": _D("900"), "work_orders": 2,
+     "material_name": "无供应商料号", "lead_time_days": 12, "default_supplier": None,
+     "unit_cost": None, "ready": False},
+]
 AUTO = {"pr_materials": 512, "pr_lines": 512, "pr_units": _D("10520"),
         "pr_in_kit_universe": 149, "gap_materials": 821, "gap_units": _D("4237670"),
         "gap_without_request": 675, "request_without_gap": 366,
@@ -71,6 +84,16 @@ class _Db:
             return _Res([TRIG])
         if "pr_lines" in sql:
             return _Res([AUTO])
+        if "AS ready_to_act" in sql:
+            return _Res([BACKLOG_HEAD])
+        if "AS ready" in sql:
+            return _Res(BACKLOG_ROWS)
+        if "count(DISTINCT unit_cost) AS distinct_values" in sql:
+            return _Res([{"distinct_values": 10, "mode_value": _D("18"), "filled": 11092}])
+        if "AS n FROM inventory" in sql and "unit_cost =" in sql:
+            return _Res([{"n": 10981}])
+        if "AS z" in sql and "unit_cost = 0" in sql:
+            return _Res([{"z": 10981, "pos": 108}])
         if "FROM safety_stock_config" in sql:
             return _Res([], self.config_rows)
         if "ORDER BY abs(inv.inv_ss - mat.mat_ss) DESC" in sql:
@@ -276,3 +299,44 @@ def test_no_auto_line_when_nothing_has_been_ordered(monkeypatch):
     db.execute = quiet
     out = asyncio.run(ssa.safety_stock_authority(db, "FAC_MECH_001"))
     assert not [x for x in out["reading"] if "已经开出去的自动补货" in x]
+
+
+def test_backlog_lists_what_can_be_acted_on_today_and_names_the_missing_master_data():
+    out = asyncio.run(ssa.safety_stock_authority(_Db(decimal=True), "FAC_MECH_001", examples=2))
+    line = [x for x in out["reading"] if "缺口却没开过单的料号" in x]
+    assert line and "675 个 / 3,219,581 件" in line[0]
+    assert "今天就能去催的只有 12 个" in line[0]
+    assert "663 个没供应商" in line[0] and "470 个没单价" in line[0]
+    assert "不给金额" in line[0], "没有可信单价就不许折算成钱"
+    bl = out["shortage_backlog"]
+    assert bl["items"][0]["ready_to_act"] is True and bl["items"][0]["supplier"] == "宝钢金属(佛山)"
+    assert bl["items"][1]["unit_cost"] is None and bl["items"][1]["ready_to_act"] is False
+    import json
+    json.dumps(out, ensure_ascii=False)
+
+
+def test_backlog_line_is_absent_when_no_shortage_is_uncovered():
+    db = _Db(decimal=True)
+    orig = db.execute
+
+    async def quiet(stmt, params=None):
+        if "AS ready_to_act" in str(stmt):
+            return _Res([{**BACKLOG_HEAD, "parts": 0, "units": _D("0"), "work_order_lines": _D("0"),
+                         "without_supplier": 0, "without_lead": 0, "without_cost": 0,
+                         "ready_to_act": 0}])
+        return await orig(stmt, params)
+
+    db.execute = quiet
+    out = asyncio.run(ssa.safety_stock_authority(db, "FAC_MECH_001"))
+    assert not [x for x in out["reading"] if "缺口却没开过单的料号" in x], "0 个就不要印一行空话"
+
+
+def test_unit_cost_being_present_is_not_the_same_as_it_being_real():
+    """三项齐 ≠ 能算钱：单价自己也是铺的就要当场说破。"""
+    out = asyncio.run(ssa.safety_stock_authority(_Db(decimal=True), "FAC_MECH_001", examples=2))
+    basis = out["shortage_backlog"]["unit_cost_basis"]
+    assert basis["verdict"] == "template_default" and basis["distinct_values"] == 10
+    assert basis["zero_cost_rows_share"] == 0.99, "单价是 0 的行要单独报，不能算成有价"
+    assert basis["mode_share"] == 0.99
+    line = [x for x in out["reading"] if "却没开过单" in x][0]
+    assert "单价也只有" in line or "不折成金额" in line

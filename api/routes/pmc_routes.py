@@ -897,6 +897,7 @@ async def get_sim_schedule_risk(
 async def get_safety_stock_authority(
     factory_id: str = Query(..., description="厂区"),
     examples: int = Query(5, description="列几例两表差得最远的料号"),
+    backlog_limit: int = Query(12, description="缺口未开单的清单列几行（按能催的优先、缺口件数排序）"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -910,7 +911,8 @@ async def get_safety_stock_authority(
     del current_user
     from core.mes.safety_stock_authority import safety_stock_authority
 
-    return await safety_stock_authority(db, factory_id, examples=max(1, min(20, int(examples))))
+    return await safety_stock_authority(db, factory_id, examples=max(1, min(20, int(examples))),
+                                        backlog_limit=max(1, min(200, int(backlog_limit))))
 
 
 @router.get("/data-flow-profile", summary="数据流节点剖面：这座厂一次推演流经多少节点、按规模要多多少")

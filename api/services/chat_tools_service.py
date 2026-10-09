@@ -3528,6 +3528,7 @@ async def _tool_query_safety_stock_authority(
             "shortfall_units": out.get("shortfall_units"),
             "ruler_spread_x": out.get("ruler_spread_x"),
             "auto_replenishment": out.get("auto_replenishment"),
+            "shortage_backlog": out.get("shortage_backlog"),
             "reading": out.get("reading"), "claim_guard": out.get("claim_guard")}
 
 

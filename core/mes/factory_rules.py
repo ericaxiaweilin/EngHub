@@ -438,6 +438,12 @@ async def open_questions(db: AsyncSession, factory_id: str, *,
                              "助手用工具 record_factory_rule 落成 declared 规则"}
 
 
+def _fmt(value) -> str:
+    """件数用千分位：读数量级要看清，科学计数法不算读数。"""
+    v = float(value or 0)
+    return f"{v:,.0f}" if abs(v) >= 1000 else f"{v:g}"
+
+
 async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str, Any]]:
     """引擎要按产能算、但口径还没人定过的问题 —— 现场一句话就能定，定了产能才算得动。
 
@@ -686,6 +692,35 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                                     "三条都是字段级决定，不是调阈值。"),
                 "record_as": {"subject": "safety_stock_authority",
                               "verdict": "inventory|materials|per_item_rewritten",
+                              "status": "declared", "source": "chat"},
+            })
+    if ss_auth and ss_auth.get("status") == "ok" and (ss_auth.get("auto_replenishment") or {}):
+        auto = ss_auth["auto_replenishment"]
+        back = ss_auth.get("shortage_backlog") or {}
+        if not (await binding_rules(db, factory_id)).get("auto_replenishment_demand_gate"):
+            out.append({
+                "topic": "auto_replenishment_demand_gate",
+                "question": (f"自动补货现在只看库存水位开单：已开的 {int(auto['pr_lines'])} 条里 "
+                             f"{int(auto['request_without_gap'])} 个料号引擎当前并不缺，"
+                             f"而 {int(back.get('parts') or 0)} 个真缺口料号"
+                             f"（{_fmt(back.get('units'))} 件）一条都没开 —— "
+                             "要不要加需求侧就绪门：只有当前在流程工单真缺的料号才允许自动开单？"),
+                "why_it_matters": ("两头都错不是精度问题：不看需求就会给没人要的料下单（钱压在仓库），"
+                                   "缺口那边等于没有动作。加门之后动作量从"
+                                   f"{int(auto['pr_lines'])} 条变成 {int(back.get('parts') or 0)} 条待办，"
+                                   f"其中主数据齐、今天能催的 {int(back.get('ready_to_act') or 0)} 条；"
+                                   "其余要先补供应商/单价，那是要人写的字段，引擎不代填"),
+                "expected_answer": ("① 加门：以 work_order_materials 的 shortage_qty>0 为准出单，"
+                                    "水位线只作参考不再触发开单；② 保留水位线但把需求侧条件 AND 进去；"
+                                    "③ 保持现状（等于承认这 "
+                                    f"{int(auto['request_without_gap'])} 条是按模板值开的）"),
+                "prefilled_evidence": (f"缺口未开单 {_fmt(back.get('units'))} 件挂在 "
+                                       f"{int(back.get('work_order_lines') or 0)} 个工单行上；"
+                                       f"缺供应商 {int(back.get('without_supplier') or 0)}、"
+                                       f"缺单价 {int(back.get('without_cost') or 0)}、"
+                                       f"缺提前期 {int(back.get('without_lead') or 0)}"),
+                "record_as": {"subject": "auto_replenishment_demand_gate",
+                              "verdict": "demand_only|water_and_demand|keep_water_line",
                               "status": "declared", "source": "chat"},
             })
     elif ss_error:

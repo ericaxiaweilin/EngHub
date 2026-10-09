@@ -126,6 +126,103 @@ SELECT (SELECT count(*) FROM pr) AS pr_materials,
        (SELECT max(last_created) FROM pr) AS last_created
 """
 
+# 缺口但一条单都没开的料号清单：能催的先列出来，催不动的点名缺哪一项主数据
+BACKLOG_SQL = """
+WITH gap AS (
+    SELECT m.material_code,
+           sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) AS need,
+           count(DISTINCT m.work_order_id) AS work_orders
+    FROM work_order_materials m JOIN work_orders o ON o.id = m.work_order_id
+    WHERE o.factory_id = :fid
+    GROUP BY 1
+    HAVING sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) > 0),
+naked AS (
+    SELECT * FROM gap WHERE NOT EXISTS
+        (SELECT 1 FROM purchase_requests p WHERE p.material_code = gap.material_code)),
+inv AS (SELECT material_code, min(unit_cost) AS unit_cost
+        FROM inventory WHERE factory_id = :fid GROUP BY 1)
+SELECT count(*) AS parts,
+       round(sum(naked.need)) AS units,
+       sum(naked.work_orders) AS work_order_lines,
+       count(*) FILTER (WHERE t.default_supplier IS NULL) AS without_supplier,
+       count(*) FILTER (WHERE t.lead_time_days IS NULL) AS without_lead,
+       count(*) FILTER (WHERE i.unit_cost IS NULL OR i.unit_cost <= 0) AS without_cost,
+       count(*) FILTER (WHERE t.default_supplier IS NOT NULL AND t.lead_time_days IS NOT NULL
+                             AND i.unit_cost > 0) AS ready_to_act
+FROM naked
+LEFT JOIN materials t ON t.material_code = naked.material_code AND t.factory_id = :fid
+LEFT JOIN inv i ON i.material_code = naked.material_code
+"""
+
+BACKLOG_ROWS_SQL = """
+WITH gap AS (
+    SELECT m.material_code,
+           sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) AS need,
+           count(DISTINCT m.work_order_id) AS work_orders
+    FROM work_order_materials m JOIN work_orders o ON o.id = m.work_order_id
+    WHERE o.factory_id = :fid
+    GROUP BY 1
+    HAVING sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) > 0),
+naked AS (
+    SELECT * FROM gap WHERE NOT EXISTS
+        (SELECT 1 FROM purchase_requests p WHERE p.material_code = gap.material_code)),
+inv AS (SELECT material_code, min(unit_cost) AS unit_cost
+        FROM inventory WHERE factory_id = :fid GROUP BY 1)
+SELECT naked.material_code, round(naked.need) AS need, naked.work_orders,
+       t.material_name, t.lead_time_days, t.default_supplier, i.unit_cost,
+       (t.default_supplier IS NOT NULL AND t.lead_time_days IS NOT NULL
+        AND i.unit_cost IS NOT NULL) AS ready
+FROM naked
+LEFT JOIN materials t ON t.material_code = naked.material_code AND t.factory_id = :fid
+LEFT JOIN inv i ON i.material_code = naked.material_code
+ORDER BY (t.default_supplier IS NOT NULL AND t.lead_time_days IS NOT NULL
+          AND i.unit_cost > 0) DESC, naked.need DESC
+LIMIT :limit
+"""
+
+
+def _as_number(value):
+    return None if value is None else float(value)
+
+
+async def shortage_backlog(db: AsyncSession, factory_id: str, *, limit: int = 12) -> Dict[str, Any]:
+    """真缺口却没开过单的料号：能催的排前面，催不动的点名缺哪一项主数据。
+
+    这一格只列台账：`purchase_requests` 里没出现过的料号才进清单，
+    金额只在三项齐（供应商+提前期+单价）时才给，缺单价的条目不折算成钱。
+    """
+    head = (await db.execute(text(BACKLOG_SQL), {"fid": factory_id})).mappings().first()
+    rows = (await db.execute(text(BACKLOG_ROWS_SQL),
+                             {"fid": factory_id, "limit": max(1, int(limit))})).mappings().all()
+    items = [{"material_code": str(r["material_code"]), "shortage_units": _as_number(r["need"]),
+              "work_orders": int(r["work_orders"] or 0),
+              "material_name": (str(r["material_name"]) if r["material_name"] else None),
+              "lead_time_days": _as_number(r["lead_time_days"]),
+              "supplier": (str(r["default_supplier"]) if r["default_supplier"] else None),
+              "unit_cost": _as_number(r["unit_cost"]),
+              "ready_to_act": bool(r["ready"])} for r in rows]
+    result = {"parts": int((head or {}).get("parts") or 0) if head else 0,
+              "units": _as_number((head or {}).get("units")) if head else 0.0,
+              "work_order_lines": _as_number((head or {}).get("work_order_lines")) if head else 0.0,
+              "without_supplier": int((head or {}).get("without_supplier") or 0) if head else 0,
+              "without_lead": int((head or {}).get("without_lead") or 0) if head else 0,
+              "without_cost": int((head or {}).get("without_cost") or 0) if head else 0,
+              "ready_to_act": int((head or {}).get("ready_to_act") or 0) if head else 0,
+              "items": items}
+    # 「可催的那几条单价是不是也只有几个值」要用这几条自己算，不能拿全厂普查顶
+    priced = [it for it in items if it["ready_to_act"] and it["unit_cost"] is not None]
+    if priced:
+        counts: Dict[float, int] = {}
+        for it in priced:
+            counts[it["unit_cost"]] = counts.get(it["unit_cost"], 0) + 1
+        top_cost, top_n = max(counts.items(), key=lambda kv: kv[1])
+        result["ready_cost_census"] = {
+            "rows_sampled": len(priced), "rows_ready": result["ready_to_act"],
+            "complete": len(priced) >= result["ready_to_act"],
+            "distinct_values": len(counts), "mode_value": top_cost,
+            "mode_share": round(top_n / len(priced), 3)}
+    return result
+
 
 def _units(value: Any) -> str:
     """件数别用 :g —— 4.23767e+06 不是人读的数，现场要能一眼看出量级。"""
@@ -169,9 +266,53 @@ async def _mode_share(db: AsyncSession, table: str, fid: str) -> float:
     top = sum(int(r["n"]) for r in rows[:1])
     return (top / total) if total else 0.0
 
+# 单价本身是不是也是铺的：只有几个取值就不能拿它算金额
+COST_CENSUS_SQL = """
+    SELECT count(DISTINCT unit_cost) AS distinct_values,
+           mode() WITHIN GROUP (ORDER BY unit_cost) AS mode_value,
+           count(*) AS filled
+    FROM inventory WHERE factory_id = :fid AND unit_cost IS NOT NULL
+"""
+
+
+async def cost_basis(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
+    """`inventory.unit_cost` 的取值普查：铺出来的价格不能拿来折算金额。"""
+    row = (await db.execute(text(COST_CENSUS_SQL), {"fid": factory_id})).mappings().first()
+    if not row:
+        return {"distinct_values": 0, "mode_share": 0.0, "verdict": "no_cost_data"}
+    distinct = int(row["distinct_values"] or 0)
+    total = int(row["filled"] or 0)
+    share = 0.0
+    if total and distinct:
+        top = (await db.execute(text("""
+            SELECT count(*) AS n FROM inventory
+            WHERE factory_id = :fid AND unit_cost = (
+                SELECT mode() WITHIN GROUP (ORDER BY unit_cost) FROM inventory
+                WHERE factory_id = :fid AND unit_cost IS NOT NULL)"""),
+            {"fid": factory_id})).mappings().first()
+        share = float((top or {}).get("n") or 0) / total
+    zero_share = 0.0
+    if total:
+        zr = (await db.execute(text("""
+            SELECT count(*) FILTER (WHERE unit_cost = 0) AS z,
+                   count(*) FILTER (WHERE unit_cost > 0) AS pos
+            FROM inventory WHERE factory_id = :fid AND unit_cost IS NOT NULL"""),
+            {"fid": factory_id})).mappings().first()
+        zero_share = float((zr or {}).get("z") or 0) / total
+    template = distinct <= TEMPLATE_MAX_DISTINCT and share >= TEMPLATE_MIN_MODE_SHARE
+    return {"zero_cost_rows_share": round(zero_share, 3), "filled_rows_real": None,
+            "distinct_values": distinct, "filled_rows": total,
+            "mode_value": (float(row["mode_value"]) if row["mode_value"] is not None else None),
+            "mode_share": round(share, 3),
+            "verdict": ("template_default" if template else "declared_per_item"),
+            "why": (f"全厂 {total} 行有单价，只有 {distinct} 个取值、众数 "
+                    f"{float(row['mode_value'] or 0):g} 占 {share:.1%}"
+                    + (f"，其中 {zero_share:.1%} 的行单价是 0（等于没填价）" if zero_share else "")
+                    + " ——" + ("这是铺出来的价，能填表不能算钱" if template
+                               else "取值分布支持按声明使用"))}
 
 async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
-                                 examples: int = 5) -> Dict[str, Any]:
+                                 examples: int = 5, backlog_limit: int = 12) -> Dict[str, Any]:
     """两处声明 + 四条尺的实测对照，结论是"该拍哪条"，不是一个假告警数。"""
     if db is None:
         return {"status": "no_session",
@@ -291,6 +432,34 @@ async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
             f"同期真缺口 {auto.get('gap_materials')} 个料号 / {_units(auto.get('gap_units'))} 件里，"
             f"{auto.get('gap_without_request')} 个一条单都没开 —— "
             "触发线只看库存水位、不看有没有工单要，所以两头都能错")
+    backlog, backlog_error = None, None
+    try:
+        backlog = await shortage_backlog(db, factory_id, limit=max(1, int(backlog_limit)))
+        cost = await cost_basis(db, factory_id)
+        backlog["unit_cost_basis"] = cost
+    except Exception as exc:  # noqa: BLE001
+        backlog, backlog_error = None, type(exc).__name__ + ": " + str(exc)[:120]
+    cost = None
+    out["shortage_backlog"] = backlog
+    out["shortage_backlog_error"] = backlog_error
+    if backlog and backlog.get("parts"):
+        out["reading"].append(
+            f"缺口却没开过单的料号：{backlog['parts']} 个 / {_units(backlog['units'])} 件"
+            f"（挂在 {int(backlog['work_order_lines'])} 个工单行上），其中主数据三项齐、"
+            f"今天就能去催的只有 {backlog['ready_to_act']} 个；"
+            f"催不动的卡在缺料号自己的 {backlog['without_supplier']} 个没供应商、"
+            f"{backlog['without_cost']} 个没单价、{backlog['without_lead']} 个没提前期"
+            + ((f"；可催的这 {rc['rows_sampled']} 条里单价也只有 {rc['distinct_values']} 个值"
+                f"（众数 {rc['mode_value']:g} 占 {rc['mode_share']:.1%}"
+                f"{'' if rc['complete'] else '，样本只覆盖部分可催条目'}）—— "
+                "全厂单价另有 "
+                f"{backlog['unit_cost_basis']['zero_cost_rows_share']:.1%} 的行是 0 元占位，"
+                "所以这一格只给件数，不给金额")
+               if (rc := backlog.get("ready_cost_census")) else
+               (" —— 缺单价的那些我不折成金额"
+                if (backlog.get("unit_cost_basis") or {}).get("verdict") != "template_default"
+                else " —— 单价整体只有 "
+                     f"{backlog['unit_cost_basis']['distinct_values']} 个取值，不折成金额")))
     if all(str(s["verdict"]) == "template_default" for s in sources):
         out["reading"].append(
             "两边都是模板值时，任何一边的告警清单都不能当补货依据 —— "
