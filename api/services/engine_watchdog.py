@@ -746,12 +746,19 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
         if n >= MIN_GROUNDING_REPLIES and rate is not None and rate < MIN_GROUNDING_BACKING:
             samples = ground.get("unbacked_samples") or []
             numbers = sorted({x for s in samples for x in (s.get("numbers") or [])})[:8]
+            kinds = ground.get("unbacked_kinds") or {}
+            kinds_txt = ("、".join(f"{k} {v} 处" for k, v in sorted(kinds.items()))
+                         if kinds else "本轮未分类")
+            derived = sum(int(v or 0) for k, v in kinds.items() if k != "找不到来源")
             out.append(_gap(
                 "reply_grounding", "unsourced_numbers", f"ground|{n}|{int(rate * 100) // 5 * 5}",
                 f"转述失真｜近 30 天 {n} 条带数字的答复里 {ground.get('numbers_unbacked')} 条"
                 f"报的数在引擎返回里找不到（有出处率 {rate}，判线 {MIN_GROUNDING_BACKING}）",
-                "这些数字既不在本会话任何引擎工具的返回里，也不是人自己报过的数 —— "
-                "要么是模型自己算的，要么是编的。无人工厂里这两种都得当场见光，"
+                f"这些数字既不在本会话任何引擎工具的返回里，也不是人自己报过的数。分类：{kinds_txt}。"
+                "「两数之差/两数之和/百分数写法/千分位写法」是引擎只给了分量、没给派生结果 —— "
+                "修法是工具把那个数返回出来（这一类正在逐个补到出口上）；"
+                f"其中真正「找不到来源」的是 {kinds.get('找不到来源', 0)} 处"
+                f"（派生缺失 {derived} 处）—— 无人工厂里这两种都得当场见光，"
                 "不能靠读的人凭感觉分辨。\n"
                 f"找不到的数：{numbers}；样例见 payload.unbacked_samples。\n"
                 "复核：GET /api/v1/pmc/engine-capability-profile（总结格）、"
@@ -761,6 +768,7 @@ def gap_readings(*, gen: Dict[str, Any], sup: Dict[str, Any],
                 "调了工具但复述了没有的数不标 —— 那是这一格剩下的缺口）。",
                 {"replies_with_claims": n, "number_backing_rate": rate,
                  "numbers_unbacked": ground.get("numbers_unbacked"),
+                 "unbacked_kinds": kinds, "derived_missing": derived,
                  "unbacked_samples": samples[:6]}))
     if wc is not None and int(wc.get("attendance_days") or 0) >= MIN_ATTENDANCE_DAYS_FOR_SLOPE:
         ev.add("working_conditions_evidence")
