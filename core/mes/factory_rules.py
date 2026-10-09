@@ -570,12 +570,14 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                          "默认锚要不要改成实测中位？"),
             "why_it_matters": ("中心与带宽是两件事：带宽说『这个数有多不准』，中心说『这个数偏朝哪边』。"
                                f"现在每一格的 P50/P90 与准点概率都是拿偏乐观 {ratio['anchor']:g}× 的台账算的，"
-                               "所以准点概率系统性偏高。改成实测锚会让 P90 往后挪多少，"
-                               "/pmc/sim-lead-calibration 已经量过（同一串抽样只挪中心）；"
+                               "所以准点概率系统性偏高。三条路各后移几天，/pmc/sim-lead-calibration 已经"
+                               "在同一串抽样上量好了（按台账 / 整批按实测中位 / 料号级 hybrid）；"
                                "不改也要得起另一个说法：对外报的数是已知偏乐观的"),
             "expected_answer": ("① 默认锚按实测中位（引擎把分布中心挪到 "
                                 f"{ratio['anchor']:g}×）；② 仍按台账，但对外读数必须标『未校准』；"
-                                "③ 分批：先按已量过的料号锚，其余照台账"),
+                                "③ 分批：先按已量过的料号锚，其余照台账 —— 引擎已经能按料号执行 "
+                                "（hybrid 走料号级乘子 map，覆盖多少行会在读数里点名），"
+                                "选它不需要再等开发"),
             "prefilled_evidence": ("样本：" + "、".join(
                 f"{e['material_code']} 台账 {e['ledger_days']} 天 vs 实测中位 "
                 f"{e['measured_median_days']} 天（{e['po_count']} 张单，{e['ratio']:g}×）"
@@ -602,7 +604,8 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
         declared_anchor = {"verdict": declared.get("verdict"), "status": declared.get("status"),
                            "statement": declared.get("statement"),
                            "anchor_available": ratio.get("anchor"),
-                           "note": "锚定口径已定，所以不再问；引擎每次抽样都按这个口径取中心，"
+                           "note": "锚定口径已定，所以不再问；引擎每次抽样都按这个口径取中心"
+                                   "（hybrid 则按料号级乘子 map，中心留 1.0），"
                                    "读数里带 lead_anchor.basis。要改口径用 record_factory_rule 覆盖"}
     return {"questions": out, "coverage": cov,
             "answer_how": ("同 capacity 口径这类问题，回答后用 record_factory_rule 落成 declared 规则；"

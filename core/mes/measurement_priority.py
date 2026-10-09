@@ -27,8 +27,10 @@ MEASURED_RATIO_SQL = text("""
         WHERE factory_id = :fid AND order_date IS NOT NULL AND actual_date IS NOT NULL
           AND actual_date >= order_date
         GROUP BY material_code),
-    led AS (SELECT material_code, lead_time_days FROM materials WHERE factory_id = :fid)
+    led AS (SELECT material_code, lead_time_days, make_or_buy
+            FROM materials WHERE factory_id = :fid)
     SELECT po.material_code, led.lead_time_days AS ledger_days, po.n, po.measured::float AS measured_days,
+           led.make_or_buy AS make_or_buy,
            po.measured::float / NULLIF(led.lead_time_days, 0) AS ratio
     FROM po LEFT JOIN led ON led.material_code = po.material_code
     WHERE led.lead_time_days > 0
@@ -75,6 +77,39 @@ async def lead_ratio_census(db: AsyncSession, factory_id: str) -> Dict[str, Any]
         "caveat": ("实测 0 天的行＝收货记录缺失或同日进出，不是快；单张单的料号只算样本不算依据。"
                    "两者都不进 anchor，所以 anchor 可能比『全部行的中位数』更极端 —— 那不是挑数据，"
                    "是不肯把缺失当观测"),
+    }
+
+
+LEDGER_BUY_COUNT_SQL = text("""
+    SELECT count(*) AS n FROM materials
+    WHERE factory_id = :fid AND make_or_buy = '外购'
+      AND lead_time_days IS NOT NULL AND lead_time_days > 0
+""")
+
+
+async def measured_lead_factors(db: AsyncSession, factory_id: str, *,
+                                min_po: int = 2) -> Dict[str, Any]:
+    """hybrid 口径要的料号级乘子：量过的按自己的实测÷台账，没量过的保持台账。
+
+    只给乘子，不猜值：没有实测的料号一个都不进 map，覆盖多少就说多少。
+    分子分母同人群 —— 只算外购件，因为引擎只对缺料的外购行按提前期排到货日。
+    """
+    rows = [(str(r["material_code"]), float(r["measured_days"]), int(r["n"] or 0),
+             float(r["ratio"]), str(r["make_or_buy"] or ""))
+            for r in (await db.execute(MEASURED_RATIO_SQL, {"fid": factory_id})).mappings().all()
+            if r["ratio"] is not None]
+    usable = [(c, m, n, rt) for c, m, n, rt, kind in rows
+              if rt > 0 and n >= int(min_po) and kind == "外购"]
+    ledger = int((await db.execute(LEDGER_BUY_COUNT_SQL, {"fid": factory_id})).scalar() or 0)
+    return {
+        "factory_id": factory_id,
+        "factors": {c: round(rt, 4) for c, _m, _n, rt in usable},
+        "measured_days": {c: round(m, 1) for c, m, _n, _rt in usable},
+        "codes": len(usable), "ledger_rows_with_lead": ledger,
+        "coverage": round(len(usable) / max(1, ledger), 6),
+        "min_po": int(min_po),
+        "caveat": ("map 里每一条都是这个料号自己的实测÷台账；其余料号按定义保持台账值。"
+                   f"覆盖 {len(usable)}/{ledger} 行外购件 —— 覆盖低是事实，不是可以顺手抹平的东西"),
     }
 
 

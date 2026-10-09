@@ -141,10 +141,11 @@ def _days_between(later: Optional[str], earlier: Optional[str]) -> Optional[int]
 
 async def _run_one(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
                    policy: Dict[str, Any], *, attendance: float,
-                   perturb: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+                   perturb: Optional[Dict[str, float]] = None,
+                   factor_map: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     scan = await vr.scan_policies(db, factory_id, targets, policies=[policy],
                                   scenarios=[{"name": "基准", "attendance": attendance}],
-                                  perturb=perturb or {})
+                                  perturb=perturb or {}, lead_factor_map=factor_map)
     return _metrics(scan)
 
 
@@ -778,9 +779,9 @@ async def resolve_lead_anchor(db: AsyncSession, factory_id: str, *,
                              census: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """提前期分布该锚在哪：厂里 declared 的规则优先；没人定过就按台账抽，并把"未校准"说在明处。
 
-    这一格不做决定：`measured` 才挪中心，`ledger`/没规则都留在 1.0，但后者的读数必须带
-    "实测说偏 N×、口径还没人拍"。`hybrid`（只锚已量过的料号）现在实现不了 ——
-    引擎只有一个整批中心旋钮，按它猜一个数等于替厂里做主。
+    这一格不做决定：`measured` 挪整批中心，`hybrid` 只挪已量过的料号（各自实测÷台账，
+    中心仍 1.0），`ledger`/没规则都留在 1.0，但后者的读数必须带"实测说偏 N×、口径还没人拍"。
+    hybrid 的 map 为空时落回 ledger 并明说"不假装做过校准" —— 口径定了不等于数据够了。
     """
     from core.mes.factory_rules import binding_rules
     from core.mes.measurement_priority import lead_ratio_census
@@ -806,9 +807,19 @@ async def resolve_lead_anchor(db: AsyncSession, factory_id: str, *,
                 "basis": "规则说按实测锚，可现在没有可用的非零校准比 —— 不能假装锚过，"
                          "回到台账抽并说明缺什么"}
     if verdict == "hybrid":
+        from core.mes.measurement_priority import measured_lead_factors
+
+        fm = await measured_lead_factors(db, factory_id)
+        if fm["factors"]:
+            return {**base, "center": 1.0, "in_force": "hybrid", "calibrated": True,
+                    "factor_map": fm["factors"], "map_codes": fm["codes"],
+                    "map_coverage": fm["coverage"],
+                    "basis": (f"料号级锚定：已量过的 {fm['codes']} 个料号按各自实测÷台账"
+                              f"（覆盖 {fm['coverage']:.1%} of {fm['ledger_rows_with_lead']} 行有提前期的外购料号），"
+                              "其余按台账 —— 两边都不猜")}
         return {**base, "center": 1.0, "in_force": "ledger", "calibrated": False,
-                "basis": "hybrid 要按料号分别锚，引擎现在只有『整批中心』这一个旋钮 —— "
-                         "先按台账；要实现 hybrid 得先让抽样支持料号级乘子"}
+                "basis": "口径是 hybrid，但现在没有任何料号有 po≥2 的非零实测 —— map 是空的，"
+                         "按定义就是全按台账，不假装做过校准"}
     if verdict == "ledger":
         return {**base, "center": 1.0, "in_force": "ledger", "calibrated": False,
                 "basis": f"厂里定的口径：按台账锚（对外读数要标未校准；实测说偏 {anchor or '—'}×）"}
@@ -855,18 +866,26 @@ async def _risk_setup(db: AsyncSession, factory_id: str, models: List[str], *,
                       "crew_attendance_levels": list(RISK_ATTENDANCE_LEVELS),
                       "equipment_plus_minus": 0.02},
             "lead_center": float(lead_center), "lead_anchor": anchor_meta,
+            "lead_factor_map": anchor_meta.get("factor_map") or {},
             "draws": _risk_draws(n, seed, lead_band=lead_band, hours_band=hours_band,
                                  base_equip=base_eq, lead_center=lead_center)}
 
 
 async def _sample_rows(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
-                       one_policy: Dict[str, Any], draws: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按给定抽次序列逐抽推演一次（同序，所以两条政策/两种带宽的行能逐抽相减）。"""
+                       one_policy: Dict[str, Any], draws: List[Dict[str, Any]], *,
+                       factor_map: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+    """按给定抽次序列逐抽推演一次（同序，所以两条政策/两种带宽的行能逐抽相减）。
+
+    `factor_map` 是料号级额外乘子（hybrid 口径）。只在真的有时才往下传 ——
+    已有的假 `_run_one` 不认这个参数，凭空多一个 kwarg 会把一片测试打翻，
+    而那不属于本次改动的语义。
+    """
+    extra = {"factor_map": factor_map} if factor_map else {}
     rows: List[Dict[str, Any]] = []
     for d in draws:
         perturb = {k: v for k, v in d.items() if k != "attendance"}
         m = await _run_one(db, factory_id, targets, one_policy,
-                           attendance=d["attendance"], perturb=perturb)
+                           attendance=d["attendance"], perturb=perturb, **extra)
         rows.append({"attendance": d["attendance"], **perturb, "binding": m.get("binding"),
                      "finish_date": m.get("finish_date"),
                      "days_late_worst": (float(m["days_late_worst"])
@@ -907,7 +926,7 @@ async def schedule_risk(db: AsyncSession, factory_id: str, models: List[str], *,
                   "没有引入新的分布假设，种子固定可重算。")
 
     async def sample(one_policy: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return await _sample_rows(db, factory_id, setup["targets"], one_policy, setup["draws"])
+        return await _sample_rows(db, factory_id, setup["targets"], one_policy, setup["draws"], factor_map=setup["lead_factor_map"] or None)
 
     base_rows = await sample(pol)
     out = _risk_summary(base_rows, factory_id=factory_id, models=models, policy_name=pol["name"],
@@ -1032,7 +1051,7 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
                   "其余因子逐抽原样 —— 所以差值是这条数据的，不是抽样的。")
 
     async def run(draws: List[Dict[str, Any]], name: str) -> Dict[str, Any]:
-        rows = await _sample_rows(db, factory_id, setup["targets"], pol, draws)
+        rows = await _sample_rows(db, factory_id, setup["targets"], pol, draws, factor_map=setup["lead_factor_map"] or None)
         return _risk_summary(rows, factory_id=factory_id, models=models, policy_name=name,
                              samples=n, seed=seed, bands=bands, with_date_note=basis_note)
 
@@ -1268,7 +1287,7 @@ async def crew_margin_for_p90(db: AsyncSession, factory_id: str, models: List[st
 
     async def one(k: float) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         rows = await _sample_rows(db, factory_id, setup["targets"], {**pol, "crew_bonus": float(k)},
-                                  setup["draws"])
+                                  setup["draws"], factor_map=setup["lead_factor_map"] or None)
         return rows, _risk_summary(rows, factory_id=factory_id, models=models,
                                    policy_name=f"{pol['name']}＋加人 {k:.0%}", samples=n, seed=seed,
                                    bands=bands, with_date_note=note)
@@ -1458,7 +1477,7 @@ async def promise_headroom(db: AsyncSession, factory_id: str, models: List[str],
     options: List[Dict[str, Any]] = []
     for pol in (policies or PROMISE_POLICIES):
         name = str(pol.get("name") or "政策")
-        rows = await _sample_rows(db, factory_id, setup["targets"], pol, setup["draws"])
+        rows = await _sample_rows(db, factory_id, setup["targets"], pol, setup["draws"], factor_map=setup["lead_factor_map"] or None)
         s = _risk_summary(rows, factory_id=factory_id, models=models, policy_name=name,
                           samples=n, seed=seed, bands=bands, with_date_note=note)
         if base_rows is None:
@@ -1581,7 +1600,7 @@ async def volume_ceiling_for_promise(db: AsyncSession, factory_id: str, models: 
     for r in ladder:
         scaled = [{**t, "units": max(1, int(round(float(t.get("units") or 0) * float(r))))}
                   for t in setup["targets"]]
-        rows = await _sample_rows(db, factory_id, scaled, pol, setup["draws"])
+        rows = await _sample_rows(db, factory_id, scaled, pol, setup["draws"], factor_map=setup["lead_factor_map"] or None)
         s = _risk_summary(rows, factory_id=factory_id, models=models,
                           policy_name=f"{pol['name']}·量 {r:.0%}", samples=n, seed=seed,
                           bands=bands, with_date_note=note)
@@ -1899,7 +1918,7 @@ async def expedite_price_by_part(db: AsyncSession, factory_id: str, models: List
             "到岗/带宽逐抽原样 —— 所以天数差是加急的，不是抽样的。")
 
     async def sample(one_policy: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        rows = await _sample_rows(db, factory_id, setup["targets"], one_policy, setup["draws"])
+        rows = await _sample_rows(db, factory_id, setup["targets"], one_policy, setup["draws"], factor_map=setup["lead_factor_map"] or None)
         return rows, _risk_summary(rows, factory_id=factory_id, models=models,
                                    policy_name=one_policy.get("name") or "政策", samples=n,
                                    seed=seed, bands=bands, with_date_note=note)
@@ -2045,6 +2064,74 @@ def _center_word(center: float) -> str:
     return "台账值" if abs(float(center) - 1.0) < 1e-9 else "实测校准比"
 
 
+async def hybrid_reach(db: AsyncSession, factory_id: str, targets: List[Dict[str, Any]],
+                       factors: Dict[str, float]) -> Dict[str, Any]:
+    """料号级 map 够不够得着这几台机：按引擎自己那条 BOM/库存路径复算"决定开工日那一档"。
+
+    覆盖率高不等于碰得到交期 —— map 里的件如果不在缺料最长那一档（或根本不在引擎实际吃的
+    BOM 行里，比如量的是演示料号而引擎吃镜像 SAP 料号），hybrid 一天也挪不动。反过来，
+    量过的件即便只是并列最长档里的一个，只要它的实测比台账大，那一档就被它抬高 ——
+    所以判据是"按 map 重算的最长档 vs 台账最长档差几天"，不是"有没有量过某个件"。
+    """
+    per_model: List[Dict[str, Any]] = []
+    for t in targets:
+        model = str(t.get("model_code"))
+        units = float(t.get("units") or 0)
+        got = await vr.sim_bom_lines(db, factory_id, model, units)
+        bom = got.get("rows") or []
+        codes = [str(r["material_code"]) for r in bom]
+        stock = {str(r["material_code"]): float(r["available"] or 0)
+                 for r in ((await db.execute(vr.STOCK_SQL, {"fid": factory_id, "codes": codes})).mappings().all()
+                           if codes else [])}
+        short_leads: List[Tuple[str, int]] = []
+        for r in bom:
+            code = str(r["material_code"])
+            need = float(r.get("qty_per_unit") or 0) * units
+            if need <= 0 or str(r.get("make_or_buy")) != "外购" or not str(r.get("lead_time_days") or "").isdigit():
+                continue
+            if need - float(stock.get(code, 0.0)) <= 0:
+                continue
+            short_leads.append((code, int(r["lead_time_days"])))
+        base_max = max((l for _c, l in short_leads), default=None)
+        # 与 build_kit 同一把尺：逐件放大后取最长，四舍五入到整天
+        hyb_max = (max((int(round(l * float((factors or {}).get(c, 1.0)))) for c, l in short_leads), default=None)
+                   if base_max is not None else None)
+        binding_all = sorted({c for c, l in short_leads if l == base_max}) if base_max is not None else []
+        # 并列最长档可能有几百件（台账是按类别铺的），全列出来会把响应撑爆；点名前 6 件并报总数
+        per_model.append({
+            "model_code": model, "units": round(units, 1), "bom_rows": len(bom),
+            "bom_source": got.get("source"), "short_buy_rows": len(short_leads),
+            "max_short_lead_days": base_max, "hybrid_max_lead_days": hyb_max,
+            "moved_days": (None if base_max is None or hyb_max is None else hyb_max - base_max),
+            "binding_parts": binding_all[:6], "binding_parts_total": len(binding_all),
+            "measured_in_bom": sorted({c for c in codes if c in (factors or {})}),
+            "measured_at_binding": sorted(set(binding_all) & set(factors or {})),
+        })
+    moved = [m for m in per_model if m["moved_days"]]
+    return {"models_checked": len(per_model), "models_reachable": len(moved),
+            "reachable_models": [m["model_code"] for m in moved],
+            "moved_days_per_model": {m["model_code"]: m["moved_days"] for m in per_model},
+            "binding_parts": {m["model_code"]: m["binding_parts"] for m in per_model},
+            "measured_in_bom_total": sorted({c for m in per_model for c in m["measured_in_bom"]}),
+            "per_model": per_model}
+
+
+
+def _hybrid_tier_word(m: Dict[str, Any]) -> str:
+    """一台机的"决定开工日那一档"怎么说：件数并列就报件数，不把名单截断成看起来像全部。"""
+    total = int(m.get("binding_parts_total") or 0)
+    shown = "/".join(m.get("binding_parts") or [])
+    if not total:
+        tier = "没有缺料的外购行"
+    elif total == 1:
+        tier = shown or "1 件"
+    else:
+        tier = f"{total} 件并列最长档（{shown}" + ("…" if total > len(m.get("binding_parts") or []) else "") + "）"
+    return (f"{m['model_code']}（缺料最长档 {m['max_short_lead_days']} 天＝{tier}，"
+            f"按 map 重算仍是 {m['hybrid_max_lead_days']} 天，BOM 出处 "
+            f"{m.get('bom_source') or '—'}）")
+
+
 async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str], *,
                              samples: int = 12, seed: int = 20261008,
                              policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2062,19 +2149,34 @@ async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str
                             f"可用行 {cal.get('reliable_rows')} 条 —— "
                             f"没有可用实测时分布只能按『台账无偏』抽，这句必须跟着读数一起出去"]}
 
-    async def run_at(center: float) -> Dict[str, Any]:
+    async def run_at(label: str, center: float, factor_map: Optional[Dict[str, float]] = None,
+                     how: str = "", stash: Optional[str] = None) -> Dict[str, Any]:
         setup = await _risk_setup(db, factory_id, models, samples=samples, seed=seed,
                                   lead_center=center)
-        rows = await _sample_rows(db, factory_id, setup["targets"], pol, setup["draws"])
-        return _risk_summary(rows, factory_id=factory_id, models=models, policy_name=pol["name"],
+        if stash:
+            stashed[stash] = setup
+        rows = await _sample_rows(db, factory_id, setup["targets"], pol, setup["draws"],
+                                  factor_map=factor_map or None)
+        return _risk_summary(rows, factory_id=factory_id, models=models, policy_name=label,
                              samples=setup["n"], seed=seed, bands=setup["bands"],
-                             with_date_note=f"提前期中心锚在 {center:g}（{_center_word(center)}）")
+                             with_date_note=(f"提前期锚定＝{label}：中心 {center:g}"
+                                             f"＋料号级乘子 {len(factor_map or {})} 条 {how}"))
 
-    ledger = await run_at(1.0)
-    measured = await run_at(float(cal["anchor"]))
-    if ledger.get("status") != "ok" or measured.get("status") != "ok":
+    from core.mes.measurement_priority import measured_lead_factors
+
+    stashed: Dict[str, Any] = {}
+    fm = await measured_lead_factors(db, factory_id)
+    ledger = await run_at("按台账（未校准）", 1.0, None, "（全按台账）", stash="ledger")
+    measured = await run_at("整批按实测中位", float(cal["anchor"]), None,
+                            f"（中心×{cal['anchor']:g}，所有外购件一起放大）")
+    hybrid = await run_at("料号级 hybrid", 1.0, fm["factors"],
+                          f"（只有量过的 {fm['codes']} 个料号按各自实测，其余按台账）")
+    reach = (await hybrid_reach(db, factory_id, stashed["ledger"]["targets"], fm["factors"])
+             if (fm["factors"] and db is not None) else None)
+    if (ledger.get("status") != "ok" or measured.get("status") != "ok"
+            or hybrid.get("status") != "ok"):
         return {"status": "no_dates", "calibration": cal,
-                "reading": ["锚定对比没跑成：至少一边抽不出完工日 —— 不给差值"]}
+                "reading": ["锚定对比没跑成：三种锚里至少一边抽不出完工日 —— 不给差值"]}
 
     def _shift(a: Dict[str, Any], b: Dict[str, Any], pct: int) -> Optional[int]:
         pa = next((p for p in a["percentiles"] if int(p["percentile"]) == pct), None)
@@ -2084,7 +2186,59 @@ async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str
         return (date.fromisoformat(str(pb["finish_date"])) - date.fromisoformat(str(pa["finish_date"]))).days
 
     p50_shift, p90_shift = _shift(ledger, measured, 50), _shift(ledger, measured, 90)
+    hyb_p50, hyb_p90 = _shift(ledger, hybrid, 50), _shift(ledger, hybrid, 90)
+    modes = [
+        {"mode": "ledger", "label": "按台账（未校准）",
+         "p50": ledger["percentiles"][1]["finish_date"], "p90": ledger["percentiles"][2]["finish_date"],
+         "p_on_time": ledger["p_on_time"], "p50_shift_days": 0, "p90_shift_days": 0,
+         "meaning": "所有外购件的提前期都按台账值抽，中心 1.0"},
+        {"mode": "global_measured", "label": "整批按实测中位",
+         "p50": measured["percentiles"][1]["finish_date"], "p90": measured["percentiles"][2]["finish_date"],
+         "p_on_time": measured["p_on_time"], "p50_shift_days": p50_shift, "p90_shift_days": p90_shift,
+         "meaning": f"中心锚到非零中位 {cal['anchor']:g}×，量过的与没量过的一起放大"},
+        {"mode": "hybrid", "label": "料号级 hybrid",
+         "p50": hybrid["percentiles"][1]["finish_date"], "p90": hybrid["percentiles"][2]["finish_date"],
+         "p_on_time": hybrid["p_on_time"], "p50_shift_days": hyb_p50, "p90_shift_days": hyb_p90,
+         "meaning": (f"只把量过的 {fm['codes']} 个料号按各自实测÷台账（覆盖 "
+                     f"{fm['coverage']:.1%} of {fm['ledger_rows_with_lead']} 行），其余保持台账值")},
+    ]
     drop_pp = round(100.0 * (float(ledger["p_on_time"]) - float(measured["p_on_time"])), 1)
+    on_time_change_pp = round(100.0 * (float(measured["p_on_time"]) - float(ledger["p_on_time"])), 1)
+    hyb_change_pp = round(100.0 * (float(hybrid["p_on_time"]) - float(ledger["p_on_time"])), 1)
+    # 两种"按实测"的差不是模型分歧，是有多少件真被量过：这一句要说清差在哪一档、点名到件
+    unmeasured = int(fm["ledger_rows_with_lead"]) - int(fm["codes"])
+    moved_named = "、".join(
+        "{0} 最长档 {1}→{2} 天".format(m["model_code"], m["max_short_lead_days"], m["hybrid_max_lead_days"])
+        for m in (reach or {}).get("per_model", []) if m.get("moved_days"))
+    if reach and not reach["models_reachable"]:
+        named = "、".join(_hybrid_tier_word(m) for m in reach["per_model"])
+        between = (f"hybrid 在这几台机上一天也挪不动（P90 {hyb_p90:+g} 天）：量过的料号没有一个决定"
+                   f"最长档 —— {named}；map 的 {fm['codes']} 个料号里出现在引擎实际吃的 BOM 的只有 "
+                   f"{len(reach['measured_in_bom_total'])} 个。要让 hybrid 动交期，得去量上面点名的那一档，"
+                   f"而不是把中位乘到剩下 {unmeasured} 行上")
+    elif reach:
+        still = [_hybrid_tier_word(m) for m in reach["per_model"] if not m.get("moved_days")]
+        still_txt = "、".join(still)
+        between = (f"hybrid 挪了 P90 {hyb_p90:+g} 天、整批锚挪 {p90_shift:+g} 天："
+                   f"{reach['models_reachable']}/{reach['models_checked']} 台机的最长档被 map 改了"
+                   f"（{moved_named}）")
+        if still:
+            between += (f"；另 {len(still)} 台一天没动 —— {still_txt}"
+                        "（交付取的是最坏那台，只要还有一台的档没被碰到，整体 P50/P90 就不动）")
+        between += f"。还有 {unmeasured} 行外购件没被量过，map 碰不到它们，按定义保持台账值"
+        if hyb_p90 is not None and float(hyb_p90) < 0:
+            between += ("；方向是往前 —— 台账把已量过的这件写长了，按台账推演是在低估这几台机的交付能力"
+                        f"（hybrid 让准点概率 {hyb_change_pp:+g}pp）")
+    elif hyb_p90 is None or p90_shift is None:
+        between = "hybrid 与整批锚的差值有一个取不到完工日，不排先后"
+    elif abs(float(hyb_p90)) < abs(float(p90_shift)):
+        between = (f"hybrid 只把 P90 挪了 {hyb_p90} 天，整批锚挪了 {p90_shift} 天 —— "
+                   f"差出来的 {abs(int(p90_shift)) - abs(int(hyb_p90))} 天是还没量过的料号；"
+                   "要把它们从台账口径挪走只能逐料号量，不是把中位乘到所有件上"
+                   f"（没核到 hybrid 碰不碰得到这几台机的最长档：没有库会话）")
+    else:
+        between = (f"hybrid 把 P90 挪了 {hyb_p90} 天，不低于整批锚的 {p90_shift} 天 —— "
+                   "已量过的这几件偏得比中位还狠，剩下未量的仍按台账")
     out = {
         "status": "ok", "factory_id": factory_id, "models": models, "samples": samples, "seed": seed,
         "calibration": cal, "anchor": float(cal["anchor"]),
@@ -2097,18 +2251,27 @@ async def calibration_impact(db: AsyncSession, factory_id: str, models: List[str
                         "p_on_time": measured["p_on_time"], "promise_date": measured["promise_date"],
                         "rough_days": measured["rough_days"]},
         "p50_shift_days": p50_shift, "p90_shift_days": p90_shift,
-        "on_time_drop_pp": drop_pp,
+        "modes": modes, "hybrid": {"map_codes": fm["codes"], "coverage": fm["coverage"],
+                                   "ledger_rows_with_lead": fm["ledger_rows_with_lead"],
+                                   "min_po": fm["min_po"], "caveat": fm["caveat"],
+                                   "p_on_time_change_pp": hyb_change_pp, "reach": reach},
+        "on_time_drop_pp": drop_pp, "on_time_change_pp": on_time_change_pp,
         "default_unchanged": True,
         "reading": [
             f"校准依据：{cal['reliable_rows']}/{cal['rows']} 条能算依据（po≥2 且非零），"
             f"非零中位 {cal['median_ratio_nonzero']:g}×（p25 {cal['spread_nonzero']['p25']}、"
             f"p75 {cal['spread_nonzero']['p75']}）；另有 {cal['zero_ratio_rows']} 条实测 0 天被排除",
-            f"按台账锚：P50={ledger['percentiles'][1]['finish_date']}、"
+            f"三种锚定的对照（同一串抽样、只换锚）：按台账 P50={ledger['percentiles'][1]['finish_date']}、"
             f"P90={ledger['percentiles'][2]['finish_date']}、准点 {ledger['p_on_time']:.0%}；"
-            f"按实测锚：P50={measured['percentiles'][1]['finish_date']}、"
-            f"P90={measured['percentiles'][2]['finish_date']}、准点 {measured['p_on_time']:.0%}",
-            f"差值：P50 后移 {p50_shift} 天、P90 后移 {p90_shift} 天、"
-            f"准点概率掉 {drop_pp:g}pp —— 这几天不是新增的不确定，是台账偏乐观的系统性偏差",
+            f"整批按实测中位 P50={measured['percentiles'][1]['finish_date']}、"
+            f"P90={measured['percentiles'][2]['finish_date']}、准点 {measured['p_on_time']:.0%}；"
+            f"料号级 hybrid P50={hybrid['percentiles'][1]['finish_date']}、"
+            f"P90={hybrid['percentiles'][2]['finish_date']}、准点 {hybrid['p_on_time']:.0%}",
+            f"差值（都相对按台账，正数＝后移）：整批锚 P50 {p50_shift:+g} 天、P90 {p90_shift:+g} 天、"
+            f"准点 {on_time_change_pp:+g}pp；料号级 hybrid P50 {hyb_p50:+g} 天、P90 {hyb_p90:+g} 天、"
+            f"准点 {hyb_change_pp:+g}pp（map 覆盖 {fm['codes']}/{fm['ledger_rows_with_lead']} 个有提前期的外购料号）"
+            f"—— 整批那 {p90_shift:+g} 天不是新增的不确定，是台账偏乐观的系统性偏差",
+            between,
             "默认锚定没改（这一格只算差值）：要不要按实测承诺是厂里的口径，"
             f"但既然现场量出来是 {cal['median_ratio_nonzero']:g}×，继续按台账报 P90 就是在报一个已知偏乐观的数",
         ],

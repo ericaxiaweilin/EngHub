@@ -1390,15 +1390,25 @@ def _calib_env(monkeypatch, *, anchor=2.0, rows=6):
                             "components": {"lead_time": {"score": 1.0},
                                            "hours": {"score": 1.0, "basis": "route_standard_hours"}}}]}
 
-    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None, factor_map=None):
         d = perturb or {}
-        late = round(20.0 * float(d.get("lead_multiplier", 1.0)) * (2.0 - float(attendance)) - 25.0, 1)
+        # 假件按 map 的平均倍数放大（真引擎是逐料号各按自己的实测÷台账）
+        fm = (sum((factor_map or {}).values()) / len(factor_map)) if factor_map else 1.0
+        late = round(20.0 * float(d.get("lead_multiplier", 1.0)) * float(fm)
+                     * (2.0 - float(attendance)) - 25.0, 1)
         return {"finish_date": str(date(2026, 11, 1) + timedelta(days=int(late))),
                 "days_late_worst": late, "days_late_per_model": {"M-1": late},
                 "labor_cost_usd": 100.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
                 "binding": "material_arrival", "bottleneck_parts": {}, "lines_used": [],
                 "material_arrival_days": {}, "capacity_line_declared_max": 0.0,
                 "crew_before_staffing_sum": 100.0, "crew_effective_sum": 90.0}
+
+    async def fake_factors(db, fid, *, min_po=2):
+        return {"factors": {"RM-A": 2.0, "RM-B": 4.0}, "measured_days": {}, "codes": 2,
+                "ledger_rows_with_lead": 6, "coverage": 2 / 6, "min_po": min_po,
+                "caveat": "map 里每条都是自己的实测÷台账"}
+
+    monkeypatch.setattr("core.mes.measurement_priority.measured_lead_factors", fake_factors)
 
     async def fake_cal(db, fid):
         if anchor is None:
@@ -1430,6 +1440,9 @@ def test_calibration_impact_shifts_the_centre_not_the_band(monkeypatch):
     assert any("系统性偏差" in x for x in out["reading"])
     assert any("默认锚定没改" in x for x in out["reading"])
     assert "中心是" in out["method"] and "带宽是" in out["method"], "中心与带宽必须分开说"
+    modes = {m["mode"]: m for m in out["modes"]}
+    assert set(modes) == {"ledger", "global_measured", "hybrid"} and modes["hybrid"]["p90"]
+    assert out["hybrid"]["map_codes"] == 2 and out["hybrid"]["ledger_rows_with_lead"] == 6
 
 
 def test_calibration_impact_refuses_to_anchor_without_evidence(monkeypatch):

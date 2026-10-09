@@ -412,8 +412,15 @@ def hours_per_unit_from(route: List[Dict[str, Any]], line: Optional[Dict[str, An
 
 def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
               start_day: int, *, lead_multiplier: float = 1.0,
-              stock_multiplier: float = 1.0) -> Dict[str, Any]:
-    """齐套与到货计划：外购按提前期到料，自制件先记 needing（由子件满足）。"""
+              stock_multiplier: float = 1.0,
+              lead_factor_map: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """齐套与到货计划：外购按提前期到料，自制件先记 needing（由子件满足）。
+
+    `lead_factor_map` 是料号级的额外乘子（hybrid 口径：已量过的按实测、其余按台账），
+    与整批的 `lead_multiplier` 相乘 —— 一个是"这批还剩多少没量"，一个是"抽样怎么动"。
+    """
+    def _lead_mult(code: Any) -> float:
+        return max(0.0, float(lead_multiplier)) * float((lead_factor_map or {}).get(str(code), 1.0))
     lines: List[Dict[str, Any]] = []
     buy_arrival_days: List[int] = []
     kit_lead_max: List[Optional[int]] = [None]
@@ -444,7 +451,7 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
         else:
             cost_unknown += 1
         if short > 0 and str(lead or "").isdigit() and kind == "外购":
-            lead_days = max(0, int(round(int(lead) * max(0.0, float(lead_multiplier)))))
+            lead_days = max(0, int(round(int(lead) * _lead_mult(code))))
             if lead_days >= (kit_lead_max[0] or -1):
                 kit_lead_max[0] = lead_days
                 kit_bottleneck[0] = {"material_code": code, "lead_time_days": lead_days,
@@ -456,7 +463,7 @@ def build_kit(bom: List[Dict[str, Any]], units: float, stock: Dict[str, float],
         if short > 0:
             if kind == "外购":
                 if str(lead or "").isdigit() and int(lead) >= 0:
-                    scaled = max(0, int(round(int(lead) * max(0.0, float(lead_multiplier)))))
+                    scaled = max(0, int(round(int(lead) * _lead_mult(code))))
                     arrival_day = start_day + scaled
                     buy_arrival_days.append(arrival_day)
                     entry["arrival_day"] = arrival_day
@@ -698,6 +705,7 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
                      line_busy_days: float = 0.0, equip_rate: float = 1.0,
                      hours_multiplier: float = 1.0, lead_multiplier: float = 1.0,
                      stock_multiplier: float = 1.0, batches: int = 1,
+                     lead_factor_map: Optional[Dict[str, float]] = None,
                      changeover_hours: float = 0.0,
                      line_staffing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """把一个目标跑成一条演变时间线。"""
@@ -732,7 +740,7 @@ async def run_target(db: AsyncSession, factory_id: str, model: str, units: float
         hours_per_unit = round(hours_per_unit * max(0.05, float(hours_multiplier)), 6)
 
     kit = build_kit(bom, units, stock, start_day=0, lead_multiplier=lead_multiplier,
-                    stock_multiplier=stock_multiplier)
+                    stock_multiplier=stock_multiplier, lead_factor_map=lead_factor_map)
     if expedite_lead_days is not None and kit["bottleneck_part"]:
         kit["buy_arrival_days"] = [expedite_lead_days if d == kit["bottleneck_part"]["lead_time_days"] else d
                                    for d in kit["buy_arrival_days"]]
@@ -2305,6 +2313,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                         scenarios: Optional[List[Dict[str, Any]]] = None,
                         targets_by_scenario: Optional[Dict[str, List[Dict[str, Any]]]] = None,
                         perturb: Optional[Dict[str, float]] = None,
+                        lead_factor_map: Optional[Dict[str, float]] = None,
                         with_constraints: bool = False,
                         enforce_constraints: bool = True) -> Dict[str, Any]:
     """让引擎自己扫政策组合：同一批目标在多种产能/出勤/采购/分批政策下的多目标结果。
@@ -2388,6 +2397,7 @@ async def scan_policies(db: AsyncSession, factory_id: str, targets: List[Dict[st
                                                     or equip.get("rate") or 1.0),
                                    hours_multiplier=float((perturb or {}).get("hours_multiplier", 1.0)),
                                    lead_multiplier=float((perturb or {}).get("lead_multiplier", 1.0)),
+                                   lead_factor_map=lead_factor_map,
                                    stock_multiplier=float((perturb or {}).get("stock_multiplier", 1.0)),
                                    batches=int((perturb or {}).get("batches", 1)),
                                    changeover_hours=float((perturb or {}).get("changeover_hours",
