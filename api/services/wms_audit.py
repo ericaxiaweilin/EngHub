@@ -15,6 +15,7 @@ wms_transfer_requests / wms_rfid_tags / wms_automation_jobs）。
 """
 from __future__ import annotations
 
+import io
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +28,78 @@ def _grade(state: str, name: str, reads: str, *, so_what: str = "",
            missing: str = "") -> Dict[str, Any]:
     return {"capability": name, "state": state, "reads": reads,
             "so_what": so_what, "missing": missing or None}
+
+# ── 表有没有"对象"：三态要分开，别把"没实现"读成"没人用" ────────────────────
+# 10-09 实测：光看 `Base.metadata` 会误判 —— `inventory_freezes` / `stock_alerts` /
+# `wms_transfer_requests` / `safety_stock_config` 都没映射成 ORM 对象，但代码在用它们（裸 SQL）。
+# 而 `wms_barcodes` / `wms_inventory_pools` / `wms_inventory_pool_members` / `wms_rfid_tags` /
+# `wms_automation_jobs` 是**全仓零引用**：没对象、没裸 SQL、没端点。
+# 两种"空表"不是一回事：前者是实现没人走，后者是功能从没实现过。
+WMS_DOMAIN_TABLES = ("locations", "warehouses", "inventory", "inventory_freezes",
+                     "inventory_counts", "inventory_count_items", "stock_alerts",
+                     "safety_stock_config", "wms_barcodes", "wms_inventory_pools",
+                     "wms_inventory_pool_members", "wms_rfid_tags", "wms_automation_jobs",
+                     "wms_transfer_requests")
+
+
+def classify_table(name: str, *, in_db: bool, mapped: bool, referenced: bool) -> str:
+    """一张 WMS 表的三态判词（纯函数，两个方向都要测）。
+
+    · wired        —— 有 ORM 对象；
+    · raw_sql_only —— 没对象，只有裸 SQL 在读写：能用，但没有可挂属性/校验/界面的对象；
+    · orphan       —— 库里建了表、代码里一个引用都没有：这功能从没实现过；
+    · missing      —— 连表都不在库里（不许把"没有这张表"读成"0 行的空表"）。
+    """
+    if not in_db:
+        return "missing"
+    if mapped:
+        return "wired"
+    if referenced:
+        return "raw_sql_only"
+    return "orphan"
+
+
+_CODE_ROOTS = ("api", "core", "database", "integrations")
+_scan_cache: dict = {}
+
+
+def table_references():
+    """扫挂载在进程里的源码，返回"被引用过的 WMS 表名"集合；扫不动返回 None。
+
+    两个坑：
+    ① **排除本模块** —— 我的 docstring 里点名了这些表，留着就是自己证明自己存在；
+    ② 扫不到必须说"算不出"，不能返回空集 —— 空集会被读成"这些表全是 orphan"，
+       那正是把"测不出"当"没有"。容器只挂 api/core/database/integrations（scripts/ 没有），
+       所以这一判据的意思是"运行时代码有没有引用"，不是"仓库里有没有字"。
+    """
+    if "value" in _scan_cache:
+        return _scan_cache["value"]
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    here = os.path.abspath(__file__)
+    found, scanned = set(), 0
+    for top in _CODE_ROOTS:
+        base = os.path.join(root, top)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, fn)
+                if os.path.abspath(path) == here:
+                    continue
+                try:
+                    body = io.open(path, encoding="utf-8", errors="ignore").read()
+                except OSError:
+                    continue
+                scanned += 1
+                for name in WMS_DOMAIN_TABLES:
+                    if name in body:
+                        found.add(name)
+    out = None if scanned == 0 else found
+    _scan_cache["value"] = out
+    return out
 
 
 async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
@@ -306,7 +379,38 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
                 "读成'账实不符'是冤枉现场，也修不了",
         missing="engflow 侧库存导入要有新数 + 带水位线；EngHub 这边镜像要自动跟随（不是手工聚合表）"))
 
-    states = {"live": 0, "thin": 0, "empty": 0, "blocked_on_source": 0, "error": 0}
+
+    # 地基盘点：这些表各自是"有对象 / 只有裸 SQL / 全仓零引用 / 库里没有"。
+    from database.models import Base as _Base
+    refs = table_references()
+    in_db = set((await db.execute(text(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+    )).scalars().all() or [])
+    mapped_now = set(_Base.metadata.tables)
+    verdicts = {}
+    for tb in WMS_DOMAIN_TABLES:
+        verdicts[tb] = classify_table(tb, in_db=tb in in_db, mapped=tb in mapped_now,
+                                      referenced=(tb in refs) if refs is not None else False)
+    orphans = sorted(k for k, v in verdicts.items() if v == "orphan")
+    raws = sorted(k for k, v in verdicts.items() if v == "raw_sql_only")
+    absent = sorted(k for k, v in verdicts.items() if v == "missing")
+    caps.append(_grade(
+        "not_computable" if refs is None else ("thin" if orphans else "live"),
+        "表有没有对象（地基盘点）",
+        (f"扫不到源码目录（挂载里只有 {'/'.join(_CODE_ROOTS)}）—— 这一格算不出，不猜"
+         if refs is None else
+         f"{len(WMS_DOMAIN_TABLES)} 张 WMS 表：有对象 {len(WMS_DOMAIN_TABLES) - len(orphans) - len(raws) - len(absent)} 张、"
+         f"只有裸 SQL {len(raws)} 张（{'、'.join(raws) or '无'}）、"
+         f"全仓零引用 {len(orphans)} 张（{'、'.join(orphans) or '无'}）"
+         + (f"、库里根本没有 {len(absent)} 张（{'、'.join(absent)}）" if absent else "")),
+        so_what="两种'空表'不是一回事：裸 SQL 那几张能用但没有对象（挂不了属性、做不了校验、"
+                "界面上没得点）；零引用那五张是**功能从没实现过**。把'WMS 功能弱'整个归给"
+                "'实现了没人用'是读错了 —— 条码/库存池/RFID/自动化任务这四件事仓库里一行代码都没有",
+        missing="零引用那张清单要么按厂里的需求立项再做，要么从'仓储功能'里划掉；"
+                "不许为了让矩阵好看顺手造一个没人要的条码表"))
+
+    states = {"live": 0, "thin": 0, "empty": 0, "blocked_on_source": 0,
+              "not_computable": 0, "error": 0}
     for c in caps:
         if c.get("reads", "").startswith("Traceback"):
             states["error"] += 1
