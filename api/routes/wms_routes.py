@@ -886,4 +886,36 @@ async def wms_count_status(
 
 
 
+@router.get("/wms/alert-sync", summary="库存报警落库：四把尺各报多少、会新增/关闭几条（默认只算不写）")
+async def wms_alert_sync(
+    factory_id: str,
+    apply: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """`stock_alerts` 一直 0 行：报警是实时算完就丢的，没有"谁处理了"这一格。
+
+    四把尺分开存、不合并 —— 按行声明的补货点只有 111 条会报（94.7% 的补货点是 1），
+    代码里写死的 `<10` 会报 1,260 条，这两个数是两件事，合成一个就要替厂里选阈值。
+    关闭只发生在本轮评估过、且条件已消失的告警上。
+    """
+    del current_user
+    from api.services.stock_alerts import sync_alerts
+
+    return await sync_alerts(db, factory_id, apply=apply)
+
+
+@router.get("/wms/alert-summary", summary="落库后的告警分布：开着/自动消/人处理，按类型分开")
+async def wms_alert_summary(
+    factory_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+    from api.services.stock_alerts import alert_summary
+
+    return await alert_summary(db, factory_id)
+
+
+
 __all__ = ["router"]

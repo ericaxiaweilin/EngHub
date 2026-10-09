@@ -173,6 +173,7 @@ async def _periodic_scheduler():
         "engine_kit_backfill": "_last_engine_kit_backfill",
         "delivery_prediction_ledger": "_last_delivery_ledger",
         "blocked_followup_recheck": "_last_blocked_recheck",
+        "wms_alert_sync": "_last_wms_alert_sync",
     }
     while True:
         did = {}
@@ -503,6 +504,34 @@ async def _periodic_scheduler():
                     }
         except Exception as e:
             _logger.warning(f"[scheduler] 引擎数据缺口巡检异常: {e}")
+
+        # 库存报警落库 —— 每 30 分钟。为什么要有这一道：`stock_alerts` 长期 0 行，
+        # 报警是每次实时算完就丢的，于是"上次那条缺料告警谁处理了、多久处理的"永远答不出。
+        # 四把尺分开存、不合并（按行声明的补货点 vs 代码里写死的 <10 是两件事，
+        # 合成一个数就等于替厂里选阈值）；关闭只发生在本轮评估过且条件已消失的告警上。
+        try:
+            import time as _t_wa
+            if not hasattr(_periodic_scheduler, "_last_wms_alert_sync"):
+                _periodic_scheduler._last_wms_alert_sync = 0
+            if _t_wa.time() - _periodic_scheduler._last_wms_alert_sync > 1800:  # 30min
+                _periodic_scheduler._last_wms_alert_sync = _t_wa.time()
+                from api.services.engine_watchdog import DEFAULT_FACTORY_ID as _WA_FID
+                from api.services.stock_alerts import sync_alerts as _sync_alerts
+                async with db_config.session_factory() as db:
+                    res = await _sync_alerts(
+                        db, _WA_FID,
+                        apply=os.getenv("WMS_ALERT_SYNC_APPLY", "true").lower()
+                            not in {"0", "false", "no", "off"})
+                    did["wms_alert_sync"] = {
+                        "applied": res["apply"], "counts": res["counts"],
+                        "created": res.get("created", 0), "closed": res.get("closed", 0),
+                        "renewed": res["renewed_count"], "left_alone": res["left_alone_count"],
+                        "failed_kinds": res["failed"]}
+                    if res.get("created") or res.get("closed"):
+                        _logger.info(f"[wms-alert] 新增 {res.get('created')} 消 {res.get('closed')}")
+        except Exception as e:
+            # 落库失败只影响"告警有没有历史可查"，不能把整个调度器带停
+            _logger.warning(f"[scheduler] 库存报警落库异常: {e}")
 
         # 齐套行覆盖补齐 —— 每 2 小时补 25 张单（只加不改不删，每张 ≤400 行）。
         # 为什么要自动、为什么闸口放到 400 行：10-08 把一致率按登记深度切开实测是

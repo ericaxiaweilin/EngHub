@@ -144,7 +144,14 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
                        f"inventory_freezes {frz.get('冻结')} 行",
                        so_what="待检、质量拦截、事故封存都没有对象可挂 —— 只能靠口头不让领"))
 
-    alert = await one("SELECT COUNT(*) AS 落库报警 FROM stock_alerts WHERE factory_id = :fid")
+    alert = await one("""
+        SELECT COUNT(*) AS 落库报警,
+               COUNT(*) FILTER (WHERE LOWER(status)='open') AS 开着,
+               COUNT(*) FILTER (WHERE LOWER(status)='resolved'
+                                AND COALESCE(resolved_by,'') LIKE 'system:%') AS 系统自动消,
+               COUNT(*) FILTER (WHERE LOWER(status)='resolved'
+                                AND COALESCE(resolved_by,'') NOT LIKE 'system:%') AS 人处理
+        FROM stock_alerts WHERE factory_id = :fid""")
     below = await one("""
         SELECT COUNT(*) AS 低于补货点, COUNT(*) FILTER (WHERE COALESCE(total_qty,0)=0) AS 其中零库存
         FROM inventory WHERE factory_id=:fid AND COALESCE(reorder_point,0)>0
@@ -159,9 +166,15 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
         so_what="补货这条腿是活的（写 purchase_requests），但报警不落库"))
     caps.append(_grade(
         "empty" if not int(alert.get("落库报警") or 0) else "live", "报警闭环",
-        f"stock_alerts {alert.get('落库报警')} 行 —— 报警是每次实时算的，"
-        "没有「谁在处理 / 处理完了」这一格",
-        so_what="实时算出来的告警不落库，就永远无法回答'上次那条缺料告警谁处理的、多久处理的'"))
+        (f"stock_alerts {alert.get('落库报警')} 行：开着 {alert.get('开着')}、"
+         f"系统重算自动消 {alert.get('系统自动消')}、人处理 {alert.get('人处理')}"
+         if int(alert.get("落库报警") or 0) else
+         "stock_alerts 0 行 —— 报警是每次实时算的，算完就丢，"
+         "没有「谁在处理 / 处理完了」这一格"),
+        so_what="实时算出来的告警不落库，就永远无法回答'上次那条缺料告警谁处理的、多久处理的'；"
+                "落库之后还要能分清'人处理了'与'条件自己消失'，否则自动消警会被读成人已处理",
+        missing=None if int(alert.get("落库报警") or 0)
+        else "GET /api/v1/wms/alert-sync?apply=false 先看四把尺各报多少"))
 
     money = await one("""
         SELECT COUNT(*) AS 行, COUNT(*) FILTER (WHERE COALESCE(unit_cost,0)>0) AS 有单价,
