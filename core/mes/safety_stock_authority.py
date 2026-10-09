@@ -100,6 +100,38 @@ WHERE inv.inv_ss <> mat.mat_ss
 ORDER BY abs(inv.inv_ss - mat.mat_ss) DESC, inv.material_code LIMIT :limit
 """
 
+# 自动补货开出去的单，与引擎当前缺口是否对得上：只看水位不看需求会开出"没人要"的单
+AUTO_PR_SQL = """
+WITH pr AS (
+    SELECT material_code, sum(requested_qty) AS asked, count(*) AS lines,
+           max(created_at)::date AS last_created
+    FROM purchase_requests WHERE factory_id = :fid GROUP BY 1),
+gap AS (
+    SELECT m.material_code, sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) AS need
+    FROM work_order_materials m JOIN work_orders o ON o.id = m.work_order_id
+    WHERE o.factory_id = :fid GROUP BY 1
+    HAVING sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) > 0)
+SELECT (SELECT count(*) FROM pr) AS pr_materials,
+       (SELECT coalesce(sum(lines), 0) FROM pr) AS pr_lines,
+       (SELECT coalesce(sum(asked), 0) FROM pr) AS pr_units,
+       (SELECT count(*) FROM pr WHERE EXISTS (SELECT 1 FROM gap g WHERE g.material_code = pr.material_code)
+                                  OR EXISTS (SELECT 1 FROM work_order_materials m
+                                             WHERE m.material_code = pr.material_code)) AS pr_in_kit_universe,
+       (SELECT count(*) FROM gap) AS gap_materials,
+       (SELECT coalesce(round(sum(need)), 0) FROM gap) AS gap_units,
+       (SELECT count(*) FROM gap g WHERE NOT EXISTS
+            (SELECT 1 FROM pr p WHERE p.material_code = g.material_code)) AS gap_without_request,
+       (SELECT count(*) FROM pr p WHERE NOT EXISTS
+            (SELECT 1 FROM gap g WHERE g.material_code = p.material_code)) AS request_without_gap,
+       (SELECT max(last_created) FROM pr) AS last_created
+"""
+
+
+def _units(value: Any) -> str:
+    """件数别用 :g —— 4.23767e+06 不是人读的数，现场要能一眼看出量级。"""
+    v = float(value or 0)
+    return f"{v:,.0f}" if abs(v) >= 1000 else f"{v:g}"
+
 
 def classify_source(name: str, row: Dict[str, Any], mode_share: float) -> Dict[str, Any]:
     """一处声明一个判定：取值少 + 众数扎堆 = 模板铺的，不是逐料号决定的。"""
@@ -155,8 +187,25 @@ async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
     joined = dict((await db.execute(text(DISAGREE_SQL), {"fid": factory_id})).mappings().first() or {})
     trigger = dict((await db.execute(text(TRIGGER_SQL), {"fid": factory_id})).mappings().first() or {})
     config_rows = int((await db.execute(text(CONFIG_TABLE_SQL), {"fid": factory_id})).scalar() or 0)
-    # 每一格都转成 float：SQL 回来的 Decimal 进不了 chat_messages 的 jsonb，
-    # 一落库就 500 —— 答复文案已经生成好也白搭（实测过一次）
+    raw_auto = (await db.execute(text(AUTO_PR_SQL), {"fid": factory_id})).mappings().first()
+    # 同样逐字段转 Python 原生类型：这里的数会进 chat_messages 的 jsonb
+    auto = {}
+    for key, value in dict(raw_auto or {}).items():
+        if key == "last_created":
+            auto[key] = str(value) if value is not None else None
+        elif value is None:
+            auto[key] = 0
+        elif isinstance(value, bool):
+            auto[key] = value
+        else:
+            try:
+                auto[key] = float(value)
+            except (TypeError, ValueError):
+                auto[key] = str(value)
+    for count_key in ("pr_materials", "pr_lines", "pr_in_kit_universe", "gap_materials",
+                      "gap_without_request", "request_without_gap"):
+        auto[count_key] = int(auto.get(count_key) or 0)
+
     samples = [{"material_code": str(r["material_code"]),
                 "by_inventory": float(r["by_inventory"] or 0),
                 "by_materials": float(r["by_materials"] or 0),
@@ -210,6 +259,7 @@ async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
         "shortfall_units": {"by_inventory": (float(joined.get("shortfall_by_inventory") or 0)),
                             "by_materials": (float(joined.get("shortfall_by_materials") or 0))},
         "ruler_spread_x": spread,
+        "auto_replenishment": auto,
         "reading": [], "claim_guard": "",
     }
 
@@ -231,6 +281,16 @@ async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
          "这不是精度问题而是口径问题。已挂成 /pmc/open-rule-questions 的 "
          "safety_stock_authority 待回答；要落成 stock_alerts 的动作也等这个口径拍定。"),
     ]
+    pr_lines = int(auto.get("pr_lines") or 0)
+    if pr_lines:
+        out["reading"].append(
+            f"已经开出去的自动补货：{pr_lines} 条 / {_units(auto.get('pr_units'))} 件"
+            f"（最近一次 {auto.get('last_created')}），其中 "
+            f"{auto.get('request_without_gap')} 个料号引擎当前并不缺、"
+            f"{auto.get('pr_in_kit_universe')} 个料号出现在齐套结构里；"
+            f"同期真缺口 {auto.get('gap_materials')} 个料号 / {_units(auto.get('gap_units'))} 件里，"
+            f"{auto.get('gap_without_request')} 个一条单都没开 —— "
+            "触发线只看库存水位、不看有没有工单要，所以两头都能错")
     if all(str(s["verdict"]) == "template_default" for s in sources):
         out["reading"].append(
             "两边都是模板值时，任何一边的告警清单都不能当补货依据 —— "

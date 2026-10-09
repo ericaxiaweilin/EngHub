@@ -672,7 +672,14 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                                    "自动补货那条链读的是 inventory 侧 + reorder_point，"
                                    "物料主数据那句在 materials 侧，两边已经在互相否证。"
                                    f"本该作准的 safety_stock_config 本厂 "
-                                   f"{ss_auth['config_table_rows']} 行 —— 空表不等于库存正常"),
+                                   f"{ss_auth['config_table_rows']} 行 —— 空表不等于库存正常"
+                                   + (f"；更要紧的是这条水位线已经在开单："
+                                      f"{ss_auth['auto_replenishment']['pr_lines']} 条自动补货申请里 "
+                                      f"{ss_auth['auto_replenishment']['request_without_gap']} 个料号"
+                                      f"引擎当前并不缺，而 "
+                                      f"{ss_auth['auto_replenishment']['gap_without_request']} 个真缺口料号"
+                                      f"一条都没开 —— 触发线只看库存水位、不看有没有工单要"
+                                      if (ss_auth.get("auto_replenishment") or {}).get("pr_lines") else "")),
                 "expected_answer": ("① 以 inventory.safety_stock 作准（补货链现读它），"
                                     "materials 侧改成同一条口径；② 以 materials.safety_stock 作准，"
                                     "触发线改读它；③ 逐料号重写（先重写决定开工那一档的件）。"

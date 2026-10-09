@@ -16,6 +16,11 @@ JOIN = {"joined_materials": 31685, "in_both": 11171, "disagree": 11171,
         "shortfall_by_inventory": 41000.0, "shortfall_by_materials": 778703.0}
 TRIG = {"below_trigger_line": 476, "no_reorder_qty": 0, "no_reorder_point": 0,
         "no_inventory_safety": 0}
+from decimal import Decimal as _D
+AUTO = {"pr_materials": 512, "pr_lines": 512, "pr_units": _D("10520"),
+        "pr_in_kit_universe": 149, "gap_materials": 821, "gap_units": _D("4237670"),
+        "gap_without_request": 675, "request_without_gap": 366,
+        "last_created": "2026-10-09"}
 
 
 class _Res:
@@ -64,6 +69,8 @@ class _Db:
             return _Res([JOIN])
         if "below_trigger_line" in sql:
             return _Res([TRIG])
+        if "pr_lines" in sql:
+            return _Res([AUTO])
         if "FROM safety_stock_config" in sql:
             return _Res([], self.config_rows)
         if "ORDER BY abs(inv.inv_ss - mat.mat_ss) DESC" in sql:
@@ -241,3 +248,31 @@ def test_top_gap_samples_are_cast_not_passed_through():
     out = asyncio.run(ssa.safety_stock_authority(_Db(), "FAC_MECH_001", examples=2))
     row = out["disagreement"]["widest_examples"][0]
     assert type(row["available"]) is float and type(row["gap"]) is float, row
+
+
+def test_auto_replenishment_is_audited_against_real_shortages_and_stays_serialisable():
+    out = asyncio.run(ssa.safety_stock_authority(_Db(decimal=True), "FAC_MECH_001", examples=2))
+    line = [x for x in out["reading"] if "已经开出去的自动补货" in x]
+    assert line, "水位线已经在开单这件事必须跟着读数出去"
+    assert "512 条" in line[0] and "366 个料号引擎当前并不缺" in line[0]
+    assert "675 个一条单都没开" in line[0]
+    assert out["auto_replenishment"]["pr_units"] == 10520.0
+    assert out["auto_replenishment"]["gap_units"] == 4237670.0
+    assert isinstance(out["auto_replenishment"]["pr_lines"], int)
+    import json
+    json.dumps(out, ensure_ascii=False)     # Decimal/date 都转掉了才能落 jsonb
+
+
+def test_no_auto_line_when_nothing_has_been_ordered(monkeypatch):
+    """没开过单就不要凭空写一条"自动补货对不上"。"""
+    db = _Db(decimal=True)
+    orig = db.execute
+
+    async def quiet(stmt, params=None):
+        if "pr_lines" in str(stmt):
+            return _Res([])
+        return await orig(stmt, params)
+
+    db.execute = quiet
+    out = asyncio.run(ssa.safety_stock_authority(db, "FAC_MECH_001"))
+    assert not [x for x in out["reading"] if "已经开出去的自动补货" in x]
