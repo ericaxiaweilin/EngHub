@@ -149,3 +149,17 @@ def test_row_coverage_without_engine_rows_is_none_not_zero():
     assert el.row_coverage(120, 0) is None
     assert el.row_coverage(0, 0) is None
     assert el.row_coverage(0, 500) == 0.0, "引擎有缺口行而台账零行，这才是真的 0"
+
+
+def test_worst_ci_row_names_the_widest_curve_and_direction_test_is_decidable():
+    """「最差」必须指到具体一条曲线；区间跨 0 与不跨 0 是两种不同的缺陷。"""
+    rows = [
+        {"lever": "外购提前期", "ci_width_steps": 1.2, "ci90": [-0.4, 0.8], "step": 0.1},
+        {"lever": "到岗率", "ci_width_steps": 44.71, "ci90": [-3.1, 41.6], "step": 0.05},
+        {"lever": "设备节拍", "ci_width_steps": 0.3, "ci90": [1.0, 1.3], "step": 0.1},
+    ]
+    assert el.worst_ci_row(rows)["lever"] == "到岗率"
+    assert el.worst_ci_row([]) is None
+    # 不跨 0 的那条是"幅值不定"，跨 0 的那条才是"方向没定"
+    assert not (rows[2]["ci90"][0] <= 0.0 <= rows[2]["ci90"][1])
+    assert rows[1]["ci90"][0] <= 0.0 <= rows[1]["ci90"][1]

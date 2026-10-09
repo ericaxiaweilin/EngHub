@@ -211,6 +211,16 @@ def boot_ci_slope(levels: List[float], days: List[float], step: float,
             "ci_width_steps": round(abs(hi - lo) / step, 2)}
 
 
+def worst_ci_row(ci_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """区间最宽的那条杠杆 —— 「最差」必须能指到具体一条曲线，否则这格只是个大数。
+
+    平的曲线与样本不够是两件事：区间跨过 0 说明方向都没定；不跨 0 只是幅值不定。
+    """
+    if not ci_rows:
+        return None
+    return max(ci_rows, key=lambda r: float(r.get("ci_width_steps") or 0.0))
+
+
 def direction_expectations() -> List[Dict[str, Any]]:
     """已知冲击的方向判据：符号错了不是精度问题，是模型坏。"""
     return [
@@ -411,6 +421,7 @@ async def _l2a_sensitivity(db: AsyncSession, factory_id: str, models: List[str],
                        "got": got, "ok": ok, "why": p["why"]})
     hits = sum(1 for p in probes if p["ok"])
     ci_usable_rate = round(ci_usable / len(ci_rows), 3) if ci_rows else None
+    worst = worst_ci_row(ci_rows)
     return {"metrics": [
         _metric("弹性可算覆盖率", round(len(computable) / max(1, len(levers)), 3),
                 THRESHOLDS["L2A"]["elastic_coverage"], "gte", "",
@@ -423,7 +434,14 @@ async def _l2a_sensitivity(db: AsyncSession, factory_id: str, models: List[str],
                 "（bootstrap 200 次重采样；区间宽过档距就是没测出来，不报斜率）",
                 n=len(ci_rows), min_n=3),
         _metric("最差置信区间宽度", width_worst, None, "lte", "档距",
-                "只报最差那个，供人看是哪条曲线量不出来"),
+                (f"最差的是「{worst['lever']}」：{worst['ci_width_steps']} 个档距，"
+                 f"斜率 {worst['slope_per_step']} 天/档，90% 区间 {worst['ci90']}。"
+                 + ("区间跨过 0 —— 这条杠杆连方向都没定，斜率不报；"
+                    if float(worst['ci90'][0]) <= 0.0 <= float(worst['ci90'][1])
+                    else "区间没跨 0 —— 方向定了，只是幅值量不准；")
+                 + f"步长 {worst.get('step')} 档，判线是宽 <= "
+                   f"{THRESHOLDS['L2A']['ci_width_steps']} 个档距算测出来")
+                if worst else "本轮没有算得出区间的杠杆"),
     ], "probes": probes, "ci": ci_rows, "base_finish": base_finish,
         "levers": [{"lever": l["label"], "slope": l.get("slope"),
                     "not_a_scheduling_lever": l.get("not_a_scheduling_lever")} for l in levers]}

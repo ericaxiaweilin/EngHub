@@ -19,9 +19,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import json
 import os
+import subprocess
 import sys
 
 def _root() -> str:
@@ -34,7 +36,71 @@ def _root() -> str:
 ROOT = _root()
 sys.path.insert(0, ROOT)
 
-BLOCKS = ("gate", "layers", "capability", "ledger", "inbox", "timers")
+BLOCKS = ("gate", "layers", "capability", "ledger", "inbox", "timers", "names")
+
+# 名字对照默认扫这些：改了谁就查谁，全扫一遍也不贵
+NAME_CHECK_FILES = (
+    "api/services/engine_layers.py", "api/services/sim_backtest.py",
+    "api/services/engine_capability.py", "api/services/engine_watchdog.py",
+    "api/services/prediction_ledger.py", "api/services/virtual_run.py",
+    "api/services/portfolio_flywheel.py", "api/services/chat_tools_service.py",
+    "api/services/bom_source.py", "api/services/component_orders.py",
+)
+
+
+def _top_names(src: str) -> set:
+    tree = ast.parse(src)
+    out = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, ast.Assign):
+            out.update(x.id for x in node.targets if isinstance(x, ast.Name))
+    return out
+
+
+def check_names(files=NAME_CHECK_FILES) -> int:
+    """HEAD 与工作树的模块顶级名字对照：谁被字符串替换吃掉了，这里立刻现形。
+
+    为什么要它：这一天里我把 `def direction_expectations` / `async def delivery_accuracy`
+    整行当锚点替换、没把锚点重贴回去两次。py_compile 有时吃旧 pyc、单测也可能没覆盖到那个函数，
+    于是坏掉的模块还能"绿"着上线 —— 名字少了是藏不住的。
+    """
+    _w("模块名字对照（HEAD vs 工作树）—— 字符串替换吃掉函数头的探测器")
+    try:
+        has_git = subprocess.run(["git", "rev-parse", "--git-dir"],
+                                 capture_output=True).returncode == 0
+    except OSError:                     # 容器里没装 git，不只是"不在仓库里"
+        has_git = False
+    if not has_git:
+        print("  这一步要在宿主的仓库根跑（容器里既没有 git 也没有 .git）：\n"
+              "    cd /home/eric/enghub && python3 scripts/engine_status.py --only names")
+        return 2
+    bad = []
+    for f in files:
+        head = subprocess.run(["git", "show", f"HEAD:{f}"],
+                              capture_output=True, text=True).stdout
+        if not head:
+            print(f"  {f}: HEAD 里没有这份文件（新增的？跳过）")
+            continue
+        try:
+            cur = open(f, encoding="utf-8").read()
+        except OSError as exc:
+            print(f"  {f}: 读工作树失败 {exc}")
+            continue
+        try:
+            lost = _top_names(head) - _top_names(cur)
+            added = _top_names(cur) - _top_names(head)
+        except SyntaxError as exc:
+            print(f"  {f}: 语法就坏了 —— {exc.msg}")
+            bad.append(f)
+            continue
+        mark = f"  ← 丢了 {sorted(lost)}" if lost else ""
+        print(f"  {f}: 丢 {len(lost)}{mark}" + (f" | 新增 {sorted(added)}" if added else ""))
+        if lost:
+            bad.append(f)
+    print("  结论：" + ("全部完好" if not bad else f"要修：{bad}"))
+    return 1 if bad else 0
 
 
 def _load_env() -> list[str]:
@@ -198,6 +264,9 @@ def main() -> int:
     ap.add_argument("--only", default=",".join(BLOCKS),
                     help="逗号分隔的块：" + ",".join(BLOCKS))
     args = ap.parse_args()
+    only = [b.strip() for b in args.only.split(",") if b.strip() in BLOCKS]
+    if only == ["names"]:
+        return check_names()      # 纯文件比对：不需要数据库，也不该被 .env 缺失挡住
     loaded = _load_env()
     if loaded:
         # 只报键名：.env 里是真凭证，把值带进日志就等于把它交出去
@@ -206,7 +275,6 @@ def main() -> int:
     if not os.getenv("DATABASE_URL"):
         print("缺少 DATABASE_URL —— 在仓库根跑（那里有 .env），或先导出连接串", file=sys.stderr)
         return 2
-    only = [b.strip() for b in args.only.split(",") if b.strip() in BLOCKS]
     asyncio.run(run(args.factory_id, args.refresh, only))
     return 0
 
