@@ -107,7 +107,19 @@ def _metrics(scan: Dict[str, Any], scenario: str = "基准") -> Dict[str, Any]:
                 float((d.get("staffing") or {}).get("crew_before_staffing") or 0) for d in detail), 1),
             "crew_effective_sum": round(sum(
                 float((d.get("staffing") or {}).get("crew_effective") or 0) for d in detail), 1),
-            "blocked_models": blocked}
+            "blocked_models": blocked,
+            # 卡住的东西要点名：瓶颈件、到货关键件、用了哪条线 —— 否则"卡在料上"是一句空话
+            "bottleneck_parts": {str(d.get("model_code")): d.get("bottleneck_part")
+                                 for d in detail if d.get("bottleneck_part")},
+            "arrival_critical_parts": {str(d.get("model_code")): (d.get("arrival_critical_parts") or [])
+                                       for d in detail if d.get("arrival_critical_parts")},
+            "material_arrival_days": {str(d.get("model_code")): d.get("material_arrival_day")
+                                      for d in detail if d.get("material_arrival_day") is not None},
+            "lines_used": sorted({
+                str((d.get("staffing") or {}).get("line") or d.get("line"))
+                for d in detail
+                if (d.get("staffing") or {}).get("line") or d.get("line")}),
+            }
 
 
 def _days_between(later: Optional[str], earlier: Optional[str]) -> Optional[int]:
@@ -934,7 +946,8 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
                                  samples: int = 24, seed: int = 20261008,
                                  days_of_output: float = 6.0,
                                  lead_margin: Optional[float] = None,
-                                 policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                 policy: Optional[Dict[str, Any]] = None,
+                                 only: Optional[Tuple[str, ...]] = None) -> Dict[str, Any]:
     """逐条把误差带修到已声明的下限，重跑同一串抽样，报"这条数据值几天毛边"。
 
     与 propagate_uncertainty 的区别要写清：那边是 |斜率|×带宽 的线性折算（只单条杠杆、
@@ -964,8 +977,10 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
     cov_now = {"purchase_lead_time": setup["lead_coverage"], "unit_work_hours": setup["hours_basis"],
                "equipment_availability": setup["base_equip"], "crew_attendance": None}
 
+    targets_to_try = [t for t in DATA_REPAIR_TARGETS
+                      if (not only) or t["input"] in set(only)]
     repairs: List[Dict[str, Any]] = []
-    for t in DATA_REPAIR_TARGETS:
+    for t in targets_to_try:
         inp = t["input"]
         cur = band_now[inp]
         entry = {"input": inp, "label": t["label"], "repairable": t["repairable"],
@@ -1005,7 +1020,7 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
         })
         repairs.append(entry)
 
-    measurable = [t for t in DATA_REPAIR_TARGETS if t["repairable"]]
+    measurable = [t for t in targets_to_try if t["repairable"]]
     narrowed: Dict[str, float] = {}
     for t in measurable:
         cur = band_now[t["input"]]
@@ -1081,8 +1096,9 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
         lines.append("反向：" + "、".join(
             f"{r['label']} 修到下限反而把毛边撑开 {-r['gap_days_narrowed']:g} 天（约束切换所致，"
             f"不是算错）" for r in zeroed))
-    lines.append("这些带宽各自量的是什么：" + "；".join(
-        f"{r['label']}＝{r['evidence_meaning']}" for r in repairs if r.get("evidence_meaning")))
+    if not only:
+        lines.append("这些带宽各自量的是什么：" + "；".join(
+            f"{r['label']}＝{r['evidence_meaning']}" for r in repairs if r.get("evidence_meaning")))
     return {
         "status": "ok", "factory_id": factory_id, "models": models, "policy": pol["name"],
         "samples": n, "seed": seed, "bands_now": band_now, "evidence_now": cov_now,
@@ -1098,6 +1114,36 @@ async def data_repair_experiment(db: AsyncSession, factory_id: str, models: List
 # 加多少人赶得上承诺 —— 这格必须逐档真跑：斜率那一格在好天档测出"加班 0 天"，
 # 而毛边几乎全来自暴雨档，所以"要不要加人"只能在抽过样的分布上判。
 CREW_LADDER = (0.10, 0.20, 0.30, 0.50, 0.75, 1.00)
+
+
+def _part_names(parts: Any) -> List[str]:
+    """瓶颈件要点名到料号＋缺口＋提前期＋供应商＋依据，不然"卡在料上"是空话。
+
+    台账里 bottleneck_part 是字典（有时是字符串/空），两种形状都要能吃，且不许因为
+    字典不可哈希就在 set() 里炸掉整张卡。
+    """
+    out: List[str] = []
+    values = list(parts.values()) if isinstance(parts, dict) else list(parts or [])
+    for v in values:
+        if isinstance(v, dict):
+            bits = [str(v.get("material_code") or "?")]
+            if v.get("short") is not None:
+                bits.append(f"缺 {v['short']:g} 件")
+            if v.get("lead_time_days") is not None:
+                bits.append(f"提前 {v['lead_time_days']} 天")
+            if v.get("supplier"):
+                bits.append(f"供应商 {v['supplier']}")
+            if v.get("lead_evidence"):
+                bits.append(f"依据 {v['lead_evidence']}")
+            out.append("·".join(bits))
+        elif v:
+            out.append(str(v))
+    return sorted(set(out))
+
+
+def _g(value: Any, when_missing: str = "—") -> str:
+    """人头/天数缺读数时给一个明写的占位，不让格式串把整格炸掉。"""
+    return when_missing if value is None else f"{float(value):g}"
 
 
 def _median(values: List[Any]) -> Optional[float]:
@@ -1256,7 +1302,9 @@ async def crew_margin_for_p90(db: AsyncSession, factory_id: str, models: List[st
     reach_heads = _median([r.get("crew_before_staffing_sum") for r in reach_rows or []])
     from math import ceil
 
-    extra_heads = int(ceil(max(0.0, float(reach_heads or 0) - float(base_heads or 0))))
+    heads_known = base_heads is not None and reach_heads is not None
+    extra_heads = (int(ceil(max(0.0, float(reach_heads) - float(base_heads))))
+                   if heads_known else None)
     extra_cost = _paired_median_delta(base_rows, reach_rows or [], "labor_cost_usd")
     below_txt = f"低一档 {below['crew_bonus']:.0%} 实测只到 {below['p_on_time']:.0%} 准点"
     helps = attendance_effect(reach_sum)
@@ -1273,8 +1321,9 @@ async def crew_margin_for_p90(db: AsyncSession, factory_id: str, models: List[st
     out["reading"] = [
         f"现状：{n} 抽准点概率 {base['p_on_time']:.0%}（要求 ≥{req:.0%}），P90 完工 "
         f"{_p90(base).get('finish_date')}（延 {_p90(base).get('days_late_worst')} 天，承诺 "
-        f"{base['promise_date']}），班组每天到站中位 {base_heads:g} 人",
-        f"赶得上要加：人手 +{reach_k:.0%} ＝ 每天多 {extra_heads} 人（{base_heads:g}→{reach_heads:g} 人），"
+        f"{base['promise_date']}），班组每天到站中位 {_g(base_heads)} 人",
+        f"赶得上要加：人手 +{reach_k:.0%} ＝ 每天多 {_g(extra_heads, '算不出')} 人"
+        f"（{_g(base_heads)}→{_g(reach_heads)} 人），"
         f"准点概率到 {reach_sum['p_on_time']:.0%}；{below_txt}",
         f"这档的钱：人工中位多花 ${extra_cost or 0:,.0f}/批｜口径：收益侧未建模，只有成本差值"
         f"（$30/人日·标定），不构成投资回报",
@@ -1573,4 +1622,152 @@ async def volume_ceiling_for_promise(db: AsyncSession, factory_id: str, models: 
                           "只是不赶这个承诺日；要按客户优先级决定砍哪几台，引擎不替厂里挑客户")
     out["method"] = ("同一串抽样上逐档改 targets.units，取'仍有 9 成准点'的最大量；"
                      "并报多做一档（上一档）实测到达的准点概率，所以这个台数自己就成立")
+    return out
+
+# 交付做不到时该动什么：四条路（改日期 / 加杠杆 / 修数据 / 减量）各跑一档粗筛，
+# 一屏给完"每条路实测换到什么、因此不该拿什么当结论"。细数字看各自的端点，这一格只给判定。
+PROMISE_COARSE: List[Dict[str, Any]] = [
+    {"name": "现政策（分批开工）", "allow_partial": True},
+    {"name": "压瓶颈件提前期→7 天", "allow_partial": True, "expedite_lead_days": 7},
+]
+CREW_COARSE: Tuple[float, ...] = (0.30, 1.00)
+VOLUME_COARSE: Tuple[float, ...] = (1.0, 0.50, 0.20)
+BLOCK_ENDPOINTS = {
+    "date": "/api/v1/pmc/sim-promise-headroom",
+    "crew": "/api/v1/pmc/sim-crew-margin",
+    "data": "/api/v1/pmc/sim-data-repair",
+    "volume": "/api/v1/pmc/sim-volume-ceiling",
+}
+
+
+async def delivery_blockers(db: AsyncSession, factory_id: str, models: List[str], *,
+                            samples: int = 8, seed: int = 20261008,
+                            required: float = 0.90, days_of_output: float = 6.0,
+                            lead_margin: Optional[float] = None) -> Dict[str, Any]:
+    """把"这单为什么做不到、该动什么"收成一次可核对的判定。
+
+    每条路都用同一种粗筛（默认 8 抽 × 少数档），够用来回答"能不能靠它救"，
+    不给精细台阶 —— 精细数在各自端点里，读数里把端点路径带上。
+    五段都要跑（分布 + 四条路），所以这一格慢；慢是诚实的代价，写在 took_seconds 里。
+    """
+    import time
+
+    started = time.time()
+    req = max(0.50, min(0.99, float(required)))
+    base = await schedule_risk(db, factory_id, models, samples=samples, seed=seed)
+    if base.get("status") != "ok":
+        return {"status": "no_dates", "factory_id": factory_id, "models": models,
+                "why": base.get("why"), "paths": [],
+                "reading": [f"判定卡没生成：{base.get('why')} —— 连一条完工日分布都抽不出来，"
+                            f"四条路就无从比较"]}
+    prom = await promise_headroom(db, factory_id, models, samples=samples, seed=seed,
+                                  required=req, days_of_output=days_of_output,
+                                  lead_margin=lead_margin, policies=PROMISE_COARSE)
+    crew = await crew_margin_for_p90(db, factory_id, models, samples=samples, seed=seed,
+                                     on_time_required=req, ladder=CREW_COARSE,
+                                     days_of_output=days_of_output, lead_margin=lead_margin)
+    vol = await volume_ceiling_for_promise(db, factory_id, models, samples=samples, seed=seed,
+                                           required=req, ladder=VOLUME_COARSE,
+                                           days_of_output=days_of_output, lead_margin=lead_margin)
+    rep = await data_repair_experiment(db, factory_id, models, samples=samples, seed=seed,
+                                       days_of_output=days_of_output, lead_margin=lead_margin,
+                                       only=("purchase_lead_time", "unit_work_hours",
+                                             "equipment_availability"))
+
+    def late(value: Any) -> Optional[float]:
+        return None if value is None else float(value)
+
+    base_p90_late = late((base.get("percentiles") or [{}])[-1].get("days_late_worst"))         if base.get("percentiles") else None
+    for p in (base.get("percentiles") or []):
+        if int(p.get("percentile") or 0) == 90:
+            base_p90_late = late(p.get("days_late_worst"))
+    prom_v = prom.get("verdict") or {}
+    crew_rungs = [x for x in (crew.get("ladder_tried") or []) if "p90_days_late" in x]
+    crew_top = crew_rungs[-1] if crew_rungs else {}
+    vol_rungs = vol.get("ladder_tried") or []
+    vol_smallest = min((x for x in vol_rungs if x.get("status") == "ok"),
+                       key=lambda x: float(x["ratio"]), default={})
+    rep_best = max((x.get("gap_days_narrowed") or 0) for x in (rep.get("repairs") or [])
+                   if x.get("status") == "ok") if any(
+        x.get("status") == "ok" for x in (rep.get("repairs") or [])) else None
+
+    paths = [
+        {"path": "改日期（承诺上限）", "key": "date", "endpoint": BLOCK_ENDPOINTS["date"],
+         "moves_days": prom_v.get("days_saved_by_policy"), "moves_unit": "P90 少延天数",
+         "can_reach_required": None,
+         "measured": (f"有 {req:.0%} 把握最早能报 {prom_v.get('earliest_defensible_promise')}"
+                      f"（现承诺 {prom.get('current_promise')}，晚 "
+                      f"{prom_v.get('days_later_than_current')} 天；靠"
+                      f"『{prom_v.get('policy')}』）" if prom_v else "承诺上限那一格没出数"),
+         "therefore_not": "不许拿 P50 当承诺日，也不许把改日期说成引擎批的"},
+        {"path": "加人手（杠杆）", "key": "crew", "endpoint": BLOCK_ENDPOINTS["crew"],
+         "moves_days": (round(base_p90_late - late(crew_top.get("p90_days_late")), 1)
+                        if base_p90_late is not None and crew_top.get("p90_days_late") is not None
+                        else None),
+         "moves_unit": "P90 少延天数",
+         "can_reach_required": (crew.get("verdict") or {}).get("kind") == "found",
+         "measured": ((f"加到 {(crew.get('verdict') or {}).get('top_crew_bonus', 0):.0%} 人手"
+                       f"（每天多 {_g((crew.get('verdict') or {}).get('top_extra_heads_per_day'))} 人）"
+                       f"准点概率 {(crew.get('verdict') or {}).get('top_p_on_time', 0):.0%}")
+                      if (crew.get("verdict") or {}).get("kind") == "not_crew_bound" else
+                      (f"加 {(crew.get('verdict') or {}).get('crew_bonus', 0):.0%} 人手就到 "
+                       f"{(crew.get('verdict') or {}).get('p_on_time_at_level', 0):.0%} 准点"
+                       if (crew.get("verdict") or {}).get("kind") == "found" else
+                       "现况已达标，不用加人")),
+         "therefore_not": "不许把'到岗影响延误'说成'加人能补回到岗'——两件事实测分开"},
+        {"path": "修数据（误差带）", "key": "data", "endpoint": BLOCK_ENDPOINTS["data"],
+         "moves_days": rep_best, "moves_unit": "毛边收窄天数（不改交期）",
+         "can_reach_required": None,
+         "measured": ((rep.get("reading") or [None])[1] or "") if len(rep.get("reading") or []) > 1
+         else "修数据那一格没出数",
+         "therefore_not": "覆盖率≠量过；也不许拿'修数据'去承诺交期提前"},
+        {"path": "减量（需求侧）", "key": "volume", "endpoint": BLOCK_ENDPOINTS["volume"],
+         "moves_days": (round(base_p90_late - late(vol_smallest.get("p90_days_late")), 1)
+                        if base_p90_late is not None
+                        and vol_smallest.get("p90_days_late") is not None else None),
+         "moves_unit": "P90 少延天数",
+         "can_reach_required": (vol.get("verdict") or {}).get("kind") == "found",
+         "measured": ((vol.get("reading") or [None])[0] or "") if vol.get("reading") else "减量那一格没出数",
+         "therefore_not": "减量是'少做'不是'早交'；砍掉的台数仍然要做，只是不赶这个承诺日"},
+    ]
+
+    probe = await _run_one(db, factory_id, (await _risk_setup(
+        db, factory_id, models, days_of_output=days_of_output, lead_margin=lead_margin,
+        samples=1, seed=seed))["targets"], {"name": "现政策", "allow_partial": True},
+        attendance=RISK_ATTENDANCE_LEVELS[0])
+    what = {
+        "bottleneck_parts": probe.get("bottleneck_parts") or {},
+        "arrival_critical_parts": probe.get("arrival_critical_parts") or {},
+        "material_arrival_days": probe.get("material_arrival_days") or {},
+        "lines_used": probe.get("lines_used") or [],
+        "line_declared_units_per_day_max": probe.get("capacity_line_declared_max"),
+        "binding": probe.get("binding"),
+        "note": ("这两处才是延期的入口：瓶颈件到料日（等料）与所用线的声明台/天（产能上限）。"
+                 "四格的实测都落在它们身上时才谈得上改善交付"),
+    }
+    out = {"status": "ok", "factory_id": factory_id, "models": models, "samples": base["samples"],
+           "seed": seed, "on_time_required": req,
+           "promise_date": base["promise_date"], "p50": base["percentiles"][1]["finish_date"],
+           "p90": base["percentiles"][2]["finish_date"], "p_on_time": base["p_on_time"],
+           "rough_days": base["rough_days"], "paths": paths, "what_moves_it": what,
+           "took_seconds": round(time.time() - started, 1),
+           "reading": [
+               f"结论（{len(models)} 台机·{samples} 抽·seed {seed}）：承诺 {base['promise_date']} 做不到 —— "
+               f"现政策 P50={base['percentiles'][1]['finish_date']}、"
+               f"P90={base['percentiles'][2]['finish_date']}（延 "
+               f"{base['percentiles'][2]['days_late_worst']} 天）、准点概率 {base['p_on_time']:.0%}",
+               f"能动的是两处：等料（瓶颈件 {'、'.join(_part_names(what['bottleneck_parts'])[:3]) or '未点名'}"
+               f"，到料第 {'/'.join(sorted(set(str(v) for v in (what['material_arrival_days'] or {}).values()))[:3]) or '未'} 天）"
+               f"与线声明产能（{'、'.join(what['lines_used'][:3]) or '未'} 最多 "
+               f"{float(what['line_declared_units_per_day_max'] or 0):g} 台/天，"
+               f"binding={what['binding'] or '未明'}）",
+           ] + [f"{p['path']}：{p['measured']}"
+                + (f"｜{p.get('moves_unit', 'P90 少延天数')} {p['moves_days']:g} 天"
+                   if p.get("moves_days") else f"｜{p.get('moves_unit', 'P90 少延天数')} 0 天")
+                + f"｜不该做的：{p['therefore_not']}" for p in paths],
+           "method": ("每条路在同一串抽样上跑少数几档做粗筛（默认 8 抽）；"
+                      "'P90 换到几天'是这条路实测能买到/买不到的天数，不是承诺"),
+           "claim_guard": ("这一格只回答'该动哪一处'，不回答'该不该接单'；"
+                           "改承诺日、砍台数、花加急费都是企业授权动作，引擎只给数"),
+           }
     return out

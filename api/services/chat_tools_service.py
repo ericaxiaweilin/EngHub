@@ -1123,6 +1123,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "with_volume_ceiling": {"type": "boolean",
                                         "description": ("要'保住现承诺最多能做几台'时置 true"
                                                         "（5 档量 × 20 抽同一串）")},
+                "with_blocker_card": {"type": "boolean",
+                                      "description": ("要'这单为什么做不到、该动哪一处'的一屏判定时置 true"
+                                                      "（四条路各跑几档粗筛，最慢的一格）")},
             }},
         },
     },
@@ -3361,6 +3364,10 @@ async def _tool_query_simulation_sensitivity(
                        include_crew_margin=bool(args.get("with_crew_margin")),
                        include_promise=bool(args.get("with_promise_headroom")),
                        include_volume=bool(args.get("with_volume_ceiling")))
+    if args.get("with_blocker_card"):
+        # 四条路一起跑（每条几档粗筛），所以这一格慢；它回答"为什么做不到、该动哪一处"
+        from api.services.sim_sensitivity import delivery_blockers
+        out["blockers"] = await delivery_blockers(db, fid, models, samples=8)
     sens = out.get("sensitivity") or {}
     base = sens.get("base") or {}
     levers = [{"lever": l["label"], "base_level": l.get("base_level"),
@@ -3412,6 +3419,7 @@ async def _tool_query_simulation_sensitivity(
         "volume_ceiling": (out.get("volume") or {}),
         "volume_not_sampled_because": (None if out.get("volume") else
                                        "没点要减量测算（with_volume_ceiling=true 才逐档改量真跑）"),
+        "delivery_blockers": (out.get("blockers") or {}),
         "promise_not_sampled_because": (None if out.get("promise") else
                                         "没点要承诺上限（with_promise_headroom=true 才逐条政策取 P90）"),
         "method": ("斜率只取基准两侧最近两档（局部线性，不做全局回归）；"
@@ -5012,6 +5020,7 @@ INTENT_RULES: List[Dict[str, Any]] = [
                      "加多少人", "要加几个人", "加人行不行", "人手余量", "排班余量", "赶得上要",
                      "最早能承诺", "能承诺哪天", "承诺哪天", "报哪天", "改到哪天", "9 成把握", "九成把握",
                      "最多能做几台", "能做几台", "要砍多少台", "减量", "砍多少台", "少做几台",
+                     "为什么做不到", "该动哪一处", "该动什么", "卡在哪", "怎么办才能", "哪一处能动", "还有救吗",
                      "sensitivity", "斜率"],
     },
     {
@@ -5681,6 +5690,10 @@ def _resolve_intent_keyword(message: str) -> Optional[Dict[str, Any]]:
         if any(k in message for k in ("最多能做几台", "能做几台", "要砍多少台", "减量",
                                       "砍多少台", "少做几台")):
             args["with_volume_ceiling"] = True
+        # "为什么做不到/该动什么"必须把四条路一起跑一遍，不然模型会挑一条最顺口的说
+        if any(k in message for k in ("为什么做不到", "该动哪一处", "该动什么", "卡在哪",
+                                      "怎么办才能", "哪一处能动", "还有救吗")):
+            args["with_blocker_card"] = True
     elif tool == "query_workflow_diagram":
         flow_id = re.search(r"(?:流程ID|flow_id)[:：= ]+([A-Za-z0-9_-]+)", message, flags=re.IGNORECASE)
         flow_code = re.search(r"\bFLOW-[A-Za-z0-9_-]+", message, flags=re.IGNORECASE)

@@ -1455,6 +1455,17 @@ def _format_sensitivity_reply(result: Dict[str, Any]) -> str:
         lines.append(f"- 减量测算：没算成 —— {vol.get('reading') or vv.get('note')}")
     elif result.get("volume_not_sampled_because"):
         lines.append(f"- 减量测算：没算 —— {result['volume_not_sampled_because']}")
+    blk = result.get("delivery_blockers") or {}
+    if blk.get("status") == "ok":
+        lines.append(f"- 判定（{blk.get('factory_id')}，{blk.get('samples')} 抽粗筛，"
+                     f"跑了 {blk.get('took_seconds')} 秒）：")
+        for x in (blk.get("reading") or []):
+            lines.append(f"  · {x}")
+        lines.append(f"  · 明细端点：" + "、".join(
+            f"{p.get('path')}→{p.get('endpoint')}" for p in (blk.get("paths") or [])))
+        lines.append(f"  · 规矩：{blk.get('claim_guard') or ''}")
+    elif blk:
+        lines.append(f"- 判定卡：没生成 —— {blk.get('why') or blk.get('status')}")
     lines.append(f"- 映射精度：{result.get('accuracy_overall')} 分（0-100，只统计输入有没有真依据）")
     for u in (result.get("uncertainty") or [])[:2]:
         lines.append(f"- 这台机的不确定度：{u.get('model_code')} 现在 {u.get('uncertainty_days_sum')} 天"

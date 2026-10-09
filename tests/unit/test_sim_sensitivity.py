@@ -1027,3 +1027,129 @@ def test_volume_ceiling_chat_answer_names_units_and_the_refusal():
     not_run = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
                "volume_not_sampled_because": "没点要减量测算（with_volume_ceiling=true 才逐档改量真跑）"}
     assert "减量测算：没算 —— 没点要减量测算" in _format_sensitivity_reply(not_run)
+
+
+def _blockers_env(monkeypatch, *, effect=2.0, cut=12.0):
+    """一条只卡等料的世界：加人不动、修带宽不动、减量只挪 cut 天、只有压提前期真的省天。"""
+    from datetime import date, timedelta
+
+    due = date(2026, 10, 31)
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 1800, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 60.0, "hours_error_band": 0.05,
+                            "components": {"lead_time": {"score": 1.0},
+                                           "hours": {"score": 1.0, "basis": "route_standard_hours"}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        p = policy or {}
+        d = perturb or {}
+        lead_mult = float(d.get("lead_multiplier", 1.0))
+        days = 20.0 * lead_mult * (2.0 - float(attendance)) / (1.0 + effect * float(p.get("crew_bonus") or 0))
+        if p.get("expedite_lead_days"):
+            days = days * 0.45
+        days = days * (sum(float(t.get("units") or 0) for t in targets) / 1800.0) ** 0.25
+        late = round(days - cut, 1)
+        return {"finish_date": str(due + timedelta(days=int(late))), "days_late_worst": late,
+                "labor_cost_usd": 900.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0,
+                "binding": "line_declared",
+                # _run_one 出来的是 _metrics 的形状（复数、按机种分组），不是 detail 那一行
+                "bottleneck_parts": {"M-1": "RM-ELEC-101"},
+                "arrival_critical_parts": {"M-1": ["RM-ELEC-101"]},
+                "material_arrival_days": {"M-1": 20}, "lines_used": ["LINE-TREAD-01"],
+                "capacity_line_declared_max": 300.0,
+                "crew_before_staffing_sum": round(300.0 * (1.0 + float(p.get("crew_bonus") or 0)), 1),
+                "crew_effective_sum": round(300.0 * (1.0 + float(p.get("crew_bonus") or 0))
+                                            * float(attendance), 1)}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+
+def test_metrics_names_the_part_and_the_line_behind_the_binding():
+    detail = [{"model_code": "M-1", "finish_date": "2026-11-05", "bottleneck_part": "RM-ELEC-101",
+               "arrival_critical_parts": ["RM-ELEC-101"], "material_arrival_day": 20,
+               "capacity_line_declared": 300.0, "staffing": {"line": "LINE-TREAD-01"}}]
+    m = ss._metrics({"by_scenario": {"基准": {"solutions": [{"objectives": {}, "detail": detail}]}}})
+    assert m["bottleneck_parts"] == {"M-1": "RM-ELEC-101"}
+    assert m["material_arrival_days"] == {"M-1": 20}
+    assert m["lines_used"] == ["LINE-TREAD-01"], "『卡在料上』要点名线与件，否则是空话"
+
+
+def test_delivery_blockers_runs_all_four_paths_and_names_what_moves_it(monkeypatch):
+    import asyncio
+
+    _blockers_env(monkeypatch)
+    out = asyncio.run(ss.delivery_blockers(None, "FAC", ["M-1"], samples=8, seed=5))
+    assert out["status"] == "ok"
+    assert [p["key"] for p in out["paths"]] == ["date", "crew", "data", "volume"]
+    assert all(p["endpoint"].startswith("/api/v1/pmc/") for p in out["paths"])
+    w = out["what_moves_it"]
+    assert w["bottleneck_parts"] == {"M-1": "RM-ELEC-101"}
+    assert w["lines_used"] == ["LINE-TREAD-01"] and w["binding"] == "line_declared"
+    assert w["line_declared_units_per_day_max"] == 300.0
+    assert out["p_on_time"] is not None and out["promise_date"]
+    line0 = [x for x in out["reading"] if x.startswith("结论")][0]
+    assert "做不到" in line0 and "1 台机" in line0 and "8 抽" in line0 and "seed 5" in line0, \
+        "判定卡要自报场景形状，否则不同 n_models/samples 的数会被横向比较"
+    assert any("能动的是两处" in x and "RM-ELEC-101" in x and "LINE-TREAD-01" in x for x in out["reading"])
+    assert out["took_seconds"] >= 0 and out["samples"] == 8
+    assert "企业授权动作" in out["claim_guard"] and "该不该接单" in out["claim_guard"]
+
+
+def test_delivery_blockers_refuses_to_guess_when_no_dates(monkeypatch):
+    import asyncio
+
+    async def fake_targets(db, fid, models, **kw):
+        return [{"model_code": "M-1", "units": 100, "due_in_days": 23}]
+
+    async def fake_equip(db, fid):
+        return {"rate": 0.84}
+
+    async def fake_acc(db, fid, models):
+        return {"models": [{"model_code": "M-1", "accuracy_score": 0.0, "hours_error_band": 0.4,
+                            "components": {"lead_time": {"score": 0.0}}}]}
+
+    async def fake_run_one(db, fid, targets, policy, *, attendance, perturb=None):
+        return {"finish_date": None, "days_late_worst": None, "binding": "no_material",
+                "labor_cost_usd": 0.0, "expedite_cost_usd": 0.0, "line_activation_cost_usd": 0.0}
+
+    for name, value in (("derive_targets", fake_targets), ("equipment_rate", fake_equip)):
+        monkeypatch.setattr(ss.vr, name, value)
+    monkeypatch.setattr(ss, "mapping_accuracy", fake_acc)
+    monkeypatch.setattr(ss, "_run_one", fake_run_one)
+
+    out = asyncio.run(ss.delivery_blockers(None, "FAC", ["M-1"], samples=6, seed=1))
+    assert out["status"] == "no_dates" and out["paths"] == []
+    assert any("判定卡没生成" in x for x in out["reading"])
+
+
+def test_delivery_blockers_chat_answer_is_one_screen_with_the_four_paths():
+    from api.routes.chat_routes import _format_sensitivity_reply
+
+    res = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+           "delivery_blockers": {"status": "ok", "factory_id": "FAC", "samples": 8,
+                                 "took_seconds": 41.3, "promise_date": "2026-10-31",
+                                 "p_on_time": 0.0,
+                                 "paths": [{"path": "改日期（承诺上限）", "endpoint": "/api/v1/pmc/sim-promise-headroom"},
+                                           {"path": "加人手（杠杆）", "endpoint": "/api/v1/pmc/sim-crew-margin"}],
+                                 "reading": ["结论：承诺 2026-10-31 做不到 —— 现政策 P50=11-21、P90=12-04（延 34 天）、准点概率 0%",
+                                             "能动的是两处：等料（瓶颈件 ['RM-ELEC-101']，到料第 ['20'] 天）与线声明产能（LINE-TREAD-01 最多 300 台/天，binding=line_declared）",
+                                             "改日期（承诺上限）：有 90% 把握最早能报 2026-11-28（P90 换到 4 天）｜不该做的：不许拿 P50 当承诺日"],
+                                 "claim_guard": "这一格只回答'该动哪一处'，不回答'该不该接单'"}}
+    text = _format_sensitivity_reply(res)
+    assert "判定（FAC，8 抽粗筛，跑了 41.3 秒）" in text
+    assert "能动的是两处" in text and "RM-ELEC-101" in text and "LINE-TREAD-01" in text
+    assert "改日期（承诺上限）→/api/v1/pmc/sim-promise-headroom" in text
+    assert "只回答'该动哪一处'" in text
+
+    broken = {"factory_id": "FAC", "models": ["M-1"], "has_data": True, "base": {},
+              "delivery_blockers": {"status": "no_dates", "why": "抽不出完工日", "reading": []}}
+    assert "判定卡：没生成 —— 抽不出完工日" in _format_sensitivity_reply(broken)
