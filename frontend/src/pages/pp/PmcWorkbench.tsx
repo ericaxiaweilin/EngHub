@@ -516,7 +516,9 @@ export default function PmcWorkbench() {
                       <Space direction="vertical" size={2}>
                         <Text>{q.question}</Text>
                         {!!q.what_records_say && (
-                          <Text style={{ fontSize: 12, color: '#7dd3fc' }}>{q.what_records_say}</Text>
+                          /* 这里也必须走 asText：同 10-09 那两处同一个漏网字段 ——
+                             后端发的是"一句人话"，但形状错了不该由整页来承担。 */
+                          <Text style={{ fontSize: 12, color: '#7dd3fc' }}>{asText(q.what_records_say)}</Text>
                         )}
                         <Text type="secondary" style={{ fontSize: 12 }}>{q.why_it_matters}</Text>
                         <Text type="secondary" style={{ fontSize: 12 }}>

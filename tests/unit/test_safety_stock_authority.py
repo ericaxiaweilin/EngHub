@@ -375,8 +375,19 @@ def test_question_is_registered_with_its_four_rulers_and_disappears_once_declare
     mine = [q for q in qs if q.get("topic") == "safety_stock_authority"]
     assert mine and mine[0]["record_as"]["subject"] == "safety_stock_authority"
     assert "11.49" in mine[0]["why_it_matters"] and "0 行" in mine[0]["why_it_matters"]
-    assert len(mine[0]["what_records_say"]) == 4, "四条尺都要跟着问题走，否则现场没法拍"
+    wrs = mine[0]["what_records_say"]
+    assert isinstance(wrs, str), f"what_records_say 是 {type(wrs).__name__} —— 界面上整页都会没"
+    for name in ("触发线", "inventory 侧", "materials 侧", "配置表"):
+        assert name in wrs, "四条尺都要跟着问题走，否则现场没法拍"
     assert asked.get("worklist_limit"), "活清单没被要，那一句『能不能回填供应商』就没有依据"
+
+    for q in qs:  # 界面只认"一句人话"：形状错了由整页承担（本轮实测过一次）
+        for field in ("question", "what_records_say", "why_it_matters",
+                      "prefilled_evidence", "expected_answer"):
+            val = q.get(field)
+            assert val is None or isinstance(val, str), (
+                "{}.{} 是 {}：React 会把 /pmc 整页换成交界异常".format(
+                    q.get("topic"), field, type(val).__name__))
 
     gate = [q for q in qs if q.get("topic") == "auto_replenishment_demand_gate"]
     assert gate, "已经有自动开单记录时，需求侧就绪门那条要跟着挂出来"
@@ -669,3 +680,18 @@ def test_worklist_truncates_items_but_not_the_grades():
     assert len(wl["items"]) == 2 and wl["rows_total"] == 4
     assert "前 2 行" in wl["items_are"]
     assert sum(g["parts"] for g in wl["grades"]) == 4, "截断只影响清单，分档必须看全集"
+
+def test_rulers_sentence_keeps_each_rulers_own_grain_and_basis():
+    """四条尺拼一句人话：粒度和条件不能省，否则现场没法判断这三个数为什么不一样。"""
+    text = ssa.rulers_sentence([
+        {"ruler": "补货触发线", "alerts": 476, "condition": "available <= COALESCE(reorder_point, …)",
+         "basis": "inventory.reorder_point", "grain": "行级（一个仓一行）"},
+        {"ruler": "按 materials.safety_stock 比", "alerts": 4668, "condition": "sum(available) < declared",
+         "basis": "materials.safety_stock（众数 100，判定 template_default）", "grain": "料号级"},
+    ])
+    assert isinstance(text, str)
+    assert "476 条" in text and "4668 条" in text
+    assert "行级（一个仓一行）" in text and "料号级" in text
+    assert "available <= COALESCE" in text
+    assert ssa.rulers_sentence([]) == "", "空清单要拼成空串，界面上那一格就不出现"
+

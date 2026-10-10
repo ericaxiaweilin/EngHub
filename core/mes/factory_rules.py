@@ -648,7 +648,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     # 安全库存这句话现在有两套互相矛盾的声明：报几条告警取决于信哪张表，
     # 这不是算法能定的，所以挂成待回答的问题；已经拍过就不再问。
     try:
-        from core.mes.safety_stock_authority import safety_stock_authority
+        from core.mes.safety_stock_authority import rulers_sentence, safety_stock_authority
 
         ss_auth = await safety_stock_authority(db, factory_id, worklist_limit=4)
     except Exception as exc:  # noqa: BLE001
@@ -667,9 +667,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                              f"materials.safety_stock（众数 {ss_auth['sources'][1]['mode_value']:g}）？"
                              f"两表都有的 {disagree['materials_in_both']} 个料号里 "
                              f"{disagree['disagree']} 个不一致。"),
-                "what_records_say": [
-                    {"ruler": r["ruler"], "alerts": r["alerts"], "condition": r["condition"],
-                     "basis": r["basis"]} for r in ss_rulers],
+                "what_records_say": rulers_sentence(ss_rulers),
                 "widest_examples": disagree["widest_examples"],
                 "why_it_matters": (f"同一句『低于安全库存』按出处给出 "
                                    f"{ss_rulers[0]['alerts']}/{ss_rulers[1]['alerts']}/"

@@ -592,6 +592,16 @@ async def master_data_worklist(db: AsyncSession, factory_id: str, *,
             "rows_total": len(items_all), "reading": reading}
 
 
+def rulers_sentence(rulers: List[Dict[str, Any]]) -> str:
+    """四条尺拼成一句人话。
+
+    字段约定是字符串（见 frontend/src/pages/pp/PmcWorkbench.tsx 里 asText 的注释）：
+    这里发 list[dict]，React 就把整页换成"页面渲染失败"—— 一个字段的数据形状不能有这样的威力。
+    """
+    return "；".join(f"{r['ruler']}：{r['alerts']} 条｜粒度 {r['grain']}"
+                     f"｜条件 {r['condition']}｜依据 {r['basis']}" for r in rulers)
+
+
 def classify_source(name: str, row: Dict[str, Any], mode_share: float) -> Dict[str, Any]:
     """一处声明一个判定：取值少 + 众数扎堆 = 模板铺的，不是逐料号决定的。"""
     distinct = int(row.get("distinct_values") or 0)
@@ -863,44 +873,3 @@ async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
     out["claim_guard"] = ("缺口件数按各自的声明算，不合并成一个『总缺口』；"
                           "模板值不冒充逐料号决定；空配置表不冒充『库存正常』")
     return out
-
-
-async def safety_stock_question(db: AsyncSession, factory_id: str) -> Optional[Dict[str, Any]]:
-    """把"哪张表作准"挂成待回答的问题；已经拍定（declared）就不再问。"""
-    from core.mes.factory_rules import binding_rules
-
-    auth = await safety_stock_authority(db, factory_id)
-    if auth.get("status") != "ok":
-        return None
-    declared = (await binding_rules(db, factory_id)).get("safety_stock_authority")
-    if declared:
-        return {"declared": {"verdict": declared.get("verdict"), "status": declared.get("status"),
-                             "statement": declared.get("statement")}}
-    disagree = auth["disagreement"]
-    rulers = auth["rulers"]
-    return {
-        "question": {
-            "topic": "safety_stock_authority",
-            "question": (f"『安全库存』这两处声明哪个作准 —— inventory.safety_stock"
-                         f"（众数 {auth['sources'][0]['mode_value']:g}）还是 materials.safety_stock"
-                         f"（众数 {auth['sources'][1]['mode_value']:g}）？"
-                         f"两表都有的 {disagree['materials_in_both']} 个料号里 "
-                         f"{disagree['disagree']} 个不一致。"),
-            "what_records_say": [
-                {"ruler": r["ruler"], "alerts": r["alerts"], "condition": r["condition"],
-                 "basis": r["basis"]} for r in rulers],
-            "widest_examples": disagree["widest_examples"],
-            "why_it_matters": (f"同一句『低于安全库存』现在按出处给出 "
-                               f"{rulers[0]['alerts']}/{rulers[1]['alerts']}/{rulers[2]['alerts']} 条，"
-                               "差到十几倍；自动补货那条链（warehouse_agent）用的是 inventory 侧与 "
-                               "reorder_point，而物料主数据那句在 materials 侧 —— 两边的数已经在互相"
-                               "否证。`safety_stock_config` 那张本该作准的配置表是 0 行。"),
-            "expected_answer": ("① 以 inventory.safety_stock 作准（补货链现有实现就是读它），"
-                                "并把 materials 侧的值改成同一条口径；② 以 materials.safety_stock 作准，"
-                                "则补货触发线要改读它；③ 逐料号重写（先重写决定开工那一档的件）；"
-                                "三条都要落到 line 之外的字段级决定，不是调阈值。"),
-            "record_as": {"subject": "safety_stock_authority",
-                          "verdict": "inventory|materials|per_item_rewritten",
-                          "status": "declared", "source": "chat"},
-        }
-    }
