@@ -9,7 +9,9 @@ from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, text, update
 
-from api.services.wms_architecture.movements import MovementError, apply_transfer_pair
+from api.services.wms_architecture.movements import (
+    MovementError, apply_movement, apply_transfer_pair, document_movement_type,
+)
 from database.models import Inventory, InventoryTransaction
 
 
@@ -46,11 +48,22 @@ class WmsOperationService:
         reference_id: Optional[str] = None,
         operator: str = "system",
         remark: Optional[str] = None,
+        inbound_type: str = "purchase",
     ) -> Dict[str, Any]:
-        """快速入库（扫码/手动）"""
-        now = datetime.utcnow()
+        """快速入库（扫码/手动）—— 数量与流水一起走记账原语。
 
-        # 查找或创建库存记录
+        10-10 之前这段自己写 `inv.total_qty += quantity`，再补一条
+        `transaction_type='inbound'` 的流水。三处不对：
+        ① 'inbound' 是原语明确拒收的遗留字面量，成本与周转读不到这一笔；
+        ② 没有单据号，事后说不清这批是谁收的；
+        ③ 建行时就把数量写进去，等于"账是先有数、流水是后补的"。
+        现在建一行空数量库存，由 apply_movement 一次把数量和流水写对。
+        """
+        now = datetime.utcnow()
+        qty = int(quantity)
+        if qty <= 0:
+            return {"error": f"入库数量必须是正整数，收到 {quantity!r}"}
+
         inv_stmt = select(Inventory).where(
             and_(
                 Inventory.factory_id == factory_id,
@@ -62,14 +75,7 @@ class WmsOperationService:
         inv_result = await self.db.execute(inv_stmt)
         inv = inv_result.scalar_one_or_none()
 
-        before_qty = 0
-        if inv:
-            before_qty = inv.total_qty
-            inv.total_qty += quantity
-            inv.available_qty += quantity
-            inv.last_movement_at = now
-            inv.updated_at = now
-        else:
+        if inv is None:
             inv = Inventory(
                 id=_gen_id(),
                 material_id=material_id,
@@ -79,38 +85,42 @@ class WmsOperationService:
                 warehouse_id=warehouse_id,
                 location_id=location_id,
                 batch_code=batch_code or "DEFAULT",
-                total_qty=quantity,
-                available_qty=quantity,
+                total_qty=0,
+                available_qty=0,
                 reserved_qty=0,
                 unit=unit,
                 status="available",
-                last_movement_at=now,
                 created_at=now,
                 updated_at=now,
             )
             self.db.add(inv)
+            await self.db.flush()
+        elif location_id and not inv.location_id:
+            inv.location_id = location_id
 
-        # 记录流水
-        txn = InventoryTransaction(
-            id=_gen_id(),
-            factory_id=factory_id,
-            inventory_id=inv.id,
-            material_id=material_id,
-            batch_code=batch_code,
-            transaction_type="inbound",
-            quantity=quantity,
-            before_qty=before_qty,
-            after_qty=before_qty + quantity,
-            reference_type=reference_type,
-            reference_id=reference_id,
-            operator=operator,
-            remark=remark or "快速入库",
-            created_at=now,
-        )
-        self.db.add(txn)
-        await self.db.commit()
+        doc_no = f"IN-T{(factory_id or '')[:4]}-{now:%Y%m%d%H%M%S}-{_gen_id()[:6]}"
+        try:
+            movement_type = document_movement_type("in", inbound_type)
+        except MovementError as exc:
+            await self.db.rollback()
+            return {"error": str(exc)}
+        try:
+            txn = await apply_movement(
+                self.db, inventory=inv, transaction_type=movement_type, quantity=qty,
+                reference_type="wms_terminal", reference_id=doc_no, reference_doc_no=doc_no,
+                operator=operator, remark=remark or f"终端收货（{inbound_type}）",
+            )
+        except MovementError as exc:
+            await self.db.rollback()
+            return {"error": f"入库没记成：{exc}"}
 
-        # ═══ G2断点修复：收货自动触发IQC（按自动化等级决定行为） ═══
+        before_qty = int(txn.before_qty or 0)
+        after_qty = int(txn.after_qty or 0)
+
+        # ═══ 收货自动触发 IQC（按自动化等级决定行为）═══
+        # 判据没改：仍然是"来源写了 purchase，或备注里带采购"。
+        # 采购收货"必须先有 IQC PASS 才能入账"是 create_inbound 那条路上的另一套政策，
+        # 两套政策并存这件事要人定，不在这一格里替厂里选。
         iqc_triggered = False
         iqc_action = "none"
         if reference_type == "purchase" or (remark and "采购" in (remark or "")):
@@ -120,17 +130,16 @@ class WmsOperationService:
                 iqc_level = await lvl_svc.get_level(factory_id, "auto_iqc")
 
                 if iqc_level >= 2:
-                    # L2/L3: 自动创建IQC任务+抽样
                     from api.services.inspection_service import InspectionService
                     insp_svc = InspectionService(self.db)
                     import math
-                    sample = min(80, max(5, int(math.sqrt(quantity))))
+                    sample = min(80, max(5, int(math.sqrt(qty))))
                     await insp_svc.create_task(
                         factory_id=factory_id,
                         inspect_type="IQC",
                         material_code=material_code,
                         material_name=material_name,
-                        batch_qty=quantity,
+                        batch_qty=qty,
                         sample_qty=sample,
                         source_type="inbound",
                         source_code=batch_code or material_code,
@@ -139,29 +148,36 @@ class WmsOperationService:
                     iqc_triggered = True
                     iqc_action = "auto_task_created" if iqc_level == 2 else "auto_task_and_judge"
                 elif iqc_level == 1:
-                    # L1: 只提醒品质部有待检（不自动创建任务）
                     iqc_action = "notify_qc"
                 else:
-                    # L0: 纯手工，不做任何事
                     iqc_action = "manual"
             except Exception:
-                pass  # IQC触发失败不阻塞入库
+                pass  # IQC 触发失败不阻塞入账（账已经走原语落了）
+
+        await self.db.commit()
 
         return {
             "success": True,
             "type": "inbound",
+            "document_no": doc_no,
+            "transaction_type": movement_type,
+            "material_id": material_id,
             "material_code": material_code,
-            "quantity": quantity,
-            "after_qty": before_qty + quantity,
+            "quantity": qty,
+            "before_qty": before_qty,
+            "after_qty": after_qty,
             "warehouse_id": warehouse_id,
+            "batch_code": inv.batch_code,
             "operator": operator,
             "time": now.isoformat(),
             "iqc_triggered": iqc_triggered,
             "iqc_action": iqc_action,
-            "iqc_note": {"auto_task_created": "已自动创建IQC任务", "auto_task_and_judge": "已自动创建IQC+自动判定", "notify_qc": "已提醒品质部(L1)", "manual": "手工模式-需人通知品质部", "none": "非采购入库"}.get(iqc_action, ""),
+            "iqc_note": {"auto_task_created": "已自动创建IQC任务",
+                         "auto_task_and_judge": "已自动创建IQC+自动判定",
+                         "notify_qc": "已提醒品质部(L1)",
+                         "manual": "手工模式-需人通知品质部",
+                         "none": "非采购入库"}.get(iqc_action, ""),
         }
-
-    # ==================== 快速出库 ====================
 
     async def quick_outbound(
         self,
@@ -174,65 +190,59 @@ class WmsOperationService:
         reference_id: Optional[str] = None,
         operator: str = "system",
         remark: Optional[str] = None,
+        outbound_type: str = "sales",
+        work_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """快速出库（领料/发货）"""
-        now = datetime.utcnow()
+        """出库只走带守卫的那扇门：InventoryService.create_outbound。
 
-        # 查找库存
-        conditions = [
-            Inventory.factory_id == factory_id,
-            Inventory.material_id == material_id,
-        ]
-        if warehouse_id:
-            conditions.append(Inventory.warehouse_id == warehouse_id)
-        if batch_code:
-            conditions.append(Inventory.batch_code == batch_code)
+        10-10 界面自检抓到这条路径把质量冻结整个绕过去 —— 它自己
+        `inv.total_qty -= quantity` 再补一条 `transaction_type='outbound'` 流水，
+        而冻结守卫在 apply_movement 里，这段代码从没进过那扇门：
+        实测一行 status='locked' 的库存照样出库成功，还留下 1 条遗留字面量流水。
+        顺带修掉两个小错：只扣 created_at 最早的一行（跨批次不拆）、没有单据号。
+        """
+        from api.services.wms_service import InventoryService
 
-        inv_stmt = select(Inventory).where(and_(*conditions)).order_by(Inventory.created_at.asc())
-        inv_result = await self.db.execute(inv_stmt)
-        inv = inv_result.scalars().first()
+        qty = int(quantity)
+        if qty <= 0:
+            return {"error": f"出库数量必须是正整数，收到 {quantity!r}"}
 
-        if not inv:
-            return {"error": f"物料 {material_id} 无库存"}
-        if inv.available_qty < quantity:
-            return {"error": f"可用库存不足：需要 {quantity}，可用 {inv.available_qty}"}
+        try:
+            outbound = await InventoryService(self.db).create_outbound(
+                factory_id=factory_id,
+                warehouse_id=warehouse_id,
+                material_id=material_id,
+                quantity=qty,
+                work_order_id=work_order_id,
+                batch_code=batch_code,
+                outbound_type=outbound_type or "sales",
+                created_by=operator,
+            )
+        except (MovementError, ValueError) as exc:
+            # 欠料/被冻住都从 create_outbound 的判词里出来，原样报给操作员
+            await self.db.rollback()
+            return {"error": str(exc)}
 
-        before_qty = inv.total_qty
-        inv.total_qty -= quantity
-        inv.available_qty -= quantity
-        inv.last_movement_at = now
-        inv.updated_at = now
-
-        # 记录流水
-        txn = InventoryTransaction(
-            id=_gen_id(),
-            factory_id=factory_id,
-            inventory_id=inv.id,
-            material_id=material_id,
-            batch_code=inv.batch_code,
-            transaction_type="outbound",
-            quantity=-quantity,
-            before_qty=before_qty,
-            after_qty=before_qty - quantity,
-            reference_type=reference_type,
-            reference_id=reference_id,
-            operator=operator,
-            remark=remark or "快速出库",
-            created_at=now,
-        )
-        self.db.add(txn)
-        await self.db.commit()
+        summary = (await self.db.execute(text("""
+            SELECT COALESCE(MAX(material_code), '') AS material_code,
+                   COALESCE(SUM(available_qty), 0) AS remaining
+            FROM inventory WHERE factory_id = :fid AND material_id = :mid
+        """), {"fid": factory_id, "mid": material_id})).mappings().first() or {}
 
         return {
             "success": True,
             "type": "outbound",
+            "outbound_code": outbound.outbound_code,
+            # 界面要显示的是流水那一格的规范名（sales_out），不是单据类型（sales）
+            "transaction_type": document_movement_type("out", outbound.outbound_type),
             "material_id": material_id,
-            "material_code": inv.material_code,
-            "quantity": quantity,
-            "after_qty": before_qty - quantity,
-            "warehouse_id": inv.warehouse_id,
+            "material_code": summary.get("material_code") or material_id,
+            "quantity": int(outbound.quantity or qty),
+            "after_qty": int(summary.get("remaining") or 0),
+            "warehouse_id": outbound.warehouse_id,
+            "batch_code": outbound.batch_code,
             "operator": operator,
-            "time": now.isoformat(),
+            "time": (outbound.completed_at or datetime.utcnow()).isoformat(),
         }
 
     # ==================== 移库 ====================
@@ -376,6 +386,10 @@ class WmsOperationService:
                 "available_qty": i.available_qty,
                 "reserved_qty": i.reserved_qty,
                 "unit": i.unit,
+                # 锁标记要在选行时看得见：冻结写的是 status='locked'，读侧不给这一列，
+                # 人就分不清"这行还能冻"还是"早就冻着"
+                "status": i.status,
+                "lock_reason": i.lock_reason,
                 "last_movement_at": i.last_movement_at.isoformat() if i.last_movement_at else None,
             } for i in items],
             "total": len(items),

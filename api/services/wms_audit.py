@@ -102,6 +102,57 @@ def table_references():
     return out
 
 
+def direct_stock_writes():
+    """还有几处在记账原语外面直接改库存数量：点名清单，扫不动返回 None。
+
+    这条不是风格洁癖 —— 质量冻结的守卫长在 apply_movement 里，
+    所以在它外面写 `total_qty -= n` 的路径，等于拿着锁住的料也能领走。
+    10-10 界面自检就是靠这条抓到 /wms/outbound 把 status='locked' 的行出库成功。
+
+    判据走 AST，不看注释：第一版用正则在源码文本上找，结果把我自己 docstring 里
+    引用的旧代码也算成了旁路 —— 那样报出来的红是假的，会把真旁路淹掉。
+    排除两处：movements.py（它就是那扇门）、本模块（docstring 里点名了这些写法）。
+    """
+    import ast
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    here = os.path.abspath(__file__)
+    primitive = os.path.join(root, "api", "services", "wms_architecture", "movements.py")
+    fields = {"total_qty", "available_qty", "reserved_qty"}
+    hits, scanned = [], 0
+    for top in _CODE_ROOTS:
+        base = os.path.join(root, top)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in sorted(files):
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, fn)
+                real = os.path.abspath(path)
+                if real in (here, primitive):
+                    continue
+                try:
+                    body = io.open(path, encoding="utf-8", errors="ignore").read()
+                    tree = ast.parse(body, filename=path)
+                except (OSError, SyntaxError, ValueError):
+                    continue
+                scanned += 1
+                for node in ast.walk(tree):
+                    targets = []
+                    if isinstance(node, ast.AugAssign):
+                        targets = [node.target]
+                    elif isinstance(node, ast.Assign):
+                        targets = node.targets
+                    for tgt in targets:
+                        if isinstance(tgt, ast.Attribute) and tgt.attr in fields:
+                            hits.append(f"{os.path.relpath(path, root)}:{node.lineno}")
+    if scanned == 0:
+        return None
+    return sorted(set(hits))
+
+
 async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
     """跑一遍实测，返回每一格的判词。只读，不写任何表。"""
     from sqlalchemy import text
@@ -210,8 +261,24 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
         so_what="没有盘点 = 台账说有多少就是多少，谁也没验证过；"
                 "10-08 那次'零领料却完工入库 165 件虚假半成品'就是这类没被盘出来",
         missing=(None if approved else
-                 ("要人把实测数录进 inventory_count_items（GET /api/v1/wms/count-plan 看该盘哪些行）"
-                  if orders else "GET /api/v1/wms/count-plan?apply=false 先看范围"))))
+                 ("界面已给'录入明细'面板（GET /inventory/count/{id}/items 列 item_id → 逐行填实测数 → 审批）。"
+                  "还差的是人真去数一遍：实测数是现场事实，系统和界面都不代填"
+                  if orders else "先 GET /api/v1/wms/count-plan?apply=false 看范围，再建盘点单"))))
+
+    gates = direct_stock_writes()
+    caps.append(_grade(
+        "live" if gates == [] else ("not_computable" if gates is None else "bypass"),
+        "库存写入是否只走一扇门",
+        ("运行时代码里 0 处在 apply_movement 外面直接改 total/available/reserved"
+         if gates == [] else
+         ("扫不到源码，这条判不出（不是「没有旁路」）" if gates is None else
+          f"{len(gates)} 处在原语外面直接改数量：" + "、".join(gates[:8]))),
+        so_what="冻结守卫长在写入原语里 —— 原语外面改数量的那条路，就是冻结挡不住的那条路",
+        missing=(None if gates == [] else
+                 ("算不出：容器没挂到源码目录" if gates is None else
+                  "每处各自判：能删的删掉重复实现（core/wms/inventory.py 除了枚举没人 import），"
+                  "该改的改成走 apply_movement/apply_transfer_pair；"
+                  "预留/主数据这类不落流水的写法要在这里说明为什么不落"))))
 
     frz = await one("""
         SELECT (SELECT COUNT(*) FROM inventory_freezes WHERE factory_id=:fid

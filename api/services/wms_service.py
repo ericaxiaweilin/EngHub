@@ -153,6 +153,47 @@ class WmsService:
 
         return {"success": True, "count_id": count_order.id, "count_code": count_code, "total_items": item_count}
 
+    async def get_count_items(self, count_id: str) -> Dict[str, Any]:
+        """取一张盘点单的明细，带上人看得懂的料号/批次/库位。
+
+        为什么单独补这一条：录入端点 POST /inventory/count/{id}/items 要的是 item_id，
+        但全仓没有任何地方能把这些行的 id 列出来 —— 于是"已录实测 0/200"不是现场没录，
+        是任何客户端都看不到该录哪几行。判词当时写成了人的问题，这里补上通路。
+        """
+        from sqlalchemy import text
+
+        rows = (await self.db.execute(text("""
+            SELECT ci.id AS item_id, ci.material_id, ci.batch_code,
+                   ci.system_qty, ci.counted_qty, ci.diff_qty, ci.adjusted, ci.remark,
+                   COALESCE(i.material_code, ci.material_id) AS material_code,
+                   COALESCE(i.material_name, '') AS material_name,
+                   COALESCE(i.unit, '') AS unit,
+                   COALESCE(l.location_code, '') AS location_code,
+                   COALESCE(w.warehouse_code, '') AS warehouse_code,
+                   COALESCE(i.factory_id, '') AS factory_id
+            FROM inventory_count_items ci
+            LEFT JOIN inventory i ON i.id = ci.inventory_id
+            LEFT JOIN locations l ON l.id = i.location_id
+            LEFT JOIN warehouses w ON w.id = i.warehouse_id
+            WHERE ci.count_id = :cid
+            ORDER BY (ci.counted_qty IS NOT NULL), material_code, ci.batch_code
+        """), {"cid": count_id})).mappings().all()
+        items = [dict(r) for r in rows]
+        counted = sum(1 for it in items if it.get("counted_qty") is not None)
+        diffs = [it for it in items if it.get("counted_qty") is not None
+                 and int(it.get("diff_qty") or 0) != 0]
+        return {
+            "count_id": count_id,
+            "items": items,
+            "total": len(items),
+            "counted": counted,
+            "pending": len(items) - counted,
+            "with_diff": len(diffs),
+            "factories": sorted({it["factory_id"] for it in items if it["factory_id"]}),
+            "note": ("没录的行不算差异：diff_qty 只在已录入后才成立，"
+                     "否则'还没盘'会被读成'盘平了'"),
+        }
+
     async def submit_count_item(
         self,
         count_id: str,
@@ -166,7 +207,8 @@ class WmsService:
             return {"success": False, "message": "盘点明细不存在"}
 
         item.counted_qty = counted_qty
-        item.diff_qty = counted_qty - item.system_qty
+        # 与 approve_count 同一把尺：缺 system_qty 按 0 算，别一个 500 一个静默
+        item.diff_qty = int(counted_qty) - int(item.system_qty or 0)
         if remark:
             item.remark = remark
 
@@ -651,8 +693,14 @@ class InventoryService:
         factory_id: str,
         material_id: Optional[str] = None,
         warehouse_id: Optional[str] = None,
+        material_code: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> List[Inventory]:
-        """获取库存信息"""
+        """获取库存信息
+
+        `status` 是读侧唯一的过滤口：冻结上线后写的是 locked，界面要能筛出这一格，
+        否则"锁住了多少"只能靠 curl 数。
+        """
         query = select(Inventory).where(
             Inventory.factory_id == factory_id,
         )
@@ -661,7 +709,15 @@ class InventoryService:
             query = query.where(Inventory.material_id == material_id)
         if warehouse_id:
             query = query.where(Inventory.warehouse_id == warehouse_id)
-        
+        if material_code:
+            query = query.where(Inventory.material_code.ilike(f"%{material_code}%"))
+        if status:
+            # 台账里"可用"有两个词（active 11,021 行 / available 209 行）—— 界面要筛"可用"
+            # 就得能一次给多个词，而不是让后端偷偷替厂里选一个同义词。
+            wanted = [s.strip().lower() for s in str(status).split(",") if s.strip()]
+            if wanted:
+                query = query.where(func.lower(Inventory.status).in_(wanted))
+
         result = await self.db.execute(query)
         return result.scalars().all()
     
@@ -1245,19 +1301,30 @@ class InventoryService:
         work_order_id: str,
     ) -> dict:
         """预留库存"""
+        from api.services.wms_architecture.movements import frozen_stock_error
+
         inventories = await self.get_inventory(factory_id, material_id, warehouse_id)
-        
-        total_available = sum(inv.available_qty for inv in inventories)
-        
+        # 被质量冻住的行不参与预留：预留了也领不走，只会让工单卡在"有预留却缺料"
+        usable, held = [], []
+        for inv in inventories:
+            (held if frozen_stock_error(inv, 1) else usable).append(inv)
+        held_qty = sum(int(i.available_qty or 0) for i in held)
+
+        total_available = sum(inv.available_qty for inv in usable)
+
         if total_available < quantity:
-            raise ValueError(f"Insufficient available inventory. Available: {total_available}, Requested: {quantity}")
-        
+            note = (f"（另有 {len(held)} 行共 {held_qty} 件被质量冻着，不算进可预留量；"
+                    f"放行走 POST /api/v1/wms/freeze/release）" if held else "")
+            raise ValueError(
+                f"Insufficient available inventory. Available: {total_available}, "
+                f"Requested: {quantity}{note}")
+
         # 简单实现：预留第一个有足够库存的记录
         remaining_qty = quantity
-        for inventory in inventories:
+        for inventory in usable:
             if remaining_qty <= 0:
                 break
-            
+
             reserve_qty = min(remaining_qty, inventory.available_qty)
             inventory.available_qty -= reserve_qty
             inventory.reserved_qty += reserve_qty

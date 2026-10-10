@@ -29,6 +29,8 @@ class InboundRequest(BaseModel):
     material_name: Optional[str] = None
     unit: str = "pcs"
     remark: Optional[str] = None
+    # 入库类型决定流水词表里的哪一格：purchase/production/return/adjustment
+    inbound_type: str = "purchase"
 
 
 class OutboundRequest(BaseModel):
@@ -38,6 +40,8 @@ class OutboundRequest(BaseModel):
     warehouse_id: Optional[str] = None
     batch_code: Optional[str] = None
     remark: Optional[str] = None
+    outbound_type: str = "sales"
+    work_order_id: Optional[str] = None
 
 
 class TransferRequest(BaseModel):
@@ -96,6 +100,7 @@ async def quick_inbound(
         unit=req.unit,
         operator=current_user.username,
         remark=req.remark,
+        inbound_type=req.inbound_type,
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
@@ -118,6 +123,8 @@ async def quick_outbound(
         batch_code=req.batch_code,
         operator=current_user.username,
         remark=req.remark,
+        outbound_type=req.outbound_type,
+        work_order_id=req.work_order_id,
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])

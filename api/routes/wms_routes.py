@@ -107,14 +107,18 @@ class InventoryUpdatePartial(BaseModel):
 
 
 class InventoryUpdateFull(BaseModel):
-    """完全替换更新库存（PUT）"""
-    location_id: str
-    batch_code: str
-    total_qty: int
-    available_qty: int
-    reserved_qty: int
-    unit_cost: float
-    status: str
+    """更新库存主数据（PUT）—— 数量不在这里改
+
+    给默认值不是为了省事，是为了分得开"没送这个字段"和"送了"：
+    路由按 model_fields_set 判，送数量就直接拒（见 update_inventory_full）。
+    """
+    location_id: Optional[str] = None
+    batch_code: Optional[str] = None
+    total_qty: Optional[int] = None
+    available_qty: Optional[int] = None
+    reserved_qty: Optional[int] = None
+    unit_cost: Optional[float] = None
+    status: Optional[str] = None
 
 
 class InventoryDeleteResponse(BaseModel):
@@ -360,33 +364,58 @@ async def get_inventory(
     factory_id: str,
     material_id: Optional[str] = None,
     warehouse_id: Optional[str] = None,
+    material_code: Optional[str] = None,
+    status: Optional[str] = None,
+    page: Optional[int] = None,
+    page_size: int = 50,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """获取库存信息"""
+    """获取库存信息
+
+    以前只回 8 个字段：`InventoryItem` 在前端声明了 status/unit_cost/created_at，
+    后端一个都没发 —— 于是"状态"列永远空、"冻结"筛了等于没筛。
+    """
     service = InventoryService(db)
 
     inventories = await service.get_inventory(
         factory_id=factory_id,
         material_id=material_id,
         warehouse_id=warehouse_id,
+        material_code=material_code,
+        status=status,
     )
-    
+    total = len(inventories)
+    if page and page > 0:
+        start = (page - 1) * max(1, int(page_size))
+        inventories = inventories[start:start + max(1, int(page_size))]
+
     return {
         "items": [
             {
                 "id": inv.id,
                 "material_id": inv.material_id,
                 "material_code": inv.material_code,
+                "material_name": inv.material_name,
                 "warehouse_id": str(inv.warehouse_id),
+                "location_id": inv.location_id,
                 "batch_code": inv.batch_code,
                 "total_qty": inv.total_qty,
                 "available_qty": inv.available_qty,
                 "reserved_qty": inv.reserved_qty,
+                "unit": inv.unit,
+                "unit_cost": float(inv.unit_cost) if inv.unit_cost is not None else None,
+                "status": inv.status,
+                "lock_reason": inv.lock_reason,
+                "qualified_status": inv.qualified_status,
+                "created_at": inv.created_at.isoformat() if inv.created_at else None,
+                "updated_at": inv.updated_at.isoformat() if inv.updated_at else None,
             }
             for inv in inventories
         ],
-        "total": len(inventories)
+        "total": total,
+        "page": page,
+        "page_size": page_size if page else None,
     }
 
 
@@ -400,12 +429,25 @@ async def update_inventory_full(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """完全替换更新库存记录（PUT）"""
+    """完全替换更新库存记录（PUT）
+
+    数量三个字段不在这里改：PUT 直接写 total/available/reserved 等于绕过记账原语 ——
+    没有流水、没有操作人、也不认质量冻结，事后账实对不上时没人知道是哪一次改的。
+    要改数量走 POST /api/v1/wms/inbound（收货）/wms/outbound（出库）/wms/transfer（调拨），
+    盘点差异走 GET+POST /api/v1/inventory/count/{id}/items 再审批。
+    """
+    quantity_fields = ({"total_qty", "available_qty", "reserved_qty"}
+                       & set(req.model_fields_set))
+    if quantity_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"库存数量不能由 PUT 直接改（动了 {'、'.join(sorted(quantity_fields))}）；"
+                   "要改数量请走出入库/调拨/盘点审批 —— 那三条都会在台账留下单据号和流水")
     try:
         service = InventoryService(db)
         result = await service.update_inventory_full(
             inventory_id=inventory_id,
-            data=req.dict(),
+            data=req.model_dump(exclude_unset=True),
             updated_by=current_user.username,
         )
         if not result.get("success"):
@@ -660,6 +702,17 @@ async def list_inventory_counts(
             for c in counts
         ]
     }
+
+
+@router.get("/inventory/count/{count_id}/items", summary="盘点明细（带料号/批次/库位，供录入）")
+async def list_count_items(
+    count_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """没有这条，POST .../items 要的 item_id 对人就是不可得的，盘点流程走不通。"""
+    del current_user
+    return await WmsService(db).get_count_items(count_id)
 
 
 @router.post("/inventory/count/{count_id}/items")

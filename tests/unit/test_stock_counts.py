@@ -1,7 +1,11 @@
 """周期盘点的范围判据：为什么是这一行该盘，必须说得出理由。"""
 from datetime import datetime
 
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+
 from api.services.stock_counts import MAX_ITEMS_PER_ORDER, plan_scope
+from api.services.wms_service import WmsService
 
 NOW = datetime(2026, 10, 9)
 
@@ -73,3 +77,99 @@ def test_scope_rotates_reasons_instead_of_burning_the_cap_on_one():
     # 候选总数与本轮取数分开报：读的人要知道"还剩多少没盘到"，不是"就这么点问题"
     assert plan["candidates_by_reason"] == {"never_moved": 60, "no_location": 30,
                                             "class_a": 30, "zero_stock": 0}
+
+
+class _Mappings:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _Result:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return _Mappings(self._rows)
+
+
+class _Db:
+    """只回放一条明细查询 —— 列明细不该绕第二次 DB。"""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = []
+
+    async def execute(self, statement, params=None):
+        self.calls.append((str(statement), params))
+        assert len(self.calls) == 1, f"列一次明细打了 {len(self.calls)} 条查询"
+        return _Result(self._rows)
+
+
+def _item(i, counted, diff, factory="FAC_MECH_001"):
+    return {"item_id": f"i{i}", "material_id": f"M{i}", "batch_code": f"B{i}",
+            "system_qty": 10, "counted_qty": counted, "diff_qty": diff,
+            "adjusted": False, "remark": None, "material_code": f"M{i}",
+            "material_name": "墊圈", "unit": "pcs", "location_code": f"LOC-{i}",
+            "warehouse_code": "WH-MECH-RAW", "factory_id": factory}
+
+
+@pytest.mark.asyncio
+async def test_count_items_lists_ids_the_entry_endpoint_needs():
+    """录入要 item_id，之前全仓没人能列出它 —— 这条通路是盘点能不能走起来的分界。"""
+    db = _Db([_item(1, None, None)])
+    out = await WmsService(db).get_count_items("c1")
+    assert [it["item_id"] for it in out["items"]] == ["i1"]
+    sql = db.calls[0][0]
+    assert "inventory_count_items ci" in sql and "LEFT JOIN inventory i" in sql
+    assert db.calls[0][1] == {"cid": "c1"}
+
+
+@pytest.mark.asyncio
+async def test_uncounted_rows_are_pending_not_zero_diff():
+    """没录的行算"还没盘"，不算"盘平了"：差异只数已录入且 diff≠0 的行。"""
+    rows = [_item(1, 10, 0), _item(2, None, None), _item(3, 7, -3)]
+    out = await WmsService(_Db(rows)).get_count_items("c1")
+    assert (out["total"], out["counted"], out["pending"], out["with_diff"]) == (3, 2, 1, 1)
+    assert out["factories"] == ["FAC_MECH_001"]
+
+
+@pytest.mark.asyncio
+async def test_factories_are_named_not_assumed():
+    """明细要能报出自哪个厂，否则拿 A 厂的进度答 B 厂的问题。"""
+    out = await WmsService(_Db([_item(1, None, None, "FAC_MECH_001"),
+                                _item(2, None, None, "FAC_BIKE_001")])).get_count_items("c1")
+    assert out["factories"] == ["FAC_BIKE_001", "FAC_MECH_001"]
+    assert out["counted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_item_uses_the_same_diff_ruler_as_approval():
+    """录入和审批必须同一把尺：缺 system_qty 时按 0 算，别一边 500 一边静默。"""
+    from api.services.wms_service import WmsService
+
+    class _Item:
+        def __init__(self):
+            self.count_id = "c1"
+            self.system_qty = None
+            self.counted_qty = None
+            self.diff_qty = None
+            self.remark = None
+
+    class _Order:
+        status = "draft"
+
+    item, order = _Item(), _Order()
+
+    async def fake_get(model, _pk):
+        return item if model.__name__ == "InventoryCountItem" else order
+
+    db = MagicMock()
+    db.get = fake_get
+    db.commit = AsyncMock()
+
+    out = await WmsService(db).submit_count_item("c1", "i1", 12, None)
+    assert out["success"] is True and out["diff_qty"] == 12, out
+
