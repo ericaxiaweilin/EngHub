@@ -1301,7 +1301,10 @@ def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
         if a > 0:
             out.append({**base, "type": "start_first_batch", "units": round(a, 3),
                         "start_date": str(today),
-                        "note": f"现料够先做 {a:g} 台，不等齐套；这批可以马上进排产预排"})
+                        "note": (f"现料够先做 {a:g} 台，不等齐套。这一步引擎落不了地："
+                                "aps_schedule_requests 一入队就真跑一次重排（不是等人批的草案），"
+                                "PMC 沙盘也表达不了分批（options 里认不了 allow_partial/分批）—— "
+                                "要分批开工得由计划员在工单上改开工范围")})
         if b > 0:
             out.append({**base, "type": "schedule_second_batch_after_arrival",
                         "units": round(b, 3),
@@ -1335,7 +1338,54 @@ def recommendation_actions(scan: Dict[str, Any], verdict: Dict[str, Any],
     ranked = sorted((merged[k] for k in order),
                     key=lambda a: (_ACTION_PRIORITY.get(str(a.get("type")), 9),
                                    str(a.get("model_code") or "")))
-    return ranked[:max(1, int(max_actions))]
+    return stamp_landing(ranked[:max(1, int(max_actions))])
+
+
+# 动作的"落点"收成封闭词表（#63 剩下的一半）：以前只有催购真的落成等人批的草稿，
+# 分批那条却在正文写"可以马上进排产预排" —— 出口侧承诺了一件系统没有通路做的事。
+# 现在每条动作都带 landing.mode；认不出的类型标 unknown，
+# 新动作忘了登记就露出来，不会悄悄退化成"看着有落点其实没有"。
+LANDING_DRAFT_PENDING_HUMAN = "draft_pending_human"
+LANDING_NONE = "no_landing"
+LANDING_UNKNOWN = "unknown"
+
+_LANDING: Dict[str, Dict[str, Any]] = {
+    "expedite_purchase": {
+        "mode": LANDING_DRAFT_PENDING_HUMAN,
+        "drafts_path": "/api/v1/pmc/expedite-drafts",
+        "decision_path": "/api/v1/pmc/expedite-drafts/decision",
+        "switch": "ENGHUB_EXPEDITE_DRAFTS_APPLY",
+    },
+    # 下面这几类是"建议得对，但系统里没有可落的对象"—— 点名缺什么，不装能落
+    "start_first_batch": {
+        "mode": LANDING_NONE,
+        "why": ("没有'等人批的预排草案'这种对象：APS 请求队列一入队就真跑重排；"
+                "PMC 沙盘的 options 也表达不了分批（没有 allow_partial/分批 开关）"),
+        "would_need": "落到工单的开工范围（计划员改主数据），或先新建一个预排草案对象"},
+    "schedule_second_batch_after_arrival": {
+        "mode": LANDING_NONE,
+        "why": "和分批同源：到货日之后的第二批没有可确认的预排对象",
+        "would_need": "同上"},
+    "supplier_master_missing": {
+        "mode": LANDING_NONE,
+        "why": "催购没有对象（料号没默认供应商），要的是补数据不是下建议",
+        "would_need": "物料主档补 supplier_code"},
+    "master_data_gap": {
+        "mode": LANDING_NONE,
+        "why": "缺口在数据侧（自制/外购、BOM 层级），不是任何一张可批的单",
+        "would_need": "按 detail 点名的字段补主数据"},
+}
+
+
+def stamp_landing(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """给每条动作盖上落点；未登记的类型一律 unknown，不许默认成"有落点"。"""
+    for a in actions:
+        got = _LANDING.get(str(a.get("type")))
+        a["landing"] = (dict(got) if got else
+                        {"mode": LANDING_UNKNOWN,
+                         "why": f"动作类型 {a.get('type')!r} 没登记落点"})
+    return actions
+
 
 
 def _seed_calibration(seed: Optional[Dict[str, Any]], days_of_output: float,

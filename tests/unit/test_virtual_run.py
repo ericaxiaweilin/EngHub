@@ -431,3 +431,73 @@ def test_evidence_flag_kinds_name_the_reasons_without_rejudging():
     # 没供应商单独点名（那是"催购没有对象"，不是料号问题）
     assert "no_supplier" in evidence_flag_kinds({"lead_evidence": "measured"},
                                                 {"bom_source": "engflow_mirror"})
+
+
+# ── #63 剩下的一半：动作要声明自己有没有落点，别再在正文里承诺没通路的事 ──────
+def _split_scan():
+    """一台单现料够先做一批、还缺主数据标注 —— 逼出分批与缺口两类动作。"""
+    def d(m, a_units, b_units):
+        return {"model_code": m, "status": "simulated", "days_late": 0,
+                "material_arrival_day": 12,
+                "batch_a_units": a_units, "batch_b_units": b_units,
+                "bottleneck_part": None, "blockers": ["RM-X 未标自制/外购"]}
+    return _scan_with("现况", {"好天": [d("M-1", 10, 90)]})
+
+
+def test_every_emitted_action_declares_a_landing_mode():
+    from api.services import virtual_run as vr
+    from datetime import date
+    scan, verdict = _split_scan()
+    acts = vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))
+    assert acts, "这一轮该出动作，没出动作的断言是假绿"
+    allowed = {vr.LANDING_DRAFT_PENDING_HUMAN, vr.LANDING_NONE, vr.LANDING_UNKNOWN}
+    for a in acts:
+        assert "landing" in a and a["landing"]["mode"] in allowed, a.get("type")
+
+
+def test_split_action_stops_promising_a_path_it_does_not_have():
+    """10-09 之前的正文写"这批可以马上进排产预排" —— 而 APS 请求队列一入队就真跑重排、
+    PMC 沙盘的 options 又表达不了分批，所以那句话没有任何通路。改成说实话并点名缺什么。"""
+    from api.services import virtual_run as vr
+    from datetime import date
+    scan, verdict = _split_scan()
+    first = [a for a in vr.recommendation_actions(scan, verdict, today=date(2026, 10, 6))
+             if a["type"] == "start_first_batch"][0]
+    assert "马上进排产预排" not in first["note"]
+    assert first["landing"]["mode"] == vr.LANDING_NONE
+    for needle in ("aps_schedule_requests", "工单"):
+        assert needle in first["note"] or needle in str(first["landing"].get("why", "")), needle
+
+
+def test_no_landing_actions_say_what_object_is_missing():
+    """只说"落不了地"不算披露 —— 要点名缺哪个对象，人才知道去补什么。"""
+    from api.services import virtual_run as vr
+    for name, spec in vr._LANDING.items():
+        if spec["mode"] == vr.LANDING_NONE:
+            assert spec.get("why") and spec.get("would_need"), name
+
+
+def test_unregistered_action_type_becomes_unknown_not_silently_ok():
+    """新动作忘了登记落点，必须露出来（默认当"有落点"就是再一次自证）。"""
+    from api.services import virtual_run as vr
+    out = vr.stamp_landing([{"type": "brand_new_action"}])
+    assert out[0]["landing"]["mode"] == vr.LANDING_UNKNOWN
+    assert "brand_new_action" in out[0]["landing"]["why"]
+
+
+def test_expedite_landing_paths_point_at_registered_routes():
+    """唯一有落点的那类，路径要真在路由表里 —— 不然字段只是把假承诺搬了个地方。"""
+    import io
+    import os
+    import re
+    from api.services import virtual_run as vr
+
+    src = io.open(os.path.join(os.path.dirname(__file__), "..", "..",
+                              "api", "routes", "pmc_routes.py"),
+                  encoding="utf-8").read()
+    spec = vr._LANDING["expedite_purchase"]
+    for key in ("drafts_path", "decision_path"):
+        # 注册的是 ("/expedite-drafts"（带前导斜杠），公开路径还要算上 router 前缀
+        tail = "/" + spec[key].split("/api/v1/pmc/", 1)[1]
+        assert re.search(r'@router\.(get|post)\("%s' % re.escape(tail), src), (key, tail)
+    assert spec["switch"] == "ENGHUB_EXPEDITE_DRAFTS_APPLY"
