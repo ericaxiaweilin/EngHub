@@ -190,6 +190,29 @@ def allowed_factory_ids(user: Optional[User]) -> Optional[set]:
     return {getattr(user, "factory_id", None), getattr(user, "active_factory_id", None)} - {None, ""}
 
 
+def ensure_row_in_tenant(row, user, action: str, *, label: str = "记录") -> None:
+    """按 id 取出来的这一行必须属于调用者有权的厂区（超管不限；无身份的服务内调用不拦）。
+
+    和 `enforce_tenant` 是同一件事的两面：那道闸管"请求说要动哪个厂"，这一道管
+    "你动的那行其实是哪个厂"。只判 factory_id 这个事实，不判角色 —— 谁能取消计划是厂规。
+    """
+    if user is None:
+        return
+    allowed = allowed_factory_ids(user)
+    if allowed is None:
+        return
+    row_factory = getattr(row, "factory_id", None) or ""
+    if row_factory in allowed:
+        return
+    ident = getattr(row, "plan_code", None) or getattr(row, "work_order_code", None) or getattr(row, "id", "")
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(f"{action}：{label} {ident} 属于厂区 {row_factory or '(未标注)'}，不在账号 "
+                f"{getattr(user, 'username', '?')} 的可访问范围"
+                f"（可访问：{'、'.join(sorted(allowed)) or '未分配厂区'}）"),
+    )
+
+
 async def enforce_tenant(
     request: Request,
     db: AsyncSession = Depends(get_db),

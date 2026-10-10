@@ -6,7 +6,7 @@ import types
 
 import pytest
 
-from core.auth.security import allowed_factory_ids
+from core.auth.security import allowed_factory_ids, ensure_row_in_tenant
 from api.services.work_order_service import WorkOrderService, WoTenantError
 
 
@@ -17,6 +17,34 @@ def _user(username="u", factory="FAC_MECH_001", active=None, superuser=False):
 
 def _wo(code="WO-1", factory="FAC_MECH_001"):
     return types.SimpleNamespace(id="id-1", work_order_code=code, factory_id=factory)
+
+
+class TestEnsureRowInTenant:
+    """路由侧的行归属判据（pp 计划这类"按 id 取行就改"的路由用它）。"""
+
+    def test_same_factory_passes(self):
+        ensure_row_in_tenant(_wo(factory="FAC_MECH_001"), _user(), "取消计划")
+
+    def test_foreign_factory_is_403_naming_the_row_and_scope(self):
+        from fastapi import HTTPException
+        u = _user(username="pp_planner_09")
+        with pytest.raises(HTTPException) as exc:
+            ensure_row_in_tenant(_wo(factory="FAC_ELEC_DEMO_2026"), u, "取消计划", label="计划")
+        assert exc.value.status_code == 403
+        text = str(exc.value.detail)
+        assert "取消计划" in text
+        assert "FAC_ELEC_DEMO_2026" in text      # 那行属于哪个厂
+        assert "pp_planner_09" in text          # 谁在动
+        assert "FAC_MECH_001" in text           # 他有权进哪些厂
+
+    def test_superuser_and_in_process_calls_are_unbounded(self):
+        ensure_row_in_tenant(_wo(factory="FAC_ELEC_DEMO_2026"), _user(superuser=True), "下达计划")
+        ensure_row_in_tenant(_wo(factory="FAC_ELEC_DEMO_2026"), None, "下达计划")
+
+    def test_row_without_factory_label_is_blocked_for_normal_user(self):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            ensure_row_in_tenant(_wo(factory=None), _user(), "批准变更请求")
 
 
 class TestAllowedFactoryIds:

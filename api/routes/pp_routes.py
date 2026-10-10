@@ -14,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_config import get_db
-from core.auth.security import get_current_user, require_permission
+from core.auth.security import get_current_user, require_permission, ensure_row_in_tenant
 from database.models import User, Plan, Product, Inventory, Station, WorkOrder, WorkOrderMaterial
 from core.pp.plan import MPSService
 from api.services.bom_source import (
@@ -204,6 +204,7 @@ async def release_plan(
     p = await db.get(Plan, plan_id)
     if not p:
         raise HTTPException(status_code=404, detail="计划不存在")
+    ensure_row_in_tenant(p, current_user, "下达计划", label="计划")
     if p.status != "confirmed":
         raise HTTPException(status_code=400, detail="只有已确认的计划可以下达")
     
@@ -351,6 +352,7 @@ async def cancel_plan(
     p = await db.get(Plan, plan_id)
     if not p:
         raise HTTPException(status_code=404, detail="计划不存在")
+    ensure_row_in_tenant(p, current_user, "取消计划", label="计划")
     if p.status in ["completed", "cancelled"]:
         raise HTTPException(status_code=400, detail="计划已完成或已取消，无法再次取消")
     
@@ -579,7 +581,14 @@ async def approve_change_request(
     """人工批准变更请求（Level2/Level3）"""
     from api.services.pp_service import PPService
     pp = PPService(db)
-    
+
+    # 这条路由以前从不加载 plan_id 指向的那行，也就没人看过它属于哪个厂 ——
+    # 批准动作先落到"这个账号能不能碰这张计划"上。
+    p = await db.get(Plan, plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="计划不存在")
+    ensure_row_in_tenant(p, current_user, "批准变更请求", label="计划")
+
     if body.action.lower() != "approve":
         raise HTTPException(status_code=400, detail="操作必须是 approve")
     
