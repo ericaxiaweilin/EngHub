@@ -870,17 +870,19 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
                COUNT(*) FILTER (WHERE role='assistant' AND COALESCE(tool_calls::text,'[]') NOT IN ('[]','null','')) AS with_tools,
                COUNT(*) FILTER (WHERE role='assistant' AND tool_calls::text LIKE '%"result"%'
                                      AND COALESCE(content,'') <> '') AS answerable
-        FROM chat_messages WHERE created_at > NOW() - INTERVAL '30 days'
-    """))).mappings().first()
+          FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id
+         WHERE s.factory_id = :fid AND m.created_at > NOW() - INTERVAL '30 days'
+    """), {"fid": factory_id})).mappings().first()
     assistants = int((stats or {}).get("assistants") or 0)
     with_tools = int((stats or {}).get("with_tools") or 0)
     backing = round(with_tools / assistants, 3) if assistants else None
     # "回答里的数有没有出处"：抽最近带工具结果的回答，把正文里的数字逐个回查 tool_results 原文
     turn_rows = (await db.execute(text("""
-        SELECT data::text AS d FROM chat_events
-        WHERE event_type = 'item/completed' AND data::text LIKE '%tool_call_count%'
-          AND created_at > NOW() - INTERVAL '30 days' ORDER BY created_at DESC LIMIT 400
-    """))).mappings().all()
+        SELECT e.data::text AS d FROM chat_events e JOIN chat_sessions s ON s.id = e.session_id
+        WHERE e.event_type = 'item/completed' AND e.data::text LIKE '%tool_call_count%'
+          AND s.factory_id = :fid AND e.created_at > NOW() - INTERVAL '30 days'
+        ORDER BY e.created_at DESC LIMIT 400
+    """), {"fid": factory_id})).mappings().all()
     with_call = without_call = 0
     for tr in turn_rows:
         try:
@@ -898,12 +900,13 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
     # 把用户刚报的数当"无出处编造"是误判，把正文里复述的数字当"有出处"是放水 ——
     # 所以两边分开存、分开算，用户给的那一类不进判线分母，单列报出来给人看。
     hist = (await db.execute(text("""
-        SELECT session_id, role, content, tool_calls::text AS tc, created_at
-        FROM chat_messages
-        WHERE role IN ('assistant', 'user') AND COALESCE(content,'') <> ''
-          AND created_at > NOW() - INTERVAL '30 days'
-        ORDER BY session_id, created_at, id
-    """))).mappings().all()
+        SELECT m.session_id, m.role, m.content, m.tool_calls::text AS tc, m.created_at
+        FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id
+        WHERE s.factory_id = :fid
+          AND m.role IN ('assistant', 'user') AND COALESCE(m.content,'') <> ''
+          AND m.created_at > NOW() - INTERVAL '30 days'
+        ORDER BY m.session_id, m.created_at, m.id
+    """), {"fid": factory_id})).mappings().all()
     from core.kernel.reply_sanitizer import number_backing, numeric_claims
 
     corpus: Dict[str, str] = {}
@@ -988,14 +991,14 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
                 THRESHOLDS["L4"]["routing_accuracy"], "gte", "",
                 f"{hits}/{len(ROUTING_GOLDEN)} 条自然问法命中应选工具（回归集在 ROUTING_GOLDEN）"),
         _metric("助手回复里调过工具的比例（只报数）", backing, None, "gte", "",
-                f"近 30 天 {assistants} 条助手回复里 {with_tools} 条真调了工具。"
+                f"近 30 天本厂会话 {assistants} 条助手回复里 {with_tools} 条真调了工具。"
                 "这一格和下面那格是同一个毛口径的两件外衣，都不再当判据 —— "
                 "分母里全是追问、确认、引用前轮这些本来就不该查库的回复；"
                 "要判的是「报了数的回复有没有出处」，看「报数轮次里本轮真查的比例」和「回答数字可回溯率」"),
         _metric("报数轮次里本轮真查的比例",
                 round(claims_with_tool / checked, 3) if checked else None,
                 THRESHOLDS["L4"]["tool_backing_rate"], "gte", "",
-                f"近 30 天 {checked} 条「引擎自己给数」的回复里，{claims_with_tool} 条本轮真调了工具"
+                f"近 30 天本厂会话 {checked} 条「引擎自己给数」的回复里，{claims_with_tool} 条本轮真调了工具"
                 f" = {round(claims_with_tool / max(1, checked), 3)}。分母从「所有完成轮」换成「报了数的轮」："
                 "判据要管的是「给数必须有出处」，不是「每轮都得调一次工具」—— 追问、确认、"
                 "用户自己报数的轮次调工具没有意义（近 30 天没调工具的回复里 76% 根本没给数字）",
@@ -1003,11 +1006,11 @@ async def _l4_agent(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
                 missing=(None if checked >= 20 else
                          f"报数回复只有 {checked} 条（判线要 ≥20 条）：样本太少不判"),),
         _metric("所有完成轮里调工具的比例（只报数）", turn_backing, None, "gte", "",
-                f"近 30 天 {with_call + without_call} 个完成轮里 {with_call} 个发生过工具调用。"
+                f"近 30 天本厂会话 {with_call + without_call} 个完成轮里 {with_call} 个发生过工具调用。"
                 "这一格不再当判据：里面一大半是不需要查库的轮次（追问/确认/引用前轮），"
                 "拿它判线只会逼人为了调工具而调工具"),
         _metric("回答数字可回溯率", number_rate, THRESHOLDS["L4"]["number_backing_rate"], "gte", "",
-                f"近 30 天 {checked} 条**引擎自己给数**的助手回复里，逐个数出来的：正文共 {stats['claims_total']} 个读数，"
+                f"近 30 天本厂会话 {checked} 条**引擎自己给数**的助手回复里，逐个数出来的：正文共 {stats['claims_total']} 个读数，"
                 f"本轮工具返回里查到 {same_turn} 个、引用本会话前几轮 {from_history} 个、"
                 f"答复自己已标注未经核实 {disclosed} 个、查无字面出处 {unbacked_total} 个。"
                 "**判线按读数条数（每个数一票），不按答复条数** —— 这个名字说的就是"

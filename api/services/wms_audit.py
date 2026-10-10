@@ -153,7 +153,8 @@ async def capability_matrix(db, factory_id: str) -> Dict[str, Any]:
             missing="建 transfer 单 → 审批 → 完成时才过账（现在反了）"))
 
     loc = await one("""
-        SELECT (SELECT COUNT(*) FROM locations) AS 库位对象,
+        SELECT (SELECT COUNT(*) FROM locations l JOIN warehouses w ON w.id = l.warehouse_id
+                  WHERE w.factory_id = :fid) AS 库位对象,
                (SELECT COUNT(DISTINCT location_code) FROM inventory
                  WHERE factory_id=:fid AND COALESCE(location_code,'')<>'') AS 台账里的库位号,
                (SELECT COUNT(*) FROM inventory WHERE factory_id=:fid AND location_id IS NULL
