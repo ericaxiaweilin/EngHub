@@ -898,6 +898,7 @@ async def get_safety_stock_authority(
     factory_id: str = Query(..., description="厂区"),
     examples: int = Query(5, description="列几例两表差得最远的料号"),
     backlog_limit: int = Query(12, description="缺口未开单的清单列几行（按能催的优先、缺口件数排序）"),
+    worklist_limit: int = Query(12, description="催单前置条件清单列几行（按缺口件数排，含逐档与回填判定）；0=不算"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -907,12 +908,18 @@ async def get_safety_stock_authority(
     模板判定用的是与提前期那次同一把尺（众数占比 / 取值个数）。
     引擎不选哪张表作准：那是要厂里拍的口径，已挂成 /pmc/open-rule-questions 的问题；
     这一格也不写 stock_alerts（那是等人确认的动作表）。
+
+    worklist_limit>0 时附 `master_data_worklist`：同一批缺口料号换个问法 —— 催这一单还差
+    哪几格、填哪一格能解锁多少件，以及"缺供应商"那批到底能不能从别的台账回填（逐出处普查，
+    不是"没查到"）。合计格与分档格出自同一次取数，所以两边数字必须一致，不一致会在
+    `backlog_worklist_agreement.agree=false` 与读数里点名。
     """
     del current_user
     from core.mes.safety_stock_authority import safety_stock_authority
 
     return await safety_stock_authority(db, factory_id, examples=max(1, min(20, int(examples))),
-                                        backlog_limit=max(1, min(200, int(backlog_limit))))
+                                        backlog_limit=max(1, min(200, int(backlog_limit))),
+                                        worklist_limit=max(0, min(200, int(worklist_limit))))
 
 
 @router.get("/data-flow-profile", summary="数据流节点剖面：这座厂一次推演流经多少节点、按规模要多多少")

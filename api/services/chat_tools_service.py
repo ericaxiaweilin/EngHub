@@ -1151,10 +1151,18 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "『低于安全库存』按不同出处各报几条 —— 补货触发线（行级）、按 inventory 侧"
                 "（料号级）、按 materials 侧（料号级）、以及 safety_stock_config 那张专用配置表"
                 "（本厂填了几行）。引擎不替厂里选哪条作准，只把口径与差值摆出来；"
-                "用于'该不该补货''安全库存准不准''为什么告警数对不上''这几张表谁作准'类问题。不写任何系统。"),
+                "还附一张催单前置条件清单（worklist_limit>0）：缺口却没开过单的料号逐条列出差哪几格"
+                "主数据、填哪一格能解锁多少件，以及『缺供应商』那批能不能从采购单/到货/供应商档案等"
+                "出处回填 —— 判『回填不了』用的是逐个出处的普查，不是没查到。"
+                "用于'该不该补货''安全库存准不准''为什么告警数对不上''这几张表谁作准'"
+                "'催单还差什么''为什么下不了单''能不能补供应商'类问题。不写任何系统。"),
             "parameters": {"type": "object", "properties": {
                 "examples": {"type": "integer",
-                             "description": "列几例两表差得最远的料号（默认 5，最多 20）"}}}},
+                             "description": "列几例两表差得最远的料号（默认 5，最多 20）"},
+                "worklist_limit": {"type": "integer",
+                                   "description": ("催单前置条件清单列几行，默认 12（最多 200）；"
+                                                   "问『还差什么才能下单/补供应商有没有依据』时才需要，"
+                                                   "0=不算（省 5 条出处普查）")}}}},
     },
     {
         "type": "function",
@@ -3516,8 +3524,12 @@ async def _tool_query_safety_stock_authority(
     from core.mes.safety_stock_authority import safety_stock_authority
 
     fid = factory_id or "FAC_MECH_001"
-    out = await safety_stock_authority(db, fid,
-                                       examples=max(1, min(20, int(args.get("examples") or 5))))
+    # worklist_limit 要区分"没填"（12）与"显式 0"（不跑那条扫 9 张表的普查）——
+    # 用 `args.get(...) or 12` 会把 0 吃成 12，等于关掉开关的那一格其实没关。
+    wl_arg = args.get("worklist_limit")
+    out = await safety_stock_authority(
+        db, fid, examples=max(1, min(20, int(args.get("examples") or 5))),
+        worklist_limit=(12 if wl_arg is None else max(0, min(200, int(wl_arg)))))
     if out.get("status") != "ok":
         return {"status": out.get("status"), "factory_id": fid, "has_data": False,
                 "message": (out.get("reading") or ["没读到声明"])[0]}
@@ -3529,6 +3541,9 @@ async def _tool_query_safety_stock_authority(
             "ruler_spread_x": out.get("ruler_spread_x"),
             "auto_replenishment": out.get("auto_replenishment"),
             "shortage_backlog": out.get("shortage_backlog"),
+            "master_data_worklist": out.get("master_data_worklist"),
+            "master_data_worklist_error": out.get("master_data_worklist_error"),
+            "backlog_worklist_agreement": out.get("backlog_worklist_agreement"),
             "reading": out.get("reading"), "claim_guard": out.get("claim_guard")}
 
 

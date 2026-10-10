@@ -650,7 +650,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     try:
         from core.mes.safety_stock_authority import safety_stock_authority
 
-        ss_auth = await safety_stock_authority(db, factory_id)
+        ss_auth = await safety_stock_authority(db, factory_id, worklist_limit=4)
     except Exception as exc:  # noqa: BLE001
         ss_auth = None
         ss_error = type(exc).__name__
@@ -697,6 +697,7 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
     if ss_auth and ss_auth.get("status") == "ok" and (ss_auth.get("auto_replenishment") or {}):
         auto = ss_auth["auto_replenishment"]
         back = ss_auth.get("shortage_backlog") or {}
+        bf = ((ss_auth.get("master_data_worklist") or {}).get("supplier_backfill") or {})
         if not (await binding_rules(db, factory_id)).get("auto_replenishment_demand_gate"):
             out.append({
                 "topic": "auto_replenishment_demand_gate",
@@ -709,7 +710,14 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                                    "缺口那边等于没有动作。加门之后动作量从"
                                    f"{int(auto['pr_lines'])} 条变成 {int(back.get('parts') or 0)} 条待办，"
                                    f"其中主数据齐、今天能催的 {int(back.get('ready_to_act') or 0)} 条；"
-                                   "其余要先补供应商/单价，那是要人写的字段，引擎不代填"),
+                                   "其余要先补供应商/单价，那是要人写的字段，引擎不代填"
+                                   + (f"；而且『让他们填供应商』这一步现在连台账可依都没有：缺供应商的 "
+                                      f"{int(bf.get('parts_without_supplier') or 0)} 个料号里，从 "
+                                      f"{int(bf.get('sources_scanned') or 0)} 个出处能回填的是 "
+                                      f"{int(bf.get('recoverable_parts') or 0)} 个"
+                                      f"（{bf.get('verdict')}）—— 门加在引擎侧，动作就全落在"
+                                      "『先有人写出这个料号由谁供』那一步上"
+                                      if bf else "")),
                 "expected_answer": ("① 加门：以 work_order_materials 的 shortage_qty>0 为准出单，"
                                     "水位线只作参考不再触发开单；② 保留水位线但把需求侧条件 AND 进去；"
                                     "③ 保持现状（等于承认这 "
@@ -718,7 +726,11 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
                                        f"{int(back.get('work_order_lines') or 0)} 个工单行上；"
                                        f"缺供应商 {int(back.get('without_supplier') or 0)}、"
                                        f"缺单价 {int(back.get('without_cost') or 0)}、"
-                                       f"缺提前期 {int(back.get('without_lead') or 0)}"),
+                                       f"缺提前期 {int(back.get('without_lead') or 0)}"
+                                       + (f"；供应商这一列逐个出处查过（{int(bf.get('sources_scanned') or 0)} 个"
+                                          f"出处，含镜像 BOM 的 vendor_name），能回填 "
+                                          f"{int(bf.get('recoverable_parts') or 0)} 个"
+                                          if bf else "")),
                 "record_as": {"subject": "auto_replenishment_demand_gate",
                               "verdict": "demand_only|water_and_demand|keep_water_line",
                               "status": "declared", "source": "chat"},

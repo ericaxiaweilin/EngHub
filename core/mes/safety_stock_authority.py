@@ -126,95 +126,79 @@ SELECT (SELECT count(*) FROM pr) AS pr_materials,
        (SELECT max(last_created) FROM pr) AS last_created
 """
 
-# 缺口但一条单都没开的料号清单：能催的先列出来，催不动的点名缺哪一项主数据
-BACKLOG_SQL = """
-WITH gap AS (
-    SELECT m.material_code,
-           sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) AS need,
-           count(DISTINCT m.work_order_id) AS work_orders
-    FROM work_order_materials m JOIN work_orders o ON o.id = m.work_order_id
-    WHERE o.factory_id = :fid
-    GROUP BY 1
-    HAVING sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) > 0),
-naked AS (
-    SELECT * FROM gap WHERE NOT EXISTS
-        (SELECT 1 FROM purchase_requests p WHERE p.material_code = gap.material_code)),
-inv AS (SELECT material_code, min(unit_cost) AS unit_cost
-        FROM inventory WHERE factory_id = :fid GROUP BY 1)
-SELECT count(*) AS parts,
-       round(sum(naked.need)) AS units,
-       sum(naked.work_orders) AS work_order_lines,
-       count(*) FILTER (WHERE t.default_supplier IS NULL) AS without_supplier,
-       count(*) FILTER (WHERE t.lead_time_days IS NULL) AS without_lead,
-       count(*) FILTER (WHERE i.unit_cost IS NULL OR i.unit_cost <= 0) AS without_cost,
-       count(*) FILTER (WHERE t.default_supplier IS NOT NULL AND t.lead_time_days IS NOT NULL
-                             AND i.unit_cost > 0) AS ready_to_act
-FROM naked
-LEFT JOIN materials t ON t.material_code = naked.material_code AND t.factory_id = :fid
-LEFT JOIN inv i ON i.material_code = naked.material_code
-"""
-
-BACKLOG_ROWS_SQL = """
-WITH gap AS (
-    SELECT m.material_code,
-           sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) AS need,
-           count(DISTINCT m.work_order_id) AS work_orders
-    FROM work_order_materials m JOIN work_orders o ON o.id = m.work_order_id
-    WHERE o.factory_id = :fid
-    GROUP BY 1
-    HAVING sum(GREATEST(COALESCE(m.shortage_qty, 0), 0)) > 0),
-naked AS (
-    SELECT * FROM gap WHERE NOT EXISTS
-        (SELECT 1 FROM purchase_requests p WHERE p.material_code = gap.material_code)),
-inv AS (SELECT material_code, min(unit_cost) AS unit_cost
-        FROM inventory WHERE factory_id = :fid GROUP BY 1)
-SELECT naked.material_code, round(naked.need) AS need, naked.work_orders,
-       t.material_name, t.lead_time_days, t.default_supplier, i.unit_cost,
-       (t.default_supplier IS NOT NULL AND t.lead_time_days IS NOT NULL
-        AND i.unit_cost IS NOT NULL) AS ready
-FROM naked
-LEFT JOIN materials t ON t.material_code = naked.material_code AND t.factory_id = :fid
-LEFT JOIN inv i ON i.material_code = naked.material_code
-ORDER BY (t.default_supplier IS NOT NULL AND t.lead_time_days IS NOT NULL
-          AND i.unit_cost > 0) DESC, naked.need DESC
-LIMIT :limit
-"""
+# 缺口但一条单都没开的料号清单：取数口只有一个（下面的 WORKLIST_SQL / gap_universe），
+# 合计与分档都从同一批行里算，不再各跑各的两条 SQL。
+# 本厂实测：一次取全量 1.5s（旧口径的合计+清单两条要 3.0s），676 行。
 
 
 def _as_number(value):
     return None if value is None else float(value)
 
 
-async def shortage_backlog(db: AsyncSession, factory_id: str, *, limit: int = 12) -> Dict[str, Any]:
+async def gap_universe(db: AsyncSession, factory_id: str) -> List[Dict[str, Any]]:
+    """"真缺口却没开过单"的料号全集，一次取数，逐条带着"还缺哪几格"。
+
+    缺口那一格（合计）与活清单那一格（分档）都从这里取，所以两格的数出自同一次查询 ——
+    以前各跑各的两条 SQL，隔两秒引擎重算齐套行就会出现两格数字打脸。
+    本厂实测一次约 2 秒（12 万行齐套展开 + 每件对照物料主数据与镜像件号）。
+    """
+    rows = (await db.execute(text(WORKLIST_SQL), {"fid": factory_id})).mappings().all()
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        item = {"material_code": str(r["material_code"]),
+                "material_name": (str(r["material_name"]) if r["material_name"] else None),
+                "shortage_units": _as_number(r["need"]) or 0.0,
+                "work_order_lines": int(r["work_orders"] or 0),
+                "has_material_master_row": bool(r["has_master_row"]),
+                "supplier": (str(r["default_supplier"]) if r["default_supplier"] else None),
+                "lead_time_days": _as_number(r["lead_time_days"]),
+                "unit_cost": _as_number(r["unit_cost"]),
+                "inventory_rows": int(r["inv_rows"] or 0),
+                "products_named": int(r["named_products"] or 0),
+                "units_on_work_orders_without_product": _as_number(r["units_unattributed"]) or 0.0,
+                "waiting_for": (str(r["named_units"]) if r["named_units"] else None)}
+        item["ready_to_act"] = True  # 先占位，下面统一按缺项判
+        item["missing_items"] = _gap_missing(item)
+        item["ready_to_act"] = not item["missing_items"]
+        item["missing_label"] = _combo_label(item["missing_items"])
+        items.append(item)
+    return items
+
+
+def _backlog_item(i: Dict[str, Any]) -> Dict[str, Any]:
+    """缺口那一格对外只给这几列（活清单还带分档，两处字段名保持同源）。"""
+    return {"material_code": i["material_code"], "shortage_units": i["shortage_units"],
+            "work_orders": i["work_order_lines"], "material_name": i["material_name"],
+            "lead_time_days": i["lead_time_days"], "supplier": i["supplier"],
+            "unit_cost": i["unit_cost"], "has_material_master_row": i["has_material_master_row"],
+            "ready_to_act": i["ready_to_act"]}
+
+
+async def shortage_backlog(db: Optional[AsyncSession], factory_id: str, *, limit: int = 12,
+                           rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """真缺口却没开过单的料号：能催的排前面，催不动的点名缺哪一项主数据。
 
     这一格只列台账：`purchase_requests` 里没出现过的料号才进清单，
     金额只在三项齐（供应商+提前期+单价）时才给，缺单价的条目不折算成钱。
     """
-    head = (await db.execute(text(BACKLOG_SQL), {"fid": factory_id})).mappings().first()
-    rows = (await db.execute(text(BACKLOG_ROWS_SQL),
-                             {"fid": factory_id, "limit": max(1, int(limit))})).mappings().all()
-    items = [{"material_code": str(r["material_code"]), "shortage_units": _as_number(r["need"]),
-              "work_orders": int(r["work_orders"] or 0),
-              "material_name": (str(r["material_name"]) if r["material_name"] else None),
-              "lead_time_days": _as_number(r["lead_time_days"]),
-              "supplier": (str(r["default_supplier"]) if r["default_supplier"] else None),
-              "unit_cost": _as_number(r["unit_cost"]),
-              "ready_to_act": bool(r["ready"])} for r in rows]
-    result = {"parts": int((head or {}).get("parts") or 0) if head else 0,
-              "units": _as_number((head or {}).get("units")) if head else 0.0,
-              "work_order_lines": _as_number((head or {}).get("work_order_lines")) if head else 0.0,
-              "without_supplier": int((head or {}).get("without_supplier") or 0) if head else 0,
-              "without_lead": int((head or {}).get("without_lead") or 0) if head else 0,
-              "without_cost": int((head or {}).get("without_cost") or 0) if head else 0,
-              "ready_to_act": int((head or {}).get("ready_to_act") or 0) if head else 0,
-              "items": items}
+    items = rows if rows is not None else await gap_universe(db, factory_id)  # type: ignore[arg-type]
+    ordered = sorted(items, key=lambda i: not i["ready_to_act"])  # 稳定排序：可催的先列，各自保持缺口件数序
+    result = {"parts": len(items),
+              "units": round(sum(float(i["shortage_units"] or 0) for i in items), 1),
+              "work_order_lines": sum(int(i["work_order_lines"]) for i in items),
+              "without_master_row": len([i for i in items if not i["has_material_master_row"]]),
+              "without_supplier": len([i for i in items if not i["supplier"]]),
+              "without_lead": len([i for i in items if i["lead_time_days"] is None]),
+              "without_cost": len([i for i in items
+                                   if i["unit_cost"] is None or i["unit_cost"] <= 0]),
+              "ready_to_act": len([i for i in items if i["ready_to_act"]]),
+              "items": [_backlog_item(i) for i in ordered[:max(1, int(limit))]]}
     # 「可催的那几条单价是不是也只有几个值」要用这几条自己算，不能拿全厂普查顶
-    priced = [it for it in items if it["ready_to_act"] and it["unit_cost"] is not None]
+    priced = [i for i in items if i["ready_to_act"] and i["unit_cost"] is not None]
     if priced:
         counts: Dict[float, int] = {}
-        for it in priced:
-            counts[it["unit_cost"]] = counts.get(it["unit_cost"], 0) + 1
+        for i in priced:
+            counts[i["unit_cost"]] = counts.get(i["unit_cost"], 0) + 1
         top_cost, top_n = max(counts.items(), key=lambda kv: kv[1])
         result["ready_cost_census"] = {
             "rows_sampled": len(priced), "rows_ready": result["ready_to_act"],
@@ -228,6 +212,384 @@ def _units(value: Any) -> str:
     """件数别用 :g —— 4.23767e+06 不是人读的数，现场要能一眼看出量级。"""
     v = float(value or 0)
     return f"{v:,.0f}" if abs(v) >= 1000 else f"{v:g}"
+
+
+# ── 活清单：同一批"真缺口却没开单"的料号，换个问法 ────────────────────────────
+# 缺口那一格报的是"差多少件"，这一格报的是"催这一单还差哪一格、填哪一格能解锁多少件"，
+# 以及最要紧的一句：**供应商这一列能不能从台账里回填**。
+#
+# WORKLIST_SQL 是这批料号的唯一取数口：一次取全量（本厂 676 行，实测 1.5 秒），
+# shortage_backlog 的合计和 master_data_worklist 的分档都从同一批行里算 ——
+# 两格的数必须来自同一次取数，否则会出现"缺口说 676、活清单说 674"这种互相打脸。
+_GAP_CTE = """
+WITH gap_lines AS (
+    SELECT m.material_code, o.id AS work_order_id, o.product_id,
+           GREATEST(COALESCE(m.shortage_qty, 0), 0) AS need
+    FROM work_order_materials m JOIN work_orders o ON o.id = m.work_order_id
+    WHERE o.factory_id = :fid
+      AND GREATEST(COALESCE(m.shortage_qty, 0), 0) > 0),
+naked AS (
+    SELECT gl.* FROM gap_lines gl WHERE NOT EXISTS
+        (SELECT 1 FROM purchase_requests p WHERE p.material_code = gl.material_code)),
+per_part AS (SELECT material_code, sum(need) AS need, count(DISTINCT work_order_id) AS work_orders
+             FROM naked GROUP BY 1),
+"""
+
+WORKLIST_SQL = _GAP_CTE + """prod AS (SELECT nl.material_code,
+                  coalesce(pr.product_code, '（工单没写成品号）') AS product_code,
+                  sum(nl.need) AS units
+           FROM naked nl LEFT JOIN products pr ON pr.id = nl.product_id
+           GROUP BY 1, 2),
+prod_ranked AS (SELECT material_code, product_code, units,
+                       row_number() OVER (PARTITION BY material_code
+                                          ORDER BY units DESC, product_code) AS rn,
+                       sum(CASE WHEN product_code = '（工单没写成品号）' THEN 0 ELSE 1 END)
+                           OVER (PARTITION BY material_code) AS named_products
+                FROM prod),
+prod_agg AS (SELECT material_code, max(named_products) AS named_products,
+                    sum(units) FILTER (WHERE product_code = '（工单没写成品号）') AS units_unattributed,
+                    string_agg(CASE WHEN rn <= 3 AND product_code <> '（工单没写成品号）'
+                                    THEN product_code || ':' || round(units)::text END,
+                               ' / ' ORDER BY rn) AS named_units
+             FROM prod_ranked GROUP BY 1),
+inv AS (SELECT material_code, min(unit_cost) AS unit_cost, count(*) AS inv_rows
+        FROM inventory WHERE factory_id = :fid GROUP BY 1)
+SELECT pp.material_code, round(pp.need) AS need, pp.work_orders,
+       (t.material_code IS NOT NULL) AS has_master_row, t.material_name,
+       t.default_supplier, t.lead_time_days, i.unit_cost, coalesce(i.inv_rows, 0) AS inv_rows,
+       coalesce(pa.named_products, 0) AS named_products,
+       coalesce(pa.units_unattributed, 0) AS units_unattributed, pa.named_units
+FROM per_part pp
+LEFT JOIN materials t ON t.material_code = pp.material_code AND t.factory_id = :fid
+LEFT JOIN inv i ON i.material_code = pp.material_code
+LEFT JOIN prod_agg pa ON pa.material_code = pp.material_code
+ORDER BY pp.need DESC, pp.work_orders DESC, pp.material_code
+"""
+
+# 能记着"这个料号由谁供"的出处，厂里一共这几张表。逐出处回答两件事：
+# ① 这张表自己有没有记过供应商（出处级普查，不靠料号）；② 把它点名的那些料号
+# 拿来跟"缺供应商的缺口料号"求交 —— 交集才是"能回填"。第②步用 :codes 传已取出的
+# 料号数组，所以这条查询不会重跑齐套展开（那是 2 秒的那条）。
+SUPPLIER_SOURCE_SQLS = (
+    ("purchase_orders.supplier_name",
+     "SELECT material_code AS code, coalesce(supplier_name, '') <> '' AS has_value "
+     "FROM purchase_orders WHERE factory_id = :fid AND material_code IS NOT NULL"),
+    ("purchase_requests.supplier_id",
+     "SELECT material_code, supplier_id IS NOT NULL FROM purchase_requests "
+     "WHERE factory_id = :fid AND material_code IS NOT NULL"),
+    ("purchase_requisitions.supplier_id",
+     "SELECT material_code, supplier_id IS NOT NULL FROM purchase_requisitions "
+     "WHERE factory_id = :fid AND material_code IS NOT NULL"),
+    ("arrival_plans.supplier_id",
+     "SELECT material_code, supplier_id IS NOT NULL FROM arrival_plans "
+     "WHERE factory_id = :fid AND material_code IS NOT NULL"),
+    ("goods_receipts.supplier_id",
+     "SELECT material_code, supplier_id IS NOT NULL FROM goods_receipts "
+     "WHERE factory_id = :fid AND material_code IS NOT NULL"),
+    ("inbound_orders.supplier_id",
+     "SELECT material_code, supplier_id IS NOT NULL FROM inbound_orders "
+     "WHERE factory_id = :fid AND material_code IS NOT NULL"),
+    ("supplier_materials.supplier_id",
+     "SELECT material_code, supplier_id IS NOT NULL FROM supplier_materials "
+     "WHERE material_code IS NOT NULL"),
+    ("supplier_prices.supplier_id",
+     "SELECT material_code, supplier_id IS NOT NULL FROM supplier_prices "
+     "WHERE material_code IS NOT NULL"),
+    ("bom_items.vendor_name",
+     "SELECT material_code, coalesce(vendor_name, '') <> '' FROM bom_items "
+     "WHERE material_code IS NOT NULL"),
+)
+
+# 每段 body 本身以 SELECT 开头，这里只补出处标签列：先剥掉前导 SELECT 再拼，
+# 否则会写成 SELECT '标签' AS s, SELECT … 这种语法错（列名由 src(...) 的 CTE 声明给出）。
+_SCAN_BRANCHES = "\n    UNION ALL\n".join(
+    f"    SELECT '{label}' AS s, {body.split('SELECT', 1)[1].lstrip()}"
+    for label, body in SUPPLIER_SOURCE_SQLS)
+
+SUPPLIER_SCAN_SQL = """
+WITH src(s, code, has_value) AS (
+{branches}
+),
+per_code AS (SELECT s, code, bool_or(has_value) AS any_value FROM src GROUP BY 1, 2),
+totals AS (SELECT s, count(*) AS codes_in_source,
+                  count(*) FILTER (WHERE any_value) AS codes_with_value
+           FROM per_code GROUP BY 1),
+hits AS (SELECT s, code, any_value FROM per_code
+         WHERE code = ANY(CAST(:codes AS text[])))
+SELECT t.s AS source, t.codes_in_source, t.codes_with_value,
+       coalesce(array_agg(h.code) FILTER (WHERE h.code IS NOT NULL), '{{}}') AS seen_codes,
+       coalesce(array_agg(h.code) FILTER (WHERE h.any_value), '{{}}') AS recoverable_codes
+FROM totals t LEFT JOIN hits h ON h.s = t.s
+GROUP BY 1, 2, 3 ORDER BY 1
+""".format(branches=_SCAN_BRANCHES)
+# 排序放在 Python 里做：Postgres 的 ORDER BY 只认输出列名当"简单排序键"，
+# 写成 array_length(recoverable_codes,1) 会报 column recoverable_codes does not exist；
+# 而在 SQL 里重抄一遍 array_agg 表达式既难读又没法被单测钉住。
+#
+# 并集不再单开一条查询：本厂实测那条和这条一样贵（各约 1.9 秒，都是把那 9 张表扫一遍），
+# 而逐出处返回的 seen_codes/recoverable_codes 已经带着料号本身 —— 在 Python 里求并集就是
+# 同一个数。少一条查询是一半，另一半是"同一件事只有一个出处"，否则会出现逐出处加起来 3 个、
+# 并集那条说 2 个这种自己跟自己打脸。
+
+# 镜像 BOM 那 48 万行单独判：整列有没有非空 vendor_name 是一次聚合就能定死的（实测 41ms），
+# 若一个都没有，逐料号回填必然是 0 —— 那就没必要再花 2.4 秒逐料号查，但要把这个推理写在读法里
+MIRROR_VENDOR_GATE_SQL = """
+    SELECT count(*) AS rows_total,
+           count(DISTINCT part_number) AS distinct_parts,
+           count(*) FILTER (WHERE coalesce(vendor_name, '') <> '') AS rows_with_vendor,
+           count(DISTINCT part_number) FILTER (WHERE coalesce(vendor_name, '') <> '') AS parts_with_vendor
+    FROM enghub_bom_items WHERE factory_id = :fid
+"""
+
+SUPPLIER_MASTER_SQL = """
+WITH m AS (SELECT default_supplier AS name FROM materials
+           WHERE factory_id = :fid AND default_supplier IS NOT NULL)
+SELECT (SELECT count(*) FROM suppliers WHERE factory_id = :fid) AS supplier_rows,
+       (SELECT count(DISTINCT name) FROM m) AS names_on_materials,
+       (SELECT count(DISTINCT name) FROM m mm WHERE NOT EXISTS
+            (SELECT 1 FROM suppliers s WHERE s.factory_id = :fid AND s.supplier_name = mm.name)
+        ) AS dangling_names,
+       (SELECT count(*) FROM m mm WHERE NOT EXISTS
+            (SELECT 1 FROM suppliers s WHERE s.factory_id = :fid AND s.supplier_name = mm.name)
+        ) AS rows_with_dangling_name
+"""
+
+SUPPLIER_DANGLING_SQL = """
+SELECT m.default_supplier AS name, count(*) AS material_rows
+FROM materials m
+WHERE m.factory_id = :fid AND m.default_supplier IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM suppliers s
+                  WHERE s.factory_id = m.factory_id AND s.supplier_name = m.default_supplier)
+GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT :limit
+"""
+
+SUPPLIER_NAMES_SQL = "SELECT supplier_name FROM suppliers WHERE factory_id = :fid"
+
+MASTER_COLUMNS = {"supplier": "materials.default_supplier",
+                  "lead": "materials.lead_time_days",
+                  "cost": "inventory.unit_cost"}
+COLUMN_SHORT = {"supplier": "供应商", "lead": "提前期", "cost": "单价"}
+
+
+def _combo_label(keys: List[str]) -> str:
+    if not keys:
+        return "三项齐 —— 今天就能开单/催单"
+    if keys == ["no_master_row"]:
+        return "物料主数据没这条 —— 要先建档，不是填一列"
+    return "差" + "+".join(COLUMN_SHORT[k] for k in keys)
+
+
+def _gap_missing(item: Dict[str, Any]) -> List[str]:
+    """一个料号还差哪几格。主数据行不存在是另一档：那不是填一列，是建这条档。"""
+    if not item["has_material_master_row"]:
+        return ["no_master_row"]
+    missing = []
+    if not item["supplier"]:
+        missing.append("supplier")
+    if item["lead_time_days"] is None:
+        missing.append("lead")
+    if item["unit_cost"] is None or item["unit_cost"] <= 0:
+        missing.append("cost")
+    return missing
+
+
+async def master_data_worklist(db: AsyncSession, factory_id: str, *,
+                               limit: int = 12, dangling_examples: int = 5,
+                               rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """缺口料号的催单前置条件清单：差哪几格、填哪一格能解锁多少件、供应商能不能回填。
+
+    只读台账。不写 materials/inventory/purchase_requests，也不替缺口料号编供应商 ——
+    判"回填不了"用的是逐个出处的普查，不是"没查到"。
+    """
+    items_all = rows if rows is not None else await gap_universe(db, factory_id)
+
+    def _sum(key: str, subset: List[Dict[str, Any]]) -> float:
+        return round(sum(float(x[key] or 0) for x in subset), 1)
+
+    combos: Dict[tuple, Dict[str, Any]] = {}
+    for it in items_all:
+        bucket = combos.setdefault(tuple(it["missing_items"]), {
+            "missing_items": list(it["missing_items"]), "label": it["missing_label"],
+            "parts": 0, "units": 0.0, "work_order_lines": 0})
+        bucket["parts"] += 1
+        bucket["units"] += float(it["shortage_units"] or 0)
+        bucket["work_order_lines"] += int(it["work_order_lines"])
+    grades = sorted(combos.values(), key=lambda g: (-g["units"], g["label"]))
+    for g in grades:
+        g["units"] = round(g["units"], 1)
+
+    columns = []
+    for key, column in MASTER_COLUMNS.items():
+        hit = [i for i in items_all if key in i["missing_items"]]
+        only = [i for i in items_all if i["missing_items"] == [key]]
+        columns.append({"column": column,
+                        "parts_missing": len(hit), "units_missing": _sum("shortage_units", hit),
+                        "work_order_lines_missing": sum(i["work_order_lines"] for i in hit),
+                        "parts_only_this_missing": len(only),
+                        "units_only_this_missing": _sum("shortage_units", only),
+                        "who_fills": ("采购选供应商（引擎不代填）" if key == "supplier" else
+                                      ("物料主数据的提前期声明" if key == "lead" else
+                                       "库存/成本那条链的单价"))})
+
+    # 与缺口那一格的 without_supplier 同一条判据：没声明供应商 = 该列空或整条主数据行不存在
+    nosup_items = [i for i in items_all if not i["supplier"]]
+    codes = [i["material_code"] for i in nosup_items]
+    need_by_code = {i["material_code"]: float(i["shortage_units"] or 0) for i in nosup_items}
+    # 没有要回填的对象就不跑：那条普查是把 9 张表各扫一遍（本厂实测约 1.9 秒），
+    # 与传进去的料号多少无关 —— 空数组也照付全款，那就更不能白付。
+    scan = ((await db.execute(text(SUPPLIER_SCAN_SQL),
+                              {"fid": factory_id, "codes": codes})).mappings().all()
+            if codes else [])
+    gate = (await db.execute(text(MIRROR_VENDOR_GATE_SQL), {"fid": factory_id})).mappings().first()
+
+    def _code_list(value) -> List[str]:
+        return [str(c) for c in (value or []) if c is not None]
+
+    def _units_of(codes_list: List[str]) -> float:
+        return round(sum(need_by_code.get(c, 0.0) for c in codes_list), 1)
+
+    def _union(key: str) -> List[str]:
+        """并集在已取回的逐出处行上算，不再单开一条同样扫 9 张表的查询。"""
+        acc = set()
+        for s in scan:
+            acc.update(_code_list(s[key]))
+        return sorted(acc)
+
+    sources = [{"source": str(s["source"]), "codes_in_source": int(s["codes_in_source"] or 0),
+                "codes_with_value": int(s["codes_with_value"] or 0),
+                "nosup_parts_seen": len(_code_list(s["seen_codes"])),
+                "seen_units": _units_of(_code_list(s["seen_codes"])),
+                "recoverable_parts": len(_code_list(s["recoverable_codes"])),
+                "recoverable_units": _units_of(_code_list(s["recoverable_codes"]))}
+               for s in scan]
+    # 能回填的排前面、其次是在该出处真出现过的料号数 —— 排序放这里才能被单测钉住
+    sources.sort(key=lambda x: (-x["recoverable_parts"], -x["nosup_parts_seen"], x["source"]))
+    seen_union = _union("seen_codes")
+    union_recoverable = _union("recoverable_codes")
+    mirror_rows = int((gate or {}).get("rows_total") or 0)
+    mirror_with_vendor = int((gate or {}).get("rows_with_vendor") or 0)
+    backfill = {
+        "parts_without_supplier": len(nosup_items),
+        "units_without_supplier": _sum("shortage_units", nosup_items),
+        "parts_seen_in_any_source": len(seen_union),
+        "recoverable_parts": len(union_recoverable),
+        "recoverable_units": _units_of(union_recoverable),
+        "recoverable_material_codes": union_recoverable[:20],
+        "sources_scanned": len(sources) + 1,      # +1 = 镜像 BOM 那一条出处级判定
+        "scan_ran": bool(codes),
+        "scan_why_skipped": (None if codes else
+                             "本厂缺口料号没有一个缺供应商，逐出处普查没跑（跑了也是白扫 9 张表）"),
+        "sources": sources,
+        "mirror_bom": {"rows_total": mirror_rows,
+                       "distinct_parts": int((gate or {}).get("distinct_parts") or 0),
+                       "rows_with_vendor_name": mirror_with_vendor,
+                       "distinct_parts_with_vendor_name": int((gate or {}).get("parts_with_vendor") or 0),
+                       "judged_at": "出处级",
+                       "why_not_per_part": (
+                           f"镜像 {mirror_rows} 行里 vendor_name 有值的是 {mirror_with_vendor} 行"
+                           + ("，所以逐料号回填必然是 0，不必再按料号去扫这 48 万行"
+                              if mirror_with_vendor == 0 else "，逐料号可回填数见 sources"))},
+        "verdict": ("nothing_to_backfill" if not codes else
+                    ("no_record_names_a_supplier" if not union_recoverable
+                     else "partially_recoverable")),
+    }
+
+    master = (await db.execute(text(SUPPLIER_MASTER_SQL), {"fid": factory_id})).mappings().first()
+    dangling = (await db.execute(text(SUPPLIER_DANGLING_SQL),
+                                 {"fid": factory_id, "limit": max(1, int(dangling_examples))})
+                ).mappings().all()
+    known = {str(n["supplier_name"]) for n in
+             (await db.execute(text(SUPPLIER_NAMES_SQL), {"fid": factory_id})).mappings().all()}
+    gap_declared = [i for i in items_all if i["supplier"]]
+    gap_dangling = [i for i in gap_declared if i["supplier"] not in known]
+    supplier_master = {
+        "supplier_rows": int((master or {}).get("supplier_rows") or 0),
+        "distinct_names_on_materials": int((master or {}).get("names_on_materials") or 0),
+        "names_not_in_supplier_master": int((master or {}).get("dangling_names") or 0),
+        "material_rows_with_dangling_name": int((master or {}).get("rows_with_dangling_name") or 0),
+        "dangling_examples": [{"supplier_name": str(d["name"]),
+                               "material_rows": int(d["material_rows"] or 0)} for d in dangling],
+        "gap_parts_declaring_supplier": len(gap_declared),
+        "gap_parts_with_dangling_supplier": len(gap_dangling),
+        "supplier_names": sorted(known),
+    }
+
+    product_attribution = {
+        "units_on_work_orders_without_product": _sum("units_on_work_orders_without_product", items_all),
+        "parts_fully_unattributed": len([i for i in items_all if i["products_named"] == 0]),
+        "note": "『（工单没写成品号）』= work_orders.product_id 为空，报不成机型，只能按工单行计"}
+
+    reading: List[str] = []
+    if not items_all:
+        reading.append(
+            "这一格没有条目：要么当前没有 shortage_qty>0 的工单行，要么每个缺口料号都已经在 "
+            "purchase_requests 里出现过 —— 两种都不是『库存正常』，得回到缺口那一格看是哪个")
+    else:
+        reading.append(
+            "催单前置条件分档（同一批料号，按还差哪几格分）：" + "；".join(
+                f"{g['label']} {g['parts']} 个 / {_units(g['units'])} 件"
+                f"（{g['work_order_lines']} 个工单行）" for g in grades[:4])
+            + (f"；另有 {len(grades) - 4} 档更少，没列" if len(grades) > 4 else ""))
+        one_col = [c for c in columns if c["parts_only_this_missing"]]
+        reading.append(
+            "只填一列就能催单的料号："
+            + ("、".join(f"{c['column']} {c['parts_only_this_missing']} 个/"
+                         f"{_units(c['units_only_this_missing'])} 件" for c in one_col)
+               if one_col else f"0 个 —— 三列（{('、'.join(MASTER_COLUMNS.values()))}）"
+               f"里没有一个料号是只差其中一列的，所以『补上供应商就能下单』这条推理在本厂不成立；"
+               f"缺供应商的 {backfill['parts_without_supplier']} 个料号同时还缺别的"))
+        if not backfill["scan_ran"]:
+            reading.append(
+                "供应商这一列不用回填：本厂缺口料号没有一个缺供应商，所以逐出处普查没跑"
+                f"（镜像 BOM {backfill['mirror_bom']['rows_total']} 行里 vendor_name 有值的是 "
+                f"{backfill['mirror_bom']['rows_with_vendor_name']} 行）—— "
+                "这一格的 0 是『没有对象』，不是『查了没有』")
+        else:
+            reading.append(
+                f"供应商这一列能不能从台账回填：扫了 {backfill['sources_scanned']} 个出处"
+                f"（{'、'.join(s['source'] for s in backfill['sources'][:5])} 等），"
+                f"能回填的料号 {backfill['recoverable_parts']} 个 / "
+                f"{_units(backfill['recoverable_units'])} 件；"
+                + (f"镜像 BOM {backfill['mirror_bom']['rows_total']} 行里 vendor_name 有值的是 "
+                   f"{backfill['mirror_bom']['rows_with_vendor_name']} 行 —— "
+                   "参照厂那套 BOM 本来就没带供应商，所以这不是『我没查到』，是无处可查"
+                   if backfill["mirror_bom"]["rows_with_vendor_name"] == 0 else
+                   f"镜像里 {backfill['mirror_bom']['rows_with_vendor_name']} 行带 vendor_name，"
+                   "可逐料号核对"))
+        sm = supplier_master
+        dangling_egs = "、".join(f"{d['supplier_name']} {d['material_rows']} 行"
+                                 for d in sm["dangling_examples"][:3])
+        reading.append(
+            f"要填也得先有得选：suppliers 本厂 {sm['supplier_rows']} 行，"
+            f"物料上写了 {sm['distinct_names_on_materials']} 个供应商名，其中 "
+            f"{sm['names_not_in_supplier_master']} 个在这 {sm['supplier_rows']} 行里不存在"
+            f"（涉及 {sm['material_rows_with_dangling_name']} 行物料"
+            + (f"，例：{dangling_egs}" if dangling_egs else "")
+            + f"）；缺口清单里已声明供应商的 {sm['gap_parts_declaring_supplier']} 个料号里，"
+            f"有 {sm['gap_parts_with_dangling_supplier']} 个指向的就是这种悬空名")
+        pa = product_attribution
+        reading.append(
+            f"这些缺口挂在哪些机上：{len([i for i in items_all if i['waiting_for']])} 个料号能报到成品号"
+            f"（清单里每行 waiting_for 给了最多 3 个，带各自件数），"
+            f"{pa['parts_fully_unattributed']} 个料号一条都报不出机型 —— "
+            f"{_units(pa['units_on_work_orders_without_product'])} 件缺口挂在 "
+            "work_orders.product_id 为空的工单上，这一格按工单行计，不假装知道是哪台机要的")
+    return {"universe": {"parts": len(items_all), "units": _sum("shortage_units", items_all),
+                         "work_order_lines": sum(i["work_order_lines"] for i in items_all),
+                         "basis": "work_order_materials.shortage_qty>0 且该料号在 purchase_requests 里没出现过"},
+            "can_expedite_today": len([i for i in items_all if not i["missing_items"]]),
+            "grades": grades, "columns": columns,
+            "no_master_row_parts": len([i for i in items_all if not i["has_material_master_row"]]),
+            "supplier_backfill": backfill, "supplier_master": supplier_master,
+            "cost_placeholders": {
+                "parts_without_inventory_row": len([i for i in items_all if i["inventory_rows"] == 0]),
+                "parts_with_zero_cost": len([i for i in items_all
+                                             if i["unit_cost"] is not None and i["unit_cost"] <= 0]),
+                "note": "没库存行的料号连单价的出处都没有，这一格不给金额"},
+            "product_attribution": product_attribution,
+            "items": items_all[:max(1, int(limit))],
+            "items_are": f"前 {min(len(items_all), max(1, int(limit)))} 行，按缺口件数、影响工单行排",
+            "rows_total": len(items_all), "reading": reading}
 
 
 def classify_source(name: str, row: Dict[str, Any], mode_share: float) -> Dict[str, Any]:
@@ -312,7 +674,8 @@ async def cost_basis(db: AsyncSession, factory_id: str) -> Dict[str, Any]:
                                else "取值分布支持按声明使用"))}
 
 async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
-                                 examples: int = 5, backlog_limit: int = 12) -> Dict[str, Any]:
+                                 examples: int = 5, backlog_limit: int = 12,
+                                 worklist_limit: int = 0) -> Dict[str, Any]:
     """两处声明 + 四条尺的实测对照，结论是"该拍哪条"，不是一个假告警数。"""
     if db is None:
         return {"status": "no_session",
@@ -433,15 +796,46 @@ async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
             f"{auto.get('gap_without_request')} 个一条单都没开 —— "
             "触发线只看库存水位、不看有没有工单要，所以两头都能错")
     backlog, backlog_error = None, None
+    gap_rows, worklist, worklist_error = None, None, None
     try:
-        backlog = await shortage_backlog(db, factory_id, limit=max(1, int(backlog_limit)))
+        gap_rows = await gap_universe(db, factory_id)
+        backlog = await shortage_backlog(db, factory_id, limit=max(1, int(backlog_limit)),
+                                         rows=gap_rows)
         cost = await cost_basis(db, factory_id)
         backlog["unit_cost_basis"] = cost
     except Exception as exc:  # noqa: BLE001
-        backlog, backlog_error = None, type(exc).__name__ + ": " + str(exc)[:120]
-    cost = None
+        backlog, backlog_error = None, type(exc).__name__ + ": " + str(exc)[:160]
     out["shortage_backlog"] = backlog
     out["shortage_backlog_error"] = backlog_error
+    # 活清单要按料号逐条分档，还要跑逐出处普查（本厂实测约 1.9 秒，缺供应商的料号为 0 时不跑），
+    # 所以默认不跑：要的出口显式传 worklist_limit（PMC 那一格、聊天工具、厂规问题都传）
+    if int(worklist_limit or 0) > 0 and gap_rows is not None:
+        try:
+            worklist = await master_data_worklist(db, factory_id,
+                                                  limit=max(1, int(worklist_limit)), rows=gap_rows)
+        except Exception as exc:  # noqa: BLE001
+            worklist, worklist_error = None, type(exc).__name__ + ": " + str(exc)[:160]
+    out["master_data_worklist"] = worklist
+    out["master_data_worklist_error"] = worklist_error
+    if worklist:
+        out["reading"] += worklist["reading"]
+        if backlog is not None:
+            agree = (int(backlog.get("parts") or 0) == int(worklist["universe"]["parts"])
+                     and int(backlog.get("ready_to_act") or 0) == int(worklist["can_expedite_today"]))
+            out["backlog_worklist_agreement"] = {
+                "backlog_parts": int(backlog.get("parts") or 0),
+                "worklist_parts": int(worklist["universe"]["parts"]),
+                "backlog_ready": int(backlog.get("ready_to_act") or 0),
+                "worklist_ready": int(worklist["can_expedite_today"]),
+                "agree": agree,
+                "why": "两格出自同一次 gap_universe 取数，所以数字必须一致；"
+                       "不一致就是分档那一步算错了，不是数据在动"}
+            if not agree:
+                out["reading"].append(
+                    "⚠ 缺口那一格和活清单这一格数不一致："
+                    f"{out['backlog_worklist_agreement']['backlog_parts']} vs "
+                    f"{out['backlog_worklist_agreement']['worklist_parts']} 个料号 —— "
+                    "两格共用同一次取数却对不上，别引用这两格的数")
     if backlog and backlog.get("parts"):
         out["reading"].append(
             f"缺口却没开过单的料号：{backlog['parts']} 个 / {_units(backlog['units'])} 件"
@@ -449,6 +843,8 @@ async def safety_stock_authority(db: Optional[AsyncSession], factory_id: str, *,
             f"今天就能去催的只有 {backlog['ready_to_act']} 个；"
             f"催不动的卡在缺料号自己的 {backlog['without_supplier']} 个没供应商、"
             f"{backlog['without_cost']} 个没单价、{backlog['without_lead']} 个没提前期"
+            + (f"（其中 {backlog['without_master_row']} 个连物料主数据行都没有，"
+               f"那不是填一列，是建这条档）" if backlog.get("without_master_row") else "")
             + ((f"；可催的这 {rc['rows_sampled']} 条里单价也只有 {rc['distinct_values']} 个值"
                 f"（众数 {rc['mode_value']:g} 占 {rc['mode_share']:.1%}"
                 f"{'' if rc['complete'] else '，样本只覆盖部分可催条目'}）—— "

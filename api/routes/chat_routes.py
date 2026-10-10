@@ -1337,6 +1337,36 @@ def _format_safety_stock_authority_reply(result: Dict[str, Any]) -> str:
     for rl in (result.get("rulers") or []):
         lines.append(f"  · {rl.get('ruler')}：{rl.get('alerts')} 条｜条件 {rl.get('condition')}"
                      f"｜粒度 {rl.get('grain')}｜依据 {rl.get('basis')}")
+    wl = result.get("master_data_worklist") or {}
+    if wl:
+        uni = wl.get("universe") or {}
+        lines.append(f"- 催单前置条件（{uni.get('parts')} 个缺口料号里，今天就能催的 "
+                     f"{wl.get('can_expedite_today')} 个；依据：{uni.get('basis')}）：")
+        for g in (wl.get("grades") or [])[:5]:
+            lines.append(f"  · {g.get('label')}：{g.get('parts')} 个 / "
+                         f"{float(g.get('units') or 0):,.0f} 件"
+                         f"（{g.get('work_order_lines')} 个工单行）")
+        bf = wl.get("supplier_backfill") or {}
+        if bf:
+            lines.append(f"  · 缺供应商的 {bf.get('parts_without_supplier')} 个料号"
+                         f"（{float(bf.get('units_without_supplier') or 0):,.0f} 件）里，"
+                         f"扫了 {bf.get('sources_scanned')} 个出处后能回填的 "
+                         f"{bf.get('recoverable_parts')} 个 —— 判据 {bf.get('verdict')}")
+        sm = wl.get("supplier_master") or {}
+        if sm:
+            lines.append(f"  · 要填也得先有得选：suppliers 本厂 {sm.get('supplier_rows')} 行、"
+                         f"可填名 {'、'.join((sm.get('supplier_names') or [])[:3])}"
+                         f"（物料上已写的 {sm.get('distinct_names_on_materials')} 个名里 "
+                         f"{sm.get('names_not_in_supplier_master')} 个不在档案）")
+        for it in (wl.get("items") or [])[:8]:
+            lines.append(f"  · {it.get('material_code')}"
+                         f"{('｜' + str(it.get('material_name'))) if it.get('material_name') else ''}"
+                         f"｜缺 {float(it.get('shortage_units') or 0):,.0f} 件"
+                         f"｜{it.get('missing_label')}"
+                         + (f"｜等的是 {it.get('waiting_for')}" if it.get("waiting_for") else ""))
+    else:
+        if result.get("master_data_worklist_error"):
+            lines.append(f"- 催单前置条件：没算成 —— {result['master_data_worklist_error']}")
     lines.append(f"- 规矩：{result.get('claim_guard') or ''}")
     fb = result.get("trigger_fallbacks") or {}
     if fb:
