@@ -10,7 +10,8 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from core.auth.security import enforce_tenant, require_login_for_api
-from fastapi.responses import FileResponse
+from api.services.work_order_service import WoPermissionError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from api.routes import (
     auth_router,
@@ -85,6 +86,16 @@ app = FastAPI(
     # 认证闸（默认拒绝）：/api/ 下除公开清单外一律要有访问票 —— 新接口忘了挂依赖也兜得住。
     dependencies=[Depends(require_login_for_api), Depends(enforce_tenant)],
 )
+
+
+@app.exception_handler(WoPermissionError)
+async def _wo_gate_error(request: Request, exc: WoPermissionError):
+    """工单角色门槛 / 对象归属违例统一转 403。
+
+    以前只有 3 个路由点 `except WoPermissionError`，其余路由上它会冒成 500 ——
+    客户端越界被报成服务端故障，既误分类也让"被拦下"在日志里看起来像坏了。
+    """
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")

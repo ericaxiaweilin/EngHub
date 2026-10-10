@@ -30,6 +30,15 @@ class WoPermissionError(Exception):
     pass
 
 
+class WoTenantError(WoPermissionError):
+    """工单不属于该账号有权的厂区。
+
+    继承 WoPermissionError 是为了让已有的 `except WoPermissionError` 路由点直接接住，
+    再由 main.py 的全局处理器统一转 403 —— 不新增需要逐路由补的异常类型。
+    """
+    pass
+
+
 # ============================================================
 # 工单状态枚举
 # ============================================================
@@ -142,6 +151,36 @@ class WorkOrderService:
         raise WoPermissionError(
             f"权限不足：「{action}」需要角色 {' / '.join(allowed)}，当前角色：{role or '(无)'}"
         )
+
+    def _require_object_factory(self, work_order, user, action: str) -> None:
+        """对象归属闸：这行属于哪个厂，动手的人就得有权进那个厂。
+
+        只判事实（行上的 factory_id 在不在账号的可访问集合里），不发明角色政策 ——
+        「什么角色可以取消工单」是厂规，已挂成 /pmc/open-rule-questions 的待回答项。
+        `user=None` 是引擎/定时任务在进程内的调用（它们不经过 HTTP 拿身份），不在射程内。
+        """
+        if user is None:
+            return
+        from core.auth.security import allowed_factory_ids
+        allowed = allowed_factory_ids(user)
+        if allowed is None:
+            return
+        wo_factory = getattr(work_order, "factory_id", None) or ""
+        if wo_factory in allowed:
+            return
+        code = getattr(work_order, "work_order_code", None) or work_order.id
+        raise WoTenantError(
+            f"{action}：工单 {code} 属于厂区 {wo_factory or '(未标注)'}，不在账号 "
+            f"{getattr(user, 'username', '?')} 的可访问范围"
+            f"（可访问：{'、'.join(sorted(allowed)) or '未分配厂区'}）"
+        )
+
+    async def _load_for_action(self, work_order_id: str, user, action: str) -> Optional[WorkOrder]:
+        """按 id 取工单并立刻做对象归属校验；取不到仍返回 None（由调用方转 404）。"""
+        work_order = await self.get_work_order_by_id(work_order_id)
+        if work_order:
+            self._require_object_factory(work_order, user, action)
+        return work_order
 
     def _log_status(self, wo: WorkOrder, action: str, from_status: Optional[str],
                     to_status: str, user, comment: Optional[str] = None):
@@ -398,7 +437,7 @@ class WorkOrderService:
     
     async def release_work_order(self, work_order_id: str, user=None) -> Optional[WorkOrder]:
         """待下发 → 已下达（审核门槛：管理角色 + 职责分离：创建人不能下达自己的工单）"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "下达")
         if not work_order:
             return None
         
@@ -492,7 +531,7 @@ class WorkOrderService:
     
     async def start_work_order(self, work_order_id: str, user=None) -> Optional[WorkOrder]:
         """已下达 → 生产中（父子约束+工序依赖锁止：含子工单的主工单不直接生产）"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "开工")
         if not work_order:
             return None
         
@@ -520,7 +559,7 @@ class WorkOrderService:
     
     async def pause_work_order(self, work_order_id: str, reason: str = "", user=None) -> Optional[WorkOrder]:
         """生产中 → 暂停"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "暂停")
         if not work_order:
             return None
         
@@ -540,7 +579,7 @@ class WorkOrderService:
     
     async def resume_work_order(self, work_order_id: str, reason: str = "", user=None) -> Optional[WorkOrder]:
         """暂停 → 生产中"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "恢复")
         if not work_order:
             return None
         
@@ -560,7 +599,7 @@ class WorkOrderService:
     
     async def mark_pending_inbound(self, work_order_id: str, user=None) -> Optional[WorkOrder]:
         """生产中 → 待入库"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "待入库")
         if not work_order:
             return None
         
@@ -585,7 +624,7 @@ class WorkOrderService:
         user=None,
     ) -> Optional[WorkOrder]:
         """生产中/待入库 → 已完成（审核门槛：品质角色 + 实际产出 + 父子完工约束）"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "完工")
         if not work_order:
             return None
         
@@ -679,7 +718,7 @@ class WorkOrderService:
     
     async def close_work_order(self, work_order_id: str, user=None) -> Optional[WorkOrder]:
         """已完成 → 已关闭（审核门槛：厂长 / 管理员）"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "关闭")
         if not work_order:
             return None
         
@@ -699,7 +738,7 @@ class WorkOrderService:
     
     async def cancel_work_order(self, work_order_id: str, reason: str, user=None) -> Optional[WorkOrder]:
         """取消工单（draft/pending/released/in_progress/on_hold 均可取消）"""
-        work_order = await self.get_work_order_by_id(work_order_id)
+        work_order = await self._load_for_action(work_order_id, user, "取消")
         if not work_order:
             return None
         
@@ -729,7 +768,7 @@ class WorkOrderService:
 
         子工单编码 {主工单码}-SPL{nn}，无工序码 → 主工单数量按「求和」汇总。
         """
-        original_wo = await self.get_work_order_by_id(work_order_id)
+        original_wo = await self._load_for_action(work_order_id, user, "拆单")
         if not original_wo:
             raise ValueError("Work order not found")
         

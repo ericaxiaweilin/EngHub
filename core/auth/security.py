@@ -175,6 +175,21 @@ async def require_login_for_api(request: Request) -> None:
         )
 
 
+def allowed_factory_ids(user: Optional[User]) -> Optional[set]:
+    """这个账号有权进入的厂区集合。返回 None = 不限（超管）。
+
+    租户归属只有这一个取法：请求侧的厂区选择器（`enforce_tenant`）和对象侧的行归属
+    （服务层的 `_require_object_factory`）都问它，避免两处口径各自漂移。
+    普通账号的集合 = {自身 factory_id} ∪ {已被管理员切换过的 active_factory_id} ——
+    `active_factory_id` 只能由 /factory/switch（超管/开发账户）改，所以不是自助后门。
+    """
+    if user is None:
+        return None
+    if getattr(user, "is_superuser", False):
+        return None
+    return {getattr(user, "factory_id", None), getattr(user, "active_factory_id", None)} - {None, ""}
+
+
 async def enforce_tenant(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -209,8 +224,8 @@ async def enforce_tenant(
     if getattr(user, "is_superuser", False):
         return requested
 
-    allowed = {user.factory_id, getattr(user, "active_factory_id", None)} - {None, ""}
-    if requested in allowed:
+    allowed = allowed_factory_ids(user)
+    if allowed is None or requested in allowed:
         return requested
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
