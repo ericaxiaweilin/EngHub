@@ -2,8 +2,9 @@
 认证授权 API 路由
 用户登录、注册、Token 刷新、角色管理
 """
+import os
 from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, EmailStr, field_validator
@@ -153,25 +154,73 @@ def _build_user_response(user: User) -> UserResponse:
     return resp
 
 
+# --- 口令爆破节流 ---
+# 计数放在库里而不是进程内存：uvicorn 以 --workers 2 起跑，进程内计数会让攻击者
+# 按 worker 数把预算翻倍，而且重启即清零。窗口与阈值都用窗口内失败行数判，
+# 锁定到期不需要定时任务 —— 超窗的行自然不再计入。
+LOGIN_FAIL_WINDOW_MINUTES = int(os.getenv("LOGIN_FAIL_WINDOW_MINUTES", "15"))
+LOGIN_FAIL_LIMIT = int(os.getenv("LOGIN_FAIL_LIMIT", "10"))
+
+
+async def _recent_login_failures(db: AsyncSession, username: str) -> int:
+    from sqlalchemy import text
+    return int((await db.execute(
+        text("SELECT count(*) FROM login_attempts WHERE username = :u "
+             "AND attempted_at > now() - make_interval(mins => :w)"),
+        {"u": username, "w": LOGIN_FAIL_WINDOW_MINUTES})).scalar() or 0)
+
+
+async def _note_login_failure(db: AsyncSession, username: str, client_ip: str) -> None:
+    from sqlalchemy import text
+    await db.execute(
+        text("INSERT INTO login_attempts (username, client_ip, reason) VALUES (:u, :i, :r)"),
+        {"u": username, "i": client_ip, "r": "bad_password"})
+    await db.commit()
+
+
+async def _clear_login_failures(db: AsyncSession, username: str) -> None:
+    from sqlalchemy import text
+    await db.execute(text("DELETE FROM login_attempts WHERE username = :u"), {"u": username})
+    await db.commit()
+
+
 # --- Endpoints ---
 
 @router.post("/login", response_model=TokenResponse)
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+async def login(
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db),
+):
     """
     用户登录
     返回 access_token 和 refresh_token
     """
     user_service = UserService(db)
-    
+
+    client_ip = ((request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+                 or (request.client.host if request.client else ""))
+    failed = await _recent_login_failures(db, form_data.username)
+    if failed >= LOGIN_FAIL_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(f"账号 {form_data.username} 在 {LOGIN_FAIL_WINDOW_MINUTES} 分钟内"
+                    f"密码错误 {failed} 次，已临时锁定"),
+            headers={"Retry-After": str(LOGIN_FAIL_WINDOW_MINUTES * 60)},
+        )
+
     # 验证用户
     user = await user_service.authenticate_user(form_data.username, form_data.password)
     if not user:
+        await _note_login_failure(db, form_data.username, client_ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户名或密码错误",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
+    await _clear_login_failures(db, form_data.username)
+
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

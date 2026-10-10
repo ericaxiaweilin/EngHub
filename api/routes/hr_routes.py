@@ -92,6 +92,11 @@ async def list_factories(
     rows = (await db.execute(text(
         "SELECT id, name, short_name, factory_type, address, status FROM factories ORDER BY created_at"
     ))).fetchall()
+    # 厂区选择器不能列出这个账号本来就没权进厂：列出来就是诱使前端去发一个必被
+    # 租户闸 403 的请求。超管/开发账户沿用 /factory/switch 的口径，仍能看到全部。
+    if not _is_dev_account(current_user):
+        allowed = {current_user.factory_id, getattr(current_user, "active_factory_id", None)} - {None, ""}
+        rows = [r for r in rows if r[0] in allowed]
     return {
         "items": [
             {"id": r[0], "name": r[1], "short_name": r[2], "factory_type": r[3], "address": r[4], "status": r[5]}

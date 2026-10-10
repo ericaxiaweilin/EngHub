@@ -8,7 +8,8 @@ import asyncio
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
+from core.auth.security import enforce_tenant, require_login_for_api
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from api.routes import (
@@ -73,7 +74,16 @@ from core.org_panel.api_adapter import router as org_panel_router
 app = FastAPI(
     title="EngHub MES",
     description="Manufacturing Execution System API with TMS (Task Management System)",
-    version="2.5.0"
+    version="2.5.0",
+    # 接口目录默认不公开：/openapi.json 会把 624 条路径连同参数白送给任何访客，
+    # 实测就是攻击者最省事的一张地图。要恢复（本地调试/联调）设 API_DOCS_ENABLED=1。
+    docs_url="/docs" if os.getenv("API_DOCS_ENABLED", "0") == "1" else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if os.getenv("API_DOCS_ENABLED", "0") == "1" else None,
+    # 租户闸（app 级单点）：只要请求带了厂区选择器（?factory_id= 或 X-Factory-Id 头），
+    # 就必须证明这个厂区属于调用者。没带选择器的请求在依赖里直接返回，行为与开销都不变。
+    # 认证闸（默认拒绝）：/api/ 下除公开清单外一律要有访问票 —— 新接口忘了挂依赖也兜得住。
+    dependencies=[Depends(require_login_for_api), Depends(enforce_tenant)],
 )
 
 # Include routers
@@ -657,6 +667,31 @@ async def _periodic_scheduler():
 
 
 @app.on_event("startup")
+async def _security_readiness():
+    """启动就绪门：JWT 密钥没配就别对外服务；顺带把口令节流表建出来（幂等，无需迁移框架）。"""
+    from sqlalchemy import text
+    from core.auth.security import secret_key_configured
+    from database.db_config import db_config
+
+    if not secret_key_configured():
+        raise RuntimeError(
+            "SECRET_KEY 未配置，拒绝启动：代码里曾经兜底的是公开占位值 "
+            "your-secret-key-change-in-production，漏配等于任何人都能自签票冒充任意账号"
+            "（2026-10-10 在克隆靶上实测通过）。请在容器环境里设置 SECRET_KEY 后重启。"
+        )
+    async with db_config.session_factory() as session:
+        await session.execute(text(
+            "CREATE TABLE IF NOT EXISTS login_attempts ("
+            "id bigserial PRIMARY KEY, username text NOT NULL, client_ip text, "
+            "reason text, attempted_at timestamptz NOT NULL DEFAULT now())"))
+        await session.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_login_attempts_user_time "
+            "ON login_attempts (username, attempted_at)"))
+        await session.commit()
+    _logger.info("[security] SECRET_KEY 已配置；login_attempts 节流表就绪")
+
+
+@app.on_event("startup")
 async def _start_scheduler():
     # Agent Event Bus：开启 DB 审计持久化（失败不阻断实时事件流）。
     from core.agent import AgentEventBus
@@ -697,10 +732,22 @@ if FRONTEND_DIST.is_dir():
 
     @app.get("/{full_path:path}")
     async def spa_fallback(request: Request, full_path: str):
-        """SPA fallback：非 API 路由全部返回前端页面"""
-        file_path = FRONTEND_DIST / full_path
-        if full_path and file_path.is_file():
-            return FileResponse(str(file_path))
+        """SPA fallback：非 API 路由返回前端页面，但文件只允许在 frontend_dist 之内。
+
+        改之前是 `FRONTEND_DIST / full_path` 判 `is_file()` 就直接 FileResponse ——
+        未认证请求用 `/..%2f..%2f..%2fetc%2fpasswd` 即可读到容器里任何文件
+        （2026-10-10 靶上实测：/etc/passwd 返回 880B、/app/main.py 返回 43,777B，
+        字节数与容器内 `wc -c` 完全一致）。现在解析后必须仍落在 dist 里，越界一律回首页。
+        未知的 `/api/...` 也不再兜底成 HTML：那会把 404 伪装成 200，
+        让"这个接口能不能匿名访问"这类判据全部失真。
+        """
+        if full_path.startswith("api/") or full_path in ("docs", "redoc", "openapi.json"):
+            raise HTTPException(status_code=404, detail=f"接口不存在: /{full_path}")
+        base = FRONTEND_DIST.resolve()
+        if full_path:
+            candidate = (base / full_path).resolve()
+            if candidate.is_file() and candidate.is_relative_to(base):
+                return FileResponse(str(candidate))
         # index.html 禁止缓存，确保发版后用户立即拿到新代码（js/css 带 hash 可长期缓存）
         return FileResponse(
             str(FRONTEND_DIST / "index.html"),
