@@ -5,7 +5,7 @@ import {
   Input, Select, message, Empty, Spin, Timeline,
 } from 'antd'
 import {
-  AuditOutlined, SearchOutlined, PlusOutlined, WarningOutlined,
+  AuditOutlined, SearchOutlined, PlusOutlined, WarningOutlined, DashboardOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
 
@@ -173,6 +173,70 @@ const AlertPanel: React.FC = () => {
   )
 }
 
+// ============== 能力矩阵（WMS 到底哪一格能用、哪一格缺东西） ==============
+// 这一格存在的理由：后端 10-09 把"仓储功能很弱"拆成了 14 张可核对的格子，但界面上一格都看不见 ——
+// 判词只能靠 curl 读，等于没交付。四种状态必须分颜色分开文字，不能笼统写成"弱"：
+// live=有数据有人在用；thin=有数但填充率低到不能当结论；empty=表和接口都在、0 行（没被走过）；
+// blocked_on_source=外部源没有新数（点名哪个源、停更多久），不拿过期快照出读数。
+const STATE_META: Record<string, { color: string; text: string }> = {
+  live: { color: 'success', text: '能用' },
+  thin: { color: 'warning', text: '数不够硬' },
+  empty: { color: 'default', text: '从没被走过' },
+  blocked_on_source: { color: 'error', text: '缺外部新数' },
+  not_computable: { color: 'processing', text: '算不出' },
+  error: { color: 'error', text: '读取出错' },
+}
+
+const CapabilityPanel: React.FC = () => {
+  const [data, setData] = useState<any | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res: any = await api.get('/api/v1/wms/capability', { params: { factory_id: FACTORY } })
+      setData(res)
+    } catch { /* 读不到要显式空态，不能拿上一厂的数顶着看 */ } finally { setLoading(false) }
+  }, [])
+  useEffect(() => { load() }, [load])
+
+  if (loading) return <Spin />
+  if (!data) return <Empty description="能力矩阵没读到（GET /api/v1/wms/capability）" />
+
+  const score = data.score || {}
+  return (
+    <div>
+      <Row gutter={12} style={{ marginBottom: 12 }}>
+        <Col span={6}><Card size="small"><Statistic title="能用" value={score.live || 0} valueStyle={{ color: '#52c41a' }} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="数不够硬" value={score.thin || 0} valueStyle={{ color: '#faad14' }} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="从没被走过" value={score.empty || 0} /></Card></Col>
+        <Col span={6}><Card size="small"><Statistic title="缺外部新数" value={score.blocked_on_source || 0} valueStyle={{ color: '#f5222d' }} /></Card></Col>
+      </Row>
+      <Table dataSource={data.capabilities || []} rowKey="capability" size="small"
+        pagination={false}
+        columns={[
+          { title: '状态', dataIndex: 'state', width: 120, render: (v: string) => {
+              const m = STATE_META[v] || { color: 'default', text: v }
+              return <Tag color={m.color}>{m.text}</Tag>
+            } },
+          { title: '能力', dataIndex: 'capability', width: 190 },
+          { title: '实测读数', dataIndex: 'reads' },
+          { title: '还缺什么', dataIndex: 'missing', width: 260,
+            render: (v: string) => v || <span style={{ color: '#999' }}>—</span> },
+        ]}
+      />
+      <Card size="small" style={{ marginTop: 12 }} title="判词怎么读">
+        <div style={{ whiteSpace: 'pre-wrap', color: '#555', fontSize: 12 }}>{data.rule}</div>
+        <div style={{ color: '#999', fontSize: 12, marginTop: 6 }}>
+          生成时间 {String(data.generated_at || '').replace('T', ' ').slice(0, 19)} · 厂区 {data.factory_id}
+          （空表不等于坏了，也不等于通过）
+        </div>
+      </Card>
+    </div>
+  )
+}
+
+
 // ============== 主页面 ==============
 const WmsCenter: React.FC = () => {
   return (
@@ -180,6 +244,7 @@ const WmsCenter: React.FC = () => {
       { key: 'count', label: <span><AuditOutlined /> 盘点管理</span>, children: <CountPanel /> },
       { key: 'trace', label: <span><SearchOutlined /> 物料追溯</span>, children: <TracePanel /> },
       { key: 'alerts', label: <span><WarningOutlined /> 库存预警</span>, children: <AlertPanel /> },
+      { key: 'capability', label: <span><DashboardOutlined /> 能力矩阵</span>, children: <CapabilityPanel /> },
     ]} />
   )
 }
