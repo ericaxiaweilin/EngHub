@@ -212,6 +212,11 @@ export interface InventoryItem {
   reserved_qty: number;
   unit_cost?: number;
   status: string;
+  material_name?: string;
+  unit?: string;
+  lock_reason?: string | null;
+  qualified_status?: string | null;
+  updated_at?: string;
   created_at?: string;
 }
 

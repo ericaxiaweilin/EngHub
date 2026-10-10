@@ -2,20 +2,171 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Tabs, Table, Button, Tag, Space, Row, Col, Statistic, Modal, Form,
-  Input, Select, message, Empty, Spin, Timeline,
+  Input, InputNumber, Select, message, Empty, Spin, Timeline, Drawer, Progress,
+  Popconfirm, Alert, Tooltip,
 } from 'antd'
 import {
   AuditOutlined, SearchOutlined, PlusOutlined, WarningOutlined, DashboardOutlined,
+  EditOutlined, CheckCircleOutlined,
 } from '@ant-design/icons'
 import api from '../../services/api'
 
 const FACTORY = getActiveFactoryId()
+
+// ============== 盘点录入（把实测数敲进明细） ==============
+// 为什么要有这一层：POST /inventory/count/{id}/items 只认 item_id，而在这次补 GET 明细之前
+// 全仓没有任何地方能列出 item_id —— 于是"已录实测 0/200"从来不是现场没盘，是人看不到该录哪几行。
+const CountEntryDrawer: React.FC<{
+  order: any | null
+  onClose: () => void
+  onChanged: () => void
+}> = ({ order, onClose, onChanged }) => {
+  const [items, setItems] = useState<any[]>([])
+  const [meta, setMeta] = useState<any | null>(null)
+  const [draft, setDraft] = useState<Record<string, number | null>>({})
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState<string | null>(null)
+  const [approving, setApproving] = useState(false)
+
+  const load = useCallback(async () => {
+    if (!order?.id) return
+    setLoading(true)
+    try {
+      const res: any = await api.get(`/api/v1/inventory/count/${order.id}/items`)
+      setItems(res.items || [])
+      setMeta(res)
+      setDraft({})
+    } catch {
+      setItems([]); setMeta(null)
+    } finally { setLoading(false) }
+  }, [order?.id])
+
+  useEffect(() => { load() }, [load])
+
+  const save = async (row: any) => {
+    const value = draft[row.item_id]
+    if (value === undefined || value === null) { message.warning('先填这一行的实测数'); return }
+    setSaving(row.item_id)
+    try {
+      const res: any = await api.post(`/api/v1/inventory/count/${order.id}/items`, {
+        item_id: row.item_id, counted_qty: value,
+      })
+      const diff = Number(res.diff_qty ?? 0)
+      message.success(diff === 0 ? '已录入：与系统数一致' : `已录入：差异 ${diff > 0 ? '+' : ''}${diff}`)
+      await load(); onChanged()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '录入失败')
+    } finally { setSaving(null) }
+  }
+
+  const approve = async () => {
+    setApproving(true)
+    try {
+      const res: any = await api.post(`/api/v1/inventory/count/${order.id}/approve`, {})
+      message.success(res.message || '盘点已审批')
+      await load(); onChanged()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '审批失败')
+    } finally { setApproving(false) }
+  }
+
+  const pending = meta?.pending ?? 0
+  const columns = [
+    { title: '料号', dataIndex: 'material_code', width: 130 },
+    { title: '名称', dataIndex: 'material_name', width: 170, ellipsis: true,
+      render: (v: string) => v ? <Tooltip title={v}>{v}</Tooltip> : <span style={{ color: '#999' }}>—</span> },
+    { title: '库位', dataIndex: 'location_code', width: 120,
+      render: (v: string) => v || <span style={{ color: '#999' }}>无库位</span> },
+    { title: '批次', dataIndex: 'batch_code', width: 120, render: (v: string) => v || '—' },
+    { title: '系统数', dataIndex: 'system_qty', width: 90, align: 'right' as const },
+    { title: '实测数', width: 120, align: 'center' as const,
+      render: (_: any, r: any) => (
+        <InputNumber
+          size="small" min={0} style={{ width: 100 }}
+          defaultValue={r.counted_qty ?? undefined}
+          placeholder={r.counted_qty == null ? '实盘数' : String(r.counted_qty)}
+          onChange={(v) => setDraft(d => ({ ...d, [r.item_id]: v as number | null }))}
+        />
+      ) },
+    { title: '差异', width: 80, align: 'right' as const,
+      render: (_: any, r: any) => {
+        const v = draft[r.item_id] ?? r.counted_qty
+        if (v === undefined || v === null) return <span style={{ color: '#999' }}>未盘</span>
+        const diff = Number(v) - Number(r.system_qty ?? 0)
+        return <span style={{ color: diff === 0 ? '#999' : '#f5222d', fontWeight: diff === 0 ? 400 : 600 }}>
+          {diff > 0 ? `+${diff}` : diff}
+        </span>
+      } },
+    { title: '状态', width: 90,
+      render: (_: any, r: any) => r.adjusted
+        ? <Tag color="success">已调差</Tag>
+        : (r.counted_qty != null ? <Tag color="processing">已录</Tag> : <Tag>未录</Tag>) },
+    { title: '操作', width: 80,
+      render: (_: any, r: any) => (
+        <Button size="small" type="link" loading={saving === r.item_id}
+          disabled={draft[r.item_id] === undefined || draft[r.item_id] === null}
+          onClick={() => save(r)}>保存</Button>
+      ) },
+  ]
+
+  return (
+    <Drawer
+      open
+      width={1000}
+      onClose={onClose}
+      title={order ? `盘点录入 · ${order.count_code || order.id}` : '盘点录入'}
+      extra={
+        <Popconfirm
+          title="提交审批并调整台账？"
+          description={pending > 0
+            ? `还有 ${pending} 行没录实测数 —— 审批只调已录的行，没录的不动库存`
+            : '所有明细都已录入，审批后按差异自动盘盈/盘亏'}
+          okText="审批"
+          cancelText="先不"
+          onConfirm={approve}
+        >
+          <Button type="primary" icon={<CheckCircleOutlined />} loading={approving} disabled={!items.length}>
+            提交审批
+          </Button>
+        </Popconfirm>
+      }
+    >
+      {order && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={`厂区 ${FACTORY} · 仓库 ${order.warehouse_id || '未指定'} · 当前状态 ${order.status || '—'}`}
+          description={meta ? (
+            <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <span>
+                已录 {meta.counted}/{meta.total} 行 · 待录 {meta.pending} · 有差异 {meta.with_diff} 行
+                · 已调差 {items.filter(i => i.adjusted).length} 行
+              </span>
+              <Progress percent={Math.round((meta.counted / Math.max(1, meta.total)) * 100)} size="small" />
+              <span style={{ color: '#8c8c8c', fontSize: 12 }}>{meta.note}</span>
+            </Space>
+          ) : '明细没读到（GET /api/v1/inventory/count/{id}/items）'}
+        />
+      )}
+      <Table
+        rowKey="item_id"
+        size="small"
+        loading={loading}
+        columns={columns}
+        dataSource={items}
+        pagination={{ pageSize: 20, showTotal: (t) => `共 ${t} 行` }}
+      />
+    </Drawer>
+  )
+}
 
 // ============== 盘点管理 ==============
 const CountPanel: React.FC = () => {
   const [counts, setCounts] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [createModal, setCreateModal] = useState(false)
+  const [entry, setEntry] = useState<any | null>(null)
   const [form] = Form.useForm()
 
   const load = useCallback(async () => {
@@ -41,7 +192,10 @@ const CountPanel: React.FC = () => {
 
   return (
     <div>
-      <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModal(true)} style={{ marginBottom: 12 }}>新建盘点</Button>
+      <Space style={{ marginBottom: 12 }}>
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModal(true)}>新建盘点</Button>
+        <Button icon={<SearchOutlined />} onClick={load}>刷新</Button>
+      </Space>
       <Table dataSource={counts} rowKey="id" size="small" loading={loading} pagination={{ pageSize: 10 }}
         columns={[
           { title: '盘点单号', dataIndex: 'count_code', width: 180 },
@@ -51,8 +205,13 @@ const CountPanel: React.FC = () => {
           { title: '差异项', dataIndex: 'diff_items', width: 80, render: (v: number) => <span style={{ color: v > 0 ? '#f5222d' : undefined }}>{v}</span> },
           { title: '差异数量', dataIndex: 'total_diff_qty', width: 90 },
           { title: '创建时间', dataIndex: 'created_at', width: 110, render: (v: string) => v?.slice(0, 10) },
+          { title: '操作', width: 110,
+            render: (_: any, r: any) => (
+              <Button size="small" icon={<EditOutlined />} onClick={() => setEntry(r)}>录入明细</Button>
+            ) },
         ]}
       />
+      {entry && <CountEntryDrawer order={entry} onClose={() => setEntry(null)} onChanged={load} />}
       <Modal title="新建盘点单" open={createModal} onOk={handleCreate} onCancel={() => setCreateModal(false)}>
         <Form form={form} layout="vertical">
           <Form.Item name="warehouse_id" label="仓库ID" rules={[{ required: true }]}><Input placeholder="仓库ID" /></Form.Item>

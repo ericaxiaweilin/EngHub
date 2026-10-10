@@ -6,7 +6,7 @@ import { SearchOutlined, ReloadOutlined, WarningOutlined } from '@ant-design/ico
 import dayjs from 'dayjs'
 import type { ColumnsType } from 'antd/es/table'
 import { getInventory, InventoryItem, getWarehouses, Warehouse } from '../../services/mes'
-import { getStoredUser } from '../../services/auth'
+import { getActiveFactoryId } from '../../utils/factory'
 import DrillDownDrawer from '../../components/trace/DrillDownDrawer'
 import RecordDetailDrawer, { DetailField } from '../../components/trace/RecordDetailDrawer'
 
@@ -36,16 +36,9 @@ const InventoryList: React.FC = () => {
   const [drill, setDrill] = useState<DrillConfig | null>(null)
   const [detail, setDetail] = useState<InventoryItem | null>(null)
 
-  const user = getStoredUser()
-  const factoryId = localStorage.getItem('active_factory_id') || user?.factory_id || 'F01'
-
-  const MOCK_INVENTORY: any[] = [
-    { id: 'inv-1', material_code: 'MAT-1001', material_name: '轴承 6205', quantity: 2400, unit: '个', warehouse_id: 'WH-01', location: 'A-01-01', safety_stock: 500, max_stock: 5000, status: 'normal', factory_id: 'factory-sh-01', updated_at: '2026-07-20' },
-    { id: 'inv-2', material_code: 'MAT-2003', material_name: 'M8螺栓', quantity: 180, unit: '个', warehouse_id: 'WH-01', location: 'A-02-03', safety_stock: 200, max_stock: 3000, status: 'below_safety', factory_id: 'factory-sh-01', updated_at: '2026-07-19' },
-    { id: 'inv-3', material_code: 'MAT-3010', material_name: 'PCB主板', quantity: 850, unit: '块', warehouse_id: 'WH-02', location: 'B-01-02', safety_stock: 100, max_stock: 2000, status: 'normal', factory_id: 'factory-sh-01', updated_at: '2026-07-18' },
-    { id: 'inv-4', material_code: 'MAT-4005', material_name: '密封圈', quantity: 5200, unit: '个', warehouse_id: 'WH-02', location: 'B-03-01', safety_stock: 1000, max_stock: 5000, status: 'above_max', factory_id: 'factory-sh-01', updated_at: '2026-07-17' },
-    { id: 'inv-5', material_code: 'MAT-5002', material_name: '铝合金棒材', quantity: 320, unit: 'kg', warehouse_id: 'WH-03', location: 'C-01-01', safety_stock: 100, max_stock: 1000, status: 'normal', factory_id: 'factory-sh-01', updated_at: '2026-07-16' },
-  ]
+  // 厂区只能有一个来源：这一页以前自己拼 localStorage → user.factory_id → 'F01'，
+  // 而 'F01' 在台账里是 0 行 —— 于是整页看着像空的，实际是问错了厂。
+  const factoryId = getActiveFactoryId()
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -86,12 +79,18 @@ const InventoryList: React.FC = () => {
   }
 
   const statusTag = (s: string) => {
+    // 词表要跟写入侧一致：质量冻结写的是 status='locked'。
+    // 之前这里只有 frozen，读侧一处都没用到 locked —— 于是界面把被锁的行显示成原文 locked，
+    // 而"冻结"筛选项筛的是一个台账里不存在的词，等于永远筛不到。
     const map: Record<string, { color: string; text: string }> = {
-      available: { color: 'success', text: '正常' },
+      available: { color: 'success', text: '可用' },
+      active: { color: 'success', text: '可用' },
+      locked: { color: 'error', text: '质量冻结' },
+      held: { color: 'warning', text: '待检' },
+      shortage: { color: 'warning', text: '缺货' },
       low_stock: { color: 'warning', text: '低库存' },
-      frozen: { color: 'error', text: '冻结' },
     }
-    const info = map[s] || { color: 'default', text: s }
+    const info = map[(s || '').toLowerCase()] || { color: 'default', text: s || '未标' }
     return <Tag color={info.color}>{info.text}</Tag>
   }
 
@@ -173,8 +172,10 @@ const InventoryList: React.FC = () => {
       render: (v: number) => v != null ? `¥${Number(v).toFixed(2)}` : '-',
     },
     {
-      title: '状态', dataIndex: 'status', key: 'status', width: 90,
-      render: (s: string) => statusTag(s),
+      title: '状态', dataIndex: 'status', key: 'status', width: 150,
+      render: (s: string, r: any) => (
+        <span>{statusTag(s)}{r.lock_reason ? <span style={{ fontSize: 12, color: '#8c8c8c' }}>{r.lock_reason}</span> : null}</span>
+      ),
     },
     { title: '更新时间', dataIndex: 'updated_at', key: 'updated', width: 130, render: (v: string) => v ? dayjs(v).format('MM-DD HH:mm') : '-' },
   ]
@@ -211,10 +212,12 @@ const InventoryList: React.FC = () => {
             allowClear value={search} onChange={(e) => setSearch(e.target.value)}
             onPressEnter={() => { setPage(1); fetchData() }}
           />
-          <Select placeholder="状态" style={{ width: 120 }} allowClear value={statusFilter} onChange={(v) => { setStatusFilter(v); setPage(1) }}>
-            <Option value="available">正常</Option>
-            <Option value="low_stock">低库存</Option>
-            <Option value="frozen">冻结</Option>
+          <Select placeholder="状态" style={{ width: 140 }} allowClear value={statusFilter} onChange={(v) => { setStatusFilter(v); setPage(1) }}>
+            {/* "可用"在台账里是两个词（active / available），筛一个就漏另一个 —— 一次给全 */}
+            <Option value="active,available">可用</Option>
+            <Option value="locked">质量冻结</Option>
+            <Option value="held">待检</Option>
+            <Option value="shortage">缺货</Option>
           </Select>
           <Button type="primary" onClick={() => { setPage(1); fetchData() }}>查询</Button>
           <Button icon={<ReloadOutlined />} onClick={fetchData}>刷新</Button>
