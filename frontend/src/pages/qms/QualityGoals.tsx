@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Row, Col, Tag, Space, Statistic, Empty, Spin, Progress, Button,
   Modal, Form, Input, InputNumber, Select, message,
@@ -10,7 +11,7 @@ import {
 import dayjs from 'dayjs'
 import api from '../../services/api'
 
-const FACTORY = 'F001'
+const FACTORY = getActiveFactoryId()
 
 const metricLabels: Record<string, string> = {
   yield_rate: '良品率',

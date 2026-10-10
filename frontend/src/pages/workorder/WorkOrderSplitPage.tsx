@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import { 
   Card, Table, Tag, Space, Button, Modal, Form, Input, InputNumber, Select,
   message, Typography, Row, Col, Tree, Spin, Tabs
@@ -15,7 +16,7 @@ import { getStoredUser, hasPermission } from '../../services/auth'
 const { Title, Text } = Typography
 const { TabPane } = Tabs
 
-const FACTORY = 'F001' // 从上下文获取
+const FACTORY = getActiveFactoryId()
 
 interface WorkOrder {
   id: string

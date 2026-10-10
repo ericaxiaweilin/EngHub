@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Row, Col, Tag, Space, Statistic, Empty, Spin, Badge, Tooltip,
   Progress, Button,
@@ -11,7 +12,7 @@ import {
 import dayjs from 'dayjs'
 import api from '../../services/api'
 
-const FACTORY = 'factory-sh-01'
+const FACTORY = getActiveFactoryId()
 
 const MOCK_STATIONS: WorkstationCard[] = [
   { id: 'pf-1', station_id: 'CNC-01', station_name: 'CNC加工中心-01', status: 'running', current_wo: 'WO-2026-0701', current_product: '轴承座', operator: '张伟', oee: 85.2, running_minutes: 420 },

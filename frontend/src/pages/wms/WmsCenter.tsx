@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Tabs, Table, Button, Tag, Space, Row, Col, Statistic, Modal, Form,
   Input, Select, message, Empty, Spin, Timeline,
@@ -8,7 +9,7 @@ import {
 } from '@ant-design/icons'
 import api from '../../services/api'
 
-const FACTORY = 'F001'
+const FACTORY = getActiveFactoryId()
 
 // ============== 盘点管理 ==============
 const CountPanel: React.FC = () => {

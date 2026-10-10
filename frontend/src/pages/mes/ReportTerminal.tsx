@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Row, Col, Button, InputNumber, Select, Tag, Space, Statistic,
   message, Result, Typography, Modal,
@@ -12,7 +13,7 @@ import dayjs from 'dayjs'
 import api from '../../services/api'
 
 const { Text } = Typography
-const FACTORY = 'F001'
+const FACTORY = getActiveFactoryId()
 
 // 班次配置
 const shiftConfig: Record<string, { label: string; color: string; icon: React.ReactNode }> = {

@@ -1,11 +1,12 @@
 
 
 import { useState, useEffect } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import { Card, Table, Tag, Button, Modal, Form, Input, message, Descriptions, Space } from 'antd'
 import { PlusOutlined, RiseOutlined } from '@ant-design/icons'
 import api from '../../services/api'
 
-const FACTORY = 'factory-sh-01'
+const FACTORY = getActiveFactoryId()
 
 const MOCK_TICKETS = [
   { id: 'an-1', ticket_code: 'AND-2026-001', category_code: 'equipment_repair', title: 'CNC-03主轴异响', description: '加工时发出异常噪音，疑似轴承磨损', status: 'in_progress', priority: 'high', station_id: 'ST-01', created_at: '2026-07-20T08:30:00', resolved_at: null },

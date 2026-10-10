@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Tabs, Form, Input, InputNumber, Select, Button, message, Space,
   Table, Tag, Typography, Row, Col, Result, Timeline, Divider,
@@ -11,7 +12,7 @@ import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 
 const { Title, Text } = Typography
-const FACTORY = 'F001'
+const FACTORY = getActiveFactoryId()
 
 const typeColors: Record<string, string> = {
   inbound: 'green', outbound: 'red', transfer: 'blue', adjust: 'orange', count_diff: 'purple',

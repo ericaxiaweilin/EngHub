@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Table, Tag, Space, Button, message, Typography, Row, Col,
   Statistic, Badge, Progress, Empty,
@@ -11,7 +12,7 @@ import type { ColumnsType } from 'antd/es/table'
 import api from '../../services/api'
 
 const { Title, Text } = Typography
-const FACTORY = 'factory-sh-01'
+const FACTORY = getActiveFactoryId()
 
 const MOCK_ALERTS = [
   { id: 'sa-1', material_code: 'MAT-2003', material_name: 'M8螺栓', alert_type: 'below_safety', severity: 'critical', current_qty: 180, safety_stock: 200, message: '当前库存180低于安全库存200', status: 'open', created_at: '2026-07-19' },

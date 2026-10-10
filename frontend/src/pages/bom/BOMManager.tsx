@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Row, Col, Select, Button, Table, Spin, Empty, message, Tabs, Space, Tag, Input,
 } from 'antd';
@@ -10,7 +11,7 @@ import api from '../../services/api';
 
 const { Option } = Select;
 
-const FACTORY = 'factory-sh-01';
+const FACTORY = getActiveFactoryId();
 
 interface BOMModel {
   id: string;

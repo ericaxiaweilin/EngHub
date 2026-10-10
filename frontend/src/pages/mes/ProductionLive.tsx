@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react'
+import { getActiveFactoryId } from '../../utils/factory'
 import {
   Card, Row, Col, Statistic, Tag, Space, Badge, Empty, Spin,
   Progress, Typography, Tooltip, Button,
@@ -11,7 +12,7 @@ import dayjs from 'dayjs'
 import api from '../../services/api'
 
 const { Title, Text } = Typography
-const FACTORY = 'factory-sh-01'
+const FACTORY = getActiveFactoryId()
 
 const MOCK_LIVE = { total_output: 1250, target_output: 1500, oee: 78.5, active_stations: 8, total_stations: 12, defect_rate: 1.8, running_orders: 5 }
 const MOCK_TREND = { hours: ['08:00','09:00','10:00','11:00','12:00','13:00','14:00'], output: [120,145,160,155,80,150,140], target: [150,150,150,150,100,150,150] }
