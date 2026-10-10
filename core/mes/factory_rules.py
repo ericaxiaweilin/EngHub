@@ -732,6 +732,72 @@ async def capacity_questions(db: AsyncSession, factory_id: str) -> List[Dict[str
             "prefilled_evidence": ss_error,
         })
 
+    # 工单生命周期动作的角色门槛：对象归属已经拦住了跨厂，但"本厂里谁能取消/开工"
+    # 是厂规，引擎不替厂里定 —— 这里把现状与代价量出来挂成待回答的问题。
+    try:
+        from api.services.work_order_service import ACTION_ROLE_GATES
+
+        wo_actions = [("release", "下达"), ("start", "开工"), ("pause", "暂停"),
+                      ("resume", "恢复"), ("mark_pending_inbound", "待入库"),
+                      ("complete", "完工"), ("close", "关闭"), ("cancel", "取消"),
+                      ("split", "拆单")]
+        gated = [(k, cn) for k, cn in wo_actions if k in ACTION_ROLE_GATES]
+        open_actions = [(k, cn) for k, cn in wo_actions if k not in ACTION_ROLE_GATES]
+        roles = (await db.execute(text(
+            "SELECT role, count(*) AS n FROM users WHERE factory_id = :fid "
+            "GROUP BY 1 ORDER BY 2 DESC"), {"fid": factory_id})).mappings().all()
+        wo_by_status = (await db.execute(text(
+            "SELECT status, count(*) AS n FROM work_orders WHERE factory_id = :fid "
+            "GROUP BY 1 ORDER BY 2 DESC"), {"fid": factory_id})).mappings().all()
+        exposed = sum(int(r["n"]) for r in wo_by_status
+                      if str(r["status"]) not in ("cancelled", "closed", "completed"))
+        role_txt = "、".join(f"{r['role']} {int(r['n'])} 人" for r in roles[:6]) or "本厂无账号"
+        wo_txt = "、".join(f"{r['status']} {int(r['n'])}" for r in wo_by_status[:6]) or "无工单"
+        fm_count = next((int(r["n"]) for r in roles if str(r["role"]) == "factory_manager"), 0)
+        fm_cost = (f"本厂 `factory_manager` 一个都没有（0 人）—— 也就是说把取消/关闭收紧到厂长角色，"
+                   f"现在没有任何账号能按，约 {exposed} 张在流程工单的收尾会当场卡住"
+                   if fm_count == 0 else
+                   f"本厂 `factory_manager` 只有 {fm_count} 人，要担约 {exposed} 张在流程工单的"
+                   "取消/关闭判断")
+        gated_txt = "、".join("%s→%s" % (cn, "/".join(ACTION_ROLE_GATES.get(k, [])))
+                              for k, cn in gated)
+        if not (await binding_rules(db, factory_id)).get("work_order_action_role_gate"):
+            out.append({
+                "topic": "work_order_action_role_gate",
+                "question": (f"工单生命周期动作里，{len(open_actions)} 个没有角色门槛"
+                             f"（{'、'.join(cn for _, cn in open_actions)}），只有 "
+                             f"{len(gated)} 个有（{'、'.join(cn for _, cn in gated)}）—— "
+                             f"本厂任何登录账号都能取消/开工/暂停在流程里的 {exposed} 张工单，"
+                             "这是厂里要承认的现状，还是要设门槛？"),
+                "why_it_matters": (
+                    f"跨厂那一路已经被对象归属闸拦掉（本厂以外改不动），剩下的是本厂内的动作权。"
+                    f"门槛一旦收紧到管理角色，要先看清代价：本厂角色分布是 {role_txt}；{fm_cost}。"
+                    "另外 `require_permission` 这套 RBAC 原语是全仓可用的，"
+                    "但 321 个写路由里只挂了 26 个、390 个读路由只挂了 16 个 —— "
+                    "有工具不等于有门槛"),
+                "expected_answer": (
+                    "① 维持现状（承认任何本厂账号可取消/开工/暂停，责任在班组）；"
+                    "② 给每个动作列允许角色（形如 cancel: [factory_manager, planner]），"
+                    "由厂里逐动作给表，引擎按表拦；"
+                    "③ 启用已有的 require_permission/RBAC 角色表并把工单动作接进去"
+                    "（改动面最大，但和权限页一致）。三条都要落到 ACTION_ROLE_GATES 或角色表，"
+                    "不是口头约定。"),
+                "prefilled_evidence": (f"无门槛动作：{'、'.join(cn for _, cn in open_actions)}；"
+                                       f"有门槛动作：{gated_txt}；"
+                                       f"本厂角色：{role_txt}；工单状态：{wo_txt}"),
+                "record_as": {"subject": "work_order_action_role_gate",
+                              "verdict": "keep_open|per_action_role_table|adopt_rbac",
+                              "status": "declared", "source": "chat"},
+            })
+    except Exception as exc:  # noqa: BLE001
+        out.append({
+            "topic": "work_order_action_role_gate",
+            "question": "工单动作门槛这轮没核出来：取数失败，不能当成『门槛齐了』",
+            "why_it_matters": f"factory_rules 取数异常（{type(exc).__name__}）—— 空集合≠通过",
+            "expected_answer": "看 /pmc/open-rule-questions 为什么取不到",
+            "prefilled_evidence": str(exc)[:160],
+        })
+
     declared_anchor = None
     if declared:
         declared_anchor = {"verdict": declared.get("verdict"), "status": declared.get("status"),
