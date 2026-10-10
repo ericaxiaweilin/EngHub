@@ -9,7 +9,12 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Depends
-from core.auth.security import enforce_tenant, require_login_for_api
+from core.auth.security import (
+    enforce_tenant, require_login_for_api, current_request_identity,
+    tenant_write_violation, TENANT_GUARD_MODE, TenantWriteViolation, _UNSET,
+)
+from sqlalchemy import event
+from sqlalchemy.orm import Session as _SyncSession
 from api.services.work_order_service import WoPermissionError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -96,6 +101,41 @@ async def _wo_gate_error(request: Request, exc: WoPermissionError):
     客户端越界被报成服务端故障，既误分类也让"被拦下"在日志里看起来像坏了。
     """
     return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+@event.listens_for(_SyncSession, "before_flush")
+def _tenant_row_guard(session, flush_context, instances):
+    """行归属观察器：一次 flush 里，带 `factory_id` 的行若被"无权的人"改动，先记一条再说。
+
+    为什么挂在 flush 而不是补 132 个路由：那些路由的形状都一样
+    （按 id 取一行 → 改 → commit），逐个补必漏，新写的接口还会继续漏；
+    flush 是唯一的必经点。
+
+    默认 `observe`：只写日志、不改行为。要先量出"真实有哪些跨厂写在发生"
+    （引擎自写、报表回写、班组互援都可能是合法的），才有资格谈 `enforce`；
+    切换是配置动作（TENANT_GUARD_MODE=enforce），不是改代码。
+    没有调用者上下文（引擎循环、定时任务）时完全沉默 —— 那些写入没有"越权的人"。
+    """
+    identity = current_request_identity()
+    if identity is _UNSET or identity["allowed"] is None:
+        return
+    mode = TENANT_GUARD_MODE
+    if mode == "off":
+        return
+    import json
+    logger = logging.getLogger("tenant-guard")
+    for op, items in (("insert", list(session.new)), ("update", list(session.dirty)),
+                      ("delete", list(session.deleted))):
+        for obj in items:
+            violation = tenant_write_violation(obj, identity["allowed"])
+            if not violation:
+                continue
+            violation.update({"op": op, "user": identity["username"]})
+            logger.warning("[tenant-guard] %s %s",
+                           "would-block" if mode == "enforce" else "observe",
+                           json.dumps(violation, ensure_ascii=False))
+            if mode == "enforce":
+                raise TenantWriteViolation(json.dumps(violation, ensure_ascii=False))
 
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")

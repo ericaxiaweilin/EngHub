@@ -4,6 +4,7 @@ Security utilities for authentication
 """
 import os
 import bcrypt
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Optional, List
@@ -128,6 +129,9 @@ async def get_current_user(
     if user is None or not user.is_active:
         raise credentials_exception
 
+    # 记进请求上下文：flush 层的行归属观察器靠它判断"这一行是不是这个人有权改的"。
+    # 放在这里而不是入口闸里，是因为只有这里已经拿到了库里的用户行（不额外多查一次）。
+    remember_request_identity(user)
     return user
 
 
@@ -211,6 +215,52 @@ def ensure_row_in_tenant(row, user, action: str, *, label: str = "记录") -> No
                 f"{getattr(user, 'username', '?')} 的可访问范围"
                 f"（可访问：{'、'.join(sorted(allowed)) or '未分配厂区'}）"),
     )
+
+
+_UNSET = object()
+# 一次请求内"谁能改哪一厂的行"的上下文。由 get_current_user 在取到用户行之后写入；
+# 非 HTTP 路径（引擎循环、定时任务）读到的就是 _UNSET —— 那里根本没有"调用者"，
+# 观察器对它们完全不说话，避免把后台写入误报成越界。
+_request_identity = ContextVar("enghub_request_identity", default=_UNSET)
+
+# off | observe | enforce。enforce 会改行为，所以默认只观察：
+# 先把"真有哪些跨厂写在发生"的量出来，再由人决定切不切。
+TENANT_GUARD_MODE = (os.getenv("TENANT_GUARD_MODE", "observe") or "observe").strip().lower()
+
+
+class TenantWriteViolation(Exception):
+    """enforce 模式下：这一行不属于调用者有权的厂区。"""
+
+
+def remember_request_identity(user) -> None:
+    """把调用者记进请求上下文（厂区集合 + 用户名，供观察器写日志）。"""
+    _request_identity.set({"allowed": allowed_factory_ids(user),
+                           "username": getattr(user, "username", "?")})
+
+
+def current_request_identity():
+    return _request_identity.get()
+
+
+def tenant_write_violation(obj, allowed) -> Optional[dict]:
+    """这行如果算越界，返回一条可解释的观察记录；不算则 None。
+
+    只参与**有 factory_id 列**的表：不是每张表都按厂分（状态日志、码表等），
+    对这些表报"越界"是噪声。`allowed=None` 是超管（不限），`_UNSET` 是没有调用者。
+    """
+    if allowed is _UNSET or allowed is None:
+        return None
+    row_factory = getattr(obj, "factory_id", _UNSET)
+    if row_factory is _UNSET:
+        return None
+    if row_factory in allowed:
+        return None
+    cls = type(obj)
+    table = getattr(cls, "__tablename__", None) or getattr(getattr(cls, "__table__", None), "name", "?")
+    return {"table": str(table),
+            "id": str(getattr(obj, "id", "") or ""),
+            "row_factory": str(row_factory or "(未标注)"),
+            "allowed": sorted(allowed)}
 
 
 async def enforce_tenant(

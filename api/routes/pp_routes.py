@@ -390,21 +390,23 @@ async def patch_plan(
     if updates.priority is not None:
         p.priority = updates.priority
         # 重新计算优先级分数
-        required_date = p.required_date
-        days_until_due = (required_date - datetime.utcnow()).days
-        if days_until_due <= 0:
-            due_score = 100
-        elif days_until_due <= 7:
-            due_score = 80 + (7 - days_until_due) * 3
-        elif days_until_due <= 14:
-            due_score = 60 + (14 - days_until_due) * 2
-        elif days_until_due <= 30:
-            due_score = 30 + (30 - days_until_due)
-        else:
-            due_score = max(0, 30 - (days_until_due - 30) * 0.5)
-        level_scores = {"vip": 50, "a": 35, "b": 20, "c": 10}
-        level_score = level_scores.get(p.customer_level, 20)
-        p.priority_score = min(due_score + level_score + p.priority, 150)
+        # 重新计算优先级分数。required_date 是 date、utcnow() 是 datetime，直接相减会
+        # TypeError（草稿计划改优先级这条路以前没人走到）；没填交期就保留原分数。
+        if p.required_date is not None:
+            days_until_due = (p.required_date - datetime.utcnow().date()).days
+            if days_until_due <= 0:
+                due_score = 100
+            elif days_until_due <= 7:
+                due_score = 80 + (7 - days_until_due) * 3
+            elif days_until_due <= 14:
+                due_score = 60 + (14 - days_until_due) * 2
+            elif days_until_due <= 30:
+                due_score = 30 + (30 - days_until_due)
+            else:
+                due_score = max(0, 30 - (days_until_due - 30) * 0.5)
+            level_scores = {"vip": 50, "a": 35, "b": 20, "c": 10}
+            level_score = level_scores.get(p.customer_level, 20)
+            p.priority_score = min(due_score + level_score + p.priority, 150)
     
     p.updated_by = current_user.username if current_user else "system"
     p.updated_at = datetime.utcnow()
@@ -466,21 +468,23 @@ async def update_plan(
     if updates.priority is not None:
         p.priority = updates.priority
         # 重新计算优先级分数
-        required_date = p.required_date
-        days_until_due = (required_date - datetime.utcnow()).days
-        if days_until_due <= 0:
-            due_score = 100
-        elif days_until_due <= 7:
-            due_score = 80 + (7 - days_until_due) * 3
-        elif days_until_due <= 14:
-            due_score = 60 + (14 - days_until_due) * 2
-        elif days_until_due <= 30:
-            due_score = 30 + (30 - days_until_due)
-        else:
-            due_score = max(0, 30 - (days_until_due - 30) * 0.5)
-        level_scores = {"vip": 50, "a": 35, "b": 20, "c": 10}
-        level_score = level_scores.get(p.customer_level, 20)
-        p.priority_score = min(due_score + level_score + p.priority, 150)
+        # 重新计算优先级分数。required_date 是 date、utcnow() 是 datetime，直接相减会
+        # TypeError（草稿计划改优先级这条路以前没人走到）；没填交期就保留原分数。
+        if p.required_date is not None:
+            days_until_due = (p.required_date - datetime.utcnow().date()).days
+            if days_until_due <= 0:
+                due_score = 100
+            elif days_until_due <= 7:
+                due_score = 80 + (7 - days_until_due) * 3
+            elif days_until_due <= 14:
+                due_score = 60 + (14 - days_until_due) * 2
+            elif days_until_due <= 30:
+                due_score = 30 + (30 - days_until_due)
+            else:
+                due_score = max(0, 30 - (days_until_due - 30) * 0.5)
+            level_scores = {"vip": 50, "a": 35, "b": 20, "c": 10}
+            level_score = level_scores.get(p.customer_level, 20)
+            p.priority_score = min(due_score + level_score + p.priority, 150)
     
     p.updated_by = current_user.username if current_user else "system"
     p.updated_at = datetime.utcnow()
