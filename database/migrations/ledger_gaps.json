@@ -1,0 +1,86 @@
+{
+  "_why": "台账有、仓库无 的迁移登记表。scripts/check_migration_ledger.py 用它区分『已知且有理由的缺口』与『新漂移』。2026-10-11 审计建立。",
+  "_how_to_close": "要从生产库反推一份基线 schema 快照入库，让新环境能一次建到当前形态；逐个复原这 16 条已不可能（源码不存在）。",
+  "gaps": [
+    {
+      "name": "065_wms_inventory_order_links.sql",
+      "applied_at": "2026-08-08 09:23:52",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "066_ai_memory_candidates.sql",
+      "applied_at": "2026-08-08 09:23:52",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "067_capa_workflow_persistence.sql",
+      "applied_at": "2026-08-08 09:23:52",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "068_ai_experience_compounding.sql",
+      "applied_at": "2026-08-08 09:23:52",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "069_ai_action_approvals.sql",
+      "applied_at": "2026-08-08 09:23:52",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "070_chatbot_role_trainer.sql",
+      "applied_at": "2026-08-08 09:23:52",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "071_internal_meetings.sql",
+      "applied_at": "2026-08-08 12:12:25",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "072_virtual_factory_operational_stream.sql",
+      "applied_at": "2026-08-08 12:35:53",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "073_role_simulation_and_defects.sql",
+      "applied_at": "2026-08-08 13:57:31",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "074_virtual_factory_quality_profiles.sql",
+      "applied_at": "2026-08-08 14:11:03",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "075_pmc_training_pack.sql",
+      "applied_at": "2026-08-08 15:16:14",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "076_enterprise_knowledge_documents.sql",
+      "applied_at": "2026-08-08 15:53:51",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "077_virtual_factory_bom.sql",
+      "applied_at": "2026-08-10 01:49:43",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "079_atp_wheel_routing.sql",
+      "applied_at": "2026-08-10 01:49:43",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "080_treadmill_production_flow.sql",
+      "applied_at": "2026-08-10 02:28:05",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    },
+    {
+      "name": "081_treadmill_crp_alignment.sql",
+      "applied_at": "2026-08-10 02:31:31",
+      "reason": "已应用在生产库，但源文件从未进 git（git 历史里查无此文件），无法原样找回。后果：新环境按仓库建库会缺这一段 schema。"
+    }
+  ]
+}
