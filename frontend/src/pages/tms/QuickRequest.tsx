@@ -623,7 +623,7 @@ const QuickRequest: React.FC = () => {
               <Row gutter={16}>
                 {selectedTemplate.fields.map(renderField)}
               </Row>
-              <Divider orientation="left" plain>
+              <Divider titlePlacement="left" plain>
                 <CameraOutlined /> 现场照片 / 视频记录
               </Divider>
               <Form.Item>
@@ -702,7 +702,7 @@ const QuickRequest: React.FC = () => {
               </Col>
             </Row>
             {/* 呼叫类型专属字段 */}
-            <Divider orientation="left" plain style={{ fontSize: 13 }}>
+            <Divider titlePlacement="left" plain style={{ fontSize: 13 }}>
               {CALL_TYPES.find(c => c.value === selectedCallType)?.label} - 专属信息
             </Divider>
             <Row gutter={16}>

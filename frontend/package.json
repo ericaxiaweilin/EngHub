@@ -7,33 +7,43 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "lint": "eslint . --ext ts,tsx"
+    "lint": "eslint ."
   },
   "dependencies": {
     "@ant-design/charts": "^2.6.7",
+    "@ant-design/icons": "^6.3.4",
     "@antv/x6": "^3.1.7",
     "@antv/x6-react-shape": "^3.0.1",
     "@univerjs/preset-sheets-core": "^0.25.1",
     "@univerjs/presets": "^0.25.1",
-    "antd": "^5.12.0",
+    "antd": "^6.6.5",
     "axios": "^1.6.2",
     "dayjs": "^1.11.10",
     "form-render": "^2.5.6",
     "i18next": "^26.3.6",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "react-i18next": "^17.0.11",
-    "react-router-dom": "^6.20.0",
-    "zustand": "^4.4.7"
+    "react-router-dom": "^7.18.4",
+    "rxjs": "^7.8.2"
   },
   "devDependencies": {
-    "@types/react": "^18.2.43",
-    "@types/react-dom": "^18.2.17",
-    "@typescript-eslint/eslint-plugin": "^6.14.0",
-    "@typescript-eslint/parser": "^6.14.0",
-    "@vitejs/plugin-react": "^4.2.1",
-    "eslint": "^8.55.0",
-    "typescript": "^5.2.2",
-    "vite": "^5.0.8"
+    "@eslint/js": "^10.0.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@typescript-eslint/eslint-plugin": "^8.71.1",
+    "@typescript-eslint/parser": "^8.71.1",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.12.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.13.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vite": "^8.3.4"
+  },
+  "overrides": {
+    "form-render": {
+      "antd": "$antd"
+    }
   }
 }

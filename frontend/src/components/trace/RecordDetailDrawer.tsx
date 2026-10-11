@@ -52,7 +52,7 @@ const RecordDetailDrawer: React.FC<RecordDetailDrawerProps> = ({
 
           {(related || []).map((sec) => (
             <div key={sec.title} style={{ marginTop: 16 }}>
-              <Divider orientation="left" style={{ margin: '8px 0' }}>
+              <Divider titlePlacement="left" style={{ margin: '8px 0' }}>
                 {sec.title}（{sec.records.length}）
               </Divider>
               <Table

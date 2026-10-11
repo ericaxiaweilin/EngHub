@@ -348,6 +348,11 @@ const OutboundPanel: React.FC = () => {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<any>(null)
+  // 必须在下面 `if (result) return` 之前调用。原先它写在 JSX 里
+  // （`{Form.useWatch('outbound_type', form) === 'production' && ...}`），
+  // 而那条早退在它前面 ⇒ 出库成功、result 有值的那次渲染会少调一个 hook，
+  // React 抛 "Rendered fewer hooks than expected"。
+  const outboundType = Form.useWatch('outbound_type', form)
 
   const handleSubmit = async () => {
     try {
@@ -378,7 +383,7 @@ const OutboundPanel: React.FC = () => {
       <Form.Item name="outbound_type" label="出库用途" initialValue="sales">
         <Select options={OUTBOUND_TYPES} />
       </Form.Item>
-      {Form.useWatch('outbound_type', form) === 'production' && (
+      {outboundType === 'production' && (
         <Form.Item name="work_order_id" label="工单ID"
           rules={[{ required: true, message: '领料必须挂工单，否则这笔消耗归不到工单' }]}>
           <Input placeholder="WO-…（生产领料必填）" />

@@ -163,12 +163,12 @@ export default function RCCAnalysis() {
     // 工位负荷瓶颈
     (people.work_center_load || []).forEach((wc: any) => {
       items.push({ name: `${wc.name} (工位)`, loadRate: wc.load_rate || 0, type: 'people' })
-    })
+    });
 
     // 设备利用率瓶颈
     (equipment.overloaded_devices || equipment.equipment_details || []).forEach((dev: any) => {
       items.push({ name: `${dev.name || dev.equipment_name} (设备)`, loadRate: dev.utilization_rate || 0, type: 'equipment' })
-    })
+    });
 
     // 按负荷排序
     return items.sort((a, b) => b.loadRate - a.loadRate)

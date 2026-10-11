@@ -250,7 +250,7 @@ const PositionTrainer: React.FC<{ pmcMode?: boolean }> = ({ pmcMode = false }) =
             />
             {result.details?.some((item: any) => !item.correct) && (
               <>
-                <Divider orientation="left" plain>错题复盘</Divider>
+                <Divider titlePlacement="left" plain>错题复盘</Divider>
                 <List
                   size="small"
                   dataSource={result.details.filter((item: any) => !item.correct)}

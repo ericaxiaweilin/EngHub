@@ -73,7 +73,7 @@ class RCCDecisionEngine {
     let scenario: string
     let recommendations: Array<{
       action: string; reason: string; impact: string; confidence: number; type: string;
-    }> = []
+    }>
 
     if (totalOrders === 0 && activeWorkers > 0 && runningEquipment > 0) {
       scenario = '无工单但有资源'

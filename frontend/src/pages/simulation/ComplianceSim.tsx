@@ -382,7 +382,7 @@ const ComplianceSim: React.FC = () => {
                 plugin_names: DEFAULT_PLUGINS,
               }}
             >
-              <Divider orientation="left" plain><ExperimentOutlined /> 物理输入</Divider>
+              <Divider titlePlacement="left" plain><ExperimentOutlined /> 物理输入</Divider>
               <Row gutter={16}>
                 <Col span={8}>
                   <Form.Item label={<span>时间步长(min){tipIcon('time_step_minutes')}</span>} name="time_step_minutes" rules={[{ required: true }]}>
@@ -417,7 +417,7 @@ const ComplianceSim: React.FC = () => {
                 </Col>
               </Row>
 
-              <Divider orientation="left" plain><EnvironmentOutlined /> 环境</Divider>
+              <Divider titlePlacement="left" plain><EnvironmentOutlined /> 环境</Divider>
               <Row gutter={16}>
                 <Col span={8}>
                   <Form.Item label={<span>温度(℃){tipIcon('temperature_c')}</span>} name="temperature_c" rules={[{ required: true }]}>
@@ -452,7 +452,7 @@ const ComplianceSim: React.FC = () => {
                 </Col>
               </Row>
 
-              <Divider orientation="left" plain><UserOutlined /> 作业上下文</Divider>
+              <Divider titlePlacement="left" plain><UserOutlined /> 作业上下文</Divider>
               <Row gutter={16}>
                 <Col span={8}>
                   <Form.Item label={<span>工人{tipIcon('worker_ref')}</span>} name="worker_ref" rules={[{ required: true }]}>
@@ -499,7 +499,7 @@ const ComplianceSim: React.FC = () => {
                 </Col>
               </Row>
 
-              <Divider orientation="left" plain><SafetyCertificateOutlined /> 法规插件</Divider>
+              <Divider titlePlacement="left" plain><SafetyCertificateOutlined /> 法规插件</Divider>
               <Form.Item name="plugin_names" rules={[{ required: true, message: '至少选择一个插件' }]}>
                 <Select mode="multiple" options={pluginOptions} placeholder="选择参与裁决的法规插件" />
               </Form.Item>

@@ -119,7 +119,7 @@ const RoleSwitcher: React.FC<RoleSwitcherProps> = ({ open, onClose, currentRole 
       ) : (
         Object.entries(groupedRoles).map(([group, groupRoles]) => (
           <div key={group}>
-            <Divider orientation="left" plain>
+            <Divider titlePlacement="left" plain>
               {group}
             </Divider>
             <List
