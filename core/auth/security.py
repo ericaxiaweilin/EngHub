@@ -149,7 +149,12 @@ async def get_current_active_superuser(
 
 # 公开面：登录前必须可达的路径。/api/v1/auth/ 整段放行是因为其中的受保护接口
 # （/me、/change-password 等）本来就各自挂了 current_user，不靠这道闸。
-PUBLIC_API_PREFIXES = ("/api/v1/auth/", "/api/v1/health")
+#
+# 本清单只对 /api/ 下的路径生效（见 require_login_for_api 的前缀判断）。健康检查在
+# /health（main.py:200，docker healthcheck 打的就是它），不在 /api/ 下、天然不过这道闸，
+# 因此不需要也不能写进这里。原先这里挂的 "/api/v1/health" 没有任何路由服务（实测 404，
+# 全仓仅此一处引用），已摘除 —— 留着它等于给一个未来可能叫这个名字的新路由预发通行证。
+PUBLIC_API_PREFIXES = ("/api/v1/auth/",)
 
 
 async def require_login_for_api(request: Request) -> None:
