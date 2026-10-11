@@ -76,23 +76,42 @@ python scripts/check_migration_ledger.py --quiet   # 一行摘要 + 退出码
 三条判据：① 台账有、仓库无（**只有未登记的才报错**）② 内容与台账 checksum 漂移
 ③ 仓库有、台账无（只报 >= 42 的）。**退出码非 0 = 需要处理。**
 
-### ⚠️ 部署注意：`scripts/` 不在 bind-mount 里
+### ⚠️ 部署注意：`scripts/` 与容器
 
-只有 `database/`、`api/`、`core/`、`main.py`、`engine_asgi.py`、`integrations/`、
-`frontend_dist/` 是挂载的。容器里的 `/app/scripts/` 是**镜像里的旧快照** ——
-实测冻结在 **2026-07-30**：比仓库**少 13 个脚本、多 1 个**，连 `schema_migrate.py`
-都缺了 2026-08-22 才加的那行 `print("Applying migration: ...")`。
+挂载的只有 `database/`、`api/`、`core/`、`main.py`、`engine_asgi.py`、
+`integrations/`、`frontend_dist/`。**`scripts/` 原先不在里面** ——
+于是 `deploy_safe.sh:200` 把 `scripts/` rsync 到宿主机之后**没有任何东西读它**，
+容器里 `/app/scripts` 一直是镜像烘焙的快照（实测冻结在 **2026-07-30**：37 个脚本，
+比仓库少 13 个，`schema_migrate.py` 缺 2026-08-22 才加的那行 `print`）。
 
-要在生产容器里跑核对器，得先拷进去：
+**已在 `a5d4a305` 补上挂载**（`&backend-code` 锚点里加了 `scripts`，
+`engine` 用 `<<: *backend` + `volumes: *backend-code` 所以两个服务一起覆盖）。
+
+⚠️ **挂载要重建容器才生效**（`docker restart` 不加挂载）。在那之前要在生产里
+跑核对器，得先拷进去：
 
 ```bash
 docker cp scripts/check_migration_ledger.py enghub-backend-1:/app/scripts/
 docker exec -w /app enghub-backend-1 python scripts/check_migration_ledger.py
 ```
 
-`docker cp` 只进容器**可写层**，容器重建即丢；长期要靠重建镜像。
+`docker cp` 只进容器**可写层**，容器重建即丢。
 （脚本自己算 `ROOT = parents[1]`，所以必须落在 `/app/scripts/` 下，
 拷到 `/tmp` 会 `ModuleNotFoundError: No module named 'database'`。）
+
+### ⚠️ 生产上迁移失败**拦不住启动**
+
+镜像里的 `docker/entrypoint.sh` 是：
+
+```sh
+python /app/scripts/schema_migrate.py || echo "[entrypoint] schema migration failed, continuing..."
+```
+
+而仓库里的 `docker/entrypoint.sh`（`7eba1585`，2026-07-28）是 **fail-closed** 的裸调用。
+镜像建于 **2026-07-31** ⇒ 那个 `|| echo` 是构建时在工作区里改的、**没进 git**。
+
+后果：checksum 漂移、迁移报错这类问题，在生产上只打一行日志就继续起服务。
+`docker/` 既不在 deploy 的 rsync 列表里、也不在挂载里 ⇒ 要对齐**必须重建镜像**。
 
 ## 6. 加新迁移的规矩
 
