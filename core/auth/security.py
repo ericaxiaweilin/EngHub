@@ -279,6 +279,13 @@ async def enforce_tenant(
     if not requested:
         return None
 
+    if any(request.url.path == p or request.url.path.startswith(p)
+           for p in PUBLIC_API_PREFIXES):
+        # 公开接口（登录/刷新/健康）不参与租户闸。登录请求自己也可能带上厂区选择器
+        # （前端全局 axios 拦截器给所有 /api/ 请求加 X-Factory-Id），而那一刻还没有
+        # token；不豁免就形成"要登录才能登录"的死锁。口径与 require_login_for_api 一致。
+        return None
+
     authorization = request.headers.get("authorization", "")
     token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
     payload = decode_token(token) if token else None
