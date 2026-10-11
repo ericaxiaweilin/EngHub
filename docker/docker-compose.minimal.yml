@@ -136,6 +136,11 @@ services:
       - ${CODE_DIR:-..}/integrations:/app/integrations
       - ${CODE_DIR:-..}/main.py:/app/main.py
       - ${CODE_DIR:-..}/frontend_dist:/app/frontend_dist
+      # scripts/ 也必须挂：deploy_safe.sh 会把它 rsync 到宿主机，
+      # 不挂的话容器读的是**镜像里烘焙的旧快照**（实测冻结在 2026-07-30，
+      # 比仓库少 13 个脚本），于是「同步 scripts」等于没同步，
+      # 改 scripts/schema_migrate.py 这类也永远到不了生产。
+      - ${CODE_DIR:-..}/scripts:/app/scripts
       # 引擎进程的 ASGI 入口（engine 服务用它当 command 目标）
       - ${CODE_DIR:-..}/engine_asgi.py:/app/engine_asgi.py
     healthcheck:
