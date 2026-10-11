@@ -137,7 +137,7 @@ const Login: React.FC = () => {
             <Tag color="default">操作员</Tag>
           </div>
           <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-            默认账号 admin，如无法登录请联系管理员初始化
+            如无法登录，请联系管理员重置密码
           </Text>
         </div>
       </Card>

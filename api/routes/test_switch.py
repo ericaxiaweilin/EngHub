@@ -84,17 +84,35 @@ async def _build_test_user_response(user: User) -> TestSwitchResult:
     )
 
 
+async def require_test_operator(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """测试角色切换是演示用的开发开关，只对超级管理员开放。
+
+    原来 /status 和 /roles 完全没有鉴权，/switch-role 只要求"已登录" —— 任何低权账号
+    一条请求就能换到 admin 的 token（实测 操作员 → role=admin, is_superuser=True）。
+    而本服务端口是公网直开的，等于把整套权限模型绕过去。门禁口径与前端 FactorySwitcher
+    保持一致（超管 / eric）。
+    """
+    if not (getattr(current_user, "is_superuser", False) or current_user.username == "eric"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="测试角色切换仅限超级管理员",
+        )
+    return current_user
+
+
 @test_router.get("/status")
-async def check_test_mode():
-    """检查测试模式是否启用"""
+async def check_test_mode(current_user: User = Depends(require_test_operator)):
+    """检查测试模式是否启用（仅超级管理员）"""
     return {
         "enabled": _is_test_mode(),
-        "message": "测试模式已启用 - 可以免登录切换角色" if _is_test_mode() else "测试模式未启用",
+        "message": "测试模式已启用（仅超级管理员可切换角色）" if _is_test_mode() else "测试模式未启用",
     }
 
 
 @test_router.get("/roles")
-async def list_test_roles():
+async def list_test_roles(current_user: User = Depends(require_test_operator)):
     """
     获取所有可切换的角色列表
     每个角色包含：
@@ -150,7 +168,7 @@ async def list_test_roles():
 async def switch_role(
     request: TestSwitchRoleRequest,
     db=Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_test_operator),
 ):
     """
     测试模式：切换当前会话到指定角色
@@ -225,7 +243,7 @@ async def switch_role(
 async def get_test_user_info(
     username: str,
     db=Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_test_operator),
 ):
     """获取指定测试用户的信息（含权限和菜单）"""
     user_service = UserService(db)

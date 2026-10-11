@@ -310,8 +310,8 @@ const Layout: React.FC = () => {
             <Tag color="geekblue">{t('layout.factory')} {user.factory_id}</Tag>
           )}
           
-          {/* 测试模式：角色切换按钮 */}
-          {testMode && (
+          {/* 测试模式：角色切换按钮（与 FactorySwitcher 同口径：仅超管 / eric） */}
+          {testMode && (user?.is_superuser || user?.username === 'eric') && (
             <Button
               type="primary"
               ghost
