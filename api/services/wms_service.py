@@ -11,7 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.services import bom_source
 from api.services.wms_architecture.movements import (
+    FROZEN_STATUS,
     apply_movement,
+    frozen_stock_error,
     MovementError,
     document_movement_type,
 )
@@ -21,6 +23,48 @@ from database.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# PUT/PATCH 这两扇门只改元数据：数量与锁状态都不许从这里过。
+# 冻结 = inventory.status == 'locked'，与写入原语 frozen_stock_error 认的是同一件事；
+# 锁的进出只能走 /wms/freeze 与 /wms/freeze/release —— 它们要 reason_code、要落名，
+# 并同步写 inventory_freezes 记录（两本账对得上见 wms_freezes.sync_check）。
+_METADATA_QUANTITY_FIELDS = ("total_qty", "available_qty", "reserved_qty")
+
+
+def inventory_metadata_write_error(
+    inventory: Any, data: Dict[str, Any], *, via: str
+) -> Optional[str]:
+    """这两扇门只改元数据。返回错因，None = 放行。
+
+    三个方向都要挡，且全程用与写入原语同一把尺，避免长出新的一把：
+    · 任何行：数量三字段一个都不许动 —— 从这儿改数量等于绕过记账原语，
+      没有流水、没有操作人，也不认质量冻结，事后账实对不上时没人知道是哪一次改的；
+    · 任何行：status 不许写进或写出 'locked' ——
+      写进 = 造出"锁了没记"的行（冻结记录表里查无此锁），
+      写出 = 无理由码、无人名地放行；
+    · 冻着的行：库位也不许动 —— 换库位就是搬货，搬出同样要被冻结挡住。
+    非锁的 status 取值（active/available/shortage…）照常能改：冻结上线不能把
+    正常状态流转一起锁死。
+    """
+    touched_qty = [f for f in _METADATA_QUANTITY_FIELDS
+                   if f in data and data.get(f) is not None]
+    if touched_qty:
+        return (f"库存数量不能由 {via} 直接改（动了 {'、'.join(touched_qty)}）；"
+                "要改数量请走出入库/调拨/盘点审批 —— 那三条都会在台账留下单据号和流水")
+
+    current = str(getattr(inventory, "status", "") or "").strip().lower()
+    if data.get("status") is not None:
+        target = str(data.get("status") or "").strip().lower()
+        if target == FROZEN_STATUS or current == FROZEN_STATUS:
+            return (f"质量冻结不能由 {via} 改：锁上走 POST /api/v1/wms/freeze"
+                    "（要 reason_code），放行走 POST /api/v1/wms/freeze/release"
+                    "（谁放的、为什么都要落名）")
+
+    if current == FROZEN_STATUS and data.get("location_id") is not None:
+        return (f"库存行被质量冻结着，不能由 {via} 换库位（换库位就是搬货）；"
+                "要放行走 POST /api/v1/wms/freeze/release")
+
+    return None
 
 
 class WmsService:
@@ -1320,6 +1364,16 @@ class InventoryService:
                 f"Requested: {quantity}{note}")
 
         # 简单实现：预留第一个有足够库存的记录
+        #
+        # 为什么这里直接改 available/reserved 而**不走 apply_movement**（有意为之）：
+        #   预留只是把同一行里的 available 挪到 reserved，total_qty 不变 ——
+        #   它不是一次出入库，没有实物移动，因此不该在 inventory_transactions
+        #   留一条流水（落了反而会把"流水合计=库存变动"这条对账关系搞脏）。
+        #   真出库时才由 apply_movement 扣 total 并落流水。
+        # 冻结仍然管得住：上面已用 frozen_stock_error 把 locked 行剔出 usable，
+        #   所以"冻着的货被预留走"不会发生（单测见 tests/unit/wms/）。
+        # 注意：wms_audit.direct_stock_writes() 是静态扫描，这处赋值会被点名，
+        #   这是已知且有理由的一条，不是旁路。
         remaining_qty = quantity
         for inventory in usable:
             if remaining_qty <= 0:
@@ -1349,13 +1403,14 @@ class InventoryService:
         if not inventory:
             return {"success": False, "message": "库存记录不存在"}
 
-        # 允许更新的字段
+        reject = inventory_metadata_write_error(inventory, updates, via="PATCH")
+        if reject:
+            return {"success": False, "message": reject}
+
+        # 允许更新的字段（数量三字段故意不在内：改数量走记账原语，见上方守卫）
         allowed_fields = {
             "location_id": inventory.location_id,
             "batch_code": inventory.batch_code,
-            "total_qty": inventory.total_qty,
-            "available_qty": inventory.available_qty,
-            "reserved_qty": inventory.reserved_qty,
             "unit_cost": inventory.unit_cost,
             "status": inventory.status,
         }
@@ -1401,12 +1456,16 @@ class InventoryService:
         if not inventory:
             return {"success": False, "message": "库存记录不存在"}
 
-        # 完全替换所有可更新字段
+        reject = inventory_metadata_write_error(inventory, data, via="PUT")
+        if reject:
+            return {"success": False, "message": reject}
+
+        # 完全替换所有可更新字段。
+        # 数量三字段（total/available/reserved）**故意不在这里**：这扇门只改元数据，
+        # 上面 inventory_metadata_write_error 已经把它们拒了，这里也不留赋值 ——
+        # 结构上写不进去，比"靠守卫拦住"更硬。
         inventory.location_id = data.get("location_id", inventory.location_id)
         inventory.batch_code = data.get("batch_code", inventory.batch_code)
-        inventory.total_qty = data.get("total_qty", inventory.total_qty)
-        inventory.available_qty = data.get("available_qty", inventory.available_qty)
-        inventory.reserved_qty = data.get("reserved_qty", inventory.reserved_qty)
         inventory.unit_cost = data.get("unit_cost", inventory.unit_cost)
         inventory.unit = data.get("unit", inventory.unit)
         inventory.status = data.get("status", inventory.status)

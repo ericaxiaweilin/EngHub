@@ -11,6 +11,18 @@ WMS Inventory Service - 库存管理服务 (修复版)
 - 批次追溯
 
 集成方式: 使用数据库中的 Inventory, InboundOrder, OutboundOrder 表
+
+⚠️ 别接线 —— 生产代码只用这个模块的枚举，不要用 InventoryService。
+   · 生产实际调用方：core/cost/costing.py、wms_architecture/movements.py，
+     都只 import `TransactionType` / `InventoryStatus`。
+   · `InventoryService` 没有任何生产调用方，只有单测和集成测试在用。
+   · 它的写入是**第二套实现**：直接改数量（本文件 274/275 入库累加、
+     425 出库扣减并把 status 写成 AVAILABLE），既不落流水也不认质量冻结
+     （movements.frozen_stock_error 认 inventory.status）。
+     接上路由 = 冻结当场失效且账实无痕，事后查不出是哪一次改的。
+   · 要写入请走 `api/services/wms_architecture/movements.py` 的
+     `apply_movement` / `apply_transfer_pair` —— 那是唯一的记账原语，
+     流水与数量同源、冻结守卫也在里面。
 """
 
 import uuid
